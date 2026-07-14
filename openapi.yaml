@@ -2022,22 +2022,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [namespace, scope, health]
-                properties:
-                  namespace:
-                    type: string
-                  scope:
-                    type: object
-                  health:
-                    type: object
-                    properties:
-                      sidecar_admitted_services:
-                        type: integer
-                        format: int64
-                      sidecar_denied_services:
-                        type: integer
-                        format: int64
+                $ref: "#/components/schemas/MeshEgressScopeResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -2112,8 +2097,7 @@ paths:
                   host:
                     type: string
                   port:
-                    type: integer
-                    nullable: true
+                    type: [integer, "null"]
                   dry_run:
                     type: boolean
         "400":
@@ -2212,9 +2196,8 @@ paths:
                           type: integer
                           description: Number of cached JWT authority entries.
                         refresh_hint_seconds:
-                          type: integer
+                          type: [integer, "null"]
                           format: int64
-                          nullable: true
                           description: SPIFFE `spiffe_refresh_hint` from the bundle, if present.
         "401":
           $ref: "#/components/responses/Unauthorized"
@@ -2318,8 +2301,7 @@ paths:
                           type: string
                           description: SPIFFE trust domain the remote endpoints were ingested under.
                         network:
-                          type: string
-                          nullable: true
+                          type: [string, "null"]
                           description: Istio network label of the remote cluster, when declared.
                         workload_count:
                           type: integer
@@ -2364,8 +2346,7 @@ paths:
                           type: string
                           description: SPIFFE trust domain declared for the remote cluster.
                         network:
-                          type: string
-                          nullable: true
+                          type: [string, "null"]
                           description: Istio network label, when declared.
                         control_plane_configured:
                           type: boolean
@@ -2397,14 +2378,12 @@ paths:
                             bootstrap is blocking a CP-supplied fallback until
                             the first successful federation poll.
                         trust_bundle_fetched_at_unix_seconds:
-                          type: integer
+                          type: [integer, "null"]
                           format: int64
-                          nullable: true
                           description: Unix timestamp (seconds) of the last successful polled bundle fetch, present when `trust_source` is `polled`.
                         trust_bundle_age_seconds:
-                          type: integer
+                          type: [integer, "null"]
                           format: int64
-                          nullable: true
                           description: Seconds since the last successful polled bundle fetch, present when `trust_source` is `polled`.
               examples:
                 discovery-active:
@@ -5857,12 +5836,12 @@ components:
         - backend_port
       properties:
         id:
-          type: [string, "null"]
+          type: string
           description: >-
             Unique identifier (UUID auto-generated if omitted or empty on create).
             Custom IDs must start with an alphanumeric character and contain only
             alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
-          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          pattern: "^$|^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
           maxLength: 254
         namespace:
           type: string
@@ -5936,7 +5915,6 @@ components:
           oneOf:
             - $ref: "#/components/schemas/BackendScheme"
             - type: "null"
-          nullable: true
           description: >-
             Wire-level scheme the proxy uses to talk to its backend.
             Optional for HTTP-family proxies — defaults to `https` when
@@ -5967,7 +5945,7 @@ components:
             false the H3 server does not advertise
             `SETTINGS_ENABLE_CONNECT_PROTOCOL` and the bridge returns 501.
         backend_host:
-          type: [string, "null"]
+          type: string
           description: >-
             Backend server hostname or IP. Required when `upstream_id` is not set.
             When `upstream_id` is set, this field is ignored (upstream targets
@@ -6177,17 +6155,15 @@ components:
             Only valid for stream proxies (tcp, tcp_tls, udp, dtls).
             Mutually exclusive with frontend_tls.
         tcp_idle_timeout_seconds:
-          type: integer
+          type: [integer, "null"]
           format: uint64
-          nullable: true
           description: |
             TCP stream idle timeout in seconds. After this duration of no data transfer
             in either direction, the connection is closed. When omitted, uses the global
             FERRUM_TCP_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to disable.
             Only applicable for tcp/tcp_tls protocols.
         stream_proxy_protocol:
-          type: boolean
-          nullable: true
+          type: [boolean, "null"]
           description: |
             Enable inbound PROXY protocol (v1 text or v2 binary, auto-detected) on this
             stream proxy listener. When true, every inbound TCP connection must begin with a
@@ -6208,9 +6184,8 @@ components:
 
             Default: null / false (disabled; socket peer is always used as client_ip).
         websocket_idle_timeout_seconds:
-          type: integer
+          type: [integer, "null"]
           format: uint64
-          nullable: true
           minimum: 0
           maximum: 86400
           description: |
@@ -6309,11 +6284,11 @@ components:
             of the bundle, and `DELETE /api-specs/{id}` deletes this proxy (and
             its plugins via FK cascade).
         created_at:
-          type: [string, "null"]
+          type: string
           format: date-time
           description: Creation timestamp (set by server)
         updated_at:
-          type: [string, "null"]
+          type: string
           format: date-time
           description: Last modification timestamp (set by server)
 
@@ -6376,7 +6351,7 @@ components:
       required: [plugin_config_id]
       properties:
         plugin_config_id:
-          type: [string, "null"]
+          type: string
           description: ID of the PluginConfig to apply to this proxy
 
     # ── Consumer ────────────────────────────────────────────────────
@@ -6385,12 +6360,12 @@ components:
       required: [username]
       properties:
         id:
-          type: [string, "null"]
+          type: string
           description: >-
             Unique identifier (UUID auto-generated if omitted or empty on create).
             Custom IDs must start with an alphanumeric character and contain only
             alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
-          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          pattern: "^$|^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
           maxLength: 254
         namespace:
           type: string
@@ -6404,7 +6379,7 @@ components:
             default) on every create/update; any value in the request body
             is ignored.
         username:
-          type: [string, "null"]
+          type: string
           minLength: 1
           description: >-
             Unique consumer username (must be non-empty). Used as the lookup key
@@ -6474,10 +6449,10 @@ components:
             addition to) individual consumer usernames. A consumer can belong to
             up to 500 groups.
         created_at:
-          type: [string, "null"]
+          type: string
           format: date-time
         updated_at:
-          type: [string, "null"]
+          type: string
           format: date-time
 
     ConsumerCreate:
@@ -6570,12 +6545,12 @@ components:
       required: [plugin_name, scope, enabled]
       properties:
         id:
-          type: [string, "null"]
+          type: string
           description: >-
             Unique identifier (UUID auto-generated if omitted or empty on create).
             Custom IDs must start with an alphanumeric character and contain only
             alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
-          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          pattern: "^$|^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
           maxLength: 254
         namespace:
           type: string
@@ -6589,7 +6564,7 @@ components:
             default) on every create/update; any value in the request body
             is ignored.
         plugin_name:
-          type: [string, "null"]
+          type: string
           description: >-
             Plugin type name. Must be one of the available built-in plugins
             (e.g., key_auth, rate_limiting, cors, stdout_logging). Use
@@ -6639,10 +6614,10 @@ components:
             endpoints (`POST /plugins/config`). When set, `PUT /api-specs/{id}`
             replaces this plugin as part of the bundle.
         created_at:
-          type: [string, "null"]
+          type: string
           format: date-time
         updated_at:
-          type: [string, "null"]
+          type: string
           format: date-time
       allOf:
         - if:
@@ -7801,12 +7776,12 @@ components:
       required: [targets]
       properties:
         id:
-          type: [string, "null"]
+          type: string
           description: >-
             Unique identifier (UUID auto-generated if omitted or empty on create).
             Custom IDs must start with an alphanumeric character and contain only
             alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
-          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          pattern: "^$|^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
           maxLength: 254
         namespace:
           type: string
@@ -7870,6 +7845,30 @@ components:
             subset when its `tags` are a superset of the subset's labels.
             Empty arrays are rejected; omit the field when no subsets are
             configured.
+        port_overrides:
+          type: object
+          readOnly: true
+          additionalProperties:
+            $ref: "#/components/schemas/UpstreamPortOverride"
+          description: >-
+            Per-destination-port traffic policy projected from mesh
+            DestinationRule `portLevelSettings`. Keys are decimal port numbers.
+            A direct value in a create/update or file config is rejected; this
+            field can appear in read responses for mesh-derived upstreams.
+        source_locality:
+          type: [string, "null"]
+          readOnly: true
+          description: >-
+            Source workload locality in `region/zone/subzone` form, projected
+            by mesh slice apply. A direct operator value is rejected.
+        locality_lb_setting:
+          oneOf:
+            - $ref: "#/components/schemas/UpstreamLocalityLbSetting"
+            - type: "null"
+          readOnly: true
+          description: >-
+            Locality distribute/failover policy projected from a mesh
+            DestinationRule. A direct operator value is rejected.
         backend_tls_client_cert_path:
           type: [string, "null"]
           description: >-
@@ -7940,10 +7939,10 @@ components:
             endpoints (`POST /upstreams`). When set, `DELETE /api-specs/{id}` also
             deletes this upstream; `PUT /api-specs/{id}` replaces it.
         created_at:
-          type: [string, "null"]
+          type: string
           format: date-time
         updated_at:
-          type: [string, "null"]
+          type: string
           format: date-time
 
     UpstreamTarget:
@@ -7951,7 +7950,7 @@ components:
       required: [host, port]
       properties:
         host:
-          type: [string, "null"]
+          type: string
           description: Backend hostname or IP
         port:
           type: integer
@@ -7965,8 +7964,14 @@ components:
           type: object
           default: {}
           additionalProperties:
-            type: [string, "null"]
+            type: string
           description: Arbitrary key-value tags
+        locality:
+          type: [string, "null"]
+          maxLength: 255
+          description: >-
+            Optional locality in `region`, `region/zone`, or
+            `region/zone/subzone` form. Used by locality-aware load balancing.
         path:
           type: [string, "null"]
           description: >-
@@ -8014,6 +8019,199 @@ components:
             Optional hash-key source for subset-scoped consistent hashing. Uses
             the same syntax as `Upstream.hash_on`: `ip`, `header:<name>`, or
             `cookie:<name>`.
+        tls:
+          oneOf:
+            - $ref: "#/components/schemas/MeshTrafficPolicyTls"
+            - type: "null"
+          readOnly: true
+          description: >-
+            Subset TLS origination policy projected from a mesh
+            DestinationRule. Direct admin/file configuration is rejected; the
+            field can appear in read responses for mesh-derived upstreams.
+        connect_timeout_ms:
+          type: [integer, "null"]
+          format: uint64
+          readOnly: true
+          description: >-
+            Subset backend-connect timeout projected from a mesh
+            DestinationRule. Direct admin/file configuration is rejected.
+        passive_health_check:
+          oneOf:
+            - $ref: "#/components/schemas/PassiveHealthCheck"
+            - type: "null"
+          readOnly: true
+          description: >-
+            Subset passive-health policy projected from mesh outlier detection.
+            Direct admin/file configuration is rejected.
+
+    MeshTrafficPolicyTls:
+      type: object
+      required: [mode, subject_alt_names, insecure_skip_verify]
+      properties:
+        mode:
+          type: string
+          enum: [disable, simple, mutual, istio_mutual]
+          default: simple
+          description: DestinationRule client-side TLS mode.
+        sni:
+          type: [string, "null"]
+          description: Optional backend TLS Server Name Indication value.
+        ca_certificates:
+          type: [string, "null"]
+          description: Optional path to a PEM CA bundle.
+        client_certificate:
+          type: [string, "null"]
+          description: Client-certificate path required by `mutual` mode.
+        private_key:
+          type: [string, "null"]
+          description: Private-key path required by `mutual` mode.
+        subject_alt_names:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Allowed backend certificate Subject Alternative Names.
+        insecure_skip_verify:
+          type: boolean
+          default: false
+          description: Disable backend server-certificate verification.
+
+    UpstreamLocalityLbSetting:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        distribute:
+          type: array
+          items:
+            $ref: "#/components/schemas/LocalityDistribute"
+          description: Weighted target-locality distributions.
+        failover:
+          type: array
+          items:
+            $ref: "#/components/schemas/LocalityFailover"
+          description: Source-region to failover-region mappings.
+
+    LocalityDistribute:
+      type: object
+      required: [from]
+      properties:
+        from:
+          type: string
+          description: Source locality in `region/zone/subzone` form.
+        to:
+          type: object
+          additionalProperties:
+            type: integer
+            format: uint32
+          description: Target locality to relative-weight mapping.
+
+    LocalityFailover:
+      type: object
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          description: Source region.
+        to:
+          type: string
+          description: Failover region.
+
+    BackendTlsConfig:
+      type: object
+      required: [client_cert_path, client_key_path, server_ca_cert_path, verify_server_cert]
+      properties:
+        client_cert_path:
+          type: [string, "null"]
+        client_key_path:
+          type: [string, "null"]
+        server_ca_cert_path:
+          type: [string, "null"]
+        verify_server_cert:
+          type: boolean
+          default: true
+        sni:
+          type: [string, "null"]
+        san_allow_list:
+          type: array
+          items:
+            type: string
+
+    TcpKeepaliveCfg:
+      type: object
+      properties:
+        time_seconds:
+          type: [integer, "null"]
+          format: uint32
+          minimum: 1
+        interval_seconds:
+          type: [integer, "null"]
+          format: uint32
+          minimum: 1
+        probes:
+          type: [integer, "null"]
+          format: uint32
+          minimum: 1
+
+    H2UpgradePolicy:
+      type: string
+      enum: [DEFAULT, UPGRADE, DO_NOT_UPGRADE]
+      description: Mesh backend HTTP/2 upgrade policy.
+
+    UpstreamPortOverride:
+      type: object
+      properties:
+        connect_timeout_ms:
+          type: [integer, "null"]
+          format: uint64
+        algorithm:
+          oneOf:
+            - $ref: "#/components/schemas/LoadBalancerAlgorithm"
+            - type: "null"
+        hash_on:
+          type: [string, "null"]
+        passive_health_check:
+          oneOf:
+            - $ref: "#/components/schemas/PassiveHealthCheck"
+            - type: "null"
+        locality_lb_setting:
+          oneOf:
+            - $ref: "#/components/schemas/UpstreamLocalityLbSetting"
+            - type: "null"
+        max_connections:
+          type: [integer, "null"]
+          format: uint32
+        tcp_keepalive:
+          oneOf:
+            - $ref: "#/components/schemas/TcpKeepaliveCfg"
+            - type: "null"
+        http_max_requests_per_connection:
+          type: [integer, "null"]
+          format: uint32
+          deprecated: true
+          description: Legacy mesh carrier; not applied by runtime dispatch.
+        http_idle_timeout_ms:
+          type: [integer, "null"]
+          format: uint64
+        h2_max_concurrent_streams:
+          type: [integer, "null"]
+          format: uint32
+        tls:
+          oneOf:
+            - $ref: "#/components/schemas/BackendTlsConfig"
+            - type: "null"
+        h2_upgrade_policy:
+          oneOf:
+            - $ref: "#/components/schemas/H2UpgradePolicy"
+            - type: "null"
+        max_retries:
+          type: [integer, "null"]
+          format: uint32
+        http1_max_pending_requests:
+          type: [integer, "null"]
+          format: uint32
 
     LoadBalancerAlgorithm:
       type: string
@@ -8083,7 +8281,7 @@ components:
       type: object
       properties:
         http_path:
-          type: [string, "null"]
+          type: string
           default: /health
           description: HTTP path to probe
         interval_seconds:
@@ -8203,8 +8401,9 @@ components:
           enum: [dns_sd, kubernetes, consul, mesh]
           description: Service discovery provider type
         dns_sd:
-          type: object
+          type: [object, "null"]
           description: DNS-SD (SRV record) configuration. Required when provider is `dns_sd`.
+          required: [service_name]
           properties:
             service_name:
               type: string
@@ -8215,8 +8414,9 @@ components:
               default: 30
               description: Re-query interval in seconds
         kubernetes:
-          type: object
+          type: [object, "null"]
           description: Kubernetes EndpointSlice configuration. Required when provider is `kubernetes`.
+          required: [service_name]
           properties:
             service_name:
               type: string
@@ -8240,8 +8440,9 @@ components:
               format: uint64
               default: 30
         consul:
-          type: object
+          type: [object, "null"]
           description: HashiCorp Consul configuration. Required when provider is `consul`.
+          required: [address, service_name]
           properties:
             address:
               type: string
@@ -8267,8 +8468,9 @@ components:
               format: uint64
               default: 30
         mesh:
-          type: object
+          type: [object, "null"]
           description: Ferrum mesh service configuration. Required when provider is `mesh`.
+          required: [service_name]
           properties:
             service_name:
               type: string
@@ -8302,6 +8504,136 @@ components:
           format: uint32
           default: 1
           description: Default weight assigned to discovered targets
+      allOf:
+        - if:
+            properties:
+              provider:
+                const: dns_sd
+          then:
+            required: [dns_sd]
+            properties:
+              dns_sd:
+                type: object
+        - if:
+            properties:
+              provider:
+                const: kubernetes
+          then:
+            required: [kubernetes]
+            properties:
+              kubernetes:
+                type: object
+        - if:
+            properties:
+              provider:
+                const: consul
+          then:
+            required: [consul]
+            properties:
+              consul:
+                type: object
+        - if:
+            properties:
+              provider:
+                const: mesh
+          then:
+            required: [mesh]
+            properties:
+              mesh:
+                type: object
+
+    MeshEgressScopeResponse:
+      type: object
+      required: [namespace, scope, health]
+      properties:
+        namespace:
+          type: string
+        scope:
+          $ref: "#/components/schemas/MeshEgressScopeSnapshot"
+        health:
+          $ref: "#/components/schemas/MeshEgressScopeHealth"
+
+    MeshEgressScopeSnapshot:
+      type: object
+      required:
+        - sidecar_enforced
+        - dry_run
+        - sidecar_applied
+        - sidecar_admitted_services
+        - sidecar_denied_services
+        - sidecar_admitted_destination_rules
+        - sidecar_denied_destination_rules
+      properties:
+        sidecar_enforced:
+          type: boolean
+        dry_run:
+          type: boolean
+        sidecar_applied:
+          type: boolean
+        sidecar_admitted_services:
+          type: integer
+          format: uint64
+        sidecar_denied_services:
+          type: integer
+          format: uint64
+        destination_rules:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshEgressScopeResource"
+        sidecar_admitted_destination_rules:
+          type: integer
+          format: uint64
+        sidecar_denied_destination_rules:
+          type: integer
+          format: uint64
+        services:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshEgressScopeResource"
+        service_entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshEgressScopeResource"
+        known_destinations:
+          type: array
+          items:
+            type: string
+
+    MeshEgressScopeResource:
+      type: object
+      required: [namespace, name]
+      properties:
+        namespace:
+          type: string
+        name:
+          type: string
+        hosts:
+          type: array
+          items:
+            type: string
+        ports:
+          type: array
+          items:
+            type: integer
+            format: uint16
+
+    MeshEgressScopeHealth:
+      type: object
+      required: [sidecar_admitted_services, sidecar_denied_services]
+      properties:
+        sidecar_admitted_services:
+          type: integer
+          format: uint64
+        sidecar_denied_services:
+          type: integer
+          format: uint64
+
+    MeshHealthResponse:
+      type: object
+      required: [egress_scope]
+      properties:
+        egress_scope:
+          $ref: "#/components/schemas/MeshEgressScopeHealth"
 
     # ── Health response ─────────────────────────────────────────────
     HealthResponse:
@@ -8316,7 +8648,7 @@ components:
       required: [status, ready]
       properties:
         status:
-          type: [string, "null"]
+          type: string
           enum: [ok, degraded, starting, unavailable]
           description: |
             Aggregate gateway health.
@@ -8353,14 +8685,14 @@ components:
             unavailable. When `false` and read-only mode is not configured,
             `status` is forced to `degraded`.
         timestamp:
-          type: [string, "null"]
+          type: string
           format: date-time
         mode:
-          type: [string, "null"]
+          type: string
           description: Gateway operating mode
           examples:
-            - control_plane
-            - data_plane
+            - cp
+            - dp
             - file
         database:
           type: object
@@ -8370,10 +8702,10 @@ components:
           required: [status]
           properties:
             status:
-              type: [string, "null"]
+              type: string
               enum: [connected, disconnected]
             type:
-              type: [string, "null"]
+              type: string
               description: Database engine type. Present only when connected.
               examples:
                 - postgres
@@ -8420,7 +8752,7 @@ components:
             available:
               type: boolean
             loaded_at:
-              type: [string, "null"]
+              type: string
               format: date-time
               description: Present only when `available` is true
             proxy_count:
@@ -8452,6 +8784,8 @@ components:
             underlying flag remains set. A genuine connectivity failure is
             reported via `admin_writes_enabled`/`status` instead and does not set
             this flag.
+        mesh:
+          $ref: "#/components/schemas/MeshHealthResponse"
         listener_failures:
           $ref: "#/components/schemas/ServingListenerFailureSnapshot"
 
@@ -8510,9 +8844,44 @@ components:
           type: string
           enum: [normal, pressure, critical]
 
+    NodeWaypointDropSnapshot:
+      type: object
+      required:
+        - cookie_unavailable
+        - unknown_cookie
+        - missing_pod_uid
+        - missing_workload_hash
+        - unknown_pod
+        - hash_mismatch
+      properties:
+        cookie_unavailable:
+          type: integer
+          format: uint64
+          description: Connections dropped because the socket cookie was unavailable.
+        unknown_cookie:
+          type: integer
+          format: uint64
+          description: Connections dropped because the socket cookie was not enrolled.
+        missing_pod_uid:
+          type: integer
+          format: uint64
+          description: Connections dropped because the cookie record had no pod UID.
+        missing_workload_hash:
+          type: integer
+          format: uint64
+          description: Connections dropped because the cookie record had no workload identity hash.
+        unknown_pod:
+          type: integer
+          format: uint64
+          description: Connections dropped because the pod UID was absent from the identity index.
+        hash_mismatch:
+          type: integer
+          format: uint64
+          description: Connections dropped because the cookie and workload identity hashes differed.
+
     OverloadSnapshot:
       type: object
-      required: [level, draining, active_connections, active_requests, red_drop_probability_pct, port_exhaustion_events, pressure, actions]
+      required: [level, draining, active_connections, active_requests, red_drop_probability_pct, port_exhaustion_events, node_waypoint_drops, pressure, actions, stream_listeners]
       properties:
         level:
           type: string
@@ -8537,6 +8906,8 @@ components:
           type: integer
           format: uint64
           description: Monotonic count of EADDRNOTAVAIL errors (ephemeral port exhaustion). Alert when this value increases.
+        node_waypoint_drops:
+          $ref: "#/components/schemas/NodeWaypointDropSnapshot"
         pressure:
           type: object
           required: [file_descriptors, connections, requests, event_loop_latency_us]
@@ -8693,7 +9064,7 @@ components:
           format: uint64
         mode:
           type: string
-          enum: [database, file, cp, dp, mesh, injector, migrate]
+          enum: [database, file, cp, dp, mesh, node_agent, injector, migrate]
         ferrum_version:
           type: string
         system:
@@ -9079,9 +9450,8 @@ components:
             (requests_per_second, status_codes_per_second). Configured via
             FERRUM_STATUS_METRICS_WINDOW_SECONDS (default 30).
         config_last_updated_at:
-          type: string
+          type: [string, "null"]
           format: date-time
-          nullable: true
           description: RFC 3339 timestamp of the last successful config load/reload
         config_source_status:
           type: string
@@ -11343,6 +11713,59 @@ components:
             policy remains evaluable, and audit-only scoped policy does not
             force suppression. Auto-set by mesh injection on `NodeWaypoint`
             topology where one listener serves many pods.
+        ambient_udp_source_scoping:
+          type: boolean
+          default: false
+          readOnly: true
+          description: >-
+            Enables node-waypoint Ambient UDP source-policy scoping. Injected
+            by mesh runtime configuration rather than operator-managed plugin
+            config.
+        cluster_domain:
+          type: string
+          default: cluster.local
+          readOnly: true
+          description: Primary Kubernetes cluster domain injected by mesh mode.
+        cluster_domains:
+          type: array
+          readOnly: true
+          items:
+            type: string
+          description: >-
+            Deduplicated cluster-domain aliases used for node-waypoint service
+            host matching; injected by mesh mode.
+        node_waypoint_route_upstreams:
+          type: array
+          readOnly: true
+          description: >-
+            Mesh-generated route upstream metadata used to precompute
+            destination policy scopes for node-waypoint dispatch.
+          items:
+            type: object
+            required: [id, namespace]
+            properties:
+              id:
+                type: string
+              namespace:
+                type: string
+              targets:
+                type: array
+                items:
+                  type: object
+                  required: [host, port]
+                  properties:
+                    host:
+                      type: string
+                    port:
+                      type: integer
+                      format: uint16
+                    service_namespace:
+                      type: [string, "null"]
+                    service_name:
+                      type: [string, "null"]
+                    service_port:
+                      type: [integer, "null"]
+                      format: uint16
         trusted_hbone_assertors:
           type: array
           items:
@@ -12697,6 +13120,16 @@ components:
             the gateway invariant that `ctx.headers` carries the original
             inbound headers during `before_proxy`). Auto-emitted by the
             Istio VirtualService translator.
+        runtime_overlay_scope:
+          type: string
+          minLength: 1
+          description: Optional RTDS boolean key controlling whether the transformer runs.
+        default_enabled:
+          type: boolean
+          default: true
+          description: >-
+            Fallback when `runtime_overlay_scope` is configured but the RTDS
+            overlay has no boolean value for that key.
 
     ResponseTransformerConfig:
       type: object
@@ -12747,6 +13180,16 @@ components:
             response headers. Auto-emitted by the Istio VirtualService
             translator on routes carrying `headers.response.{set,add,remove}`
             that have no operator-configured `response_transformer`.
+        runtime_overlay_scope:
+          type: string
+          minLength: 1
+          description: Optional RTDS boolean key controlling whether the transformer runs.
+        default_enabled:
+          type: boolean
+          default: true
+          description: >-
+            Fallback when `runtime_overlay_scope` is configured but the RTDS
+            overlay has no boolean value for that key.
 
     SecurityHeadersConfig:
       type: object
@@ -13633,6 +14076,15 @@ components:
           type: boolean
           default: false
           description: Reject messages containing field numbers not in the descriptor
+        grpc_max_decompressed_size_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 10485760
+          description: >-
+            Maximum decompressed protobuf payload size accepted from a gRPC
+            frame. Defaults to `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`, or 10 MiB
+            when that setting is absent.
 
     OpenapiValidatorConfig:
       type: object
@@ -13981,6 +14433,14 @@ components:
           default: 30000
           minimum: 1
           description: "Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll)"
+        max_response_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 1048576
+          description: >-
+            Maximum synthetic response bytes consumed per request. Larger
+            responses are truncated to bound each worker's memory use.
         gateway_port:
           type: integer
           format: uint16
@@ -14040,6 +14500,15 @@ components:
           type: boolean
           default: true
           description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy."
+        max_in_flight:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 256
+          description: >-
+            Maximum mirror tasks allowed concurrently. Requests that arrive
+            while every permit is in use are still served normally but are not
+            mirrored.
         max_response_body_bytes:
           type: integer
           format: uint64
@@ -14074,7 +14543,9 @@ components:
             terminate: invoke and return response to client (HTTP only).
         function_url:
           type: string
-          description: "HTTPS trigger URL. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda (URL is derived from region + function name)."
+          format: uri
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://"
+          description: "HTTP(S) trigger URL. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda (URL is derived from region + function name)."
         aws_region:
           type: string
           description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars."
@@ -14093,6 +14564,13 @@ components:
         aws_qualifier:
           type: string
           description: "Optional version/alias qualifier (e.g., $LATEST, prod)."
+        aws_endpoint_url:
+          type: string
+          format: uri
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://"
+          description: >-
+            Optional HTTP(S) Lambda endpoint override for LocalStack or a
+            VPC-internal endpoint. Falls back to `AWS_LAMBDA_ENDPOINT_URL`.
         azure_function_key:
           type: string
           description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var."
@@ -14136,6 +14614,17 @@ components:
           maximum: 599
           default: 502
           description: "HTTP status when rejecting on error. Must be in range 100-599."
+      allOf:
+        - if:
+            required: [provider]
+            properties:
+              provider:
+                enum: [azure_functions, gcp_cloud_functions]
+          then:
+            required: [function_url]
+            properties:
+              function_url:
+                type: string
 
     ResponseCachingConfig:
       type: object
@@ -16888,14 +17377,12 @@ components:
               type: boolean
               description: True when connected to the primary CP, false for a fallback CP
             connected_since:
-              type: string
+              type: [string, "null"]
               format: date-time
-              nullable: true
               description: When the current connection was established (null if offline)
             last_config_received_at:
-              type: string
+              type: [string, "null"]
               format: date-time
-              nullable: true
               description: When the last config update was received (null if none yet)
 
     ClusterStatusOther:
@@ -16975,8 +17462,7 @@ components:
             (`mark_h2_tls_unsupported`, `mark_h3_unsupported`,
             `mark_hbone_unsupported`).
         last_probe_error:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: |
             Human-readable error from the most recent probe or live
             downgrade. `null` when the latest update classified the

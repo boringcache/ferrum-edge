@@ -934,10 +934,22 @@ fn build_overload_snapshot(proxy_state: Option<&crate::proxy::ProxyState>) -> Va
                 "unknown_pod": 0,
                 "hash_mismatch": 0
             },
+            "pressure": {
+                "file_descriptors": {"current": 0, "max": 0, "ratio": 0.0},
+                "connections": {"current": 0, "max": 0, "ratio": 0.0},
+                "requests": {"current": 0, "max": 0, "ratio": 0.0},
+                "event_loop_latency_us": 0
+            },
             "actions": {
                 "disable_keepalive": false,
                 "reject_new_connections": false,
                 "reject_new_requests": false
+            },
+            "stream_listeners": {
+                "dtls_demux_sessions_total": 0,
+                "dtls_demux_sessions": [],
+                "bind_failures_total": 0,
+                "bind_failures": []
             }
         })
     }

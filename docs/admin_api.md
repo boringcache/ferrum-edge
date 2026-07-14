@@ -74,10 +74,19 @@ curl http://localhost:9000/health
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
 # Returns: {"status","timestamp","mode","database":{...},"admin_writes_enabled",
 #           "ready","cached_config":{"proxy_count":...},"database_polling":{...},
-#           "config_rejected":true,"listener_failures":{"failures_total":...}, ...}
+#           "config_rejected":true,"mesh":{"egress_scope":{...}},
+#           "listener_failures":{"failures_total":...}, ...}
 ```
 
 Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. The detailed diagnostics (DB type/pool stats, cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures) require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config.
+
+In mesh mode, authenticated health detail includes
+`mesh.egress_scope.sidecar_admitted_services` and
+`mesh.egress_scope.sidecar_denied_services`. The authenticated `/overload`
+snapshot also includes `node_waypoint_drops`, with monotonic counters for
+missing/unknown socket-cookie metadata, missing pod/workload identity data,
+unknown pods, and workload-hash mismatches. These fields are omitted from the
+coarse unauthenticated responses.
 
 In database **and control-plane** mode, if a **full** config load is rejected by the runtime-config validation contract (a reachable backend served a semantically-invalid snapshot — e.g. a partial/direct-DB write) the gateway keeps serving the last known-good config **and keeps the admin API writable**: `db_available` stays true because admin writes are the in-band repair path for the offending resource. Re-enabling writes is gated on any deferred schema migration applying first, so a reachable backend whose schema is still pending keeps writes blocked while `config_rejected` stays set. The rejection also skips failover (the same invalid snapshot lives on every replica). The authenticated `/health` detail then carries `config_rejected: true` and `status: "degraded"` (the boolean detail is authenticated-only; the coarse `degraded` status is also visible unauthenticated). The flag is sticky and clears only after an accepted authoritative **full** reload (an accepted incremental poll does not clear it). While the backend is later unreachable (`admin_writes_enabled` false) the `config_rejected` detail is suppressed so it never advertises the writable repair path during an outage, even though the underlying flag remains set. A genuine connectivity failure is unaffected and still flips `admin_writes_enabled` to false.
 

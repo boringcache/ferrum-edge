@@ -369,3 +369,425 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         "custom plugins should keep generic PluginConfig config shape"
     );
 }
+
+#[tokio::test]
+async fn runtime_valid_builtin_plugin_fixtures_match_their_openapi_schemas() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let mapping = plugin_config_schema_mapping(&spec);
+    let mut exercised = 0usize;
+
+    for (plugin_name, schema_ref) in mapping {
+        let config = super::plugins::minimal_plugin_config(&plugin_name);
+        let Ok(Some(_plugin)) = ferrum_edge::plugins::create_plugin(&plugin_name, &config) else {
+            continue;
+        };
+        let component = schema_ref
+            .strip_prefix("#/components/schemas/")
+            .unwrap_or_else(|| panic!("PluginConfig ref for {plugin_name} is not local"));
+        assert_component_validity(&spec, component, &config, true);
+        exercised += 1;
+    }
+
+    assert!(
+        exercised >= 50,
+        "expected broad plugin-schema coverage, exercised only {exercised} built-ins"
+    );
+}
+
+#[tokio::test]
+async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let mapping = plugin_config_schema_mapping(&spec);
+    let fixtures = [
+        (
+            "body_validator",
+            json!({"grpc_max_decompressed_size_bytes": 0}),
+        ),
+        (
+            "load_testing",
+            json!({
+                "key": "test-key",
+                "concurrent_clients": 1,
+                "duration_seconds": 1,
+                "max_response_body_bytes": 1024
+            }),
+        ),
+        (
+            "request_mirror",
+            json!({"mirror_host": "mirror.example", "max_in_flight": 8}),
+        ),
+        (
+            "request_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "x-audit",
+                    "value": "enabled"
+                }],
+                "runtime_overlay_scope": "ferrum.transform.request",
+                "default_enabled": false
+            }),
+        ),
+        (
+            "response_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "x-audit",
+                    "value": "enabled"
+                }],
+                "runtime_overlay_scope": "ferrum.transform.response",
+                "default_enabled": false
+            }),
+        ),
+        (
+            "serverless_function",
+            json!({
+                "provider": "aws_lambda",
+                "aws_region": "us-east-1",
+                "aws_access_key_id": "test-access-key",
+                "aws_secret_access_key": "test-secret-key",
+                "aws_function_name": "test-function",
+                "aws_endpoint_url": "http://127.0.0.1:4566"
+            }),
+        ),
+        (
+            "mesh_authz",
+            json!({
+                "mesh_policies": [],
+                "per_pod_policy_scoping": true,
+                "ambient_udp_source_scoping": true,
+                "cluster_domain": "cluster.local",
+                "cluster_domains": ["cluster.local", "cluster.internal"],
+                "node_waypoint_route_upstreams": [{
+                    "id": "istio-vs-upstream-reviews",
+                    "namespace": "ferrum",
+                    "targets": [{
+                        "host": "10.0.0.10",
+                        "port": 8080,
+                        "service_namespace": "ferrum",
+                        "service_name": "reviews",
+                        "service_port": 80
+                    }]
+                }]
+            }),
+        ),
+    ];
+
+    for (plugin_name, optional_fields) in fixtures {
+        let mut config = super::plugins::minimal_plugin_config(plugin_name);
+        let config_object = config
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("minimal {plugin_name} config is not an object"));
+        config_object.extend(
+            optional_fields
+                .as_object()
+                .unwrap_or_else(|| panic!("optional {plugin_name} fields are not an object"))
+                .clone(),
+        );
+        let created = ferrum_edge::plugins::create_plugin(plugin_name, &config)
+            .unwrap_or_else(|error| panic!("runtime rejected {plugin_name} fixture: {error}"));
+        assert!(created.is_some(), "missing built-in plugin {plugin_name}");
+        let schema_ref = mapping
+            .get(plugin_name)
+            .unwrap_or_else(|| panic!("missing OpenAPI mapping for {plugin_name}"));
+        let component = schema_ref
+            .strip_prefix("#/components/schemas/")
+            .unwrap_or_else(|| panic!("PluginConfig ref for {plugin_name} is not local"));
+        assert_component_validity(&spec, component, &config, true);
+    }
+
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({"provider": "azure_functions"}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({"provider": "gcp_cloud_functions", "function_url": "ftp://functions.example"}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "aws_lambda",
+            "aws_endpoint_url": "ftp://lambda.example"
+        }),
+        false,
+    );
+}
+
+fn assert_component_validity(
+    spec: &serde_json::Value,
+    component: &str,
+    instance: &serde_json::Value,
+    expected_valid: bool,
+) {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": format!("#/components/schemas/{component}"),
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .unwrap_or_else(|error| panic!("{component} schema compiles: {error}"));
+    let actual_valid = validator.validate(instance).is_ok();
+    assert_eq!(
+        actual_valid, expected_valid,
+        "unexpected {component} validation result for {instance}"
+    );
+}
+
+#[test]
+fn upstream_runtime_serialization_is_covered_by_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let upstream: ferrum_edge::config::types::Upstream = serde_json::from_value(json!({
+        "targets": [{
+            "host": "backend.example",
+            "port": 8443,
+            "weight": 2,
+            "tags": {"version": "v1"},
+            "locality": "us-east/us-east-1/a",
+            "path": "/api"
+        }],
+        "service_discovery": {
+            "provider": "dns_sd",
+            "dns_sd": {"service_name": "_https._tcp.backend.example"}
+        },
+        "subsets": [{
+            "name": "v1",
+            "labels": {"version": "v1"},
+            "traffic_policy": {
+                "load_balancer_algorithm": "consistent_hashing",
+                "hash_on": "header:x-tenant",
+                "tls": {
+                    "mode": "simple",
+                    "sni": "backend.example",
+                    "subject_alt_names": ["backend.example"]
+                },
+                "connect_timeout_ms": 750,
+                "passive_health_check": {}
+            }
+        }],
+        "port_overrides": {
+            "8443": {
+                "connect_timeout_ms": 500,
+                "algorithm": "least_connections",
+                "hash_on": "ip",
+                "passive_health_check": {},
+                "locality_lb_setting": {
+                    "enabled": true,
+                    "distribute": [{
+                        "from": "us-east/us-east-1/a",
+                        "to": {"us-east": 90, "us-west": 10}
+                    }]
+                },
+                "max_connections": 100,
+                "tcp_keepalive": {"time_seconds": 30, "interval_seconds": 10, "probes": 3},
+                "http_max_requests_per_connection": 1000,
+                "http_idle_timeout_ms": 30000,
+                "h2_max_concurrent_streams": 128,
+                "tls": {},
+                "h2_upgrade_policy": "UPGRADE",
+                "max_retries": 2,
+                "http1_max_pending_requests": 64
+            }
+        },
+        "source_locality": "us-east/us-east-1/a",
+        "locality_lb_strict": true,
+        "locality_lb_setting": {
+            "enabled": true,
+            "failover": [{"from": "us-east", "to": "us-west"}]
+        }
+    }))
+    .expect("representative upstream deserializes");
+    let serialized = serde_json::to_value(upstream).expect("upstream serializes");
+
+    assert_component_validity(&spec, "Upstream", &serialized, true);
+}
+
+#[test]
+fn config_schemas_reject_nulls_that_rust_does_not_accept() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for (component, instance) in [
+        (
+            "Proxy",
+            json!({"id": null, "backend_host": "backend", "backend_port": 443}),
+        ),
+        ("Consumer", json!({"username": null})),
+        (
+            "PluginConfig",
+            json!({"plugin_name": null, "scope": "global", "enabled": true}),
+        ),
+        ("PluginAssociation", json!({"plugin_config_id": null})),
+        ("UpstreamTarget", json!({"host": null, "port": 443})),
+        ("ActiveHealthCheck", json!({"http_path": null})),
+    ] {
+        assert_component_validity(&spec, component, &instance, false);
+    }
+
+    assert_component_validity(
+        &spec,
+        "Proxy",
+        &json!({"id": "", "backend_host": "", "backend_port": 0}),
+        true,
+    );
+}
+
+#[test]
+fn service_discovery_schema_matches_provider_validation_and_serialization() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    assert_component_validity(
+        &spec,
+        "ServiceDiscoveryConfig",
+        &json!({
+            "provider": "dns_sd",
+            "dns_sd": {"service_name": "_http._tcp.backend.example"},
+            "kubernetes": null,
+            "consul": null,
+            "mesh": null,
+            "default_weight": 1
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "ServiceDiscoveryConfig",
+        &json!({"provider": "dns_sd", "dns_sd": null}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServiceDiscoveryConfig",
+        &json!({"provider": "consul", "consul": {"address": "http://consul:8500"}}),
+        false,
+    );
+}
+
+#[test]
+fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
+    use ferrum_edge::modes::mesh::runtime::MeshEgressScopeHealth;
+    use ferrum_edge::modes::mesh::slice::{MeshEgressScopeResource, MeshEgressScopeSnapshot};
+    use ferrum_edge::overload::{
+        ActionSnapshot, ConnPressure, FdPressure, NodeWaypointDropSnapshot, OverloadLevel,
+        OverloadSnapshot, PressureSnapshot, ReqPressure,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let resource = MeshEgressScopeResource {
+        namespace: "ferrum".to_string(),
+        name: "reviews".to_string(),
+        hosts: vec!["reviews.ferrum.svc.cluster.local".to_string()],
+        ports: vec![8080],
+    };
+    let scope = MeshEgressScopeSnapshot {
+        sidecar_enforced: true,
+        dry_run: false,
+        sidecar_applied: true,
+        sidecar_admitted_services: 1,
+        sidecar_denied_services: 0,
+        destination_rules: vec![resource.clone()],
+        sidecar_admitted_destination_rules: 1,
+        sidecar_denied_destination_rules: 0,
+        services: vec![resource],
+        service_entries: Vec::new(),
+        known_destinations: vec!["reviews.ferrum.svc.cluster.local:8080".to_string()],
+    };
+    let health = MeshEgressScopeHealth {
+        sidecar_admitted_services: 1,
+        sidecar_denied_services: 0,
+    };
+    let egress_response = json!({
+        "namespace": "ferrum",
+        "scope": scope,
+        "health": health
+    });
+    assert_component_validity(&spec, "MeshEgressScopeResponse", &egress_response, true);
+    assert_component_validity(
+        &spec,
+        "HealthResponse",
+        &json!({
+            "status": "ok",
+            "ready": true,
+            "mesh": {"egress_scope": health}
+        }),
+        true,
+    );
+
+    let mut overload = serde_json::to_value(OverloadSnapshot {
+        level: OverloadLevel::Normal,
+        draining: false,
+        active_connections: 2,
+        active_requests: 1,
+        red_drop_probability_pct: 0.0,
+        port_exhaustion_events: 0,
+        node_waypoint_drops: NodeWaypointDropSnapshot {
+            cookie_unavailable: 1,
+            unknown_cookie: 2,
+            missing_pod_uid: 3,
+            missing_workload_hash: 4,
+            unknown_pod: 5,
+            hash_mismatch: 6,
+        },
+        pressure: PressureSnapshot {
+            file_descriptors: FdPressure {
+                current: 10,
+                max: 100,
+                ratio: 0.1,
+            },
+            connections: ConnPressure {
+                current: 2,
+                max: 100,
+                ratio: 0.02,
+            },
+            requests: ReqPressure {
+                current: 1,
+                max: 100,
+                ratio: 0.01,
+            },
+            event_loop_latency_us: 50,
+        },
+        actions: ActionSnapshot {
+            disable_keepalive: false,
+            reject_new_connections: false,
+            reject_new_requests: false,
+        },
+    })
+    .expect("overload snapshot serializes");
+    overload
+        .as_object_mut()
+        .expect("overload snapshot is an object")
+        .insert(
+            "stream_listeners".to_string(),
+            json!({
+                "dtls_demux_sessions_total": 0,
+                "dtls_demux_sessions": [],
+                "bind_failures_total": 0,
+                "bind_failures": []
+            }),
+        );
+    assert_component_validity(&spec, "OverloadSnapshot", &overload, true);
+}
+
+#[test]
+fn no_proxy_runtime_metrics_snapshot_is_covered_by_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let snapshot = ferrum_edge::runtime_metrics::build_snapshot("node_agent", None);
+    let serialized = serde_json::to_value(snapshot).expect("runtime metrics snapshot serializes");
+
+    assert_component_validity(&spec, "RuntimeMetricsSnapshot", &serialized, true);
+}

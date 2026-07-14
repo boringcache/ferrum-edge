@@ -5678,7 +5678,8 @@ impl Upstream {
 
         // NOTE: rejection of mesh-PROJECTED fields that an operator must not set
         // directly (`port_overrides`, `source_locality`, `locality_lb_strict`,
-        // `locality_lb_setting`) lives in
+        // `locality_lb_setting`, and the mesh-only fields nested under
+        // `subsets[].traffic_policy`) lives in
         // [`Upstream::validate_operator_provided_fields`], NOT here. The rejection
         // belongs on every OPERATOR-PROVIDED load (admin write/admission AND the
         // file-mode loader, via [`GatewayConfig::validate_operator_provided_fields`])
@@ -5956,15 +5957,18 @@ impl Upstream {
 
     /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
     ///
-    /// `port_overrides`, `source_locality`, `locality_lb_strict`, and
-    /// `locality_lb_setting` are all populated by the mesh slice-apply layer (from
-    /// DestinationRules / the workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`),
-    /// NOT by operators. None of them are persisted by the SQL / MongoDB schemas,
-    /// so a direct admin POST/PUT — or an operator-authored YAML/JSON file in file
-    /// mode — would "succeed" and then silently vanish on the next reload. Worse, a
-    /// file-mode operator slipping in `locality_lb_strict` / `locality_lb_setting`
-    /// could enable strict-locality or DR-derived policy that the mesh layer is
-    /// meant to own. The canonical surface for each is named in its message.
+    /// `port_overrides`, `source_locality`, `locality_lb_strict`,
+    /// `locality_lb_setting`, and the `tls`, `connect_timeout_ms`, and
+    /// `passive_health_check` fields nested under `subsets[].traffic_policy` are
+    /// all populated by the mesh slice-apply layer (from DestinationRules / the
+    /// workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`), NOT by operators.
+    /// The top-level projected fields are not persisted by the SQL / MongoDB
+    /// schemas. The nested fields can round-trip inside the persisted `subsets`
+    /// JSON, but their effective runtime overlays are built only while applying a
+    /// mesh DestinationRule; accepting them from an admin/file config would
+    /// therefore advertise policy that is not applied. A file-mode operator
+    /// slipping in these fields could also briefly enable mesh-owned policy before
+    /// a reload. The canonical surface for each is named in its message.
     ///
     /// This applies to **every operator-PROVIDED config load** — the admin write /
     /// admission path AND the file-mode loader — and is deliberately SEPARATE from
@@ -6013,6 +6017,38 @@ impl Upstream {
                  weighted distribute and failover via a DestinationRule"
                     .to_string(),
             );
+        }
+
+        if let Some(subsets) = self.subsets.as_ref() {
+            for (index, subset) in subsets.iter().enumerate() {
+                let Some(policy) = subset.traffic_policy.as_ref() else {
+                    continue;
+                };
+                let field_prefix =
+                    format!("subsets[{index}].traffic_policy (subset '{}')", subset.name);
+
+                if policy.tls.is_some() {
+                    errors.push(format!(
+                        "{field_prefix}.tls is projected from a mesh DestinationRule and cannot \
+                         be set directly via the admin API — express subset TLS policy as a \
+                         DestinationRule"
+                    ));
+                }
+                if policy.connect_timeout_ms.is_some() {
+                    errors.push(format!(
+                        "{field_prefix}.connect_timeout_ms is projected from a mesh \
+                         DestinationRule and cannot be set directly via the admin API — express \
+                         subset connection-pool policy as a DestinationRule"
+                    ));
+                }
+                if policy.passive_health_check.is_some() {
+                    errors.push(format!(
+                        "{field_prefix}.passive_health_check is projected from a mesh \
+                         DestinationRule and cannot be set directly via the admin API — express \
+                         subset outlier-detection policy as a DestinationRule"
+                    ));
+                }
+            }
         }
 
         if errors.is_empty() {
@@ -6804,9 +6840,11 @@ impl GatewayConfig {
     /// Reject mesh-PROJECTED upstream fields on operator-PROVIDED config loads.
     ///
     /// `Upstream.{port_overrides, source_locality, locality_lb_strict,
-    /// locality_lb_setting}` are owned by the mesh slice-apply layer (Destination
-    /// rules / workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`); an operator
-    /// must never set them directly. This is the config-wide wrapper over
+    /// locality_lb_setting}` and mesh-only fields under
+    /// `Upstream.subsets[].traffic_policy` are owned by the mesh slice-apply layer
+    /// (Destination rules / workload locality /
+    /// `FERRUM_MESH_LOCALITY_LB_STRICT`); an operator must never set them directly.
+    /// This is the config-wide wrapper over
     /// [`Upstream::validate_operator_provided_fields`] that the **file-mode loader**
     /// runs so an operator-authored YAML/JSON upstream cannot smuggle in strict
     /// locality / DR-derived policy (none of these fields are persisted, so they
