@@ -2,17 +2,35 @@
 
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{
-    HTTP_FAMILY_PROTOCOLS, Plugin, RequestContext, basic_auth::BasicAuth, priority,
+    HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, basic_auth::BasicAuth, priority,
 };
 use hmac::{KeyInit, Mac};
 use serde_json::json;
 
-use super::plugin_utils::{assert_continue, assert_reject};
+use super::plugin_utils::assert_continue;
 
 /// A fixed test secret used for all basic_auth tests.
 /// Tests set `FERRUM_BASIC_AUTH_HMAC_SECRET` to this value before constructing
 /// the plugin.
 const TEST_HMAC_SECRET: &str = "test-hmac-secret-for-basic-auth-unit-tests";
+const BASIC_CHALLENGE: &str = r#"Basic realm="ferrum-edge", charset="UTF-8""#;
+
+fn assert_basic_reject(result: PluginResult) {
+    match result {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 401);
+            assert_eq!(
+                headers.get("WWW-Authenticate").map(String::as_str),
+                Some(BASIC_CHALLENGE)
+            );
+        }
+        other => panic!("expected Basic-auth rejection, got {other:?}"),
+    }
+}
 
 /// Set the test HMAC secret in the environment. Required before constructing
 /// `BasicAuth` because the plugin rejects missing secrets.
@@ -121,6 +139,7 @@ fn test_basic_auth_plugin_contract() {
     assert_eq!(plugin.priority(), 1300);
     assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
     assert!(plugin.is_auth_plugin());
+    assert_eq!(plugin.authentication_challenge(), Some(BASIC_CHALLENGE));
     assert!(!plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
     assert!(!plugin.requires_request_body_before_before_proxy());
@@ -186,7 +205,7 @@ async fn test_basic_auth_wrong_password() {
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_basic_reject(result);
 }
 
 #[tokio::test]
@@ -204,7 +223,7 @@ async fn test_basic_auth_wrong_username() {
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_basic_reject(result);
 }
 
 #[tokio::test]
@@ -230,7 +249,8 @@ async fn test_basic_auth_invalid_scheme() {
         .insert("authorization".to_string(), "Bearer some-token".to_string());
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_none());
 }
 
 #[tokio::test]
@@ -246,7 +266,23 @@ async fn test_basic_auth_invalid_base64() {
     );
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_basic_reject(result);
+}
+
+#[tokio::test]
+async fn test_basic_auth_invalid_utf8_uses_basic_challenge() {
+    use base64::Engine;
+
+    set_test_hmac_secret();
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
+    let encoded = base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe]);
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Basic {encoded}"));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_basic_reject(result);
 }
 
 #[tokio::test]
@@ -262,7 +298,7 @@ async fn test_basic_auth_missing_colon_separator() {
         .insert("authorization".to_string(), format!("Basic {}", encoded));
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_basic_reject(result);
 }
 
 #[tokio::test]
@@ -316,7 +352,7 @@ async fn test_basic_auth_empty_consumers() {
     );
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_basic_reject(result);
 }
 
 #[tokio::test]
@@ -335,7 +371,7 @@ async fn test_basic_auth_password_with_colon() {
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_basic_reject(result);
 }
 
 #[tokio::test]
@@ -372,7 +408,7 @@ async fn test_basic_auth_rejects_non_hmac_hash() {
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_basic_reject(result);
 }
 
 #[tokio::test]
@@ -403,7 +439,7 @@ async fn test_basic_auth_hmac_sha256_password_hash() {
     );
 
     let result = plugin.authenticate(&mut wrong_ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_basic_reject(result);
 }
 
 #[tokio::test]
@@ -421,7 +457,7 @@ async fn test_basic_auth_malformed_hmac_hash_is_rejected() {
     );
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_basic_reject(result);
 }
 
 // ---- Multi-credential rotation tests ----
@@ -508,5 +544,5 @@ async fn test_basic_auth_multi_password_wrong_password_rejected() {
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_basic_reject(result);
 }

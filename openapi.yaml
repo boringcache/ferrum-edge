@@ -6476,9 +6476,14 @@ components:
 
     BasicAuthCredential:
       type: object
+      additionalProperties: false
+      oneOf:
+        - required: [password]
+        - required: [password_hash]
       properties:
         password:
           type: string
+          minLength: 1
           writeOnly: true
           description: >-
             Plaintext password (automatically hashed on write using HMAC-SHA256
@@ -6486,9 +6491,11 @@ components:
             exclusive with `password_hash`.
         password_hash:
           type: string
+          pattern: "^hmac_sha256:[0-9a-f]{64}$"
+          writeOnly: true
           description: >-
-            Pre-hashed password in `hmac_sha256:<hex>` format (constant-time,
-            ~1μs). On read, this field is always returned instead of `password`.
+            Pre-hashed password in `hmac_sha256:<64 lowercase hex>` format
+            (constant-time, ~1μs). Credential values are redacted on read.
       description: >-
         Basic auth credential for the `basic_auth` plugin. Supply either
         `password` (auto-hashed) or `password_hash` (pre-hashed). Indexed by

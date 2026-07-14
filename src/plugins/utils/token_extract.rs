@@ -58,20 +58,21 @@ pub enum TokenLocationExtract {
 pub fn extract_authorization_bearer(ctx: &RequestContext) -> ExtractedCredential {
     match ctx.headers.get("authorization") {
         None => ExtractedCredential::Missing,
-        Some(value) => match value.split_once(' ') {
-            Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => {
-                if token.is_empty() {
-                    ExtractedCredential::InvalidFormat(
-                        r#"{"error":"Empty bearer token"}"#.to_string(),
-                    )
-                } else {
-                    ExtractedCredential::BearerToken(token.to_string())
-                }
+        Some(value) => {
+            let scheme = value
+                .split(|c: char| c.is_ascii_whitespace())
+                .next()
+                .unwrap_or_default();
+            if !scheme.eq_ignore_ascii_case("bearer") {
+                return ExtractedCredential::Missing;
             }
-            _ => ExtractedCredential::InvalidFormat(
-                r#"{"error":"Missing Bearer token"}"#.to_string(),
-            ),
-        },
+            match crate::plugins::strip_auth_scheme(value, "Bearer") {
+                Some(token) => ExtractedCredential::BearerToken(token.to_string()),
+                None => ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Empty bearer token"}"#.to_string(),
+                ),
+            }
+        }
     }
 }
 

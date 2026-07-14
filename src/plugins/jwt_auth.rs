@@ -119,15 +119,21 @@ impl JwtAuth {
             TokenLookup::Header {
                 lower_name,
                 original_name,
-            } => ctx
-                .headers
-                .get(lower_name.as_str())
-                .or_else(|| ctx.headers.get(original_name.as_str()))
-                .map(|v| {
-                    strip_auth_scheme(v, "Bearer")
-                        .unwrap_or(v.as_str())
-                        .to_string()
-                }),
+            } => {
+                let value = ctx
+                    .headers
+                    .get(lower_name.as_str())
+                    .or_else(|| ctx.headers.get(original_name.as_str()))?;
+                if lower_name.eq_ignore_ascii_case("authorization") {
+                    strip_auth_scheme(value, "Bearer").map(str::to_string)
+                } else {
+                    Some(
+                        strip_auth_scheme(value, "Bearer")
+                            .unwrap_or(value.as_str())
+                            .to_string(),
+                    )
+                }
+            }
             TokenLookup::Query(param_name) => ctx.query_params.get(param_name.as_str()).cloned(),
         }
     }

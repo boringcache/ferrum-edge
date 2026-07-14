@@ -627,7 +627,7 @@ fn new_bounds_provider_count_and_requires_explicit_shared_trust_for_fanout() {
 }
 
 #[tokio::test]
-async fn authorization_scheme_is_case_insensitive_but_non_bearer_is_rejected() {
+async fn authorization_scheme_is_case_insensitive_and_non_bearer_is_skipped() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/introspect"))
@@ -655,12 +655,10 @@ async fn authorization_scheme_is_case_insensitive_but_non_bearer_is_rejected() {
         "authorization".to_string(),
         "Basic not-a-bearer-token".to_string(),
     );
-    assert_bearer_reject(
+    assert_continue(
         plugin
             .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
             .await,
-        401,
-        "invalid_request",
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }

@@ -121,7 +121,7 @@ Use `priority_override` to control the relative execution order of instances tha
 
 ## Multi-Authentication Mode
 
-When a proxy has `auth_mode: multi`, all attached authentication plugins execute sequentially. The first plugin that successfully identifies a consumer attaches that consumer's context. Subsequent auth plugins cannot overwrite it. After all auth plugins run, the Access Control plugin verifies that at least one consumer was identified.
+With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. An `Authorization` scheme belonging to another configured mechanism is skipped, while malformed credentials for the applicable scheme are rejected. With `auth_mode: multi`, authentication plugins execute sequentially until one succeeds; earlier ordinary rejections do not block a later successful mechanism. After authentication, the Access Control plugin can apply consumer or group policy.
 
 ## Consumer Identity Headers
 
@@ -1560,18 +1560,22 @@ credentials:
 
 ### `basic_auth`
 
-Authenticates using HTTP Basic credentials. Supports `hmac_sha256:<hex>` password hashes derived from `FERRUM_BASIC_AUTH_HMAC_SECRET`. A default secret is provided but **must be changed in production**.
+Authenticates using HTTP Basic credentials. Every HTTP 401 response advertises `Basic realm="ferrum-edge", charset="UTF-8"`. Password hashes use the exact `hmac_sha256:<64 lowercase hex>` form derived from `FERRUM_BASIC_AUTH_HMAC_SECRET`.
 
 **Priority:** 1300
 
-**Config**: None required.
+**Config**: The plugin object is empty. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+
+Admin API writes may supply exactly one of `password` or `password_hash`; plaintext passwords are hashed and removed before persistence. File-mode configuration must supply only `password_hash` so plaintext credentials never enter observable runtime configuration.
+
+Basic authentication normalizes password-verification work to the configured credential rotation limit to reduce username and rotation-state timing signals. Apply an authentication rate-limit policy as an additional control against online guessing.
 
 **Consumer credential** (`basicauth`) — array:
 ```yaml
 credentials:
   basicauth:
-    - password_hash: "hmac_sha256:ab3f..."
-    - password_hash: "hmac_sha256:new..."
+    - password_hash: "hmac_sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    - password_hash: "hmac_sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ```
 
 ### `hmac_auth`

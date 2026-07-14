@@ -321,6 +321,19 @@ fn test_redact_consumer_basicauth_password_hash_redacted() {
 }
 
 #[test]
+fn test_redact_consumer_basicauth_plaintext_and_unknown_fields_redacted() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!([{"password": "plaintext", "unexpected": "also-sensitive"}]),
+    );
+    let redacted = redact_consumer_credentials(&consumer);
+    let basicauth = redacted.credentials.get("basicauth").unwrap();
+    assert_eq!(basicauth[0]["password"], "[REDACTED]");
+    assert_eq!(basicauth[0]["unexpected"], "[REDACTED]");
+}
+
+#[test]
 fn test_redact_consumer_jwt_secret_redacted() {
     let mut consumer = make_consumer("c1", "alice");
     consumer.credentials.insert(

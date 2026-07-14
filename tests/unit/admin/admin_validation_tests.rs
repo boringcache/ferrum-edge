@@ -77,7 +77,20 @@ fn test_redact_basicauth_password_hash() {
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
     let basic = redacted.credentials.get("basicauth").unwrap();
     assert_eq!(basic["password_hash"], "[REDACTED]");
-    assert_eq!(basic["username"], "alice");
+    assert_eq!(basic["username"], "[REDACTED]");
+}
+
+#[test]
+fn test_redact_basicauth_plaintext_password() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "basicauth".to_string(),
+        json!({"password": "must-not-escape"}),
+    );
+    let consumer = make_consumer(credentials);
+
+    let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
+    assert_eq!(redacted.credentials["basicauth"]["password"], "[REDACTED]");
 }
 
 #[test]

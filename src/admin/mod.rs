@@ -2742,10 +2742,12 @@ fn hash_credential_if_needed(
     if cred_type == "basicauth"
         && let Err(e) = crud::hash_basic_auth_credentials(cred_value)
     {
-        return Err(Box::new(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": e}),
-        )));
+        let status = if e.starts_with("Basic-auth credential") {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err(Box::new(json_response(status, &json!({"error": e}))));
     }
     Ok(())
 }

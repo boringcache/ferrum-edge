@@ -13901,14 +13901,24 @@ pub async fn run_authentication_phase(
         }
         AuthMode::Single => {
             for auth_plugin in auth_plugins {
+                if request_is_authenticated(ctx) {
+                    return None;
+                }
                 match auth_plugin.authenticate(ctx, consumer_index).await {
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
+                        if request_is_authenticated(ctx) {
+                            return None;
+                        }
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
                             return Some((reject.status_code, reject.body, reject.headers));
                         }
                     }
-                    PluginResult::Continue => {}
+                    PluginResult::Continue => {
+                        if request_is_authenticated(ctx) {
+                            return None;
+                        }
+                    }
                 }
             }
             let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1

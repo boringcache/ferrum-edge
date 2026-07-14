@@ -270,7 +270,10 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, key_auth::KeyAuth};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, RequestContext, basic_auth::BasicAuth, jwt_auth::JwtAuth,
+    key_auth::KeyAuth,
+};
 use ferrum_edge::proxy::grpc_proxy::grpc_status;
 use ferrum_edge::proxy::run_authentication_phase;
 use hyper::StatusCode;
@@ -279,6 +282,31 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 struct ExternalIdentityAuth;
+
+const BASIC_AUTH_TEST_SECRET: &str = "test-hmac-secret-for-basic-auth-unit-tests";
+
+fn basic_auth_dispatch_consumer() -> Consumer {
+    use hmac::{KeyInit, Mac};
+
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+    let mut mac = HmacSha256::new_from_slice(BASIC_AUTH_TEST_SECRET.as_bytes()).unwrap();
+    mac.update(b"password");
+    let password_hash = format!("hmac_sha256:{}", hex::encode(mac.finalize().into_bytes()));
+
+    Consumer {
+        id: "basic-dispatch-consumer".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: "alice".to_string(),
+        custom_id: None,
+        credentials: HashMap::from([(
+            "basicauth".to_string(),
+            json!([{"password_hash": password_hash}]),
+        )]),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
 
 #[async_trait]
 impl Plugin for ExternalIdentityAuth {
@@ -495,6 +523,90 @@ async fn test_single_auth_missing_credentials_rejects_before_backend() {
     );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
+}
+
+#[tokio::test]
+async fn test_single_basic_auth_missing_credentials_uses_basic_challenge() {
+    unsafe {
+        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
+    }
+    let basic_auth: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/basic-auth".to_string(),
+    );
+
+    let result = run_authentication_phase(
+        AuthMode::Single,
+        &[basic_auth],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await;
+
+    let (status, _body, headers) = result.expect("missing Basic credentials must reject");
+    assert_eq!(status, 401);
+    assert_eq!(
+        headers.get("WWW-Authenticate").map(String::as_str),
+        Some(r#"Basic realm="ferrum-edge", charset="UTF-8""#)
+    );
+}
+
+#[tokio::test]
+async fn test_single_auth_valid_basic_skips_earlier_jwt_scheme() {
+    use base64::Engine;
+
+    unsafe {
+        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
+    }
+    let jwt: Arc<dyn Plugin> = Arc::new(JwtAuth::new(&json!({})).unwrap());
+    let basic: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let auth_plugins = vec![jwt, basic];
+    let consumer_index = ConsumerIndex::new(&[basic_auth_dispatch_consumer()]);
+    let encoded = base64::engine::general_purpose::STANDARD.encode("alice:password");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mixed-auth".to_string(),
+    );
+    ctx.headers
+        .insert("authorization".to_string(), format!("Basic {encoded}"));
+
+    let result =
+        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    assert!(result.is_none());
+    assert_eq!(
+        ctx.identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str()),
+        Some("alice")
+    );
+}
+
+#[tokio::test]
+async fn test_single_auth_stops_before_later_reject_after_success() {
+    let external: Arc<dyn Plugin> = Arc::new(ExternalIdentityAuth);
+    let rejecting: Arc<dyn Plugin> = Arc::new(RejectingAuth {
+        body: r#"{"error":"must not override success"}"#,
+    });
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mixed-auth".to_string(),
+    );
+
+    let result = run_authentication_phase(
+        AuthMode::Single,
+        &[external, rejecting],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await;
+
+    assert!(result.is_none());
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
 }
 
 #[tokio::test]

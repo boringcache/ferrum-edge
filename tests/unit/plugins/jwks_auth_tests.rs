@@ -890,7 +890,7 @@ async fn test_jwks_auth_non_bearer_scheme() {
         "Basic dXNlcjpwYXNz".to_string(),
     );
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
 }
 
 // ─── Single Provider JWKS Validation ───────────────────────────────────
