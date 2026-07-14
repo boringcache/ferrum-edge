@@ -376,11 +376,8 @@ fn mesh_route_dispatch_ignores_non_http_interleaving_when_finalizing() {
 
     let cache = PluginCache::new(&config)
         .expect("TCP-only plugins do not interleave the HTTP-family execution chain");
-    let http_names: Vec<_> = cache
-        .get_plugins_for_protocol("p1", ProxyProtocol::Http)
-        .iter()
-        .map(|plugin| plugin.name())
-        .collect();
+    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_names: Vec<_> = http_plugins.iter().map(|plugin| plugin.name()).collect();
     assert_eq!(
         http_names,
         [
@@ -390,11 +387,8 @@ fn mesh_route_dispatch_ignores_non_http_interleaving_when_finalizing() {
         ]
     );
 
-    let tcp_names: Vec<_> = cache
-        .get_plugins_for_protocol("p1", ProxyProtocol::Tcp)
-        .iter()
-        .map(|plugin| plugin.name())
-        .collect();
+    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_names: Vec<_> = tcp_plugins.iter().map(|plugin| plugin.name()).collect();
     assert_eq!(tcp_names, ["tcp_connection_throttle"]);
 }
 
