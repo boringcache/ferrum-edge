@@ -1094,7 +1094,22 @@ async fn request_extraction_paths_define_the_inspected_fields() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
 
     assert_continue(result);
-    assert!(!ctx.metadata.contains_key("ai_semantic_firewall.rule_ids"));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("no_extractable_content")
+    );
+    for key in [
+        "ai_semantic_firewall.decision",
+        "ai_semantic_firewall.action",
+        "ai_semantic_firewall.rule_ids",
+    ] {
+        assert!(
+            !ctx.metadata.contains_key(key),
+            "uninspected pass-through must not stamp {key}"
+        );
+    }
 }
 
 #[tokio::test]

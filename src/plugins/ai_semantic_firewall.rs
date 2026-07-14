@@ -1828,21 +1828,6 @@ impl FirewallEngine {
         direction: Direction,
         reason: &'static str,
     ) -> PluginResult {
-        let action = if self.fail_on_uninspectable_body {
-            match self.on_error {
-                OnErrorAction::Allow => Action::Allow,
-                OnErrorAction::Warn => Action::Warn,
-                OnErrorAction::Reject => Action::Reject,
-            }
-        } else {
-            Action::Allow
-        };
-        let decision = FirewallDecision {
-            action,
-            dry_run: self.mode == EnforcementMode::DryRun,
-            matches: Vec::new(),
-        };
-        self.write_decision_metadata(ctx, &decision, direction, None);
         let key = if self.metadata_direction_scoped {
             format!(
                 "ai_semantic_firewall.{}.uninspectable_body",
@@ -1852,6 +1837,25 @@ impl FirewallEngine {
             "ai_semantic_firewall.uninspectable_body".to_string()
         };
         ctx.metadata.insert(key, reason.to_string());
+
+        // This compatibility opt-out passes the body through without inspecting
+        // any content. Keep the diagnostic above, but do not make that path look
+        // like an evaluated allow decision in transaction metadata.
+        if !self.fail_on_uninspectable_body {
+            return PluginResult::Continue;
+        }
+
+        let action = match self.on_error {
+            OnErrorAction::Allow => Action::Allow,
+            OnErrorAction::Warn => Action::Warn,
+            OnErrorAction::Reject => Action::Reject,
+        };
+        let decision = FirewallDecision {
+            action,
+            dry_run: self.mode == EnforcementMode::DryRun,
+            matches: Vec::new(),
+        };
+        self.write_decision_metadata(ctx, &decision, direction, None);
 
         if decision.dry_run || action != Action::Reject {
             return PluginResult::Continue;
