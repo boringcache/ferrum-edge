@@ -40,7 +40,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::db_backend::DatabaseBackend;
 use crate::config::env_config::EnvConfig;
@@ -303,6 +303,122 @@ async fn handle_startup_plugin_migrations_with_list(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Shared config-validation-rejection handling for writable poll loops
+// (database + control-plane), issue #2158.
+//
+// Both the `database` and `cp` runtimes poll an authoritative primary and are
+// WRITABLE through the admin API. When a reachable backend returns a
+// semantically-invalid full snapshot, admin writes are the in-band repair tool,
+// so the poll loop must keep the admin API writable (rather than fail closed as
+// it does for a genuine connectivity outage). These helpers centralize that
+// classification so the two runtimes cannot drift.
+// ---------------------------------------------------------------------------
+
+/// Classify a poll-loop full-load failure: `true` for a config-VALIDATION
+/// rejection (reachable backend, semantically-invalid snapshot), `false` for a
+/// connectivity/driver failure. A validation rejection is downcast-discoverable
+/// through the `anyhow` source chain (see
+/// [`crate::config::validation_pipeline::ConfigValidationRejection`]).
+pub(crate) fn is_poll_validation_rejection(err: &anyhow::Error) -> bool {
+    crate::config::validation_pipeline::is_config_validation_rejection(err)
+}
+
+/// Apply the config-validation-rejection state transition once the deferred
+/// migration gate has decided whether admin writes may be re-enabled.
+///
+/// `writes_enabled` is the result of the migration gate: a validation rejection
+/// proves the backend is reachable, so writes are re-enabled — but ONLY if any
+/// deferred migrations applied cleanly, so writes never land on an unmigrated
+/// schema (issue #2158). `config_rejected` is raised regardless so the
+/// authenticated `/health` detail reports the degraded snapshot. Logs loudly
+/// only on the transition INTO the rejected state; repeats log at debug to
+/// avoid per-poll spam.
+///
+/// Kept pure (no async, no backend) so the state machine is unit-testable.
+pub(crate) fn apply_config_validation_rejection(
+    db_available: &AtomicBool,
+    config_rejected: &AtomicBool,
+    writes_enabled: bool,
+    err: &anyhow::Error,
+    context: &str,
+) {
+    db_available.store(writes_enabled, Ordering::Relaxed);
+    if !config_rejected.swap(true, Ordering::Relaxed) {
+        if writes_enabled {
+            error!(
+                "Full config load rejected by validation ({}); backend is reachable so KEEPING \
+                 admin API writable to repair the offending resource in-band, serving last \
+                 known-good runtime config: {}",
+                context, err
+            );
+        } else {
+            error!(
+                "Full config load rejected by validation ({}); backend is reachable but deferred \
+                 migrations are still pending, so admin writes stay BLOCKED until the schema is \
+                 applied; serving last known-good runtime config: {}",
+                context, err
+            );
+        }
+    } else {
+        debug!(
+            "Full config load still rejected by validation ({}); serving last known-good \
+             runtime config: {}",
+            context, err
+        );
+    }
+}
+
+/// Raise the config-rejection signal for a full load rejected by the
+/// runtime-config VALIDATION contract (issue #2158). A validation rejection is
+/// positive proof the backend is REACHABLE, so re-enable admin writes so the
+/// offending resource can be repaired in-band — but gate that on
+/// [`DatabaseBackend::maybe_apply_deferred_migrations`] first so a reachable
+/// backend with a still-pending schema never enables writes against an
+/// unmigrated schema (the common case is a cheap no-op). On migration failure
+/// admin writes stay blocked while `config_rejected` is still raised. The last
+/// known-good runtime config keeps serving (the caches were never rebuilt — the
+/// load returned `Err`).
+pub(crate) async fn record_config_validation_rejection(
+    db: &Arc<dyn DatabaseBackend>,
+    db_available: &AtomicBool,
+    config_rejected: &AtomicBool,
+    err: &anyhow::Error,
+    context: &str,
+) {
+    let writes_enabled = match db.maybe_apply_deferred_migrations().await {
+        Ok(_) => true,
+        Err(migration_err) => {
+            warn!(
+                "Deferred migrations failed while handling a reachable-backend config-validation \
+                 rejection ({}): {}. Admin writes remain blocked until the schema is applied.",
+                context, migration_err
+            );
+            false
+        }
+    };
+    apply_config_validation_rejection(db_available, config_rejected, writes_enabled, err, context);
+}
+
+/// Clear the standing config-rejection signal once a FULL config reload is
+/// accepted (issue #2158). This is the ONLY site that clears `config_rejected`:
+/// an accepted incremental/delta poll does not re-validate the whole snapshot,
+/// so it must leave the flag set until a full reload proves the offending row is
+/// gone. Logs the recovery only on the transition out of the rejected state to
+/// avoid per-poll spam.
+pub(crate) fn clear_config_rejected_after_accepted_full_reload(
+    config_rejected: &AtomicBool,
+    context: &str,
+) {
+    if config_rejected.swap(false, Ordering::Relaxed) {
+        info!(
+            "Full config snapshot accepted after a prior validation rejection ({}); \
+             config_rejected cleared",
+            context
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Inline tests for `handle_startup_plugin_migrations_with_list`.
@@ -480,5 +596,112 @@ mod tests {
 
         let pending = db.pending_plugin_migrations(&migrations).await.unwrap();
         assert!(pending.is_empty());
+    }
+
+    // --- Shared config-validation-rejection handling (issue #2158) ---------
+
+    fn validation_rejection_error() -> anyhow::Error {
+        crate::config::validation_pipeline::ConfigValidationRejection {
+            backend: "Database",
+            errors: vec!["dangling upstream reference".to_string()],
+        }
+        .into_anyhow()
+    }
+
+    #[test]
+    fn is_poll_validation_rejection_classifies_marker_and_ignores_connectivity() {
+        assert!(
+            is_poll_validation_rejection(&validation_rejection_error()),
+            "a ConfigValidationRejection must classify as a validation rejection"
+        );
+        // Context-wrapped rejections must still classify.
+        let wrapped = validation_rejection_error().context("while polling authoritative primary");
+        assert!(is_poll_validation_rejection(&wrapped));
+        // A plain connectivity error must fall through to fail-closed handling.
+        assert!(!is_poll_validation_rejection(&anyhow::anyhow!(
+            "connection refused (os error 61)"
+        )));
+    }
+
+    #[test]
+    fn apply_rejection_with_writes_enabled_keeps_admin_writable_after_prior_outage() {
+        // db_available was already false from a connectivity outage. A later
+        // load that reaches the backend but fails only validation proves
+        // reachability, so with the migration gate satisfied admin writes are
+        // re-enabled and config_rejected is raised.
+        let db_available = AtomicBool::new(false);
+        let config_rejected = AtomicBool::new(false);
+        apply_config_validation_rejection(
+            &db_available,
+            &config_rejected,
+            true,
+            &validation_rejection_error(),
+            "unit",
+        );
+        assert!(
+            db_available.load(Ordering::Relaxed),
+            "a reachable validation rejection with schema ready must re-enable writes"
+        );
+        assert!(config_rejected.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_rejection_with_pending_migrations_keeps_writes_blocked_but_flags_rejection() {
+        // Issue #2158 P3/migration gate: a reachable backend whose deferred
+        // migrations are still pending must NOT enable writes against an
+        // unmigrated schema, yet config_rejected must still be raised.
+        let db_available = AtomicBool::new(true);
+        let config_rejected = AtomicBool::new(false);
+        apply_config_validation_rejection(
+            &db_available,
+            &config_rejected,
+            false,
+            &validation_rejection_error(),
+            "unit",
+        );
+        assert!(
+            !db_available.load(Ordering::Relaxed),
+            "pending migrations must keep admin writes blocked"
+        );
+        assert!(
+            config_rejected.load(Ordering::Relaxed),
+            "config_rejected must be raised even when the migration gate blocks writes"
+        );
+    }
+
+    #[test]
+    fn clear_config_rejected_only_transitions_from_true() {
+        let flag = AtomicBool::new(true);
+        clear_config_rejected_after_accepted_full_reload(&flag, "unit");
+        assert!(!flag.load(Ordering::Relaxed));
+        // Idempotent when already clear.
+        clear_config_rejected_after_accepted_full_reload(&flag, "unit");
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn record_rejection_applies_migration_gate_against_a_real_store() {
+        // End-to-end through the migration gate on a real (already-migrated)
+        // SQLite store: maybe_apply_deferred_migrations is a cheap no-op, so a
+        // reachable-backend validation rejection re-enables writes and raises
+        // config_rejected. This exercises the async gate wiring without a mock.
+        let (db, _tmp) = fresh_store().await;
+        let db_available = AtomicBool::new(false);
+        let config_rejected = AtomicBool::new(false);
+
+        record_config_validation_rejection(
+            &db,
+            &db_available,
+            &config_rejected,
+            &validation_rejection_error(),
+            "unit poll",
+        )
+        .await;
+
+        assert!(
+            db_available.load(Ordering::Relaxed),
+            "a migrated reachable store must re-enable writes on a validation rejection"
+        );
+        assert!(config_rejected.load(Ordering::Relaxed));
     }
 }

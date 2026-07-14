@@ -114,6 +114,7 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: max_spec_mib,
         reserved_ports: std::collections::HashSet::new(),

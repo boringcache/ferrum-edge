@@ -321,6 +321,7 @@ async fn test_list_proxies_falls_back_to_cached_config() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -375,6 +376,7 @@ async fn test_list_consumers_falls_back_to_cached_config() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -424,6 +426,7 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -475,6 +478,7 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -521,6 +525,7 @@ async fn test_get_proxy_not_found_in_cache() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -565,6 +570,7 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -611,6 +617,7 @@ async fn test_get_consumer_not_found_in_cache() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -655,6 +662,7 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -702,6 +710,7 @@ async fn test_get_plugin_config_not_found_in_cache() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -746,6 +755,7 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -793,6 +803,7 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -840,6 +851,7 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -891,6 +903,7 @@ async fn test_health_endpoint_shows_cached_config_info() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -948,6 +961,7 @@ async fn test_health_endpoint_shows_no_cached_config() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -1002,6 +1016,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -1064,6 +1079,7 @@ async fn test_cached_config_reflects_live_updates() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -1175,6 +1191,7 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -1407,6 +1424,7 @@ fn db_admin_state(
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -1492,6 +1510,7 @@ async fn create_db_admin_state_with_availability(
         serving_degraded: None,
         serving_listener_failures: None,
         db_available,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -1636,6 +1655,7 @@ async fn test_batch_create_read_only_rejected() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -2682,6 +2702,7 @@ async fn test_restore_read_only_rejected() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -2863,6 +2884,7 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -2917,6 +2939,7 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -2963,6 +2986,7 @@ async fn test_get_upstream_not_found_in_cache() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -3005,6 +3029,7 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -3052,6 +3077,7 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -3473,6 +3499,135 @@ async fn test_delete_upstream_returns_503_when_db_unavailable() {
 }
 
 // ============================================================================
+// Config-Validation Rejection Classification (issue #2158)
+// ============================================================================
+
+#[tokio::test]
+async fn test_config_rejection_keeps_admin_writable_and_marks_health_degraded() {
+    // A reachable backend that serves a validation-rejected snapshot must NOT
+    // lock the admin API read-only: db_available stays true and admin writes
+    // are the in-band repair path. The condition surfaces on authenticated
+    // /health as config_rejected + degraded, and clears on the next good load.
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(true));
+    let cfg_rejected = Arc::new(AtomicBool::new(true));
+    let (mut state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag)).await;
+    state.config_rejected = Some(cfg_rejected.clone());
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // (a) Admin write succeeds despite the standing validation rejection.
+    let proxy = json!({
+        "listen_path": "/repair-2158",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert!(
+        (200..300).contains(&status),
+        "config_rejected must not lock admin read-only (got {status}): {body:?}"
+    );
+
+    // Authenticated /health detail surfaces the degraded status + flag.
+    let (health_status, health, _) = admin_get(&base_url, "/health", &token).await;
+    assert_eq!(health_status, reqwest::StatusCode::OK);
+    assert_eq!(health["status"], "degraded");
+    assert_eq!(health["config_rejected"], true);
+    assert_eq!(health["admin_writes_enabled"], true);
+
+    // Tiering: the boolean detail must NOT leak to unauthenticated probes.
+    let client = reqwest::Client::new();
+    let unauth: Value = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        unauth.get("config_rejected").is_none(),
+        "config_rejected detail must be authenticated-only: {unauth:?}"
+    );
+
+    // (c) Lifecycle: an accepted load clears the flag and drops the detail.
+    cfg_rejected.store(false, Ordering::Relaxed);
+    let (_, health2, _) = admin_get(&base_url, "/health", &token).await;
+    assert!(
+        health2.get("config_rejected").is_none(),
+        "config_rejected must clear once the rejection resolves: {health2:?}"
+    );
+    assert_eq!(health2["admin_writes_enabled"], true);
+}
+
+#[tokio::test]
+async fn test_connectivity_failure_still_blocks_admin_writes_2158() {
+    // Contrast with the validation-rejection case: a genuine connectivity
+    // outage (db_available=false, no validation rejection) must still flip the
+    // admin API read-only, preserving the fail-closed behavior.
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let (state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag)).await;
+    // config_rejected stays None — this is an outage, not a validation rejection.
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let proxy = json!({
+        "listen_path": "/outage-2158",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(
+        status, 503,
+        "connectivity failure must still block admin writes: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_config_rejected_detail_suppressed_during_connectivity_outage_2158() {
+    // Finding 3 (issue #2158): the stored config_rejected flag is deliberately
+    // sticky and clears only on an accepted authoritative full reload. But once a
+    // later connectivity outage sets db_available=false, admin writes are blocked
+    // (admin_writes_enabled=false), so the writable in-band repair path that
+    // config_rejected advertises no longer exists. The authenticated /health
+    // detail must therefore SUPPRESS config_rejected while db_available=false —
+    // keeping the two authenticated details mutually honest — without clearing
+    // the sticky stored flag.
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false)); // connectivity outage
+    let cfg_rejected = Arc::new(AtomicBool::new(true)); // sticky prior rejection
+    let (mut state, _dir) =
+        create_db_admin_state_with_availability(&tc, Some(db_flag.clone())).await;
+    state.config_rejected = Some(cfg_rejected.clone());
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (health_status, health, _) = admin_get(&base_url, "/health", &token).await;
+    assert_eq!(health_status, reqwest::StatusCode::OK);
+    assert_eq!(
+        health["admin_writes_enabled"], false,
+        "a connectivity outage must block admin writes: {health:?}"
+    );
+    assert!(
+        health.get("config_rejected").is_none(),
+        "config_rejected detail must be suppressed while db_available=false: {health:?}"
+    );
+
+    // The stored flag is only suppressed, not cleared: once the backend is
+    // reachable again the detail re-appears (writes are back, repair path valid).
+    db_flag.store(true, Ordering::Relaxed);
+    let (_, health2, _) = admin_get(&base_url, "/health", &token).await;
+    assert_eq!(health2["admin_writes_enabled"], true);
+    assert_eq!(
+        health2["config_rejected"], true,
+        "the sticky rejection detail must re-surface once the backend is reachable: {health2:?}"
+    );
+}
+
+// ============================================================================
 // Backup Cached Config Fallback Tests
 // ============================================================================
 
@@ -3495,6 +3650,7 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -3546,6 +3702,7 @@ async fn test_backup_no_db_no_cache_returns_503() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -3596,6 +3753,7 @@ async fn test_create_proxy_returns_503_when_no_db() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -3643,6 +3801,7 @@ async fn test_create_upstream_returns_503_when_no_db() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -3736,6 +3895,7 @@ async fn test_cached_config_reflects_upstream_updates() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -4141,6 +4301,7 @@ async fn test_health_endpoint_shows_db_availability() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: Some(db_flag.clone()),
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -4312,6 +4473,7 @@ async fn test_cluster_endpoint_requires_auth() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -4358,6 +4520,7 @@ async fn test_cluster_endpoint_cp_mode_empty_registry() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -4419,6 +4582,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -4484,6 +4648,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -4544,6 +4709,7 @@ async fn test_cluster_endpoint_dp_mode_connected() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -4592,6 +4758,7 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),
@@ -4636,6 +4803,7 @@ async fn test_cluster_endpoint_database_mode() {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),

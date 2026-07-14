@@ -34,7 +34,9 @@ use crate::config::db_backend::{self, DatabaseBackend, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::config::types::GatewayConfig;
-use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
+use crate::config::validation_pipeline::{
+    ConfigValidationRejection, collect_rejecting_runtime_config_errors,
+};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope};
 use crate::grpc::mesh_registry::{
@@ -447,10 +449,14 @@ fn reject_invalid_cp_full_snapshot(config: &GatewayConfig) -> Result<(), anyhow:
     for message in &validation_errors {
         error!("CP full config rejected: {}", message);
     }
-    anyhow::bail!(
-        "CP full configuration validation failed: {} rejecting error(s) found",
-        validation_errors.len()
-    )
+    // Return the typed marker (not a bare `anyhow::bail!`) so the CP poll loop
+    // can distinguish this reachable-but-invalid snapshot from a connectivity
+    // failure and keep the admin API writable for in-band repair (issue #2158).
+    Err(ConfigValidationRejection {
+        backend: "CP",
+        errors: validation_errors,
+    }
+    .into_anyhow())
 }
 
 /// Run the rejecting runtime validators with the same namespace boundaries as
@@ -894,6 +900,13 @@ pub async fn run(
     // below is not re-masked by that store.
     let serving_degraded = Arc::new(AtomicBool::new(false));
     let db_available = Arc::new(AtomicBool::new(true));
+    // Raised by the poll loop when a full config load is rejected by the
+    // runtime-config validation contract (reachable backend, invalid snapshot).
+    // Distinct from `db_available`: the CP is a writer, so admin stays writable
+    // to repair the offending resource in-band (issue #2158). Cleared only by an
+    // accepted authoritative full reload. CP startup fails fast on an invalid
+    // initial snapshot, so this starts `false`.
+    let config_rejected = Arc::new(AtomicBool::new(false));
 
     let reserved_ports = env_config.reserved_gateway_ports();
     // Shared admin connection limiter (plaintext + HTTPS listeners share one
@@ -915,6 +928,7 @@ pub async fn run(
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: None,
         db_available: Some(db_available.clone()),
+        config_rejected: Some(config_rejected.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
         reserved_ports: reserved_ports.clone(),
@@ -1358,6 +1372,7 @@ pub async fn run(
     let db_poll = db.clone();
     let config_poll = config_arc.clone();
     let db_available_poll = db_available.clone();
+    let config_rejected_poll = config_rejected.clone();
     let mut cp_poll_shutdown = shutdown_tx.subscribe();
 
     // DNS re-resolution for the database FQDN (same as database mode).
@@ -1491,6 +1506,10 @@ pub async fn run(
                                 force_full_reload = false;
                                 rejected_delta_tracker.record_accepted();
                                 db_available_poll.store(true, Ordering::Relaxed);
+                                crate::modes::clear_config_rejected_after_accepted_full_reload(
+                                    &config_rejected_poll,
+                                    "full reload after DB DNS reconnect",
+                                );
 
                                 // Per-namespace fan-out. For `Single` this
                                 // is one channel; for `Set`/`All` each DP
@@ -1513,11 +1532,26 @@ pub async fn run(
                                 debug!("Full config reload complete after DB DNS reconnect");
                             }
                             Err(e) => {
-                                error!(
-                                    "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
-                                    e
-                                );
-                                db_available_poll.store(false, Ordering::Relaxed);
+                                if crate::modes::is_poll_validation_rejection(&e) {
+                                    // Reachable backend, invalid snapshot: keep the
+                                    // admin API writable (subject to the migration
+                                    // gate) for in-band repair and do NOT flip
+                                    // reachability closed (issue #2158).
+                                    crate::modes::record_config_validation_rejection(
+                                        &db_poll,
+                                        &db_available_poll,
+                                        &config_rejected_poll,
+                                        &e,
+                                        "full reload after DB DNS reconnect",
+                                    )
+                                    .await;
+                                } else {
+                                    error!(
+                                        "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
+                                        e
+                                    );
+                                    db_available_poll.store(false, Ordering::Relaxed);
+                                }
                                 continue;
                             }
                         }
@@ -1630,15 +1664,37 @@ pub async fn run(
                                                 rejected_delta_tracker.record_accepted();
                                                 db_available_poll
                                                     .store(true, Ordering::Relaxed);
+                                                crate::modes::clear_config_rejected_after_accepted_full_reload(
+                                                    &config_rejected_poll,
+                                                    "rejected-delta escalation full reload",
+                                                );
                                                 info!(
                                                     "Rejected CP delta recovered by authoritative full reload and full-snapshot broadcast"
                                                 );
                                             }
                                             Err(error) => {
-                                                warn!(
-                                                    "Authoritative full reload failed after repeated CP delta rejection; keeping the last accepted cursors and cached config: {}",
-                                                    error
-                                                );
+                                                if crate::modes::is_poll_validation_rejection(
+                                                    &error,
+                                                ) {
+                                                    // The full snapshot is invalid too
+                                                    // (not just the delta): raise
+                                                    // config_rejected and keep admin
+                                                    // writable for in-band repair
+                                                    // (issue #2158).
+                                                    crate::modes::record_config_validation_rejection(
+                                                        &db_poll,
+                                                        &db_available_poll,
+                                                        &config_rejected_poll,
+                                                        &error,
+                                                        "rejected-delta escalation full reload",
+                                                    )
+                                                    .await;
+                                                } else {
+                                                    warn!(
+                                                        "Authoritative full reload failed after repeated CP delta rejection; keeping the last accepted cursors and cached config: {}",
+                                                        error
+                                                    );
+                                                }
                                             }
                                         }
                                     } else {
@@ -1712,6 +1768,10 @@ pub async fn run(
                                 match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
                                     Ok((new_config, sequences)) => {
                                         db_available_poll.store(true, Ordering::Relaxed);
+                                        crate::modes::clear_config_rejected_after_accepted_full_reload(
+                                            &config_rejected_poll,
+                                            "full fallback reload",
+                                        );
                                         last_polled_namespaces = nslist.clone();
                                         last_change_sequences = sequences;
                                         rejected_delta_tracker.record_accepted();
@@ -1730,6 +1790,22 @@ pub async fn run(
                                         info!("Configuration reloaded from database (full fallback) and pushed to DPs and mesh nodes");
                                     }
                                     Err(e2) => {
+                                        // Classify the primary full-reload error before
+                                        // failover: a validation rejection is identical
+                                        // on every replica, so keep the last known-good
+                                        // config + admin writable and skip failover
+                                        // (issue #2158).
+                                        if crate::modes::is_poll_validation_rejection(&e2) {
+                                            crate::modes::record_config_validation_rejection(
+                                                &db_poll,
+                                                &db_available_poll,
+                                                &config_rejected_poll,
+                                                &e2,
+                                                "full fallback reload",
+                                            )
+                                            .await;
+                                            continue;
+                                        }
                                         // Both incremental and full reload failed —
                                         // try failover URLs before giving up.
                                         match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
@@ -1737,6 +1813,10 @@ pub async fn run(
                                                 match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
                                                     Ok((new_config, sequences)) => {
                                                         db_available_poll.store(true, Ordering::Relaxed);
+                                                        crate::modes::clear_config_rejected_after_accepted_full_reload(
+                                                            &config_rejected_poll,
+                                                            "failover full reload",
+                                                        );
                                                         last_polled_namespaces = nslist.clone();
                                                         last_change_sequences = sequences;
                                                         rejected_delta_tracker.record_accepted();
@@ -1755,11 +1835,22 @@ pub async fn run(
                                                         info!("Configuration reloaded from database (failover) and pushed to DPs and mesh nodes");
                                                     }
                                                     Err(e3) => {
-                                                        db_available_poll.store(false, Ordering::Relaxed);
-                                                        warn!(
-                                                            "Authoritative primary failover reload also failed (serving cached): {}",
-                                                            e3
-                                                        );
+                                                        if crate::modes::is_poll_validation_rejection(&e3) {
+                                                            crate::modes::record_config_validation_rejection(
+                                                                &db_poll,
+                                                                &db_available_poll,
+                                                                &config_rejected_poll,
+                                                                &e3,
+                                                                "failover full reload",
+                                                            )
+                                                            .await;
+                                                        } else {
+                                                            db_available_poll.store(false, Ordering::Relaxed);
+                                                            warn!(
+                                                                "Authoritative primary failover reload also failed (serving cached): {}",
+                                                                e3
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2096,10 +2187,17 @@ mod tests {
         let error = reject_invalid_cp_full_snapshot(&config)
             .expect_err("CP full snapshot must reject a dangling upstream reference");
 
+        // Issue #2158: the rejection must carry the typed marker so the CP poll
+        // loop classifies it as a reachable-but-invalid snapshot (keeping admin
+        // writable) rather than a connectivity failure (which fails closed).
+        assert!(
+            crate::modes::is_poll_validation_rejection(&error),
+            "CP full-snapshot rejection must be a typed ConfigValidationRejection: {error}"
+        );
         assert!(
             error
                 .to_string()
-                .contains("CP full configuration validation failed"),
+                .contains("CP configuration validation failed"),
             "unexpected error: {error}"
         );
     }
