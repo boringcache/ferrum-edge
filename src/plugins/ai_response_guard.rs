@@ -22,7 +22,8 @@ use tracing::{debug, warn};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
-    SseReassembler, is_sse_request, parse_sse_data_frames, parse_sse_data_frames_checked,
+    SseReassembler, SseTextKind, is_sse_request, parse_sse_data_frames,
+    parse_sse_data_frames_checked,
 };
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -388,11 +389,18 @@ impl AiResponseGuard {
 
     /// Extract client-visible or executable completion text from supported AI
     /// response families.
-    fn extract_completion_texts<'a>(&self, json: &'a Value) -> Vec<&'a str> {
+    ///
+    /// Adjacent text-bearing parts of one content array (and adjacent
+    /// Anthropic text blocks / Gemini parts) are joined into one fragment, so
+    /// detection and length enforcement see the logical completion the client
+    /// renders rather than each part in isolation. Tool/function `arguments`
+    /// contribute both the raw string and its decoded JSON tokens.
+    fn extract_completion_texts<'a>(&self, json: &'a Value) -> Vec<Cow<'a, str>> {
         let mut texts = Vec::new();
 
-        // OpenAI chat/completions, including multimodal content parts and tool
-        // calls. Buffered delta-shaped payloads use the same selectors.
+        // OpenAI chat/completions, including multimodal content parts, refusal
+        // strings, and tool calls. Buffered delta-shaped payloads use the same
+        // selectors.
         if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
             for choice in choices {
                 collect_string_value(choice.get("text"), &mut texts);
@@ -401,6 +409,7 @@ impl AiResponseGuard {
                     .flatten()
                 {
                     collect_content_value(container.get("content"), &mut texts);
+                    collect_string_value(container.get("refusal"), &mut texts);
                     collect_function_value(container.get("function_call"), &mut texts);
                     if let Some(tool_calls) = container.get("tool_calls").and_then(Value::as_array)
                     {
@@ -417,23 +426,26 @@ impl AiResponseGuard {
         if let Some(output) = json.get("output").and_then(Value::as_array) {
             for item in output {
                 collect_string_value(item.get("name"), &mut texts);
-                collect_string_value(item.get("arguments"), &mut texts);
+                collect_argument_value(item.get("arguments"), &mut texts);
                 collect_content_value(item.get("content"), &mut texts);
             }
         }
 
-        // Anthropic: content[].text
+        // Anthropic: content[].text, joining adjacent text blocks.
         if let Some(content) = json.get("content").and_then(|c| c.as_array()) {
-            for block in content {
-                if block.get("type").and_then(|t| t.as_str()) == Some("text")
-                    && let Some(text) = block.get("text").and_then(|t| t.as_str())
-                {
-                    texts.push(text);
-                }
-            }
+            push_joined_adjacent_texts(
+                content.iter().map(|block| {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        block.get("text").and_then(|t| t.as_str())
+                    } else {
+                        None
+                    }
+                }),
+                &mut texts,
+            );
         }
 
-        // Google Gemini: candidates[].content.parts[].text
+        // Google Gemini: candidates[].content.parts[].text, joined per candidate.
         if let Some(candidates) = json.get("candidates").and_then(|c| c.as_array()) {
             for candidate in candidates {
                 if let Some(parts) = candidate
@@ -441,11 +453,12 @@ impl AiResponseGuard {
                     .and_then(|c| c.get("parts"))
                     .and_then(|p| p.as_array())
                 {
-                    for part in parts {
-                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                            texts.push(text);
-                        }
-                    }
+                    push_joined_adjacent_texts(
+                        parts
+                            .iter()
+                            .map(|part| part.get("text").and_then(|t| t.as_str())),
+                        &mut texts,
+                    );
                 }
             }
         }
@@ -514,9 +527,11 @@ impl AiResponseGuard {
             return Vec::new();
         }
         let mut hit = vec![false; self.detection_pattern_count];
-        // Pass 1: decoded tokens.
+        // Pass 1: decoded tokens, plus decoded tool/function-argument tokens
+        // so scan-all keeps parity with content mode on nested JSON escapes.
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
         collect_decoded_json_strings(json, &mut texts);
+        collect_decoded_argument_tokens(json, &mut texts);
         for text in &texts {
             for idx in self.detection_set.matches(text.as_ref()).into_iter() {
                 hit[idx] = true;
@@ -559,6 +574,7 @@ impl AiResponseGuard {
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
         for frame in frames {
             collect_decoded_json_strings(frame, &mut texts);
+            collect_decoded_argument_tokens(frame, &mut texts);
         }
         for text in &texts {
             for idx in self.detection_set.matches(text.as_ref()).into_iter() {
@@ -682,6 +698,7 @@ impl AiResponseGuard {
         // markers cannot re-trigger their own pattern.
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
         collect_decoded_json_strings(&redacted, &mut texts);
+        collect_decoded_argument_tokens(&redacted, &mut texts);
         for text in &texts {
             let cleaned = self.strip_known_placeholders(text.as_ref());
             if self.detection_set.is_match(&cleaned) {
@@ -690,6 +707,27 @@ impl AiResponseGuard {
         }
         let serialized = self.strip_known_placeholders(&redacted.to_string());
         self.detection_set.is_match(&serialized)
+    }
+
+    /// `ScanMode::Content` redact mode: decide whether the structured redactor
+    /// would leave detectable content in the extracted completion texts, so
+    /// the caller can fail closed (reject) instead of forwarding the body
+    /// while reporting it `redacted`. Two shapes are detectable but not
+    /// rewritable: a match that exists only across adjacent content-array
+    /// parts (each part alone is clean, so per-part redaction rewrites
+    /// nothing), and tool-argument content the argument redactor cannot
+    /// rewrite (a decoded object key or numeric scalar).
+    fn content_redact_leaves_residual(&self, original: &Value) -> bool {
+        if self.detection_pattern_count == 0 {
+            return false;
+        }
+        let mut redacted = original.clone();
+        self.redact_response_json(&mut redacted);
+        let texts = self.extract_completion_texts(&redacted);
+        texts.iter().any(|text| {
+            self.detection_set
+                .is_match(&self.strip_known_placeholders(text.as_ref()))
+        })
     }
 
     /// `ScanMode::All` redact mode, SSE bodies: decide whether redaction would
@@ -733,6 +771,7 @@ impl AiResponseGuard {
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
         for frame in &frames {
             collect_decoded_json_strings(frame, &mut texts);
+            collect_decoded_argument_tokens(frame, &mut texts);
         }
         for text in &texts {
             let cleaned = self.strip_known_placeholders(text.as_ref());
@@ -764,6 +803,9 @@ impl AiResponseGuard {
                 if let Some(text) = part.get_mut("text") {
                     self.redact_string_value(text);
                 }
+                if let Some(refusal) = part.get_mut("refusal") {
+                    self.redact_string_value(refusal);
+                }
             }
         }
     }
@@ -773,13 +815,45 @@ impl AiResponseGuard {
             self.redact_string_value(name);
         }
         if let Some(arguments) = value.get_mut("arguments") {
-            self.redact_string_value(arguments);
+            self.redact_arguments_value(arguments);
+        }
+    }
+
+    /// Redact a tool/function `arguments` string. The raw string is redacted
+    /// first (literal matches); when the string is itself a JSON document, its
+    /// decoded string values are redacted too and the document re-serialized,
+    /// so JSON escapes such as `\u0040` cannot carry content past redaction.
+    /// Re-serialization is semantically transparent to the tool client, which
+    /// parses the arguments as JSON. Decoded keys and numeric scalars are not
+    /// rewritable here; the residual re-scan fails closed on them.
+    fn redact_arguments_value(&self, value: &mut Value) {
+        self.redact_string_value(value);
+        let Some(text) = value.as_str() else {
+            return;
+        };
+        let Ok(mut decoded) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        let original = decoded.clone();
+        redact_json_strings(
+            &mut decoded,
+            &self.pii_patterns,
+            &self.blocked_phrases,
+            false,
+        );
+        if decoded != original
+            && let Ok(rewritten) = serde_json::to_string(&decoded)
+        {
+            *value = Value::String(rewritten);
         }
     }
 
     fn redact_message_like(&self, value: &mut Value) {
         if let Some(content) = value.get_mut("content") {
             self.redact_content_value(content);
+        }
+        if let Some(refusal) = value.get_mut("refusal") {
+            self.redact_string_value(refusal);
         }
         if let Some(function_call) = value.get_mut("function_call") {
             self.redact_function_value(function_call);
@@ -818,7 +892,7 @@ impl AiResponseGuard {
                     self.redact_string_value(name);
                 }
                 if let Some(arguments) = item.get_mut("arguments") {
-                    self.redact_string_value(arguments);
+                    self.redact_arguments_value(arguments);
                 }
                 if let Some(content) = item.get_mut("content") {
                     self.redact_content_value(content);
@@ -935,12 +1009,12 @@ impl AiResponseGuard {
     /// rather than `str::len()` (UTF-8 bytes). Counting bytes would trip the
     /// guard early for multibyte completions (CJK, emoji, accented Latin),
     /// rejecting or warning before the operator-configured character limit.
-    fn check_completion_length(&self, texts: &[&str]) -> Option<String> {
+    fn check_completion_length<S: AsRef<str>>(&self, texts: &[S]) -> Option<String> {
         if self.max_completion_length == 0 {
             return None;
         }
         for text in texts {
-            let char_len = text.chars().count();
+            let char_len = text.as_ref().chars().count();
             if char_len > self.max_completion_length {
                 return Some(format!(
                     "Completion length {} exceeds maximum {}",
@@ -953,13 +1027,17 @@ impl AiResponseGuard {
 
     /// Extract and concatenate completion texts from parsed SSE frames.
     ///
-    /// Handles three streaming formats:
-    /// - OpenAI: `choices[].delta.content` keyed by choice `index`
+    /// Handles the streaming formats:
+    /// - OpenAI: `choices[].delta.content` keyed by choice `index`, plus
+    ///   legacy `function_call` name/argument deltas and `delta.refusal`
+    /// - OpenAI Responses: reassembler deltas plus `response.refusal.delta`
     /// - Anthropic: `content_block_delta` events with `delta.text` keyed by block `index`
     /// - Gemini: `candidates[].content.parts[].text` keyed by candidate position
     ///
     /// Returns one accumulated `String` per choice/block index, ordered by
-    /// index (BTreeMap keeps output deterministic across runs).
+    /// index (BTreeMap keeps output deterministic across runs). Accumulated
+    /// tool/function argument strings additionally contribute their decoded
+    /// JSON tokens so escapes cannot hide content from detection.
     fn extract_sse_completion_texts(&self, frames: &[Value]) -> Vec<String> {
         let mut reassembler = SseReassembler::default();
         let mut provider_texts: std::collections::BTreeMap<(u8, usize), String> =
@@ -973,6 +1051,8 @@ impl AiResponseGuard {
             // Legacy Chat Completions streamed `function_call` before the
             // indexed `tool_calls` shape. Keep name and arguments in separate
             // accumulators so neither field can hide a cross-frame match.
+            // Chat refusal deltas (`delta.refusal`) are client-visible text
+            // and accumulate the same way.
             if let Some(choices) = frame.get("choices").and_then(Value::as_array) {
                 for (position, choice) in choices.iter().enumerate() {
                     let index = choice
@@ -996,7 +1076,36 @@ impl AiResponseGuard {
                                 .push_str(arguments);
                         }
                     }
+                    if let Some(refusal) = choice
+                        .get("delta")
+                        .and_then(|delta| delta.get("refusal"))
+                        .and_then(Value::as_str)
+                    {
+                        provider_texts
+                            .entry((4, index))
+                            .or_default()
+                            .push_str(refusal);
+                    }
                 }
+            }
+
+            // Responses API refusal deltas (`response.refusal.delta`) carry a
+            // client-visible refusal string outside the reassembler's coverage.
+            if frame
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|event_type| event_type.ends_with("refusal.delta"))
+                && let Some(delta) = frame.get("delta").and_then(Value::as_str)
+            {
+                let index = frame
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
+                provider_texts
+                    .entry((5, index))
+                    .or_default()
+                    .push_str(delta);
             }
 
             // Anthropic streaming: type=content_block_delta, delta.text
@@ -1029,12 +1138,24 @@ impl AiResponseGuard {
             }
         }
 
-        let mut texts: Vec<String> = reassembler
-            .into_texts()
-            .into_iter()
-            .map(|text| text.text)
-            .collect();
-        texts.extend(provider_texts.into_values());
+        let mut texts: Vec<String> = Vec::new();
+        for sse_text in reassembler.into_texts() {
+            if matches!(
+                sse_text.kind,
+                SseTextKind::ChatToolArguments | SseTextKind::ResponsesArguments
+            ) {
+                append_decoded_argument_texts(&sse_text.text, &mut texts);
+            }
+            texts.push(sse_text.text);
+        }
+        for ((kind, _), text) in provider_texts {
+            // Kind 3 accumulates legacy `function_call.arguments`, which is
+            // nested JSON like the reassembler's tool-call arguments.
+            if kind == 3 {
+                append_decoded_argument_texts(&text, &mut texts);
+            }
+            texts.push(text);
+        }
         texts
     }
 
@@ -1058,6 +1179,7 @@ impl AiResponseGuard {
                 .is_some_and(|event_type| {
                     event_type.ends_with("output_text.delta")
                         || event_type.ends_with("function_call_arguments.delta")
+                        || event_type.ends_with("refusal.delta")
                 });
         if is_responses_delta && let Some(delta) = frame.get_mut("delta") {
             self.redact_string_value(delta);
@@ -1491,19 +1613,23 @@ impl Plugin for AiResponseGuard {
             return PluginResult::Continue;
         }
 
-        // Redact mode in scan-all can detect PII the structured + recursive
-        // redactor cannot rewrite (object keys, numeric scalars, cross-token
-        // custom patterns, duplicate-key values). Forwarding such a body while
-        // reporting it `redacted` would leak PII, so fail closed (reject) when
-        // redaction would leave residual detections rather than emit false
-        // "redacted" telemetry. Bodies whose PII is fully rewritable fall
-        // through to the normal redact path below.
-        if self.action == GuardAction::Redact
-            && self.scan_mode == ScanMode::All
-            && self.redact_leaves_residual(&json)
-        {
+        // Redact mode can detect PII the redactor cannot rewrite — in scan-all,
+        // object keys, numeric scalars, cross-token custom patterns, and
+        // duplicate-key values; in content mode, matches that exist only across
+        // adjacent content-array parts and decoded tool-argument keys/numbers.
+        // Forwarding such a body while reporting it `redacted` would leak PII,
+        // so fail closed (reject) when redaction would leave residual
+        // detections rather than emit false "redacted" telemetry. Bodies whose
+        // PII is fully rewritable fall through to the normal redact path below.
+        let leaves_residual = self.action == GuardAction::Redact
+            && if self.scan_mode == ScanMode::All {
+                self.redact_leaves_residual(&json)
+            } else {
+                self.content_redact_leaves_residual(&json)
+            };
+        if leaves_residual {
             debug!(
-                "ai_response_guard: scan-all redact leaves residual content (types: {:?}), rejecting response",
+                "ai_response_guard: redact leaves residual content (types: {:?}), rejecting response",
                 detected
             );
             let types_json: Vec<String> = detected
@@ -1648,33 +1774,132 @@ fn collect_decoded_json_strings<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, st
     }
 }
 
-fn collect_string_value<'a>(value: Option<&'a Value>, texts: &mut Vec<&'a str>) {
+fn collect_string_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, str>>) {
     if let Some(text) = value.and_then(Value::as_str) {
-        texts.push(text);
+        texts.push(Cow::Borrowed(text));
     }
 }
 
-fn collect_content_value<'a>(value: Option<&'a Value>, texts: &mut Vec<&'a str>) {
+/// Client-visible text carried by one content-array part: ordinary `text`
+/// parts and OpenAI Responses refusal parts shaped
+/// `{"type":"refusal","refusal":"..."}`. Parts carrying neither are not
+/// text-bearing.
+fn content_part_text(part: &Value) -> Option<&str> {
+    part.get("text")
+        .and_then(Value::as_str)
+        .or_else(|| part.get("refusal").and_then(Value::as_str))
+}
+
+/// Push each run of adjacent text-bearing parts as one joined fragment so
+/// detection and length limits see the logical completion a client renders —
+/// a match or length overflow split across adjacent parts cannot hide at part
+/// boundaries. A non-text part (e.g. an image) breaks adjacency. Single-part
+/// runs stay borrowed; only multi-part runs allocate.
+fn push_joined_adjacent_texts<'a>(
+    parts: impl Iterator<Item = Option<&'a str>>,
+    texts: &mut Vec<Cow<'a, str>>,
+) {
+    let mut run: Vec<&'a str> = Vec::new();
+    for part in parts {
+        match part {
+            Some(text) => run.push(text),
+            None => flush_joined_text_run(&mut run, texts),
+        }
+    }
+    flush_joined_text_run(&mut run, texts);
+}
+
+fn flush_joined_text_run<'a>(run: &mut Vec<&'a str>, texts: &mut Vec<Cow<'a, str>>) {
+    if run.len() == 1 {
+        texts.push(Cow::Borrowed(run[0]));
+    } else if !run.is_empty() {
+        texts.push(Cow::Owned(run.concat()));
+    }
+    run.clear();
+}
+
+fn collect_content_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, str>>) {
     let Some(value) = value else {
         return;
     };
     if let Some(text) = value.as_str() {
-        texts.push(text);
+        texts.push(Cow::Borrowed(text));
         return;
     }
     if let Some(parts) = value.as_array() {
-        for part in parts {
-            collect_string_value(part.get("text"), texts);
+        push_joined_adjacent_texts(parts.iter().map(content_part_text), texts);
+    }
+}
+
+/// Tool/function `arguments` are a JSON document serialized into a string, so
+/// scanning only the raw string lets JSON escapes (e.g. `\u0040` for `@`) hide
+/// content the tool client will decode. Push the raw string and, when it
+/// parses, every decoded token of the nested document — one bounded parse
+/// under serde's recursion limit; deeper nested strings are not re-descended.
+fn collect_argument_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, str>>) {
+    let Some(text) = value.and_then(Value::as_str) else {
+        return;
+    };
+    texts.push(Cow::Borrowed(text));
+    if let Ok(decoded) = serde_json::from_str::<Value>(text) {
+        let mut decoded_texts: Vec<Cow<'_, str>> = Vec::new();
+        collect_decoded_json_strings(&decoded, &mut decoded_texts);
+        texts.extend(
+            decoded_texts
+                .into_iter()
+                .map(|token| Cow::Owned(token.into_owned())),
+        );
+    }
+}
+
+/// String-accumulator variant of [`collect_argument_value`] for the SSE path,
+/// which reassembles arguments across frames into owned `String`s first.
+fn append_decoded_argument_texts(arguments: &str, texts: &mut Vec<String>) {
+    if let Ok(decoded) = serde_json::from_str::<Value>(arguments) {
+        let mut decoded_texts: Vec<Cow<'_, str>> = Vec::new();
+        collect_decoded_json_strings(&decoded, &mut decoded_texts);
+        texts.extend(decoded_texts.into_iter().map(Cow::into_owned));
+    }
+}
+
+/// Collect decoded tool/function-argument tokens for the supported response
+/// shapes, so `ScanMode::All` detection keeps parity with content mode: the
+/// decoded-token and raw-body passes only ever see the serialized argument
+/// string, in which JSON escapes still hide content until the nested document
+/// is parsed.
+fn collect_decoded_argument_tokens<'a>(json: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
+    if let Some(choices) = json.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            for container in [choice.get("message"), choice.get("delta")]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(function_call) = container.get("function_call") {
+                    collect_argument_value(function_call.get("arguments"), texts);
+                }
+                if let Some(tool_calls) = container.get("tool_calls").and_then(Value::as_array) {
+                    for tool_call in tool_calls {
+                        if let Some(function) = tool_call.get("function") {
+                            collect_argument_value(function.get("arguments"), texts);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(output) = json.get("output").and_then(Value::as_array) {
+        for item in output {
+            collect_argument_value(item.get("arguments"), texts);
         }
     }
 }
 
-fn collect_function_value<'a>(value: Option<&'a Value>, texts: &mut Vec<&'a str>) {
+fn collect_function_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, str>>) {
     let Some(value) = value else {
         return;
     };
     collect_string_value(value.get("name"), texts);
-    collect_string_value(value.get("arguments"), texts);
+    collect_argument_value(value.get("arguments"), texts);
 }
 
 fn reject_unknown_keys(value: &Value, allowed: &[&str], path: &str) -> Result<(), String> {
