@@ -107,6 +107,7 @@ impl AccessControl {
         identified_consumer: Option<&crate::config::types::Consumer>,
         authenticated_identity: Option<&str>,
     ) -> PluginResult {
+        let authenticated_identity = super::meaningful_identity(authenticated_identity);
         let consumer = match identified_consumer {
             Some(consumer) => consumer,
             None => {
@@ -135,6 +136,14 @@ impl AccessControl {
                         };
                     }
                     return PluginResult::Continue;
+                }
+                if authenticated_identity.is_some() {
+                    warn!(client_ip = %client_ip, plugin = "access_control", reason = "external_identity_not_authorized", "Authenticated external identity rejected by access control");
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"Authenticated identity is not authorized"}"#.into(),
+                        headers: HashMap::new(),
+                    };
                 }
                 warn!(client_ip = %client_ip, plugin = "access_control", reason = "no_consumer", "No consumer identified for access control");
                 return PluginResult::Reject {
@@ -252,12 +261,23 @@ fn parse_string_set(
         let Some(raw) = entry.as_str() else {
             return Err(format!("access_control: '{field}' entries must be strings"));
         };
-        if raw.is_empty() {
+        let canonical = raw.trim();
+        if canonical.is_empty() {
             return Err(format!(
-                "access_control: '{field}' entries must be non-empty strings"
+                "access_control: '{field}' entries must contain non-whitespace characters"
             ));
         }
-        parsed.insert(raw.to_string());
+        let max_length = if field.ends_with("_groups") {
+            crate::config::types::MAX_ACL_GROUP_LENGTH
+        } else {
+            crate::config::types::MAX_USERNAME_LENGTH
+        };
+        if canonical.len() > max_length {
+            return Err(format!(
+                "access_control: '{field}' entries must not exceed {max_length} characters"
+            ));
+        }
+        parsed.insert(canonical.to_string());
     }
 
     Ok(parsed)

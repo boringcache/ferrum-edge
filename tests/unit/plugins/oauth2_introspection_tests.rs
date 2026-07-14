@@ -311,6 +311,31 @@ async fn active_token_sets_authenticated_identity_when_no_consumer_match() {
 }
 
 #[tokio::test]
+async fn active_token_with_blank_identity_does_not_authenticate_principal() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "   \t"
+        })))
+        .mount(&server)
+        .await;
+
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(&config(&endpoint), PluginHttpClient::default()).unwrap();
+    let mut ctx = make_ctx("blank-identity-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+
+    assert_continue(result);
+    assert!(ctx.authenticated_identity.is_none());
+    assert!(ctx.effective_identity().is_none());
+    assert!(ctx.auth_method.is_none());
+}
+
+#[tokio::test]
 async fn inactive_token_rejects_with_401() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

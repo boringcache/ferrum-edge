@@ -82,6 +82,9 @@ impl VerifyOutcome {
         external_identity: Option<String>,
         external_identity_header: Option<String>,
     ) -> Self {
+        let external_identity = external_identity.filter(|identity| !identity.trim().is_empty());
+        let external_identity_header =
+            external_identity_header.filter(|identity_header| !identity_header.trim().is_empty());
         Self::Success {
             consumer,
             external_identity,
@@ -185,6 +188,10 @@ async fn run_auth_impl<M: AuthMechanism>(
                 external_identity,
                 external_identity_header,
             } => {
+                let external_identity =
+                    external_identity.filter(|identity| !identity.trim().is_empty());
+                let external_identity_header = external_identity_header
+                    .filter(|identity_header| !identity_header.trim().is_empty());
                 let consumer_identified = consumer.is_some();
                 let external_identity_identified =
                     allow_external_identity && external_identity.is_some();
@@ -499,6 +506,28 @@ mod tests {
 
         run_auth_external_identity(&mechanism, &mut ctx, &index).await;
 
+        assert!(ctx.effective_identity().is_none());
+        assert!(ctx.auth_method.is_none());
+    }
+
+    #[tokio::test]
+    async fn blank_external_identity_does_not_authenticate() {
+        let mechanism = FakeMechanism {
+            extracted: ExtractedCredential::BearerToken("token".to_string()),
+            outcome: VerifyOutcome::Success {
+                consumer: None,
+                external_identity: Some("   \t".to_string()),
+                external_identity_header: Some(" \n".to_string()),
+            },
+        };
+        let mut ctx = test_ctx();
+        let index = ConsumerIndex::new(&[]);
+
+        let result = run_auth_external_identity(&mechanism, &mut ctx, &index).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(ctx.authenticated_identity.is_none());
+        assert!(ctx.authenticated_identity_header.is_none());
         assert!(ctx.effective_identity().is_none());
         assert!(ctx.auth_method.is_none());
     }

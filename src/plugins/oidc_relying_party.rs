@@ -3117,6 +3117,33 @@ mod tests {
     }
 
     #[test]
+    fn oidc_identity_resolution_rejects_blank_principals() {
+        let config =
+            plugin_config_without_optional_defaults("https://app.example.com/oauth/callback");
+        let plugin = build_plugin_without_workers(&config);
+
+        for claims in [
+            json!({}),
+            json!({"sub": null}),
+            json!({"sub": 42}),
+            json!({"sub": ""}),
+            json!({"sub": "   \t"}),
+        ] {
+            let VerifyOutcome::Success {
+                consumer,
+                external_identity,
+                external_identity_header,
+            } = plugin.resolve_identity(&claims, &ConsumerIndex::new(&[]))
+            else {
+                panic!("identity resolution should remain non-rejecting");
+            };
+            assert!(consumer.is_none());
+            assert!(external_identity.is_none());
+            assert!(external_identity_header.is_none());
+        }
+    }
+
+    #[test]
     fn concurrent_browser_challenges_keep_distinct_state_bindings() {
         let config =
             plugin_config_without_optional_defaults("https://app.example.com/oauth/callback");

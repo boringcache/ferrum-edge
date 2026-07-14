@@ -571,6 +571,11 @@ fn test_request_context_effective_identity_prefers_consumer_then_external_identi
     ctx.authenticated_identity = Some("external-user".to_string());
     assert_eq!(ctx.effective_identity(), Some("external-user"));
 
+    ctx.authenticated_identity = Some("   \t".to_string());
+    assert_eq!(ctx.effective_identity(), None);
+
+    ctx.authenticated_identity = Some("external-user".to_string());
+
     ctx.identified_consumer = Some(Arc::new(Consumer {
         id: "consumer-1".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -598,6 +603,9 @@ fn test_request_context_backend_consumer_username_prefers_consumer_then_header_t
 
     ctx.authenticated_identity_header = Some("user@example.com".to_string());
     assert_eq!(ctx.backend_consumer_username(), Some("user@example.com"));
+
+    ctx.authenticated_identity_header = Some("   ".to_string());
+    assert_eq!(ctx.backend_consumer_username(), Some("external-user"));
 
     ctx.identified_consumer = Some(Arc::new(Consumer {
         id: "consumer-1".to_string(),

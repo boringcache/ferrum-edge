@@ -1401,6 +1401,37 @@ async fn test_jwks_auth_continues_without_consumer_in_index() {
 }
 
 #[tokio::test]
+async fn test_jwks_auth_signed_tokens_do_not_authenticate_blank_identity_claims() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    plugin.warmup_jwks().await;
+
+    for claims in [
+        json!({}),
+        json!({"sub": null}),
+        json!({"sub": 42}),
+        json!({"sub": ""}),
+        json!({"sub": "   \t"}),
+    ] {
+        let token = create_rs256_token(&claims, private_key_pem);
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+
+        let result = plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await;
+        assert_continue(result);
+        assert!(ctx.identified_consumer.is_none());
+        assert!(ctx.authenticated_identity.is_none());
+        assert!(ctx.effective_identity().is_none());
+        assert!(ctx.auth_method.is_none());
+    }
+}
+
+#[tokio::test]
 async fn test_jwks_auth_consumer_header_claim_separate_from_identity() {
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");

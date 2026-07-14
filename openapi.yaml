@@ -13222,7 +13222,8 @@ components:
         keys are rejected. `allow_authenticated_identity=true` cannot be combined
         with an allow-list (`allowed_consumers`/`allowed_groups`) because the
         allow-list is not applied to unmapped external identities. Use
-        ip_restriction for IP/CIDR rules.
+        ip_restriction for IP/CIDR rules. Rule entries are trimmed and must
+        contain at least one non-whitespace character.
       allOf:
         - anyOf:
             - required: [allowed_consumers]
@@ -13265,6 +13266,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '\S'
           default: []
           description: >-
             Consumer usernames that are explicitly allowed. Empty list disables
@@ -13273,6 +13277,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '\S'
           default: []
           description: >-
             Consumer usernames that are explicitly denied. Takes precedence
@@ -13281,6 +13288,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '\S'
           default: []
           description: >-
             ACL group names that are explicitly allowed. The check matches if
@@ -13289,6 +13299,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '\S'
           default: []
           description: >-
             ACL group names that are explicitly denied. If any of the consumer's
@@ -13300,7 +13313,8 @@ components:
           description: >-
             Allow requests whose `ctx.authenticated_identity` is set by an
             external auth plugin (e.g. jwks_auth) even when no gateway Consumer
-            was mapped. Cannot be combined with an allow-list
+            was mapped. Empty or whitespace-only identities are unauthenticated.
+            Cannot be combined with an allow-list
             (`allowed_consumers`/`allowed_groups`); the deny-list
             `disallowed_consumers` is still applied to the external identity.
 

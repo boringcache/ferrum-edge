@@ -566,8 +566,8 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
         .expect("Denied external identity request failed");
     assert_eq!(
         denied.status().as_u16(),
-        401,
-        "without allow_authenticated_identity, external identity should still be rejected by ACL"
+        403,
+        "an authenticated external identity outside the Consumer allow-list is forbidden"
     );
 }
 

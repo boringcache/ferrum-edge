@@ -123,6 +123,19 @@ fn claim_resolver_resolves_hash_inside_path_segment() {
 }
 
 #[test]
+fn claim_resolver_rejects_blank_or_non_string_identity_values() {
+    for claims in [
+        json!({}),
+        json!({"sub": null}),
+        json!({"sub": 42}),
+        json!({"sub": ""}),
+        json!({"sub": "   \t"}),
+    ] {
+        assert_eq!(extract_claim_string(&claims, "sub"), None);
+    }
+}
+
+#[test]
 fn claim_resolver_extracts_space_delimited_and_array_values() {
     let claims = json!({
         "scope": "read write",
