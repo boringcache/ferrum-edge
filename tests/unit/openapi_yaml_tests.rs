@@ -1269,6 +1269,41 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         assert!(MeshRouteDispatch::new(&invalid_transform).is_err());
     }
 
+    for invalid_nested_policy in [
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "api.internal",
+                    "backend_port": 443,
+                    "backend_tls": {"client_certpath": "/tls/client.pem"}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {"max_retry": 2}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {"backoff": {"fixed": {"delay_millis": 25}}}
+            }]
+        }),
+    ] {
+        assert_component_validity(
+            &spec,
+            "MeshRouteDispatchConfig",
+            &invalid_nested_policy,
+            false,
+        );
+        assert!(MeshRouteDispatch::new(&invalid_nested_policy).is_err());
+    }
+
     let status_only_redirect = json!({
         "rules": [{
             "match": {"methods": ["GET"]},

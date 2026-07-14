@@ -7694,6 +7694,7 @@ components:
     # ── Retry ───────────────────────────────────────────────────────
     RetryConfig:
       type: object
+      additionalProperties: false
       properties:
         max_retries:
           type: integer
@@ -7728,11 +7729,13 @@ components:
       description: Retry delay strategy
       oneOf:
         - type: object
+          additionalProperties: false
           title: Fixed delay
           required: [fixed]
           properties:
             fixed:
               type: object
+              additionalProperties: false
               required: [delay_ms]
               properties:
                 delay_ms:
@@ -7741,11 +7744,13 @@ components:
                   default: 100
                   description: Fixed delay between retries in milliseconds
         - type: object
+          additionalProperties: false
           title: Exponential backoff
           required: [exponential]
           properties:
             exponential:
               type: object
+              additionalProperties: false
               required: [base_ms, max_ms]
               properties:
                 base_ms:
@@ -8121,6 +8126,7 @@ components:
 
     BackendTlsConfig:
       type: object
+      additionalProperties: false
       properties:
         client_cert_path:
           type: [string, "null"]

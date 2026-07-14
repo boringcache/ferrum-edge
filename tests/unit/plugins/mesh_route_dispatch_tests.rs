@@ -177,6 +177,30 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
         json!({
             "rules": [{
                 "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "api.internal",
+                    "backend_port": 443,
+                    "backend_tls": {"client_certpath": "/tls/client.pem"}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {"max_retry": 2}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {"backoff": {"fixed": {"delay_millis": 25}}}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
                 "destination": {"upstream_id": "api"},
                 "fault": {
                     "delay": {"duration_ms": 1, "percentage": 1.0},

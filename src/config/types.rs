@@ -1093,6 +1093,7 @@ pub const MAX_COOKIE_DOMAIN_LENGTH: usize = 253;
 /// All runtime code (connection pools, health checks, proxy dispatch) reads
 /// from this resolved config rather than raw proxy/upstream fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendTlsConfig {
     #[serde(default)]
     pub client_cert_path: Option<String>,
@@ -1512,7 +1513,7 @@ fn default_trip_on_connection_errors() -> bool {
 
 /// Retry backoff strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackoffStrategy {
     Fixed { delay_ms: u64 },
     Exponential { base_ms: u64, max_ms: u64 },
@@ -1526,6 +1527,7 @@ impl Default for BackoffStrategy {
 
 /// Retry configuration for a proxy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
