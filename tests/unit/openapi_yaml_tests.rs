@@ -1269,7 +1269,10 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         assert!(MeshRouteDispatch::new(&invalid_transform).is_err());
     }
 
-    for invalid_nested_policy in [
+    // These nested types are shared with the general Proxy model, whose
+    // unknown-field compatibility is intentionally broader than the
+    // mesh-route-owned object boundaries above.
+    for compatible_shared_policy in [
         json!({
             "rules": [{
                 "match": {"methods": ["GET"]},
@@ -1291,17 +1294,17 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             "rules": [{
                 "match": {"methods": ["GET"]},
                 "destination": {"upstream_id": "api"},
-                "retry": {"backoff": {"fixed": {"delay_millis": 25}}}
+                "retry": {"backoff": {"fixed": {"delay_ms": 25, "delay_millis": 25}}}
             }]
         }),
     ] {
         assert_component_validity(
             &spec,
             "MeshRouteDispatchConfig",
-            &invalid_nested_policy,
-            false,
+            &compatible_shared_policy,
+            true,
         );
-        assert!(MeshRouteDispatch::new(&invalid_nested_policy).is_err());
+        assert!(MeshRouteDispatch::new(&compatible_shared_policy).is_ok());
     }
 
     let status_only_redirect = json!({
