@@ -5964,11 +5964,10 @@ impl Upstream {
     /// workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`), NOT by operators.
     /// The top-level projected fields are not persisted by the SQL / MongoDB
     /// schemas. The nested fields can round-trip inside the persisted `subsets`
-    /// JSON, but their effective runtime overlays are built only while applying a
-    /// mesh DestinationRule; accepting them from an admin/file config would
-    /// therefore advertise policy that is not applied. A file-mode operator
-    /// slipping in these fields could also briefly enable mesh-owned policy before
-    /// a reload. The canonical surface for each is named in its message.
+    /// JSON, but their effective runtime state is materialized only while applying
+    /// a mesh DestinationRule; accepting them from an admin/file config would
+    /// therefore advertise policy that those entry points never apply. The
+    /// canonical surface for each is named in its message.
     ///
     /// This applies to **every operator-PROVIDED config load** — the admin write /
     /// admission path AND the file-mode loader — and is deliberately SEPARATE from

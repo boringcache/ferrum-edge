@@ -266,10 +266,22 @@ fn implemented_admin_operations() -> BTreeSet<(String, String)> {
             .map(str::trim)
             .filter(|segment| !segment.is_empty())
             .map(|segment| {
-                segment
+                if let Some(literal) = segment
                     .strip_prefix('"')
                     .and_then(|value| value.strip_suffix('"'))
-                    .unwrap_or("{}")
+                {
+                    return literal;
+                }
+
+                static IDENTIFIER: LazyLock<Regex> = LazyLock::new(|| {
+                    Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")
+                        .expect("Rust identifier regex compiles")
+                });
+                assert!(
+                    IDENTIFIER.is_match(segment),
+                    "unsupported admin route pattern segment `{segment}`; update the inventory parser explicitly"
+                );
+                "{}"
             })
             .collect::<Vec<_>>();
         operations.insert((method, format!("/{}", segments.join("/"))));
@@ -966,6 +978,15 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         }),
         false,
     );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "aws_lambda",
+            "function_url": "not-a-url"
+        }),
+        false,
+    );
 }
 
 fn assert_component_validity(
@@ -1092,6 +1113,28 @@ fn config_schemas_reject_nulls_that_rust_does_not_accept() {
 fn service_discovery_schema_matches_provider_validation_and_serialization() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let provider_guards = spec
+        .pointer("/components/schemas/ServiceDiscoveryConfig/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("service discovery provider guards are an array");
+    let guarded_providers: BTreeSet<_> = provider_guards
+        .iter()
+        .map(|guard| {
+            assert_eq!(
+                guard["if"]["required"],
+                json!(["provider"]),
+                "each provider conditional must require the discriminator"
+            );
+            guard["if"]["properties"]["provider"]["const"]
+                .as_str()
+                .expect("provider guard has a string const")
+        })
+        .collect();
+    assert_eq!(
+        guarded_providers,
+        BTreeSet::from(["consul", "dns_sd", "kubernetes", "mesh"])
+    );
 
     assert_component_validity(
         &spec,

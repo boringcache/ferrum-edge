@@ -8506,6 +8506,7 @@ components:
           description: Default weight assigned to discovered targets
       allOf:
         - if:
+            required: [provider]
             properties:
               provider:
                 const: dns_sd
@@ -8515,6 +8516,7 @@ components:
               dns_sd:
                 type: object
         - if:
+            required: [provider]
             properties:
               provider:
                 const: kubernetes
@@ -8524,6 +8526,7 @@ components:
               kubernetes:
                 type: object
         - if:
+            required: [provider]
             properties:
               provider:
                 const: consul
@@ -8533,6 +8536,7 @@ components:
               consul:
                 type: object
         - if:
+            required: [provider]
             properties:
               provider:
                 const: mesh
@@ -14545,7 +14549,7 @@ components:
           type: string
           format: uri
           pattern: "^[Hh][Tt][Tt][Pp][Ss]?://"
-          description: "HTTP(S) trigger URL. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda (URL is derived from region + function name)."
+          description: "HTTP(S) trigger URL. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied."
         aws_region:
           type: string
           description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars."

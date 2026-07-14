@@ -169,6 +169,22 @@ fn test_gcp_missing_url_rejects() {
 }
 
 #[test]
+fn test_aws_rejects_invalid_ignored_function_url() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "aws_lambda",
+            "function_url": "not-a-url",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIATEST",
+            "aws_secret_access_key": "secret",
+            "aws_function_name": "my-func"
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("invalid function_url"), "got: {err}");
+}
+
+#[test]
 fn test_aws_missing_region_rejects() {
     let _lock = ENV_MUTEX.lock().unwrap();
     // SAFETY: serialized by ENV_MUTEX — no concurrent env var access

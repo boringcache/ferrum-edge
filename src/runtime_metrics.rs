@@ -908,51 +908,29 @@ fn build_logs_snapshot(metrics: &RuntimeMetrics) -> LogsSnapshot {
 }
 
 fn build_overload_snapshot(proxy_state: Option<&crate::proxy::ProxyState>) -> Value {
-    if let Some(ps) = proxy_state {
-        let mut value = serde_json::to_value(ps.overload.snapshot()).unwrap_or_else(|_| json!({}));
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert(
-                "stream_listeners".to_string(),
-                serde_json::to_value(ps.stream_listener_manager.overload_snapshot())
-                    .unwrap_or_else(|_| json!({})),
-            );
-        }
-        value
-    } else {
-        json!({
-            "level": "normal",
-            "draining": false,
-            "active_connections": 0,
-            "active_requests": 0,
-            "red_drop_probability_pct": 0.0,
-            "port_exhaustion_events": 0,
-            "node_waypoint_drops": {
-                "cookie_unavailable": 0,
-                "unknown_cookie": 0,
-                "missing_pod_uid": 0,
-                "missing_workload_hash": 0,
-                "unknown_pod": 0,
-                "hash_mismatch": 0
-            },
-            "pressure": {
-                "file_descriptors": {"current": 0, "max": 0, "ratio": 0.0},
-                "connections": {"current": 0, "max": 0, "ratio": 0.0},
-                "requests": {"current": 0, "max": 0, "ratio": 0.0},
-                "event_loop_latency_us": 0
-            },
-            "actions": {
-                "disable_keepalive": false,
-                "reject_new_connections": false,
-                "reject_new_requests": false
-            },
-            "stream_listeners": {
+    let overload = proxy_state
+        .map(|ps| ps.overload.snapshot())
+        .unwrap_or_else(|| crate::overload::OverloadState::new().snapshot());
+    let stream_listeners = proxy_state.map_or_else(
+        || {
+            json!({
                 "dtls_demux_sessions_total": 0,
                 "dtls_demux_sessions": [],
                 "bind_failures_total": 0,
                 "bind_failures": []
-            }
-        })
+            })
+        },
+        |ps| {
+            serde_json::to_value(ps.stream_listener_manager.overload_snapshot())
+                .unwrap_or_else(|_| json!({}))
+        },
+    );
+
+    let mut value = serde_json::to_value(overload).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("stream_listeners".to_string(), stream_listeners);
     }
+    value
 }
 
 fn ratio(numerator: u64, denominator: u64) -> f64 {
