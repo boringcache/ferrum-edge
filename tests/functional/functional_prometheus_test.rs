@@ -30,17 +30,14 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
-    plugins:
-      - plugin_config_id: "prom-1"
 
 consumers: []
 upstreams: []
 
 plugin_configs:
   - id: "prom-1"
-    proxy_id: "test-proxy"
     plugin_name: "prometheus_metrics"
-    scope: "proxy"
+    scope: "global"
     enabled: true
     config:
       render_cache_ttl_seconds: 0
@@ -126,17 +123,14 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
-    plugins:
-      - plugin_config_id: "prom-traffic"
 
 consumers: []
 upstreams: []
 
 plugin_configs:
   - id: "prom-traffic"
-    proxy_id: "traffic-proxy"
     plugin_name: "prometheus_metrics"
-    scope: "proxy"
+    scope: "global"
     enabled: true
     config:
       render_cache_ttl_seconds: 0

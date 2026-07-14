@@ -4099,6 +4099,31 @@ async fn handle_batch_create(
         }
     }
 
+    let enabled_prometheus_configs: Vec<&str> = batch
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.enabled && plugin.plugin_name == "prometheus_metrics")
+        .map(|plugin| plugin.id.as_str())
+        .collect();
+    if enabled_prometheus_configs.len() > 1 {
+        validation_errors.push(format!(
+            "prometheus_metrics permits at most one enabled global instance; batch contains: {}",
+            enabled_prometheus_configs.join(", ")
+        ));
+    } else if let Some(submitted_id) = enabled_prometheus_configs.first() {
+        match crud::enabled_prometheus_metrics_owner_exists(db.as_ref(), namespace, None).await {
+            Ok(true) => validation_errors.push(format!(
+                "PluginConfig '{}': prometheus_metrics permits at most one enabled global instance; another config already owns the process registry",
+                submitted_id
+            )),
+            Ok(false) => {}
+            Err(err) => validation_errors.push(format!(
+                "PluginConfig '{}': prometheus_metrics uniqueness check failed: {}",
+                submitted_id, err
+            )),
+        }
+    }
+
     // Cross-resource validations require a GatewayConfig view over the batch.
     // Individual items are already normalized and field-validated above, so skip
     // normalize_fields() and validate_all_fields() to avoid redundant work.
@@ -4736,6 +4761,35 @@ async fn handle_restore(
             if let Err(errs) = u.validate_operator_provided_fields() {
                 for e in errs {
                     validation_errors.push(format!("Upstream '{}': {}", u.id, e));
+                }
+            }
+        }
+        if temp_config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.enabled && plugin.plugin_name == "prometheus_metrics")
+        {
+            match crud::enabled_prometheus_metrics_owner_exists_outside_namespace(
+                db.as_ref(),
+                namespace,
+            )
+            .await
+            {
+                Ok(true) => validation_errors.push(
+                    "prometheus_metrics permits at most one enabled global instance; another namespace already owns the process registry"
+                        .to_string(),
+                ),
+                Ok(false) => {}
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Restore aborted: prometheus_metrics ownership could not be validated: {}. Existing config was NOT deleted.",
+                                error
+                            )
+                        }),
+                    ));
                 }
             }
         }

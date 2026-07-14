@@ -7,6 +7,7 @@ use ferrum_edge::plugins::{
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::plugin_utils::{
     assert_continue, assert_reject, create_test_consumer, create_test_context,
@@ -154,9 +155,13 @@ async fn test_rate_limiting_plugin_short_window() {
     let result = plugin.on_request_received(&mut ctx).await;
     assert_continue(result);
 
-    // Third request should be rejected
+    // Third request should be rejected and exported by the process-wide
+    // aggregate limiter metric.
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.rate_limit_exceeded.load(Ordering::Relaxed);
     let result = plugin.on_request_received(&mut ctx).await;
     assert_reject(result, Some(429));
+    assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) > before);
 }
 
 #[tokio::test]

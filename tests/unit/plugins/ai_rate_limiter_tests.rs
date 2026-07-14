@@ -7,6 +7,7 @@ use ferrum_edge::plugins::{
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
@@ -163,11 +164,15 @@ async fn test_token_accumulation_and_limit() {
         .on_response_body(&mut ctx2, 200, &resp_headers, &body2)
         .await;
 
-    // Third request should be rejected (250 >= 200)
+    // Third request should be rejected (250 >= 200) and exported by the
+    // aggregate limiter metric.
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.rate_limit_exceeded.load(Ordering::Relaxed);
     let mut ctx3 = create_test_context();
     let mut headers3 = HashMap::new();
     let result = plugin.before_proxy(&mut ctx3, &mut headers3).await;
     assert_reject(result, Some(429));
+    assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) > before);
 }
 
 // ─── Sliding window eviction ─────────────────────────────────────────────

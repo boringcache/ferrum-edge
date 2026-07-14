@@ -1296,6 +1296,7 @@ impl std::error::Error for GrpcProxyError {
 
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
+    pub const UNKNOWN: u32 = 2;
     pub const INVALID_ARGUMENT: u32 = 3;
     pub const DEADLINE_EXCEEDED: u32 = 4;
     pub const NOT_FOUND: u32 = 5;
@@ -1370,13 +1371,47 @@ pub(crate) fn grpc_admission_status_from_maps(
     headers: &HashMap<String, String>,
     http_status: u16,
 ) -> u16 {
-    trailers
-        .get("grpc-status")
-        .or_else(|| headers.get("grpc-status"))
-        .and_then(|s| s.trim().parse::<u32>().ok())
+    grpc_status_from_maps(trailers, headers)
         .filter(|&code| code != 0)
         .map(grpc_status_to_http_status)
         .unwrap_or(http_status)
+}
+
+/// Extract the terminal gRPC application status without mapping it onto HTTP.
+/// Trailers take precedence over trailers-only initial headers, matching the
+/// wire protocol. Callers use this for transaction metadata and metrics while
+/// retaining HTTP 200 as the transport status.
+pub(crate) fn grpc_status_from_maps(
+    trailers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+) -> Option<u32> {
+    trailers
+        .get("grpc-status")
+        .or_else(|| headers.get("grpc-status"))
+        .map(|status| parse_grpc_status_value(status))
+}
+
+/// Parse a peer-supplied gRPC status without allowing malformed values to look
+/// like success. `u32::MAX` is outside the standard 0..=16 range, maps to an
+/// HTTP 500 health outcome, and is rendered in the bounded `OTHER` metric
+/// bucket.
+pub(crate) fn parse_grpc_status_value(status: &str) -> u32 {
+    status.trim().parse::<u32>().unwrap_or(u32::MAX)
+}
+
+/// Refresh transaction metadata from the final client-visible gRPC response.
+///
+/// Response hooks can rewrite or remove terminal metadata after the backend
+/// status was captured for health accounting. Missing terminal status is
+/// gRPC UNKNOWN for the client, so it must not leave a stale backend status in
+/// Prometheus/log metadata.
+pub(crate) fn refresh_grpc_status_metadata(
+    metadata: &mut HashMap<String, String>,
+    trailers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+) {
+    let status = grpc_status_from_maps(trailers, headers).unwrap_or(grpc_status::UNKNOWN);
+    metadata.insert("grpc_status".to_string(), status.to_string());
 }
 
 /// Effective request-body cap for the sidecar mesh-mTLS dispatch path (issue
@@ -2743,6 +2778,38 @@ mod tests {
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
     };
     use chrono::Utc;
+
+    #[test]
+    fn terminal_grpc_status_prefers_trailers_and_preserves_ok() {
+        let headers = HashMap::from([("grpc-status".to_string(), "14".to_string())]);
+        let trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
+        assert_eq!(grpc_status_from_maps(&trailers, &headers), Some(0));
+        assert_eq!(
+            grpc_admission_status_from_maps(&trailers, &headers, 200),
+            200
+        );
+
+        let malformed = HashMap::from([("grpc-status".to_string(), "hostile".to_string())]);
+        assert_eq!(
+            grpc_status_from_maps(&malformed, &HashMap::new()),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            grpc_admission_status_from_maps(&malformed, &HashMap::new(), 200),
+            500
+        );
+    }
+
+    #[test]
+    fn final_grpc_status_metadata_tracks_rewrites_and_missing_status() {
+        let mut metadata = HashMap::from([("grpc_status".to_string(), "14".to_string())]);
+        let rewritten = HashMap::from([("grpc-status".to_string(), "7".to_string())]);
+        refresh_grpc_status_metadata(&mut metadata, &rewritten, &HashMap::new());
+        assert_eq!(metadata.get("grpc_status").map(String::as_str), Some("7"));
+
+        refresh_grpc_status_metadata(&mut metadata, &HashMap::new(), &HashMap::new());
+        assert_eq!(metadata.get("grpc_status").map(String::as_str), Some("2"));
+    }
 
     /// Build a minimal `Proxy` for thread-local key tests. Uses HTTPS so the
     /// gRPC pool path is the realistic codepath (gRPC over TLS).

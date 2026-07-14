@@ -1,7 +1,7 @@
 //! Prometheus Metrics Plugin
 //!
 //! Records request metrics in Prometheus format. The actual `/metrics`
-//! endpoint is served by the admin API (unauthenticated).
+//! endpoint is served by the authenticated admin observability API.
 //! This plugin uses the `log()` hook to record metrics from TransactionSummary.
 
 use arc_swap::ArcSwap;
@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use super::mesh::prometheus_helpers::{self, MeshRequestKey};
-use super::{Direction, Plugin, StreamTransactionSummary, TransactionSummary};
+use super::{Direction, Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::ebpf::NodeAgentMetrics;
 use crate::retry::ErrorClass;
 
@@ -41,14 +41,17 @@ pub(crate) fn escape_label_value(value: &str) -> String {
     escaped
 }
 
-/// Composite key for request counter: (proxy_id, method, status_code).
-/// Uses Arc<str> to avoid heap-allocating cloned strings on every request —
-/// DashMap entry() lookups on existing keys only bump a refcount.
+/// Composite key for request counter: (proxy_id, method, status_code, grpc_status).
+///
+/// `method` and `grpc_status` are normalized to bounded static label sets before
+/// insertion. Request-controlled extension methods and malformed gRPC status
+/// values can therefore never create unbounded registry keys.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CounterKey {
     pub proxy_id: Arc<str>,
-    pub method: Arc<str>,
+    pub method: &'static str,
     pub status_code: u16,
+    pub grpc_status: Option<&'static str>,
 }
 
 /// Composite key for stream connection counter: (proxy_id, protocol).
@@ -56,6 +59,26 @@ pub struct CounterKey {
 pub struct StreamCounterKey {
     pub proxy_id: Arc<str>,
     pub protocol: Arc<str>,
+}
+
+/// Bounded WebSocket terminal-series key.
+///
+/// Every non-proxy label is derived from a compiled-in enum; no error message,
+/// close reason, URL, or other peer-controlled string is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WsSessionKey {
+    pub proxy_id: Arc<str>,
+    pub result: &'static str,
+    pub direction: &'static str,
+    pub io_side: &'static str,
+    pub error_class: &'static str,
+}
+
+/// Bounded directional WebSocket traffic key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WsTrafficKey {
+    pub proxy_id: Arc<str>,
+    pub direction: &'static str,
 }
 
 /// Composite key for the HTTP-family client-disconnect counter.
@@ -150,22 +173,30 @@ pub struct TlsCertRotationKey {
 
 /// Scrape-time certificate inventory gauge values.
 pub struct TlsCertGaugeValues {
-    pub expiry_seconds: CachePadded<AtomicI64>,
+    pub not_after_unix_seconds: CachePadded<AtomicI64>,
     pub not_before_unix_seconds: CachePadded<AtomicI64>,
 }
 
 impl TlsCertGaugeValues {
-    fn new(expiry_seconds: i64, not_before_unix_seconds: i64) -> Self {
+    fn new(not_after_unix_seconds: i64, not_before_unix_seconds: i64) -> Self {
         Self {
-            expiry_seconds: CachePadded::new(AtomicI64::new(expiry_seconds)),
+            not_after_unix_seconds: CachePadded::new(AtomicI64::new(not_after_unix_seconds)),
             not_before_unix_seconds: CachePadded::new(AtomicI64::new(not_before_unix_seconds)),
         }
     }
 
-    fn update(&self, expiry_seconds: i64, not_before_unix_seconds: i64) {
-        self.expiry_seconds.store(expiry_seconds, Ordering::Relaxed);
-        self.not_before_unix_seconds
-            .store(not_before_unix_seconds, Ordering::Relaxed);
+    /// Update absolute certificate timestamps and report whether the inventory
+    /// materially changed. Relative expiry is derived only during an uncached
+    /// render so the passage of one wall-clock second cannot defeat the render
+    /// cache on every scrape.
+    fn update(&self, not_after_unix_seconds: i64, not_before_unix_seconds: i64) -> bool {
+        let old_not_after = self
+            .not_after_unix_seconds
+            .swap(not_after_unix_seconds, Ordering::Relaxed);
+        let old_not_before = self
+            .not_before_unix_seconds
+            .swap(not_before_unix_seconds, Ordering::Relaxed);
+        old_not_after != not_after_unix_seconds || old_not_before != not_before_unix_seconds
     }
 }
 
@@ -214,6 +245,61 @@ fn direction_label(direction: Option<super::Direction>) -> &'static str {
     }
 }
 
+fn ws_io_side_label(side: Option<crate::proxy::tcp_proxy::StreamIoSide>) -> &'static str {
+    match side {
+        Some(crate::proxy::tcp_proxy::StreamIoSide::Read) => "read",
+        Some(crate::proxy::tcp_proxy::StreamIoSide::Write) => "write",
+        None => "unknown",
+    }
+}
+
+/// Normalize request-controlled HTTP methods to a finite label set. HTTP
+/// extension methods remain routable, but all share the `OTHER` metrics bucket.
+fn method_label(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "CONNECT" => "CONNECT",
+        "OPTIONS" => "OPTIONS",
+        "TRACE" => "TRACE",
+        "PATCH" => "PATCH",
+        _ => "OTHER",
+    }
+}
+
+/// Convert the internal gRPC terminal-status metadata to a bounded Prometheus
+/// label. Standard codes retain their numeric representation; malformed or
+/// future non-standard codes share one `OTHER` bucket.
+fn grpc_status_label(metadata: &std::collections::HashMap<String, String>) -> Option<&'static str> {
+    let status = match metadata.get("grpc_status")?.trim().parse::<u32>() {
+        Ok(status) => status,
+        Err(_) => return Some("OTHER"),
+    };
+    Some(match status {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        10 => "10",
+        11 => "11",
+        12 => "12",
+        13 => "13",
+        14 => "14",
+        15 => "15",
+        16 => "16",
+        _ => "OTHER",
+    })
+}
+
 /// Atomic counter paired with a last-updated timestamp for stale entry eviction.
 pub struct TimestampedCounter {
     pub value: CachePadded<AtomicU64>,
@@ -229,7 +315,11 @@ impl TimestampedCounter {
     }
 
     fn increment(&self, epoch: Instant) {
-        self.value.fetch_add(1, Ordering::Relaxed);
+        self.add(1, epoch);
+    }
+
+    fn add(&self, value: u64, epoch: Instant) {
+        self.value.fetch_add(value, Ordering::Relaxed);
         self.last_updated
             .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
@@ -354,6 +444,14 @@ pub struct MetricsRegistry {
     pub stream_connection_counter: DashMap<StreamCounterKey, TimestampedCounter>,
     /// Stream connection duration histogram by proxy_id
     pub stream_duration_buckets: DashMap<Arc<str>, HistogramBuckets>,
+    /// Completed WebSocket sessions by bounded terminal classification.
+    pub ws_session_counter: DashMap<WsSessionKey, TimestampedCounter>,
+    /// WebSocket session duration by the same bounded terminal classification.
+    pub ws_session_duration_buckets: DashMap<WsSessionKey, HistogramBuckets>,
+    /// WebSocket payload bytes by proxy and direction.
+    pub ws_bytes_counter: DashMap<WsTrafficKey, TimestampedCounter>,
+    /// WebSocket frames by proxy and direction.
+    pub ws_frames_counter: DashMap<WsTrafficKey, TimestampedCounter>,
     /// HTTP-family client disconnect counter keyed by proxy_id. Incremented
     /// on every `record()` where `client_disconnected == true`.
     pub client_disconnect_counter: DashMap<ClientDisconnectKey, TimestampedCounter>,
@@ -451,6 +549,10 @@ impl MetricsRegistry {
             rate_limit_exceeded: AtomicU64::new(0),
             stream_connection_counter: DashMap::new(),
             stream_duration_buckets: DashMap::new(),
+            ws_session_counter: DashMap::new(),
+            ws_session_duration_buckets: DashMap::new(),
+            ws_bytes_counter: DashMap::new(),
+            ws_frames_counter: DashMap::new(),
             client_disconnect_counter: DashMap::new(),
             stream_disconnect_counter: DashMap::new(),
             mesh_dns_upstream_id_exhaustions: AtomicU64::new(0),
@@ -476,9 +578,9 @@ impl MetricsRegistry {
         }
     }
 
-    /// Update tunable parameters. Called by plugin constructor so the first
-    /// plugin instance's config wins (global singleton, subsequent calls
-    /// overwrite — but all instances on the same gateway share one config).
+    /// Update process-wide tunable parameters from the single enabled global
+    /// plugin instance. Config validation rejects scoped or duplicate enabled
+    /// instances before plugin construction.
     pub fn configure(
         &self,
         render_cache_ttl_secs: u64,
@@ -533,6 +635,68 @@ impl MetricsRegistry {
             .or_insert_with(|| TimestampedCounter::new(self.epoch))
             .increment(self.epoch);
 
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_ws_session(&self, ctx: &WsDisconnectContext) {
+        let proxy_id: Arc<str> = Arc::from(ctx.proxy_id.as_str());
+        let session_key = WsSessionKey {
+            proxy_id: Arc::clone(&proxy_id),
+            result: if ctx.error_class.is_some() {
+                "error"
+            } else {
+                "success"
+            },
+            direction: direction_label(ctx.direction),
+            io_side: ws_io_side_label(ctx.io_side),
+            error_class: ctx
+                .error_class
+                .as_ref()
+                .map(ErrorClass::as_str)
+                .unwrap_or("none"),
+        };
+        self.ws_session_counter
+            .entry(session_key.clone())
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.ws_session_duration_buckets
+            .entry(session_key)
+            .or_insert_with(|| HistogramBuckets::new(self.epoch))
+            .observe(ctx.duration_ms.max(0.0), self.epoch);
+
+        for (direction, bytes, frames) in [
+            (
+                "client_to_backend",
+                ctx.bytes_client_to_backend,
+                ctx.frames_client_to_backend,
+            ),
+            (
+                "backend_to_client",
+                ctx.bytes_backend_to_client,
+                ctx.frames_backend_to_client,
+            ),
+        ] {
+            let key = WsTrafficKey {
+                proxy_id: Arc::clone(&proxy_id),
+                direction,
+            };
+            self.ws_bytes_counter
+                .entry(key.clone())
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                .add(bytes, self.epoch);
+            self.ws_frames_counter
+                .entry(key)
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                .add(frames, self.epoch);
+        }
+
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one rejection/drop/connection-close produced by any built-in
+    /// rate-limiter plugin.
+    pub fn record_rate_limit_exceeded(&self) {
+        self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -615,18 +779,18 @@ impl MetricsRegistry {
         &self,
         inventory: &crate::tls::inventory::TlsInventory,
     ) {
-        let now_ts = Utc::now().timestamp();
         let mut seen = std::collections::HashSet::new();
+        let mut changed = false;
 
         for entry in &inventory.entries {
             let Some(not_after) = entry.not_after else {
                 continue;
             };
+            let not_after_ts = not_after.timestamp();
             let not_before_ts = entry
                 .not_before
                 .map(|not_before| not_before.timestamp())
                 .unwrap_or(0);
-            let expiry_seconds = not_after.timestamp().saturating_sub(now_ts);
             let mut surfaces = entry
                 .used_by
                 .iter()
@@ -642,15 +806,24 @@ impl MetricsRegistry {
                     source_kind: Arc::from(entry.source.kind.as_str()),
                 };
                 seen.insert(key.clone());
-                self.tls_cert_gauges
-                    .entry(key)
-                    .and_modify(|values| values.update(expiry_seconds, not_before_ts))
-                    .or_insert_with(|| TlsCertGaugeValues::new(expiry_seconds, not_before_ts));
+                match self.tls_cert_gauges.entry(key) {
+                    dashmap::mapref::entry::Entry::Occupied(existing) => {
+                        changed |= existing.get().update(not_after_ts, not_before_ts);
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                        vacant.insert(TlsCertGaugeValues::new(not_after_ts, not_before_ts));
+                        changed = true;
+                    }
+                }
             }
         }
 
+        let old_len = self.tls_cert_gauges.len();
         self.tls_cert_gauges.retain(|key, _| seen.contains(key));
-        self.render_cache.store(Arc::new(None));
+        changed |= self.tls_cert_gauges.len() != old_len;
+        if changed {
+            self.render_cache.store(Arc::new(None));
+        }
     }
 
     pub fn record_tls_source_refresh(
@@ -800,8 +973,9 @@ impl MetricsRegistry {
         // Increment request counter (composite key — no format!() allocation)
         let counter_key = CounterKey {
             proxy_id: Arc::clone(&proxy_id),
-            method: Arc::from(summary.http_method.as_str()),
+            method: method_label(summary.http_method.as_str()),
             status_code: summary.response_status_code,
+            grpc_status: grpc_status_label(&summary.metadata),
         };
         self.request_counter
             .entry(counter_key)
@@ -864,11 +1038,12 @@ impl MetricsRegistry {
             .cache_invalidation_min_age_nanos
             .load(Ordering::Relaxed);
         let cached = self.render_cache.load();
-        if let Some((generated_at, _)) = **cached {
-            let age_nanos = generated_at.elapsed().as_nanos() as u64;
-            if age_nanos < min_age_nanos {
-                return; // Cache is young enough, skip invalidation
-            }
+        let Some((generated_at, _)) = &**cached else {
+            return; // Already invalid: avoid another Arc allocation + atomic store.
+        };
+        let age_nanos = generated_at.elapsed().as_nanos() as u64;
+        if age_nanos < min_age_nanos {
+            return; // Cache is young enough, skip invalidation
         }
         self.render_cache.store(Arc::new(None));
     }
@@ -942,6 +1117,38 @@ impl MetricsRegistry {
             keep
         });
 
+        self.ws_session_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.ws_session_duration_buckets.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.ws_bytes_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.ws_frames_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         self.client_disconnect_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
@@ -967,6 +1174,47 @@ impl MetricsRegistry {
         });
 
         self.mesh_tcp_egress_connection_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.mesh_outbound_registry_decisions.retain(|_, hosts| {
+            hosts.retain(|_, counters| {
+                let keep = counters.admit.nanos_since_update(self.epoch) < ttl_nanos
+                    || counters.deny.nanos_since_update(self.epoch) < ttl_nanos;
+                if !keep {
+                    evicted += 1;
+                }
+                keep
+            });
+            let keep = !hosts.is_empty();
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.mesh_outbound_registry_stream_decisions
+            .retain(|_, protocols| {
+                protocols.retain(|_, counters| {
+                    let keep = counters.admit.nanos_since_update(self.epoch) < ttl_nanos
+                        || counters.deny.nanos_since_update(self.epoch) < ttl_nanos;
+                    if !keep {
+                        evicted += 1;
+                    }
+                    keep
+                });
+                let keep = !protocols.is_empty();
+                if !keep {
+                    evicted += 1;
+                }
+                keep
+            });
+
+        self.tls_source_refresh_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
                 evicted += 1;
@@ -1043,6 +1291,10 @@ impl MetricsRegistry {
             + self.mesh_request_duration_buckets.len() * 1800
             + self.stream_connection_counter.len() * 200
             + self.stream_duration_buckets.len() * 800
+            + self.ws_session_counter.len() * 320
+            + self.ws_session_duration_buckets.len() * 1000
+            + self.ws_bytes_counter.len() * 180
+            + self.ws_frames_counter.len() * 180
             + self.hbone_relay_failure_counter.len() * 240
             + self.mesh_tcp_egress_connection_counter.len() * 120
             + self
@@ -1085,6 +1337,9 @@ impl MetricsRegistry {
             .read()
             .map(|l| l.clone())
             .unwrap_or_default();
+        // Mesh families reserve `namespace` for workload/resource namespaces,
+        // so the gateway's configured namespace uses a distinct stable label.
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
 
         // Request counter
         output.push_str("# HELP ferrum_requests_total Total number of requests processed.\n");
@@ -1093,11 +1348,17 @@ impl MetricsRegistry {
             let key = entry.key();
             let count = entry.value().value.load(Ordering::Relaxed);
             let proxy_id = escape_label_value(&key.proxy_id);
-            let method = escape_label_value(&key.method);
-            output.push_str(&format!(
-                "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"{}}} {}\n",
-                proxy_id, method, key.status_code, ns_label, count
-            ));
+            if let Some(grpc_status) = key.grpc_status {
+                output.push_str(&format!(
+                    "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\",grpc_status=\"{}\"{}}} {}\n",
+                    proxy_id, key.method, key.status_code, grpc_status, ns_label, count
+                ));
+            } else {
+                output.push_str(&format!(
+                    "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"{}}} {}\n",
+                    proxy_id, key.method, key.status_code, ns_label, count
+                ));
+            }
         }
 
         // Request duration histogram
@@ -1154,8 +1415,8 @@ impl MetricsRegistry {
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let labels = prometheus_helpers::mesh_label_fragment(entry.key(), None);
                 output.push_str(&format!(
-                    "ferrum_mesh_requests_total{{{}}} {}\n",
-                    labels, count
+                    "ferrum_mesh_requests_total{{{}{}}} {}\n",
+                    labels, gateway_ns_label, count
                 ));
             }
         }
@@ -1166,7 +1427,12 @@ impl MetricsRegistry {
             );
             output.push_str("# TYPE ferrum_mesh_request_duration_ms histogram\n");
             for entry in self.mesh_request_duration_buckets.iter() {
-                prometheus_helpers::render_mesh_histogram(&mut output, entry.key(), entry.value());
+                prometheus_helpers::render_mesh_histogram(
+                    &mut output,
+                    entry.key(),
+                    entry.value(),
+                    &gateway_ns_label,
+                );
             }
         }
 
@@ -1219,6 +1485,70 @@ impl MetricsRegistry {
                     entry.value(),
                     &ns_label,
                 );
+            }
+        }
+
+        if !self.ws_session_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_websocket_sessions_total Completed WebSocket sessions by bounded terminal classification.\n",
+            );
+            output.push_str("# TYPE ferrum_websocket_sessions_total counter\n");
+            for entry in self.ws_session_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(&key.proxy_id);
+                output.push_str(&format!(
+                    "ferrum_websocket_sessions_total{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\"{}}} {}\n",
+                    proxy_id,
+                    key.result,
+                    key.direction,
+                    key.io_side,
+                    key.error_class,
+                    ns_label,
+                    count
+                ));
+            }
+        }
+
+        if !self.ws_session_duration_buckets.is_empty() {
+            output.push_str(
+                "# HELP ferrum_websocket_session_duration_ms WebSocket session duration in milliseconds.\n",
+            );
+            output.push_str("# TYPE ferrum_websocket_session_duration_ms histogram\n");
+            for entry in self.ws_session_duration_buckets.iter() {
+                render_ws_histogram(&mut output, entry.key(), entry.value(), &ns_label);
+            }
+        }
+
+        if !self.ws_bytes_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_websocket_bytes_total WebSocket payload bytes relayed by direction.\n",
+            );
+            output.push_str("# TYPE ferrum_websocket_bytes_total counter\n");
+            for entry in self.ws_bytes_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(&key.proxy_id);
+                output.push_str(&format!(
+                    "ferrum_websocket_bytes_total{{proxy_id=\"{}\",direction=\"{}\"{}}} {}\n",
+                    proxy_id, key.direction, ns_label, count
+                ));
+            }
+        }
+
+        if !self.ws_frames_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_websocket_frames_total WebSocket frames relayed by direction.\n",
+            );
+            output.push_str("# TYPE ferrum_websocket_frames_total counter\n");
+            for entry in self.ws_frames_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(&key.proxy_id);
+                output.push_str(&format!(
+                    "ferrum_websocket_frames_total{{proxy_id=\"{}\",direction=\"{}\"{}}} {}\n",
+                    proxy_id, key.direction, ns_label, count
+                ));
             }
         }
 
@@ -1375,6 +1705,7 @@ impl MetricsRegistry {
         }
 
         if !self.tls_cert_gauges.is_empty() {
+            let now_ts = Utc::now().timestamp();
             output.push_str(
                 "# HELP ferrum_tls_cert_expiry_seconds Seconds until the certificate leaf not_after timestamp. Negative means expired.\n",
             );
@@ -1388,7 +1719,11 @@ impl MetricsRegistry {
                 let cert_id = escape_label_value(&key.cert_id);
                 let surface = escape_label_value(&key.surface);
                 let source_kind = escape_label_value(&key.source_kind);
-                let expiry = entry.value().expiry_seconds.load(Ordering::Relaxed);
+                let expiry = entry
+                    .value()
+                    .not_after_unix_seconds
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(now_ts);
                 let not_before = entry
                     .value()
                     .not_before_unix_seconds
@@ -1474,7 +1809,10 @@ impl MetricsRegistry {
             }
         }
 
-        prometheus_helpers::render_mesh_observability_metrics(&mut output);
+        prometheus_helpers::render_mesh_observability_metrics_with_gateway_namespace(
+            &mut output,
+            &gateway_ns_label,
+        );
 
         if let Some(snapshot) = self.database_delta_poll_metrics_snapshot() {
             output.push_str(
@@ -1727,6 +2065,14 @@ fn namespace_label_body(ns_label: &str) -> &str {
     ns_label.strip_prefix(',').unwrap_or(ns_label)
 }
 
+fn gateway_namespace_label(ns_label: &str) -> String {
+    if ns_label.is_empty() {
+        String::new()
+    } else {
+        format!(",gateway_{}", namespace_label_body(ns_label))
+    }
+}
+
 /// Render a single histogram's buckets, sum, and count into the output buffer.
 fn render_histogram(
     output: &mut String,
@@ -1755,6 +2101,47 @@ fn render_histogram(
     output.push_str(&format!(
         "{}_count{{proxy_id=\"{}\"{}}} {}\n",
         metric_name, proxy_id, ns_label, total_count
+    ));
+}
+
+fn render_ws_histogram(
+    output: &mut String,
+    key: &WsSessionKey,
+    histogram: &HistogramBuckets,
+    ns_label: &str,
+) {
+    let proxy_id = escape_label_value(&key.proxy_id);
+    for (i, boundary) in histogram.boundaries.iter().enumerate() {
+        let count = histogram.counts[i].load(Ordering::Relaxed);
+        output.push_str(&format!(
+            "ferrum_websocket_session_duration_ms_bucket{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",le=\"{}\"{}}} {}\n",
+            proxy_id,
+            key.result,
+            key.direction,
+            key.io_side,
+            key.error_class,
+            boundary,
+            ns_label,
+            count
+        ));
+    }
+    let total_count = histogram.count.load(Ordering::Relaxed);
+    let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
+    let labels = format!(
+        "proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\"",
+        proxy_id, key.result, key.direction, key.io_side, key.error_class
+    );
+    output.push_str(&format!(
+        "ferrum_websocket_session_duration_ms_bucket{{{},le=\"+Inf\"{}}} {}\n",
+        labels, ns_label, total_count
+    ));
+    output.push_str(&format!(
+        "ferrum_websocket_session_duration_ms_sum{{{}{}}} {:.2}\n",
+        labels, ns_label, sum
+    ));
+    output.push_str(&format!(
+        "ferrum_websocket_session_duration_ms_count{{{}{}}} {}\n",
+        labels, ns_label, total_count
     ));
 }
 
@@ -1863,6 +2250,14 @@ impl Plugin for PrometheusMetrics {
         self.registry.record_stream(summary);
     }
 
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        self.registry.record_ws_session(ctx);
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         self.registry.record(summary);
     }
@@ -1883,12 +2278,11 @@ mod tests {
         TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
     };
 
-    #[test]
-    fn renders_tls_certificate_inventory_gauges() {
-        let registry = MetricsRegistry::new();
-        let not_before = Utc::now() - chrono::Duration::days(1);
-        let not_after = Utc::now() + chrono::Duration::days(30);
-        let inventory = TlsInventory {
+    fn test_inventory(
+        not_before: chrono::DateTime<Utc>,
+        not_after: chrono::DateTime<Utc>,
+    ) -> TlsInventory {
+        TlsInventory {
             entries: vec![TlsInventoryEntry {
                 id: "certificate-test".to_string(),
                 material_kind: "certificate".to_string(),
@@ -1917,7 +2311,15 @@ mod tests {
                 crl_count: None,
                 error: None,
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn renders_tls_certificate_inventory_gauges() {
+        let registry = MetricsRegistry::new();
+        let not_before = Utc::now() - chrono::Duration::days(1);
+        let not_after = Utc::now() + chrono::Duration::days(30);
+        let inventory = test_inventory(not_before, not_after);
 
         registry.refresh_tls_certificate_inventory(&inventory);
         let output = registry.render_uncached();
@@ -1927,6 +2329,57 @@ mod tests {
         assert!(output.contains("cert_id=\"certificate-test\""));
         assert!(output.contains("surface=\"frontend_tls\""));
         assert!(output.contains("source_kind=\"file\""));
+    }
+
+    #[test]
+    fn unchanged_tls_inventory_preserves_render_cache() {
+        let registry = MetricsRegistry::new();
+        let inventory = test_inventory(
+            Utc::now() - chrono::Duration::days(1),
+            Utc::now() + chrono::Duration::days(30),
+        );
+        registry.refresh_tls_certificate_inventory(&inventory);
+        let _ = registry.render();
+        let before = registry.render_cache.load_full();
+
+        registry.refresh_tls_certificate_inventory(&inventory);
+        let after = registry.render_cache.load_full();
+
+        assert!(Arc::ptr_eq(&before, &after));
+        assert!(after.is_some());
+    }
+
+    #[test]
+    fn changed_or_removed_tls_inventory_invalidates_render_cache() {
+        let registry = MetricsRegistry::new();
+        let mut inventory = test_inventory(
+            Utc::now() - chrono::Duration::days(1),
+            Utc::now() + chrono::Duration::days(30),
+        );
+        registry.refresh_tls_certificate_inventory(&inventory);
+        let _ = registry.render();
+
+        inventory.entries[0].not_after = Some(Utc::now() + chrono::Duration::days(60));
+        registry.refresh_tls_certificate_inventory(&inventory);
+        assert!(registry.render_cache.load().is_none());
+
+        let _ = registry.render();
+        registry.refresh_tls_certificate_inventory(&TlsInventory {
+            entries: Vec::new(),
+        });
+        assert!(registry.render_cache.load().is_none());
+        assert!(registry.tls_cert_gauges.is_empty());
+    }
+
+    #[test]
+    fn recording_while_cache_is_invalid_does_not_replace_empty_arc() {
+        let registry = MetricsRegistry::new();
+        let before = registry.render_cache.load_full();
+        registry.record_rate_limit_exceeded();
+        let after = registry.render_cache.load_full();
+
+        assert!(Arc::ptr_eq(&before, &after));
+        assert!(after.is_none());
     }
 
     #[test]

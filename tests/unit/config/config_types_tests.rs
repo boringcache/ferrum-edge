@@ -4338,6 +4338,22 @@ fn transaction_log_schema_pc(scope: PluginScope, proxy_id: Option<&str>) -> Plug
     }
 }
 
+fn prometheus_metrics_pc(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> PluginConfig {
+    PluginConfig {
+        id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "prometheus_metrics".into(),
+        config: serde_json::json!({}),
+        scope,
+        proxy_id: proxy_id.map(str::to_string),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
 #[test]
 fn transaction_log_schema_global_scope_admitted_by_both_surfaces() {
     let pc = transaction_log_schema_pc(PluginScope::Global, None);
@@ -4413,6 +4429,53 @@ fn transaction_log_schema_proxy_scope_rejected_by_both_surfaces() {
             .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
         "unexpected validate_plugin_references errors: {ref_errors:?}"
     );
+}
+
+#[test]
+fn prometheus_metrics_requires_global_scope_on_both_validation_surfaces() {
+    for (scope, proxy_id) in [
+        (PluginScope::ProxyGroup, None),
+        (PluginScope::Proxy, Some("p1")),
+    ] {
+        let pc = prometheus_metrics_pc("prometheus", scope, proxy_id);
+        let field_errors = pc
+            .validate_fields()
+            .expect_err("admin validation must reject scoped prometheus_metrics");
+        assert!(field_errors.iter().any(|error| {
+            error.contains("prometheus_metrics") && error.contains("scope 'global'")
+        }));
+
+        let mut config = empty_config();
+        config.proxies = vec![make_proxy("p1", "/api")];
+        config.plugin_configs = vec![pc];
+        let reference_errors = config
+            .validate_plugin_references()
+            .expect_err("runtime validation must reject scoped prometheus_metrics");
+        assert!(reference_errors.iter().any(|error| {
+            error.contains("prometheus_metrics") && error.contains("scope 'global'")
+        }));
+    }
+}
+
+#[test]
+fn prometheus_metrics_rejects_duplicate_enabled_global_instances() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        prometheus_metrics_pc("prometheus-a", PluginScope::Global, None),
+        prometheus_metrics_pc("prometheus-b", PluginScope::Global, None),
+    ];
+
+    let errors = config
+        .validate_plugin_references()
+        .expect_err("one process may have only one enabled Prometheus registry owner");
+    assert!(errors.iter().any(|error| {
+        error.contains("at most one enabled global instance")
+            && error.contains("prometheus-a")
+            && error.contains("prometheus-b")
+    }));
+
+    config.plugin_configs[1].enabled = false;
+    assert!(config.validate_plugin_references().is_ok());
 }
 
 #[test]

@@ -3082,6 +3082,7 @@ async fn handle_h3_request(
                 body_error_class: outcome.body_error_class,
                 bytes_streamed: outcome.bytes_streamed,
                 client_disconnected: outcome.client_disconnected,
+                grpc_status: None,
             };
             run_response_stream_termination_hooks(
                 &plugins,
@@ -4013,6 +4014,7 @@ async fn handle_h3_request(
             body_error_class,
             bytes_streamed,
             client_disconnected,
+            grpc_status: None,
         };
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
@@ -4552,6 +4554,7 @@ async fn handle_h3_request(
             body_error_class: h3_stream_result.body_error_class,
             bytes_streamed: h3_stream_result.bytes_streamed,
             client_disconnected: h3_stream_result.client_disconnected,
+            grpc_status: None,
         };
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
@@ -7263,6 +7266,12 @@ async fn dispatch_grpc_native_h3(
             health_error_class,
             backend_admission_response_elapsed,
         );
+        let grpc_status = wire_grpc_status.as_deref().map_or(
+            crate::proxy::grpc_proxy::grpc_status::UNKNOWN,
+            crate::proxy::grpc_proxy::parse_grpc_status_value,
+        );
+        ctx.metadata
+            .insert("grpc_status".to_string(), grpc_status.to_string());
         log_h3_grpc_transaction(
             proxy,
             ctx,
@@ -7609,10 +7618,11 @@ async fn dispatch_grpc_native_h3(
             };
             match trailers_result {
                 Ok(Some(mut trailers)) => {
-                    grpc_trailer_status = trailers
-                        .get("grpc-status")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.trim().parse::<u32>().ok());
+                    grpc_trailer_status = trailers.get("grpc-status").map(|value| {
+                        value.to_str().map_or(u32::MAX, |value| {
+                            crate::proxy::grpc_proxy::parse_grpc_status_value(value)
+                        })
+                    });
                     strip_response_hop_by_hop_trailers(&mut trailers);
                     let finish_ok = if !trailers.is_empty() {
                         // `send_trailers` only writes the trailer HEADERS frame;
@@ -7776,6 +7786,15 @@ async fn dispatch_grpc_native_h3(
         body_outcome_error_class,
         backend_admission_response_elapsed,
     );
+    let grpc_status = grpc_trailer_status
+        .or_else(|| {
+            wire_grpc_status
+                .as_deref()
+                .map(crate::proxy::grpc_proxy::parse_grpc_status_value)
+        })
+        .unwrap_or(crate::proxy::grpc_proxy::grpc_status::UNKNOWN);
+    ctx.metadata
+        .insert("grpc_status".to_string(), grpc_status.to_string());
     log_h3_grpc_transaction(
         proxy,
         ctx,

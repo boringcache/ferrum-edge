@@ -362,7 +362,7 @@ Given all built-in plugins enabled, the execution order is:
 | 74 | `ws_logging` | 9175 | log, on_stream_disconnect |
 | 75 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
 | 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
-| 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect, on_ws_disconnect |
 | 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
 | 79 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
 | 80 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |

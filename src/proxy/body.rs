@@ -854,15 +854,24 @@ impl http_body::Body for ProxyBody {
                         .fetch_add(data.len() as u64, Ordering::Relaxed);
                 }
                 let is_trailers = frame.trailers_ref().is_some();
+                let grpc_status = frame
+                    .trailers_ref()
+                    .and_then(|trailers| trailers.get("grpc-status"))
+                    .map(|value| {
+                        value.to_str().map_or(u32::MAX, |value| {
+                            crate::proxy::grpc_proxy::parse_grpc_status_value(value)
+                        })
+                    });
                 // gRPC streaming: the response can finish HTTP 200 while the real
                 // outcome rides in the grpc-status trailer. Capture a non-OK status
                 // once and feed both deferred admission and backend dispatch
                 // accounting from the same mapped value.
                 if let Some(trailers) = frame.trailers_ref()
-                    && let Some(code) = trailers
-                        .get("grpc-status")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.trim().parse::<u32>().ok())
+                    && let Some(code) = trailers.get("grpc-status").map(|value| {
+                        value.to_str().map_or(u32::MAX, |value| {
+                            crate::proxy::grpc_proxy::parse_grpc_status_value(value)
+                        })
+                    })
                     && code != 0
                 {
                     let status = crate::proxy::grpc_proxy::grpc_status_to_http_status(code);
@@ -880,7 +889,10 @@ impl http_body::Body for ProxyBody {
                 if is_trailers {
                     if let Some(logger) = this.logger.take() {
                         let bytes = this.bytes_streamed.load(Ordering::Relaxed);
-                        logger.fire(crate::proxy::deferred_log::BodyOutcome::success(bytes));
+                        logger.fire(
+                            crate::proxy::deferred_log::BodyOutcome::success(bytes)
+                                .with_grpc_status(grpc_status),
+                        );
                     }
                     this.record_deferred_backend_admission(None, false);
                     this.record_deferred_backend_dispatch(None, false);

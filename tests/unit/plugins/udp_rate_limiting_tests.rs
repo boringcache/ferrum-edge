@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, ProxyProtocol, StreamBytesKind, UDP_ONLY_PROTOCOLS,
@@ -208,9 +209,13 @@ async fn datagrams_exceeding_limit_are_dropped() {
             UdpDatagramVerdict::Forward
         );
     }
-    // 6th datagram should be dropped
+    // 6th datagram should be dropped and exported by the aggregate limiter
+    // metric.
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.rate_limit_exceeded.load(Ordering::Relaxed);
     let ctx = make_ctx("10.0.0.1", 100);
     assert_eq!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop);
+    assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) > before);
 }
 
 #[tokio::test]

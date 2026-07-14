@@ -2657,6 +2657,10 @@ where
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::Acquire))
     {
+        ctx.metadata.insert(
+            "grpc_status".to_string(),
+            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED.to_string(),
+        );
         record_backend_outcome(
             state,
             proxy,
@@ -2785,6 +2789,17 @@ where
         sticky_cookie_needed,
         &mut streaming.headers,
     );
+    // Hooks may rewrite/remove a Trailers-Only status. Record their final
+    // client-visible header result now; a real terminal trailer wins below.
+    let client_header_grpc_status = streaming
+        .headers
+        .get("grpc-status")
+        .map(|status| crate::proxy::grpc_proxy::parse_grpc_status_value(status));
+    crate::proxy::grpc_proxy::refresh_grpc_status_metadata(
+        &mut ctx.metadata,
+        &HashMap::new(),
+        &streaming.headers,
+    );
 
     if let Err(error) = send_response_headers(stream, streaming.status, &streaming.headers).await {
         debug!("cross-protocol H3 gRPC streaming response header write failed: {error}");
@@ -2842,10 +2857,11 @@ where
         crate::http3::stream_util::abort_response_stream(stream);
         final_body_completed = false;
     } else if body_completed && let Some(mut trailers) = trailers {
-        grpc_trailer_status = trailers
-            .get("grpc-status")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u32>().ok());
+        grpc_trailer_status = trailers.get("grpc-status").map(|value| {
+            value.to_str().map_or(u32::MAX, |value| {
+                crate::proxy::grpc_proxy::parse_grpc_status_value(value)
+            })
+        });
         // Strip RFC 9110 §7.6.1 response-direction hop-by-hop names from
         // the backend gRPC trailers before forwarding to the H3 client,
         // via the shared helper so this site, the buffered path
@@ -2925,6 +2941,15 @@ where
         outcome_error_class,
         backend_admission_start.elapsed(),
     );
+    let terminal_grpc_status = if request_overflowed_late {
+        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
+    } else {
+        grpc_trailer_status
+            .or(client_header_grpc_status)
+            .unwrap_or(grpc_proxy::grpc_status::UNKNOWN)
+    };
+    ctx.metadata
+        .insert("grpc_status".to_string(), terminal_grpc_status.to_string());
     Ok(CrossProtocolOutcome {
         response_status: streaming.status,
         response_streamed: true,
@@ -3429,6 +3454,12 @@ where
                     &resp.headers,
                     resp.status,
                 );
+            if let Some(grpc_status) =
+                crate::proxy::grpc_proxy::grpc_status_from_maps(&resp.trailers, &resp.headers)
+            {
+                ctx.metadata
+                    .insert("grpc_status".to_string(), grpc_status.to_string());
+            }
             let (mut plugin_response_headers, header_shadowed_trailer_keys) =
                 crate::proxy::grpc_proxy::build_grpc_plugin_header_view(
                     &resp.headers,
@@ -3651,6 +3682,13 @@ where
                 &plugin_response_headers,
                 &resp.headers,
                 &header_shadowed_trailer_keys,
+            );
+            // Admission retains the pristine backend status; transaction
+            // metadata follows the post-hook status that the H3 client sees.
+            crate::proxy::grpc_proxy::refresh_grpc_status_metadata(
+                &mut ctx.metadata,
+                &response_trailers,
+                &plugin_response_headers,
             );
             let mut response_headers = plugin_response_headers;
             for k in response_trailers.keys() {

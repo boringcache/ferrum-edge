@@ -1097,7 +1097,11 @@ The plugin runs across all protocols (HTTP, gRPC, WebSocket, TCP, UDP). For stre
 ### `prometheus_metrics`
 
 Records gateway metrics in Prometheus exposition format. The admin API serves
-the `/metrics` endpoint; this plugin records request and stream metrics.
+the authenticated `/metrics` endpoint; this plugin records HTTP/gRPC requests,
+WebSocket completions, and TCP/UDP stream metrics. At most one enabled
+`prometheus_metrics` config is permitted per process and it must have `global`
+scope. This keeps the process-wide registry, render-cache policy, and namespace
+label deterministic across reloads.
 Mesh deployments also get `ferrum_mesh_hbone_relay_failures_total` for HBONE
 CONNECT tunnels that fail after the `200 OK` response has already been sent,
 labelled by `proxy_id`, relay `direction`, and `error_class`.
@@ -1110,7 +1114,30 @@ labelled by `proxy_id`, relay `direction`, and `error_class`.
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle metric entries live before eviction (prevents unbounded memory growth from deleted/recreated proxies) |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Under extreme load this prevents an allocation per request — the render TTL is the real freshness guarantee |
 
-> **Namespace isolation:** All Prometheus metrics include a `namespace` label (for example, `namespace="ferrum"` or `namespace="staging"`). This prevents metric collisions when multiple gateway instances with different namespaces are scraped by the same Prometheus server.
+`ferrum_requests_total` labels standard HTTP methods individually and maps every
+extension/unknown method to `method="OTHER"`, keeping request-controlled method
+cardinality bounded. gRPC transactions retain the HTTP transport status and add
+the terminal numeric `grpc_status` (`0`–`16`, or `OTHER` for malformed/future
+codes), so application failures under HTTP 200 are distinguishable. The
+`ferrum_rate_limit_exceeded_total` process counter aggregates each rejection,
+UDP drop, and WebSocket policy close produced by `rate_limiting`,
+`ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`.
+
+WebSocket teardown exports `ferrum_websocket_sessions_total`,
+`ferrum_websocket_session_duration_ms`, `ferrum_websocket_bytes_total`, and
+`ferrum_websocket_frames_total`. Terminal labels come only from bounded enums;
+peer-supplied close reasons and error messages are never metric labels.
+
+Certificate inventory keeps absolute validity timestamps internally and derives
+the relative expiry gauge on an uncached render. An unchanged TLS refresh does
+not invalidate the render cache. Stale eviction covers every dynamic metric
+map, including TLS refresh series and nested mesh decision maps.
+
+> **Namespace isolation:** Non-mesh metrics use the gateway `namespace` label
+> (for example, `namespace="ferrum"`). Mesh families already reserve
+> `namespace` for resource identity, so they use `gateway_namespace` for the
+> gateway's configured namespace. This avoids duplicate label keys while still
+> preventing collisions across gateway namespaces.
 
 ### `api_chargeback`
 
@@ -1162,8 +1189,9 @@ configured) but no per-call charge.
 | `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task |
 
 **Admin endpoint:** `GET /charges` requires a valid admin JWT in
-`Authorization: Bearer <token>`. Unlike `/metrics`, this endpoint is
-authenticated because chargeback output can contain customer and billing data.
+`Authorization: Bearer <token>`. Chargeback output can contain customer and
+billing data; `/metrics` is likewise protected by the observability-detail
+authentication policy.
 
 | Query Parameter | Description |
 |---|---|

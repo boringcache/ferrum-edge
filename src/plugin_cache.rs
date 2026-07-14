@@ -1124,6 +1124,29 @@ pub struct PluginCache {
     http_client: PluginHttpClient,
 }
 
+fn validate_prometheus_metrics_ownership(config: &GatewayConfig) -> Result<(), String> {
+    let mut enabled = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.enabled && plugin.plugin_name == "prometheus_metrics");
+    let Some(first) = enabled.next() else {
+        return Ok(());
+    };
+    if first.scope != PluginScope::Global {
+        return Err(format!(
+            "PluginConfig '{}' (prometheus_metrics) must have scope 'global'",
+            first.id
+        ));
+    }
+    if let Some(second) = enabled.next() {
+        return Err(format!(
+            "prometheus_metrics permits at most one enabled global instance; found '{}' and '{}'",
+            first.id, second.id
+        ));
+    }
+    Ok(())
+}
+
 impl PluginCache {
     /// Build a new plugin cache from the given config with a default HTTP client.
     #[allow(dead_code)]
@@ -1158,6 +1181,7 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
     ) -> Result<Arc<PluginCacheInner>, String> {
+        validate_prometheus_metrics_ownership(config)?;
         let (
             proxy_map,
             globals,
@@ -1250,6 +1274,7 @@ impl PluginCache {
         removed_proxy_ids: &[String],
         rebuild_globals: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
+        validate_prometheus_metrics_ownership(config)?;
         let mut plugin_errors: Vec<String> = Vec::new();
 
         // Rebuild globals if any global plugin config changed

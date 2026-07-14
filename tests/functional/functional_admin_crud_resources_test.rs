@@ -1079,13 +1079,9 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
         let config = plugin_config_fixture(plugin_name, &dispatch_upstream_id);
         let (scope, proxy_id) = match *plugin_name {
             "openapi_validator" => ("proxy", Some(validator_proxy_id.as_str())),
-            // `transaction_log_schema` registers process-global named schemas, so
-            // both the admin write path and the runtime rejecting contract require
-            // scope 'global'. Creating it as proxy_group is admitted by admin but
-            // rejected by every subsequent full-config load, which flips the DB
-            // poll loop to db_available=false and wedges the admin API read-only
-            // (issue #2158).
-            "transaction_log_schema" => ("global", None),
+            // These plugins own process-global registries, so the admin write
+            // path and runtime rejecting contract both require global scope.
+            "transaction_log_schema" | "prometheus_metrics" => ("global", None),
             _ => ("proxy_group", None),
         };
 

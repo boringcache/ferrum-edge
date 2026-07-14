@@ -3860,6 +3860,19 @@ impl GatewayConfig {
             .collect();
         let mut errors = Vec::new();
 
+        let enabled_prometheus_metrics: Vec<&str> = self
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.enabled && plugin.plugin_name == "prometheus_metrics")
+            .map(|plugin| plugin.id.as_str())
+            .collect();
+        if enabled_prometheus_metrics.len() > 1 {
+            errors.push(format!(
+                "prometheus_metrics permits at most one enabled global instance; found: {}",
+                enabled_prometheus_metrics.join(", ")
+            ));
+        }
+
         for plugin in &self.plugin_configs {
             // `transaction_log_schema` is process-global by design (it
             // registers named schemas into a single registry); reject
@@ -3868,6 +3881,12 @@ impl GatewayConfig {
             {
                 errors.push(format!(
                     "PluginConfig '{}' (transaction_log_schema) must have scope 'global'",
+                    plugin.id
+                ));
+            }
+            if plugin.plugin_name == "prometheus_metrics" && plugin.scope != PluginScope::Global {
+                errors.push(format!(
+                    "PluginConfig '{}' (prometheus_metrics) must have scope 'global'",
                     plugin.id
                 ));
             }
@@ -6410,6 +6429,12 @@ impl PluginConfig {
         if self.plugin_name == "transaction_log_schema" && self.scope != PluginScope::Global {
             errors.push(
                 "transaction_log_schema must have scope 'global' (it registers process-global named schemas)"
+                    .to_string(),
+            );
+        }
+        if self.plugin_name == "prometheus_metrics" && self.scope != PluginScope::Global {
+            errors.push(
+                "prometheus_metrics must have scope 'global' (it owns one process-wide registry)"
                     .to_string(),
             );
         }

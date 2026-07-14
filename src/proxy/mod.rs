@@ -17030,6 +17030,12 @@ async fn handle_proxy_request_inner(
 
                 // after_proxy plugins run on headers only (body is not yet in memory).
                 let mut response_headers: HashMap<String, String> = grpc_streaming.headers;
+                let grpc_header_status =
+                    grpc_proxy::grpc_status_from_maps(&EMPTY_HEADERS, &response_headers);
+                if let Some(grpc_status) = grpc_header_status {
+                    ctx.metadata
+                        .insert("grpc_status".to_string(), grpc_status.to_string());
+                }
                 let grpc_backend_dispatch_status = grpc_proxy::grpc_admission_status_from_maps(
                     &EMPTY_HEADERS,
                     &response_headers,
@@ -17197,6 +17203,14 @@ async fn handle_proxy_request_inner(
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
+                // Hooks may rewrite/remove a Trailers-Only grpc-status in the
+                // initial header block. Seed deferred metadata from the final
+                // client-visible headers; a later real trailer overrides it.
+                grpc_proxy::refresh_grpc_status_metadata(
+                    &mut ctx.metadata,
+                    &EMPTY_HEADERS,
+                    &response_headers,
+                );
 
                 // Check if the streaming request body exceeded the size limit
                 // BEFORE logging — otherwise the transaction summary captures a
@@ -17215,6 +17229,12 @@ async fn handle_proxy_request_inner(
                 } else {
                     None
                 };
+                if body_exceeded {
+                    ctx.metadata.insert(
+                        "grpc_status".to_string(),
+                        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED.to_string(),
+                    );
+                }
 
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
@@ -17523,11 +17543,14 @@ async fn handle_proxy_request_inner(
                             // because gRPC errors ride on HTTP/2 and this is
                             // a framing/build failure on the response stream,
                             // not a client-initiated request failure.
-                            logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
-                                crate::retry::ErrorClass::ProtocolError,
-                                0,
-                                false,
-                            ));
+                            logger.fire(
+                                crate::proxy::deferred_log::BodyOutcome::error(
+                                    crate::retry::ErrorClass::ProtocolError,
+                                    0,
+                                    false,
+                                )
+                                .with_grpc_status(Some(grpc_proxy::grpc_status::UNAVAILABLE)),
+                            );
                         }
                         return Ok(grpc_proxy::build_grpc_error_response(
                             grpc_proxy::grpc_status::UNAVAILABLE,
@@ -17541,6 +17564,12 @@ async fn handle_proxy_request_inner(
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
                 let mut response_body = grpc_resp.body;
+                if let Some(grpc_status) =
+                    grpc_proxy::grpc_status_from_maps(&response_trailers, &response_headers)
+                {
+                    ctx.metadata
+                        .insert("grpc_status".to_string(), grpc_status.to_string());
+                }
                 // `response_trailers` is the backend's untouched trailer map at
                 // this point (moved out of `grpc_resp` above, reconciled with
                 // plugin mutations only later), so the grpc-status mapping is
@@ -17827,6 +17856,15 @@ async fn handle_proxy_request_inner(
                     );
                     response_headers = plugin_response_headers;
                 }
+                // Health/circuit-breaker accounting intentionally retains the
+                // pristine backend status above. Metrics and logs instead track
+                // the final status after response hooks reconciled their edits
+                // back onto the client-visible header/trailer maps.
+                grpc_proxy::refresh_grpc_status_metadata(
+                    &mut ctx.metadata,
+                    &response_trailers,
+                    &response_headers,
+                );
                 if response_body.is_empty() {
                     // True Trailers-Only encoding: no DATA frame, grpc-status
                     // and friends ride in the initial HEADERS with END_STREAM.
