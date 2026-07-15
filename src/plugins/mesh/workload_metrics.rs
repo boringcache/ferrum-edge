@@ -44,6 +44,8 @@ const MESH_DIRECTION_INBOUND: &str = "inbound";
 const MESH_DIRECTION_OUTBOUND: &str = "outbound";
 const TRACEPARENT_HEADER: &str = "traceparent";
 const TRACESTATE_HEADER: &str = "tracestate";
+const CAPTURED_TRACEPARENT_METADATA: &str = "workload_metrics.captured_traceparent";
+const CAPTURED_TRACESTATE_METADATA: &str = "workload_metrics.captured_tracestate";
 const MAX_CUSTOM_TAGS: usize = 32;
 const MAX_CUSTOM_TAG_NAME_BYTES: usize = 128;
 const MAX_CUSTOM_TAG_VALUE_BYTES: usize = 1024;
@@ -405,6 +407,38 @@ impl WorkloadMetrics {
         }
     }
 
+    fn reconcile_captured_trace_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        // `on_request_received` captures inbound W3C context so authorization
+        // rejects remain observable. For accepted requests, request_transformer
+        // runs before this hook and its final header policy is authoritative:
+        // never restore an inbound trace header that it removed. Trace IDs and
+        // sampling metadata remain available for the local span/reject record.
+        if ctx
+            .metadata
+            .remove(CAPTURED_TRACEPARENT_METADATA)
+            .is_some()
+            && !has_valid_traceparent(headers)
+        {
+            ctx.metadata.remove(TRACEPARENT_HEADER);
+            // A transformer may replace a valid inbound value with malformed
+            // hostile input. Drop that value rather than forwarding it or
+            // replacing it with the early cached context.
+            headers.retain(|name, _| !name.eq_ignore_ascii_case(TRACEPARENT_HEADER));
+        }
+        if ctx
+            .metadata
+            .remove(CAPTURED_TRACESTATE_METADATA)
+            .is_some()
+            && header_value(headers, TRACESTATE_HEADER).is_none()
+        {
+            ctx.metadata.remove(TRACESTATE_HEADER);
+        }
+    }
+
     fn resolve_peer_source_identity(
         &self,
         ctx: &mut RequestContext,
@@ -729,7 +763,21 @@ impl Plugin for WorkloadMetrics {
         // labels and trace context; before_proxy refreshes the same metadata
         // after route selection for accepted requests.
         let headers = std::mem::take(&mut ctx.headers);
+        let captured_traceparent = has_valid_traceparent(&headers);
+        let captured_tracestate = header_value(&headers, TRACESTATE_HEADER).is_some();
         self.annotate_http_context(ctx, &headers);
+        if captured_traceparent && ctx.metadata.contains_key(TRACEPARENT_HEADER) {
+            ctx.metadata.insert(
+                CAPTURED_TRACEPARENT_METADATA.to_string(),
+                "true".to_string(),
+            );
+        }
+        if captured_tracestate && ctx.metadata.contains_key(TRACESTATE_HEADER) {
+            ctx.metadata.insert(
+                CAPTURED_TRACESTATE_METADATA.to_string(),
+                "true".to_string(),
+            );
+        }
         ctx.headers = headers;
         PluginResult::Continue
     }
@@ -739,6 +787,7 @@ impl Plugin for WorkloadMetrics {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        self.reconcile_captured_trace_headers(ctx, headers);
         self.annotate_http_context(ctx, headers);
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
             headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
@@ -778,6 +827,11 @@ impl Plugin for WorkloadMetrics {
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
             response_headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
         }
+        // Accepted requests consume these markers in `before_proxy`. Rejects
+        // intentionally retain the early trace context through this hook, then
+        // discard the temporary provenance markers before transaction logging.
+        ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA);
+        ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA);
         PluginResult::Continue
     }
 

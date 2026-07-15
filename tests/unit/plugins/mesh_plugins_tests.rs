@@ -13,6 +13,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::{
     Plugin, PluginFailurePolicy, PluginResult, RequestContext, StreamConnectionContext,
     available_plugins, create_plugin, plugin_failure_policy,
@@ -5464,6 +5465,140 @@ async fn workload_metrics_outbound_listener_stamps_mesh_direction_outbound() {
         ctx.metadata.get("mesh.direction").map(String::as_str),
         Some("outbound")
     );
+}
+
+fn workload_metrics_tracing_plugin() -> WorkloadMetrics {
+    WorkloadMetrics::new(&json!({
+        "sampling_percentage": 100.0
+    }))
+    .expect("tracing workload metrics config")
+}
+
+fn trace_header_remover(header: &str) -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [{
+            "operation": "remove",
+            "target": "header",
+            "key": header
+        }]
+    }))
+    .expect("trace header removal config")
+}
+
+fn inbound_trace_headers() -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "traceparent".to_string(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+        ),
+        ("tracestate".to_string(), "vendor=value".to_string()),
+    ])
+}
+
+#[tokio::test]
+async fn workload_metrics_does_not_restore_traceparent_removed_by_transformer() {
+    let metrics = workload_metrics_tracing_plugin();
+    let transformer = trace_header_remover("traceparent");
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+    assert!(
+        transformer.priority() < metrics.priority(),
+        "request_transformer must finalize request headers before workload_metrics"
+    );
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("trace_id"));
+    assert!(ctx.metadata.contains_key("traceparent"));
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!headers.contains_key("traceparent"));
+
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!headers.contains_key("traceparent"));
+    assert!(!ctx.metadata.contains_key("traceparent"));
+    assert!(ctx.metadata.contains_key("trace_id"));
+
+    let mut response_headers = HashMap::new();
+    let result = metrics
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!response_headers.contains_key("traceparent"));
+}
+
+#[tokio::test]
+async fn workload_metrics_does_not_restore_tracestate_removed_by_transformer() {
+    let metrics = workload_metrics_tracing_plugin();
+    let transformer = trace_header_remover("tracestate");
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!headers.contains_key("tracestate"));
+
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(headers.contains_key("traceparent"));
+    assert!(!headers.contains_key("tracestate"));
+    assert!(!ctx.metadata.contains_key("tracestate"));
+}
+
+#[tokio::test]
+async fn workload_metrics_keeps_unchanged_valid_trace_headers() {
+    let metrics = workload_metrics_tracing_plugin();
+    let transformer = trace_header_remover("x-private");
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let propagated = headers
+        .get("traceparent")
+        .expect("valid traceparent propagated");
+    assert!(propagated.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
+    assert!(propagated.ends_with("-01"));
+    assert_ne!(
+        propagated,
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    );
+    assert_eq!(
+        headers.get("tracestate").map(String::as_str),
+        Some("vendor=value")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_keeps_early_trace_context_for_reject_observability() {
+    let metrics = workload_metrics_tracing_plugin();
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    // Authorization rejects before `before_proxy`, so the early context must
+    // remain available to the rejection response and transaction summary.
+    let mut response_headers = HashMap::new();
+    let result = metrics
+        .after_proxy(&mut ctx, 403, &mut response_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(response_headers.contains_key("traceparent"));
+    assert!(ctx.metadata.contains_key("trace_id"));
+    assert!(ctx.metadata.contains_key("span_id"));
 }
 
 #[tokio::test]
