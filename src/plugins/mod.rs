@@ -224,8 +224,9 @@ pub struct BufferedInitialResponseHeaderPolicyState {
     observed_headers: HashMap<String, String>,
     /// Application-trailer outcomes immediately before initial-header policy
     /// first changed each name. A later non-policy hook clears the entry and
-    /// owns both visible copies; otherwise reconciliation restores this
-    /// pre-policy value (or removal) on the trailer channel.
+    /// owns both visible copies. Otherwise a final policy set/override restores
+    /// this pre-policy outcome on the trailer channel, while a final policy
+    /// removal suppresses both compatibility-view copies.
     pre_policy_application_trailers: HashMap<String, Option<String>>,
 }
 
@@ -331,12 +332,19 @@ impl BufferedInitialResponseHeaderPolicyState {
         }
     }
 
-    /// Application-trailer value to restore when only initial-header policy
-    /// changed this name. `Some(None)` means policy observed a prior removal.
-    pub fn pre_policy_application_trailer(&self, name: &str) -> Option<Option<&str>> {
-        self.pre_policy_application_trailers
-            .get(name)
-            .map(|value| value.as_deref())
+    /// Return the pre-policy application-trailer outcome and whether the final
+    /// policy keeps this name in genuine initial headers. Reconciliation uses
+    /// the presence flag to distinguish a final set/override from a removal;
+    /// `None` leaves the ordinary merged-view outcome authoritative.
+    pub fn application_trailer_initial_response_policy_outcome(
+        &self,
+        name: &str,
+    ) -> Option<(Option<&str>, bool)> {
+        let pre_policy_value = self.pre_policy_application_trailers.get(name)?;
+        Some((
+            pre_policy_value.as_deref(),
+            self.desired_headers.contains_key(name),
+        ))
     }
 
     /// Apply the final ordered policy-owned fields to genuine initial HEADERS.

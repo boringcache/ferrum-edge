@@ -904,6 +904,97 @@ async fn buffered_override_policy_preserves_application_trailer_value() {
 }
 
 #[tokio::test]
+async fn buffered_policy_removal_suppresses_mutated_cookie_and_application_trailers() {
+    let backend_headers = grpc_map(&[
+        ("content-type", "application/grpc"),
+        ("x-powered-by", "backend-header"),
+    ]);
+    let backend_trailers = grpc_map(&[
+        ("grpc-status", "0"),
+        ("set-cookie", "session=backend"),
+        ("x-powered-by", "backend-trailer"),
+        ("x-trailer-only", "backend-trailer"),
+    ]);
+    let original_trailer_set_cookie = backend_trailers.get("set-cookie").cloned();
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    let transformer: Arc<dyn Plugin> = Arc::new(
+        ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "Set-Cookie",
+                "value": "session=mutated"
+            }]
+        }))
+        .unwrap(),
+    );
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {},
+            "remove": ["Set-Cookie", "X-Powered-By", "X-Trailer-Only", "Grpc-Status"]
+        }))
+        .unwrap(),
+    );
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
+
+    let _ = transformer
+        .after_proxy(&mut ctx, 200, &mut plugin_view)
+        .await;
+    policy_state.record_after_proxy_plugin(transformer.as_ref(), &mut plugin_view);
+    assert_eq!(
+        plugin_view.get("set-cookie").map(String::as_str),
+        Some("session=mutated")
+    );
+    let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+
+    let mut wire_trailers = backend_trailers;
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        Some(&policy_state),
+    );
+    let mut initial_headers = plugin_view;
+    grpc_proxy::finalize_buffered_grpc_split_response(
+        &mut initial_headers,
+        &mut wire_trailers,
+        &shadowed,
+        Some(&policy_state),
+        false,
+        original_trailer_set_cookie.as_deref(),
+    );
+
+    for removed_name in ["set-cookie", "x-powered-by", "x-trailer-only"] {
+        assert!(
+            !initial_headers.contains_key(removed_name),
+            "final security policy removal must suppress {removed_name} in initial headers"
+        );
+        assert!(
+            !wire_trailers.contains_key(removed_name),
+            "final security policy removal must suppress {removed_name} in trailers"
+        );
+    }
+    assert!(
+        !initial_headers.contains_key("grpc-status"),
+        "terminal gRPC status must not be promoted to non-empty initial headers"
+    );
+    assert_eq!(
+        wire_trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "policy removal must not disturb terminal gRPC metadata"
+    );
+}
+
+#[tokio::test]
 async fn buffered_policy_state_preserves_later_header_mutator_order() {
     let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
     let backend_trailers = grpc_map(&[("grpc-status", "0"), ("x-policy", "backend-trailer")]);

@@ -1546,7 +1546,10 @@ pub fn build_grpc_plugin_header_view(
 /// wire trailer (a sanitizer must scrub every client-visible copy); an
 /// untouched shadowed trailer keeps the backend's true trailing value. A
 /// non-shadowed (trailer-only) key whose view value changed was edited by a
-/// hook; copy it.
+/// hook; copy it. Initial-header policy provenance is handled separately: a
+/// final set/override preserves the pre-policy application trailer, while a
+/// final removal suppresses it. Reserved gRPC terminal metadata is the sole
+/// removal exception and retains its authoritative pre-policy trailer value.
 pub fn reconcile_grpc_trailers_from_view(
     response_trailers: &mut HashMap<String, String>,
     plugin_response_headers: &HashMap<String, String>,
@@ -1555,9 +1558,13 @@ pub fn reconcile_grpc_trailers_from_view(
     policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
 ) {
     response_trailers.retain(|k, v| {
-        if let Some(pre_policy_value) =
-            policy_state.and_then(|state| state.pre_policy_application_trailer(k))
+        if let Some((pre_policy_value, final_policy_value_present)) = policy_state.and_then(|state| {
+            state.application_trailer_initial_response_policy_outcome(k)
+        })
         {
+            if !final_policy_value_present && !is_reserved_grpc_terminal_metadata(k) {
+                return false;
+            }
             if let Some(pre_policy_value) = pre_policy_value {
                 if !header_shadowed_trailer_keys.contains(k)
                     || original_response_headers.get(k).map(String::as_str)
@@ -1659,6 +1666,43 @@ pub fn apply_buffered_grpc_initial_response_policy(
     }
 }
 
+/// Restore the split gRPC wire channels and apply the final initial-header
+/// policy outcome in one order-preserving boundary operation.
+///
+/// Trailer-derived compatibility fields are removed from initial HEADERS
+/// first. A hook-mutated trailer-only `set-cookie` is then re-homed so the
+/// ordered policy overlay gets the final decision: a later removal suppresses
+/// it, while a later set/override wins without bypassing hook priority. Other
+/// application trailers remain on the trailer channel unless the provenance
+/// state records a final policy removal.
+///
+/// Shared by the H1/H2 buffered response path and the H3 cross-protocol bridge
+/// so channel ownership and policy order cannot drift between frontends.
+pub fn finalize_buffered_grpc_split_response(
+    response_headers: &mut HashMap<String, String>,
+    response_trailers: &mut HashMap<String, String>,
+    header_shadowed_trailer_keys: &HashSet<String>,
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
+    preserve_terminal_metadata: bool,
+    original_trailer_set_cookie: Option<&str>,
+) {
+    strip_non_initial_grpc_trailer_fields(
+        response_headers,
+        response_trailers,
+        header_shadowed_trailer_keys,
+    );
+    rehome_hook_mutated_trailer_set_cookie(
+        response_headers,
+        response_trailers,
+        original_trailer_set_cookie,
+    );
+    apply_buffered_grpc_initial_response_policy(
+        policy_state,
+        response_headers,
+        preserve_terminal_metadata,
+    );
+}
+
 /// Collapse a buffered gRPC Trailers-Only response into its initial HEADERS
 /// while keeping trailer provenance from defeating initial-header policy.
 ///
@@ -1720,11 +1764,11 @@ pub fn collapse_grpc_trailers_only_with_initial_response_policies(
 ///   (`original_trailer_set_cookie` differs from the current wire trailer). An
 ///   untouched backend trailer keeps the backend's faithful split wire shape.
 ///
-/// Must be called AFTER the strip loop and BEFORE sticky-cookie injection (so an
-/// injected sticky `set-cookie` cannot mask the trailer-only check) and BEFORE
-/// the gRPC-Web trailer-clear guard. Shared by the main buffered gRPC path
-/// (`proxy::handle_proxy_request`) and the H3 cross-protocol bridge
-/// (`http3::cross_protocol`) so both stay byte-for-byte identical (#1614).
+/// Must be called AFTER the strip loop and BEFORE the final initial-header
+/// policy overlay, sticky-cookie injection (so an injected sticky `set-cookie`
+/// cannot mask the trailer-only check), and the gRPC-Web trailer-clear guard.
+/// [`finalize_buffered_grpc_split_response`] owns this ordering for both the
+/// main buffered gRPC path and the H3 cross-protocol bridge (#1614).
 pub fn rehome_hook_mutated_trailer_set_cookie(
     response_headers: &mut HashMap<String, String>,
     response_trailers: &mut HashMap<String, String>,

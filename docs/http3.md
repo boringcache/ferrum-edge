@@ -183,8 +183,12 @@ headers and trailers. Before the H3 response is written, Ferrum restores the
 original provenance, reapplies the prefiltered `security_headers` policy to the
 initial header map, and keeps `grpc-status`, `grpc-message`, status details, and
 application metadata on the trailer channel whenever the backend supplied a
-real trailers frame, including split responses with an empty DATA body. A
-backend Trailers-Only response that already carries terminal status in its
+real trailers frame, including split responses with an empty DATA body. A final
+security-policy removal is authoritative across both compatibility copies: it
+also suppresses trailer-only or header-shadowed application metadata, and runs
+after any hook-mutated trailer cookie is rehomed. A final policy set/override
+remains initial-header policy and preserves the backend's application trailer.
+A backend Trailers-Only response that already carries terminal status in its
 END_STREAM initial HEADERS and has no trailers frame keeps that status there;
 policy replay cannot remove or replace it. This is also the path used after
 gRPC-Web binary or text response framing, so security policy cannot disappear

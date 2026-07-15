@@ -18189,28 +18189,15 @@ async fn handle_proxy_request_inner(
                     // keys are never shadowed, so a malformed duplicate
                     // grpc-status initial header is always stripped here:
                     // status must only appear in the trailers.
-                    grpc_proxy::strip_non_initial_grpc_trailer_fields(
+                    grpc_proxy::finalize_buffered_grpc_split_response(
                         &mut response_headers,
-                        &response_trailers,
+                        &mut response_trailers,
                         &header_shadowed_trailer_keys,
-                    );
-                    grpc_proxy::apply_buffered_grpc_initial_response_policy(
                         buffered_initial_response_header_policy_state.as_deref(),
-                        &mut response_headers,
                         false,
+                        original_trailer_set_cookie.as_deref(),
                     );
                 }
-
-                // Re-home a hook-mutated trailer-only `set-cookie` onto the
-                // initial HEADERS (issue #1638) so browsers / gRPC-Web clients
-                // can store it. Runs after the strip loop and before the
-                // gRPC-Web trailer-clear guard and sticky-cookie injection
-                // below — see `rehome_hook_mutated_trailer_set_cookie`.
-                grpc_proxy::rehome_hook_mutated_trailer_set_cookie(
-                    &mut response_headers,
-                    &mut response_trailers,
-                    original_trailer_set_cookie.as_deref(),
-                );
 
                 // A response transform that re-encodes the gRPC terminal
                 // status into the body (e.g. `grpc_web` appends a gRPC-Web

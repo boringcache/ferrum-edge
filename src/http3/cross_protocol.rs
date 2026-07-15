@@ -3714,24 +3714,14 @@ where
                 &plugin_response_headers,
             );
             let mut response_headers = plugin_response_headers;
-            crate::proxy::grpc_proxy::strip_non_initial_grpc_trailer_fields(
-                &mut response_headers,
-                &response_trailers,
-                &header_shadowed_trailer_keys,
-            );
-            crate::proxy::grpc_proxy::apply_buffered_grpc_initial_response_policy(
-                buffered_initial_response_header_policy_state.as_deref(),
-                &mut response_headers,
-                response_body.is_empty() && response_trailers.is_empty(),
-            );
-            // Re-home a hook-mutated trailer-only `set-cookie` onto the initial
-            // HEADERS (issue #1638) so browsers / gRPC-Web clients can store it,
-            // identically to the main gRPC path. Runs after the strip loop and
-            // before sticky-cookie injection and the gRPC-Web trailer-clear
-            // guard below.
-            crate::proxy::grpc_proxy::rehome_hook_mutated_trailer_set_cookie(
+            let preserve_terminal_metadata =
+                response_body.is_empty() && response_trailers.is_empty();
+            crate::proxy::grpc_proxy::finalize_buffered_grpc_split_response(
                 &mut response_headers,
                 &mut response_trailers,
+                &header_shadowed_trailer_keys,
+                buffered_initial_response_header_policy_state.as_deref(),
+                preserve_terminal_metadata,
                 original_trailer_set_cookie.as_deref(),
             );
             // Inject the sticky-affinity cookie onto the final initial headers,

@@ -46,7 +46,11 @@ fn write_frontend_certs(scratch: &std::path::Path) -> (String, String) {
 
 /// File-mode YAML for one HTTPS proxy (gRPC is a runtime flavor of `https`)
 /// pointing at `(127.0.0.1, backend_port)`.
-fn file_mode_yaml_with_response_buffering(backend_port: u16, buffer_response: bool) -> String {
+fn file_mode_yaml_with_response_buffering(
+    backend_port: u16,
+    buffer_response: bool,
+    remove_buffered_trailer_fields: bool,
+) -> String {
     let mut proxy = json!({
         "id": "h3-grpc-stream",
         "listen_path": "/api",
@@ -62,23 +66,43 @@ fn file_mode_yaml_with_response_buffering(backend_port: u16, buffer_response: bo
     if buffer_response {
         proxy["response_body_mode"] = json!("buffer");
     }
+    let mut security_config = json!({
+        "override_existing": false,
+        "hsts": true,
+        "set": { "X-Security-Policy": "gateway-enforced" },
+        "remove": [],
+    });
+    let mut plugin_configs = Vec::new();
+    if remove_buffered_trailer_fields {
+        plugin_configs.push(json!({
+            "id": "h3-grpc-cookie-transformer",
+            "plugin_name": "response_transformer",
+            "config": {
+                "rules": [{
+                    "target": "header",
+                    "operation": "update",
+                    "key": "Set-Cookie",
+                    "value": "session=mutated",
+                }],
+            },
+            "scope": "global",
+            "enabled": true,
+        }));
+        security_config["remove"] = json!(["Set-Cookie", "X-Powered-By"]);
+    }
+    plugin_configs.push(json!({
+        "id": "h3-grpc-security-headers",
+        "plugin_name": "security_headers",
+        "config": security_config,
+        "scope": "global",
+        "enabled": true,
+    }));
     let config = json!({
         "version": "1",
         "proxies": [proxy],
         "consumers": [],
         "upstreams": [],
-        "plugin_configs": [{
-            "id": "h3-grpc-security-headers",
-            "plugin_name": "security_headers",
-            "config": {
-                "override_existing": false,
-                "hsts": true,
-                "set": { "X-Security-Policy": "gateway-enforced" },
-                "remove": [],
-            },
-            "scope": "global",
-            "enabled": true,
-        }],
+        "plugin_configs": plugin_configs,
     });
     serde_yaml::to_string(&config).expect("yaml serialize")
 }
@@ -90,17 +114,24 @@ async fn spawn_h3_grpc_gateway(
     backend_port: u16,
     extra_env: &[(&str, String)],
 ) -> (GatewayHarness, u16) {
-    spawn_h3_grpc_gateway_with_response_buffering(backend_port, extra_env, false).await
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, extra_env, false, false).await
 }
 
 async fn spawn_buffered_h3_grpc_gateway(backend_port: u16) -> (GatewayHarness, u16) {
-    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true).await
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true, false).await
+}
+
+async fn spawn_buffered_h3_grpc_gateway_with_security_removals(
+    backend_port: u16,
+) -> (GatewayHarness, u16) {
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true, true).await
 }
 
 async fn spawn_h3_grpc_gateway_with_response_buffering(
     backend_port: u16,
     extra_env: &[(&str, String)],
     buffer_response: bool,
+    remove_buffered_trailer_fields: bool,
 ) -> (GatewayHarness, u16) {
     // Outer retry (codex P3): `FERRUM_PROXY_HTTPS_PORT` is a fixed port we
     // reserve-then-drop before the subprocess binds it, so a parallel test can
@@ -120,6 +151,7 @@ async fn spawn_h3_grpc_gateway_with_response_buffering(
             .file_config(file_mode_yaml_with_response_buffering(
                 backend_port,
                 buffer_response,
+                remove_buffered_trailer_fields,
             ))
             .log_level("info")
             .capture_output()
@@ -313,6 +345,85 @@ async fn h3_buffered_grpc_security_policy_preserves_initial_and_trailer_provenan
             .get("grpc-status")
             .and_then(|value| value.to_str().ok()),
         Some("0")
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
+        Some("OK")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_security_removal_wins_over_cookie_rehome_and_trailer_replay() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let ca = TestCa::new("h3-grpc-buffered-removal-be").expect("ca");
+    let (be_cert, be_key) = ca.valid().expect("backend leaf");
+    let _backend = ScriptedH2Backend::builder_tls(backend_listener, &be_cert, &be_key)
+        .expect("backend tls")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+            ("x-powered-by", "backend-header".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from(grpc_frame(b"buffered-removal-reply")),
+            end_stream: false,
+        })
+        .step(H2Step::RespondTrailers(vec![
+            ("grpc-status", "0".into()),
+            ("grpc-message", "OK".into()),
+            ("set-cookie", "session=backend".into()),
+            ("x-powered-by", "backend-trailer".into()),
+        ]))
+        .spawn()
+        .expect("spawn backend");
+
+    let (_harness, https_port) =
+        spawn_buffered_h3_grpc_gateway_with_security_removals(backend_port).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    stream.send_message(b"ping").await.expect("send message");
+    stream.finish().await.expect("finish");
+    let (status, headers) = stream.recv_response().await.expect("recv response");
+    let (body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("recv body+trailers");
+
+    assert_eq!(status.as_u16(), 200);
+    assert_eq!(
+        body.as_ref(),
+        grpc_frame(b"buffered-removal-reply").as_slice()
+    );
+    assert!(
+        headers.get("set-cookie").is_none(),
+        "final H3 security policy must suppress the transformed trailer cookie after rehoming"
+    );
+    assert!(
+        headers.get("x-powered-by").is_none(),
+        "final H3 security policy must suppress the shadowed initial header"
+    );
+    assert!(
+        trailers.get("set-cookie").is_none(),
+        "final H3 security policy must suppress the transformed application trailer"
+    );
+    assert!(
+        trailers.get("x-powered-by").is_none(),
+        "final H3 security policy must not restore removed shadowed metadata"
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("0"),
+        "terminal status must remain on the H3 trailer channel"
     );
     assert_eq!(
         trailers
