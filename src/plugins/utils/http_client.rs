@@ -254,12 +254,11 @@ fn build_dns_cached_fallback_client(
              TLS posture as a last resort.",
             e
         );
-        let builder = tls_posture
-            .apply(
-                reqwest::Client::builder()
-                    .no_proxy()
-                    .redirect(reqwest::redirect::Policy::none()),
-            );
+        let builder = tls_posture.apply(
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none()),
+        );
         match builder.build() {
             Ok(client) => client,
             Err(e2) => {

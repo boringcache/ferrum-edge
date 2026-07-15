@@ -739,7 +739,10 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         .pointer("/properties/providers/items/properties")
         .expect("missing provider properties");
     assert_eq!(provider_properties["allow_plaintext"]["default"], false);
-    assert_eq!(provider_properties["max_response_body_bytes"]["default"], 8_388_608);
+    assert_eq!(
+        provider_properties["max_response_body_bytes"]["default"],
+        8_388_608
+    );
     assert!(provider_properties.get("circuit_breaker").is_some());
 
     let valid = json!({
@@ -769,7 +772,10 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "base_url": "http://127.0.0.1/v1/chat"}]}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-../unsafe": "gpt-4o"}}]}),
     ] {
-        assert!(validator.validate(&invalid).is_err(), "schema accepted {invalid}");
+        assert!(
+            validator.validate(&invalid).is_err(),
+            "schema accepted {invalid}"
+        );
     }
 }
 

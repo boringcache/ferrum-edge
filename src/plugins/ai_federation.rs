@@ -44,8 +44,8 @@ use bytes::Bytes;
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
@@ -290,9 +290,7 @@ impl OAuth2Cache {
             return Ok(token.token.clone());
         }
 
-        let token = self
-            .refresh_token(http_client, latency_accumulator)
-            .await?;
+        let token = self.refresh_token(http_client, latency_accumulator).await?;
         let result = token.token.clone();
         self.cache.store(Some(Arc::new(token)));
         Ok(result)
@@ -371,9 +369,7 @@ impl OAuth2Cache {
             Some(value) => value
                 .as_u64()
                 .filter(|seconds| (1..=86_400).contains(seconds))
-                .ok_or(
-                    "ai_federation: OAuth2 expires_in must be an integer between 1 and 86400",
-                )?,
+                .ok_or("ai_federation: OAuth2 expires_in must be an integer between 1 and 86400")?,
         };
 
         Ok(CachedToken {
@@ -559,8 +555,7 @@ impl ProviderCircuit {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            super::prometheus_metrics::global_registry()
-                .record_ai_federation_half_open_probe();
+            super::prometheus_metrics::global_registry().record_ai_federation_half_open_probe();
             CircuitAdmission::HalfOpenProbe
         } else {
             CircuitAdmission::Open
@@ -570,8 +565,7 @@ impl ProviderCircuit {
     fn may_admit(&self) -> bool {
         let open_until = self.open_until_epoch_ms.load(Ordering::Acquire);
         open_until == 0
-            || (epoch_millis() >= open_until
-                && !self.half_open_in_flight.load(Ordering::Acquire))
+            || (epoch_millis() >= open_until && !self.half_open_in_flight.load(Ordering::Acquire))
     }
 
     fn record_success(&self, provider_name: &str, admission: CircuitAdmission) {
@@ -588,8 +582,7 @@ impl ProviderCircuit {
             self.open_until_epoch_ms.store(0, Ordering::Release);
             self.half_open_successes.store(0, Ordering::Release);
             if self.metrics_open.swap(false, Ordering::AcqRel) {
-                super::prometheus_metrics::global_registry()
-                    .record_ai_federation_circuit_closed();
+                super::prometheus_metrics::global_registry().record_ai_federation_circuit_closed();
             }
             info!(
                 provider = provider_name,
@@ -633,8 +626,7 @@ impl ProviderCircuit {
         self.half_open_successes.store(0, Ordering::Release);
         self.half_open_in_flight.store(false, Ordering::Release);
         if !self.metrics_open.swap(true, Ordering::AcqRel) {
-            super::prometheus_metrics::global_registry()
-                .record_ai_federation_circuit_opened();
+            super::prometheus_metrics::global_registry().record_ai_federation_circuit_opened();
         }
         warn!(
             provider = provider_name,
@@ -648,8 +640,7 @@ impl ProviderCircuit {
 impl Drop for ProviderCircuit {
     fn drop(&mut self) {
         if self.metrics_open.load(Ordering::Acquire) {
-            super::prometheus_metrics::global_registry()
-                .release_ai_federation_open_circuit();
+            super::prometheus_metrics::global_registry().release_ai_federation_open_circuit();
         }
     }
 }
@@ -663,10 +654,7 @@ fn epoch_millis() -> u64 {
 }
 
 fn add_external_io_elapsed(accumulator: &AtomicU64, started: std::time::Instant) {
-    let nanos = started
-        .elapsed()
-        .as_nanos()
-        .min(u128::from(u64::MAX)) as u64;
+    let nanos = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
     accumulator.fetch_add(nanos, Ordering::Relaxed);
 }
 
@@ -755,9 +743,8 @@ fn validate_base_url(
         ));
     }
 
-    let host = normalized_url_hostname(&parsed).ok_or_else(|| {
-        format!("ai_federation: provider '{provider_name}' base_url has no host")
-    })?;
+    let host = normalized_url_hostname(&parsed)
+        .ok_or_else(|| format!("ai_federation: provider '{provider_name}' base_url has no host"))?;
 
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(format!(
@@ -1004,9 +991,9 @@ impl AiFederation {
         let backend_allow_ips = http_client.backend_allow_ips().clone();
 
         for (i, pv) in providers_val.iter().enumerate() {
-            let provider_object = pv.as_object().ok_or_else(|| {
-                format!("ai_federation: provider[{i}] must be an object")
-            })?;
+            let provider_object = pv
+                .as_object()
+                .ok_or_else(|| format!("ai_federation: provider[{i}] must be an object"))?;
             reject_unsupported_streaming_config(pv, &format!("provider[{i}]"))?;
             reject_unknown_config_keys(
                 provider_object,
@@ -1021,10 +1008,7 @@ impl AiFederation {
             if name.is_empty()
                 || name.len() > 128
                 || !name.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric()
-                        || byte == b'.'
-                        || byte == b'_'
-                        || byte == b'-'
+                    byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_' || byte == b'-'
                 })
             {
                 return Err(format!(
@@ -1099,8 +1083,7 @@ impl AiFederation {
                 None => MultimodalMode::default_for_provider(provider_type),
             };
 
-            let connect_timeout_seconds =
-                optional_u64(pv, "connect_timeout_seconds")?.unwrap_or(5);
+            let connect_timeout_seconds = optional_u64(pv, "connect_timeout_seconds")?.unwrap_or(5);
             let read_timeout_seconds = optional_u64(pv, "read_timeout_seconds")?.unwrap_or(60);
             if connect_timeout_seconds == 0 || read_timeout_seconds == 0 {
                 return Err(format!(
@@ -1260,11 +1243,8 @@ const AI_FEDERATION_PROVIDER_KEYS: &[&str] = &[
     "circuit_breaker",
 ];
 
-const PROVIDER_CIRCUIT_KEYS: &[&str] = &[
-    "failure_threshold",
-    "cooldown_seconds",
-    "success_threshold",
-];
+const PROVIDER_CIRCUIT_KEYS: &[&str] =
+    &["failure_threshold", "cooldown_seconds", "success_threshold"];
 
 fn reject_unknown_config_keys(
     object: &serde_json::Map<String, Value>,
@@ -1340,17 +1320,13 @@ fn parse_provider_circuit(
         PROVIDER_CIRCUIT_KEYS,
     )?;
 
-    let failure_threshold = u32::try_from(
-        optional_u64(value, "failure_threshold")?.unwrap_or(3),
-    )
-    .map_err(|_| {
+    let failure_threshold = u32::try_from(optional_u64(value, "failure_threshold")?.unwrap_or(3))
+        .map_err(|_| {
         format!("ai_federation: provider '{name}' circuit failure_threshold is too large")
     })?;
     let cooldown_seconds = optional_u64(value, "cooldown_seconds")?.unwrap_or(30);
-    let success_threshold = u32::try_from(
-        optional_u64(value, "success_threshold")?.unwrap_or(1),
-    )
-    .map_err(|_| {
+    let success_threshold = u32::try_from(optional_u64(value, "success_threshold")?.unwrap_or(1))
+        .map_err(|_| {
         format!("ai_federation: provider '{name}' circuit success_threshold is too large")
     })?;
 
@@ -1755,8 +1731,7 @@ fn is_valid_model_identifier(model: &str) -> bool {
         && model.len() <= MAX_MODEL_IDENTIFIER_BYTES
         && !model.contains("..")
         && model.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'+')
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'+')
         })
 }
 
@@ -1846,7 +1821,10 @@ fn validate_openai_request(openai_body: &Value) -> Result<(), String> {
     let object = openai_body
         .as_object()
         .ok_or("ai_federation: request body must be a JSON object")?;
-    if object.get("stream").is_some_and(|value| !value.is_boolean()) {
+    if object
+        .get("stream")
+        .is_some_and(|value| !value.is_boolean())
+    {
         return Err("ai_federation: 'stream' must be a boolean when present".to_string());
     }
     let messages = object
@@ -1859,9 +1837,9 @@ fn validate_openai_request(openai_body: &Value) -> Result<(), String> {
 
     let mut tool_call_ids = HashSet::new();
     for (index, message) in messages.iter().enumerate() {
-        let message_object = message.as_object().ok_or_else(|| {
-            format!("ai_federation: messages[{index}] must be an object")
-        })?;
+        let message_object = message
+            .as_object()
+            .ok_or_else(|| format!("ai_federation: messages[{index}] must be an object"))?;
         let role = message_object
             .get("role")
             .and_then(Value::as_str)
@@ -1906,9 +1884,7 @@ fn validate_openai_request(openai_body: &Value) -> Result<(), String> {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    format!(
-                        "ai_federation: messages[{index}] tool message missing tool_call_id"
-                    )
+                    format!("ai_federation: messages[{index}] tool message missing tool_call_id")
                 })?;
             if !tool_call_ids.contains(tool_call_id) {
                 return Err(format!(
@@ -2145,9 +2121,7 @@ fn validate_openai_tool_choice(openai_body: &Value) -> Result<(), String> {
         return Ok(());
     };
     let named_choice = match choice {
-        Value::String(value) if matches!(value.as_str(), "none" | "auto" | "required") => {
-            Ok(None)
-        }
+        Value::String(value) if matches!(value.as_str(), "none" | "auto" | "required") => Ok(None),
         Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("function") => {
             let name = object
                 .get("function")
@@ -2169,11 +2143,9 @@ fn validate_openai_tool_choice(openai_body: &Value) -> Result<(), String> {
         return Err("ai_federation: tool_choice requires a non-empty tools array".to_string());
     }
     if let Some(name) = named_choice
-        && !tools.as_ref().is_some_and(|tools| {
-            tools
-                .iter()
-                .any(|tool| tool["name"].as_str() == Some(name))
-        })
+        && !tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"].as_str() == Some(name)))
     {
         return Err(format!(
             "ai_federation: named tool_choice '{name}' does not match any declared tool"
@@ -2197,13 +2169,9 @@ fn tool_result_text(content: &Value) -> Result<String, String> {
             ));
         }
         text.push_str(
-            part.get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    format!(
-                        "ai_federation: tool message content[{index}] missing text"
-                    )
-                })?,
+            part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                format!("ai_federation: tool message content[{index}] missing text")
+            })?,
         );
     }
     Ok(text)
@@ -2232,8 +2200,7 @@ fn normalized_stop_sequences(openai_body: &Value) -> Result<Option<Value>, Strin
         }
         _ => {
             return Err(
-                "ai_federation: 'stop' must be a string, an array of strings, or null"
-                    .to_string(),
+                "ai_federation: 'stop' must be a string, an array of strings, or null".to_string(),
             );
         }
     };
@@ -3105,13 +3072,11 @@ fn translate_to_anthropic(
                 && messages[message_index]["role"].as_str() == Some("tool")
             {
                 let tool_message = &messages[message_index];
-                let tool_use_id = tool_message["tool_call_id"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        format!(
-                            "ai_federation: messages[{message_index}] tool message missing tool_call_id"
-                        )
-                    })?;
+                let tool_use_id = tool_message["tool_call_id"].as_str().ok_or_else(|| {
+                    format!(
+                        "ai_federation: messages[{message_index}] tool message missing tool_call_id"
+                    )
+                })?;
                 tool_results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
@@ -3274,13 +3239,11 @@ fn translate_to_gemini(
                 && messages[message_index]["role"].as_str() == Some("tool")
             {
                 let tool_message = &messages[message_index];
-                let tool_call_id = tool_message["tool_call_id"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        format!(
-                            "ai_federation: messages[{message_index}] tool message missing tool_call_id"
-                        )
-                    })?;
+                let tool_call_id = tool_message["tool_call_id"].as_str().ok_or_else(|| {
+                    format!(
+                        "ai_federation: messages[{message_index}] tool message missing tool_call_id"
+                    )
+                })?;
                 let tool_name = tool_names.get(tool_call_id).ok_or_else(|| {
                     format!(
                         "ai_federation: messages[{message_index}] tool_call_id has no matching assistant tool call"
@@ -3308,10 +3271,8 @@ fn translate_to_gemini(
         }
 
         let native_role = if role == "assistant" { "model" } else { role };
-        let mut parts = openai_content_to_gemini_parts(
-            &message["content"],
-            provider.multimodal_mode,
-        )?;
+        let mut parts =
+            openai_content_to_gemini_parts(&message["content"], provider.multimodal_mode)?;
         let tool_calls = if role == "assistant" {
             parse_openai_tool_calls(message, message_index)?
         } else {
@@ -3447,13 +3408,11 @@ fn translate_to_bedrock(
                 && messages[message_index]["role"].as_str() == Some("tool")
             {
                 let tool_message = &messages[message_index];
-                let tool_use_id = tool_message["tool_call_id"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        format!(
-                            "ai_federation: messages[{message_index}] tool message missing tool_call_id"
-                        )
-                    })?;
+                let tool_use_id = tool_message["tool_call_id"].as_str().ok_or_else(|| {
+                    format!(
+                        "ai_federation: messages[{message_index}] tool message missing tool_call_id"
+                    )
+                })?;
                 let text = tool_result_text(&tool_message["content"])?;
                 let result_content = match serde_json::from_str::<Value>(&text) {
                     Ok(value) => json!([{ "json": value }]),
@@ -3474,10 +3433,8 @@ fn translate_to_bedrock(
             continue;
         }
 
-        let mut content = openai_content_to_bedrock_blocks(
-            &message["content"],
-            provider.multimodal_mode,
-        )?;
+        let mut content =
+            openai_content_to_bedrock_blocks(&message["content"], provider.multimodal_mode)?;
         let tool_calls = if role == "assistant" {
             parse_openai_tool_calls(message, message_index)?
         } else {
@@ -3704,10 +3661,12 @@ fn normalize_response(
     let response_object = resp
         .as_object()
         .ok_or("ai_federation: provider success response must be a JSON object")?;
-    if response_object.get("error").is_some_and(|error| !error.is_null()) {
+    if response_object
+        .get("error")
+        .is_some_and(|error| !error.is_null())
+    {
         return Err(
-            "ai_federation: provider returned an error envelope with a success status"
-                .to_string(),
+            "ai_federation: provider returned an error envelope with a success status".to_string(),
         );
     }
 
@@ -3754,9 +3713,7 @@ fn normalize_from_openai_compatible(resp: &Value) -> Result<(Value, TokenCounts)
             .get("message")
             .and_then(Value::as_object)
             .ok_or_else(|| {
-                format!(
-                    "ai_federation: OpenAI-compatible choices[{index}] missing message object"
-                )
+                format!("ai_federation: OpenAI-compatible choices[{index}] missing message object")
             })?;
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             return Err(format!(
@@ -3774,9 +3731,7 @@ fn normalize_from_openai_compatible(resp: &Value) -> Result<(Value, TokenCounts)
             .get("finish_reason")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                format!(
-                    "ai_federation: OpenAI-compatible choices[{index}] missing finish_reason"
-                )
+                format!("ai_federation: OpenAI-compatible choices[{index}] missing finish_reason")
             })?;
         if !matches!(
             finish_reason,
@@ -3793,11 +3748,10 @@ fn normalize_from_openai_compatible(resp: &Value) -> Result<(Value, TokenCounts)
         }
     }
 
-    validate_optional_usage_object(resp.get("usage"), &[
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-    ])?;
+    validate_optional_usage_object(
+        resp.get("usage"),
+        &["prompt_tokens", "completion_tokens", "total_tokens"],
+    )?;
     let tokens = TokenCounts {
         prompt_tokens: resp["usage"]["prompt_tokens"].as_u64(),
         completion_tokens: resp["usage"]["completion_tokens"].as_u64(),
@@ -3815,10 +3769,7 @@ fn validate_optional_usage_object(usage: Option<&Value>, fields: &[&str]) -> Res
         .as_object()
         .ok_or("ai_federation: response usage must be an object")?;
     for field in fields {
-        if usage
-            .get(*field)
-            .is_some_and(|value| !value.is_u64())
-        {
+        if usage.get(*field).is_some_and(|value| !value.is_u64()) {
             return Err(format!(
                 "ai_federation: response usage.{field} must be a non-negative integer"
             ));
@@ -3853,11 +3804,7 @@ fn required_model_identifier<'a>(
     Ok(model)
 }
 
-fn required_tool_name<'a>(
-    value: &'a Value,
-    key: &str,
-    scope: &str,
-) -> Result<&'a str, String> {
+fn required_tool_name<'a>(value: &'a Value, key: &str, scope: &str) -> Result<&'a str, String> {
     let name = required_non_empty_string(value, key, scope)?;
     if !valid_tool_name(name) {
         return Err(format!(
@@ -3892,9 +3839,7 @@ fn openai_tool_call(id: &str, name: &str, arguments: &Value) -> Result<Value, St
             );
         }
         Err(BoundedJsonSerializationError::Serialization) => {
-            return Err(
-                "ai_federation: tool-call arguments serialization failed".to_string(),
-            );
+            return Err("ai_federation: tool-call arguments serialization failed".to_string());
         }
     };
     Ok(json!({
@@ -3938,9 +3883,10 @@ fn summed_usage(
     provider: &str,
 ) -> Result<Option<u64>, String> {
     match (input, output) {
-        (Some(input), Some(output)) => input.checked_add(output).map(Some).ok_or_else(|| {
-            format!("ai_federation: {provider} token usage total overflowed")
-        }),
+        (Some(input), Some(output)) => input
+            .checked_add(output)
+            .map(Some)
+            .ok_or_else(|| format!("ai_federation: {provider} token usage total overflowed")),
         _ => Ok(None),
     }
 }
@@ -3969,8 +3915,7 @@ fn insert_normalized_usage(
 fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenCounts), String> {
     if resp["type"].as_str() != Some("message") || resp["role"].as_str() != Some("assistant") {
         return Err(
-            "ai_federation: Anthropic success response must be an assistant message"
-                .to_string(),
+            "ai_federation: Anthropic success response must be an assistant message".to_string(),
         );
     }
     let id = required_non_empty_string(resp, "id", "Anthropic response")?;
@@ -3985,16 +3930,11 @@ fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenC
     let mut tool_calls = Vec::new();
     for (index, block) in content_blocks.iter().enumerate() {
         match block.get("type").and_then(Value::as_str) {
-            Some("text") => text.push_str(
-                block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        format!(
-                            "ai_federation: Anthropic content[{index}] text block missing text"
-                        )
-                    })?,
-            ),
+            Some("text") => {
+                text.push_str(block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    format!("ai_federation: Anthropic content[{index}] text block missing text")
+                })?)
+            }
             Some("tool_use") => {
                 let tool_id = required_non_empty_string(
                     block,
@@ -4141,9 +4081,8 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
                                 "ai_federation: Gemini candidates[{candidate_index}].parts[{part_index}] functionCall args must be an object"
                             )
                         })?;
-                    let call_id = format!(
-                        "call_fed_{call_id_prefix}_{candidate_index}_{part_index}"
-                    );
+                    let call_id =
+                        format!("call_fed_{call_id_prefix}_{candidate_index}_{part_index}");
                     tool_calls.push(openai_tool_call(&call_id, name, args)?);
                 }
                 _ => {
@@ -4160,9 +4099,7 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
         }
 
         let native_finish = candidate["finishReason"].as_str().ok_or_else(|| {
-            format!(
-                "ai_federation: Gemini candidates[{candidate_index}] missing finishReason"
-            )
+            format!("ai_federation: Gemini candidates[{candidate_index}] missing finishReason")
         })?;
         let finish_reason = if !tool_calls.is_empty() {
             if native_finish != "STOP" {
@@ -4175,10 +4112,14 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
             match native_finish {
                 "STOP" | "OTHER" => "stop",
                 "MAX_TOKENS" => "length",
-                "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII"
-                | "MODEL_ARMOR" | "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" => {
-                    "content_filter"
-                }
+                "SAFETY"
+                | "RECITATION"
+                | "BLOCKLIST"
+                | "PROHIBITED_CONTENT"
+                | "SPII"
+                | "MODEL_ARMOR"
+                | "MALFORMED_FUNCTION_CALL"
+                | "UNEXPECTED_TOOL_CALL" => "content_filter",
                 _ => {
                     return Err(
                         "ai_federation: Gemini candidate has an unsupported finishReason"
@@ -4265,7 +4206,10 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
     let mut text = String::new();
     let mut tool_calls = Vec::new();
     for (index, block) in blocks.iter().enumerate() {
-        match (block.get("text").and_then(Value::as_str), block.get("toolUse")) {
+        match (
+            block.get("text").and_then(Value::as_str),
+            block.get("toolUse"),
+        ) {
             (Some(block_text), None) => text.push_str(block_text),
             (None, Some(tool_use)) => {
                 let tool_id = required_non_empty_string(
@@ -4308,7 +4252,9 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
     let finish_reason = match stop_reason {
         "end_turn" | "stop_sequence" => "stop",
         "max_tokens" | "model_context_window_exceeded" => "length",
-        "guardrail_intervened" | "content_filtered" | "malformed_model_output"
+        "guardrail_intervened"
+        | "content_filtered"
+        | "malformed_model_output"
         | "malformed_tool_use" => "content_filter",
         "tool_use" => "tool_calls",
         _ => {
@@ -4318,12 +4264,8 @@ fn normalize_from_bedrock(resp: &Value, model: &str) -> Result<(Value, TokenCoun
         }
     };
 
-    let (input_tokens, output_tokens) = native_usage_pair(
-        resp.get("usage"),
-        "inputTokens",
-        "outputTokens",
-        "Bedrock",
-    )?;
+    let (input_tokens, output_tokens) =
+        native_usage_pair(resp.get("usage"), "inputTokens", "outputTokens", "Bedrock")?;
     let total = match resp["usage"]["totalTokens"].as_u64() {
         Some(total) => Some(total),
         None => summed_usage(input_tokens, output_tokens, "Bedrock")?,
@@ -4385,16 +4327,9 @@ fn normalize_from_cohere(resp: &Value, model: &str) -> Result<(Value, TokenCount
                 "ai_federation: Cohere message.content[{index}] has unsupported block type"
             ));
         }
-        text.push_str(
-            block
-                .get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    format!(
-                        "ai_federation: Cohere message.content[{index}] missing text"
-                    )
-                })?,
-        );
+        text.push_str(block.get("text").and_then(Value::as_str).ok_or_else(|| {
+            format!("ai_federation: Cohere message.content[{index}] missing text")
+        })?);
     }
     let tool_calls = parse_openai_tool_calls(&Value::Object(message.clone()), 0)?;
     if text.is_empty() && tool_calls.is_empty() {
@@ -4403,12 +4338,9 @@ fn normalize_from_cohere(resp: &Value, model: &str) -> Result<(Value, TokenCount
         );
     }
 
-    let native_finish_reason =
-        required_non_empty_string(resp, "finish_reason", "Cohere response")?;
+    let native_finish_reason = required_non_empty_string(resp, "finish_reason", "Cohere response")?;
     if (native_finish_reason == "TOOL_CALL") != !tool_calls.is_empty() {
-        return Err(
-            "ai_federation: Cohere tool calls and finish_reason disagree".to_string(),
-        );
+        return Err("ai_federation: Cohere tool calls and finish_reason disagree".to_string());
     }
     let finish_reason = match native_finish_reason {
         "COMPLETE" | "STOP_SEQUENCE" => "stop",
@@ -4446,9 +4378,7 @@ fn normalize_from_cohere(resp: &Value, model: &str) -> Result<(Value, TokenCount
         openai_message["tool_calls"] = Value::Array(
             tool_calls
                 .into_iter()
-                .map(|call| {
-                    openai_tool_call(&call.id, &call.name, &call.arguments)
-                })
+                .map(|call| openai_tool_call(&call.id, &call.name, &call.arguments))
                 .collect::<Result<Vec<_>, _>>()?,
         );
     }
@@ -4765,9 +4695,7 @@ impl Plugin for AiFederation {
             Ok(value) if !value.is_empty() => value,
             _ => {
                 if self.fail_on_missing_model {
-                    debug!(
-                        "ai_federation: rejecting JSON POST without a final UTF-8 request body"
-                    );
+                    debug!("ai_federation: rejecting JSON POST without a final UTF-8 request body");
                     return self.openai_error_response(
                         400,
                         "Request body is required and must be UTF-8 JSON for ai_federation model routing",
@@ -4938,8 +4866,7 @@ impl Plugin for AiFederation {
                 .unwrap_or(CircuitAdmission::Closed);
             if admission == CircuitAdmission::Open {
                 skipped_open_circuit = true;
-                super::prometheus_metrics::global_registry()
-                    .record_ai_federation_open_skip();
+                super::prometheus_metrics::global_registry().record_ai_federation_open_skip();
                 let skips = ctx
                     .metadata
                     .get("ai_federation_circuit_open_skips")
@@ -5129,9 +5056,7 @@ impl Plugin for AiFederation {
                         );
                     }
                     if let Some(circuit) = &provider.circuit {
-                        if failure.error_class
-                            == crate::retry::ErrorClass::DispatchPolicyRejected
-                        {
+                        if failure.error_class == crate::retry::ErrorClass::DispatchPolicyRejected {
                             circuit.release_probe(admission);
                         } else {
                             circuit.record_failure(&provider.name, admission);
@@ -5161,8 +5086,7 @@ impl Plugin for AiFederation {
                             ProviderCallFailureKind::ResponseTooLarge => false,
                         };
                     if fallback_allowed {
-                        let (message, code) = if failure.kind
-                            == ProviderCallFailureKind::Ambiguous
+                        let (message, code) = if failure.kind == ProviderCallFailureKind::Ambiguous
                         {
                             (
                                 "Provider request failed after the outcome became ambiguous; automatic replay was explicitly enabled",
@@ -5231,10 +5155,7 @@ impl Plugin for AiFederation {
                 if let Some(circuit) = &provider.circuit {
                     circuit.record_failure(&provider.name, admission);
                 }
-                if self.fallback_enabled
-                    && self.fallback_on_protocol_errors
-                    && has_later_provider
-                {
+                if self.fallback_enabled && self.fallback_on_protocol_errors && has_later_provider {
                     last_failure_result = Some(self.openai_error_response_with_headers(
                         status,
                         &format!("Upstream provider returned status {status}"),
@@ -5385,9 +5306,7 @@ impl Plugin for AiFederation {
 
         if let Some(result) = last_failure_result {
             result
-        } else if !attempted_provider
-            && let Some(message) = last_client_rejection
-        {
+        } else if !attempted_provider && let Some(message) = last_client_rejection {
             self.openai_error_response(
                 400,
                 &message,

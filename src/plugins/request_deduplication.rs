@@ -2064,9 +2064,7 @@ impl Plugin for RequestDeduplication {
             ("cache-control".to_string(), "no-store".to_string()),
         ]);
         let body = br#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
-        let _ = self
-            .on_final_response_body(ctx, 409, &headers, body)
-            .await;
+        let _ = self.on_final_response_body(ctx, 409, &headers, body).await;
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {

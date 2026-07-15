@@ -1,8 +1,8 @@
+use bytes::Bytes;
 use ferrum_edge::plugins::ai_federation;
 use ferrum_edge::plugins::ai_federation::test_helpers;
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
-use bytes::Bytes;
 use ferrum_edge::{
     config::{BackendAllowIps, PoolConfig},
     dns::{DnsCache, DnsConfig},
@@ -294,7 +294,10 @@ fn google_oauth_token_authority_is_pinned() {
     let error = ai_federation::AiFederation::new(&config, create_test_http_client())
         .err()
         .expect("untrusted OAuth authority must be rejected");
-    assert!(error.contains("oauth2.googleapis.com/token"), "got: {error}");
+    assert!(
+        error.contains("oauth2.googleapis.com/token"),
+        "got: {error}"
+    );
 }
 
 #[test]
@@ -904,17 +907,16 @@ fn tool_round_trip_request(stop: Value) -> Value {
 fn native_adapters_preserve_tool_call_state_and_scalar_stop() {
     let request = tool_round_trip_request(json!("DONE"));
 
-    let (_, _, anthropic_bytes) = test_helpers::translate_request_test(
-        "anthropic",
-        &request,
-        "claude-3",
-        &json!({}),
-    )
-    .unwrap();
+    let (_, _, anthropic_bytes) =
+        test_helpers::translate_request_test("anthropic", &request, "claude-3", &json!({}))
+            .unwrap();
     let anthropic: Value = serde_json::from_slice(&anthropic_bytes).unwrap();
     assert_eq!(anthropic["messages"][1]["content"][0]["type"], "tool_use");
     assert_eq!(anthropic["messages"][1]["content"][0]["id"], "call_weather");
-    assert_eq!(anthropic["messages"][2]["content"][0]["type"], "tool_result");
+    assert_eq!(
+        anthropic["messages"][2]["content"][0]["type"],
+        "tool_result"
+    );
     assert_eq!(anthropic["stop_sequences"], json!(["DONE"]));
     assert_eq!(anthropic["tools"][0]["name"], "get_weather");
 
@@ -926,8 +928,14 @@ fn native_adapters_preserve_tool_call_state_and_scalar_stop() {
     )
     .unwrap();
     let gemini: Value = serde_json::from_slice(&gemini_bytes).unwrap();
-    assert_eq!(gemini["contents"][1]["parts"][0]["functionCall"]["name"], "get_weather");
-    assert_eq!(gemini["contents"][2]["parts"][0]["functionResponse"]["name"], "get_weather");
+    assert_eq!(
+        gemini["contents"][1]["parts"][0]["functionCall"]["name"],
+        "get_weather"
+    );
+    assert_eq!(
+        gemini["contents"][2]["parts"][0]["functionResponse"]["name"],
+        "get_weather"
+    );
     assert_eq!(gemini["generationConfig"]["stopSequences"], json!(["DONE"]));
 
     let (_, _, vertex_bytes) = test_helpers::translate_request_test(
@@ -938,8 +946,14 @@ fn native_adapters_preserve_tool_call_state_and_scalar_stop() {
     )
     .unwrap();
     let vertex: Value = serde_json::from_slice(&vertex_bytes).unwrap();
-    assert_eq!(vertex["contents"][1]["parts"][0]["functionCall"]["name"], "get_weather");
-    assert_eq!(vertex["contents"][2]["parts"][0]["functionResponse"]["name"], "get_weather");
+    assert_eq!(
+        vertex["contents"][1]["parts"][0]["functionCall"]["name"],
+        "get_weather"
+    );
+    assert_eq!(
+        vertex["contents"][2]["parts"][0]["functionResponse"]["name"],
+        "get_weather"
+    );
 
     let (_, _, bedrock_bytes) = test_helpers::translate_request_test(
         "aws_bedrock",
@@ -949,8 +963,14 @@ fn native_adapters_preserve_tool_call_state_and_scalar_stop() {
     )
     .unwrap();
     let bedrock: Value = serde_json::from_slice(&bedrock_bytes).unwrap();
-    assert_eq!(bedrock["messages"][1]["content"][0]["toolUse"]["toolUseId"], "call_weather");
-    assert_eq!(bedrock["messages"][2]["content"][0]["toolResult"]["toolUseId"], "call_weather");
+    assert_eq!(
+        bedrock["messages"][1]["content"][0]["toolUse"]["toolUseId"],
+        "call_weather"
+    );
+    assert_eq!(
+        bedrock["messages"][2]["content"][0]["toolResult"]["toolUseId"],
+        "call_weather"
+    );
     assert_eq!(bedrock["inferenceConfig"]["stopSequences"], json!(["DONE"]));
 
     let (_, _, cohere_bytes) =
@@ -993,31 +1013,41 @@ fn native_adapters_group_parallel_tool_results_without_losing_ids() {
         "tool_choice": "auto"
     });
 
-    let (_, _, anthropic) = test_helpers::translate_request_test(
-        "anthropic",
-        &request,
-        "claude-3",
-        &json!({}),
-    )
-    .unwrap();
+    let (_, _, anthropic) =
+        test_helpers::translate_request_test("anthropic", &request, "claude-3", &json!({}))
+            .unwrap();
     let anthropic: Value = serde_json::from_slice(&anthropic).unwrap();
     assert_eq!(anthropic["messages"].as_array().unwrap().len(), 3);
-    assert_eq!(anthropic["messages"][2]["content"].as_array().unwrap().len(), 2);
-    assert_eq!(anthropic["messages"][2]["content"][0]["tool_use_id"], "call_a");
-    assert_eq!(anthropic["messages"][2]["content"][1]["tool_use_id"], "call_b");
+    assert_eq!(
+        anthropic["messages"][2]["content"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        anthropic["messages"][2]["content"][0]["tool_use_id"],
+        "call_a"
+    );
+    assert_eq!(
+        anthropic["messages"][2]["content"][1]["tool_use_id"],
+        "call_b"
+    );
 
-    let (_, _, gemini) = test_helpers::translate_request_test(
-        "google_gemini",
-        &request,
-        "gemini-2",
-        &json!({}),
-    )
-    .unwrap();
+    let (_, _, gemini) =
+        test_helpers::translate_request_test("google_gemini", &request, "gemini-2", &json!({}))
+            .unwrap();
     let gemini: Value = serde_json::from_slice(&gemini).unwrap();
     assert_eq!(gemini["contents"].as_array().unwrap().len(), 3);
     assert_eq!(gemini["contents"][2]["parts"].as_array().unwrap().len(), 2);
-    assert_eq!(gemini["contents"][2]["parts"][0]["functionResponse"]["name"], "lookup_a");
-    assert_eq!(gemini["contents"][2]["parts"][1]["functionResponse"]["name"], "lookup_b");
+    assert_eq!(
+        gemini["contents"][2]["parts"][0]["functionResponse"]["name"],
+        "lookup_a"
+    );
+    assert_eq!(
+        gemini["contents"][2]["parts"][1]["functionResponse"]["name"],
+        "lookup_b"
+    );
 
     let (_, _, bedrock) = test_helpers::translate_request_test(
         "aws_bedrock",
@@ -1028,9 +1058,18 @@ fn native_adapters_group_parallel_tool_results_without_losing_ids() {
     .unwrap();
     let bedrock: Value = serde_json::from_slice(&bedrock).unwrap();
     assert_eq!(bedrock["messages"].as_array().unwrap().len(), 3);
-    assert_eq!(bedrock["messages"][2]["content"].as_array().unwrap().len(), 2);
-    assert_eq!(bedrock["messages"][2]["content"][0]["toolResult"]["toolUseId"], "call_a");
-    assert_eq!(bedrock["messages"][2]["content"][1]["toolResult"]["toolUseId"], "call_b");
+    assert_eq!(
+        bedrock["messages"][2]["content"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(
+        bedrock["messages"][2]["content"][0]["toolResult"]["toolUseId"],
+        "call_a"
+    );
+    assert_eq!(
+        bedrock["messages"][2]["content"][1]["toolResult"]["toolUseId"],
+        "call_b"
+    );
 }
 
 #[test]
@@ -1051,16 +1090,14 @@ fn malformed_stop_and_tool_shapes_fail_explicitly() {
         ] {
             let request = tool_round_trip_request(stop);
             assert!(
-                test_helpers::translate_request_test(provider, &request, "model", &config)
-                    .is_err(),
+                test_helpers::translate_request_test(provider, &request, "model", &config).is_err(),
                 "{provider} must reject malformed stop values"
             );
         }
     }
 
     let mut malformed = tool_round_trip_request(Value::Null);
-    malformed["messages"][1]["tool_calls"][0]["function"]["arguments"] =
-        json!("not-json");
+    malformed["messages"][1]["tool_calls"][0]["function"]["arguments"] = json!("not-json");
     assert!(
         test_helpers::translate_request_test("google_gemini", &malformed, "gemini", &json!({}))
             .is_err()
@@ -1104,8 +1141,7 @@ fn native_stop_fields_preserve_arrays_and_omit_null_or_absent_values() {
                 request.as_object_mut().unwrap().remove("stop");
             }
             let (_, _, body) =
-                test_helpers::translate_request_test(provider, &request, "model", &config)
-                    .unwrap();
+                test_helpers::translate_request_test(provider, &request, "model", &config).unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert!(body.pointer(pointer).is_none(), "{provider}: {body}");
         }
@@ -1821,14 +1857,13 @@ fn native_normalizers_preserve_all_supported_blocks_candidates_and_tool_calls() 
         "usage": {"input_tokens": 4, "output_tokens": 5}
     });
     let anthropic_body = serde_json::to_vec(&anthropic).unwrap();
-    let (normalized, _, _, _) = test_helpers::normalize_response_test(
-        "anthropic",
-        200,
-        &anthropic_body,
-        "claude-3",
-    )
-    .unwrap();
-    assert_eq!(normalized["choices"][0]["message"]["content"], "first second");
+    let (normalized, _, _, _) =
+        test_helpers::normalize_response_test("anthropic", 200, &anthropic_body, "claude-3")
+            .unwrap();
+    assert_eq!(
+        normalized["choices"][0]["message"]["content"],
+        "first second"
+    );
     assert_eq!(
         normalized["choices"][0]["message"]["tool_calls"]
             .as_array()
@@ -1862,26 +1897,24 @@ fn native_normalizers_preserve_all_supported_blocks_candidates_and_tool_calls() 
         ]
     });
     let gemini_body = serde_json::to_vec(&gemini).unwrap();
-    let (normalized, _, _, _) = test_helpers::normalize_response_test(
-        "google_gemini",
-        200,
-        &gemini_body,
-        "gemini-2",
-    )
-    .unwrap();
+    let (normalized, _, _, _) =
+        test_helpers::normalize_response_test("google_gemini", 200, &gemini_body, "gemini-2")
+            .unwrap();
     assert_eq!(normalized["choices"].as_array().unwrap().len(), 2);
     assert_eq!(normalized["choices"][0]["message"]["content"], "one two");
-    assert_eq!(normalized["choices"][1]["message"]["tool_calls"][0]["function"]["name"], "lookup");
+    assert_eq!(
+        normalized["choices"][1]["message"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
 
-    let (vertex_normalized, _, _, _) = test_helpers::normalize_response_test(
-        "google_vertex",
-        200,
-        &gemini_body,
-        "gemini-2",
-    )
-    .unwrap();
+    let (vertex_normalized, _, _, _) =
+        test_helpers::normalize_response_test("google_vertex", 200, &gemini_body, "gemini-2")
+            .unwrap();
     assert_eq!(vertex_normalized["choices"].as_array().unwrap().len(), 2);
-    assert_eq!(vertex_normalized["choices"][0]["message"]["content"], "one two");
+    assert_eq!(
+        vertex_normalized["choices"][0]["message"]["content"],
+        "one two"
+    );
     assert_eq!(
         vertex_normalized["choices"][1]["message"]["tool_calls"][0]["function"]["name"],
         "lookup"
@@ -1896,15 +1929,17 @@ fn native_normalizers_preserve_all_supported_blocks_candidates_and_tool_calls() 
         "stopReason": "tool_use"
     });
     let bedrock_body = serde_json::to_vec(&bedrock).unwrap();
-    let (normalized, _, _, _) = test_helpers::normalize_response_test(
-        "aws_bedrock",
-        200,
-        &bedrock_body,
-        "bedrock-model",
-    )
-    .unwrap();
-    assert_eq!(normalized["choices"][0]["message"]["content"], "first second");
-    assert_eq!(normalized["choices"][0]["message"]["tool_calls"][0]["id"], "call_b");
+    let (normalized, _, _, _) =
+        test_helpers::normalize_response_test("aws_bedrock", 200, &bedrock_body, "bedrock-model")
+            .unwrap();
+    assert_eq!(
+        normalized["choices"][0]["message"]["content"],
+        "first second"
+    );
+    assert_eq!(
+        normalized["choices"][0]["message"]["tool_calls"][0]["id"],
+        "call_b"
+    );
 
     let cohere = json!({
         "id": "cohere-tools",
@@ -1931,14 +1966,12 @@ fn native_normalizers_preserve_all_supported_blocks_candidates_and_tool_calls() 
         }
     });
     let cohere_body = serde_json::to_vec(&cohere).unwrap();
-    let (normalized, _, _, _) = test_helpers::normalize_response_test(
-        "cohere",
-        200,
-        &cohere_body,
-        "command-r",
-    )
-    .unwrap();
-    assert_eq!(normalized["choices"][0]["message"]["content"], "first second");
+    let (normalized, _, _, _) =
+        test_helpers::normalize_response_test("cohere", 200, &cohere_body, "command-r").unwrap();
+    assert_eq!(
+        normalized["choices"][0]["message"]["content"],
+        "first second"
+    );
     assert_eq!(
         normalized["choices"][0]["message"]["tool_calls"]
             .as_array()
@@ -1954,7 +1987,10 @@ fn malformed_provider_success_shapes_are_rejected() {
     for (provider, body) in [
         ("openai", json!({})),
         ("openai", json!({"choices": []})),
-        ("anthropic", json!({"type": "message", "role": "assistant", "content": []})),
+        (
+            "anthropic",
+            json!({"type": "message", "role": "assistant", "content": []}),
+        ),
         ("google_gemini", json!({"candidates": []})),
         (
             "google_gemini",
@@ -2699,7 +2735,10 @@ async fn completed_federation_call_publishes_non_replayable_dedup_tombstone() {
         "messages": [{"role": "user", "content": "hello"}]
     });
     let mut headers = json_headers();
-    headers.insert("idempotency-key".to_string(), "federated-call-1".to_string());
+    headers.insert(
+        "idempotency-key".to_string(),
+        "federated-call-1".to_string(),
+    );
     let mut first_ctx = post_json_ctx(&request);
 
     assert!(matches!(
@@ -2735,9 +2774,7 @@ async fn completed_federation_call_publishes_non_replayable_dedup_tombstone() {
             .await,
         PluginResult::Continue
     ));
-    first_ctx
-        .metadata
-        .remove("ferrum:synthetic_short_circuit");
+    first_ctx.metadata.remove("ferrum:synthetic_short_circuit");
     dedup
         .on_response_committed(
             &mut first_ctx,
@@ -2808,14 +2845,22 @@ async fn malformed_success_response_falls_through_to_next_provider() {
     let mut ctx = post_json_ctx(&request);
     let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
     match result {
-        PluginResult::RejectBinary { status_code, body, .. } => {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
             assert_eq!(status_code, 200);
             let body: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["choices"][0]["message"]["content"], "Served by the fallback provider.");
+            assert_eq!(
+                body["choices"][0]["message"]["content"],
+                "Served by the fallback provider."
+            );
         }
         other => panic!("expected normalized fallback response, got {other:?}"),
     }
-    assert_eq!(ctx.metadata.get("ai_federation_provider"), Some(&"secondary".to_string()));
+    assert_eq!(
+        ctx.metadata.get("ai_federation_provider"),
+        Some(&"secondary".to_string())
+    );
 }
 
 #[tokio::test]
@@ -2863,7 +2908,13 @@ async fn invalid_json_sse_and_native_schema_protocol_failures_use_fallback() {
         let mut ctx = post_json_ctx(&request);
         let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
         assert!(
-            matches!(result, PluginResult::RejectBinary { status_code: 200, .. }),
+            matches!(
+                result,
+                PluginResult::RejectBinary {
+                    status_code: 200,
+                    ..
+                }
+            ),
             "{provider_type} malformed protocol response should use fallback"
         );
         assert_eq!(primary.received_requests().await.unwrap().len(), 1);
@@ -2890,7 +2941,10 @@ async fn proven_pre_wire_connection_failure_uses_network_fallback() {
     let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
     assert!(matches!(
         result,
-        PluginResult::RejectBinary { status_code: 200, .. }
+        PluginResult::RejectBinary {
+            status_code: 200,
+            ..
+        }
     ));
     assert_eq!(secondary.received_requests().await.unwrap().len(), 1);
 }
@@ -2926,10 +2980,17 @@ async fn provider_redirect_status_and_safe_headers_are_preserved_without_followi
     let mut ctx = post_json_ctx(&request);
     let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
     match result {
-        PluginResult::RejectBinary { status_code, headers, .. } => {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            ..
+        } => {
             assert_eq!(status_code, 302);
             assert_eq!(headers.get("retry-after").map(String::as_str), Some("30"));
-            assert_eq!(headers.get("x-request-id").map(String::as_str), Some("req-safe"));
+            assert_eq!(
+                headers.get("x-request-id").map(String::as_str),
+                Some("req-safe")
+            );
             assert!(!headers.contains_key("location"));
             assert!(!headers.contains_key("set-cookie"));
         }
@@ -2971,7 +3032,10 @@ async fn successful_provider_status_is_preserved_after_normalization() {
     let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
     assert!(matches!(
         result,
-        PluginResult::RejectBinary { status_code: 201, .. }
+        PluginResult::RejectBinary {
+            status_code: 201,
+            ..
+        }
     ));
 }
 
@@ -3045,7 +3109,11 @@ async fn final_and_fallback_exhaustion_responses_preserve_only_safe_headers() {
     let mut ctx = post_json_ctx(&request);
     let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
     match result {
-        PluginResult::RejectBinary { status_code, headers, .. } => {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            ..
+        } => {
             assert_eq!(status_code, 429);
             assert_eq!(headers.get("retry-after").map(String::as_str), Some("45"));
             assert_eq!(
@@ -3106,7 +3174,11 @@ async fn provider_response_limit_is_terminal_and_external_io_is_tracked() {
         }
         other => panic!("expected bounded-read rejection, got {other:?}"),
     }
-    assert!(ctx.plugin_http_call_ns.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    assert!(
+        ctx.plugin_http_call_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    );
     assert!(secondary.received_requests().await.unwrap().is_empty());
 }
 
@@ -3134,9 +3206,18 @@ async fn open_provider_circuit_skips_unhealthy_primary_on_next_request() {
     for attempt in 0..2 {
         let mut ctx = post_json_ctx(&request);
         let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
-        assert!(matches!(result, PluginResult::RejectBinary { status_code: 200, .. }));
+        assert!(matches!(
+            result,
+            PluginResult::RejectBinary {
+                status_code: 200,
+                ..
+            }
+        ));
         if attempt == 1 {
-            assert_eq!(ctx.metadata.get("ai_federation_circuit_open_skips"), Some(&"1".to_string()));
+            assert_eq!(
+                ctx.metadata.get("ai_federation_circuit_open_skips"),
+                Some(&"1".to_string())
+            );
             assert_eq!(
                 ctx.metadata.get("ai_federation_circuit_last_provider"),
                 Some(&"primary".to_string())
@@ -3187,12 +3268,20 @@ async fn all_open_provider_circuits_fail_fast_and_reload_replaces_state() {
 
     let mut first_ctx = post_json_ctx(&request);
     let first = run_federation_final_body(&plugin, &mut first_ctx, &json_headers()).await;
-    assert!(matches!(first, PluginResult::RejectBinary { status_code: 503, .. }));
+    assert!(matches!(
+        first,
+        PluginResult::RejectBinary {
+            status_code: 503,
+            ..
+        }
+    ));
 
     let mut second_ctx = post_json_ctx(&request);
     let second = run_federation_final_body(&plugin, &mut second_ctx, &json_headers()).await;
     match second {
-        PluginResult::RejectBinary { status_code, body, .. } => {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
             assert_eq!(status_code, 503);
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["error"]["code"], "provider_circuit_open");
@@ -3207,7 +3296,10 @@ async fn all_open_provider_circuits_fail_fast_and_reload_replaces_state() {
         run_federation_final_body(&reloaded, &mut reload_ctx, &json_headers()).await;
     assert!(matches!(
         reloaded_result,
-        PluginResult::RejectBinary { status_code: 503, .. }
+        PluginResult::RejectBinary {
+            status_code: 503,
+            ..
+        }
     ));
     assert_eq!(primary.received_requests().await.unwrap().len(), 2);
 }
@@ -3240,7 +3332,10 @@ async fn provider_dispatch_uses_authoritative_final_transformed_body() {
         .await;
     assert!(matches!(
         result,
-        PluginResult::RejectBinary { status_code: 200, .. }
+        PluginResult::RejectBinary {
+            status_code: 200,
+            ..
+        }
     ));
     let outbound = first_received_json(&server).await;
     assert_eq!(outbound["messages"][0]["content"], "transformed");
@@ -3262,9 +3357,7 @@ async fn spawn_post_reader_that_closes_without_response() -> (String, tokio::tas
                 break;
             }
             received.extend_from_slice(&chunk[..count]);
-            let Some(header_end) = received
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
+            let Some(header_end) = received.windows(4).position(|window| window == b"\r\n\r\n")
             else {
                 continue;
             };
@@ -3324,7 +3417,9 @@ async fn ambiguous_post_outcome_is_not_replayed_without_explicit_opt_in() {
     let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
     primary.await.unwrap();
     match result {
-        PluginResult::RejectBinary { status_code, body, .. } => {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
             assert_eq!(status_code, 502);
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["error"]["code"], "ambiguous_provider_outcome");
@@ -3350,7 +3445,10 @@ async fn explicit_ambiguous_replay_opt_in_allows_fallback_provider() {
     primary.await.unwrap();
     assert!(matches!(
         result,
-        PluginResult::RejectBinary { status_code: 200, .. }
+        PluginResult::RejectBinary {
+            status_code: 200,
+            ..
+        }
     ));
     assert_eq!(secondary.received_requests().await.unwrap().len(), 1);
 }
@@ -3772,13 +3870,17 @@ async fn matched_request_rejects_non_boolean_stream_shape_before_provider_io() {
     let mut ctx = post_json_ctx(&body);
     let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
     match result {
-        PluginResult::RejectBinary { status_code, body, .. } => {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
             assert_eq!(status_code, 400);
             let body: Value = serde_json::from_slice(&body).unwrap();
-            assert!(body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("stream"));
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("stream")
+            );
         }
         other => panic!("expected invalid stream shape rejection, got {other:?}"),
     }
