@@ -690,6 +690,7 @@ struct AdaptiveConcurrencyUpstreamRoute {
     subset: Option<String>,
     backend_port: u16,
     port_override_keys: Vec<u16>,
+    resolved_port_override_keys: Vec<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -816,12 +817,16 @@ fn push_upstream_route(
     upstream: Option<&crate::config::types::Upstream>,
 ) {
     let port_override_keys = upstream
+        .map(adaptive_concurrency_port_override_keys)
+        .unwrap_or_default();
+    let resolved_port_override_keys = upstream
         .map(adaptive_concurrency_resolved_port_override_keys)
         .unwrap_or_default();
     let port_scope = upstream.and_then(|upstream| {
         adaptive_concurrency_upstream_port_scope(
             backend_port,
             &port_override_keys,
+            &resolved_port_override_keys,
             &upstream.targets,
         )
     });
@@ -831,6 +836,7 @@ fn push_upstream_route(
         subset: subset.map(ToOwned::to_owned),
         backend_port,
         port_override_keys,
+        resolved_port_override_keys,
     });
     let key_count = keys.len();
     if let Some(upstream) = upstream {
@@ -860,6 +866,14 @@ fn push_upstream_route(
     }
 }
 
+fn adaptive_concurrency_port_override_keys(
+    upstream: &crate::config::types::Upstream,
+) -> Vec<u16> {
+    let mut keys = upstream.port_overrides.keys().copied().collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys
+}
+
 fn adaptive_concurrency_resolved_port_override_keys(
     upstream: &crate::config::types::Upstream,
 ) -> Vec<u16> {
@@ -878,6 +892,7 @@ fn adaptive_concurrency_resolved_port_override_keys(
 fn adaptive_concurrency_upstream_port_scope(
     backend_port: u16,
     port_override_keys: &[u16],
+    resolved_port_override_keys: &[u16],
     targets: &[crate::config::types::UpstreamTarget],
 ) -> Option<u16> {
     if port_override_keys.is_empty() || targets.is_empty() {
@@ -900,10 +915,13 @@ fn adaptive_concurrency_upstream_port_scope(
     } else {
         backend_port
     };
-    port_override_keys
+    (resolved_port_override_keys
         .binary_search(&dispatch_port)
         .is_ok()
-        .then_some(dispatch_port)
+        && targets
+            .iter()
+            .any(|target| target.dispatch_policy_port() == dispatch_port))
+    .then_some(dispatch_port)
 }
 
 fn push_direct_route_key(
@@ -1420,6 +1438,7 @@ fn adaptive_concurrency_effective_lb_keys(
             let port_scope = adaptive_concurrency_upstream_port_scope(
                 route.backend_port,
                 &route.port_override_keys,
+                &route.resolved_port_override_keys,
                 &upstream.targets,
             );
             keys.extend(
