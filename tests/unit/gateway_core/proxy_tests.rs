@@ -296,18 +296,56 @@ fn retry_target(host: &str, path: Option<&str>) -> UpstreamTarget {
 
 #[test]
 fn test_backend_path_policy_pins_target_path_across_retries() {
-    let initial = retry_target("first.example.com", Some("/pkg.Service/Allowed"));
-    let same_method = retry_target("second.example.com", Some("/pkg.Service/Allowed"));
-    let different_method = retry_target("third.example.com", Some("/admin.Service/Delete"));
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("/pkg.Service".to_string());
+    let incoming = "/api/v1/Allowed";
+    let strip_len = "/api/v1".len();
+    let initial = retry_target("first.example.com", Some("/pkg.Service"));
+    let same_method = retry_target("second.example.com", Some("/pkg.Service"));
+    let different_method = retry_target("third.example.com", Some("/admin.Service"));
+    let explicit_prefix = retry_target("fourth.example.com", Some("/pkg.Service"));
+    let proxy_fallback = retry_target("fifth.example.com", None);
+    let relative_prefix = retry_target("sixth.example.com", Some("pkg.Service"));
 
     assert!(retry_target_preserves_backend_path(
-        true, &initial, &same_method
+        true,
+        &proxy,
+        incoming,
+        strip_len,
+        &initial,
+        &same_method
     ));
     assert!(!retry_target_preserves_backend_path(
-        true, &initial, &different_method
+        true,
+        &proxy,
+        incoming,
+        strip_len,
+        &initial,
+        &different_method
     ));
     assert!(retry_target_preserves_backend_path(
-        false, &initial, &different_method
+        false,
+        &proxy,
+        incoming,
+        strip_len,
+        &initial,
+        &different_method
+    ));
+    assert!(retry_target_preserves_backend_path(
+        true,
+        &proxy,
+        incoming,
+        strip_len,
+        &explicit_prefix,
+        &proxy_fallback
+    ));
+    assert!(retry_target_preserves_backend_path(
+        true,
+        &proxy,
+        incoming,
+        strip_len,
+        &relative_prefix,
+        &proxy_fallback
     ));
 }
 
@@ -330,12 +368,17 @@ fn test_backend_path_bound_retries_abort_in_every_h1_h2_dispatch_family() {
 fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let path_policy = source
-        .find(".on_backend_path_resolved(&mut ctx, &backend_path)")
+        .rfind("if let Some(response) = run_backend_path_plugins_or_build_reject(")
         .expect("backend-path policy hook must remain present");
     let deferred = source
         .find("// Hooks that can dispatch external work or synthesize a terminal response")
         .expect("deferred before_proxy pass must remain present");
     assert!(path_policy < deferred);
+    assert!(source.contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"));
+    assert!(source.contains("backend_dispatch::upstream_selection_hash_key("));
+    assert!(source.contains(
+        "std::mem::replace(&mut ctx.path, original_request_path.clone())"
+    ));
 
     for plugin_source in [
         include_str!("../../../src/plugins/request_mirror.rs"),
@@ -347,6 +390,11 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
             "fn defer_before_proxy_until_backend_path_resolved(&self) -> bool"
         ));
     }
+
+    let serverless = include_str!("../../../src/plugins/serverless_function.rs");
+    assert!(serverless.contains(
+        "fn deferred_before_proxy_may_change_routing_headers(&self) -> bool"
+    ));
 }
 
 #[test]

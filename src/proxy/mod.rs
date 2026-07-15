@@ -8585,6 +8585,9 @@ async fn handle_websocket_request_authenticated(
                     {
                         if !retry_target_preserves_backend_path(
                             backend_path_is_policy_bound,
+                            &proxy,
+                            &ctx.path,
+                            strip_len,
                             prev_target,
                             &next,
                         ) {
@@ -9476,16 +9479,32 @@ pub fn build_backend_effective_path(
 
 /// Once a route-sensitive plugin has authorized the first target's assembled
 /// path, retries may rotate hosts and ports but must not select a different
-/// target-level path without rerunning policy and charging another method.
-/// Keeping the authorized path immutable avoids turning transport retry into a
-/// second routing decision.
+/// assembled effective path without rerunning policy and charging another
+/// method. Comparing the URL-builder output includes the proxy backend-path
+/// fallback used when a target omits its own path. Keeping the authorized path
+/// immutable avoids turning transport retry into a second routing decision.
 #[doc(hidden)]
 pub fn retry_target_preserves_backend_path(
     backend_path_is_policy_bound: bool,
+    proxy: &Proxy,
+    incoming_path: &str,
+    strip_len: usize,
     previous: &UpstreamTarget,
     next: &UpstreamTarget,
 ) -> bool {
-    !backend_path_is_policy_bound || previous.path == next.path
+    if !backend_path_is_policy_bound {
+        return true;
+    }
+    let previous_path = previous.path.as_deref().or(proxy.backend_path.as_deref());
+    let next_path = next.path.as_deref().or(proxy.backend_path.as_deref());
+    previous_path == next_path
+        || build_backend_effective_path(proxy, incoming_path, strip_len, previous.path.as_deref())
+            == build_backend_effective_path(
+                proxy,
+                incoming_path,
+                strip_len,
+                next.path.as_deref(),
+            )
 }
 
 fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
@@ -13810,6 +13829,79 @@ async fn build_grpc_web_reject_response(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_backend_path_plugins_or_build_reject(
+    backend_path_plugins: &[Arc<dyn Plugin>],
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    backend_path: &str,
+    state: &ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: &mut u64,
+    original_request_path: &str,
+    is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&str>,
+) -> Option<Response<ProxyBody>> {
+    let phase_start = Instant::now();
+    for plugin in backend_path_plugins {
+        match plugin.on_backend_path_resolved(ctx, backend_path).await {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. }
+            | reject @ PluginResult::RejectBinary { .. } => {
+                *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    error!(
+                        plugin = plugin.name(),
+                        "Backend-path plugin rejection could not be normalized"
+                    );
+                    record_request(state, 500);
+                    return Some(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status = StatusCode::from_u16(plugin_reject.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    plugins,
+                    ctx,
+                    status,
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    plugins,
+                    ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request_with_path(
+                    plugins,
+                    ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "on_backend_path_resolved",
+                    *plugin_execution_ns,
+                    Some(original_request_path),
+                )
+                .await;
+                record_request(state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Some(response);
+                }
+                return Some(build_response_from_normalized_reject(reject));
+            }
+        }
+    }
+    *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    None
+}
+
 async fn finalize_reject_response_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -13950,20 +14042,33 @@ fn missing_authentication_reject(
     (401, MISSING_AUTHENTICATION_BODY.to_vec(), headers)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum BackendPathBeforeProxyPass {
+    Initial,
+    RoutingHeaderDeferred,
+    RemainingDeferred,
+}
+
 pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
     backend_path_is_policy_bound: bool,
-    deferred_pass: bool,
+    pass: BackendPathBeforeProxyPass,
 ) -> PluginResult {
-    if !backend_path_is_policy_bound && deferred_pass {
-        return PluginResult::Continue;
-    }
     for plugin in plugins {
-        if backend_path_is_policy_bound
-            && plugin.defer_before_proxy_until_backend_path_resolved() != deferred_pass
-        {
+        let deferred = backend_path_is_policy_bound
+            && plugin.defer_before_proxy_until_backend_path_resolved();
+        let should_run = match pass {
+            BackendPathBeforeProxyPass::Initial => !deferred,
+            BackendPathBeforeProxyPass::RoutingHeaderDeferred => {
+                deferred && plugin.deferred_before_proxy_may_change_routing_headers()
+            }
+            BackendPathBeforeProxyPass::RemainingDeferred => {
+                deferred && !plugin.deferred_before_proxy_may_change_routing_headers()
+            }
+        };
+        if !should_run {
             continue;
         }
         match plugin.before_proxy(ctx, headers).await {
@@ -15402,7 +15507,7 @@ async fn handle_proxy_request_inner(
             &mut ctx,
             &mut cloned,
             backend_path_is_policy_bound,
-            false,
+            BackendPathBeforeProxyPass::Initial,
         )
         .await
         {
@@ -15456,7 +15561,7 @@ async fn handle_proxy_request_inner(
             &mut ctx,
             &mut tmp_headers,
             backend_path_is_policy_bound,
-            false,
+            BackendPathBeforeProxyPass::Initial,
         )
         .await
         {
@@ -15634,7 +15739,7 @@ async fn handle_proxy_request_inner(
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
     // enables true PASSTHROUGH load balancing when the upstream's algorithm is
     // Passthrough; it is ignored for every other algorithm.
-    let selection = backend_dispatch::select_upstream_target(
+    let mut selection = backend_dispatch::select_upstream_target(
         &proxy,
         &state,
         &epoch,
@@ -15642,101 +15747,72 @@ async fn handle_proxy_request_inner(
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
         ctx.orig_dst,
     );
-    let lb_hash_key = selection.lb_hash_key;
-    let upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+    let mut lb_hash_key = selection.lb_hash_key;
+    let mut upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
         selection.target,
         request_host.as_deref(),
     );
 
-    // Route-sensitive policy runs only after the exact backend path is known:
-    // route/header-shaping before_proxy hooks have completed, the effective
-    // proxy has been materialized, and load balancing has selected the target
-    // whose optional path overrides proxy.backend_path. External/synthetic
-    // before_proxy hooks are deferred until this policy passes. The list is
-    // precomputed by PluginCache, so ordinary requests do not scan the full
-    // plugin chain.
-    if backend_path_is_policy_bound {
-        let backend_path = build_backend_effective_path(
-            &proxy,
-            &path,
-            strip_len,
-            upstream_target.as_ref().and_then(|target| target.path.as_deref()),
-        );
-        let phase_start = Instant::now();
-        for plugin in backend_path_plugins.iter() {
-            match plugin
-                .on_backend_path_resolved(&mut ctx, &backend_path)
+    let has_deferred_routing_header_hooks = backend_path_is_policy_bound
+        && capabilities.has(PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
+    let mut deferred_result = PluginResult::Continue;
+    let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
+    let mut authorized_backend_path: Option<String> = None;
+
+    loop {
+        // Route-sensitive policy runs only after route/header-shaping hooks and
+        // target selection. If a deferred function changes the selection hash,
+        // this loop reauthorizes the newly selected effective path.
+        if backend_path_is_policy_bound {
+            let backend_path = build_backend_effective_path(
+                &proxy,
+                &path,
+                strip_len,
+                upstream_target.as_ref().and_then(|target| target.path.as_deref()),
+            );
+            if authorized_backend_path.as_deref() != Some(backend_path.as_str()) {
+                if let Some(response) = run_backend_path_plugins_or_build_reject(
+                    backend_path_plugins,
+                    &plugins,
+                    &mut ctx,
+                    &backend_path,
+                    &state,
+                    start_time,
+                    &mut plugin_execution_ns,
+                    &original_request_path,
+                    is_grpc_request,
+                    grpc_web_response_content_type,
+                )
                 .await
-            {
-                PluginResult::Continue => {}
-                reject @ PluginResult::Reject { .. }
-                | reject @ PluginResult::RejectBinary { .. } => {
-                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
-                        error!(
-                            plugin = plugin.name(),
-                            "Backend-path plugin rejection could not be normalized"
-                        );
-                        record_request(&state, 500);
-                        return Ok(build_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            r#"{"error":"Internal error"}"#,
-                        ));
-                    };
-                    let status = StatusCode::from_u16(plugin_reject.status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
-                        &plugins,
-                        &mut ctx,
-                        status,
-                        &plugin_reject.body,
-                        plugin_reject.headers,
-                        is_grpc_request,
-                        grpc_web_response_content_type.is_none(),
-                    )
-                    .await;
-                    apply_grpc_reject_metadata(&mut ctx, &reject);
-                    let grpc_web_response = build_grpc_web_reject_response(
-                        &plugins,
-                        &mut ctx,
-                        grpc_web_response_content_type,
-                        &reject,
-                    )
-                    .await;
-                    log_rejected_request_with_path(
-                        &plugins,
-                        &ctx,
-                        reject.http_status.as_u16(),
-                        start_time,
-                        "on_backend_path_resolved",
-                        plugin_execution_ns,
-                        Some(&original_request_path),
-                    )
-                    .await;
-                    record_request(&state, reject.http_status.as_u16());
-                    if let Some(response) = grpc_web_response {
-                        return Ok(response);
-                    }
-                    return Ok(build_response_from_normalized_reject(reject));
+                {
+                    return Ok(response);
                 }
+                authorized_backend_path = Some(backend_path);
             }
         }
-        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-    }
 
-    // Hooks that can dispatch external work or synthesize a terminal response
-    // must not run until route-sensitive policy has authorized the exact first
-    // backend path. The ordinary pipeline never enters this second pass.
-    if backend_path_is_policy_bound {
+        if !run_deferred_routing_headers {
+            break;
+        }
+        run_deferred_routing_headers = false;
+
+        let headers_before = owned_proxy_headers
+            .as_ref()
+            .unwrap_or(&ctx.headers)
+            .clone();
+        // These hooks moved later for authorization ordering, but their
+        // documented request view remains the original client path.
+        let backend_ctx_path =
+            std::mem::replace(&mut ctx.path, original_request_path.clone());
         let phase_start = Instant::now();
-        let deferred_result = match owned_proxy_headers.as_mut() {
+        deferred_result = match owned_proxy_headers.as_mut() {
             Some(headers) => {
                 run_before_proxy_hooks_for_backend_path_policy(
                     &plugins,
                     &mut ctx,
                     headers,
                     true,
-                    true,
+                    BackendPathBeforeProxyPass::RoutingHeaderDeferred,
                 )
                 .await
             }
@@ -15747,7 +15823,7 @@ async fn handle_proxy_request_inner(
                     &mut ctx,
                     &mut headers,
                     true,
-                    true,
+                    BackendPathBeforeProxyPass::RoutingHeaderDeferred,
                 )
                 .await;
                 ctx.headers = headers;
@@ -15755,6 +15831,76 @@ async fn handle_proxy_request_inner(
             }
         };
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        ctx.path = backend_ctx_path;
+        if !matches!(deferred_result, PluginResult::Continue) {
+            break;
+        }
+
+        let selected_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+        if selected_headers != &headers_before
+            && backend_dispatch::upstream_selection_hash_key(
+                &proxy,
+                &epoch,
+                &ctx.client_ip,
+                selected_headers,
+            ) != lb_hash_key
+        {
+            selection = backend_dispatch::select_upstream_target(
+                &proxy,
+                &state,
+                &epoch,
+                &ctx.client_ip,
+                selected_headers,
+                ctx.orig_dst,
+            );
+            lb_hash_key = selection.lb_hash_key;
+            upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+                selection.target,
+                request_host.as_deref(),
+            );
+            continue;
+        }
+        break;
+    }
+
+    // Hooks that can dispatch external work or synthesize a terminal response
+    // must not run until route-sensitive policy has authorized the exact first
+    // backend path. The ordinary pipeline never enters this second pass.
+    if backend_path_is_policy_bound {
+        if matches!(deferred_result, PluginResult::Continue) {
+            // Preserve the pre-existing client-path contract for mirrors,
+            // mocks, load fan-out, and other remaining deferred hooks.
+            let backend_ctx_path =
+                std::mem::replace(&mut ctx.path, original_request_path.clone());
+            let phase_start = Instant::now();
+            deferred_result = match owned_proxy_headers.as_mut() {
+                Some(headers) => {
+                    run_before_proxy_hooks_for_backend_path_policy(
+                        &plugins,
+                        &mut ctx,
+                        headers,
+                        true,
+                        BackendPathBeforeProxyPass::RemainingDeferred,
+                    )
+                    .await
+                }
+                None => {
+                    let mut headers = std::mem::take(&mut ctx.headers);
+                    let result = run_before_proxy_hooks_for_backend_path_policy(
+                        &plugins,
+                        &mut ctx,
+                        &mut headers,
+                        true,
+                        BackendPathBeforeProxyPass::RemainingDeferred,
+                    )
+                    .await;
+                    ctx.headers = headers;
+                    result
+                }
+            };
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+            ctx.path = backend_ctx_path;
+        }
         match deferred_result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. }
@@ -17015,6 +17161,9 @@ async fn handle_proxy_request_inner(
                 {
                     if !retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
+                        &proxy,
+                        &path,
+                        strip_len,
                         prev_target,
                         &next,
                     ) {
@@ -18974,6 +19123,9 @@ async fn handle_proxy_request_inner(
             {
                 if !retry_target_preserves_backend_path(
                     backend_path_is_policy_bound,
+                    &proxy,
+                    &path,
+                    strip_len,
                     prev_target,
                     &next,
                 ) {

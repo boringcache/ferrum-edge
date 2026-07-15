@@ -3201,7 +3201,7 @@ config:
 
 ### `grpc_method_router`
 
-Enables per-method access control and rate limiting for canonical gRPC paths (`/package.Service/Method`). The security decision uses the backend-effective path after URI rewrites, listen-path stripping, proxy/target backend-path composition, and initial load-balancer target selection. It then refreshes `grpc_service`, `grpc_method`, and `grpc_full_method` metadata with the method actually authorized for backend dispatch. Retry rotation may change the backend host or port only while preserving that authorized target-path component; a path-changing candidate aborts the retry. Late policy rejections retain native gRPC or gRPC-Web wire framing as appropriate for the client, including gRPC-Web over HTTP/3.
+Enables per-method access control and rate limiting for canonical gRPC paths (`/package.Service/Method`). The security decision uses the backend-effective path after URI rewrites, listen-path stripping, proxy/target backend-path composition, and initial load-balancer target selection. It then refreshes `grpc_service`, `grpc_method`, and `grpc_full_method` metadata with the method actually authorized for backend dispatch. Routing-header mutations from deferred pre-proxy functions trigger target reselection and authorization of any changed effective path. Retry rotation may change the backend host or port only while preserving the assembled authorized path, including proxy-path fallback; a path-changing candidate aborts the retry. Late policy rejections retain native gRPC or gRPC-Web wire framing as appropriate for the client, including gRPC-Web over HTTP/3.
 
 **Priority:** 275
 **Protocol:** gRPC only

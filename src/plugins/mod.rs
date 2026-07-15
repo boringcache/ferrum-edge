@@ -2920,6 +2920,14 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when a deferred `before_proxy` hook can mutate headers
+    /// that participate in upstream target selection. The gateway runs these
+    /// hooks in a separate deferred subphase, then reselects and reauthorizes
+    /// the backend-effective path if the selection hash changed.
+    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
+        false
+    }
+
     /// Returns `true` when this plugin must inspect the backend-effective path
     /// after route overrides and load balancing have selected the first target.
     ///

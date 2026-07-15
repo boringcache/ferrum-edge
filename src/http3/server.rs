@@ -2230,7 +2230,8 @@ async fn handle_h3_request(
     // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
     // frontend never carries a captured original destination. A Passthrough
     // upstream therefore round-robins here (with the existing warn).
-    let selection = crate::proxy::backend_dispatch::select_upstream_target(
+    let routing_proxy = Arc::clone(&proxy);
+    let mut selection = crate::proxy::backend_dispatch::select_upstream_target(
         &proxy,
         &state,
         &epoch,
@@ -2238,12 +2239,13 @@ async fn handle_h3_request(
         &proxy_headers,
         None,
     );
-    let lb_hash_key = selection.lb_hash_key;
-    let upstream_target = crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
-        selection.target,
-        request_host.as_deref(),
-    );
-    let upstream_balancer = selection.balancer;
+    let mut lb_hash_key = selection.lb_hash_key;
+    let mut upstream_target =
+        crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
+            selection.target,
+            request_host.as_deref(),
+        );
+    let mut upstream_balancer = selection.balancer;
     // Mirror H1/H2 selected-target policy: cap per-request retries, then build
     // an effective proxy carrying per-target DestinationRule-derived
     // connectionPool/TLS overrides for the FIRST selected target. That
@@ -2254,13 +2256,15 @@ async fn handle_h3_request(
     // WebSocket dial loop — re-resolves the effective proxy per attempt from
     // the capped but UNRESOLVED base proxy, so a later target does not inherit
     // the first target's port-level TLS/SNI/H1 policy.
-    let selected_base_proxy =
-        crate::proxy::cap_proxy_retry_for_target(proxy, upstream_target.as_deref());
+    let mut selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
+        Arc::clone(&routing_proxy),
+        upstream_target.as_deref(),
+    );
     let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
         &selected_base_proxy,
         upstream_target.as_deref(),
     );
-    let proxy = match effective_proxy {
+    let mut proxy = match effective_proxy {
         std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
         std::borrow::Cow::Owned(owned) => Arc::new(owned),
     };
@@ -2271,43 +2275,128 @@ async fn handle_h3_request(
     // proxy on H3 only.
     ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
 
-    if backend_path_is_policy_bound {
-        let backend_path = crate::proxy::build_backend_effective_path(
-            &proxy,
-            &path,
-            strip_len,
-            upstream_target.as_ref().and_then(|target| target.path.as_deref()),
+    let has_deferred_routing_header_hooks = backend_path_is_policy_bound
+        && capabilities.has(
+            crate::plugin_cache::PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS,
         );
-        if !run_h3_backend_path_plugins_or_send_reject(
-            backend_path_plugins,
-            &plugins,
-            &mut ctx,
-            &backend_path,
-            &original_request_path,
-            http_flavor,
-            &mut stream,
-            &state,
-            start_time,
-            &mut plugin_execution_ns,
-            grpc_web_response_content_type.as_deref(),
-        )
-        .await?
-        {
-            return Ok(());
-        }
-    }
+    let mut deferred_result = PluginResult::Continue;
+    let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
+    let mut authorized_backend_path: Option<String> = None;
 
-    if backend_path_is_policy_bound {
+    loop {
+        if backend_path_is_policy_bound {
+            let backend_path = crate::proxy::build_backend_effective_path(
+                &proxy,
+                &path,
+                strip_len,
+                upstream_target.as_ref().and_then(|target| target.path.as_deref()),
+            );
+            if authorized_backend_path.as_deref() != Some(backend_path.as_str()) {
+                if !run_h3_backend_path_plugins_or_send_reject(
+                    backend_path_plugins,
+                    &plugins,
+                    &mut ctx,
+                    &backend_path,
+                    &original_request_path,
+                    http_flavor,
+                    &mut stream,
+                    &state,
+                    start_time,
+                    &mut plugin_execution_ns,
+                    grpc_web_response_content_type.as_deref(),
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                authorized_backend_path = Some(backend_path);
+            }
+        }
+
+        if !run_deferred_routing_headers {
+            break;
+        }
+        run_deferred_routing_headers = false;
+
+        let headers_before = proxy_headers.clone();
+        // Deferral changes authorization order, not the client-path view that
+        // before_proxy hooks received before a mesh backend rewrite.
+        let backend_ctx_path =
+            std::mem::replace(&mut ctx.path, original_request_path.clone());
         let phase_start = std::time::Instant::now();
-        let deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+        deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
             &plugins,
             &mut ctx,
             &mut proxy_headers,
             true,
-            true,
+            crate::proxy::BackendPathBeforeProxyPass::RoutingHeaderDeferred,
         )
         .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        ctx.path = backend_ctx_path;
+        if !matches!(deferred_result, PluginResult::Continue) {
+            break;
+        }
+
+        if proxy_headers != headers_before
+            && crate::proxy::backend_dispatch::upstream_selection_hash_key(
+                &routing_proxy,
+                &epoch,
+                &ctx.client_ip,
+                &proxy_headers,
+            ) != lb_hash_key
+        {
+            selection = crate::proxy::backend_dispatch::select_upstream_target(
+                &routing_proxy,
+                &state,
+                &epoch,
+                &ctx.client_ip,
+                &proxy_headers,
+                None,
+            );
+            lb_hash_key = selection.lb_hash_key;
+            upstream_target =
+                crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
+                    selection.target,
+                    request_host.as_deref(),
+                );
+            upstream_balancer = selection.balancer;
+            selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
+                Arc::clone(&routing_proxy),
+                upstream_target.as_deref(),
+            );
+            let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
+                &selected_base_proxy,
+                upstream_target.as_deref(),
+            );
+            proxy = match effective_proxy {
+                std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
+                std::borrow::Cow::Owned(owned) => Arc::new(owned),
+            };
+            ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
+            continue;
+        }
+        break;
+    }
+
+    if backend_path_is_policy_bound {
+        if matches!(deferred_result, PluginResult::Continue) {
+            // Mirrors and other remaining deferred hooks retain the original
+            // client path even though dispatch keeps the rewritten path.
+            let backend_ctx_path =
+                std::mem::replace(&mut ctx.path, original_request_path.clone());
+            let phase_start = std::time::Instant::now();
+            deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+                &plugins,
+                &mut ctx,
+                &mut proxy_headers,
+                true,
+                crate::proxy::BackendPathBeforeProxyPass::RemainingDeferred,
+            )
+            .await;
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+            ctx.path = backend_ctx_path;
+        }
         match deferred_result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. }
@@ -4860,6 +4949,9 @@ async fn handle_h3_request(
                 {
                     if !crate::proxy::retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
+                        &proxy,
+                        &path,
+                        strip_len,
                         prev_target,
                         &next,
                     ) {

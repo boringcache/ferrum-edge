@@ -198,6 +198,10 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .defer_before_proxy_until_backend_path_resolved()
     }
+    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
+        self.inner
+            .deferred_before_proxy_may_change_routing_headers()
+    }
     fn requires_backend_path_resolution(&self) -> bool {
         self.inner.requires_backend_path_resolution()
     }
@@ -710,6 +714,7 @@ impl PluginCapabilities {
     pub const HAS_RESPONSE_STREAM_HOOKS: u16 = 1 << 9;
     pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
     pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
+    pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -757,6 +762,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         if p.requires_backend_path_resolution() {
             caps |= PluginCapabilities::HAS_BACKEND_PATH_PLUGINS;
             backend_path.push(Arc::clone(p));
+        }
+        if p.deferred_before_proxy_may_change_routing_headers() {
+            caps |= PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS;
         }
         for header in p.request_headers_to_redact() {
             if !request_headers_to_redact

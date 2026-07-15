@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -22,8 +24,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginConfig, PluginScope, Proxy,
-    ResponseBodyMode,
+    AuthMode, BackendScheme, BackoffStrategy, DispatchKind, GatewayConfig,
+    LoadBalancerAlgorithm, PluginConfig, PluginScope, Proxy, ResponseBodyMode, RetryConfig,
+    Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::ProxyState;
@@ -216,6 +219,14 @@ fn create_test_proxy_state_with_plugins(
     proxies: Vec<Proxy>,
     plugin_configs: Vec<PluginConfig>,
 ) -> ProxyState {
+    create_test_proxy_state_with_plugins_and_upstreams(proxies, plugin_configs, Vec::new())
+}
+
+fn create_test_proxy_state_with_plugins_and_upstreams(
+    proxies: Vec<Proxy>,
+    plugin_configs: Vec<PluginConfig>,
+    upstreams: Vec<Upstream>,
+) -> ProxyState {
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: HashMap::new(),
         resolver_addresses: None,
@@ -242,7 +253,7 @@ fn create_test_proxy_state_with_plugins(
         proxies,
         consumers: vec![],
         plugin_configs,
-        upstreams: vec![],
+        upstreams,
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
@@ -250,6 +261,36 @@ fn create_test_proxy_state_with_plugins(
     let (state, _health_check_handles) =
         ProxyState::new(config, dns_cache, create_test_env_config(), None, None).unwrap();
     state
+}
+
+fn create_test_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        name: Some(format!("gRPC Test Upstream {id}")),
+        targets,
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
 }
 
 /// Like [`create_test_proxy_state`] but with a caller-supplied `EnvConfig` so a
@@ -368,6 +409,24 @@ async fn start_mock_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) 
     // Give the server a moment to start
     tokio::time::sleep(Duration::from_millis(20)).await;
     (addr, handle)
+}
+
+async fn start_connection_counting_backend() -> (
+    SocketAddr,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let task_count = Arc::clone(&connection_count);
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            task_count.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    (addr, connection_count, handle)
 }
 
 /// Start the gateway proxy listener and return the address.
@@ -1551,6 +1610,100 @@ async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
         body.windows(b"grpc-status: 7".len())
             .any(|window| window == b"grpc-status: 7"),
         "method policy reject must embed PERMISSION_DENIED in the gRPC-Web body"
+    );
+}
+
+/// A connect retry must not dial an alternate target whose effective path
+/// would change the method authorized for the first target.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_retry_does_not_dial_path_changing_target() {
+    let (unavailable_addr, unavailable_connections, _unavailable_handle) =
+        start_connection_counting_backend().await;
+    let (path_changing_addr, path_changing_connections, _path_changing_handle) =
+        start_connection_counting_backend().await;
+
+    let mut proxy = create_grpc_proxy(
+        "grpc-retry-method-policy",
+        "/grpc",
+        unavailable_addr.port(),
+    );
+    proxy.upstream_id = Some("grpc-retry-method-policy-upstream".to_string());
+    proxy.retry = Some(RetryConfig {
+        max_retries: 1,
+        retryable_status_codes: Vec::new(),
+        retryable_methods: vec!["POST".to_string()],
+        backoff: BackoffStrategy::Fixed { delay_ms: 1 },
+        retry_on_connect_failure: true,
+    });
+    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: "grpc-retry-method-policy-router".to_string(),
+    }];
+
+    let method_router = PluginConfig {
+        id: "grpc-retry-method-policy-router".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_method_router".to_string(),
+        enabled: true,
+        config: serde_json::json!({
+            "allow_methods": ["/pkg.Service/Allowed"]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-retry-method-policy".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let upstream = create_test_upstream(
+        "grpc-retry-method-policy-upstream",
+        vec![
+            UpstreamTarget {
+                host: "127.0.0.1".to_string(),
+                port: unavailable_addr.port(),
+                service_port_policy_key: None,
+                weight: 100,
+                tags: HashMap::new(),
+                locality: None,
+                path: Some("/pkg.Service".to_string()),
+            },
+            UpstreamTarget {
+                host: "127.0.0.1".to_string(),
+                port: path_changing_addr.port(),
+                service_port_policy_key: None,
+                weight: 100,
+                tags: HashMap::new(),
+                locality: None,
+                path: Some("/admin.Service".to_string()),
+            },
+        ],
+    );
+    let state = create_test_proxy_state_with_plugins_and_upstreams(
+        vec![proxy],
+        vec![method_router],
+        vec![upstream],
+    );
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+    let unavailable_before = unavailable_connections.load(Ordering::SeqCst);
+    let path_changing_before = path_changing_connections.load(Ordering::SeqCst);
+
+    let (status, headers, _body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_grpc_request(gateway_addr, "/grpc/Allowed", b"", &[]),
+    )
+    .await
+    .expect("gRPC retry request timed out")
+    .expect("gRPC retry request failed");
+
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("14"));
+    assert!(
+        unavailable_connections.load(Ordering::SeqCst) > unavailable_before,
+        "initial target must fail during the h2c connect handshake"
+    );
+    assert_eq!(
+        path_changing_connections.load(Ordering::SeqCst),
+        path_changing_before,
+        "path-changing retry target must not be dialed"
     );
 }
 

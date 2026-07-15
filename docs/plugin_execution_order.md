@@ -101,10 +101,11 @@ backend wire. Its
 pre-filtered plugin list is built on reload; proxies without an opt-in plugin do
 not scan the chain or allocate an effective-path string. Once policy binds the
 first target's path, retries may rotate host/port only when the candidate keeps
-that target-path component. A candidate with a different path aborts the retry
-instead of redialing the failed target or silently changing the authorized
-method. This applies to HTTP, native and bridged gRPC/H3, and WebSocket retry
-loops.
+the same assembled effective backend path, including the proxy `backend_path`
+fallback when a target has no explicit path. A candidate with a different path
+aborts the retry instead of redialing the failed target or silently changing
+the authorized method. This applies to HTTP, native and bridged gRPC/H3, and
+WebSocket retry loops.
 
 When backend-path policy is active, `before_proxy` hooks that can dispatch
 external work or synthesize a terminal response opt into phase 5b. Ferrum runs
@@ -113,6 +114,11 @@ them in their normal relative priority order only after path authorization.
 `load_testing` use this boundary, so a backend-effective gRPC deny cannot be
 mirrored, invoked, mocked, or load-fanned-out before it is enforced. Proxies
 without a backend-path policy retain the ordinary single `before_proxy` pass.
+Deferred hooks observe the original client path, preserving their normal
+request semantics even when mesh routing rewrote the backend path. A deferred
+hook that can inject routing headers runs first; if it changes the load-balancer
+hash key, Ferrum reselects the target and authorizes any changed effective path
+before any remaining external or synthetic hook.
 
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
 

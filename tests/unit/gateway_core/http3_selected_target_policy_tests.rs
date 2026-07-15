@@ -225,6 +225,14 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         policy_block.contains("grpc_web_response_content_type.as_deref()"),
         "H3 backend-path rejects must retain the client's gRPC-Web response encoding"
     );
+    assert!(
+        source.contains("backend_dispatch::upstream_selection_hash_key("),
+        "H3 must re-evaluate header-hash routing after deferred header mutations"
+    );
+    assert!(
+        source.contains("BackendPathBeforeProxyPass::RemainingDeferred"),
+        "H3 must keep remaining side-effect hooks behind any required reauthorization"
+    );
     let native_retry = source
         .find("// Resolve and validate the retry target before charging this")
         .expect("native H3 retry path must preflight the candidate path");

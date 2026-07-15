@@ -971,6 +971,9 @@ pub(crate) async fn handle_h3_websocket(
                     {
                         if !crate::proxy::retry_target_preserves_backend_path(
                             backend_path_is_policy_bound,
+                            &proxy,
+                            &ctx.path,
+                            strip_len,
                             prev_target,
                             &next,
                         ) {
