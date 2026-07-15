@@ -2149,21 +2149,6 @@ impl Plugin for AiSemanticFirewall {
             return false;
         }
 
-        if content_type.is_some_and(is_event_stream_content_type) {
-            // Pin an event stream onto the buffered path only when `buffer` mode
-            // actually flagged THIS request from a detected `stream: true` JSON
-            // POST (the request-path marker). Unrelated SSE — a `GET` EventSource
-            // endpoint, or a backend that unexpectedly returns an unbounded
-            // stream — must keep streaming; buffering it would collect until
-            // `max_response_body_size_bytes` and 502 instead. An `inspect`-marked
-            // event stream stays streaming too (the windowed inspector handles it).
-            // A `skip`-marked event stream is the fail-open opt-out's target: it
-            // also keeps streaming (downgrade back to the uninspected path).
-            // (Already-buffered bodies are still inspected in `on_response_body`.)
-            return self.streaming_response == StreamingResponsePolicy::Buffer
-                && buffer_streaming_marker_set(ctx);
-        }
-
         // The final buffered hook is the only phase that can safely classify
         // an origin-encoded response by its decoded shape. Keep every eligible
         // non-identity encoding on the bounded decode path even when the origin
@@ -2171,6 +2156,11 @@ impl Plugin for AiSemanticFirewall {
         // encoding that must follow the configured `on_error` policy. This
         // remains a narrowing-only answer: if the request-level decision
         // already opted out, this hook must not reverse it.
+        //
+        // This check deliberately precedes the event-stream release below:
+        // streaming inspectors receive wire bytes and cannot parse compressed
+        // SSE. Complete origin-encoded event streams must be decoded by the
+        // buffered final hook too.
         //
         // Compression advertises a gateway-planned encoding in `after_proxy`
         // before the still-plaintext body is transformed. On dispatch paths
@@ -2183,6 +2173,22 @@ impl Plugin for AiSemanticFirewall {
             && !gateway_response_compression_planned(ctx, response_headers)
         {
             return self.should_buffer_response_body(ctx);
+        }
+
+        if content_type.is_some_and(is_event_stream_content_type) {
+            // Pin an event stream onto the buffered path only when `buffer` mode
+            // actually flagged THIS request from a detected `stream: true` JSON
+            // POST (the request-path marker). Unencoded unrelated SSE — a `GET`
+            // EventSource endpoint, or a backend that unexpectedly returns an
+            // unbounded stream — must keep streaming; buffering it would collect
+            // until `max_response_body_size_bytes` and 502 instead. An
+            // `inspect`-marked event stream stays streaming too (the windowed
+            // inspector handles it). A `skip`-marked event stream is the
+            // fail-open opt-out's target: it also keeps streaming (downgrade back
+            // to the uninspected path).
+            // (Already-buffered bodies are still inspected in `on_response_body`.)
+            return self.streaming_response == StreamingResponsePolicy::Buffer
+                && buffer_streaming_marker_set(ctx);
         }
 
         let Some(content_type) = content_type else {
@@ -5047,8 +5053,12 @@ fn gateway_response_compression_planned(
     let Some(encoding) = content_encoding_value(headers) else {
         return false;
     };
-    ctx.gateway_response_compression_algorithm()
-        .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case(encoding))
+    // A later header hook may rewrite one supported gateway encoding to the
+    // other. Compression follows that final header when transforming the body,
+    // so private ownership remains authoritative even when it differs from the
+    // algorithm originally selected.
+    (encoding.eq_ignore_ascii_case("gzip") || encoding.eq_ignore_ascii_case("br"))
+        && ctx.gateway_response_compression_algorithm().is_some()
 }
 
 fn strip_json_bom(body: &[u8]) -> &[u8] {

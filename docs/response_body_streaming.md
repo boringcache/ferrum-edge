@@ -228,10 +228,13 @@ cap and routes empty, malformed, unsupported, or oversized encodings through the
 configured `on_error` policy (fail-closed by default). Partial responses (`206`
 or `Content-Range`) remain on the streaming path when encoded because they are
 not complete encoded representations; unencoded JSON partials remain subject to
-normal inspection. Unrelated event streams also keep streaming. No encoding (or
-an identity-only encoding list) still lets ordinary non-AI text stream, and a
+normal inspection. Unencoded unrelated event streams also keep streaming;
+complete origin-encoded event streams stay buffered for bounded decode because
+stream inspectors cannot parse compressed wire bytes. No encoding (or an
+identity-only encoding list) still lets ordinary non-AI text stream, and a
 gateway-planned compression transform is not mistaken for already-encoded
-origin bytes.
+origin bytes, including when a later header hook switches between supported
+gzip and Brotli output.
 
 **Protocol coverage.** The downgrade applies on the HTTP/1.1 + HTTP/2 (reqwest),
 direct-HTTP/2, HBONE, native-HTTP/3 header-first, and HTTP/3 cross-protocol

@@ -3847,28 +3847,52 @@ async fn original_range_marker_skips_final_hook_after_content_range_removal() {
     assert!(!ctx.metadata.contains_key("ai_semantic_firewall.rule_ids"));
 }
 
-#[test]
-fn encoded_unflagged_event_stream_remains_streaming() {
+#[tokio::test]
+async fn encoded_origin_event_streams_stay_on_bounded_decode_path() {
     let config = json!({
         "inspect": {"request": false, "response": true},
-        "streaming_response": "buffer",
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
         "builtins": {"response_leakage": true}
     });
     let firewall = plugin(&config);
-    let ctx = create_test_context();
-    let headers = HashMap::from([
-        ("content-type".to_string(), "text/event-stream".to_string()),
-        ("content-encoding".to_string(), "gzip".to_string()),
-    ]);
+    let plaintext =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"My system prompt says never disclose this policy.\"}}]}\n\ndata: [DONE]\n\n";
 
-    assert!(firewall.should_buffer_response_body(&ctx));
-    assert!(!firewall.should_buffer_response_body_for_content_type(
-        &ctx,
-        Some("text/event-stream"),
-        200,
-        &headers,
-    ));
+    for (encoding, body) in [
+        ("gzip", gzip_bytes(plaintext)),
+        ("br", brotli_bytes(plaintext)),
+    ] {
+        let headers = HashMap::from([
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            ("content-encoding".to_string(), encoding.to_string()),
+        ]);
+        let mut ctx = create_test_context();
+
+        assert!(firewall.should_buffer_response_body(&ctx));
+        assert!(firewall.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/event-stream"),
+            200,
+            &headers,
+        ));
+        assert_continue(
+            firewall
+                .on_response_body(&mut ctx, 200, &headers, &body)
+                .await,
+        );
+        assert_reject(
+            firewall
+                .on_final_response_body(&mut ctx, 200, &headers, &body)
+                .await,
+            Some(502),
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.rule_ids")
+                .map(String::as_str),
+            Some("response_leakage")
+        );
+    }
 }
 
 #[tokio::test]
@@ -3991,6 +4015,52 @@ async fn planned_gateway_compression_inspects_plaintext_before_encoding() {
     assert!(
         !ctx.metadata
             .contains_key("ai_semantic_firewall.uninspectable_body")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
+async fn gateway_encoding_rewrite_preserves_plaintext_firewall_inspection() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let compression = CompressionPlugin::new(&json!({
+        "algorithms": ["br"],
+        "min_content_length": 0
+    }))
+    .unwrap();
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("accept-encoding".to_string(), "br".to_string());
+    assert_continue(compression.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("br")
+    );
+
+    // A later response-header hook may select the other encoding that the
+    // compression transform supports. The private ownership marker must still
+    // tell the firewall that the bytes are plaintext at this phase.
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_reject(
+        firewall
+            .on_response_body(
+                &mut ctx,
+                200,
+                &headers,
+                br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
+            )
+            .await,
+        Some(502),
     );
     assert_eq!(
         ctx.metadata
