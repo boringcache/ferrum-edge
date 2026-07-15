@@ -12,6 +12,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
 use super::plugin_utils::assert_reject;
 
+const AUTHORITY_MISMATCH_ERROR: &str =
+    r#"{"error":"OIDC callback host does not match request host"}"#;
+const INVALID_AUTHORITY_ERROR: &str =
+    r#"{"error":"OIDC missing or malformed request authority"}"#;
+
 fn base_config() -> serde_json::Value {
     json!({
         "providers": [{
@@ -99,6 +104,7 @@ async fn issue_browser_challenge_for_context(
 async fn assert_browser_challenge_fails_closed(
     plugin: &OidcRelyingParty,
     mut ctx: RequestContext,
+    expected_body: &str,
 ) {
     let PluginResult::Reject {
         status_code,
@@ -111,10 +117,7 @@ async fn assert_browser_challenge_fails_closed(
         panic!("expected browser challenge rejection");
     };
     assert_eq!(status_code, 400);
-    assert_eq!(
-        body,
-        r#"{"error":"OIDC callback host does not match request host"}"#
-    );
+    assert_eq!(body, expected_body);
     assert!(!headers.contains_key("location"));
     assert!(!headers.contains_key("set-cookie"));
 }
@@ -162,11 +165,7 @@ fn assert_host_only_correlation_cookie(cookie: &str, expected_max_age: &str) {
         "{cookie}"
     );
     assert_eq!(cookie_attribute(cookie, "secure"), Some(None), "{cookie}");
-    assert_eq!(
-        cookie_attribute(cookie, "httponly"),
-        Some(None),
-        "{cookie}"
-    );
+    assert_eq!(cookie_attribute(cookie, "httponly"), Some(None), "{cookie}");
 }
 
 fn assert_same_correlation_scope(created: &str, cleared: &str) {
@@ -180,8 +179,7 @@ fn assert_same_correlation_scope(created: &str, cleared: &str) {
 }
 
 fn callback_context(challenge: &BrowserChallenge) -> RequestContext {
-    let mut ctx =
-        RequestContext::new("127.0.0.1".into(), "GET".into(), "/oauth/callback".into());
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/oauth/callback".into());
     ctx.headers.insert(
         "cookie".to_string(),
         cookie_pair(&challenge.cookie).to_string(),
@@ -296,9 +294,18 @@ async fn unauthenticated_html_get_returns_302() {
 #[tokio::test]
 async fn browser_challenge_accepts_same_host_with_normalized_names_ips_and_ports() {
     for (redirect_uri, request_host) in [
-        ("https://app.example.com/oauth/callback", "APP.EXAMPLE.COM:8443"),
-        ("https://app.example.com:443/oauth/callback", "app.example.com"),
-        ("https://[2001:db8::1]:443/oauth/callback", "[2001:0db8:0:0:0:0:0:1]:8443"),
+        (
+            "https://app.example.com/oauth/callback",
+            "APP.EXAMPLE.COM:8443",
+        ),
+        (
+            "https://app.example.com:443/oauth/callback",
+            "app.example.com",
+        ),
+        (
+            "https://[2001:db8::1]:443/oauth/callback",
+            "[2001:0db8:0:0:0:0:0:1]:8443",
+        ),
     ] {
         let mut config = base_config();
         config["providers"][0]["redirect_uri"] = json!(redirect_uri);
@@ -356,7 +363,7 @@ async fn central_sibling_callback_host_fails_before_state_or_cookie_issuance() {
         "auth.example.com".to_string(),
     );
 
-    assert_browser_challenge_fails_closed(&plugin, app_request).await;
+    assert_browser_challenge_fails_closed(&plugin, app_request, AUTHORITY_MISMATCH_ERROR).await;
 
     // The mismatch must be rejected before a flow consumes the one-entry
     // admission budget. A request on the configured callback host can still
@@ -370,8 +377,11 @@ async fn central_sibling_callback_host_fails_before_state_or_cookie_issuance() {
 }
 
 #[tokio::test]
-async fn missing_or_ambiguous_request_authority_fails_before_browser_challenge() {
-    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
+async fn missing_or_malformed_request_authority_fails_before_browser_challenge() {
+    let mut config = base_config();
+    config["behavior"]["state_cache_max_entries"] = json!(1);
+    config["behavior"]["state_cache_max_entries_per_source"] = json!(1);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
     let mut contexts = Vec::new();
 
     let mut missing = html_ctx();
@@ -397,8 +407,12 @@ async fn missing_or_ambiguous_request_authority_fails_before_browser_challenge()
     }
 
     for ctx in contexts {
-        assert_browser_challenge_fails_closed(&plugin, ctx).await;
+        assert_browser_challenge_fails_closed(&plugin, ctx, INVALID_AUTHORITY_ERROR).await;
     }
+
+    // Invalid authorities must not consume the one-entry admission budget.
+    let challenge = issue_browser_challenge(&plugin).await;
+    assert_host_only_correlation_cookie(&challenge.cookie, "600");
 }
 
 #[tokio::test]

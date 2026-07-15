@@ -1354,9 +1354,13 @@ impl OidcRelyingParty {
             // which the browser would receive the cookie: the callback could
             // never return the binding, and restoring a parent Domain would
             // reintroduce sibling-host disclosure and overwrite attacks.
-            if correlation_cookie_host_from_request(ctx).as_ref()
-                != Some(&self.provider.redirect_cookie_host)
-            {
+            let Some(request_host) = correlation_cookie_host_from_request(ctx) else {
+                return reject(
+                    400,
+                    r#"{"error":"OIDC missing or malformed request authority"}"#.to_string(),
+                );
+            };
+            if request_host != self.provider.redirect_cookie_host {
                 return reject(
                     400,
                     r#"{"error":"OIDC callback host does not match request host"}"#.to_string(),
@@ -2440,9 +2444,9 @@ fn validate_redirect_uri(uri: &str) -> Result<(), String> {
 fn correlation_cookie_host_from_url(url: &Url) -> Option<CorrelationCookieHost> {
     match url.host()? {
         Host::Domain(hostname) if hostname.ends_with('.') => None,
-        Host::Domain(hostname) => Some(CorrelationCookieHost::Domain(
-            hostname.to_ascii_lowercase(),
-        )),
+        Host::Domain(hostname) => {
+            Some(CorrelationCookieHost::Domain(hostname.to_ascii_lowercase()))
+        }
         Host::Ipv4(address) => Some(CorrelationCookieHost::Ip(IpAddr::V4(address))),
         Host::Ipv6(address) => Some(CorrelationCookieHost::Ip(IpAddr::V6(address))),
     }
@@ -2455,7 +2459,10 @@ fn correlation_cookie_host_from_request(ctx: &RequestContext) -> Option<Correlat
     crate::proxy::normalize_request_host_for_routing(raw)?;
     let authority: http::uri::Authority = raw.parse().ok()?;
     let host = authority.host();
-    if let Some(literal) = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')) {
+    if let Some(literal) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
         return literal
             .parse::<std::net::Ipv6Addr>()
             .ok()
@@ -3190,6 +3197,8 @@ mod tests {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
         ctx.headers
             .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
 
         let mut issue_challenge = || {
             let PluginResult::Reject {
@@ -4216,6 +4225,8 @@ mod tests {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
         ctx.headers
             .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
         let before = plugin.session.state_cache.entries.len();
         match plugin.challenge(&mut ctx, false) {
             PluginResult::Reject {
@@ -4247,6 +4258,8 @@ mod tests {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
         ctx.headers
             .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
         match plugin.challenge(&mut ctx, false) {
             PluginResult::Reject {
                 status_code,

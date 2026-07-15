@@ -11557,6 +11557,7 @@ components:
                 description: Absolute callback URI registered with the provider. Before issuing a browser challenge, Ferrum requires its host to match the validated request Host/:authority; DNS comparison is case-insensitive, IP literals compare by address, and ports are ignored. Trailing-dot DNS callback hosts and missing, malformed, or cross-host request authorities fail closed before state or cookies are issued.
               callback_path:
                 type: string
+                default: /oauth/callback
                 description: Callback path handled by Ferrum; must equal the path in redirect_uri.
               logout_path:
                 type: string

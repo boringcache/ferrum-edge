@@ -1478,7 +1478,7 @@ Runs a browser-oriented OpenID Connect relying party flow with authorization cod
 | `providers[].client_id` | String | OIDC client ID |
 | `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
 | `providers[].redirect_uri` | String | Absolute callback URI registered with the provider; its host must match the browser request host before Ferrum issues a challenge (ports are ignored) |
-| `providers[].callback_path` | String | Callback path Ferrum handles (default: path from `redirect_uri`) |
+| `providers[].callback_path` | String | Callback path Ferrum handles (default: `/oauth/callback`); must equal the path in `redirect_uri` |
 | `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`) |
 | `providers[].scopes` | String[] | OIDC scopes; must include `openid` |
 | `providers[].audiences` | String[] | Accepted ID token audiences |
