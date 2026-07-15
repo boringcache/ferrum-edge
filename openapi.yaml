@@ -17016,6 +17016,7 @@ components:
               items:
                 type: string
               default: ["2025-11-25"]
+              description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version.
         discovery:
           type: object
           properties:
