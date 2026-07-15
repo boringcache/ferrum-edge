@@ -11685,8 +11685,11 @@ components:
         key_location:
           type: string
           default: "header:X-API-Key"
-          pattern: "^(header:[!#$%&'*+.^_`|~0-9A-Za-z-]+|query:.+)$"
-          description: "Where to find the key (header:<name> or query:<name>)"
+          pattern: "^(header:[!#$%&'*+.^_`|~0-9A-Za-z-]+|query:\\S+)$"
+          description: >-
+            Exact credential location (header:<name> or query:<name>).
+            Whitespace is not trimmed; header names must be valid HTTP tokens,
+            and query names must be non-empty and contain no whitespace.
         hide_credentials:
           type: boolean
           default: true
@@ -13202,14 +13205,17 @@ components:
             - authorization
             - proxy-authorization
             - cookie
+            - api-key
             - x-api-key
+            - x-goog-api-key
             - x-auth-token
             - x-csrf-token
             - x-xsrf-token
             - x-forwarded-authorization
           description: >-
             Additional request headers to redact from `input.headers`. Built-in
-            sensitive headers are always redacted.
+            sensitive headers and active authentication credential headers are
+            always omitted.
         redact_query_keys:
           type: array
           items:

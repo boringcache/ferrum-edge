@@ -710,7 +710,7 @@ pub struct PluginPhaseData {
     pub authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Backend-admission plugins only (pre-filtered from the protocol plugin list).
     pub backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    /// Credential-bearing request header names used by diagnostic redaction.
+    /// Credential-bearing request header names used by safe downstream views.
     pub request_headers_to_redact: Arc<Vec<String>>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
@@ -1109,7 +1109,7 @@ impl PluginCacheRequestView {
         Arc::clone(&self.backend_admission_plugins)
     }
 
-    /// Get credential-bearing request headers precomputed for safe diagnostics.
+    /// Get credential-bearing request headers precomputed for safe downstream views.
     pub fn request_headers_to_redact(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.request_headers_to_redact)
     }

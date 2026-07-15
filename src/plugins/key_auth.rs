@@ -10,6 +10,7 @@
 //!
 //! Default key location: `header:X-API-Key`. Configurable via `key_location`
 //! in the plugin config (e.g., `"query:api_key"` for query parameter extraction).
+//! Location values are whitespace-sensitive and are never trimmed.
 
 use async_trait::async_trait;
 use http::header::HeaderName;
@@ -31,7 +32,7 @@ pub struct KeyAuth {
     query_param_name: Option<String>,
     /// Precomputed metadata key used to strip the configured query parameter.
     strip_query_metadata_key: Option<String>,
-    /// Configured request headers that logging plugins must always redact.
+    /// Configured request headers that diagnostics and policy calls must omit.
     request_headers_to_redact: Vec<String>,
     /// Remove the configured credential location before the backend request.
     hide_credentials: bool,
@@ -64,12 +65,17 @@ impl KeyAuth {
         let key_location = match config_obj.get("key_location") {
             Some(value) => value
                 .as_str()
-                .ok_or_else(|| format!("key_auth: 'key_location' must be a string, got: {value}"))?
-                .trim(),
+                .ok_or_else(|| format!("key_auth: 'key_location' must be a string, got: {value}"))?,
             None => "header:X-API-Key",
         };
         if key_location.is_empty() {
             return Err("key_auth: 'key_location' must not be empty".to_string());
+        }
+        if key_location.trim() != key_location {
+            return Err(
+                "key_auth: 'key_location' must not have leading or trailing whitespace"
+                    .to_string(),
+            );
         }
 
         let (
@@ -79,7 +85,6 @@ impl KeyAuth {
             strip_query_metadata_key,
             request_headers_to_redact,
         ) = if let Some(name) = key_location.strip_prefix("header:") {
-            let name = name.trim();
             if name.is_empty() {
                 return Err("key_auth: 'key_location' header name must not be empty".to_string());
             }
@@ -96,9 +101,13 @@ impl KeyAuth {
                 vec![canonical_name],
             )
         } else if let Some(name) = key_location.strip_prefix("query:") {
-            let name = name.trim();
             if name.is_empty() {
                 return Err("key_auth: 'key_location' query name must not be empty".to_string());
+            }
+            if name.chars().any(char::is_whitespace) {
+                return Err(
+                    "key_auth: 'key_location' query name must not contain whitespace".to_string(),
+                );
             }
             let mut strip_key =
                 String::with_capacity(STRIP_QUERY_PARAM_METADATA_PREFIX.len() + name.len());

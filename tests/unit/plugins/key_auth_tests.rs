@@ -59,6 +59,13 @@ fn test_key_auth_rejects_invalid_config() {
         json!({"key_location": "header:X@Api"}),
         json!({"key_location": "header:X\u{7f}Api"}),
         json!({"key_location": "header:X-Àpi"}),
+        json!({"key_location": " header:X-API-Key"}),
+        json!({"key_location": "header:X-API-Key "}),
+        json!({"key_location": "header: X-API-Key"}),
+        json!({"key_location": "query: api_key"}),
+        json!({"key_location": "query:api_key "}),
+        json!({"key_location": "query:   "}),
+        json!({"key_location": "query:tenant key"}),
     ];
 
     for config in invalid_configs {

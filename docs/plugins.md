@@ -1548,12 +1548,13 @@ Authenticates requests using an API key matched against consumer credentials.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `key_location` | String | `header:X-API-Key` | Where to find the key (`header:<name>` or `query:<name>`) |
+| `key_location` | String | `header:X-API-Key` | Exact location of the key (`header:<name>` or `query:<name>`). Whitespace is not trimmed. |
 | `hide_credentials` | Boolean | `true` | Remove the configured key location before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable credential. |
 
-Header locations must use a valid HTTP header name. Query names and values use
-the same percent-decoded representation on HTTP/1.1, HTTP/2, and HTTP/3.
-Unknown configuration fields are rejected.
+Header locations must use a valid HTTP header name. Query names must be non-empty
+and contain no whitespace; query names and values use the same percent-decoded
+representation on HTTP/1.1, HTTP/2, and HTTP/3. Unknown configuration fields
+are rejected.
 
 **Consumer credential** (`keyauth`) — array:
 ```yaml
@@ -1963,7 +1964,7 @@ Delegates HTTP request authorization to [Open Policy Agent](https://www.openpoli
 | `include_client_ip` | Boolean | `true` | Include `input.client_ip`. |
 | `include_service` | Boolean | `true` | Include matched proxy/service data. |
 | `reject_duplicate_query_keys` | Boolean | `true` | Before calling OPA, reject conflicting duplicate query values (for example `id=1&id=2`) with `deny_status` / `deny_body`. Identical duplicates pass. Set `false` for intentional repeated-key APIs, or set `include_query: false` when policy does not inspect query data. |
-| `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; built-in sensitive headers are always redacted. |
+| `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; built-in sensitive headers and active authentication credential headers are always omitted. |
 | `redact_query_keys` | String[] | `[]` | Additional query parameter names to omit from `input.query`, matched case-insensitively. Built-in credential names and query locations used by authentication plugins are omitted automatically. |
 
 Unknown or misspelled top-level OPA config keys are rejected at config load.
@@ -1974,7 +1975,7 @@ Allow decisions:
 - An object with `allow: true` at `decision_pointer` also continues the request.
 - Any other value denies with the configured policy-denial response.
 
-Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, and `x-forwarded-authorization` before sending `input.headers` to OPA. Query parameters with common credential names (including `api_key`, `access_token`, `id_token`, `jwt`, and `token`) and present custom query locations configured by authentication plugins are omitted from `input.query`, even when multi-auth succeeds through a different mechanism. Set `include_query_credentials: true` only when the policy service is explicitly trusted to receive credential material; operator-specified `redact_query_keys` still apply.
+Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, and `x-forwarded-authorization` before sending `input.headers` to OPA. Active custom authentication credential headers, including configured `key_auth` header locations, are also omitted automatically. Query parameters with common credential names (including `api_key`, `access_token`, `id_token`, `jwt`, and `token`) and present custom query locations configured by authentication plugins are omitted from `input.query`, even when multi-auth succeeds through a different mechanism. Set `include_query_credentials: true` only when the policy service is explicitly trusted to receive credential material; operator-specified `redact_query_keys` still apply.
 
 `include_body` collection occurs only after authentication succeeds, so a `401` does not retain an OPA body copy. OPA's positive `max_body_bytes` limit is always enforced, including when `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`. Successful OPA responses are streamed through the positive `max_response_bytes` ceiling before JSON parsing; body contents are never written to OPA error logs.
 

@@ -466,7 +466,7 @@ pub struct RequestContext {
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
     /// Credential header names precomputed by the plugin cache for safe
-    /// request/response diagnostics. Kept outside public metadata so plugin
+    /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
     request_headers_to_redact: Option<Arc<Vec<String>>>,
     /// Semantic-cache embedding vector staged between `before_proxy` and
@@ -2783,8 +2783,8 @@ pub trait Plugin: Send + Sync {
     fn mark_query_credentials_for_redaction(&self, _ctx: &mut RequestContext) {}
 
     /// Request header names whose values contain reusable credentials and must
-    /// be redacted by diagnostic plugins. Names are collected once when the
-    /// plugin cache is built, not rediscovered on the request hot path.
+    /// be omitted from diagnostics and policy calls. Names are collected once
+    /// when the plugin cache is built, not rediscovered on the request hot path.
     fn request_headers_to_redact(&self) -> &[String] {
         &[]
     }
