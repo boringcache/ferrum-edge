@@ -3666,7 +3666,7 @@ where
             }
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
                 Arc::make_mut(policy_state)
-                    .record_later_response_header_mutations(&plugin_response_headers);
+                    .record_later_response_header_mutations(&mut plugin_response_headers);
             }
             for plugin in plugins.iter() {
                 let result = plugin

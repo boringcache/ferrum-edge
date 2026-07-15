@@ -1833,13 +1833,9 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
     assert_no_ws_transport_policy_values(&rejected.headers);
     assert_no_h1_only_websocket_headers(&rejected.headers);
     assert_no_failed_websocket_transport_headers(&rejected.headers);
-    assert_eq!(
-        rejected
-            .headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("application/json"),
-        "the final H3 reject writer must restore JSON content-type after hooks remove it"
+    assert!(
+        !rejected.headers.contains_key(http::header::CONTENT_TYPE),
+        "the final H3 reject writer must preserve policy removal of content-type"
     );
     assert!(
         rejected

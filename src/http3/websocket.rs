@@ -432,11 +432,10 @@ async fn send_h3_reject_body<S>(
 /// Finalize a failed RFC 9220 handshake immediately before its HEADERS frame is
 /// built. Response hooks and policy overlays run before this boundary, so none
 /// can leak H1 Upgrade or WebSocket negotiation fields onto a non-upgrade H3
-/// response. JSON rejection bodies retain an intentional surviving content
-/// type and otherwise receive the gateway default after all hooks have run.
+/// response. Content-Type is seeded before those hooks run, so its absence here
+/// is an authoritative policy removal and must not be defaulted back.
 pub(crate) fn finalize_h3_websocket_reject_headers(headers: &mut HashMap<String, String>) {
     crate::proxy::strip_websocket_transport_managed_response_header_map(headers);
-    ensure_h3_reject_content_type(headers);
 }
 
 fn ensure_h3_reject_content_type(headers: &mut HashMap<String, String>) {

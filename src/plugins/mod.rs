@@ -256,11 +256,60 @@ impl BufferedInitialResponseHeaderPolicyState {
     ) -> HashMap<String, String> {
         let mut selected = HashMap::with_capacity(header_names.len());
         for name in header_names {
-            if let Some(value) = source.get(name) {
+            if let Some(value) = Self::header_value_ci(source, name) {
                 selected.insert(name.clone(), value.clone());
             }
         }
         selected
+    }
+
+    fn header_value_ci<'a>(
+        headers: &'a HashMap<String, String>,
+        name: &str,
+    ) -> Option<&'a String> {
+        headers.get(name).or_else(|| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value)
+        })
+    }
+
+    fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
+        headers.retain(|key, _| !key.eq_ignore_ascii_case(name));
+    }
+
+    /// Select the effective value after one hook and canonicalize every
+    /// case-insensitive spelling to the cache-owned lowercase name. If a later
+    /// plugin inserted a differently-cased duplicate alongside the previously
+    /// observed canonical entry, the changed value is the mutation that wins.
+    fn canonicalize_header_after_mutation(
+        headers: &mut HashMap<String, String>,
+        name: &str,
+        observed: Option<&str>,
+    ) -> Option<String> {
+        let current = headers
+            .get(name)
+            .filter(|value| observed != Some(value.as_str()))
+            .cloned()
+            .or_else(|| {
+                headers
+                    .iter()
+                    .filter(|(key, value)| {
+                        key.as_str() != name
+                            && key.eq_ignore_ascii_case(name)
+                            && observed != Some(value.as_str())
+                    })
+                    .min_by(|(left, _), (right, _)| left.cmp(right))
+                    .map(|(_, value)| value.clone())
+            })
+            .or_else(|| Self::header_value_ci(headers, name).cloned());
+
+        Self::remove_header_ci(headers, name);
+        if let Some(value) = current.as_ref() {
+            headers.insert(name.to_string(), value.clone());
+        }
+        current
     }
 
     /// Advance the genuine-initial-header outcome after one real hook has run.
@@ -273,28 +322,29 @@ impl BufferedInitialResponseHeaderPolicyState {
         if plugin.is_initial_response_header_policy() {
             plugin.apply_initial_response_header_policy(&mut self.desired_headers);
             for name in self.header_names.iter() {
-                if self.observed_headers.get(name) != self.desired_headers.get(name) {
-                    let previous_value = self.observed_headers.get(name).cloned();
+                let previous_value = self.observed_headers.get(name).cloned();
+                let desired_value = self.desired_headers.get(name).cloned();
+                if previous_value != desired_value {
                     self.pre_policy_application_trailers
                         .entry(name.clone())
-                        .or_insert(previous_value);
-                    match self.desired_headers.get(name) {
-                        Some(value) => {
-                            response_headers.insert(name.clone(), value.clone());
-                        }
-                        None => {
-                            response_headers.remove(name);
-                        }
+                        .or_insert(previous_value.clone());
+                    Self::remove_header_ci(response_headers, name);
+                    if let Some(value) = desired_value.as_ref() {
+                        response_headers.insert(name.clone(), value.clone());
                     }
                 }
-                match response_headers.get(name) {
-                    Some(value) if self.observed_headers.get(name) != Some(value) => {
-                        self.observed_headers.insert(name.clone(), value.clone());
+                let current = Self::canonicalize_header_after_mutation(
+                    response_headers,
+                    name,
+                    previous_value.as_deref(),
+                );
+                match current {
+                    Some(value) => {
+                        self.observed_headers.insert(name.clone(), value);
                     }
                     None => {
                         self.observed_headers.remove(name);
                     }
-                    Some(_) => {}
                 }
             }
             return;
@@ -309,18 +359,22 @@ impl BufferedInitialResponseHeaderPolicyState {
     /// authoritative when the buffered response is split back onto the wire.
     pub fn record_later_response_header_mutations(
         &mut self,
-        response_headers: &HashMap<String, String>,
+        response_headers: &mut HashMap<String, String>,
     ) {
         for name in self.header_names.iter() {
-            let observed = self.observed_headers.get(name);
-            let current = response_headers.get(name);
+            let observed = self.observed_headers.get(name).cloned();
+            let current = Self::canonicalize_header_after_mutation(
+                response_headers,
+                name,
+                observed.as_deref(),
+            );
             if observed == current {
                 continue;
             }
             match current {
                 Some(value) => {
                     self.desired_headers.insert(name.clone(), value.clone());
-                    self.observed_headers.insert(name.clone(), value.clone());
+                    self.observed_headers.insert(name.clone(), value);
                     self.pre_policy_application_trailers.remove(name);
                 }
                 None => {
@@ -350,7 +404,7 @@ impl BufferedInitialResponseHeaderPolicyState {
     /// Apply the final ordered policy-owned fields to genuine initial HEADERS.
     pub fn apply_to_initial_headers(&self, response_headers: &mut HashMap<String, String>) {
         for name in self.header_names.iter() {
-            response_headers.remove(name);
+            Self::remove_header_ci(response_headers, name);
             if let Some(value) = self.desired_headers.get(name) {
                 response_headers.insert(name.clone(), value.clone());
             }

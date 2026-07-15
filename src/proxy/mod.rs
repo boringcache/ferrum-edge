@@ -18169,7 +18169,7 @@ async fn handle_proxy_request_inner(
                         buffered_initial_response_header_policy_state.as_mut()
                     {
                         Arc::make_mut(policy_state)
-                            .record_later_response_header_mutations(&plugin_response_headers);
+                            .record_later_response_header_mutations(&mut plugin_response_headers);
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }

@@ -1363,7 +1363,7 @@ async fn handle_h3_request(
             initial_response_header_policy_plugins.as_ref(),
         );
         crate::proxy::restore_authoritative_allow_header(&mut headers, &allow_header);
-        send_h3_reject_flavor_aware(
+        send_h3_finalized_reject_flavor_aware(
             &mut stream,
             http_flavor,
             StatusCode::METHOD_NOT_ALLOWED,
@@ -2758,7 +2758,7 @@ async fn handle_h3_request(
             &mut reason_headers,
             initial_response_header_policy_plugins.as_ref(),
         );
-        send_h3_reject_flavor_aware(
+        send_h3_finalized_reject_flavor_aware(
             &mut stream,
             http_flavor,
             StatusCode::BAD_GATEWAY,
@@ -8675,14 +8675,24 @@ async fn send_h3_reject_response(
     body: &[u8],
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
-    let mut builder = Response::builder().status(status);
-    // Only default the content-type when the reject didn't supply its own
-    // (e.g. a WAF response-inspection reject using the configured
-    // reject_content_type). Mirrors the buffered H3 path's
-    // `entry("content-type").or_insert_with(..)`.
-    if !reject_response_sets_content_type(headers) {
-        builder = builder.header("content-type", "application/json");
+    if reject_response_sets_content_type(headers) {
+        return send_h3_finalized_reject_response(stream, status, body, headers).await;
     }
+    let mut headers = headers.clone();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    send_h3_finalized_reject_response(stream, status, body, &headers).await
+}
+
+/// Write a rejection whose header map has already completed response policy.
+/// Unlike [`send_h3_reject_response`], an absent Content-Type is authoritative:
+/// a policy removal must survive the final HTTP/3 wire boundary.
+async fn send_h3_finalized_reject_response(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Result<(), anyhow::Error> {
+    let mut builder = Response::builder().status(status);
     builder = apply_response_headers(builder, headers);
     let resp = builder
         .body(())
@@ -8834,7 +8844,8 @@ async fn send_h3_error_flavor_aware_with_policy(
             &mut headers,
             initial_response_header_policy_plugins,
         );
-        send_h3_reject_response(stream, http_status, http_body.as_bytes(), &headers).await
+        send_h3_finalized_reject_response(stream, http_status, http_body.as_bytes(), &headers)
+            .await
     }
 }
 
@@ -8855,14 +8866,67 @@ async fn send_h3_reject_flavor_aware(
     http_body: &[u8],
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
+    send_h3_reject_flavor_aware_with_header_state(
+        stream,
+        flavor,
+        http_status,
+        http_body,
+        headers,
+        false,
+    )
+    .await
+}
+
+/// Flavor-aware writer for a header map that has already completed initial
+/// response policy. This preserves intentional removals at the final H3 HEADERS
+/// boundary while retaining mandatory gRPC signalling.
+async fn send_h3_finalized_reject_flavor_aware(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    flavor: HttpFlavor,
+    http_status: StatusCode,
+    http_body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Result<(), anyhow::Error> {
+    send_h3_reject_flavor_aware_with_header_state(
+        stream,
+        flavor,
+        http_status,
+        http_body,
+        headers,
+        true,
+    )
+    .await
+}
+
+async fn send_h3_reject_flavor_aware_with_header_state(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    flavor: HttpFlavor,
+    http_status: StatusCode,
+    http_body: &[u8],
+    headers: &HashMap<String, String>,
+    headers_finalized: bool,
+) -> Result<(), anyhow::Error> {
     if !matches!(flavor, HttpFlavor::Grpc) {
         if matches!(flavor, HttpFlavor::WebSocket) {
             let mut finalized_headers = headers.clone();
             crate::http3::websocket::finalize_h3_websocket_reject_headers(&mut finalized_headers);
-            return send_h3_reject_response(stream, http_status, http_body, &finalized_headers)
-                .await;
+            return if headers_finalized {
+                send_h3_finalized_reject_response(
+                    stream,
+                    http_status,
+                    http_body,
+                    &finalized_headers,
+                )
+                .await
+            } else {
+                send_h3_reject_response(stream, http_status, http_body, &finalized_headers).await
+            };
         }
-        return send_h3_reject_response(stream, http_status, http_body, headers).await;
+        return if headers_finalized {
+            send_h3_finalized_reject_response(stream, http_status, http_body, headers).await
+        } else {
+            send_h3_reject_response(stream, http_status, http_body, headers).await
+        };
     }
 
     // gRPC flavor only — derive signalling now.

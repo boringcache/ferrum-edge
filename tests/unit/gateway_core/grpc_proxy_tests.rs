@@ -1106,6 +1106,61 @@ async fn buffered_policy_state_preserves_later_header_mutator_order() {
 }
 
 #[test]
+fn buffered_policy_state_tracks_mixed_case_later_mutation() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": { "X-Frame-Options": "DENY" }
+        }))
+        .unwrap(),
+    );
+    let initial_headers = HashMap::new();
+    let mut plugin_view = HashMap::new();
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &initial_headers,
+        &plugin_view,
+    )
+    .unwrap();
+
+    policy.apply_initial_response_header_policy(&mut plugin_view);
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+    plugin_view.insert("X-Frame-Options".to_string(), "later-plugin".to_string());
+    policy_state.record_later_response_header_mutations(&mut plugin_view);
+
+    assert_eq!(
+        plugin_view.get("x-frame-options").map(String::as_str),
+        Some("later-plugin")
+    );
+    assert_eq!(
+        plugin_view
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("x-frame-options"))
+            .count(),
+        1,
+        "later mixed-case mutations must be canonicalized without duplicates"
+    );
+
+    let mut final_initial_headers = HashMap::from([(
+        "X-Frame-Options".to_string(),
+        "stale-mixed-case".to_string(),
+    )]);
+    policy_state.apply_to_initial_headers(&mut final_initial_headers);
+    assert_eq!(
+        final_initial_headers
+            .get("x-frame-options")
+            .map(String::as_str),
+        Some("later-plugin")
+    );
+    assert_eq!(
+        final_initial_headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("x-frame-options"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn buffered_policy_state_preserves_body_transform_validator_removal() {
     let policy: Arc<dyn Plugin> = Arc::new(
         SecurityHeaders::new(&json!({
@@ -1130,7 +1185,7 @@ fn buffered_policy_state_preserves_body_transform_validator_removal() {
     );
 
     plugin_view.remove("etag");
-    policy_state.record_later_response_header_mutations(&plugin_view);
+    policy_state.record_later_response_header_mutations(&mut plugin_view);
     let mut initial_headers = HashMap::new();
     policy_state.apply_to_initial_headers(&mut initial_headers);
 
