@@ -17996,9 +17996,7 @@ async fn handle_proxy_request_inner(
                     plugin_cache_view.initial_response_header_policy_names();
                 let pristine_trailers_only_terminal_metadata = (response_body.is_empty()
                     && response_trailers.is_empty())
-                    .then(|| {
-                        grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers)
-                    });
+                .then(|| grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers));
                 ctx.begin_buffered_initial_response_header_policy(
                     initial_response_header_policy_names,
                     &response_headers,
@@ -18607,13 +18605,11 @@ async fn handle_proxy_request_inner(
                 {
                     return Ok(response);
                 }
-                return Ok(
-                    grpc_proxy::build_grpc_error_response_with_policy(
-                        grpc_code,
-                        msg,
-                        initial_response_header_policy_plugins.as_ref(),
-                    ),
-                );
+                return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                    grpc_code,
+                    msg,
+                    initial_response_header_policy_plugins.as_ref(),
+                ));
             }
         }
     }
@@ -18857,13 +18853,11 @@ async fn handle_proxy_request_inner(
             {
                 return Ok(response);
             }
-            return Ok(
-                grpc_proxy::build_grpc_error_response_with_policy(
-                    14,
-                    &message,
-                    initial_response_header_policy_plugins.as_ref(),
-                ),
-            );
+            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                14,
+                &message,
+                initial_response_header_policy_plugins.as_ref(),
+            ));
         }
         record_request(&state, 502);
         return Ok(build_response(

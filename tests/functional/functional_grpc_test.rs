@@ -1389,7 +1389,10 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
         headers2.get("content-type").map(String::as_str),
         Some("application/grpc")
     );
-    assert_ne!(headers2.get("content-length").map(String::as_str), Some("999"));
+    assert_ne!(
+        headers2.get("content-length").map(String::as_str),
+        Some("999")
+    );
     assert!(headers2.get("transfer-encoding").is_none());
 
     let _ = gateway.kill();

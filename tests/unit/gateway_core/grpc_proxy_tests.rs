@@ -330,16 +330,28 @@ fn grpc_error_policy_preserves_gateway_terminal_and_transport_authority() {
     );
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.headers().get("content-type").unwrap(), "application/grpc");
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/grpc"
+    );
     assert_eq!(response.headers().get("grpc-status").unwrap(), "14");
-    assert_eq!(response.headers().get("grpc-message").unwrap(), "Backend down");
-    assert_eq!(response.headers().get("x-synthetic-policy").unwrap(), "enforced");
+    assert_eq!(
+        response.headers().get("grpc-message").unwrap(),
+        "Backend down"
+    );
+    assert_eq!(
+        response.headers().get("x-synthetic-policy").unwrap(),
+        "enforced"
+    );
     for managed in [
         "content-length",
         "transfer-encoding",
         "grpc-status-details-bin",
     ] {
-        assert!(response.headers().get(managed).is_none(), "{managed} leaked");
+        assert!(
+            response.headers().get(managed).is_none(),
+            "{managed} leaked"
+        );
     }
 }
 
@@ -1187,11 +1199,7 @@ fn buffered_policy_restores_pristine_terminal_metadata_for_true_trailers_only_sh
         grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&terminal_headers);
 
     let mut split_initial_headers = terminal_headers.clone();
-    grpc_proxy::apply_buffered_grpc_initial_response_policy(
-        None,
-        &mut split_initial_headers,
-        None,
-    );
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(None, &mut split_initial_headers, None);
     assert!(!split_initial_headers.contains_key("grpc-status"));
     assert!(!split_initial_headers.contains_key("grpc-message"));
 
@@ -1233,8 +1241,7 @@ fn buffered_policy_restores_pristine_terminal_metadata_for_true_trailers_only_sh
         .unwrap(),
     );
     let mut removed_trailers_only_initial_headers = terminal_headers;
-    hostile_remove
-        .apply_initial_response_header_policy(&mut removed_trailers_only_initial_headers);
+    hostile_remove.apply_initial_response_header_policy(&mut removed_trailers_only_initial_headers);
     grpc_proxy::apply_buffered_grpc_initial_response_policy(
         None,
         &mut removed_trailers_only_initial_headers,

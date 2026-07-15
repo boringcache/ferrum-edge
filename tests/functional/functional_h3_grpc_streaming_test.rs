@@ -94,12 +94,8 @@ fn file_mode_yaml_with_response_buffering(
             "scope": "global",
             "enabled": true,
         }));
-        security_config["remove"] = json!([
-            "Set-Cookie",
-            "X-Powered-By",
-            "Grpc-Status",
-            "Grpc-Message",
-        ]);
+        security_config["remove"] =
+            json!(["Set-Cookie", "X-Powered-By", "Grpc-Status", "Grpc-Message",]);
         security_config["set"] = json!({
             "X-Security-Policy": "gateway-enforced",
         });
@@ -128,7 +124,8 @@ async fn spawn_h3_grpc_gateway(
     backend_port: u16,
     extra_env: &[(&str, String)],
 ) -> (GatewayHarness, u16) {
-    spawn_h3_grpc_gateway_with_response_buffering(backend_port, extra_env, false, false, false).await
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, extra_env, false, false, false)
+        .await
 }
 
 async fn spawn_buffered_h3_grpc_gateway(backend_port: u16) -> (GatewayHarness, u16) {

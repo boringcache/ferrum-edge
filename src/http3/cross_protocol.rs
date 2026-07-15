@@ -3481,12 +3481,11 @@ where
                     &resp.headers,
                     &resp.trailers,
                 );
-            let pristine_trailers_only_terminal_metadata =
-                (resp.body.is_empty() && resp.trailers.is_empty()).then(|| {
-                    crate::proxy::grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
-                        &resp.headers,
-                    )
-                });
+            let pristine_trailers_only_terminal_metadata = (resp.body.is_empty()
+                && resp.trailers.is_empty())
+            .then(|| {
+                crate::proxy::grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&resp.headers)
+            });
             ctx.begin_buffered_initial_response_header_policy(
                 initial_response_header_policy_names,
                 &resp.headers,

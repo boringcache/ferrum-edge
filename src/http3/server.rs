@@ -6945,8 +6945,8 @@ async fn dispatch_grpc_native_h3(
                 grpc_message,
                 initial_response_header_policy_plugins,
             )
-                .await
-                .is_ok();
+            .await
+            .is_ok();
 
             // Split the WIRE status from the backend-HEALTH status, exactly like
             // the H1/H2 and cross-protocol gRPC paths (`write_grpc_error` returns
@@ -8642,8 +8642,7 @@ fn finalize_h3_gateway_error_headers(
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
     if matches!(flavor, HttpFlavor::Grpc) {
-        let (grpc_status, grpc_message) =
-            h3_grpc_reject_signal(http_status, http_body, headers);
+        let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
         crate::proxy::grpc_proxy::finalize_grpc_error_response_headers(
             headers,
             grpc_status,

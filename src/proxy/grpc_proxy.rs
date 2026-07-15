@@ -1544,10 +1544,7 @@ impl GrpcTerminalMetadataSnapshot {
         for (name, value) in [
             ("grpc-status", self.grpc_status.as_ref()),
             ("grpc-message", self.grpc_message.as_ref()),
-            (
-                "grpc-status-details-bin",
-                self.grpc_status_details.as_ref(),
-            ),
+            ("grpc-status-details-bin", self.grpc_status_details.as_ref()),
         ] {
             if let Some(value) = value {
                 headers.insert(name.to_string(), value.clone());
