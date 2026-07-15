@@ -2,7 +2,8 @@
 
 use chrono::{Duration, Utc};
 use ferrum_edge::admin::audit::{
-    AuditActor, AuditEvent, AuditListFilter, create_diff, delete_diff, update_diff,
+    AuditActor, AuditEvent, AuditListFilter, create_diff, credential_update_diff, delete_diff,
+    update_diff,
 };
 use ferrum_edge::admin::jwt_auth::{AdminClaims, AdminRole};
 use serde_json::json;
@@ -101,6 +102,15 @@ fn test_audit_diff_helpers_preserve_operation_shape() {
     assert_eq!(
         update_diff(before.clone(), after.clone()),
         json!({ "before": before.clone(), "after": after })
+    );
+    assert_eq!(
+        credential_update_diff("basicauth", before.clone(), json!({"updated": true})),
+        json!({
+            "credential_type": "basicauth",
+            "credential_change": "[REDACTED]",
+            "before": before.clone(),
+            "after": {"updated": true},
+        })
     );
     assert_eq!(delete_diff(before.clone()), json!({ "before": before }));
 }
