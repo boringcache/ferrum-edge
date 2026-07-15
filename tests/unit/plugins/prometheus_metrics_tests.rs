@@ -1249,10 +1249,10 @@ async fn mesh_metrics_render_valid_labels_when_all_base_labels_are_removed() {
         "label-free buckets must not start with a comma: {buckets:?}"
     );
     assert!(
-        buckets
-            .iter()
-            .any(|line| line.starts_with("ferrum_mesh_request_duration_ms_bucket{le=\"")
-                && !line.contains("le=\"+Inf\"")),
+        buckets.iter().any(
+            |line| line.starts_with("ferrum_mesh_request_duration_ms_bucket{le=\"")
+                && !line.contains("le=\"+Inf\"")
+        ),
         "finite bucket must contain only a valid le label: {buckets:?}"
     );
     assert!(
@@ -1267,18 +1267,22 @@ async fn mesh_metrics_render_valid_labels_when_all_base_labels_are_removed() {
     registry.configure(5, 3600, 0, "mesh-system");
     let namespaced_output = registry.render_uncached();
     assert!(!namespaced_output.contains("{,"), "{namespaced_output}");
-    assert!(namespaced_output.contains(
-        "ferrum_mesh_requests_total{gateway_namespace=\"mesh-system\"} 1"
-    ));
+    assert!(
+        namespaced_output
+            .contains("ferrum_mesh_requests_total{gateway_namespace=\"mesh-system\"} 1")
+    );
     assert!(namespaced_output.contains(
         "ferrum_mesh_request_duration_ms_bucket{le=\"+Inf\",gateway_namespace=\"mesh-system\"} 1"
     ));
-    assert!(namespaced_output.contains(
-        "ferrum_mesh_request_duration_ms_sum{gateway_namespace=\"mesh-system\"} 42.00"
-    ));
-    assert!(namespaced_output.contains(
-        "ferrum_mesh_request_duration_ms_count{gateway_namespace=\"mesh-system\"} 1"
-    ));
+    assert!(
+        namespaced_output.contains(
+            "ferrum_mesh_request_duration_ms_sum{gateway_namespace=\"mesh-system\"} 42.00"
+        )
+    );
+    assert!(
+        namespaced_output
+            .contains("ferrum_mesh_request_duration_ms_count{gateway_namespace=\"mesh-system\"} 1")
+    );
 
     let mut labeled_summary = summary.clone();
     labeled_summary

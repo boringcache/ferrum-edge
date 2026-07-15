@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::MeshTrafficDirection;
-use crate::modes::mesh::config::TracingProvider;
+use crate::modes::mesh::config::{MeshMetricsConfig, MeshTracingConfig, TracingProvider};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
@@ -26,7 +26,7 @@ use crate::plugins::mesh::prometheus_helpers::{
 };
 use crate::plugins::otel_tracing::{
     OtelTracing, SpanData, SpanKind, TraceExporter, build_traceparent, ensure_trace_metadata,
-    trace_exporters_from_providers, trace_is_sampled,
+    trace_exporters_from_providers, trace_is_sampled, validate_trace_provider_endpoints,
 };
 use crate::plugins::utils::PluginHttpClient;
 use crate::plugins::utils::metadata_redaction::is_sensitive_metadata_key;
@@ -256,7 +256,7 @@ impl WorkloadMetrics {
             request_count_tag_overrides,
             request_duration_tag_overrides,
             disabled_metrics_marker,
-        } = parse_metric_config(config.get("metrics"))?;
+        } = parse_metric_config(config.get("metrics"), true)?;
         let tracing_providers = parse_tracing_providers(config)?;
         let span_reporting_disabled = config
             .get("span_reporting_disabled")
@@ -1140,7 +1140,10 @@ fn parse_tag_operation<'a>(
     }
 }
 
-fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, String> {
+fn parse_metric_config(
+    value: Option<&Value>,
+    emit_unsupported_family_warning: bool,
+) -> Result<ParsedMetricConfig, String> {
     let Some(metrics) = value else {
         return Ok(ParsedMetricConfig {
             request_count_tag_overrides: None,
@@ -1255,7 +1258,7 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
         }
     }
 
-    if !ignored_metric_families.is_empty() {
+    if emit_unsupported_family_warning && !ignored_metric_families.is_empty() {
         let metric_families = ignored_metric_families
             .iter()
             .copied()
@@ -1280,6 +1283,30 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
             .then_some(request_duration_plan),
         disabled_metrics_marker: disabled_marker,
     })
+}
+
+/// Validate the parts of an Istio Telemetry resource that are projected into
+/// the auto-injected `workload_metrics` plugin.
+///
+/// The Kubernetes translator calls this before reporting the resource as
+/// accepted. Direct/native plugin configuration still runs the same validators
+/// from [`WorkloadMetrics::new`] and retains its hard-error behavior.
+pub(crate) fn validate_istio_telemetry_config(
+    tracing: Option<&MeshTracingConfig>,
+    metrics: Option<&MeshMetricsConfig>,
+) -> Result<(), String> {
+    if let Some(tracing) = tracing {
+        validate_custom_tags(tracing.custom_tags.clone(), tracing.custom_header_tags.clone())?;
+        validate_trace_provider_endpoints(&tracing.providers).map_err(|error| {
+            format!("workload_metrics: invalid tracing exporter config: {error}")
+        })?;
+    }
+    if let Some(metrics) = metrics {
+        let metrics = serde_json::to_value(metrics)
+            .map_err(|error| format!("workload_metrics: invalid translated metrics: {error}"))?;
+        parse_metric_config(Some(&metrics), false)?;
+    }
+    Ok(())
 }
 
 struct ValidatedCustomTags {

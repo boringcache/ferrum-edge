@@ -1302,7 +1302,9 @@ pub fn render_mesh_histogram(
         base_labels, gateway_ns_label, total_count
     );
     let aggregate_gateway_ns_label = if base_labels.is_empty() {
-        gateway_ns_label.strip_prefix(',').unwrap_or(gateway_ns_label)
+        gateway_ns_label
+            .strip_prefix(',')
+            .unwrap_or(gateway_ns_label)
     } else {
         gateway_ns_label
     };

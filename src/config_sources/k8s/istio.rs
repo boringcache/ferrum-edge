@@ -4424,7 +4424,11 @@ fn telemetry(
                                     .and_then(Value::as_str)
                                 {
                                     custom_header_tags.insert(key.clone(), header_name.to_string());
-                                    return None;
+                                    return val
+                                        .get("header")
+                                        .and_then(|header| header.get("defaultValue"))
+                                        .and_then(Value::as_str)
+                                        .map(|value| (key.clone(), value.to_string()));
                                 }
 
                                 let value = val
@@ -4496,20 +4500,22 @@ fn telemetry(
             let mut disabled_metrics = Vec::new();
             if let Some(overrides) = m.get("overrides").and_then(Value::as_array) {
                 for ovr in overrides {
-                    let matched_metric = match ovr
-                        .get("match")
-                        .and_then(|matcher| matcher.get("metric"))
+                    let matched_metric =
+                        match ovr.get("match").and_then(|matcher| matcher.get("metric")) {
+                            Some(Value::String(metric)) => metric.as_str(),
+                            Some(_) => {
+                                return Err(invalid_resource(
+                                    object,
+                                    "Telemetry metrics.overrides[].match.metric must be a string",
+                                ));
+                            }
+                            None => "ALL_METRICS",
+                        };
+                    if ovr
+                        .get("disabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
                     {
-                        Some(Value::String(metric)) => metric.as_str(),
-                        Some(_) => {
-                            return Err(invalid_resource(
-                                object,
-                                "Telemetry metrics.overrides[].match.metric must be a string",
-                            ));
-                        }
-                        None => "ALL_METRICS",
-                    };
-                    if ovr.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
                         disabled_metrics.push(matched_metric.to_string());
                     }
                     if let Some(tags) = ovr.get("tagOverrides").and_then(Value::as_object) {
@@ -4521,14 +4527,27 @@ fn telemetry(
                             let operation = match op {
                                 "REMOVE" => TagOverrideOperation::Remove,
                                 "UPSERT" => {
-                                    let value = tag_spec
-                                        .get("value")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_string();
+                                    let value = telemetry_metric_upsert_literal(
+                                        object, tag_name, tag_spec,
+                                    )?;
                                     TagOverrideOperation::Set { value }
                                 }
-                                _ => continue,
+                                "" => {
+                                    return Err(invalid_resource(
+                                        object,
+                                        format!(
+                                            "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation is required"
+                                        ),
+                                    ));
+                                }
+                                _ => {
+                                    return Err(invalid_resource(
+                                        object,
+                                        format!(
+                                            "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation '{op}' is unsupported"
+                                        ),
+                                    ));
+                                }
                             };
                             tag_overrides.push(MetricTagOverride {
                                 metric: Some(matched_metric.to_string()),
@@ -4545,6 +4564,18 @@ fn telemetry(
             })
         })
         .transpose()?;
+
+    crate::plugins::mesh::workload_metrics::validate_istio_telemetry_config(
+        tracing.as_ref(),
+        metrics.as_ref(),
+    )
+    .map_err(|message| {
+        let detail = message.strip_prefix("workload_metrics: ").unwrap_or(&message);
+        invalid_resource(
+            object,
+            format!("Telemetry workload_metrics configuration is invalid: {detail}"),
+        )
+    })?;
 
     let access_logging = object
         .spec
@@ -4577,6 +4608,34 @@ fn telemetry(
             metrics,
             access_logging,
         },
+    })
+}
+
+fn telemetry_metric_upsert_literal(
+    object: &K8sObject,
+    tag_name: &str,
+    tag_spec: &Value,
+) -> Result<String, K8sTranslateError> {
+    let expression = tag_spec
+        .get("value")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT value is required"
+                ),
+            )
+        })?;
+    serde_json::from_str::<String>(expression).map_err(|_| {
+        invalid_resource(
+            object,
+            format!(
+                "Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT value must be a double-quoted string literal; CEL expressions are unsupported"
+            ),
+        )
     })
 }
 
@@ -6932,7 +6991,7 @@ mod tests {
                                 "tagOverrides": {
                                     "response_flags": {
                                         "operation": "UPSERT",
-                                        "value": "duration-only"
+                                        "value": "\"duration-only\""
                                     }
                                 }
                             }
