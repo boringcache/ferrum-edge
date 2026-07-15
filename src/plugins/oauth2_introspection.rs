@@ -998,12 +998,15 @@ fn is_authorization_bearer_location(location: &TokenLocation) -> bool {
     let TokenLocation::Header(header) = location else {
         return false;
     };
-    header.name.eq_ignore_ascii_case("authorization")
-        && header
-            .prefix
-            .as_deref()
-            .and_then(|prefix| prefix.strip_suffix(' '))
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"))
+    if !header.name.eq_ignore_ascii_case("authorization") {
+        return false;
+    }
+    match header.prefix.as_deref() {
+        None => true,
+        Some(prefix) => prefix
+            .strip_suffix(' ')
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer")),
+    }
 }
 
 #[derive(Clone)]

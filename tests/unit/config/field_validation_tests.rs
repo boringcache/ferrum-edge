@@ -593,6 +593,7 @@ fn test_consumer_basicauth_rejects_unusable_entries() {
         serde_json::json!({"password": "secret", "password_hash": format!("hmac_sha256:{}", "a".repeat(64))}),
         serde_json::json!({"password": "secret", "unexpected": true}),
         serde_json::json!({"password": ""}),
+        serde_json::json!({"password": "embedded\0null"}),
         serde_json::json!({"password": 42}),
         serde_json::json!({"password_hash": "hmac_sha256:not-hex"}),
         serde_json::json!({"password_hash": format!("hmac_sha256:{}", "A".repeat(64))}),

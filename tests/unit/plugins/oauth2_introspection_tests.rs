@@ -612,18 +612,23 @@ fn new_bounds_provider_count_and_requires_explicit_shared_trust_for_fanout() {
         "introspection_endpoint": "http://localhost/introspect",
         "client_auth": {"method": "none"}
     });
-    let explicit_authorization = json!({
-        "introspection_endpoint": "http://localhost/introspect",
-        "client_auth": {"method": "none"},
-        "from_headers": [{"name": "Authorization", "prefix": "bEaReR "}]
-    });
-    let error = Oauth2Introspection::new(
-        &json!({"providers": [implicit_authorization, explicit_authorization]}),
-        PluginHttpClient::default(),
-    )
-    .err()
-    .expect("explicit and implicit Authorization bearer sources must conflict");
-    assert!(error.contains("allow_provider_fanout"));
+    for from_headers in [
+        json!([{"name": "Authorization", "prefix": "bEaReR "}]),
+        json!([{"name": "Authorization"}]),
+    ] {
+        let explicit_authorization = json!({
+            "introspection_endpoint": "http://localhost/introspect",
+            "client_auth": {"method": "none"},
+            "from_headers": from_headers
+        });
+        let error = Oauth2Introspection::new(
+            &json!({"providers": [implicit_authorization.clone(), explicit_authorization]}),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("explicit and implicit Authorization bearer sources must conflict");
+        assert!(error.contains("allow_provider_fanout"));
+    }
 }
 
 #[tokio::test]
@@ -661,6 +666,34 @@ async fn authorization_scheme_is_case_insensitive_and_non_bearer_is_skipped() {
             .await,
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn prefixless_authorization_location_skips_foreign_scheme() {
+    let server = MockServer::start().await;
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": format!("{}/introspect", server.uri()),
+                "client_auth": {"method": "none"},
+                "from_headers": [{"name": "Authorization"}]
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Basic dXNlcjpwYXNz".to_string(),
+    );
+
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

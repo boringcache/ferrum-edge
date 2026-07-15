@@ -133,16 +133,17 @@ impl BasicAuth {
         };
 
         let consumer = consumer_index.find_by_username(&username);
-        let credential_entries = consumer
-            .as_ref()
-            .map(|consumer| consumer.credential_entries("basicauth"))
-            .unwrap_or_default();
         let mut password_matched = false;
 
         for round in 0..self.verification_rounds {
             observe_round();
-            let configured_hash = credential_entries
-                .get(round)
+            // Fixed indexed access avoids collecting a username-dependent
+            // number of entries before the padded verification work begins.
+            let configured_hash = consumer
+                .as_ref()
+                .and_then(|consumer| consumer.credentials.get("basicauth"))
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.get(round))
                 .and_then(|entry| entry.get("password_hash"))
                 .and_then(Value::as_str);
             let round_matched = self.verify_password(

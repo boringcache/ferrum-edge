@@ -6514,11 +6514,13 @@ components:
           type: string
           minLength: 1
           maxLength: 4096
+          pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           writeOnly: true
           description: >-
             Plaintext password (automatically hashed on write using HMAC-SHA256
             with the server secret `FERRUM_BASIC_AUTH_HMAC_SECRET`). Mutually
-            exclusive with `password_hash`.
+            exclusive with `password_hash`. Must not contain ASCII control bytes
+            other than horizontal tab, line feed, and carriage return.
         password_hash:
           type: string
           maxLength: 76
