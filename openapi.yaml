@@ -6356,9 +6356,11 @@ components:
       enum: [single, multi]
       default: single
       description: |
-        `single` — auth plugins run in priority order until the first success;
-        a scheme not applicable to the current mechanism is skipped, while the
-        first applicable rejection is terminal.
+        `single` — auth plugins run in priority order until the first success.
+        For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`,
+        and `oauth2_introspection`, a foreign `Authorization` scheme is skipped;
+        other mechanisms are not covered by this guarantee. Any rejection
+        returned by a plugin is terminal.
         `multi` — auth plugins run sequentially until one succeeds. If none
         succeeds, a server rejection takes precedence over the last ordinary
         rejection; an all-missing chain returns the first available challenge

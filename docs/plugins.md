@@ -121,7 +121,7 @@ Use `priority_override` to control the relative execution order of instances tha
 
 ## Multi-Authentication Mode
 
-With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. An `Authorization` scheme not applicable to the current mechanism is skipped, while the first applicable rejection is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one succeeds; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned. After authentication, the Access Control plugin can apply consumer or group policy.
+With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one succeeds; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned. After authentication, the Access Control plugin can apply consumer or group policy.
 
 ## Consumer Identity Headers
 

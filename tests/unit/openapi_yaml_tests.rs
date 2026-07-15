@@ -281,9 +281,17 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
     let auth_mode = spec["components"]["schemas"]["AuthMode"]["description"]
         .as_str()
         .expect("AuthMode description");
-    assert!(auth_mode.contains("first applicable rejection is terminal"));
+    let scoped_scheme_contract = "For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, \
+                                  `jwks_auth`, and `oauth2_introspection`, a foreign \
+                                  `Authorization` scheme is skipped; other mechanisms are not \
+                                  covered by this guarantee.";
+    assert!(auth_mode.contains(scoped_scheme_contract));
+    assert!(auth_mode.contains("Any rejection returned by a plugin is terminal"));
     assert!(auth_mode.contains("run sequentially until one succeeds"));
     assert!(auth_mode.contains("server rejection takes precedence"));
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(plugin_docs.contains(scoped_scheme_contract));
 
     let consumer_credentials =
         &spec["components"]["schemas"]["Consumer"]["properties"]["credentials"];
