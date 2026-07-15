@@ -183,6 +183,42 @@ pub mod _test_support {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct OidcSessionStateForTest {
+        pub access_token: String,
+        pub refresh_token: Option<String>,
+        pub refresh_after_unix: i64,
+    }
+
+    pub fn oidc_sealed_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        claims: serde_json::Value,
+        require_rolling_update: bool,
+    ) -> Result<String, String> {
+        plugin.sealed_session_cookie_for_tests(claims, require_rolling_update)
+    }
+
+    pub fn oidc_sealed_due_refresh_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        claims: serde_json::Value,
+        refresh_token: &str,
+    ) -> Result<String, String> {
+        plugin.sealed_due_refresh_session_cookie_for_tests(claims, refresh_token)
+    }
+
+    pub fn oidc_session_state_from_set_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        set_cookie: &str,
+    ) -> Option<OidcSessionStateForTest> {
+        let (access_token, refresh_token, refresh_after_unix) =
+            plugin.session_state_from_set_cookie_for_tests(set_cookie)?;
+        Some(OidcSessionStateForTest {
+            access_token,
+            refresh_token,
+            refresh_after_unix,
+        })
+    }
+
     pub fn prepare_basic_auth_credential_for_test(
         credential: &mut serde_json::Value,
     ) -> Result<(), StatusCode> {
