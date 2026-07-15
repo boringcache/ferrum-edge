@@ -14,7 +14,7 @@ use ferrum_edge::config::types::{GatewayConfig, Proxy, UpstreamTarget};
 use ferrum_edge::plugins::adaptive_concurrency::AdaptiveConcurrency;
 use ferrum_edge::plugins::{
     BackendAdmissionContext, BackendAdmissionDecision, BackendAdmissionOutcome,
-    BackendAdmissionPermit, Plugin, PluginHttpClient, ProxyProtocol, RequestContext,
+    BackendAdmissionPermit, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
 };
 use ferrum_edge::retry::ErrorClass;
 use serde_json::json;
@@ -925,6 +925,84 @@ fn adaptive_concurrency_global_rebuild_keeps_old_session_accounted() {
     drop(released);
 }
 
+#[tokio::test]
+async fn adaptive_concurrency_global_route_refresh_preserves_unrelated_global_state() {
+    let mut config = cache_config(
+        "global",
+        json!({
+            "min_limit": 1,
+            "initial_limit": 2,
+            "max_limit": 2,
+            "shadow_mode": true
+        }),
+    );
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "rate-limit-1",
+            "namespace": "default",
+            "plugin_name": "rate_limiting",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "limit_by": "ip",
+                "limits": [{
+                    "scope": "default",
+                    "window_seconds": 60,
+                    "max_requests": 1
+                }]
+            }
+        }))
+        .expect("rate limiting config should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let original_rate_limiter = cache
+        .get_plugins("proxy-1")
+        .iter()
+        .find(|plugin| plugin.name() == "rate_limiting")
+        .cloned()
+        .expect("global rate limiter should be cached");
+    let mut original_request =
+        RequestContext::new("192.0.2.20".to_string(), "GET".to_string(), "/".to_string());
+    assert!(matches!(
+        original_rate_limiter
+            .on_request_received(&mut original_request)
+            .await,
+        PluginResult::Continue
+    ));
+    let held = expect_admitted(acquire_from_cache(&cache, &config));
+
+    let mut reloaded = config.clone();
+    reloaded.proxies[0].backend_host = "replacement.local".to_string();
+    cache
+        .apply_delta(&reloaded, &HashSet::new(), &[], false)
+        .expect("global adaptive route refresh should publish");
+
+    let replacement_rate_limiter = cache
+        .get_plugins("proxy-1")
+        .iter()
+        .find(|plugin| plugin.name() == "rate_limiting")
+        .cloned()
+        .expect("global rate limiter should remain cached");
+    assert!(
+        Arc::ptr_eq(&original_rate_limiter, &replacement_rate_limiter),
+        "adaptive-only route refresh must preserve unrelated global instances"
+    );
+    let mut replacement_request =
+        RequestContext::new("192.0.2.20".to_string(), "GET".to_string(), "/".to_string());
+    assert!(matches!(
+        replacement_rate_limiter
+            .on_request_received(&mut replacement_request)
+            .await,
+        PluginResult::Reject {
+            status_code: 429,
+            ..
+        }
+    ));
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    drop(held);
+    drop(expect_admitted(acquire_from_cache(&cache, &reloaded)));
+}
+
 #[test]
 fn adaptive_concurrency_compatible_reload_keeps_pinned_old_view_admitted() {
     let config = cache_config(
@@ -1208,6 +1286,69 @@ fn adaptive_concurrency_upstream_target_reload_reclaims_retired_key_capacity() {
         Some(replacement_target),
     ));
     drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
+    let mut config = cache_config(
+        "proxy",
+        json!({
+            "key_by": "backend_target",
+            "min_limit": 1,
+            "initial_limit": 2,
+            "max_limit": 2,
+            "shadow_mode": true
+        }),
+    );
+    config.proxies[0].upstream_id = Some("upstream-1".to_string());
+    config.proxies[0].backend_port = 8080;
+    config.upstreams.push(
+        serde_json::from_value(json!({
+            "id": "upstream-1",
+            "namespace": "default",
+            "targets": [
+                {"host": "first.local", "port": 8080},
+                {"host": "second.local", "port": 9090}
+            ],
+            "port_overrides": {
+                "8080": {"connect_timeout_ms": 100},
+                "9090": {"connect_timeout_ms": 100}
+            }
+        }))
+        .expect("multi-port upstream should deserialize"),
+    );
+    config.resolve_dispatch_port_overrides();
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let first_target = config.upstreams[0].targets[0].clone();
+    let held = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &config.proxies[0],
+        Some(&first_target),
+    ));
+
+    let mut reloaded = config.clone();
+    reloaded.proxies[0].backend_port = 9090;
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from(["proxy-1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("effective upstream port lane change should publish");
+
+    let second_target = &reloaded.upstreams[0].targets[1];
+    assert_rejected(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &reloaded.proxies[0],
+        Some(second_target),
+    ));
+    drop(held);
+    drop(expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &reloaded.proxies[0],
+        Some(second_target),
+    )));
 }
 
 #[test]
@@ -1558,6 +1699,92 @@ fn adaptive_concurrency_mesh_direct_host_normalization_stays_compatible() {
     assert_rejected(acquire_from_plugin(&replacement, &effective_proxy, None));
     drop(second);
     drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
+    let mut config = cache_config(
+        "proxy",
+        json!({
+            "min_limit": 1,
+            "initial_limit": 2,
+            "max_limit": 2,
+            "shadow_mode": true
+        }),
+    );
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "route-dispatch-1",
+            "namespace": "default",
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "proxy_group",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "override.local",
+                        "backend_port": 443,
+                        "backend_tls": {"sni": "FIRST.Route.Local"}
+                    }
+                }]
+            }
+        }))
+        .expect("route dispatch config should deserialize"),
+    );
+    config.proxies[0].plugins.push(
+        serde_json::from_value(json!({"plugin_config_id": "route-dispatch-1"}))
+            .expect("route dispatch association should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let mut effective_proxy = config.proxies[0].clone();
+    effective_proxy.backend_host = "override.local".to_string();
+    effective_proxy.backend_port = 443;
+    let held = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_proxy,
+        None,
+    ));
+
+    let mut normalized_equivalent = config.clone();
+    normalized_equivalent.plugin_configs[1].config["rules"][0]["destination"]["backend_tls"]
+        ["sni"] = json!("first.route.local");
+    cache
+        .apply_delta(
+            &normalized_equivalent,
+            &HashSet::from(["proxy-1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("normalized-equivalent TLS identity should publish");
+    drop(expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_proxy,
+        None,
+    )));
+
+    let mut replacement = normalized_equivalent.clone();
+    replacement.plugin_configs[1].config["rules"][0]["destination"]["backend_tls"]["sni"] =
+        json!("second.route.local");
+    cache
+        .apply_delta(
+            &replacement,
+            &HashSet::from(["proxy-1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("changed TLS identity should publish");
+    assert_rejected(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_proxy,
+        None,
+    ));
+    drop(held);
+    drop(expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_proxy,
+        None,
+    )));
 }
 
 #[test]

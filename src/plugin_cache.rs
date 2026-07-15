@@ -688,6 +688,8 @@ struct AdaptiveConcurrencyUpstreamRoute {
     scope: String,
     upstream_id: String,
     subset: Option<String>,
+    backend_port: u16,
+    port_override_keys: Vec<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -810,12 +812,25 @@ fn push_upstream_route(
     scope: String,
     upstream_id: &str,
     subset: Option<&str>,
+    backend_port: u16,
     upstream: Option<&crate::config::types::Upstream>,
 ) {
+    let port_override_keys = upstream
+        .map(adaptive_concurrency_resolved_port_override_keys)
+        .unwrap_or_default();
+    let port_scope = upstream.and_then(|upstream| {
+        adaptive_concurrency_upstream_port_scope(
+            backend_port,
+            &port_override_keys,
+            &upstream.targets,
+        )
+    });
     upstream_routes.push(AdaptiveConcurrencyUpstreamRoute {
         scope: scope.clone(),
         upstream_id: upstream_id.to_string(),
         subset: subset.map(ToOwned::to_owned),
+        backend_port,
+        port_override_keys,
     });
     let key_count = keys.len();
     if let Some(upstream) = upstream {
@@ -824,6 +839,10 @@ fn push_upstream_route(
                 .targets
                 .iter()
                 .filter(|target| target_matches_subset(upstream, target, subset))
+                .filter(|target| {
+                    port_scope
+                        .is_none_or(|port| target.dispatch_policy_port() == port)
+                })
                 .map(|target| AdaptiveConcurrencyRouteKey {
                     scope: scope.clone(),
                     host: Some(target.host.clone()),
@@ -840,6 +859,53 @@ fn push_upstream_route(
             port: None,
         });
     }
+}
+
+fn adaptive_concurrency_resolved_port_override_keys(
+    upstream: &crate::config::types::Upstream,
+) -> Vec<u16> {
+    let mut keys = upstream
+        .port_overrides
+        .iter()
+        .filter_map(|(port, value)| {
+            crate::config::types::ResolvedPortOverride::from_upstream_override(value)
+                .map(|_| *port)
+        })
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+fn adaptive_concurrency_upstream_port_scope(
+    backend_port: u16,
+    port_override_keys: &[u16],
+    targets: &[crate::config::types::UpstreamTarget],
+) -> Option<u16> {
+    if port_override_keys.is_empty() || targets.is_empty() {
+        return None;
+    }
+
+    let mut full_coverage_port = None;
+    let mut full_coverage_count = 0usize;
+    for port in port_override_keys {
+        if targets
+            .iter()
+            .all(|target| target.dispatch_policy_port() == *port)
+        {
+            full_coverage_count += 1;
+            full_coverage_port = Some(*port);
+        }
+    }
+    let dispatch_port = if full_coverage_count == 1 {
+        full_coverage_port.unwrap_or(backend_port)
+    } else {
+        backend_port
+    };
+    port_override_keys
+        .binary_search(&dispatch_port)
+        .is_ok()
+        .then_some(dispatch_port)
 }
 
 fn push_direct_route_key(
@@ -924,8 +990,14 @@ fn url_destination_fingerprint(url: &str) -> serde_json::Value {
 fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Value {
     match pc.plugin_name.as_str() {
         "mesh_route_dispatch" => {
-            let rules = pc
-                .config
+            let normalized_config =
+                crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value_normalized(
+                    &pc.config,
+                )
+                .ok()
+                .and_then(|config| serde_json::to_value(config).ok());
+            let fingerprint_config = normalized_config.as_ref().unwrap_or(&pc.config);
+            let rules = fingerprint_config
                 .get("rules")
                 .and_then(serde_json::Value::as_array)
                 .map(|rules| {
@@ -959,6 +1031,9 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
                             let backend_port = destination
                                 .and_then(|value| value.get("backend_port"))
                                 .cloned();
+                            let backend_tls = destination
+                                .and_then(|value| value.get("backend_tls"))
+                                .cloned();
                             let requires_node_waypoint_authz = destination
                                 .and_then(|value| value.get("requires_node_waypoint_authz"))
                                 .and_then(serde_json::Value::as_bool)
@@ -972,6 +1047,7 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
                                     "upstream_id": upstream_id,
                                     "backend_host": backend_host,
                                     "backend_port": backend_port,
+                                    "backend_tls": backend_tls,
                                     "requires_node_waypoint_authz": requires_node_waypoint_authz
                                 },
                                 // Redirect presence suppresses backend dispatch; its
@@ -983,8 +1059,7 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
                 })
                 .unwrap_or_default();
             serde_json::json!({
-                "reject_unmatched": pc
-                    .config
+                "reject_unmatched": fingerprint_config
                     .get("reject_unmatched")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
@@ -1183,6 +1258,7 @@ fn collect_route_override_destinations(
                         adaptive_concurrency_scope(key_by, proxy, Some(upstream_id)),
                         upstream_id,
                         subset,
+                        proxy.backend_port,
                         upstream,
                     );
                 } else if let (Some(host), Some(port)) = (
@@ -1307,6 +1383,7 @@ fn adaptive_concurrency_route_definition(
                 adaptive_concurrency_scope(key_by, proxy, Some(upstream_id)),
                 upstream_id,
                 proxy.upstream_subset.as_deref(),
+                proxy.backend_port,
                 upstream,
             );
         } else {
@@ -1342,12 +1419,21 @@ fn adaptive_concurrency_effective_lb_keys(
     for route in &route_definition.upstream_routes {
         let key_count = keys.len();
         if let Some(upstream) = load_balancer.upstreams().get(&route.upstream_id) {
+            let port_scope = adaptive_concurrency_upstream_port_scope(
+                route.backend_port,
+                &route.port_override_keys,
+                &upstream.targets,
+            );
             keys.extend(
                 upstream
                     .targets
                     .iter()
                     .filter(|target| {
                         target_matches_subset(upstream, target, route.subset.as_deref())
+                    })
+                    .filter(|target| {
+                        port_scope
+                            .is_none_or(|port| target.dispatch_policy_port() == port)
                     })
                     .map(|target| AdaptiveConcurrencyRouteKey {
                         scope: route.scope.clone(),
@@ -1427,7 +1513,7 @@ fn include_adaptive_concurrency_route_rebuilds(
     current: &AdaptiveConcurrencyInstanceMap,
     config: &GatewayConfig,
     proxy_ids_to_rebuild: &mut HashSet<String>,
-    rebuild_globals: &mut bool,
+    rebuild_adaptive_globals: &mut bool,
 ) {
     for (identity, existing) in current {
         let Some(pc) = config.plugin_configs.iter().find(|pc| {
@@ -1446,7 +1532,7 @@ fn include_adaptive_concurrency_route_rebuilds(
 
         match &pc.scope {
             PluginScope::Global => {
-                *rebuild_globals = true;
+                *rebuild_adaptive_globals = true;
                 proxy_ids_to_rebuild.extend(config.proxies.iter().map(|proxy| proxy.id.clone()));
             }
             PluginScope::Proxy => {
@@ -2289,13 +2375,14 @@ impl PluginCache {
         validate_prometheus_metrics_ownership(config)?;
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
-        let mut rebuild_globals = rebuild_globals;
+        let mut rebuild_adaptive_globals = false;
         include_adaptive_concurrency_route_rebuilds(
             &current.adaptive_concurrency_instances,
             config,
             &mut proxy_ids_to_rebuild,
-            &mut rebuild_globals,
+            &mut rebuild_adaptive_globals,
         );
+        let global_plugins_changed = rebuild_globals || rebuild_adaptive_globals;
         let mut adaptive_concurrency_instances =
             retained_adaptive_concurrency_states(&current.adaptive_concurrency_instances, config);
 
@@ -2365,6 +2452,43 @@ impl PluginCache {
                 }
             }
             global_plugins.sort_by_key(|p| p.priority());
+            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
+            Arc::new(global_plugins)
+        } else if rebuild_adaptive_globals {
+            // Route compatibility can require a fresh global adaptive view
+            // without any global PluginConfig changing. Replace only those
+            // wrappers so unrelated stateful globals retain their Arc/state.
+            let mut global_plugins = current
+                .global_plugins
+                .iter()
+                .filter(|plugin| plugin.name() != "adaptive_concurrency")
+                .cloned()
+                .collect::<Vec<_>>();
+            for pc in &config.plugin_configs {
+                if !pc.enabled
+                    || pc.scope != PluginScope::Global
+                    || pc.plugin_name != "adaptive_concurrency"
+                {
+                    continue;
+                }
+                match try_create_plugin(
+                    pc,
+                    config,
+                    &self.http_client,
+                    &current.adaptive_concurrency_instances,
+                    &mut adaptive_concurrency_instances,
+                ) {
+                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("Config reload: {}", e);
+                        plugin_errors.push(e);
+                    }
+                }
+            }
+            global_plugins.sort_by_key(|plugin| plugin.priority());
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
@@ -2642,7 +2766,7 @@ impl PluginCache {
                 new_proxy_proto.insert(proxy.id.clone(), inner);
             }
         }
-        let new_global_proto = if rebuild_globals {
+        let new_global_proto = if global_plugins_changed {
             let mut g = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
             for &proto in &ALL_PROXY_PROTOCOLS {
                 g.insert(proto, build_protocol_entry(&new_globals, proto));
@@ -2652,21 +2776,21 @@ impl PluginCache {
             current.protocol_snapshot.global.clone()
         };
 
-        let new_global_requires_buffering = if rebuild_globals {
+        let new_global_requires_buffering = if global_plugins_changed {
             new_globals
                 .iter()
                 .any(|p| p.requires_response_body_buffering())
         } else {
             current.global_requires_buffering
         };
-        let new_global_requires_request_buffering = if rebuild_globals {
+        let new_global_requires_request_buffering = if global_plugins_changed {
             new_globals
                 .iter()
                 .any(|p| p.requires_request_body_buffering())
         } else {
             current.global_requires_request_buffering
         };
-        let new_global_requires_ws_frame = if rebuild_globals {
+        let new_global_requires_ws_frame = if global_plugins_changed {
             new_globals.iter().any(|p| p.requires_ws_frame_hooks())
         } else {
             current.global_requires_ws_frame
