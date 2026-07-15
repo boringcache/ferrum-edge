@@ -58,14 +58,9 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
     ]);
     let mut body = b"backend response".to_vec();
 
-    let normalized = normalize_response_body_for_inspection(
-        &plugins,
-        &mut ctx,
-        200,
-        &mut headers,
-        &mut body,
-    )
-    .await;
+    let normalized =
+        normalize_response_body_for_inspection(&plugins, &mut ctx, 200, &mut headers, &mut body)
+            .await;
 
     assert!(normalized);
     assert_eq!(headers.len(), 3);
@@ -75,7 +70,10 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
         Some("Deadline exceeded at gateway")
     );
     assert!(body.is_empty());
-    assert_eq!(ctx.metadata.get("grpc_status").map(String::as_str), Some("4"));
+    assert_eq!(
+        ctx.metadata.get("grpc_status").map(String::as_str),
+        Some("4")
+    );
 }
 
 // ── Plugin creation ──

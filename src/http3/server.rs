@@ -9158,10 +9158,7 @@ mod h3_request_body_timeout_tests {
             .expect("one second before now is representable");
         let upload = std::future::pending::<Result<(), ()>>();
         let result = super::collect_h3_request_body_with_deadline(upload, Some(deadline), 0).await;
-        assert_eq!(
-            result,
-            Err(super::H3RequestBodyReadError::DeadlineExceeded)
-        );
+        assert_eq!(result, Err(super::H3RequestBodyReadError::DeadlineExceeded));
     }
 
     #[tokio::test]
@@ -9171,8 +9168,7 @@ mod h3_request_body_timeout_tests {
             .expect("one minute after now is representable");
         let upload = std::future::pending::<Result<(), ()>>();
 
-        let result =
-            super::collect_h3_request_body_with_deadline(upload, Some(deadline), 10).await;
+        let result = super::collect_h3_request_body_with_deadline(upload, Some(deadline), 10).await;
 
         assert_eq!(result, Err(super::H3RequestBodyReadError::TimedOut));
     }
@@ -9195,14 +9191,20 @@ mod h3_request_body_timeout_tests {
 
         assert_eq!(status, http::StatusCode::OK);
         assert_eq!(headers.len(), 3);
-        assert_eq!(headers.get("content-type").map(String::as_str), Some("application/grpc"));
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc")
+        );
         assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
         assert_eq!(
             headers.get("grpc-message").map(String::as_str),
             Some("Deadline exceeded at gateway")
         );
         assert!(body.is_empty());
-        assert_eq!(ctx.metadata.get("grpc_status").map(String::as_str), Some("4"));
+        assert_eq!(
+            ctx.metadata.get("grpc_status").map(String::as_str),
+            Some("4")
+        );
         assert_eq!(
             ctx.metadata.get("grpc_message").map(String::as_str),
             Some("Deadline exceeded at gateway")

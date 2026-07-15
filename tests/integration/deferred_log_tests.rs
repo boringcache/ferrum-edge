@@ -286,15 +286,10 @@ async fn expired_grpc_deadline_still_runs_stream_cleanup_before_log() {
     });
     let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![deadline_plugin, capturing_plugin]);
     let mut ctx = make_ctx();
-    ctx.headers.insert(
-        "content-type".to_string(),
-        "application/grpc".to_string(),
-    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
     assert!(matches!(
-        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
-            plugins.as_slice(),
-            &mut ctx,
-        ),
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(plugins.as_slice(), &mut ctx,),
         ferrum_edge::plugins::PluginResult::Continue
     ));
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;

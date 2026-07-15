@@ -103,7 +103,9 @@ pub async fn run_response_stream_termination_hooks(
     // from exactly the cleanup/observability path meant to record it.
     crate::plugins::wait_for_response_stream_inspector(ctx).await;
     for plugin in plugins {
-        plugin.on_response_stream_terminated(ctx, response_status, outcome).await;
+        plugin
+            .on_response_stream_terminated(ctx, response_status, outcome)
+            .await;
     }
     crate::plugins::clear_response_stream_inspector_state(ctx);
 }

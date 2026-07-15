@@ -4005,10 +4005,9 @@ where
             // ResourceExhausted/Internal where the request bytes already
             // crossed the wire). Mirrors the H1/H2 gRPC path so a single
             // predicate governs `connection_error` everywhere.
-            let connection_error = !matches!(
-                &err,
-                grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_)
-            ) && !crate::retry::request_reached_wire(error_class);
+            let connection_error =
+                !matches!(&err, grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_))
+                    && !crate::retry::request_reached_wire(error_class);
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
@@ -4397,10 +4396,8 @@ pub(crate) async fn dispatch_grpc_streaming(
             // limiter.
             let request_overflow = matches!(&err, grpc_proxy::GrpcProxyError::ResourceExhausted(_));
             let frontend_aborted = frontend_upload_failed.load(Ordering::Acquire);
-            let client_deadline = matches!(
-                &err,
-                grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_)
-            );
+            let client_deadline =
+                matches!(&err, grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_));
             let error_class = if request_overflow {
                 ErrorClass::RequestBodyTooLarge
             } else if frontend_aborted {
@@ -5756,10 +5753,8 @@ mod tests {
             "/test.Service/Call".to_string(),
         );
         let mut status = 503;
-        let mut headers = HashMap::from([(
-            "content-type".to_string(),
-            "application/json".to_string(),
-        )]);
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
         let mut body = b"backend response".to_vec();
         let mut trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
 
@@ -5784,7 +5779,10 @@ mod tests {
         );
         assert!(body.is_empty());
         assert!(trailers.is_empty());
-        assert_eq!(ctx.metadata.get("grpc_status").map(String::as_str), Some("4"));
+        assert_eq!(
+            ctx.metadata.get("grpc_status").map(String::as_str),
+            Some("4")
+        );
     }
 
     #[test]

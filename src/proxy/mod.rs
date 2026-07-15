@@ -15991,7 +15991,7 @@ async fn handle_proxy_request_inner(
                     .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
                 let mut body_hook_ctx = (needs_final_request_body_context
                     || ctx.grpc_deadline_at().is_some())
-                    .then(|| ctx.clone_for_final_request_body_hooks());
+                .then(|| ctx.clone_for_final_request_body_hooks());
                 let transformed = apply_request_body_plugins_with_context(
                     &plugins,
                     body_hook_ctx.as_mut(),
@@ -16502,7 +16502,7 @@ async fn handle_proxy_request_inner(
                 .or_insert_with(|| path.clone());
             let mut body_hook_ctx = (needs_final_request_body_context
                 || ctx.grpc_deadline_at().is_some())
-                .then(|| ctx.clone_for_final_request_body_hooks());
+            .then(|| ctx.clone_for_final_request_body_hooks());
             let grpc_req_body = bytes::Bytes::from(
                 apply_request_body_plugins_with_context(
                     &plugins,
@@ -24140,9 +24140,7 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
 /// upstream. It has the same client-visible Trailers-Only status as a backend
 /// read timeout, but remains neutral to backend health, circuit breaking, and
 /// adaptive concurrency because there is no backend signal to attribute.
-fn client_grpc_deadline_exceeded_response(
-    resolved_ip: Option<String>,
-) -> retry::BackendResponse {
+fn client_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::BackendResponse {
     let mut response = mesh_grpc_deadline_exceeded_response(resolved_ip);
     response.headers.insert(
         "grpc-message".to_string(),
@@ -27862,10 +27860,7 @@ mod tests {
 
         let result = super::collect_request_body_with_deadline(upload, Some(deadline), 10).await;
 
-        assert!(matches!(
-            result,
-            Err(super::RequestBodyWaitError::TimedOut)
-        ));
+        assert!(matches!(result, Err(super::RequestBodyWaitError::TimedOut)));
     }
 
     #[tokio::test]

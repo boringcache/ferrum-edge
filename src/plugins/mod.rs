@@ -1980,8 +1980,7 @@ pub async fn normalize_response_body_for_inspection(
             Ok(body) => body,
             Err(()) => {
                 response_headers.clear();
-                response_headers
-                    .insert("content-type".to_string(), "application/grpc".to_string());
+                response_headers.insert("content-type".to_string(), "application/grpc".to_string());
                 response_headers.insert("grpc-status".to_string(), "4".to_string());
                 response_headers.insert(
                     "grpc-message".to_string(),

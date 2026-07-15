@@ -115,10 +115,8 @@ async fn expired_grpc_deadline_does_not_suppress_transaction_logging() {
     });
     let plugins: Vec<Arc<dyn Plugin>> = vec![deadline_plugin, logger.clone()];
     let mut ctx = make_ctx();
-    ctx.headers.insert(
-        "content-type".to_string(),
-        "application/grpc".to_string(),
-    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
     assert!(matches!(
         ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
         PluginResult::Continue
