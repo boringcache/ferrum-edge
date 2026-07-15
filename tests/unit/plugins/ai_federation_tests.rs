@@ -1701,6 +1701,55 @@ fn test_normalize_openai_response() {
 }
 
 #[test]
+fn openai_filtered_content_and_generated_tool_arguments_are_preserved() {
+    let resp = json!({
+        "id": "chatcmpl-filter-tools",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": null},
+                "finish_reason": "content_filter"
+            },
+            {
+                "index": 1,
+                "message": {"role": "assistant"},
+                "finish_reason": "content_filter"
+            },
+            {
+                "index": 2,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_partial",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": "{\"partial\":"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }
+        ]
+    });
+    let body = serde_json::to_vec(&resp).unwrap();
+    let (normalized, _, _, _) =
+        test_helpers::normalize_response_test("openai", 200, &body, "gpt-4o").unwrap();
+
+    assert_eq!(normalized["choices"][0]["finish_reason"], "content_filter");
+    assert!(normalized["choices"][0]["message"]["content"].is_null());
+    assert_eq!(normalized["choices"][1]["finish_reason"], "content_filter");
+    assert!(normalized["choices"][1]["message"].get("content").is_none());
+    assert_eq!(
+        normalized["choices"][2]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{\"partial\":"
+    );
+}
+
+#[test]
 fn test_sse_provider_response_is_rejected_by_buffered_json_parser() {
     let sse_body = br#"data: {"choices":[{"delta":{"content":"hello"}}]}
 
@@ -1808,6 +1857,17 @@ fn test_normalize_gemini_safety_filter() {
         test_helpers::normalize_response_test("google_gemini", 200, &body, "gemini-2.0-flash")
             .unwrap();
     assert_eq!(normalized["choices"][0]["finish_reason"], "content_filter");
+
+    let prompt_blocked = json!({
+        "promptFeedback": {"blockReason": "SAFETY"},
+        "usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 5}
+    });
+    let body = serde_json::to_vec(&prompt_blocked).unwrap();
+    let (normalized, _, _, _) =
+        test_helpers::normalize_response_test("google_gemini", 200, &body, "gemini-2.0-flash")
+            .unwrap();
+    assert_eq!(normalized["choices"][0]["finish_reason"], "content_filter");
+    assert!(normalized["choices"][0]["message"]["content"].is_null());
 }
 
 #[test]

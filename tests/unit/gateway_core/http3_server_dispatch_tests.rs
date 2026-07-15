@@ -28,6 +28,17 @@ fn h3_native_mesh_refusal_screens_plain_and_grpc_before_dispatch() {
 #[test]
 fn h3_final_body_rejects_use_complete_synthetic_response_pipeline() {
     let src = include_str!("../../../src/http3/server.rs");
+    let request_scoped_gate = src
+        .find("let has_terminal_body_dispatch = capabilities")
+        .expect("H3 terminal dispatch must retain a request-scoped applicability gate");
+    let early_dispatch = src
+        .find("if final_body_before_backend_dispatch {")
+        .expect("H3 terminal final-body dispatch gate must remain present");
+    let applicability = &src[request_scoped_gate..early_dispatch];
+    assert!(applicability.contains("plugin.should_buffer_request_body(&ctx)"));
+    assert!(
+        applicability.contains("plugin.requires_final_request_body_before_backend_dispatch()")
+    );
 
     let early_start = src
         .find("let raw_request_body_bytes = body_data.len() as u64;")

@@ -6,6 +6,9 @@ use ferrum_edge::router_cache::RouterCache;
 #[test]
 fn terminal_final_body_dispatch_precedes_backend_breaker_and_transport() {
     let src = include_str!("../../../src/proxy/mod.rs");
+    let request_scoped_gate = src
+        .find("let has_terminal_body_dispatch = capabilities")
+        .expect("terminal dispatch must retain a request-scoped applicability gate");
     let terminal_dispatch = src
         .find("if final_body_before_backend_dispatch {")
         .expect("terminal final-body dispatch gate must remain present");
@@ -23,7 +26,13 @@ fn terminal_final_body_dispatch_precedes_backend_breaker_and_transport() {
         .find("async fn proxy_to_backend(")
         .expect("backend transport function must remain present");
 
+    let applicability = &src[request_scoped_gate..terminal_dispatch];
+    assert!(applicability.contains("plugin.should_buffer_request_body(&ctx)"));
+    assert!(
+        applicability.contains("plugin.requires_final_request_body_before_backend_dispatch()")
+    );
     assert!(provider_hook < synthetic_pipeline);
+    assert!(request_scoped_gate < terminal_dispatch);
     assert!(terminal_dispatch < breaker);
     assert!(breaker < backend_transport);
 }

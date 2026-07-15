@@ -15167,12 +15167,43 @@ async fn handle_proxy_request_inner(
     // HBONE CONNECT requests must keep hyper's upgrade handle in the streaming
     // body (see `handle_hbone_request`), so pre-`before_proxy` buffering is
     // skipped — same reason as the pre-authenticate buffering guard above.
-    let requires_request_body_buffering = !is_hbone_connect_any
+    let request_may_need_buffering = !is_hbone_connect_any
         && allows_request_body_buffering
-        && maybe_requires_request_body_buffering
-        && plugins
-            .iter()
-            .any(|plugin| plugin.should_buffer_request_body(&ctx));
+        && maybe_requires_request_body_buffering;
+    let has_terminal_body_dispatch = capabilities
+        .has(crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH);
+    let has_contextual_final_body_hook = capabilities
+        .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    let (
+        requires_request_body_buffering,
+        final_body_before_backend_dispatch,
+        needs_final_request_body_context,
+    ) = if request_may_need_buffering
+        && (has_terminal_body_dispatch || has_contextual_final_body_hook)
+    {
+        let mut requires_buffering = false;
+        let mut terminal_dispatch = false;
+        let mut needs_final_context = false;
+        for plugin in plugins.iter() {
+            if plugin.should_buffer_request_body(&ctx) {
+                requires_buffering = true;
+                terminal_dispatch |=
+                    plugin.requires_final_request_body_before_backend_dispatch();
+                needs_final_context |= plugin.needs_final_request_body_context();
+            }
+        }
+        (requires_buffering, terminal_dispatch, needs_final_context)
+    } else if request_may_need_buffering {
+        (
+            plugins
+                .iter()
+                .any(|plugin| plugin.should_buffer_request_body(&ctx)),
+            false,
+            false,
+        )
+    } else {
+        (false, false, false)
+    };
     let requires_request_body_before_before_proxy = requires_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
         && plugins.iter().any(|plugin| {
@@ -15438,19 +15469,14 @@ async fn handle_proxy_request_inner(
         && requires_request_body_buffering
         && (maybe_requires_response_body_buffering || stream_hooks_enabled);
     let mut request_body_prepared = false;
-    // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
-    // so the proxy hot path does not re-scan the plugin list per request.
-    let needs_final_request_body_context = requires_request_body_buffering
-        && capabilities
-            .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    // The config-time capability above avoids a full scan when no contextual
+    // final-body hook is configured. The request-time value also requires that
+    // same plugin's body-applicability predicate to match, avoiding an unrelated
+    // body plugin triggering a context clone.
     // Provider-dispatch plugins synthesize the complete response from the
-    // finalized request body. Their hook is therefore the dispatch boundary,
-    // not a backend-response substitute: run it before any backend-only
-    // breaker, egress, admission, pool, or TLS work. This bit is precomputed at
-    // config reload so the hot path does not scan the plugin list.
-    let final_body_before_backend_dispatch = requires_request_body_buffering
-        && capabilities
-            .has(crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH);
+    // finalized request body. The config-time bit above avoids extra work when
+    // none are configured; the request-time value is true only when that same
+    // terminal plugin's `should_buffer_request_body` matched this request.
     let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an

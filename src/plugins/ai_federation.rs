@@ -1992,6 +1992,12 @@ struct ParsedToolCall {
     arguments: Value,
 }
 
+struct ProviderToolCall<'a> {
+    id: &'a str,
+    name: &'a str,
+    arguments: &'a str,
+}
+
 fn parse_openai_tool_calls(
     message: &Value,
     message_index: usize,
@@ -2067,6 +2073,67 @@ fn parse_openai_tool_calls(
         parsed.push(ParsedToolCall {
             id: id.to_string(),
             name: name.to_string(),
+            arguments,
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_provider_tool_calls<'a>(
+    message: &'a serde_json::Map<String, Value>,
+    choice_index: usize,
+    provider: &str,
+) -> Result<Vec<ProviderToolCall<'a>>, String> {
+    let Some(tool_calls_value) = message.get("tool_calls") else {
+        return Ok(Vec::new());
+    };
+    let tool_calls = tool_calls_value.as_array().ok_or_else(|| {
+        format!(
+            "ai_federation: {provider} choices[{choice_index}].message.tool_calls must be an array"
+        )
+    })?;
+    if tool_calls.is_empty() {
+        return Err(format!(
+            "ai_federation: {provider} choices[{choice_index}].message.tool_calls must not be empty"
+        ));
+    }
+
+    let mut parsed = Vec::with_capacity(tool_calls.len());
+    for (tool_index, call) in tool_calls.iter().enumerate() {
+        let scope = format!(
+            "{provider} choices[{choice_index}].message.tool_calls[{tool_index}]"
+        );
+        let call = call
+            .as_object()
+            .ok_or_else(|| format!("ai_federation: {scope} must be an object"))?;
+        if call.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(format!(
+                "ai_federation: {scope} must have type 'function'"
+            ));
+        }
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .ok_or_else(|| format!("ai_federation: {scope} has an invalid id"))?;
+        let function = call
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("ai_federation: {scope} missing function object"))?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_name(value))
+            .ok_or_else(|| format!("ai_federation: {scope} has an invalid function name"))?;
+        let arguments = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("ai_federation: {scope} arguments must be a string"))?;
+        parsed.push(ProviderToolCall {
+            id,
+            name,
+            // Provider output is generated text, not trusted request input.
+            // Preserve even partial or invalid JSON for the caller to validate.
             arguments,
         });
     }
@@ -3809,13 +3876,6 @@ fn normalize_from_openai_compatible(resp: &Value) -> Result<(Value, TokenCounts)
                 "ai_federation: OpenAI-compatible choices[{index}] message role must be assistant"
             ));
         }
-        let has_content = matches!(message.get("content"), Some(Value::String(_)));
-        let tool_calls = parse_openai_tool_calls(&Value::Object(message.clone()), index)?;
-        if !has_content && tool_calls.is_empty() {
-            return Err(format!(
-                "ai_federation: OpenAI-compatible choices[{index}] has neither text content nor tool calls"
-            ));
-        }
         let finish_reason = choice_object
             .get("finish_reason")
             .and_then(Value::as_str)
@@ -3828,6 +3888,21 @@ fn normalize_from_openai_compatible(resp: &Value) -> Result<(Value, TokenCounts)
         ) {
             return Err(format!(
                 "ai_federation: OpenAI-compatible choices[{index}] has unsupported finish_reason"
+            ));
+        }
+        let tool_calls = parse_provider_tool_calls(message, index, "OpenAI-compatible")?;
+        let has_non_empty_content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.is_empty());
+        let has_filtered_content_shape = finish_reason == "content_filter"
+            && matches!(
+                message.get("content"),
+                None | Some(Value::Null) | Some(Value::String(_))
+            );
+        if !has_non_empty_content && tool_calls.is_empty() && !has_filtered_content_shape {
+            return Err(format!(
+                "ai_federation: OpenAI-compatible choices[{index}] has neither text content nor tool calls"
             ));
         }
         if (finish_reason == "tool_calls") != !tool_calls.is_empty() {
@@ -4115,11 +4190,44 @@ fn normalize_from_anthropic(resp: &Value, _model: &str) -> Result<(Value, TokenC
     Ok((normalized, tokens))
 }
 
+fn gemini_prompt_is_blocked(resp: &Value) -> Result<bool, String> {
+    let Some(feedback) = resp.get("promptFeedback") else {
+        return Ok(false);
+    };
+    let feedback = feedback
+        .as_object()
+        .ok_or("ai_federation: Gemini promptFeedback must be an object")?;
+    let Some(reason) = feedback.get("blockReason") else {
+        return Ok(false);
+    };
+    match reason.as_str() {
+        Some(
+            "SAFETY"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "IMAGE_SAFETY"
+            | "JAILBREAK"
+            | "OTHER",
+        ) => Ok(true),
+        Some("BLOCK_REASON_UNSPECIFIED") => Ok(false),
+        _ => Err(
+            "ai_federation: Gemini promptFeedback has an unsupported blockReason".to_string(),
+        ),
+    }
+}
+
 fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCounts), String> {
-    let candidates = resp["candidates"]
-        .as_array()
-        .filter(|candidates| !candidates.is_empty())
-        .ok_or("ai_federation: Gemini response missing non-empty candidates array")?;
+    let prompt_is_blocked = gemini_prompt_is_blocked(resp)?;
+    let candidates: &[Value] = match resp.get("candidates") {
+        Some(Value::Array(candidates)) => candidates,
+        None if prompt_is_blocked => &[],
+        _ => return Err("ai_federation: Gemini response candidates must be an array".to_string()),
+    };
+    if candidates.is_empty() && !prompt_is_blocked {
+        return Err(
+            "ai_federation: Gemini response missing non-empty candidates array".to_string(),
+        );
+    }
     let response_id = match resp.get("responseId") {
         Some(Value::String(value)) if !value.is_empty() && value.len() <= 128 => value.clone(),
         Some(_) => {
@@ -4130,7 +4238,18 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
         None => format!("chatcmpl-fed-{}", generate_short_id()),
     };
     let call_id_prefix = generate_short_id();
-    let mut choices = Vec::with_capacity(candidates.len());
+    let mut choices = Vec::with_capacity(candidates.len().max(1));
+
+    if candidates.is_empty() {
+        choices.push(json!({
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": Value::Null,
+            },
+            "finish_reason": "content_filter",
+        }));
+    }
 
     for (candidate_index, candidate) in candidates.iter().enumerate() {
         if candidate["content"]["role"].as_str() != Some("model") {
@@ -4419,7 +4538,7 @@ fn normalize_from_cohere(resp: &Value, model: &str) -> Result<(Value, TokenCount
             format!("ai_federation: Cohere message.content[{index}] missing text")
         })?);
     }
-    let tool_calls = parse_openai_tool_calls(&Value::Object(message.clone()), 0)?;
+    let tool_calls = parse_provider_tool_calls(message, 0, "Cohere")?;
     if text.is_empty() && tool_calls.is_empty() {
         return Err(
             "ai_federation: Cohere response has no non-empty text or tool calls".to_string(),
@@ -4466,8 +4585,17 @@ fn normalize_from_cohere(resp: &Value, model: &str) -> Result<(Value, TokenCount
         openai_message["tool_calls"] = Value::Array(
             tool_calls
                 .into_iter()
-                .map(|call| openai_tool_call(&call.id, &call.name, &call.arguments))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(|call| {
+                    json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        }
+                    })
+                })
+                .collect(),
         );
     }
     let mut normalized = json!({
