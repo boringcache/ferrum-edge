@@ -68,6 +68,7 @@ const RESPONSE_VALIDATORS: &[&str] = &[
     "etag",
     "last-modified",
     "content-digest",
+    "repr-digest",
     "digest",
     "content-md5",
 ];
@@ -581,6 +582,16 @@ impl AiResponseGuard {
                 hit[idx] = true;
             }
         }
+        // Scan the coherent client-visible/executable stream as well as each
+        // decoded frame. In particular, Responses API argument deltas are a
+        // serialized JSON document that may span events; only reassembly can
+        // expose JSON escapes such as `\u0040` to the detector.
+        let accumulated = self.extract_sse_completion_texts(frames);
+        for text in &accumulated {
+            for idx in self.detection_set.matches(text).into_iter() {
+                hit[idx] = true;
+            }
+        }
         if let Some(raw) = raw {
             for idx in self.detection_set.matches(raw).into_iter() {
                 hit[idx] = true;
@@ -673,16 +684,7 @@ impl AiResponseGuard {
         }
         let mut redacted = original.clone();
         self.redact_all_strings_with_argument_shield(&mut redacted);
-
-        if let Value::Object(map) = &mut redacted {
-            for (key, value) in map.iter_mut() {
-                if STRUCTURAL_KEYS.contains(&key.as_str())
-                    && (value.is_string() || value.is_number())
-                {
-                    *value = Value::String(String::new());
-                }
-            }
-        }
+        blank_top_level_structural_scalars(&mut redacted);
 
         // Union the same two passes as `detect_matches_in_decoded_json`, but run
         // each over text with the redactor's placeholder markers removed so the
@@ -728,36 +730,57 @@ impl AiResponseGuard {
     /// The SSE transform (`redact_sse_body`) only rewrites `data:` payloads that
     /// parse as JSON. A plaintext or malformed `data:` frame (e.g.
     /// `data: contact user@example.com`) is matched by the raw-body union in
-    /// detection but cannot be rewritten, so the transform returns `None` and the
-    /// original PII would be delivered. This mirrors the JSON
+    /// detection but cannot be rewritten. This mirrors the JSON
     /// `redact_leaves_residual` fail-closed: run the same redaction the transform
-    /// performs, then re-scan the result (with the redactor's own placeholder
-    /// markers stripped). If redaction produced no rewrite at all, or the rewrite
-    /// still matches, residual content remains and the caller must reject.
+    /// performs, then re-scan the client-visible candidate (with the redactor's
+    /// own placeholder markers and preserved structural scalars excluded). If
+    /// unrewritable content still matches, the caller must reject.
     fn redact_sse_leaves_residual(&self, body: &[u8]) -> bool {
         if self.detection_pattern_count == 0 {
             return false;
         }
-        // `redact_sse_body` returns `None` when nothing was rewritten; with
-        // detection already positive that means the matched bytes are not
-        // JSON-redactable (plaintext/malformed frame or a STRUCTURAL_KEYS-only
-        // scalar). Treat "no rewrite while detected" as residual so we fail
-        // closed rather than forward the original PII.
-        let Some(redacted) = self.redact_sse_body(body) else {
-            return true;
-        };
-        let Ok(redacted_str) = std::str::from_utf8(&redacted) else {
+        // Scan the exact bytes the client would receive: transformed output
+        // when redaction changed an event, otherwise the original framing.
+        // The residual pass masks only preserved top-level structural scalar
+        // spans, so duplicate keys and formatting remain visible and matches in
+        // cross-event, key, numeric, or non-data content still fail closed.
+        let redacted = self.redact_sse_body(body);
+        self.sse_body_has_residual(redacted.as_deref().unwrap_or(body))
+    }
+
+    /// Re-scan an SSE body produced by [`Self::redact_sse_body`]. Scan-all
+    /// redaction deliberately preserves top-level structural scalar values in
+    /// each JSON event, matching the buffered JSON path. Blank those values in
+    /// both decoded and raw/contextual passes so an IP-shaped `id` does not
+    /// cause a false residual, while keys, numbers outside the carve-out,
+    /// non-`data:` fields, and cross-token patterns remain fail-closed.
+    fn sse_body_has_residual(&self, redacted: &[u8]) -> bool {
+        let Ok(redacted_str) = std::str::from_utf8(redacted) else {
             // Redacted output is not valid UTF-8 — cannot re-scan safely, so
             // fail closed rather than risk forwarding undetectable residual.
             return true;
         };
-        let frames = parse_sse_data_frames(&redacted);
+        let parsed = parse_sse_data_frames_checked(redacted);
+        if !parsed.fully_parsed {
+            return true;
+        }
+        let mut frames = parsed.frames;
         if self.scan_mode == ScanMode::Content {
             let accumulated = self.extract_sse_completion_texts(&frames);
             return accumulated.iter().any(|text| {
                 self.detection_set
                     .is_match(&self.strip_known_placeholders(text))
             });
+        }
+
+        // Reassemble while event routing metadata (`type`, indexes) is still
+        // present. Structural masking is only for the decoded-token and raw
+        // residual passes; doing it first would hide Responses delta kinds and
+        // let a match split across their argument events escape this re-scan.
+        let accumulated = self.extract_sse_completion_texts(&frames);
+
+        for frame in &mut frames {
+            blank_top_level_structural_scalars(frame);
         }
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
         for frame in &frames {
@@ -770,7 +793,22 @@ impl AiResponseGuard {
                 return true;
             }
         }
-        let cleaned_raw = self.strip_known_placeholders(redacted_str);
+
+        for text in &accumulated {
+            let cleaned = self.strip_known_placeholders(text);
+            if self.detection_set.is_match(&cleaned) {
+                return true;
+            }
+        }
+
+        // Keep the raw/contextual pass without letting preserved structural
+        // scalar values re-trigger it. Mask only their exact raw byte spans:
+        // canonicalizing parsed frames here would drop duplicate members or
+        // whitespace that the client still receives when no transform occurs.
+        let Some(sanitized) = mask_sse_top_level_structural_scalars(redacted_str) else {
+            return true;
+        };
+        let cleaned_raw = self.strip_known_placeholders(&sanitized);
         self.detection_set.is_match(&cleaned_raw)
     }
 
@@ -1254,60 +1292,13 @@ impl AiResponseGuard {
     }
 
     fn redact_sse_event(&self, lines: &[&str]) -> Option<String> {
-        let mut data_lines = Vec::new();
-        let mut payloads = Vec::new();
-        for (idx, line) in lines.iter().enumerate() {
-            let content = line
-                .strip_suffix("\r\n")
-                .or_else(|| line.strip_suffix('\n'))
-                .unwrap_or(line);
-            if let Some(data) = content
-                .strip_prefix("data: ")
-                .or_else(|| content.strip_prefix("data:"))
-            {
-                data_lines.push(idx);
-                payloads.push(data);
+        rewrite_sse_json_event(lines, |json| {
+            if self.scan_mode == ScanMode::All {
+                self.redact_all_strings_with_argument_shield(json);
+            } else {
+                self.redact_sse_frame(json);
             }
-        }
-        if payloads.is_empty() {
-            return None;
-        }
-
-        let joined = payloads.join("\n");
-        let trimmed = joined.trim();
-        if trimmed.is_empty() || trimmed == "[DONE]" {
-            return None;
-        }
-        let mut json = serde_json::from_str::<Value>(trimmed).ok()?;
-        let original = json.clone();
-        if self.scan_mode == ScanMode::All {
-            self.redact_all_strings_with_argument_shield(&mut json);
-        } else {
-            self.redact_sse_frame(&mut json);
-        }
-        if json == original {
-            return None;
-        }
-        let rewritten = serde_json::to_string(&json).ok()?;
-        let first_data_line = data_lines[0];
-        let mut output = String::new();
-        for (idx, line) in lines.iter().enumerate() {
-            if idx == first_data_line {
-                let ending = if line.ends_with("\r\n") {
-                    "\r\n"
-                } else if line.ends_with('\n') {
-                    "\n"
-                } else {
-                    ""
-                };
-                output.push_str("data: ");
-                output.push_str(&rewritten);
-                output.push_str(ending);
-            } else if data_lines.binary_search(&idx).is_err() {
-                output.push_str(line);
-            }
-        }
-        Some(output)
+        })
     }
 
     /// Redact an SSE response body, modifying complete SSE events while
@@ -1342,37 +1333,7 @@ impl AiResponseGuard {
             return None;
         }
 
-        let mut output = String::with_capacity(body_str.len());
-        let mut event_lines = Vec::new();
-        let mut modified = false;
-        for line in body_str.split_inclusive('\n') {
-            event_lines.push(line);
-            let content = line
-                .strip_suffix("\r\n")
-                .or_else(|| line.strip_suffix('\n'))
-                .unwrap_or(line);
-            if content.is_empty() {
-                if let Some(rewritten) = self.redact_sse_event(&event_lines) {
-                    output.push_str(&rewritten);
-                    modified = true;
-                } else {
-                    for original in &event_lines {
-                        output.push_str(original);
-                    }
-                }
-                event_lines.clear();
-            }
-        }
-        if !event_lines.is_empty() {
-            if let Some(rewritten) = self.redact_sse_event(&event_lines) {
-                output.push_str(&rewritten);
-                modified = true;
-            } else {
-                for original in &event_lines {
-                    output.push_str(original);
-                }
-            }
-        }
+        let (output, modified) = rewrite_sse_events(body_str, |lines| self.redact_sse_event(lines));
 
         if modified {
             Some(output.into_bytes())
@@ -1616,11 +1577,13 @@ impl Plugin for AiResponseGuard {
             }
         }
 
-        // Extract completion texts
-        let texts = if self.scan_mode == ScanMode::All {
-            Vec::new() // handled separately below
-        } else {
+        // Pattern detection in scan-all is handled separately below, but the
+        // completion-length rule is independent of scan mode and must still
+        // inspect supported completion/tool fields.
+        let texts = if self.scan_mode == ScanMode::Content || self.max_completion_length > 0 {
             self.extract_completion_texts(&json)
+        } else {
+            Vec::new()
         };
 
         // Check max completion length
@@ -1714,7 +1677,8 @@ impl Plugin for AiResponseGuard {
 
         if let Some(ct) = content_type {
             if is_event_stream_content_type(ct) {
-                return self.redact_sse_body(body);
+                let redacted = self.redact_sse_body(body)?;
+                return (!self.sse_body_has_residual(&redacted)).then_some(redacted);
             }
             if !is_json_content_type(ct) {
                 if self.scan_mode != ScanMode::All {
@@ -1781,6 +1745,335 @@ impl Plugin for AiResponseGuard {
                 .any(|header| key.eq_ignore_ascii_case(header))
         });
     }
+}
+
+/// Blank scalar values under the root response/event keys whose values are
+/// protocol metadata rather than model-authored content. The same carve-out is
+/// used by buffered JSON and buffered SSE residual scans.
+fn blank_top_level_structural_scalars(value: &mut Value) {
+    if let Value::Object(map) = value {
+        for (key, value) in map.iter_mut() {
+            if STRUCTURAL_KEYS.contains(&key.as_str()) && (value.is_string() || value.is_number()) {
+                *value = Value::String(String::new());
+            }
+        }
+    }
+}
+
+/// Parse and rewrite one complete SSE event's joined JSON `data:` payload,
+/// preserving non-data fields and the first data line's terminator.
+fn rewrite_sse_json_event(lines: &[&str], mutate: impl FnOnce(&mut Value)) -> Option<String> {
+    let mut data_lines = Vec::new();
+    let mut payloads = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let content = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        if let Some(data) = content
+            .strip_prefix("data: ")
+            .or_else(|| content.strip_prefix("data:"))
+        {
+            data_lines.push(idx);
+            payloads.push(data);
+        }
+    }
+    if payloads.is_empty() {
+        return None;
+    }
+
+    let joined = payloads.join("\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return None;
+    }
+    let mut json = serde_json::from_str::<Value>(trimmed).ok()?;
+    let original = json.clone();
+    mutate(&mut json);
+    if json == original {
+        return None;
+    }
+
+    let rewritten = serde_json::to_string(&json).ok()?;
+    let first_data_line = data_lines[0];
+    let mut output = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if idx == first_data_line {
+            let ending = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            output.push_str("data: ");
+            output.push_str(&rewritten);
+            output.push_str(ending);
+        } else if data_lines.binary_search(&idx).is_err() {
+            output.push_str(line);
+        }
+    }
+    Some(output)
+}
+
+/// Apply an event-level rewrite across a buffered SSE body while preserving
+/// event order, non-data fields, separators, and LF/CRLF framing.
+fn rewrite_sse_events<'a>(
+    body: &'a str,
+    mut rewrite_event: impl FnMut(&[&'a str]) -> Option<String>,
+) -> (String, bool) {
+    let mut output = String::with_capacity(body.len());
+    let mut event_lines: Vec<&'a str> = Vec::new();
+    for line in body.split_inclusive('\n') {
+        event_lines.push(line);
+        let content = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        if content.is_empty() {
+            if let Some(rewritten) = rewrite_event(&event_lines) {
+                output.push_str(&rewritten);
+            } else {
+                for original in &event_lines {
+                    output.push_str(original);
+                }
+            }
+            event_lines.clear();
+        }
+    }
+    if !event_lines.is_empty() {
+        if let Some(rewritten) = rewrite_event(&event_lines) {
+            output.push_str(&rewritten);
+        } else {
+            for original in &event_lines {
+                output.push_str(original);
+            }
+        }
+    }
+
+    let modified = output != body;
+    (output, modified)
+}
+
+/// Return the byte offset immediately after a JSON string beginning at
+/// `start`. The containing payload has already passed `serde_json` parsing;
+/// `None` still fails the residual check closed rather than guessing at spans.
+fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut index = start + 1;
+    while let Some(byte) = bytes.get(index) {
+        match byte {
+            b'\\' => index = index.checked_add(2)?,
+            b'"' => return index.checked_add(1),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn skip_json_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while bytes
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        index += 1;
+    }
+    index
+}
+
+/// Return the byte offset immediately after one JSON value. The caller only
+/// asks for values in a payload already parsed by `serde_json`.
+fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start)? {
+        b'"' => json_string_end(bytes, start),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut index = start;
+            while let Some(byte) = bytes.get(index) {
+                match byte {
+                    b'"' => index = json_string_end(bytes, index)?,
+                    b'{' | b'[' => {
+                        depth = depth.checked_add(1)?;
+                        index += 1;
+                    }
+                    b'}' | b']' => {
+                        depth = depth.checked_sub(1)?;
+                        index += 1;
+                        if depth == 0 {
+                            return Some(index);
+                        }
+                    }
+                    _ => index += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut index = start;
+            while bytes.get(index).is_some_and(|byte| {
+                !matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | b',' | b'}' | b']')
+            }) {
+                index += 1;
+            }
+            (index > start).then_some(index)
+        }
+    }
+}
+
+/// Locate exact byte spans of string/number values held by structural keys in
+/// the root JSON object. Scanning the original serialization preserves
+/// duplicate members and contextual whitespace for the residual raw pass.
+fn top_level_structural_scalar_spans(
+    raw: &str,
+    json: &Value,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if !json.is_object() {
+        return Some(Vec::new());
+    }
+
+    let bytes = raw.as_bytes();
+    let mut index = skip_json_whitespace(bytes, 0);
+    if bytes.get(index) != Some(&b'{') {
+        return None;
+    }
+    index += 1;
+    let mut spans = Vec::new();
+
+    loop {
+        index = skip_json_whitespace(bytes, index);
+        if bytes.get(index) == Some(&b'}') {
+            break;
+        }
+
+        let key_start = index;
+        let key_end = json_string_end(bytes, key_start)?;
+        let raw_key = raw.get(key_start..key_end)?;
+        let key: Cow<'_, str> = if raw_key.as_bytes().contains(&b'\\') {
+            Cow::Owned(serde_json::from_str::<String>(raw_key).ok()?)
+        } else {
+            Cow::Borrowed(raw_key.get(1..raw_key.len().checked_sub(1)?)?)
+        };
+
+        index = skip_json_whitespace(bytes, key_end);
+        if bytes.get(index) != Some(&b':') {
+            return None;
+        }
+        index = skip_json_whitespace(bytes, index + 1);
+        let value_start = index;
+        let value_end = json_value_end(bytes, value_start)?;
+
+        if STRUCTURAL_KEYS.contains(&key.as_ref()) {
+            let raw_value = raw.get(value_start..value_end)?;
+            let value = serde_json::from_str::<Value>(raw_value).ok()?;
+            if value.is_string() || value.is_number() {
+                spans.push(value_start..value_end);
+            }
+        }
+
+        index = skip_json_whitespace(bytes, value_end);
+        match bytes.get(index) {
+            Some(b',') => index += 1,
+            Some(b'}') => break,
+            _ => return None,
+        }
+    }
+
+    Some(spans)
+}
+
+/// Mask top-level structural scalar bytes in one SSE event without otherwise
+/// changing its data fields, duplicate JSON members, whitespace, or framing.
+fn mask_sse_event_structural_scalars(lines: &[&str]) -> Result<Option<String>, ()> {
+    let mut fragments = vec![None; lines.len()];
+    let mut payloads = Vec::new();
+    let mut joined_len = 0usize;
+
+    for (line_index, line) in lines.iter().enumerate() {
+        let content = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        let payload_start = if content.starts_with("data: ") {
+            6
+        } else if content.starts_with("data:") {
+            5
+        } else {
+            continue;
+        };
+        let payload = content.get(payload_start..).ok_or(())?;
+        if !payloads.is_empty() {
+            joined_len = joined_len.checked_add(1).ok_or(())?;
+        }
+        fragments[line_index] = Some((payload_start, joined_len, payload.len()));
+        joined_len = joined_len.checked_add(payload.len()).ok_or(())?;
+        payloads.push(payload);
+    }
+
+    if payloads.is_empty() {
+        return Ok(None);
+    }
+    let joined = payloads.join("\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Ok(None);
+    }
+    let json = serde_json::from_str::<Value>(trimmed).map_err(|_| ())?;
+    let spans = top_level_structural_scalar_spans(&joined, &json).ok_or(())?;
+    if spans.is_empty() {
+        return Ok(None);
+    }
+
+    // One byte per joined payload byte, bounded by the already-enforced
+    // `max_scan_bytes`. Keeping a flat mask makes this O(body + spans), even
+    // for attacker-controlled events with many data lines or root members.
+    let mut mask = vec![false; joined.len()];
+    for span in spans {
+        let bytes = joined.as_bytes();
+        let (start, end) = if span.end > span.start + 1
+            && bytes.get(span.start) == Some(&b'"')
+            && bytes.get(span.end - 1) == Some(&b'"')
+        {
+            (span.start + 1, span.end - 1)
+        } else {
+            (span.start, span.end)
+        };
+        mask.get_mut(start..end).ok_or(())?.fill(true);
+    }
+
+    let mut output = String::with_capacity(lines.iter().map(|line| line.len()).sum());
+    for (line_index, line) in lines.iter().enumerate() {
+        let Some((payload_start, joined_start, payload_len)) = fragments[line_index] else {
+            output.push_str(line);
+            continue;
+        };
+        let mut bytes = line.as_bytes().to_vec();
+        for offset in 0..payload_len {
+            if mask.get(joined_start + offset).copied().ok_or(())? {
+                *bytes.get_mut(payload_start + offset).ok_or(())? = b' ';
+            }
+        }
+        output.push_str(std::str::from_utf8(&bytes).map_err(|_| ())?);
+    }
+    Ok(Some(output))
+}
+
+/// Mask structural scalar spans across a complete buffered SSE body. Any
+/// unexpected parse or offset failure returns `None` so enforcement fails
+/// closed instead of scanning an incomplete sanitized representation.
+fn mask_sse_top_level_structural_scalars(body: &str) -> Option<String> {
+    let mut failed = false;
+    let (output, _) = rewrite_sse_events(body, |lines| {
+        match mask_sse_event_structural_scalars(lines) {
+            Ok(rewritten) => rewritten,
+            Err(()) => {
+                failed = true;
+                None
+            }
+        }
+    });
+    (!failed).then_some(output)
 }
 
 /// Collect every decoded JSON token for `ScanMode::All` detection so the
@@ -1944,6 +2237,13 @@ fn collect_decoded_argument_tokens<'a>(json: &'a Value, texts: &mut Vec<Cow<'a, 
         for item in output {
             collect_argument_value(item.get("arguments"), texts);
         }
+    }
+    if json
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| event_type.ends_with("function_call_arguments.delta"))
+    {
+        collect_argument_value(json.get("delta"), texts);
     }
 }
 
