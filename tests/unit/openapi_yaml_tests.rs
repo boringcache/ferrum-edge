@@ -285,10 +285,11 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
                                   `jwks_auth`, and `oauth2_introspection`, a foreign \
                                   `Authorization` scheme is skipped; other mechanisms are not \
                                   covered by this guarantee.";
-    assert!(auth_mode.contains(scoped_scheme_contract));
-    assert!(auth_mode.contains("Any rejection returned by a plugin is terminal"));
-    assert!(auth_mode.contains("run sequentially until one succeeds"));
-    assert!(auth_mode.contains("server rejection takes precedence"));
+    let normalized_auth_mode = auth_mode.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized_auth_mode.contains(scoped_scheme_contract));
+    assert!(normalized_auth_mode.contains("Any rejection returned by a plugin is terminal"));
+    assert!(normalized_auth_mode.contains("run sequentially until one succeeds"));
+    assert!(normalized_auth_mode.contains("server rejection takes precedence"));
 
     let plugin_docs = include_str!("../../docs/plugins.md");
     assert!(plugin_docs.contains(scoped_scheme_contract));
