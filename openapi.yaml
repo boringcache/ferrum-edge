@@ -6470,8 +6470,11 @@ components:
       properties:
         key:
           type: string
+          minLength: 1
+          pattern: "\\S"
           description: >-
-            API key value. Must be globally unique across all consumers.
+            API key value. Must be non-empty after trimming and globally unique
+            across all consumers.
       description: "API key credential for the `key_auth` authentication plugin."
 
     BasicAuthCredential:
@@ -11678,12 +11681,25 @@ components:
 
     KeyAuthConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: key_auth — API key authentication."
       properties:
         key_location:
           type: string
           default: "header:X-API-Key"
-          description: "Where to find the key (header:<name> or query:<name>)"
+          pattern: "^(header:[!#$%&'*+.^_`|~0-9A-Za-z-]+|query:\\S+)$"
+          description: >-
+            Exact credential location (header:<name> or query:<name>).
+            Whitespace is not trimmed; header names must be valid HTTP tokens,
+            and query names must be non-empty and contain no whitespace.
+        hide_credentials:
+          type: boolean
+          default: true
+          description: >-
+            Remove the configured API-key header or query parameter before
+            forwarding an authenticated request upstream, including when
+            another mechanism wins a multi-auth chain. Disable only when a
+            legacy backend explicitly requires the reusable credential.
 
     BasicAuthConfig:
       type: object
@@ -13191,14 +13207,17 @@ components:
             - authorization
             - proxy-authorization
             - cookie
+            - api-key
             - x-api-key
+            - x-goog-api-key
             - x-auth-token
             - x-csrf-token
             - x-xsrf-token
             - x-forwarded-authorization
           description: >-
             Additional request headers to redact from `input.headers`. Built-in
-            sensitive headers are always redacted.
+            sensitive headers and active authentication credential headers are
+            always omitted.
         redact_query_keys:
           type: array
           items:

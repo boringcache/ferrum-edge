@@ -5,6 +5,31 @@ use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::Consumer;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 fn make_consumer(
     id: &str,
@@ -736,7 +761,13 @@ fn test_keyauth_collision_last_consumer_wins() {
     // Two consumers with the same API key — second overwrites first in HashMap
     let c1 = make_consumer("c1", "alice", Some("shared-key"), None);
     let c2 = make_consumer("c2", "bob", Some("shared-key"), None);
-    let index = ConsumerIndex::new(&[c1, c2]);
+    let writer = SharedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(writer.clone())
+        .finish();
+    let index = tracing::subscriber::with_default(subscriber, || ConsumerIndex::new(&[c1, c2]));
 
     let found = index.find_by_api_key("shared-key").unwrap();
     assert_eq!(found.id, "c2", "Last consumer with colliding key wins");
@@ -744,6 +775,13 @@ fn test_keyauth_collision_last_consumer_wins() {
     // Both consumers still present in the full list
     let all = index.consumers();
     assert_eq!(all.len(), 2);
+
+    let logs = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("consumer 'c2' overwrites consumer 'c1'"));
+    assert!(
+        !logs.contains("shared-key"),
+        "credential collision log leaked the reusable API key: {logs}"
+    );
 }
 
 #[test]

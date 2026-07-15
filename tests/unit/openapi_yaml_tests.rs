@@ -581,6 +581,50 @@ fn access_control_schema_matches_runtime_validation() {
 }
 
 #[test]
+fn key_auth_location_schema_matches_runtime_whitespace_contract() {
+    use ferrum_edge::plugins::key_auth::KeyAuth;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/KeyAuthConfig")
+        .expect("missing KeyAuthConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("KeyAuthConfig schema compiles");
+
+    for (key_location, expected_valid) in [
+        ("header:X-API-Key", true),
+        ("header:X-Tenant_Key~V2", true),
+        ("query:api_key", true),
+        ("query:tenant-key.v2", true),
+        (" header:X-API-Key", false),
+        ("header:X-API-Key ", false),
+        ("header: X-API-Key", false),
+        ("query: api_key", false),
+        ("query:api_key ", false),
+        ("query:   ", false),
+        ("query:tenant key", false),
+    ] {
+        let config = json!({"key_location": key_location});
+        let schema_valid = validator.validate(&config).is_ok();
+        let runtime_valid = KeyAuth::new(&config).is_ok();
+        assert_eq!(
+            schema_valid, expected_valid,
+            "unexpected OpenAPI result for {key_location:?}"
+        );
+        assert_eq!(
+            runtime_valid, expected_valid,
+            "unexpected runtime result for {key_location:?}"
+        );
+        assert_eq!(
+            schema_valid, runtime_valid,
+            "OpenAPI/runtime key_location drift for {key_location:?}"
+        );
+    }
+}
+
+#[test]
 fn ldap_auth_schema_matches_runtime_invariants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
