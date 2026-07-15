@@ -866,6 +866,41 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
+    let document = serde_json::json!({
+        "version": "1",
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [{
+            "id": "adaptive-limit-typo",
+            "plugin_name": "adaptive_concurrency",
+            "config": {"max_limt": 32},
+            "scope": "global",
+            "enabled": true
+        }]
+    });
+    let mut file = NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{document}").unwrap();
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file-mode load must reject unknown adaptive_concurrency keys");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("1 plugin config error(s)"),
+        "unexpected file-load error: {message}"
+    );
+    assert!(
+        message.contains("max_limt"),
+        "unexpected file-load error: {message}"
+    );
+}
+
+#[test]
 fn test_optional_fail_open_plugin_validation_is_non_fatal_in_file_mode() {
     let yaml = r#"
 version: "1"

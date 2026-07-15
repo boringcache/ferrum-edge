@@ -1,10 +1,12 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ferrum_edge::PluginCache;
 use ferrum_edge::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
 };
-use ferrum_edge::config::types::{Proxy, UpstreamTarget};
+use ferrum_edge::config::types::{GatewayConfig, Proxy, UpstreamTarget};
 use ferrum_edge::plugins::adaptive_concurrency::AdaptiveConcurrency;
 use ferrum_edge::plugins::{
     BackendAdmissionContext, BackendAdmissionDecision, BackendAdmissionOutcome,
@@ -64,6 +66,71 @@ fn target(host: &str, port: u16) -> UpstreamTarget {
         tags: Default::default(),
         locality: None,
         path: None,
+    }
+}
+
+fn cache_config(scope: &str, plugin_config: serde_json::Value) -> GatewayConfig {
+    let proxy_id = (scope == "proxy").then_some("proxy-1");
+    let proxy_plugins = if scope == "proxy" {
+        json!([{"plugin_config_id": "adaptive-1"}])
+    } else {
+        json!([])
+    };
+    serde_json::from_value(json!({
+        "version": "1",
+        "proxies": [{
+            "id": "proxy-1",
+            "namespace": "default",
+            "listen_path": "/",
+            "backend_host": "backend.local",
+            "backend_port": 8080,
+            "plugins": proxy_plugins
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "adaptive-1",
+            "namespace": "default",
+            "plugin_name": "adaptive_concurrency",
+            "scope": scope,
+            "proxy_id": proxy_id,
+            "enabled": true,
+            "config": plugin_config
+        }]
+    }))
+    .expect("adaptive cache config should deserialize")
+}
+
+fn acquire_from_cache(
+    cache: &PluginCache,
+    config: &GatewayConfig,
+) -> BackendAdmissionDecision {
+    let plugin = cache
+        .get_plugins("proxy-1")
+        .iter()
+        .find(|plugin| plugin.name() == "adaptive_concurrency")
+        .cloned()
+        .expect("adaptive plugin should be cached");
+    let ctx = RequestContext::new("192.0.2.10".to_string(), "GET".to_string(), "/".to_string());
+    let admission = BackendAdmissionContext {
+        proxy: &config.proxies[0],
+        upstream_target: None,
+        protocol: ProxyProtocol::Http,
+    };
+    plugin.try_backend_admission(&ctx, &admission)
+}
+
+fn expect_admitted(decision: BackendAdmissionDecision) -> Arc<dyn BackendAdmissionPermit> {
+    match decision {
+        BackendAdmissionDecision::Admit(permit) => permit,
+        _ => panic!("request should be admitted"),
+    }
+}
+
+fn assert_rejected(decision: BackendAdmissionDecision) {
+    match decision {
+        BackendAdmissionDecision::Reject { status_code, .. } => assert_eq!(status_code, 503),
+        _ => panic!("request should be rejected"),
     }
 }
 
@@ -543,4 +610,293 @@ fn adaptive_concurrency_upstream_scope_shares_limit_across_proxies() {
     assert_eq!(limiter.tracked_keys_count(), 1);
 
     drop(first);
+}
+
+#[test]
+fn adaptive_concurrency_rejects_every_unknown_policy_key() {
+    for unknown in [
+        "key_byy",
+        "max_tracked_key",
+        "min_limt",
+        "initial_limt",
+        "max_limt",
+        "min_sample",
+        "target_latency_multipler",
+        "decrease_raio",
+        "increase_setp",
+        "shadow_mod",
+        "expose_header",
+    ] {
+        let mut config = serde_json::Map::new();
+        config.insert(unknown.to_string(), json!(1));
+        let error = AdaptiveConcurrency::new(
+            &serde_json::Value::Object(config),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("unknown adaptive policy key must be rejected");
+        assert!(
+            error.contains(unknown),
+            "unexpected validation error: {error}"
+        );
+        assert!(
+            error.contains("allowed keys"),
+            "unexpected validation error: {error}"
+        );
+    }
+}
+
+#[test]
+fn adaptive_concurrency_old_cohort_cannot_undo_failure_decrease() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = Arc::new(AdaptiveConcurrencyConfig {
+        key_by: AdaptiveConcurrencyKeyBy::Proxy,
+        max_tracked_keys: 10_000,
+        min_limit: 1,
+        initial_limit: 100,
+        max_limit: 100,
+        min_samples: 1,
+        target_latency_multiplier: 1.5,
+        decrease_ratio: 0.8,
+        increase_step: 10,
+        shadow_mode: false,
+        expose_headers: false,
+    });
+    let mut old_cohort = Vec::new();
+    for _ in 0..100 {
+        old_cohort.push(
+            limiter
+                .try_acquire(&proxy, None, Arc::clone(&config))
+                .expect("the initial cohort should fill the limit"),
+        );
+    }
+
+    // A healthy completion ordered before the failure may observe saturation,
+    // but cannot grow past max_limit. The following failure is the backoff
+    // linearization point for every still-live member of this cohort.
+    old_cohort[0].record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 200,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(1),
+    });
+    old_cohort[1].record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 503,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(1),
+    });
+    for permit in &old_cohort[2..12] {
+        permit.record_backend_outcome(BackendAdmissionOutcome {
+            response_status: 200,
+            connection_error: false,
+            error_class: None,
+            backend_elapsed: Duration::from_millis(1),
+        });
+    }
+
+    let snapshot = limiter
+        .snapshot(&proxy, None, AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("cohort state should exist");
+    assert_eq!(snapshot.limit, 80);
+
+    drop(old_cohort);
+    let mut recovery_cohort = Vec::new();
+    for _ in 0..80 {
+        recovery_cohort.push(
+            limiter
+                .try_acquire(&proxy, None, Arc::clone(&config))
+                .expect("the reduced limit should admit a new cohort"),
+        );
+    }
+    recovery_cohort[0].record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 200,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(1),
+    });
+    let snapshot = limiter
+        .snapshot(&proxy, None, AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("recovery state should exist");
+    assert_eq!(snapshot.limit, 90);
+}
+
+#[test]
+fn adaptive_concurrency_incremental_reload_keeps_streaming_permit_accounted() {
+    let config = cache_config(
+        "proxy",
+        json!({"min_limit": 1, "initial_limit": 1, "max_limit": 1}),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let held = expect_admitted(acquire_from_cache(&cache, &config));
+    held.record_backend_outcome_holding(BackendAdmissionOutcome {
+        response_status: 101,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(1),
+    });
+
+    let mut reloaded = config.clone();
+    reloaded.proxies[0].name = Some("unrelated proxy rename".to_string());
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from(["proxy-1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("unrelated proxy reload should rebuild the plugin list");
+
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    drop(held);
+    let released = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    drop(released);
+}
+
+#[test]
+fn adaptive_concurrency_global_rebuild_keeps_old_session_accounted() {
+    let config = cache_config(
+        "global",
+        json!({"min_limit": 1, "initial_limit": 1, "max_limit": 1}),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let held = expect_admitted(acquire_from_cache(&cache, &config));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "logging-1",
+            "namespace": "default",
+            "plugin_name": "stdout_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": {}
+        }))
+        .expect("sibling global plugin should deserialize"),
+    );
+    cache
+        .apply_delta(&reloaded, &HashSet::new(), &[], true)
+        .expect("global plugin generation should rebuild");
+
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    drop(held);
+    let released = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    drop(released);
+}
+
+#[test]
+fn adaptive_concurrency_structural_config_change_drains_old_key_space() {
+    let config = cache_config(
+        "proxy",
+        json!({
+            "key_by": "proxy_target",
+            "min_limit": 1,
+            "initial_limit": 2,
+            "max_limit": 2,
+            "shadow_mode": true
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let held = expect_admitted(acquire_from_cache(&cache, &config));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[0].config["key_by"] = json!("backend_target");
+    cache
+        .rebuild(&reloaded)
+        .expect("valid key-space change should publish");
+
+    // Structural transitions fail closed even in shadow mode: admitting under
+    // the replacement key space would otherwise omit this older live permit.
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    drop(held);
+    let new_generation = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    drop(new_generation);
+}
+
+#[test]
+fn adaptive_concurrency_limit_change_counts_and_clamps_old_permits() {
+    let config = cache_config(
+        "proxy",
+        json!({"min_limit": 1, "initial_limit": 2, "max_limit": 2}),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let first = expect_admitted(acquire_from_cache(&cache, &config));
+    let second = expect_admitted(acquire_from_cache(&cache, &config));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[0].config =
+        json!({"min_limit": 1, "initial_limit": 1, "max_limit": 1});
+    cache
+        .rebuild(&reloaded)
+        .expect("valid limit decrease should publish");
+
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    drop(first);
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    drop(second);
+    let replacement = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    drop(replacement);
+}
+
+#[test]
+fn adaptive_concurrency_stale_generation_feedback_cannot_mutate_new_bounds() {
+    let config = cache_config(
+        "proxy",
+        json!({
+            "min_limit": 1,
+            "initial_limit": 4,
+            "max_limit": 4,
+            "decrease_ratio": 0.5
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let old_generation = expect_admitted(acquire_from_cache(&cache, &config));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[0].config = json!({
+        "min_limit": 4,
+        "initial_limit": 4,
+        "max_limit": 4,
+        "decrease_ratio": 0.5
+    });
+    cache
+        .rebuild(&reloaded)
+        .expect("valid bounds change should publish");
+    old_generation.record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 503,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(1),
+    });
+
+    let mut new_generation = Vec::new();
+    for _ in 0..3 {
+        new_generation.push(expect_admitted(acquire_from_cache(&cache, &reloaded)));
+    }
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    drop(old_generation);
+    drop(new_generation);
+}
+
+#[test]
+fn adaptive_concurrency_invalid_reload_preserves_last_good_state() {
+    let config = cache_config(
+        "proxy",
+        json!({"min_limit": 1, "initial_limit": 1, "max_limit": 1}),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let held = expect_admitted(acquire_from_cache(&cache, &config));
+
+    let mut invalid = config.clone();
+    invalid.plugin_configs[0].config["max_limt"] = json!(8);
+    let error = cache
+        .rebuild(&invalid)
+        .expect_err("unknown adaptive key must reject reload");
+    assert!(error.contains("max_limt"), "unexpected reload error: {error}");
+
+    assert_rejected(acquire_from_cache(&cache, &config));
+    drop(held);
+    let released = expect_admitted(acquire_from_cache(&cache, &config));
+    drop(released);
 }

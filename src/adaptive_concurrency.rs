@@ -2,12 +2,12 @@
 //!
 //! The limiter answers one question on the backend dispatch path: is the
 //! selected destination currently healthy enough to accept one more in-flight
-//! request? It is intentionally plugin-owned so proxy, proxy-group, and global
-//! plugin scopes control how state is shared.
+//! request? Proxy, proxy-group, and global plugin scopes control how state is
+//! shared, and compatible cache generations reuse that state across reloads.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
@@ -20,6 +20,9 @@ use crate::plugins::{BackendAdmissionOutcome, BackendAdmissionPermit};
 const EWMA_PREVIOUS_WEIGHT: u64 = 8;
 const EWMA_SAMPLE_WEIGHT: u64 = 2;
 const EWMA_WEIGHT_SUM: u64 = EWMA_PREVIOUS_WEIGHT + EWMA_SAMPLE_WEIGHT;
+const POLICY_ACTIVE: u8 = 0;
+const POLICY_DRAINING: u8 = 1;
+const POLICY_RESETTING: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdaptiveConcurrencyKeyBy {
@@ -77,6 +80,10 @@ impl Hash for AdaptiveConcurrencyKey {
 struct AdaptiveConcurrencyState {
     in_flight: CachePadded<AtomicU64>,
     limit: CachePadded<AtomicU64>,
+    /// Recovery cohort. A decrease advances this epoch so requests admitted
+    /// before the decrease cannot use their later successes to immediately
+    /// restore the old limit.
+    feedback_epoch: AtomicU64,
     baseline_latency_us: AtomicU64,
     latency_ewma_us: AtomicU64,
     samples: AtomicU64,
@@ -88,11 +95,51 @@ impl AdaptiveConcurrencyState {
         Self {
             in_flight: CachePadded::new(AtomicU64::new(0)),
             limit: CachePadded::new(AtomicU64::new(initial_limit)),
+            feedback_epoch: AtomicU64::new(1),
             baseline_latency_us: AtomicU64::new(0),
             latency_ewma_us: AtomicU64::new(0),
             samples: AtomicU64::new(0),
             rejections: AtomicU64::new(0),
         }
+    }
+}
+
+struct AdaptiveConcurrencyPolicyLifecycle {
+    /// Plugin-cache generation currently authorized to admit and train.
+    active_generation: AtomicU64,
+    /// Permits across every target key. This is used only as a cold-generation
+    /// transition barrier; ordinary admission remains target-local.
+    total_in_flight: AtomicU64,
+    /// Feedback callbacks that linearized under the active generation. Reload
+    /// waits for this short synchronous critical section before clamping and
+    /// publishing replacement policy bounds.
+    feedback_in_progress: AtomicU64,
+    /// Structural policy changes (scope or `key_by`) drain older permits and
+    /// exclusively reset the retired target-key space before admitting under
+    /// the replacement definition.
+    transition_state: AtomicU8,
+}
+
+impl AdaptiveConcurrencyPolicyLifecycle {
+    fn new() -> Self {
+        Self {
+            active_generation: AtomicU64::new(1),
+            total_in_flight: AtomicU64::new(0),
+            feedback_in_progress: AtomicU64::new(0),
+            transition_state: AtomicU8::new(POLICY_ACTIVE),
+        }
+    }
+}
+
+struct AdaptiveConcurrencyFeedbackGuard<'a> {
+    policy: &'a AdaptiveConcurrencyPolicyLifecycle,
+}
+
+impl Drop for AdaptiveConcurrencyFeedbackGuard<'_> {
+    fn drop(&mut self) {
+        self.policy
+            .feedback_in_progress
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -106,6 +153,7 @@ pub struct AdaptiveConcurrencyLimiter {
     /// Shared scope for `key_by = backend_target` (a single constant string).
     backend_scope: Arc<str>,
     tracked_keys: AtomicUsize,
+    policy: Arc<AdaptiveConcurrencyPolicyLifecycle>,
 }
 
 impl AdaptiveConcurrencyLimiter {
@@ -119,6 +167,7 @@ impl AdaptiveConcurrencyLimiter {
             scope_cache: DashMap::with_shard_amount(shards),
             backend_scope: Arc::from("backend"),
             tracked_keys: AtomicUsize::new(0),
+            policy: Arc::new(AdaptiveConcurrencyPolicyLifecycle::new()),
         }
     }
 
@@ -132,6 +181,18 @@ impl AdaptiveConcurrencyLimiter {
         target: Option<&UpstreamTarget>,
         config: Arc<AdaptiveConcurrencyConfig>,
     ) -> Result<Arc<AdaptiveConcurrencyPermit>, AdaptiveConcurrencyLimitExceeded> {
+        let generation = self.policy.active_generation.load(Ordering::Acquire);
+        self.try_acquire_for_generation(proxy, target, config, generation)
+    }
+
+    pub(crate) fn try_acquire_for_generation(
+        &self,
+        proxy: &Proxy,
+        target: Option<&UpstreamTarget>,
+        config: Arc<AdaptiveConcurrencyConfig>,
+        generation: u64,
+    ) -> Result<Arc<AdaptiveConcurrencyPermit>, AdaptiveConcurrencyLimitExceeded> {
+        self.reserve_policy_slot(generation, &config)?;
         let key = build_key(self.resolve_scope(proxy, config.key_by), proxy, target);
         let state = match self.inner.entry(key) {
             Entry::Occupied(entry) => Arc::clone(entry.get()),
@@ -149,9 +210,9 @@ impl AdaptiveConcurrencyLimiter {
                     // blanket 503), and `shadow_mode` must never reject at all.
                     // This state is NOT inserted into the map (memory stays
                     // bounded) and dies with the permit, so overflow targets run
-                    // without adaptive limiting until churn frees a tracked slot
-                    // or a reload rebuilds the plugin. Starting at `in_flight = 0`
-                    // it always admits the request below.
+                    // without adaptive limiting until the policy is removed and
+                    // recreated (or a structural key-space change resets it).
+                    // Starting at `in_flight = 0` it always admits below.
                     drop(entry);
                     Arc::new(AdaptiveConcurrencyState::new(config.initial_limit))
                 }
@@ -163,6 +224,7 @@ impl AdaptiveConcurrencyLimiter {
             let limit = state.limit.load(Ordering::Acquire);
             if current >= limit && !config.shadow_mode {
                 state.rejections.fetch_add(1, Ordering::Relaxed);
+                self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
                 return Err(AdaptiveConcurrencyLimitExceeded {
                     current_in_flight: current,
                     limit,
@@ -176,14 +238,156 @@ impl AdaptiveConcurrencyLimiter {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    // A cache activation may race this cold target lookup/CAS.
+                    // Roll back instead of returning a permit owned by a
+                    // retired policy generation or crossing a structural
+                    // generation drain barrier.
+                    if self.policy.active_generation.load(Ordering::Acquire) != generation
+                        || self.policy.transition_state.load(Ordering::Acquire) != POLICY_ACTIVE
+                    {
+                        state.in_flight.fetch_sub(1, Ordering::AcqRel);
+                        self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
+                        return Err(self.policy_transition_rejection(&config));
+                    }
+                    let feedback_epoch = state.feedback_epoch.load(Ordering::Acquire);
                     return Ok(Arc::new(AdaptiveConcurrencyPermit {
                         state,
                         config,
+                        policy: Arc::clone(&self.policy),
+                        policy_generation: generation,
+                        feedback_epoch,
                         recorded: AtomicBool::new(false),
                     }));
                 }
                 Err(_) => continue,
             }
+        }
+    }
+
+    fn reserve_policy_slot(
+        &self,
+        generation: u64,
+        config: &AdaptiveConcurrencyConfig,
+    ) -> Result<(), AdaptiveConcurrencyLimitExceeded> {
+        loop {
+            if self.policy.active_generation.load(Ordering::Acquire) != generation {
+                return Err(self.policy_transition_rejection(config));
+            }
+
+            match self.policy.transition_state.load(Ordering::Acquire) {
+                POLICY_ACTIVE => {}
+                POLICY_DRAINING => {
+                    if self.policy.total_in_flight.load(Ordering::Acquire) != 0 {
+                        return Err(self.policy_transition_rejection(config));
+                    }
+                    if self
+                        .policy
+                        .transition_state
+                        .compare_exchange(
+                            POLICY_DRAINING,
+                            POLICY_RESETTING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    // No permit from either generation exists once the total
+                    // reaches zero. Clear the retired key space before making
+                    // the replacement policy visible to competing acquirers.
+                    self.inner.clear();
+                    self.scope_cache.clear();
+                    self.tracked_keys.store(0, Ordering::Release);
+                    if self
+                        .policy
+                        .transition_state
+                        .compare_exchange(
+                            POLICY_RESETTING,
+                            POLICY_ACTIVE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        // A newer structural generation requested another
+                        // drain while this reset was running.
+                        continue;
+                    }
+                }
+                _ => return Err(self.policy_transition_rejection(config)),
+            }
+
+            self.policy.total_in_flight.fetch_add(1, Ordering::AcqRel);
+            if self.policy.active_generation.load(Ordering::Acquire) == generation
+                && self.policy.transition_state.load(Ordering::Acquire) == POLICY_ACTIVE
+            {
+                return Ok(());
+            }
+            self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn policy_transition_rejection(
+        &self,
+        config: &AdaptiveConcurrencyConfig,
+    ) -> AdaptiveConcurrencyLimitExceeded {
+        AdaptiveConcurrencyLimitExceeded {
+            current_in_flight: self.policy.total_in_flight.load(Ordering::Acquire),
+            limit: config.min_limit,
+        }
+    }
+
+    /// Activate a fully validated plugin-cache generation. This runs on the
+    /// cold reload path immediately before the cache snapshot is published.
+    pub(crate) fn activate_policy_generation(
+        &self,
+        generation: u64,
+        config: &AdaptiveConcurrencyConfig,
+        drain_older_generation: bool,
+    ) {
+        let mut current = self.policy.active_generation.load(Ordering::Acquire);
+        loop {
+            if generation <= current {
+                return;
+            }
+            match self.policy.active_generation.compare_exchange(
+                current,
+                generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+
+        // Retire the old admission generation first. Plugin-cache publication
+        // happens only after this method returns, so the replacement cannot
+        // admit before its structural drain barrier is installed.
+        if drain_older_generation {
+            self.policy
+                .transition_state
+                .store(POLICY_DRAINING, Ordering::Release);
+        }
+
+        // A callback that acquired its guard before the generation CAS is
+        // ordered before this activation. Later callbacks fail their second
+        // generation check and cannot mutate stale sampling or limit state.
+        let mut spins = 0_u8;
+        while self.policy.feedback_in_progress.load(Ordering::Acquire) != 0 {
+            if spins < 64 {
+                std::hint::spin_loop();
+                spins = spins.saturating_add(1);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+
+        // Learned state and in-flight accounting survive compatible config
+        // changes, but the replacement bounds become authoritative at commit.
+        for entry in &self.inner {
+            clamp_limit(&entry.value().limit, config.min_limit, config.max_limit);
         }
     }
 
@@ -287,10 +491,31 @@ pub struct AdaptiveConcurrencyLimitExceeded {
 pub struct AdaptiveConcurrencyPermit {
     state: Arc<AdaptiveConcurrencyState>,
     config: Arc<AdaptiveConcurrencyConfig>,
+    policy: Arc<AdaptiveConcurrencyPolicyLifecycle>,
+    policy_generation: u64,
+    feedback_epoch: u64,
     recorded: AtomicBool,
 }
 
 impl AdaptiveConcurrencyPermit {
+    fn begin_feedback(&self) -> Option<AdaptiveConcurrencyFeedbackGuard<'_>> {
+        if self.policy.active_generation.load(Ordering::Acquire) != self.policy_generation {
+            return None;
+        }
+        self.policy
+            .feedback_in_progress
+            .fetch_add(1, Ordering::AcqRel);
+        if self.policy.active_generation.load(Ordering::Acquire) != self.policy_generation {
+            self.policy
+                .feedback_in_progress
+                .fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(AdaptiveConcurrencyFeedbackGuard {
+            policy: self.policy.as_ref(),
+        })
+    }
+
     /// Feed one healthy backend sample into the limiter.
     ///
     /// `backend_elapsed` is the dispatch-relative backend latency. For buffered
@@ -326,9 +551,14 @@ impl AdaptiveConcurrencyPermit {
         let current_limit = self.state.limit.load(Ordering::Acquire);
         let current_in_flight = self.state.in_flight.load(Ordering::Acquire);
         if ewma > target_latency {
-            decrease_limit(&self.state.limit, &self.config);
+            invalidate_recovery_cohort_and_decrease(&self.state, &self.config);
         } else if allow_increase && current_in_flight >= current_limit {
-            increase_limit(&self.state.limit, &self.config);
+            increase_limit_for_epoch(
+                &self.state.limit,
+                &self.state.feedback_epoch,
+                self.feedback_epoch,
+                &self.config,
+            );
         }
     }
 
@@ -341,6 +571,13 @@ impl AdaptiveConcurrencyPermit {
         if self.recorded.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Config changes publish a new feedback generation. Retired permits
+        // still release their shared in-flight slots on Drop, but must not
+        // train the replacement policy with stale bounds or sampling controls.
+        // The guard makes this check coherent with concurrent activation.
+        let Some(_feedback_guard) = self.begin_feedback() else {
+            return;
+        };
         // Client-/gateway-side outcomes do not reflect backend health: release
         // the slot without feeding a latency, growth, or shrink signal. An
         // oversized *client* upload surfaces as a gateway 413
@@ -369,7 +606,7 @@ impl AdaptiveConcurrencyPermit {
                 outcome.error_class,
             )
         {
-            decrease_limit(&self.state.limit, &self.config);
+            invalidate_recovery_cohort_and_decrease(&self.state, &self.config);
             return;
         }
         self.record_success_latency(outcome.backend_elapsed, allow_increase);
@@ -389,6 +626,7 @@ impl BackendAdmissionPermit for AdaptiveConcurrencyPermit {
 impl Drop for AdaptiveConcurrencyPermit {
     fn drop(&mut self) {
         self.state.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -473,6 +711,17 @@ fn update_ewma(atomic: &AtomicU64, sample: u64) -> u64 {
     }
 }
 
+fn invalidate_recovery_cohort_and_decrease(
+    state: &AdaptiveConcurrencyState,
+    config: &AdaptiveConcurrencyConfig,
+) {
+    // This increment is the recovery-ordering linearization point. A success
+    // racing before it may grow first and is then decreased; a success racing
+    // after it cannot pass `increase_limit_for_epoch` with its stale epoch.
+    state.feedback_epoch.fetch_add(1, Ordering::AcqRel);
+    decrease_limit(&state.limit, config);
+}
+
 fn decrease_limit(limit: &AtomicU64, config: &AdaptiveConcurrencyConfig) {
     let mut current = limit.load(Ordering::Acquire);
     loop {
@@ -488,9 +737,17 @@ fn decrease_limit(limit: &AtomicU64, config: &AdaptiveConcurrencyConfig) {
     }
 }
 
-fn increase_limit(limit: &AtomicU64, config: &AdaptiveConcurrencyConfig) {
+fn increase_limit_for_epoch(
+    limit: &AtomicU64,
+    feedback_epoch: &AtomicU64,
+    expected_epoch: u64,
+    config: &AdaptiveConcurrencyConfig,
+) {
     let mut current = limit.load(Ordering::Acquire);
     loop {
+        if feedback_epoch.load(Ordering::Acquire) != expected_epoch {
+            return;
+        }
         if current >= config.max_limit {
             return;
         }
@@ -498,6 +755,20 @@ fn increase_limit(limit: &AtomicU64, config: &AdaptiveConcurrencyConfig) {
             .saturating_add(config.increase_step)
             .max(config.min_limit)
             .min(config.max_limit);
+        if next == current {
+            return;
+        }
+        match limit.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn clamp_limit(limit: &AtomicU64, min_limit: u64, max_limit: u64) {
+    let mut current = limit.load(Ordering::Acquire);
+    loop {
+        let next = current.max(min_limit).min(max_limit);
         if next == current {
             return;
         }

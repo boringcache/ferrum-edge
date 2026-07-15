@@ -703,6 +703,12 @@ impl RequestEpochStore {
                 current.lb_generation
             },
         });
+        // Adaptive policies share in-flight state across plugin-cache
+        // generations. Activate the staged policy generations before the one
+        // request-epoch store so no request can observe a published plugin
+        // generation whose limiter still authorizes stale admission/feedback.
+        next.plugin_cache
+            .activate_adaptive_concurrency_generations();
         self.current.store(Arc::clone(&next));
         // Compatibility wrapper caches are mirrored while the epoch writer lock
         // is still held so service discovery and config reloads cannot publish

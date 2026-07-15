@@ -1778,6 +1778,29 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_unknown_adaptive_concurrency_policy_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let plugin = json!({
+        "id": "adaptive-limit-typo",
+        "plugin_name": "adaptive_concurrency",
+        "scope": "global",
+        "enabled": true,
+        "config": {"max_limt": 32}
+    });
+
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+    assert_eq!(status, 400, "unknown adaptive key was admitted: {body}");
+    assert!(
+        body.to_string()
+            .contains("adaptive_concurrency: unknown config key 'max_limt'"),
+        "unexpected admin validation response: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_batch_create_proxy_and_proxy_plugin_association_same_request() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

@@ -1681,6 +1681,28 @@ fn jwt_auth_schema_rejects_unknown_config_keys() {
 }
 
 #[test]
+fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AdaptiveConcurrencyConfig")
+        .expect("missing AdaptiveConcurrencyConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AdaptiveConcurrencyConfig schema compiles");
+
+    assert!(
+        validator
+            .validate(&json!({"key_by": "backend_target", "max_limit": 32}))
+            .is_ok()
+    );
+    assert!(
+        validator.validate(&json!({"max_limt": 32})).is_err(),
+        "schema must reject unknown adaptive_concurrency policy keys"
+    );
+}
+
+#[test]
 fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 
