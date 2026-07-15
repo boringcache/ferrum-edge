@@ -4445,8 +4445,7 @@ async fn test_consumer_put_preserves_basic_credentials_omitted_from_get_response
     .await;
     assert_eq!(status, 200, "Round-trip update failed: {:?}", body);
 
-    let (status, backup, _) =
-        admin_get(&base_url, "/backup?resources=consumers", &token).await;
+    let (status, backup, _) = admin_get(&base_url, "/backup?resources=consumers", &token).await;
     assert_eq!(status, 200);
     let stored = backup["consumers"]
         .as_array()
