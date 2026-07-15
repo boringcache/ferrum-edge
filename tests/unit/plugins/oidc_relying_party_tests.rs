@@ -75,10 +75,7 @@ fn session_ctx(set_cookie: &str) -> RequestContext {
     ctx
 }
 
-async fn rolling_cookie(
-    plugin: &OidcRelyingParty,
-    ctx: &mut RequestContext,
-) -> Option<String> {
+async fn rolling_cookie(plugin: &OidcRelyingParty, ctx: &mut RequestContext) -> Option<String> {
     let mut response_headers = HashMap::new();
     assert_continue(plugin.after_proxy(ctx, 200, &mut response_headers).await);
     response_headers.remove("set-cookie")
@@ -120,7 +117,11 @@ async fn principal_less_refresh_due_session_does_not_refresh_or_slide() {
     .expect("session seals");
     let mut ctx = session_ctx(&cookie);
 
-    assert_continue(plugin.authenticate(&mut ctx, &ConsumerIndex::new(&[])).await);
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
     assert!(ctx.authenticated_identity.is_none());
     assert!(rolling_cookie(&plugin, &mut ctx).await.is_none());
     assert_eq!(server.received_requests().await.expect("requests").len(), 0);
@@ -187,8 +188,7 @@ async fn multi_auth_supersession_discards_oidc_reject_without_refresh_state() {
     let mut config = refresh_config(&format!("{}/token", server.uri()));
     config["providers"][0]["required_scopes"] = json!(["admin"]);
     let oidc = Arc::new(
-        OidcRelyingParty::new(&config, PluginHttpClient::default())
-            .expect("valid refresh config"),
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config"),
     );
     let key_auth: Arc<dyn Plugin> =
         Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
@@ -259,12 +259,16 @@ async fn accepted_oidc_refresh_commits_rotated_token_once() {
     .expect("session seals");
     let mut ctx = session_ctx(&cookie);
 
-    assert_continue(plugin.authenticate(&mut ctx, &ConsumerIndex::new(&[])).await);
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
     let rolled = rolling_cookie(&plugin, &mut ctx)
         .await
         .expect("accepted refresh must emit its rolling cookie");
-    let payload = oidc_open_session_cookie_for_test(&plugin, &rolled)
-        .expect("rolling cookie opens");
+    let payload =
+        oidc_open_session_cookie_for_test(&plugin, &rolled).expect("rolling cookie opens");
     assert_eq!(payload["refresh_token_b64"], json!("rotated-refresh-token"));
     assert_eq!(payload["access_token_b64"], json!("new-access-token"));
 
@@ -307,13 +311,21 @@ async fn accepted_refresh_failure_commits_backoff_and_avoids_retry_storm() {
     .expect("session seals");
     let mut ctx = session_ctx(&cookie);
 
-    assert_continue(plugin.authenticate(&mut ctx, &ConsumerIndex::new(&[])).await);
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
     let backed_off = rolling_cookie(&plugin, &mut ctx)
         .await
         .expect("refresh failure must emit its backoff cookie");
-    let payload = oidc_open_session_cookie_for_test(&plugin, &backed_off)
-        .expect("backoff cookie opens");
-    assert!(payload["refresh_after_unix"].as_i64().is_some_and(|next| next > now));
+    let payload =
+        oidc_open_session_cookie_for_test(&plugin, &backed_off).expect("backoff cookie opens");
+    assert!(
+        payload["refresh_after_unix"]
+            .as_i64()
+            .is_some_and(|next| next > now)
+    );
 
     let mut repeated = session_ctx(&backed_off);
     assert_continue(

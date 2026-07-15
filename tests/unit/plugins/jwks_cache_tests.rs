@@ -245,10 +245,7 @@ async fn discarded_candidate_uses_bounded_reaper_for_active_shared_store() {
     clear_jwks_cache();
 
     let active_store = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
-    retain_active_requirements(&HashMap::from([(
-        uri.clone(),
-        Duration::from_secs(300),
-    )]));
+    retain_active_requirements(&HashMap::from([(uri.clone(), Duration::from_secs(300))]));
     assert_eq!(cached_reaper_generation(&uri), Some(0));
 
     let discarded = jwks_discovery_candidate_for_test(&uri, client(), Duration::from_secs(300));
