@@ -1670,10 +1670,9 @@ async fn test_websocket_backend_admission_reject_strips_transport_policy_fields(
         .as_str()
         .into_client_request()
         .expect("valid second WebSocket request");
-    second_request.headers_mut().insert(
-        "x-ws-reject-order",
-        "later-response-hook".parse().unwrap(),
-    );
+    second_request
+        .headers_mut()
+        .insert("x-ws-reject-order", "later-response-hook".parse().unwrap());
     let second = tokio_tungstenite::connect_async(second_request).await;
     match second {
         Err(WsError::Http(response)) => {

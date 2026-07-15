@@ -13785,14 +13785,15 @@ fn build_translated_grpc_web_error_response(
     message: &str,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Option<Response<ProxyBody>> {
-    let mut translated =
-        crate::plugins::grpc_web::translated_error_response(ctx, status, message)?;
+    let mut translated = crate::plugins::grpc_web::translated_error_response(ctx, status, message)?;
     finalize_grpc_web_error_response_headers(
         &mut translated,
         initial_response_header_policy_plugins,
         None,
     );
-    Some(build_grpc_web_error_response_from_parts(translated, status, message))
+    Some(build_grpc_web_error_response_from_parts(
+        translated, status, message,
+    ))
 }
 
 /// Build a gateway-generated gRPC-Web error at the client-visible boundary.
@@ -13875,10 +13876,9 @@ fn finalize_grpc_web_error_response_headers(
         response.headers.insert("x-grpc-web".to_string(), grpc_web);
     }
     if let Some(expose_headers) = expose_headers {
-        response.headers.insert(
-            "access-control-expose-headers".to_string(),
-            expose_headers,
-        );
+        response
+            .headers
+            .insert("access-control-expose-headers".to_string(), expose_headers);
     }
     response.headers.insert(
         "content-length".to_string(),
@@ -14979,10 +14979,7 @@ async fn handle_proxy_request_inner(
             let policy_plugins = epoch
                 .plugin_cache
                 .get_initial_response_header_policy_plugins(&proxy.id, ProxyProtocol::WebSocket);
-            finalize_websocket_response_headers(
-                policy_plugins.as_ref(),
-                &mut reject_headers,
-            );
+            finalize_websocket_response_headers(policy_plugins.as_ref(), &mut reject_headers);
         }
         let reject = normalize_reject_response(
             StatusCode::METHOD_NOT_ALLOWED,
