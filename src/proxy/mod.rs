@@ -2214,12 +2214,28 @@ enum RequestBodyBufferError {
     TooLarge,
     ClientDisconnected(String),
     TimedOut,
+    DeadlineExceeded,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RequestBodyWaitError {
+    TimedOut,
+    DeadlineExceeded,
+}
+
+impl From<RequestBodyWaitError> for RequestBodyBufferError {
+    fn from(error: RequestBodyWaitError) -> Self {
+        match error {
+            RequestBodyWaitError::TimedOut => Self::TimedOut,
+            RequestBodyWaitError::DeadlineExceeded => Self::DeadlineExceeded,
+        }
+    }
 }
 
 async fn collect_request_body_with_timeout<F, T, E>(
     collect: F,
     request_body_read_timeout_ms: u64,
-) -> Result<Result<T, E>, RequestBodyBufferError>
+) -> Result<Result<T, E>, RequestBodyWaitError>
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
@@ -2229,21 +2245,37 @@ where
 
     tokio::time::timeout(Duration::from_millis(request_body_read_timeout_ms), collect)
         .await
-        .map_err(|_| RequestBodyBufferError::TimedOut)
+        .map_err(|_| RequestBodyWaitError::TimedOut)
 }
 
 async fn collect_request_body_with_deadline<F, T, E>(
     collect: F,
     deadline: Option<tokio::time::Instant>,
     request_body_read_timeout_ms: u64,
-) -> Result<Result<T, E>, RequestBodyBufferError>
+) -> Result<Result<T, E>, RequestBodyWaitError>
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
     if let Some(deadline) = deadline {
-        return tokio::time::timeout_at(deadline, collect)
+        // The RPC deadline is an end-to-end ceiling, while the configured
+        // read timeout remains the operator's client-upload stall guard. Keep
+        // both by waiting only until the earlier instant; a very large
+        // grpc-timeout must not disable the operator bound.
+        let (effective_deadline, timeout_error) = if request_body_read_timeout_ms > 0 {
+            match tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(request_body_read_timeout_ms))
+            {
+                Some(read_deadline) if read_deadline < deadline => {
+                    (read_deadline, RequestBodyWaitError::TimedOut)
+                }
+                _ => (deadline, RequestBodyWaitError::DeadlineExceeded),
+            }
+        } else {
+            (deadline, RequestBodyWaitError::DeadlineExceeded)
+        };
+        return tokio::time::timeout_at(effective_deadline, collect)
             .await
-            .map_err(|_| RequestBodyBufferError::TimedOut);
+            .map_err(|_| timeout_error);
     }
     collect_request_body_with_timeout(collect, request_body_read_timeout_ms).await
 }
@@ -13892,14 +13924,16 @@ async fn handle_backend_admission_rejection(
     let grpc_web_response = if let (Some(content_type), Some(grpc_status)) =
         (grpc_web_error_content_type, reject.grpc_status)
     {
-        let message = reject
+        let mut grpc_status = grpc_status;
+        let mut message = reject
             .grpc_message
             .as_deref()
-            .unwrap_or_else(|| grpc_status_reason(grpc_status));
-        let translated = crate::plugins::grpc_web::error_response_for_content_type(
+            .unwrap_or_else(|| grpc_status_reason(grpc_status))
+            .to_string();
+        let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
             grpc_status,
-            message,
+            &message,
         );
         if plugins
             .iter()
@@ -13913,6 +13947,14 @@ async fn handle_backend_admission_rejection(
                 .await
                 .is_err()
                 {
+                    grpc_status = grpc_proxy::grpc_status::DEADLINE_EXCEEDED;
+                    message = "Deadline exceeded at gateway".to_string();
+                    translated = crate::plugins::grpc_web::error_response_for_content_type(
+                        content_type,
+                        grpc_status,
+                        &message,
+                    );
+                    insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, &message);
                     break;
                 }
             }
@@ -13920,7 +13962,7 @@ async fn handle_backend_admission_rejection(
         Some(build_grpc_web_error_response_from_parts(
             translated,
             grpc_status,
-            message,
+            &message,
         ))
     } else {
         None
@@ -15166,6 +15208,14 @@ async fn handle_proxy_request_inner(
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        let response = build_request_deadline_exceeded_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
                 }
             }
             already_buffered => already_buffered,
@@ -15278,6 +15328,14 @@ async fn handle_proxy_request_inner(
                     }
                     Err(RequestBodyBufferError::TimedOut) => {
                         let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        let response = build_request_deadline_exceeded_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
                         );
@@ -15439,6 +15497,14 @@ async fn handle_proxy_request_inner(
                     }
                     Err(RequestBodyBufferError::TimedOut) => {
                         let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        let response = build_request_deadline_exceeded_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
                         );
@@ -15899,6 +15965,21 @@ async fn handle_proxy_request_inner(
                         );
                         drop(preacquired_backend_admission.take_if_acquired());
                         let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        let response = build_request_deadline_exceeded_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
                         );
@@ -16899,10 +16980,9 @@ async fn handle_proxy_request_inner(
                         .await
                         .is_err()
                     {
-                        grpc_result = Err(GrpcProxyError::BackendTimeout {
-                            kind: grpc_proxy::GrpcTimeoutKind::Read,
-                            message: "gRPC deadline exceeded during retry backoff".to_string(),
-                        });
+                        grpc_result = Err(GrpcProxyError::ClientDeadlineExceeded(
+                            "gRPC deadline exceeded during retry backoff".to_string(),
+                        ));
                         break;
                     }
                 } else {
@@ -17237,7 +17317,11 @@ async fn handle_proxy_request_inner(
                 // response is GrpcProxyError::ResponseTooLarge (NOT
                 // ResourceExhausted) and falls to the failure arm below, matching
                 // the HTTP path's ResponseBodyTooLarge -> 502.
-                Err(GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)) => {
+                Err(
+                    GrpcProxyError::ClientDeadlineExceeded(_)
+                    | GrpcProxyError::ResourceExhausted(_)
+                    | GrpcProxyError::Internal(_),
+                ) => {
                     grpc_probe_guard.disarm();
                     cb.record_neutral(grpc_cb_probe_slot);
                 }
@@ -18407,6 +18491,9 @@ async fn handle_proxy_request_inner(
                     state.overload.record_port_exhaustion();
                 }
                 let grpc_code = match &e {
+                    GrpcProxyError::ClientDeadlineExceeded(_) => {
+                        grpc_proxy::grpc_status::DEADLINE_EXCEEDED
+                    }
                     GrpcProxyError::BackendUnavailable { .. } => {
                         grpc_proxy::grpc_status::UNAVAILABLE
                     }
@@ -18420,9 +18507,14 @@ async fn handle_proxy_request_inner(
                 };
                 // Use a generic client-facing message to avoid leaking
                 // internal backend details (hostnames, DNS errors, etc.).
-                let msg = match grpc_code {
-                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED => "Backend deadline exceeded",
-                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED => "Resource exhausted",
+                let msg = match &e {
+                    GrpcProxyError::ClientDeadlineExceeded(_) => "Deadline exceeded at gateway",
+                    _ if grpc_code == grpc_proxy::grpc_status::DEADLINE_EXCEEDED => {
+                        "Backend deadline exceeded"
+                    }
+                    _ if grpc_code == grpc_proxy::grpc_status::RESOURCE_EXHAUSTED => {
+                        "Resource exhausted"
+                    }
                     _ => "Backend unavailable",
                 };
 
@@ -18899,7 +18991,7 @@ async fn handle_proxy_request_inner(
                     .await
                     .is_err()
                 {
-                    result = mesh_grpc_deadline_exceeded_response(
+                    result = client_grpc_deadline_exceeded_response(
                         result.backend_resolved_ip.clone(),
                     );
                     break;
@@ -21040,7 +21132,7 @@ pub(crate) async fn proxy_to_backend_retry(
     let resolved_ip_result = if let Some(deadline) = request_ctx.grpc_deadline_at() {
         match tokio::time::timeout_at(deadline, resolve_backend_ip).await {
             Ok(result) => result,
-            Err(_) => return mesh_grpc_deadline_exceeded_response(None),
+            Err(_) => return client_grpc_deadline_exceeded_response(None),
         }
     } else {
         resolve_backend_ip.await
@@ -21053,7 +21145,7 @@ pub(crate) async fn proxy_to_backend_retry(
     )
     .await;
     let client = match client_result {
-        Err(()) => return mesh_grpc_deadline_exceeded_response(resolved_ip),
+        Err(()) => return client_grpc_deadline_exceeded_response(resolved_ip),
         Ok(Ok(client)) => client,
         Ok(Err(e)) => {
             error!("Failed to get client from pool for retry: {}", e);
@@ -21109,7 +21201,7 @@ pub(crate) async fn proxy_to_backend_retry(
     if let Some(deadline) = request_ctx.grpc_deadline_at() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return mesh_grpc_deadline_exceeded_response(resolved_ip);
+            return client_grpc_deadline_exceeded_response(resolved_ip);
         }
         let request_timeout = if proxy.backend_read_timeout_ms > 0 {
             remaining.min(Duration::from_millis(proxy.backend_read_timeout_ms))
@@ -21815,16 +21907,26 @@ async fn proxy_to_backend(
     // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
     // This is the same cache reqwest will use internally via DnsCacheResolver,
     // so the IP will match the actual connection target.
-    let resolved_ip = state
-        .dns_cache
-        .resolve(
-            effective_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await
-        .ok()
-        .map(|ip| ip.to_string());
+    let resolve_backend_ip = state.dns_cache.resolve(
+        effective_host,
+        proxy.dns_override.as_deref(),
+        proxy.dns_cache_ttl_seconds,
+    );
+    let resolved_ip_result = if let Some(deadline) = request_ctx.grpc_deadline_at() {
+        match tokio::time::timeout_at(deadline, resolve_backend_ip).await {
+            Ok(result) => result,
+            Err(_) => {
+                return backend_dispatch_response(
+                    client_grpc_deadline_exceeded_response(None),
+                    None,
+                    None,
+                );
+            }
+        }
+    } else {
+        resolve_backend_ip.await
+    };
+    let resolved_ip = resolved_ip_result.ok().map(|ip| ip.to_string());
 
     if dispatch_hbone {
         // 413 on an oversized declared Content-Length BEFORE admission, so a
@@ -22136,7 +22238,7 @@ async fn proxy_to_backend(
                 Err(()) => {
                     drop(h2_admission_permits.take());
                     return backend_dispatch_response(
-                        mesh_grpc_deadline_exceeded_response(resolved_ip),
+                        client_grpc_deadline_exceeded_response(resolved_ip),
                         None,
                         None,
                     );
@@ -22325,7 +22427,7 @@ async fn proxy_to_backend(
     let client = match client_result {
         Err(()) => {
             return backend_dispatch_response(
-                mesh_grpc_deadline_exceeded_response(resolved_ip),
+                client_grpc_deadline_exceeded_response(resolved_ip),
                 None,
                 None,
             );
@@ -22397,7 +22499,7 @@ async fn proxy_to_backend(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return backend_dispatch_response(
-                mesh_grpc_deadline_exceeded_response(resolved_ip),
+                client_grpc_deadline_exceeded_response(resolved_ip),
                 retained_body,
                 None,
             );
@@ -22612,12 +22714,14 @@ async fn proxy_to_backend(
                                 None,
                             );
                         }
-                        Err(_) => {
-                            let response = if request_ctx.grpc_deadline_at().is_some() {
-                                mesh_grpc_deadline_exceeded_response(resolved_ip.clone())
-                            } else {
-                                request_body_timeout_backend_response(resolved_ip.clone())
-                            };
+                        Err(RequestBodyWaitError::DeadlineExceeded) => {
+                            let response =
+                                client_grpc_deadline_exceeded_response(resolved_ip.clone());
+                            return backend_dispatch_response(response, None, None);
+                        }
+                        Err(RequestBodyWaitError::TimedOut) => {
+                            let response =
+                                request_body_timeout_backend_response(resolved_ip.clone());
                             return backend_dispatch_response(
                                 response,
                                 None,
@@ -22657,12 +22761,14 @@ async fn proxy_to_backend(
                                 None,
                             );
                         }
-                        Err(_) => {
-                            let response = if request_ctx.grpc_deadline_at().is_some() {
-                                mesh_grpc_deadline_exceeded_response(resolved_ip.clone())
-                            } else {
-                                request_body_timeout_backend_response(resolved_ip.clone())
-                            };
+                        Err(RequestBodyWaitError::DeadlineExceeded) => {
+                            let response =
+                                client_grpc_deadline_exceeded_response(resolved_ip.clone());
+                            return backend_dispatch_response(response, None, None);
+                        }
+                        Err(RequestBodyWaitError::TimedOut) => {
+                            let response =
+                                request_body_timeout_backend_response(resolved_ip.clone());
                             return backend_dispatch_response(
                                 response,
                                 None,
@@ -23745,6 +23851,30 @@ fn build_request_body_timeout_response(
     )
 }
 
+fn build_request_deadline_exceeded_response(
+    is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    const MESSAGE: &str = "Deadline exceeded at gateway";
+    if let Some(content_type) = grpc_web_response_content_type {
+        return build_grpc_web_error_response(
+            content_type,
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            MESSAGE,
+        );
+    }
+    if is_grpc_request {
+        return grpc_proxy::build_grpc_error_response(
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            MESSAGE,
+        );
+    }
+    build_response(
+        StatusCode::REQUEST_TIMEOUT,
+        r#"{"error":"Request deadline exceeded"}"#,
+    )
+}
+
 fn request_body_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
     retry::BackendResponse {
         status_code: StatusCode::REQUEST_TIMEOUT.as_u16(),
@@ -23994,8 +24124,8 @@ fn mesh_grpc_unavailable_response(
     }
 }
 
-/// Timeout refusal for a gRPC-flavored request on the sidecar mesh-mTLS path
-/// (codex r2-2 finding 6): the direct gRPC pool maps a dispatch timeout
+/// Post-dispatch timeout for a gRPC-flavored request on the sidecar mesh-mTLS
+/// path (codex r2-2 finding 6): the direct gRPC pool maps a dispatch timeout
 /// (`GrpcProxyError::BackendTimeout`) to a Trailers-Only DEADLINE_EXCEEDED
 /// with the generic "Backend deadline exceeded" message — mirror that shape
 /// instead of the plain-HTTP JSON 504. Rides HTTP 200 (gRPC errors carry the
@@ -24022,6 +24152,23 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ReadWriteTimeout),
     }
+}
+
+/// Client RPC deadline expiry before the current attempt could reach an
+/// upstream. It has the same client-visible Trailers-Only status as a backend
+/// read timeout, but remains neutral to backend health, circuit breaking, and
+/// adaptive concurrency because there is no backend signal to attribute.
+fn client_grpc_deadline_exceeded_response(
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let mut response = mesh_grpc_deadline_exceeded_response(resolved_ip);
+    response.headers.insert(
+        "grpc-message".to_string(),
+        "Deadline exceeded at gateway".to_string(),
+    );
+    response.error_class = Some(retry::ErrorClass::ClientDisconnect);
+    response.connection_error = false;
+    response
 }
 
 fn mesh_grpc_response_body_too_large_response(
@@ -25161,7 +25308,7 @@ async fn proxy_to_backend_mesh_mtls(
             Ok(result) => result,
             Err(_) => {
                 return (
-                    mesh_grpc_deadline_exceeded_response(resolved_ip),
+                    client_grpc_deadline_exceeded_response(resolved_ip),
                     None,
                     None,
                 );
@@ -25251,7 +25398,7 @@ async fn proxy_to_backend_mesh_mtls(
                     .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
                 {
                     return (
-                        mesh_grpc_deadline_exceeded_response(resolved_ip),
+                        client_grpc_deadline_exceeded_response(resolved_ip),
                         None,
                         None,
                     );
@@ -27728,6 +27875,37 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn operator_upload_timeout_caps_a_long_rpc_deadline() {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(60))
+            .expect("one minute after now is representable");
+        let upload = std::future::pending::<Result<(), ()>>();
+
+        let result = super::collect_request_body_with_deadline(upload, Some(deadline), 10).await;
+
+        assert!(matches!(
+            result,
+            Err(super::RequestBodyWaitError::TimedOut)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rpc_deadline_is_distinguished_from_operator_upload_timeout() {
+        let deadline = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before now is representable");
+        let upload = std::future::pending::<Result<(), ()>>();
+
+        let result =
+            super::collect_request_body_with_deadline(upload, Some(deadline), 60_000).await;
+
+        assert!(matches!(
+            result,
+            Err(super::RequestBodyWaitError::DeadlineExceeded)
+        ));
+    }
+
+    #[tokio::test]
     async fn stalled_buffered_probe_times_out_and_releases_slot_neutral() {
         use crate::circuit_breaker::CircuitBreaker;
         use crate::config::types::CircuitBreakerConfig;
@@ -27750,7 +27928,7 @@ mod tests {
         let stalled_upload = std::future::pending::<Result<(), ()>>();
         let result = super::collect_request_body_with_timeout(stalled_upload, 10).await;
         assert!(
-            matches!(result, Err(super::RequestBodyBufferError::TimedOut)),
+            matches!(result, Err(super::RequestBodyWaitError::TimedOut)),
             "a never-ending buffered upload must hit the configured deadline"
         );
 
@@ -30584,6 +30762,28 @@ mod tests {
         );
         let ResponseBody::Buffered(body) = resp.body else {
             panic!("gRPC deadline response should be buffered");
+        };
+        assert!(body.is_empty(), "Trailers-Only timeout carries no body");
+    }
+
+    #[test]
+    fn client_grpc_deadline_before_dispatch_is_backend_health_neutral() {
+        let resp = client_grpc_deadline_exceeded_response(Some("127.0.0.4".to_string()));
+
+        assert_eq!(resp.status_code, 200);
+        assert!(!resp.connection_error);
+        assert_eq!(resp.error_class, Some(retry::ErrorClass::ClientDisconnect));
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.4"));
+        assert_eq!(
+            resp.headers.get("grpc-status").map(String::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            resp.headers.get("grpc-message").map(String::as_str),
+            Some("Deadline exceeded at gateway")
+        );
+        let ResponseBody::Buffered(body) = resp.body else {
+            panic!("gRPC client deadline response should be buffered");
         };
         assert!(body.is_empty(), "Trailers-Only timeout carries no body");
     }

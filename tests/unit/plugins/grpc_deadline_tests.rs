@@ -1,6 +1,10 @@
-use ferrum_edge::plugins::{GRPC_ONLY_PROTOCOLS, PluginResult, create_plugin, priority};
+use ferrum_edge::plugins::{
+    GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, create_plugin,
+    normalize_response_body_for_inspection, priority,
+};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
@@ -15,6 +19,64 @@ fn create_grpc_context_with_timeout(timeout: Option<&str>) -> ferrum_edge::plugi
             .insert("grpc-timeout".to_string(), t.to_string());
     }
     ctx
+}
+
+struct StalledResponseNormalizer;
+
+#[async_trait::async_trait]
+impl Plugin for StalledResponseNormalizer {
+    fn name(&self) -> &str {
+        "stalled_response_normalizer"
+    }
+
+    async fn normalize_response_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
+    let deadline_plugin = create_plugin("grpc_deadline", &json!({ "default_deadline_ms": 1 }))
+        .unwrap()
+        .unwrap();
+    let plugins: Vec<Arc<dyn Plugin>> =
+        vec![deadline_plugin, Arc::new(StalledResponseNormalizer)];
+    let mut ctx = create_grpc_context_with_timeout(None);
+    assert_continue(ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
+        &plugins, &mut ctx,
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("x-backend".to_string(), "discard-me".to_string()),
+    ]);
+    let mut body = b"backend response".to_vec();
+
+    let normalized = normalize_response_body_for_inspection(
+        &plugins,
+        &mut ctx,
+        200,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+
+    assert!(normalized);
+    assert_eq!(headers.len(), 3);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Deadline exceeded at gateway")
+    );
+    assert!(body.is_empty());
+    assert_eq!(ctx.metadata.get("grpc_status").map(String::as_str), Some("4"));
 }
 
 // ── Plugin creation ──

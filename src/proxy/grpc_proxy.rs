@@ -1222,6 +1222,12 @@ pub enum GrpcProxyError {
         kind: GrpcTimeoutKind,
         message: String,
     },
+    /// The client RPC deadline expired before the current attempt acquired an
+    /// HTTP/2 request stream (including connection acquisition and retry
+    /// backoff). No request from that attempt reached the backend, so health,
+    /// circuit-breaker, and adaptive-concurrency accounting must treat this as
+    /// neutral while the client still receives DEADLINE_EXCEEDED.
+    ClientDeadlineExceeded(String),
     /// The CLIENT request payload exceeded the configured maximum (detected
     /// before the backend produced response headers). Client-side — the
     /// circuit breaker treats this as neutral, like an HTTP client disconnect.
@@ -1275,6 +1281,7 @@ impl std::fmt::Display for GrpcProxyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BackendUnavailable { message, .. }
+            | Self::ClientDeadlineExceeded(message)
             | Self::ResourceExhausted(message)
             | Self::ResponseTooLarge(message)
             | Self::Internal(message) => write!(f, "{}", message),
@@ -2107,10 +2114,10 @@ async fn proxy_grpc_streaming_dispatch(
     let mut sender = if let Some(deadline) = grpc_deadline_at {
         tokio::time::timeout_at(deadline, grpc_pool.get_sender(proxy))
             .await
-            .map_err(|_| GrpcProxyError::BackendTimeout {
-                kind: GrpcTimeoutKind::Read,
-                message: "gRPC deadline exceeded during backend connection acquisition"
-                    .to_string(),
+            .map_err(|_| {
+                GrpcProxyError::ClientDeadlineExceeded(
+                    "gRPC deadline exceeded during backend connection acquisition".to_string(),
+                )
             })??
     } else {
         grpc_pool.get_sender(proxy).await?
@@ -2377,6 +2384,8 @@ pub(crate) async fn proxy_grpc_request_core(
         (Some(client), None) => Some(client),
         (None, _) => None,
     };
+    let dispatch_deadline_is_client = client_grpc_deadline_at
+        .is_some_and(|client| dispatch_deadline_at.is_some_and(|effective| client <= effective));
     let request_deadline_remaining_ms = dispatch_deadline_at.map(|deadline| {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let millis = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
@@ -2407,10 +2416,17 @@ pub(crate) async fn proxy_grpc_request_core(
     let mut sender = if let Some(deadline) = dispatch_deadline_at {
         tokio::time::timeout_at(deadline, grpc_pool.get_sender(proxy))
             .await
-            .map_err(|_| GrpcProxyError::BackendTimeout {
-                kind: GrpcTimeoutKind::Read,
-                message: "gRPC deadline exceeded during backend connection acquisition"
-                    .to_string(),
+            .map_err(|_| {
+                if dispatch_deadline_is_client {
+                    GrpcProxyError::ClientDeadlineExceeded(
+                        "gRPC deadline exceeded during backend connection acquisition".to_string(),
+                    )
+                } else {
+                    GrpcProxyError::BackendTimeout {
+                        kind: GrpcTimeoutKind::Read,
+                        message: "Backend read timeout during connection acquisition".to_string(),
+                    }
+                }
             })??
     } else {
         grpc_pool.get_sender(proxy).await?

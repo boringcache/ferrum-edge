@@ -49,6 +49,7 @@ use crate::tls::{CrlList, TlsPolicy};
 pub(super) enum H3RequestBodyReadError<E> {
     Read(E),
     TimedOut,
+    DeadlineExceeded,
 }
 
 pub(super) async fn collect_h3_request_body_with_timeout<F, T, E>(
@@ -77,12 +78,42 @@ where
     F: std::future::Future<Output = Result<T, E>>,
 {
     if let Some(deadline) = deadline {
-        return tokio::time::timeout_at(deadline, collect)
+        // Preserve both timeout regimes: the absolute RPC deadline bounds the
+        // whole call, and the operator read timeout still caps a stalled
+        // client upload even when grpc-timeout is very large.
+        let (effective_deadline, timeout_error) = if request_body_read_timeout_ms > 0 {
+            match tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(request_body_read_timeout_ms))
+            {
+                Some(read_deadline) if read_deadline < deadline => {
+                    (read_deadline, H3RequestBodyReadError::TimedOut)
+                }
+                _ => (deadline, H3RequestBodyReadError::DeadlineExceeded),
+            }
+        } else {
+            (deadline, H3RequestBodyReadError::DeadlineExceeded)
+        };
+        return tokio::time::timeout_at(effective_deadline, collect)
             .await
-            .map_err(|_| H3RequestBodyReadError::TimedOut)?
+            .map_err(|_| timeout_error)?
             .map_err(H3RequestBodyReadError::Read);
     }
     collect_h3_request_body_with_timeout(collect, request_body_read_timeout_ms).await
+}
+
+fn h3_request_body_timeout_contract<E>(
+    error: &H3RequestBodyReadError<E>,
+) -> (&'static str, &'static str) {
+    match error {
+        H3RequestBodyReadError::DeadlineExceeded => (
+            r#"{"error":"Request deadline exceeded"}"#,
+            "Deadline exceeded at gateway",
+        ),
+        H3RequestBodyReadError::TimedOut | H3RequestBodyReadError::Read(_) => (
+            r#"{"error":"Request body read timed out"}"#,
+            "Request body read timed out",
+        ),
+    }
 }
 
 /// Optional HTTP/3 listener settings that don't affect the core bind contract.
@@ -1622,7 +1653,8 @@ async fn handle_h3_request(
                 return Ok(());
             }
             Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
-            Err(H3RequestBodyReadError::TimedOut) => {
+            Err(timeout) => {
+                let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
                 record_request(
                     &state,
                     if matches!(http_flavor, HttpFlavor::Grpc) {
@@ -1635,9 +1667,9 @@ async fn handle_h3_request(
                     &mut stream,
                     http_flavor,
                     StatusCode::REQUEST_TIMEOUT,
-                    r#"{"error":"Request body read timed out"}"#,
+                    error_body,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Request body read timed out",
+                    grpc_message,
                 )
                 .await?;
                 return Ok(());
@@ -1779,7 +1811,8 @@ async fn handle_h3_request(
                     return Ok(());
                 }
                 Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
-                Err(H3RequestBodyReadError::TimedOut) => {
+                Err(timeout) => {
+                    let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
                     record_request(
                         &state,
                         if matches!(http_flavor, HttpFlavor::Grpc) {
@@ -1792,9 +1825,9 @@ async fn handle_h3_request(
                         &mut stream,
                         http_flavor,
                         StatusCode::REQUEST_TIMEOUT,
-                        r#"{"error":"Request body read timed out"}"#,
+                        error_body,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                        "Request body read timed out",
+                        grpc_message,
                     )
                     .await?;
                     return Ok(());
@@ -1982,7 +2015,8 @@ async fn handle_h3_request(
                 return Ok(());
             }
             Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
-            Err(H3RequestBodyReadError::TimedOut) => {
+            Err(timeout) => {
+                let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
                 record_request(
                     &state,
                     if matches!(http_flavor, HttpFlavor::Grpc) {
@@ -1995,9 +2029,9 @@ async fn handle_h3_request(
                     &mut stream,
                     http_flavor,
                     StatusCode::REQUEST_TIMEOUT,
-                    r#"{"error":"Request body read timed out"}"#,
+                    error_body,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Request body read timed out",
+                    grpc_message,
                 )
                 .await?;
                 return Ok(());
@@ -2399,15 +2433,8 @@ async fn handle_h3_request(
                     &mut rej_headers,
                 )
                 .await;
-                let reject_status =
+                let mut reject_status =
                     StatusCode::from_u16(reject_status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-                let log_status_code = h3_reject_log_status_and_metadata(
-                    &mut ctx,
-                    http_flavor,
-                    reject_status,
-                    &reject_body,
-                    &rej_headers,
-                );
                 if capabilities
                     .has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
                 {
@@ -2430,10 +2457,22 @@ async fn handle_h3_request(
                         .await
                         .is_err()
                         {
+                            reject_status = replace_h3_response_with_grpc_deadline(
+                                &mut ctx,
+                                &mut rej_headers,
+                                &mut reject_body,
+                            );
                             break;
                         }
                     }
                 }
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    reject_status,
+                    &reject_body,
+                    &rej_headers,
+                );
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 record_request(&state, log_status_code);
                 log_rejected_request(
@@ -2566,7 +2605,8 @@ async fn handle_h3_request(
                     );
                     return Err(error.into());
                 }
-                Err(H3RequestBodyReadError::TimedOut) => {
+                Err(timeout) => {
+                    let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
                     release_h3_circuit_breaker_probe_on_admission_reject(
                         &state,
                         &proxy,
@@ -2588,9 +2628,9 @@ async fn handle_h3_request(
                         &mut stream,
                         http_flavor,
                         StatusCode::REQUEST_TIMEOUT,
-                        r#"{"error":"Request body read timed out"}"#,
+                        error_body,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                        "Request body read timed out",
+                        grpc_message,
                     )
                     .await?;
                     return Ok(());
@@ -3119,7 +3159,9 @@ async fn handle_h3_request(
                             );
                             return Err(error.into());
                         }
-                        Err(H3RequestBodyReadError::TimedOut) => {
+                        Err(timeout) => {
+                            let (error_body, grpc_message) =
+                                h3_request_body_timeout_contract(&timeout);
                             crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                                 &state,
                                 &proxy,
@@ -3146,9 +3188,9 @@ async fn handle_h3_request(
                                 &mut stream,
                                 http_flavor,
                                 StatusCode::REQUEST_TIMEOUT,
-                                r#"{"error":"Request body read timed out"}"#,
+                                error_body,
                                 crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                "Request body read timed out",
+                                grpc_message,
                             )
                             .await?;
                             return Ok(());
@@ -4267,7 +4309,8 @@ async fn handle_h3_request(
                 );
                 return Err(error.into());
             }
-            Err(H3RequestBodyReadError::TimedOut) => {
+            Err(timeout) => {
+                let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
                 release_h3_circuit_breaker_probe_on_admission_reject(
                     &state,
                     &proxy,
@@ -4286,9 +4329,9 @@ async fn handle_h3_request(
                     &mut stream,
                     http_flavor,
                     StatusCode::REQUEST_TIMEOUT,
-                    r#"{"error":"Request body read timed out"}"#,
+                    error_body,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Request body read timed out",
+                    grpc_message,
                 )
                 .await?;
                 return Ok(());
@@ -5270,6 +5313,13 @@ async fn handle_h3_request(
                 .await
                 .is_err()
                 {
+                    response_status = replace_h3_response_with_grpc_deadline(
+                        &mut ctx,
+                        &mut response_headers,
+                        &mut response_body,
+                    )
+                    .as_u16();
+                    response_trailers = None;
                     break;
                 }
             }
@@ -5431,15 +5481,8 @@ async fn run_h3_backend_admission_or_send_reject(
                 &mut headers,
             )
             .await;
-            let http_status = StatusCode::from_u16(rejection.status_code)
+            let mut http_status = StatusCode::from_u16(rejection.status_code)
                 .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-            let log_status_code = h3_reject_log_status_and_metadata(
-                ctx,
-                flavor,
-                http_status,
-                &rejection.body,
-                &headers,
-            );
             if plugins
                 .iter()
                 .any(|plugin| plugin.requires_response_committed_hook())
@@ -5463,10 +5506,22 @@ async fn run_h3_backend_admission_or_send_reject(
                     .await
                     .is_err()
                     {
+                        http_status = replace_h3_response_with_grpc_deadline(
+                            ctx,
+                            &mut headers,
+                            &mut rejection.body,
+                        );
                         break;
                     }
                 }
             }
+            let log_status_code = h3_reject_log_status_and_metadata(
+                ctx,
+                flavor,
+                http_status,
+                &rejection.body,
+                &headers,
+            );
             record_request(state, log_status_code);
             log_rejected_request(
                 plugins,
@@ -6996,6 +7051,11 @@ async fn dispatch_grpc_native_h3(
                     crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
                     "Malformed request trailers",
                 )
+            } else if is_client_side_neutral_timeout {
+                (
+                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Deadline exceeded at gateway",
+                )
             } else if is_read_timeout {
                 (
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -7625,7 +7685,7 @@ async fn dispatch_grpc_native_h3(
                     if send_h3_grpc_terminal_trailers(
                         stream,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                        "Deadline exceeded",
+                        "Deadline%20exceeded%20at%20gateway",
                     )
                     .await
                     {
@@ -7653,7 +7713,7 @@ async fn dispatch_grpc_native_h3(
                 crate::proxy::insert_grpc_error_metadata(
                     &mut ctx.metadata,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Deadline exceeded",
+                    "Deadline exceeded at gateway",
                 );
                 break 'outer;
             }
@@ -7718,7 +7778,7 @@ async fn dispatch_grpc_native_h3(
                                 if send_h3_grpc_terminal_trailers(
                                     stream,
                                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                    "Deadline exceeded",
+                                    "Deadline%20exceeded%20at%20gateway",
                                 )
                                 .await
                                 {
@@ -7744,7 +7804,7 @@ async fn dispatch_grpc_native_h3(
                             crate::proxy::insert_grpc_error_metadata(
                                 &mut ctx.metadata,
                                 crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                "Deadline exceeded",
+                                "Deadline exceeded at gateway",
                             );
                             break;
                         }
@@ -8918,6 +8978,34 @@ fn h3_reject_log_status_and_metadata(
     StatusCode::OK.as_u16()
 }
 
+/// Replace a not-yet-written H3 response when the absolute RPC deadline
+/// expires inside its final committed-response hook. This keeps the H3
+/// buffered, circuit-breaker, and admission-rejection paths aligned with the
+/// H1/H2 canonical Trailers-Only DEADLINE_EXCEEDED contract.
+fn replace_h3_response_with_grpc_deadline(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    body: &mut Vec<u8>,
+) -> StatusCode {
+    headers.clear();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "grpc-status".to_string(),
+        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED.to_string(),
+    );
+    headers.insert(
+        "grpc-message".to_string(),
+        "Deadline exceeded at gateway".to_string(),
+    );
+    body.clear();
+    crate::proxy::insert_grpc_error_metadata(
+        &mut ctx.metadata,
+        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+        "Deadline exceeded at gateway",
+    );
+    StatusCode::OK
+}
+
 fn h3_grpc_reject_signal(
     http_status: StatusCode,
     http_body: &[u8],
@@ -9071,7 +9159,55 @@ mod h3_request_body_timeout_tests {
             .expect("one second before now is representable");
         let upload = std::future::pending::<Result<(), ()>>();
         let result = super::collect_h3_request_body_with_deadline(upload, Some(deadline), 0).await;
+        assert_eq!(
+            result,
+            Err(super::H3RequestBodyReadError::DeadlineExceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_upload_timeout_caps_a_long_rpc_deadline() {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(60))
+            .expect("one minute after now is representable");
+        let upload = std::future::pending::<Result<(), ()>>();
+
+        let result =
+            super::collect_h3_request_body_with_deadline(upload, Some(deadline), 10).await;
+
         assert_eq!(result, Err(super::H3RequestBodyReadError::TimedOut));
+    }
+
+    #[test]
+    fn committed_deadline_replaces_h3_response_with_canonical_grpc_error() {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Service/Call".to_string(),
+        );
+        let mut headers = std::collections::HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-backend".to_string(), "discard-me".to_string()),
+        ]);
+        let mut body = b"backend response".to_vec();
+
+        let status =
+            super::replace_h3_response_with_grpc_deadline(&mut ctx, &mut headers, &mut body);
+
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers.get("content-type").map(String::as_str), Some("application/grpc"));
+        assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+        assert_eq!(
+            headers.get("grpc-message").map(String::as_str),
+            Some("Deadline exceeded at gateway")
+        );
+        assert!(body.is_empty());
+        assert_eq!(ctx.metadata.get("grpc_status").map(String::as_str), Some("4"));
+        assert_eq!(
+            ctx.metadata.get("grpc_message").map(String::as_str),
+            Some("Deadline exceeded at gateway")
+        );
     }
 
     #[tokio::test]

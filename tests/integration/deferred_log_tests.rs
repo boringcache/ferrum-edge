@@ -29,7 +29,7 @@ use http_body::Body as _;
 
 use ferrum_edge::plugins::{
     Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
-    create_response_stream_inspector,
+    create_plugin, create_response_stream_inspector,
 };
 use ferrum_edge::proxy::ProxyBody;
 use ferrum_edge::proxy::deferred_log::{BodyOutcome, DeferredTransactionLogger};
@@ -264,6 +264,47 @@ async fn fire_invokes_response_stream_termination_before_log() {
         Some("before_summary_log"),
         "metadata written by the terminal hook must reach TransactionSummary"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_grpc_deadline_still_runs_stream_cleanup_before_log() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status = Arc::new(Mutex::new(None));
+    let outcome = Arc::new(Mutex::new(None));
+    let summaries = Arc::new(Mutex::new(Vec::new()));
+    let deadline_plugin = create_plugin(
+        "grpc_deadline",
+        &serde_json::json!({ "default_deadline_ms": 1 }),
+    )
+    .unwrap()
+    .unwrap();
+    let capturing_plugin: Arc<dyn Plugin> = Arc::new(StreamTerminationCapturingPlugin {
+        events: events.clone(),
+        status,
+        outcome,
+        summaries,
+    });
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> =
+        Arc::new(vec![deadline_plugin, capturing_plugin]);
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc".to_string(),
+    );
+    assert!(matches!(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
+            plugins.as_slice(),
+            &mut ctx,
+        ),
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let logger = DeferredTransactionLogger::new(make_summary_with_status(200), plugins, ctx);
+
+    logger.fire(BodyOutcome::error(ErrorClass::ReadWriteTimeout, 0, false));
+
+    let events = wait_for_events(&events, 2).await;
+    assert_eq!(events.as_slice(), ["stream_terminated", "log"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

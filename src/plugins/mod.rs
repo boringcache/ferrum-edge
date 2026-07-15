@@ -1978,7 +1978,24 @@ pub async fn normalize_response_body_for_inspection(
         .await
         {
             Ok(body) => body,
-            Err(()) => break,
+            Err(()) => {
+                response_headers.clear();
+                response_headers
+                    .insert("content-type".to_string(), "application/grpc".to_string());
+                response_headers.insert("grpc-status".to_string(), "4".to_string());
+                response_headers.insert(
+                    "grpc-message".to_string(),
+                    "Deadline exceeded at gateway".to_string(),
+                );
+                response_body.clear();
+                crate::proxy::insert_grpc_error_metadata(
+                    &mut ctx.metadata,
+                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Deadline exceeded at gateway",
+                );
+                normalized = true;
+                break;
+            }
         };
         if let Some(body) = body {
             response_headers.insert("content-length".to_string(), body.len().to_string());
@@ -2450,15 +2467,11 @@ pub async fn log_with_mirror(
         None
     };
     for plugin in plugins {
-        if await_grpc_deadline(
-            ctx.grpc_deadline_at(),
-            plugin.log_with_mesh_key(summary, mesh_key.as_ref()),
-        )
-        .await
-        .is_err()
-        {
-            break;
-        }
+        // Transaction logging is gateway cleanup after the client-visible
+        // outcome is final. A client RPC deadline must bound request handling,
+        // but it must not suppress the audit/transaction record for the
+        // deadline outcome itself.
+        plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
 

@@ -372,8 +372,32 @@ where
             let http_status = StatusCode::from_u16(rejection.status_code)
                 .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
             let mut outcome = if matches!(flavor, HttpFlavor::Grpc) {
-                let normalized = normalize_h3_grpc_reject(http_status, &rejection.body, &headers);
+                let mut normalized =
+                    normalize_h3_grpc_reject(http_status, &rejection.body, &headers);
                 apply_h3_grpc_reject_metadata(ctx, &normalized);
+                if plugins
+                    .iter()
+                    .any(|plugin| plugin.requires_response_committed_hook())
+                {
+                    for plugin in plugins {
+                        if crate::plugins::await_grpc_deadline(
+                            ctx.grpc_deadline_at(),
+                            plugin.on_response_committed(
+                                ctx,
+                                normalized.http_status.as_u16(),
+                                &normalized.headers,
+                                &normalized.body,
+                            ),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            normalized = normalized_h3_grpc_deadline();
+                            apply_h3_grpc_reject_metadata(ctx, &normalized);
+                            break;
+                        }
+                    }
+                }
                 write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await?
             } else {
                 write_reject_with_headers(
@@ -3156,6 +3180,22 @@ where
                 )
                 .await;
             }
+            Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
+                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                    state,
+                    proxy,
+                    current_cb_target_key.as_deref(),
+                    cb_retry_probe_slot_available,
+                );
+                return write_grpc_error(
+                    stream,
+                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Deadline exceeded at gateway",
+                    backend_start,
+                    0,
+                )
+                .await;
+            }
         }
     };
     let bytes_sent = if body_was_prebuffered {
@@ -3324,10 +3364,9 @@ where
                     .await
                     .is_err()
                 {
-                    result = Err(grpc_proxy::GrpcProxyError::BackendTimeout {
-                        kind: grpc_proxy::GrpcTimeoutKind::Read,
-                        message: "gRPC deadline exceeded during retry backoff".to_string(),
-                    });
+                    result = Err(grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(
+                        "gRPC deadline exceeded during retry backoff".to_string(),
+                    ));
                     break;
                 }
             } else {
@@ -3594,14 +3633,16 @@ where
                 response_trailers.clear();
             }
             for plugin in plugins.iter() {
-                let result = plugin
-                    .on_response_body(
+                let result = crate::plugins::await_request_plugin_deadline(
+                    ctx.grpc_deadline_at(),
+                    plugin.on_response_body(
                         ctx,
                         response_status,
                         &plugin_response_headers,
                         &response_body,
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 match result {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
@@ -3633,15 +3674,30 @@ where
             // content-length updates land on the view and flow into the wire
             // headers after reconciliation below.
             for plugin in plugins.iter() {
-                if let Some(transformed) = plugin
-                    .transform_response_body_with_context(
+                let transformed = match crate::plugins::await_grpc_deadline(
+                    ctx.grpc_deadline_at(),
+                    plugin.transform_response_body_with_context(
                         &mut *ctx,
                         &response_body,
                         content_type_of(&plugin_response_headers),
                         &plugin_response_headers,
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
+                    Ok(transformed) => transformed,
+                    Err(()) => {
+                        replace_buffered_grpc_response_with_deadline(
+                            ctx,
+                            &mut response_status,
+                            &mut plugin_response_headers,
+                            &mut response_body,
+                            &mut response_trailers,
+                        );
+                        break;
+                    }
+                };
+                if let Some(transformed) = transformed {
                     plugin_response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
@@ -3649,14 +3705,16 @@ where
                 }
             }
             for plugin in plugins.iter() {
-                let result = plugin
-                    .on_final_response_body(
+                let result = crate::plugins::await_request_plugin_deadline(
+                    ctx.grpc_deadline_at(),
+                    plugin.on_final_response_body(
                         ctx,
                         response_status,
                         &plugin_response_headers,
                         &response_body,
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 match result {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
@@ -3754,14 +3812,27 @@ where
 
             if has_response_committed_hook {
                 for plugin in plugins.iter() {
-                    plugin
-                        .on_response_committed(
+                    if crate::plugins::await_grpc_deadline(
+                        ctx.grpc_deadline_at(),
+                        plugin.on_response_committed(
                             ctx,
                             response_status,
                             &response_headers,
                             &response_body,
-                        )
-                        .await;
+                        ),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        replace_buffered_grpc_response_with_deadline(
+                            ctx,
+                            &mut response_status,
+                            &mut response_headers,
+                            &mut response_body,
+                            &mut response_trailers,
+                        );
+                        break;
+                    }
                 }
             }
 
@@ -3903,6 +3974,10 @@ where
             // the same failure mode (timeout vs connect-refused vs TLS).
             let error_class = crate::retry::classify_grpc_proxy_error(&err);
             let (grpc_status_code, grpc_message): (u32, &str) = match &err {
+                grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_) => (
+                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Deadline exceeded at gateway",
+                ),
                 grpc_proxy::GrpcProxyError::BackendTimeout { .. } => (
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Backend deadline exceeded",
@@ -3930,7 +4005,10 @@ where
             // ResourceExhausted/Internal where the request bytes already
             // crossed the wire). Mirrors the H1/H2 gRPC path so a single
             // predicate governs `connection_error` everywhere.
-            let connection_error = !crate::retry::request_reached_wire(error_class);
+            let connection_error = !matches!(
+                &err,
+                grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_)
+            ) && !crate::retry::request_reached_wire(error_class);
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
@@ -4282,6 +4360,10 @@ pub(crate) async fn dispatch_grpc_streaming(
         Err(err) => {
             let bytes_sent = request_bytes_seen.load(Ordering::Relaxed);
             let (grpc_status_code, grpc_message): (u32, &str) = match &err {
+                grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_) => (
+                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Deadline exceeded at gateway",
+                ),
                 grpc_proxy::GrpcProxyError::BackendTimeout { .. } => (
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Backend deadline exceeded",
@@ -4315,6 +4397,10 @@ pub(crate) async fn dispatch_grpc_streaming(
             // limiter.
             let request_overflow = matches!(&err, grpc_proxy::GrpcProxyError::ResourceExhausted(_));
             let frontend_aborted = frontend_upload_failed.load(Ordering::Acquire);
+            let client_deadline = matches!(
+                &err,
+                grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_)
+            );
             let error_class = if request_overflow {
                 ErrorClass::RequestBodyTooLarge
             } else if frontend_aborted {
@@ -4322,7 +4408,8 @@ pub(crate) async fn dispatch_grpc_streaming(
             } else {
                 crate::retry::classify_grpc_proxy_error(&err)
             };
-            let connection_error = !request_overflow
+            let connection_error = !client_deadline
+                && !request_overflow
                 && !frontend_aborted
                 && !crate::retry::request_reached_wire(error_class);
             warn!(
@@ -4446,6 +4533,36 @@ async fn apply_buffered_grpc_plugin_reject(
         &reject.body,
         &headers,
     );
+    apply_h3_grpc_reject_metadata(ctx, &normalized);
+    *response_status = normalized.http_status.as_u16();
+    *response_headers = normalized.headers;
+    *response_body = normalized.body;
+    response_trailers.clear();
+}
+
+fn normalized_h3_grpc_deadline() -> crate::proxy::NormalizedRejectResponse {
+    normalize_h3_grpc_reject(
+        StatusCode::OK,
+        &[],
+        &HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("grpc-status".to_string(), "4".to_string()),
+            (
+                "grpc-message".to_string(),
+                "Deadline exceeded at gateway".to_string(),
+            ),
+        ]),
+    )
+}
+
+fn replace_buffered_grpc_response_with_deadline(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+    response_trailers: &mut HashMap<String, String>,
+) {
+    let normalized = normalized_h3_grpc_deadline();
     apply_h3_grpc_reject_metadata(ctx, &normalized);
     *response_status = normalized.http_status.as_u16();
     *response_headers = normalized.headers;
@@ -5225,7 +5342,7 @@ where
     )
     .await;
     let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
-    let normalized = crate::proxy::normalize_reject_response(
+    let mut normalized = crate::proxy::normalize_reject_response(
         http_status,
         &parts.body,
         &headers,
@@ -5236,14 +5353,24 @@ where
     }
     if has_response_committed_hook {
         for plugin in plugins {
-            plugin
-                .on_response_committed(
+            if crate::plugins::await_grpc_deadline(
+                ctx.grpc_deadline_at(),
+                plugin.on_response_committed(
                     ctx,
                     normalized.http_status.as_u16(),
                     &normalized.headers,
                     &normalized.body,
-                )
-                .await;
+                ),
+            )
+            .await
+            .is_err()
+            {
+                if matches!(flavor, HttpFlavor::Grpc) {
+                    normalized = normalized_h3_grpc_deadline();
+                    apply_h3_grpc_reject_metadata(ctx, &normalized);
+                }
+                break;
+            }
         }
     }
     if matches!(flavor, HttpFlavor::Grpc) {
@@ -5394,8 +5521,31 @@ where
     )
     .await;
     let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
-    let normalized = normalize_h3_grpc_reject(http_status, &parts.body, &headers);
+    let mut normalized = normalize_h3_grpc_reject(http_status, &parts.body, &headers);
     apply_h3_grpc_reject_metadata(ctx, &normalized);
+    if plugins
+        .iter()
+        .any(|plugin| plugin.requires_response_committed_hook())
+    {
+        for plugin in plugins {
+            if crate::plugins::await_grpc_deadline(
+                ctx.grpc_deadline_at(),
+                plugin.on_response_committed(
+                    ctx,
+                    normalized.http_status.as_u16(),
+                    &normalized.headers,
+                    &normalized.body,
+                ),
+            )
+            .await
+            .is_err()
+            {
+                normalized = normalized_h3_grpc_deadline();
+                apply_h3_grpc_reject_metadata(ctx, &normalized);
+                break;
+            }
+        }
+    }
     write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent).await
 }
 
@@ -5560,8 +5710,8 @@ mod tests {
         normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
         record_cross_protocol_connection_start, reject_body_as_h3_grpc_message,
         release_cross_protocol_circuit_breaker_probe_on_admission_reject,
-        sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
-        should_skip_cross_protocol_backend_header,
+        replace_buffered_grpc_response_with_deadline, sanitize_h3_grpc_message_for_header,
+        should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
     };
     use crate::config::EnvConfig;
     use crate::config::types::{CircuitBreakerConfig, GatewayConfig, Proxy, UpstreamTarget};
@@ -5596,6 +5746,45 @@ mod tests {
         assert!(!outcome.connection_error);
         assert_eq!(outcome.error_class, None);
         assert_eq!(outcome.body_error_class, Some(ErrorClass::ClientDisconnect));
+    }
+
+    #[test]
+    fn buffered_grpc_deadline_replacement_clears_body_and_backend_trailers() {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Service/Call".to_string(),
+        );
+        let mut status = 503;
+        let mut headers = HashMap::from([(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        )]);
+        let mut body = b"backend response".to_vec();
+        let mut trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
+
+        replace_buffered_grpc_response_with_deadline(
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            &mut trailers,
+        );
+
+        assert_eq!(status, 200);
+        assert_eq!(headers.len(), 3);
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc")
+        );
+        assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+        assert_eq!(
+            headers.get("grpc-message").map(String::as_str),
+            Some("Deadline exceeded at gateway")
+        );
+        assert!(body.is_empty());
+        assert!(trailers.is_empty());
+        assert_eq!(ctx.metadata.get("grpc_status").map(String::as_str), Some("4"));
     }
 
     #[test]
