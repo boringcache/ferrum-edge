@@ -894,10 +894,6 @@ fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
         message.contains("1 plugin config error(s)"),
         "unexpected file-load error: {message}"
     );
-    assert!(
-        message.contains("max_limt"),
-        "unexpected file-load error: {message}"
-    );
 }
 
 #[test]

@@ -821,6 +821,44 @@ fn adaptive_concurrency_compatible_reload_keeps_pinned_old_view_admitted() {
 }
 
 #[test]
+fn adaptive_concurrency_pinned_old_view_uses_replacement_admission_bounds() {
+    let config = cache_config(
+        "proxy",
+        json!({
+            "min_limit": 10,
+            "initial_limit": 10,
+            "max_limit": 10,
+            "shadow_mode": true
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let old_view = adaptive_plugin_from_cache(&cache);
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[0].config = json!({
+        "min_limit": 1,
+        "initial_limit": 1,
+        "max_limit": 1,
+        "shadow_mode": false
+    });
+    cache
+        .rebuild(&reloaded)
+        .expect("compatible emergency limit decrease should publish");
+
+    let held = expect_admitted(acquire_from_plugin(
+        &old_view,
+        &config.proxies[0],
+        None,
+    ));
+    assert_rejected(acquire_from_plugin(
+        &old_view,
+        &config.proxies[0],
+        None,
+    ));
+    drop(held);
+}
+
+#[test]
 fn adaptive_concurrency_scoped_detach_and_reattach_starts_fresh_state() {
     for scope in ["proxy", "proxy_group"] {
         let config = cache_config(

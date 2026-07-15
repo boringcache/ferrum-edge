@@ -52,11 +52,21 @@ pub(crate) fn build_proxy_index_by_id(config: &GatewayConfig) -> Arc<HashMap<Str
     )
 }
 
-fn upstream_endpoint_keys(upstream: &crate::config::types::Upstream) -> Vec<(&str, u16)> {
+fn upstream_endpoint_keys(
+    upstream: &crate::config::types::Upstream,
+) -> Vec<(&str, u16, Vec<(&str, &str)>)> {
     let mut keys: Vec<_> = upstream
         .targets
         .iter()
-        .map(|target| (target.host.as_str(), target.port))
+        .map(|target| {
+            let mut tags: Vec<_> = target
+                .tags
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            tags.sort_unstable();
+            (target.host.as_str(), target.port, tags)
+        })
         .collect();
     keys.sort_unstable();
     keys.dedup();
@@ -75,6 +85,7 @@ fn changed_upstream_endpoint_ids(
             .is_none_or(|current_upstream| {
                 upstream_endpoint_keys(current_upstream)
                     != upstream_endpoint_keys(replacement_upstream)
+                    || current_upstream.subsets != replacement_upstream.subsets
             });
         if endpoints_changed {
             changed.insert(upstream_id.clone());
@@ -664,6 +675,117 @@ mod tests {
     }
 
     #[test]
+    fn changed_upstream_endpoints_include_subset_tag_changes() {
+        let mut blue = target("a.local", 80);
+        blue.tags.insert("version".to_string(), "blue".to_string());
+        let current_config = config(vec![], vec![], vec![upstream("u1", vec![blue])]);
+        let current = LoadBalancerCache::build_inner(&current_config);
+
+        let mut green = target("a.local", 80);
+        green
+            .tags
+            .insert("version".to_string(), "green".to_string());
+        let replacement_config = config(vec![], vec![], vec![upstream("u1", vec![green])]);
+        let replacement = LoadBalancerCache::build_inner(&replacement_config);
+
+        assert_eq!(
+            changed_upstream_endpoint_ids(&current, &replacement),
+            HashSet::from(["u1".to_string()])
+        );
+    }
+
+    #[test]
+    fn config_reload_resets_route_override_upstream_target_key_space() {
+        let protected_proxy = proxy("p1", "/one", vec!["adaptive", "route"]);
+        let adaptive = plugin_config(
+            "adaptive",
+            "adaptive_concurrency",
+            json!({
+                "max_tracked_keys": 1,
+                "min_limit": 1,
+                "initial_limit": 1,
+                "max_limit": 1
+            }),
+        );
+        let route = plugin_config(
+            "route",
+            "mesh_route_dispatch",
+            json!({
+                "rules": [{"destination": {"upstream_id": "canary"}}]
+            }),
+        );
+        let initial = config(
+            vec![protected_proxy],
+            vec![adaptive, route],
+            vec![upstream("canary", vec![target("old-canary.local", 80)])],
+        );
+        let store = epoch_store(initial);
+
+        let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
+            let plugin = epoch
+                .plugin_cache
+                .get_plugins("p1")
+                .iter()
+                .find(|plugin| plugin.name() == "adaptive_concurrency")
+                .cloned()
+                .unwrap_or_else(|| panic!("adaptive plugin should be cached"));
+            let mut ctx = RequestContext::new(
+                "192.0.2.10".to_string(),
+                "GET".to_string(),
+                "/".to_string(),
+            );
+            ctx.lb_generation = epoch.lb_generation;
+            let admission = BackendAdmissionContext {
+                proxy: &epoch.config.proxies[0],
+                upstream_target: Some(target),
+                protocol: ProxyProtocol::Http,
+            };
+            plugin.try_backend_admission(&ctx, &admission)
+        };
+
+        let initial_epoch = store.load();
+        let old_target = initial_epoch.load_balancer.upstreams()["canary"].targets[0].clone();
+        match acquire(&initial_epoch, &old_target) {
+            BackendAdmissionDecision::Admit(permit) => drop(permit),
+            _ => panic!("initial route-override target should be admitted"),
+        }
+
+        let mut replacement_config = initial_epoch.config.as_ref().clone();
+        replacement_config.upstreams[0].targets = vec![target("new-canary.local", 81)];
+        store
+            .update_config(
+                |current| {
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::new(replacement_config.clone()),
+                        route_table: Arc::clone(&current.route_table),
+                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: LoadBalancerCache::build_inner(&replacement_config),
+                        route_changed: false,
+                        lb_changed: true,
+                    }))
+                },
+                |_| {},
+            )
+            .unwrap_or_else(|error| panic!("config reload should publish: {error}"));
+
+        let replacement_epoch = store.load();
+        let replacement_target =
+            replacement_epoch.load_balancer.upstreams()["canary"].targets[0].clone();
+        let held = match acquire(&replacement_epoch, &replacement_target) {
+            BackendAdmissionDecision::Admit(permit) => permit,
+            _ => panic!("replacement route-override target should be admitted"),
+        };
+        match acquire(&replacement_epoch, &replacement_target) {
+            BackendAdmissionDecision::Reject { status_code, .. } => {
+                assert_eq!(status_code, 503)
+            }
+            _ => panic!("replacement route-override target should remain limited"),
+        }
+        drop(held);
+    }
+
+    #[test]
     fn lb_only_target_update_resets_adaptive_concurrency_key_space() {
         let mut protected_proxy = proxy("p1", "/one", vec!["adaptive"]);
         protected_proxy.upstream_id = Some("u1".to_string());
@@ -878,6 +1000,8 @@ impl RequestEpochStore {
             return Ok(None);
         };
 
+        let changed_upstream_ids =
+            changed_upstream_endpoint_ids(&current.load_balancer, &staged.load_balancer);
         let proxy_index_by_id = build_proxy_index_by_id(&staged.config);
         let next = Arc::new(RequestEpoch {
             config: staged.config,
@@ -904,13 +1028,12 @@ impl RequestEpochStore {
         // new plugin objects can both admit during this handoff because their
         // target counters are shared; structural replacements remain draining.
         next.plugin_cache.prepare_adaptive_concurrency_generations();
-        let unchanged_upstream_ids = HashSet::new();
         next.plugin_cache
-            .prepare_adaptive_concurrency_lb_generation(next.lb_generation, &unchanged_upstream_ids);
+            .prepare_adaptive_concurrency_lb_generation(next.lb_generation, &changed_upstream_ids);
         self.current.store(Arc::clone(&next));
         next.plugin_cache.commit_adaptive_concurrency_generations();
         next.plugin_cache
-            .commit_adaptive_concurrency_lb_generation(next.lb_generation, &unchanged_upstream_ids);
+            .commit_adaptive_concurrency_lb_generation(next.lb_generation, &changed_upstream_ids);
         // Compatibility wrapper caches are mirrored while the epoch writer lock
         // is still held so service discovery and config reloads cannot publish
         // newer epochs and then be overwritten by an older post-lock mirror.

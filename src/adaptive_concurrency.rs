@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -126,6 +127,10 @@ struct AdaptiveConcurrencyPolicyLifecycle {
     /// handoff because they share the same target counters.
     pending_generation: AtomicU64,
     pending_requires_drain: AtomicBool,
+    /// Latest committed admission configuration. A request pinned to an older
+    /// compatible plugin view must use these bounds instead of reviving its
+    /// retired minimum, initial limit, key cap, or shadow-mode setting.
+    active_config: ArcSwapOption<AdaptiveConcurrencyPolicyConfig>,
     /// Permits across every target key. This is used only as a cold-generation
     /// transition barrier; ordinary admission remains target-local.
     total_in_flight: AtomicU64,
@@ -142,6 +147,11 @@ struct AdaptiveConcurrencyPolicyLifecycle {
     transition_state: AtomicU8,
 }
 
+struct AdaptiveConcurrencyPolicyConfig {
+    generation: u64,
+    config: Arc<AdaptiveConcurrencyConfig>,
+}
+
 impl AdaptiveConcurrencyPolicyLifecycle {
     fn new() -> Self {
         Self {
@@ -153,6 +163,7 @@ impl AdaptiveConcurrencyPolicyLifecycle {
             pending_lb_requires_drain: AtomicBool::new(false),
             pending_generation: AtomicU64::new(0),
             pending_requires_drain: AtomicBool::new(false),
+            active_config: ArcSwapOption::empty(),
             total_in_flight: AtomicU64::new(0),
             feedback_in_progress: AtomicU64::new(0),
             feedback_blocked: AtomicBool::new(false),
@@ -220,85 +231,134 @@ impl AdaptiveConcurrencyLimiter {
         &self,
         proxy: &Proxy,
         target: Option<&UpstreamTarget>,
-        config: Arc<AdaptiveConcurrencyConfig>,
+        request_config: Arc<AdaptiveConcurrencyConfig>,
         generation: u64,
         lb_generation: u64,
     ) -> Result<Arc<AdaptiveConcurrencyPermit>, AdaptiveConcurrencyLimitExceeded> {
-        self.reserve_policy_slot(generation, lb_generation, &config)?;
-        let key = build_key(self.resolve_scope(proxy, config.key_by), proxy, target);
-        let state = match self.inner.entry(key) {
-            Entry::Occupied(entry) => Arc::clone(entry.get()),
-            Entry::Vacant(entry) => match self.reserve_key_slot(config.max_tracked_keys) {
-                Ok(()) => {
-                    let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
-                    entry.insert(Arc::clone(&state));
-                    state
-                }
-                Err(_) => {
-                    // Key-cardinality cap reached. Fail OPEN with a per-request,
-                    // untracked state rather than rejecting: `max_tracked_keys`
-                    // only bounds the limiter's own memory, so a target beyond
-                    // the cap must still be admitted (never black-holed by a
-                    // blanket 503), and `shadow_mode` must never reject at all.
-                    // This state is NOT inserted into the map (memory stays
-                    // bounded) and dies with the permit, so overflow targets run
-                    // without adaptive limiting until the policy is removed and
-                    // recreated (or a structural key-space change resets it).
-                    // Starting at `in_flight = 0` it always admits below.
-                    drop(entry);
-                    Arc::new(AdaptiveConcurrencyState::new(config.initial_limit))
-                }
-            },
-        };
-
-        loop {
-            let current = state.in_flight.load(Ordering::Relaxed);
-            // During the two-phase cache handoff, compatible old/new plugin
-            // objects can briefly admit together. Each enforces its own
-            // validated bounds against the shared learned limit.
-            let limit = state
-                .limit
-                .load(Ordering::Acquire)
-                .max(config.min_limit)
-                .min(config.max_limit);
-            if current >= limit && !config.shadow_mode {
-                state.rejections.fetch_add(1, Ordering::Relaxed);
-                self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
-                return Err(AdaptiveConcurrencyLimitExceeded {
-                    current_in_flight: current,
-                    limit,
-                });
-            }
-
-            match state.in_flight.compare_exchange_weak(
-                current,
-                current.saturating_add(1),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // A cache activation may race this cold target lookup/CAS.
-                    // Roll back instead of returning a permit owned by a
-                    // retired policy generation or crossing a structural
-                    // generation drain barrier.
-                    if !self.policy_generation_admitted(generation, lb_generation) {
-                        state.in_flight.fetch_sub(1, Ordering::AcqRel);
-                        self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
-                        return Err(self.policy_transition_rejection(&config));
+        'admission: loop {
+            let (config, config_generation) =
+                self.admission_config(generation, Arc::clone(&request_config));
+            self.reserve_policy_slot(generation, lb_generation, &config)?;
+            let key = build_key(self.resolve_scope(proxy, config.key_by), proxy, target);
+            let state = match self.inner.entry(key) {
+                Entry::Occupied(entry) => Arc::clone(entry.get()),
+                Entry::Vacant(entry) => match self.reserve_key_slot(config.max_tracked_keys) {
+                    Ok(()) => {
+                        let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
+                        entry.insert(Arc::clone(&state));
+                        state
                     }
-                    let feedback_epoch = state.feedback_epoch.load(Ordering::Acquire);
-                    return Ok(Arc::new(AdaptiveConcurrencyPermit {
-                        state,
-                        config,
-                        policy: Arc::clone(&self.policy),
-                        policy_generation: generation,
-                        lb_generation,
-                        feedback_epoch,
-                        recorded: AtomicBool::new(false),
-                    }));
+                    Err(_) => {
+                        // Key-cardinality cap reached. Fail OPEN with a per-request,
+                        // untracked state rather than rejecting: `max_tracked_keys`
+                        // only bounds the limiter's own memory, so a target beyond
+                        // the cap must still be admitted (never black-holed by a
+                        // blanket 503), and `shadow_mode` must never reject at all.
+                        // This state is NOT inserted into the map (memory stays
+                        // bounded) and dies with the permit, so overflow targets run
+                        // without adaptive limiting until the policy is removed and
+                        // recreated (or a structural key-space change resets it).
+                        // Starting at `in_flight = 0` it always admits below.
+                        drop(entry);
+                        Arc::new(AdaptiveConcurrencyState::new(config.initial_limit))
+                    }
+                },
+            };
+
+            loop {
+                let current = state.in_flight.load(Ordering::Relaxed);
+                // During the two-phase cache handoff, compatible old/new plugin
+                // objects can briefly admit together. After commit, an old view
+                // uses the replacement admission configuration.
+                let limit = state
+                    .limit
+                    .load(Ordering::Acquire)
+                    .max(config.min_limit)
+                    .min(config.max_limit);
+                if current >= limit && !config.shadow_mode {
+                    if !self.admission_config_current(config_generation) {
+                        self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
+                        self.clamp_to_active_config(&state);
+                        continue 'admission;
+                    }
+                    state.rejections.fetch_add(1, Ordering::Relaxed);
+                    self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
+                    return Err(AdaptiveConcurrencyLimitExceeded {
+                        current_in_flight: current,
+                        limit,
+                    });
                 }
-                Err(_) => continue,
+
+                match state.in_flight.compare_exchange_weak(
+                    current,
+                    current.saturating_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        // A cache activation may race this cold target lookup/CAS.
+                        // Roll back instead of returning a permit owned by a
+                        // retired policy generation, crossing a structural drain,
+                        // or applying an admission config superseded by commit.
+                        let generation_admitted =
+                            self.policy_generation_admitted(generation, lb_generation);
+                        let config_current = self.admission_config_current(config_generation);
+                        if !generation_admitted || !config_current {
+                            state.in_flight.fetch_sub(1, Ordering::AcqRel);
+                            self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
+                            if generation_admitted && !config_current {
+                                self.clamp_to_active_config(&state);
+                                continue 'admission;
+                            }
+                            return Err(self.policy_transition_rejection(&config));
+                        }
+                        let feedback_epoch = state.feedback_epoch.load(Ordering::Acquire);
+                        return Ok(Arc::new(AdaptiveConcurrencyPermit {
+                            state,
+                            config,
+                            policy: Arc::clone(&self.policy),
+                            policy_generation: generation,
+                            lb_generation,
+                            feedback_epoch,
+                            recorded: AtomicBool::new(false),
+                        }));
+                    }
+                    Err(_) => continue,
+                }
             }
+        }
+    }
+
+    fn admission_config(
+        &self,
+        generation: u64,
+        config: Arc<AdaptiveConcurrencyConfig>,
+    ) -> (Arc<AdaptiveConcurrencyConfig>, u64) {
+        let active = self.policy.active_config.load();
+        match active
+            .as_ref()
+            .filter(|active| active.generation > generation)
+        {
+            Some(active) => (Arc::clone(&active.config), active.generation),
+            None => (config, generation),
+        }
+    }
+
+    fn admission_config_current(&self, config_generation: u64) -> bool {
+        self.policy
+            .active_config
+            .load()
+            .as_ref()
+            .is_none_or(|active| active.generation <= config_generation)
+    }
+
+    fn clamp_to_active_config(&self, state: &AdaptiveConcurrencyState) {
+        if let Some(active) = self.policy.active_config.load().as_ref() {
+            clamp_limit(
+                &state.limit,
+                active.config.min_limit,
+                active.config.max_limit,
+            );
         }
     }
 
@@ -431,7 +491,7 @@ impl AdaptiveConcurrencyLimiter {
     pub(crate) fn commit_policy_generation(
         &self,
         generation: u64,
-        config: &AdaptiveConcurrencyConfig,
+        config: Arc<AdaptiveConcurrencyConfig>,
         drain_older_generation: bool,
     ) {
         let mut current = self.policy.active_generation.load(Ordering::Acquire);
@@ -466,6 +526,21 @@ impl AdaptiveConcurrencyLimiter {
                 .minimum_admission_generation
                 .fetch_max(generation, Ordering::AcqRel);
         }
+
+        let replacement_config = Arc::new(AdaptiveConcurrencyPolicyConfig {
+            generation,
+            config: Arc::clone(&config),
+        });
+        self.policy.active_config.rcu(|current| {
+            if current
+                .as_ref()
+                .is_some_and(|active| active.generation >= generation)
+            {
+                current.clone()
+            } else {
+                Some(Arc::clone(&replacement_config))
+            }
+        });
 
         loop {
             if generation <= current {

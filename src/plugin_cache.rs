@@ -670,6 +670,7 @@ struct AdaptiveConcurrencyRouteKey {
     scope: String,
     host: Option<String>,
     port: Option<u16>,
+    subset: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -837,6 +838,7 @@ fn adaptive_concurrency_route_definition(
                         scope,
                         host: None,
                         port: None,
+                        subset: proxy.upstream_subset.clone(),
                     });
                 } else {
                     keys.extend(upstream.targets.iter().map(|target| {
@@ -844,6 +846,7 @@ fn adaptive_concurrency_route_definition(
                             scope: scope.clone(),
                             host: Some(target.host.clone()),
                             port: Some(target.port),
+                            subset: proxy.upstream_subset.clone(),
                         }
                     }));
                 }
@@ -855,6 +858,7 @@ fn adaptive_concurrency_route_definition(
             scope,
             host: Some(proxy.backend_host.clone()),
             port: Some(proxy.backend_port),
+            subset: proxy.upstream_subset.clone(),
         });
     }
     keys.sort_unstable();
@@ -1023,9 +1027,7 @@ fn create_adaptive_concurrency_plugin(
         )
     } else {
         (
-            Arc::new(AdaptiveConcurrencyLimiter::new(
-                http_client.pool_shard_amount(),
-            )),
+            Arc::new(AdaptiveConcurrencyLimiter::new(http_client.pool_shard_amount())),
             1,
             false,
         )
@@ -1368,7 +1370,7 @@ impl PluginCacheInner {
         for instance in self.adaptive_concurrency_instances.values() {
             instance.limiter.commit_policy_generation(
                 instance.generation,
-                &instance.config,
+                Arc::clone(&instance.config),
                 instance.drain_older_generation,
             );
         }
