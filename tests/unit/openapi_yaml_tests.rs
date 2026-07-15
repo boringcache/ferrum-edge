@@ -1345,12 +1345,7 @@ fn workload_metrics_schema_documents_runtime_tag_limits() {
         "custom_tags": custom_tags,
         "custom_header_tags": custom_header_tags,
     });
-    assert_component_validity(
-        &spec,
-        "WorkloadMetricsConfig",
-        &combined_32,
-        true,
-    );
+    assert_component_validity(&spec, "WorkloadMetricsConfig", &combined_32, true);
     assert!(WorkloadMetrics::new(&combined_32).is_ok());
 
     let mut combined_33 = combined_32;
@@ -1360,12 +1355,7 @@ fn workload_metrics_schema_documents_runtime_tag_limits() {
         .insert("header_16".to_string(), json!("x-tag"));
     // The per-map OpenAPI bounds cannot express a sum across two objects; the
     // property descriptions carry that contract and runtime rejects the union.
-    assert_component_validity(
-        &spec,
-        "WorkloadMetricsConfig",
-        &combined_33,
-        true,
-    );
+    assert_component_validity(&spec, "WorkloadMetricsConfig", &combined_33, true);
     assert!(WorkloadMetrics::new(&combined_33).is_err());
 }
 

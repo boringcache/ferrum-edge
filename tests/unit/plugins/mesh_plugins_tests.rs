@@ -5485,6 +5485,18 @@ fn trace_header_remover(header: &str) -> RequestTransformer {
     .expect("trace header removal config")
 }
 
+fn trace_header_replacer(header: &str, value: &str) -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": header,
+            "value": value
+        }]
+    }))
+    .expect("trace header replacement config")
+}
+
 fn inbound_trace_headers() -> HashMap<String, String> {
     HashMap::from([
         (
@@ -5493,6 +5505,84 @@ fn inbound_trace_headers() -> HashMap<String, String> {
         ),
         ("tracestate".to_string(), "vendor=value".to_string()),
     ])
+}
+
+#[tokio::test]
+async fn workload_metrics_propagates_valid_traceparent_replacement_as_authoritative() {
+    let metrics = workload_metrics_tracing_plugin();
+    let original_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let replacement_trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let replacement_parent_span_id = "bbbbbbbbbbbbbbbb";
+    let replacement_traceparent =
+        format!("00-{replacement_trace_id}-{replacement_parent_span_id}-00");
+    let transformer = trace_header_replacer("TraceParent", &replacement_traceparent);
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some(original_trace_id)
+    );
+    assert_eq!(
+        ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("true")
+    );
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let transformed_traceparent = headers
+        .remove("traceparent")
+        .expect("transformer replaced traceparent");
+    headers.insert("TraceParent".to_string(), transformed_traceparent);
+    let transformed_tracestate = headers
+        .remove("tracestate")
+        .expect("inbound tracestate retained");
+    headers.insert("TraceState".to_string(), transformed_tracestate);
+
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let propagated = headers
+        .get("traceparent")
+        .expect("replacement traceparent propagated");
+    assert!(propagated.starts_with(&format!("00-{replacement_trace_id}-")));
+    assert!(propagated.ends_with("-00"));
+    assert!(!propagated.contains(original_trace_id));
+    assert_eq!(
+        headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("traceparent"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        headers.get("tracestate").map(String::as_str),
+        Some("vendor=value")
+    );
+    assert!(!headers.contains_key("TraceState"));
+    assert_eq!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some(replacement_trace_id)
+    );
+    assert_eq!(
+        ctx.metadata.get("parent_span_id").map(String::as_str),
+        Some(replacement_parent_span_id)
+    );
+    assert_ne!(
+        ctx.metadata.get("span_id").map(String::as_str),
+        Some(replacement_parent_span_id)
+    );
+    assert_eq!(
+        ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        ctx.metadata.get("traceparent").map(String::as_str),
+        Some(propagated.as_str())
+    );
 }
 
 #[tokio::test]

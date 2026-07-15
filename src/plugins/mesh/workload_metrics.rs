@@ -414,25 +414,31 @@ impl WorkloadMetrics {
     ) {
         // `on_request_received` captures inbound W3C context so authorization
         // rejects remain observable. For accepted requests, request_transformer
-        // runs before this hook and its final header policy is authoritative:
-        // never restore an inbound trace header that it removed. Trace IDs and
-        // sampling metadata remain available for the local span/reject record.
-        if ctx
-            .metadata
-            .remove(CAPTURED_TRACEPARENT_METADATA)
-            .is_some()
-            && !has_valid_traceparent(headers)
-        {
-            ctx.metadata.remove(TRACEPARENT_HEADER);
-            // A transformer may replace a valid inbound value with malformed
-            // hostile input. Drop that value rather than forwarding it or
-            // replacing it with the early cached context.
-            headers.retain(|name, _| !name.eq_ignore_ascii_case(TRACEPARENT_HEADER));
+        // runs before this hook and its final header policy is authoritative.
+        // A valid final value replaces every early-derived trace field; a
+        // removed or malformed value stays suppressed while the early IDs and
+        // sampling decision remain available for the local span/reject record.
+        if ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA).is_some() {
+            if has_valid_traceparent(headers) {
+                for key in [
+                    "trace_id",
+                    "span_id",
+                    "parent_span_id",
+                    "trace_sampled",
+                    TRACEPARENT_HEADER,
+                ] {
+                    ctx.metadata.remove(key);
+                }
+                ensure_trace_metadata(&mut ctx.metadata, headers);
+            } else {
+                ctx.metadata.remove(TRACEPARENT_HEADER);
+                // A transformer may replace a valid inbound value with malformed
+                // hostile input. Drop that value rather than forwarding it or
+                // replacing it with the early cached context.
+                headers.retain(|name, _| !name.eq_ignore_ascii_case(TRACEPARENT_HEADER));
+            }
         }
-        if ctx
-            .metadata
-            .remove(CAPTURED_TRACESTATE_METADATA)
-            .is_some()
+        if ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA).is_some()
             && header_value(headers, TRACESTATE_HEADER).is_none()
         {
             ctx.metadata.remove(TRACESTATE_HEADER);
@@ -773,10 +779,8 @@ impl Plugin for WorkloadMetrics {
             );
         }
         if captured_tracestate && ctx.metadata.contains_key(TRACESTATE_HEADER) {
-            ctx.metadata.insert(
-                CAPTURED_TRACESTATE_METADATA.to_string(),
-                "true".to_string(),
-            );
+            ctx.metadata
+                .insert(CAPTURED_TRACESTATE_METADATA.to_string(), "true".to_string());
         }
         ctx.headers = headers;
         PluginResult::Continue
@@ -790,10 +794,10 @@ impl Plugin for WorkloadMetrics {
         self.reconcile_captured_trace_headers(ctx, headers);
         self.annotate_http_context(ctx, headers);
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
-            headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
+            set_header_case_insensitive(headers, TRACEPARENT_HEADER, traceparent);
         }
         if let Some(tracestate) = ctx.metadata.get(TRACESTATE_HEADER) {
-            headers.insert(TRACESTATE_HEADER.to_string(), tracestate.clone());
+            set_header_case_insensitive(headers, TRACESTATE_HEADER, tracestate);
         }
         PluginResult::Continue
     }
@@ -1623,6 +1627,11 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
     })
+}
+
+fn set_header_case_insensitive(headers: &mut HashMap<String, String>, name: &str, value: &str) {
+    headers.retain(|header_name, _| !header_name.eq_ignore_ascii_case(name));
+    headers.insert(name.to_string(), value.to_string());
 }
 
 fn has_valid_traceparent(headers: &HashMap<String, String>) -> bool {
