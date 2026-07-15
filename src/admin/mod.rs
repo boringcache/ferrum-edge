@@ -2819,6 +2819,16 @@ async fn persist_consumer_update(
     mut consumer: Consumer,
     success_status: StatusCode,
 ) -> Response<Full<Bytes>> {
+    // Every credential endpoint rewrites the complete Consumer and rebuilds
+    // its credential index entries. Revalidate retained HMAC credentials even
+    // when the requested mutation targets another credential type, so stale or
+    // out-of-band duplicates fail before the datastore uniqueness backstop.
+    if !consumer.credential_entries("hmac_auth").is_empty()
+        && let Err(response) =
+            ensure_hmac_consumer_candidate(db, &consumer.namespace, &consumer).await
+    {
+        return *response;
+    }
     consumer.updated_at = Utc::now();
     match db.update_consumer(&consumer).await {
         // The consumer vanished between the namespace-scoped load and the
@@ -3411,12 +3421,6 @@ async fn handle_update_credentials(
     {
         return Ok(*resp);
     }
-    if cred_type == "hmac_auth"
-        && let Err(resp) = ensure_hmac_consumer_candidate(db.as_ref(), namespace, &consumer).await
-    {
-        return Ok(*resp);
-    }
-
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
     if response.status().is_success() {
         let event = audit::AuditEvent::new(
@@ -3580,12 +3584,6 @@ async fn handle_append_credential(
     {
         return Ok(*resp);
     }
-    if cred_type == "hmac_auth"
-        && let Err(resp) = ensure_hmac_consumer_candidate(db.as_ref(), namespace, &consumer).await
-    {
-        return Ok(*resp);
-    }
-
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
     if response.status().is_success() {
         let event = audit::AuditEvent::new(

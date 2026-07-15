@@ -1604,6 +1604,77 @@ async fn test_batch_create_rejects_hmac_secret_reused_by_persisted_consumer() {
 }
 
 #[tokio::test]
+async fn non_hmac_credential_update_revalidates_retained_hmac_credentials() {
+    let tc = TestConfig::default();
+    let (state, temp_dir) = create_db_admin_state(&tc).await;
+    let db_path = temp_dir.path().join("test_batch.db");
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let shared_secret = "retained-hmac-secret-at-least-32-characters";
+    let owner = json!({
+        "id": "retained-hmac-owner",
+        "username": "alice",
+        "credentials": {"hmac_auth": [{"secret": shared_secret}]}
+    });
+    let stale = json!({
+        "id": "retained-hmac-stale",
+        "username": "bob",
+        "credentials": {"hmac_auth": [{
+            "secret": "original-hmac-secret-at-least-32-characters"
+        }]}
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &owner).await;
+    assert_eq!(status, 201, "HMAC owner seed failed: {body:?}");
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &stale).await;
+    assert_eq!(status, 201, "stale consumer seed failed: {body:?}");
+
+    // Simulate a legacy/out-of-band row whose HMAC credential no longer agrees
+    // with its datastore index entry. A non-HMAC mutation still rewrites the
+    // complete Consumer and must detect this collision before persistence.
+    let db_url = format!("sqlite:{}?mode=rw", db_path.to_string_lossy());
+    let pool = sqlx::SqlitePool::connect(&db_url)
+        .await
+        .expect("connect raw SQLite pool");
+    sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
+        .bind(json!({"hmac_auth": [{"secret": shared_secret}]}).to_string())
+        .bind("ferrum")
+        .bind("retained-hmac-stale")
+        .execute(&pool)
+        .await
+        .expect("inject stale HMAC credential");
+
+    let (status, body) = admin_put(
+        &base_url,
+        "/consumers/retained-hmac-stale/credentials/keyauth",
+        &token,
+        &json!([{"key": "new-keyauth-credential"}]),
+    )
+    .await;
+
+    assert_eq!(status, 409, "retained HMAC collision was not rejected: {body:?}");
+    assert!(
+        body.to_string()
+            .contains("Duplicate hmac_auth shared secret"),
+        "collision must be reported by candidate validation, not the datastore backstop: {body:?}"
+    );
+    assert!(
+        !body.to_string().contains(shared_secret),
+        "collision response must not disclose the HMAC secret"
+    );
+    let (status, consumer, _) = admin_get(
+        &base_url,
+        "/consumers/retained-hmac-stale",
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        consumer["credentials"].get("keyauth").is_none(),
+        "rejected non-HMAC mutation must not be persisted"
+    );
+}
+
+#[tokio::test]
 async fn test_batch_create_plugin_configs() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
