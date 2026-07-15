@@ -80,12 +80,109 @@ pub use router_cache::{RouteMatch, RouterCache};
 pub mod _test_support {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use hyper::StatusCode;
 
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
+
+    // ── adaptive_concurrency lifecycle ──────────────────────────────────────
+    pub struct AdaptiveConcurrencyDecreaseHarness {
+        limit: AtomicU64,
+        config: crate::adaptive_concurrency::AdaptiveConcurrencyConfig,
+    }
+
+    impl AdaptiveConcurrencyDecreaseHarness {
+        pub fn new(
+            initial_limit: u64,
+            min_limit: u64,
+            max_limit: u64,
+            decrease_ratio: f64,
+        ) -> Self {
+            Self {
+                limit: AtomicU64::new(initial_limit),
+                config: crate::adaptive_concurrency::AdaptiveConcurrencyConfig {
+                    key_by: crate::adaptive_concurrency::AdaptiveConcurrencyKeyBy::Proxy,
+                    max_tracked_keys: 1,
+                    min_limit,
+                    initial_limit,
+                    max_limit,
+                    min_samples: 1,
+                    target_latency_multiplier: 1.5,
+                    decrease_ratio,
+                    increase_step: 1,
+                    shadow_mode: false,
+                    expose_headers: false,
+                },
+            }
+        }
+
+        pub fn limit(&self) -> u64 {
+            self.limit.load(Ordering::Acquire)
+        }
+
+        pub fn decrease_from_observed_limit(&self, observed_limit: u64) {
+            crate::adaptive_concurrency::decrease_limit(&self.limit, &self.config, observed_limit);
+        }
+    }
+
+    pub struct AdaptiveConcurrencyTransitionHarness {
+        transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition,
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct AdaptiveConcurrencyResetToken {
+        reset: crate::adaptive_concurrency::AdaptiveConcurrencyResetEpoch,
+    }
+
+    impl AdaptiveConcurrencyTransitionHarness {
+        pub fn new() -> Self {
+            Self {
+                transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition::new(),
+            }
+        }
+
+        pub fn observe(&self) -> u64 {
+            self.transition.load()
+        }
+
+        pub fn begin_structural_reset(&self) -> AdaptiveConcurrencyResetToken {
+            AdaptiveConcurrencyResetToken {
+                reset: self.transition.begin_structural_reset(),
+            }
+        }
+
+        pub fn try_begin_structural_reset(&self) -> Option<AdaptiveConcurrencyResetToken> {
+            self.transition
+                .try_begin_structural_reset()
+                .map(|reset| AdaptiveConcurrencyResetToken { reset })
+        }
+
+        pub fn try_begin_observed_drain_reset(
+            &self,
+            observed: u64,
+        ) -> Option<AdaptiveConcurrencyResetToken> {
+            self.transition
+                .try_begin_drain_reset(observed)
+                .map(|reset| AdaptiveConcurrencyResetToken { reset })
+        }
+
+        pub fn finish_reset(&self, reset: AdaptiveConcurrencyResetToken, drain: bool) -> bool {
+            self.transition.finish_reset(reset.reset, drain)
+        }
+
+        pub fn is_active(&self) -> bool {
+            self.transition.is_active()
+        }
+    }
+
+    impl Default for AdaptiveConcurrencyTransitionHarness {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 
     #[allow(dead_code)] // owning the guard is the behavior exercised by cancellation tests
     pub struct JwksDiscoveryCandidateForTest(
