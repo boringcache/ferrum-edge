@@ -299,6 +299,17 @@ impl BufferedInitialResponseHeaderPolicyState {
             return;
         }
 
+        self.record_later_response_header_mutations(response_headers);
+    }
+
+    /// Advance policy-owned initial-header state after a later response phase
+    /// changes representation metadata. Body transforms run after the ordered
+    /// `after_proxy` chain, so their final edits and removals must remain
+    /// authoritative when the buffered response is split back onto the wire.
+    pub fn record_later_response_header_mutations(
+        &mut self,
+        response_headers: &HashMap<String, String>,
+    ) {
         for name in self.header_names.iter() {
             let observed = self.observed_headers.get(name);
             let current = response_headers.get(name);

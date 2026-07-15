@@ -965,6 +965,41 @@ async fn buffered_policy_state_preserves_later_header_mutator_order() {
 }
 
 #[test]
+fn buffered_policy_state_preserves_body_transform_validator_removal() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": { "ETag": "\"gateway-policy\"" }
+        }))
+        .unwrap(),
+    );
+    let initial_headers = HashMap::new();
+    let mut plugin_view = HashMap::new();
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &initial_headers,
+        &plugin_view,
+    )
+    .unwrap();
+
+    policy.apply_initial_response_header_policy(&mut plugin_view);
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+    assert_eq!(
+        plugin_view.get("etag").map(String::as_str),
+        Some("\"gateway-policy\"")
+    );
+
+    plugin_view.remove("etag");
+    policy_state.record_later_response_header_mutations(&plugin_view);
+    let mut initial_headers = HashMap::new();
+    policy_state.apply_to_initial_headers(&mut initial_headers);
+
+    assert!(
+        !initial_headers.contains_key("etag"),
+        "a body transform must be able to remove a stale policy-owned validator"
+    );
+}
+
+#[test]
 fn buffered_policy_overlay_preserves_transform_owned_content_length() {
     let policy: Arc<dyn Plugin> = Arc::new(
         SecurityHeaders::new(&json!({

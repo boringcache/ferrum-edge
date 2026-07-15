@@ -3647,6 +3647,10 @@ where
                     plugin.on_response_body_transformed(ctx, &mut plugin_response_headers);
                 }
             }
+            if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
+                Arc::make_mut(policy_state)
+                    .record_later_response_header_mutations(&plugin_response_headers);
+            }
             for plugin in plugins.iter() {
                 let result = plugin
                     .on_final_response_body(
