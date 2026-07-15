@@ -16281,7 +16281,8 @@ components:
 
     AiResponseGuardConfig:
       type: object
-      description: "Plugin: ai_response_guard — Validates and filters AI/LLM API responses for PII, blocked content, and structural requirements."
+      additionalProperties: false
+      description: "Plugin: ai_response_guard — HTTP-only validation and filtering for AI/LLM API responses. Enforcing actions fail closed when a governed buffered response is oversized or uninspectable. Native gRPC protobuf messages are not supported."
       anyOf:
         - required: [pii_patterns]
           properties:
@@ -16316,24 +16317,28 @@ components:
           type: string
           enum: [reject, redact, warn]
           default: reject
-          description: "Action when a violation is detected in the response body. NOTE: in redact mode over Server-Sent Events (text/event-stream), PII that spans two or more consecutive `data:` frames is detected on the accumulated stream but cannot be redacted per-frame and passes through to the client (only a warn log is emitted). Use action=reject for a hard guarantee that frame-straddling PII is blocked."
+          description: "Action when a violation is detected in the response body. Buffered SSE is parsed and redacted by complete event; content spanning events that cannot be safely rewritten is rejected. Live SSE requests are never re-buffered by this plugin."
         pii_patterns:
           type: array
           items:
             type: string
+            enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
           default: []
           description: "Built-in PII pattern names to scan for (e.g., ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban)"
         custom_pii_patterns:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [name, regex]
             properties:
               name:
                 type: string
+                minLength: 1
                 description: Pattern identifier used in redaction placeholders and violation reports
               regex:
                 type: string
+                minLength: 1
                 description: Regular expression pattern to match
           default: []
           description: "Custom PII {name, regex} patterns for domain-specific detection"
@@ -16341,19 +16346,23 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
           default: []
-          description: Exact phrases to block in response content (case-insensitive)
+          description: Exact phrases to block in response content (case-insensitive). Literal values are never exposed in placeholders, metadata, logs, or reject bodies; bounded positional rule IDs are used instead.
         blocked_patterns:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [name, regex]
             properties:
               name:
                 type: string
+                minLength: 1
                 description: Pattern identifier for violation reports
               regex:
                 type: string
+                minLength: 1
                 description: Regular expression pattern to match
           default: []
           description: "Custom {name, regex} patterns for blocking arbitrary content in responses"
@@ -16361,15 +16370,16 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: "Which response fields to scan: 'content' scans message content only, 'all' scans the entire response body"
+          description: "Which response fields to scan: 'content' scans supported completion and tool/function-call fields, 'all' scans the entire response body"
         redaction_placeholder:
           type: string
           default: "[REDACTED:{type}]"
           description: "Template for redacted text. {type} is replaced with the pattern name"
         max_scan_bytes:
           type: integer
+          minimum: 1
           default: 1048576
-          description: Skip scanning if response body exceeds this size in bytes
+          description: Maximum governed buffered response size. Reject/redact and structural rules fail closed above this limit; warn-only content rules record a bounded warning and pass through.
         require_json:
           type: boolean
           default: false
@@ -16378,10 +16388,12 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
           default: []
           description: JSON field names that must be present in the response body
         max_completion_length:
           type: integer
+          minimum: 0
           default: 0
           description: "Maximum allowed length of completion content, measured in characters (Unicode scalar values, not UTF-8 bytes). 0 = no limit"
 

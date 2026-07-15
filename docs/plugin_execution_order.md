@@ -617,6 +617,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `ai_prompt_shield` | ✓ | ✓ | | | | Scans bare JSON request bodies for PII; native protobuf/framed gRPC is outside its JSON inspection scope |
 | `ai_semantic_firewall` | ✓ | | | | | HTTP-only semantic inspection for LLM JSON request and response bodies |
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
+| `ai_response_guard` | ✓ | | | | | HTTP-only JSON/SSE/text response inspection; native gRPC protobuf framing is unsupported |
 | `ai_stream_router` | ✓ | | | | | Claims `stream: true` OpenAI Chat Completions, route-overrides to a provider, normalizes provider SSE to OpenAI SSE |
 | `ai_federation` | ✓ | ✓ | | | | Routes to AI providers, normalizes responses |
 | `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, routes namespaced MCP tools/resources/prompts, and reverse-maps routed JSON results |

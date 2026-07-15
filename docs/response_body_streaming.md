@@ -179,7 +179,7 @@ Built-in plugins with per-request refinement:
 | `compression` | `Accept-Encoding` header is absent (nothing to compress) |
 | `ai_token_metrics` | Request is native gRPC, or the client asked for a stream (`Accept: text/event-stream` / a `stream: true` request) without `buffer_streaming_responses: true` (pre-header); additionally, after headers, when the response content type is not JSON, or is `text/event-stream` without `buffer_streaming_responses: true` |
 | `ai_rate_limiter` | Never for active HTTP/gRPC responses; response usage reconciliation needs the body. Its pre-request reservation path only buffers request bodies for JSON `POST` requests. |
-| `ai_response_guard` | Request is not POST+JSON |
+| `ai_response_guard` | Client requested SSE (`Accept: text/event-stream`) or an earlier AI request plugin marked the request as streaming; all other HTTP requests request buffering, then response status/content type determine inspection |
 
 The decision in code:
 
