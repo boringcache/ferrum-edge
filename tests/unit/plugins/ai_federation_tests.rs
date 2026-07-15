@@ -2798,6 +2798,87 @@ async fn completed_federation_call_publishes_non_replayable_dedup_tombstone() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn prewire_concurrency_rejection_releases_dedup_inflight_marker() {
+    let server = MockServer::start().await;
+    let federation_config = json!({
+        "max_concurrent_requests": 1,
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"],
+            "base_url": server.uri(),
+            "allow_plaintext": true
+        }]
+    });
+    let federation =
+        ai_federation::AiFederation::new(&federation_config, create_test_http_client()).unwrap();
+    let dedup = RequestDeduplication::new(
+        &json!({
+            "applicable_methods": ["POST"],
+            "enforce_required": true
+        }),
+        create_test_http_client(),
+    )
+    .unwrap();
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let mut headers = json_headers();
+    headers.insert(
+        "idempotency-key".to_string(),
+        "federation-concurrency-1".to_string(),
+    );
+    let mut first_ctx = post_json_ctx(&request);
+
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    test_helpers::close_request_slots_for_test(&federation);
+    let (status, response_headers, response_body) =
+        match run_federation_final_body(&federation, &mut first_ctx, &headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected concurrency rejection, got {other:?}"),
+        };
+    assert_eq!(status, 503);
+    assert_eq!(
+        first_ctx
+            .metadata
+            .get("ferrum:release_dedup_inflight_on_commit"),
+        Some(&"true".to_string())
+    );
+    assert!(
+        !first_ctx
+            .metadata
+            .contains_key("ferrum:external_operation_completed")
+    );
+
+    // Non-2xx synthetic responses skip the response-body hook. The committed
+    // hook must still release the pre-I/O ownership marker.
+    dedup
+        .on_response_committed(
+            &mut first_ctx,
+            status,
+            &response_headers,
+            response_body.as_ref(),
+        )
+        .await;
+
+    let mut retry_ctx = post_json_ctx(&request);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
 fn two_provider_config(primary: &MockServer, secondary: &MockServer) -> Value {
     json!({
         "providers": [
@@ -2860,6 +2941,111 @@ async fn malformed_success_response_falls_through_to_next_provider() {
     assert_eq!(
         ctx.metadata.get("ai_federation_provider"),
         Some(&"secondary".to_string())
+    );
+}
+
+#[tokio::test]
+async fn malformed_success_records_original_provider_status_before_normalization() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let config = json!({
+        "fallback_enabled": false,
+        "providers": [{
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "model_patterns": ["gpt-*"],
+            "base_url": server.uri(),
+            "allow_plaintext": true
+        }]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let mut ctx = post_json_ctx(&request);
+
+    let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
+    assert!(matches!(
+        result,
+        PluginResult::RejectBinary {
+            status_code: 502,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata.get("ai_federation_provider"),
+        Some(&"primary".to_string())
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_federation_status"),
+        Some(&"200".to_string())
+    );
+}
+
+#[tokio::test]
+async fn normalized_size_failure_preserves_original_provider_status() {
+    let server = MockServer::start().await;
+    let native = json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{
+                    "functionCall": {
+                        "name": "lookup",
+                        "args": {"quoted": "\\\"\\\"\\\"\\\"\\\"\\\"\\\"\\\""}
+                    }
+                }]
+            },
+            "finishReason": "STOP"
+        }]
+    });
+    let native_bytes = serde_json::to_vec(&native).unwrap();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(native_bytes.clone()))
+        .mount(&server)
+        .await;
+    let config = json!({
+        "fallback_enabled": false,
+        "providers": [{
+            "name": "gemini",
+            "provider_type": "google_gemini",
+            "api_key": "gemini-test",
+            "model_patterns": ["gemini-*"],
+            "base_url": server.uri(),
+            "allow_plaintext": true,
+            "max_response_body_bytes": native_bytes.len()
+        }]
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    let request = json!({
+        "model": "gemini-2",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let mut ctx = post_json_ctx(&request);
+
+    let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], "provider_response_too_large");
+        }
+        other => panic!("expected normalized-size rejection, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata.get("ai_federation_provider"),
+        Some(&"gemini".to_string())
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_federation_status"),
+        Some(&"200".to_string())
     );
 }
 
@@ -3230,6 +3416,54 @@ async fn open_provider_circuit_skips_unhealthy_primary_on_next_request() {
     }
     assert_eq!(primary.received_requests().await.unwrap().len(), 1);
     assert_eq!(secondary.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn open_primary_circuit_fails_fast_when_fallback_is_disabled() {
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": "down"})))
+        .mount(&primary)
+        .await;
+    let secondary = MockServer::start().await;
+    mount_openai_success(&secondary).await;
+    let mut config = two_provider_config(&primary, &secondary);
+    config["fallback_enabled"] = json!(false);
+    config["providers"][0]["circuit_breaker"] = json!({
+        "failure_threshold": 1,
+        "cooldown_seconds": 60,
+        "success_threshold": 1
+    });
+    let plugin = ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap();
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    let mut first_ctx = post_json_ctx(&request);
+    let first = run_federation_final_body(&plugin, &mut first_ctx, &json_headers()).await;
+    assert!(matches!(
+        first,
+        PluginResult::RejectBinary {
+            status_code: 503,
+            ..
+        }
+    ));
+
+    let mut second_ctx = post_json_ctx(&request);
+    let second = run_federation_final_body(&plugin, &mut second_ctx, &json_headers()).await;
+    match second {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 503);
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], "provider_circuit_open");
+        }
+        other => panic!("expected disabled-fallback circuit rejection, got {other:?}"),
+    }
+    assert_eq!(primary.received_requests().await.unwrap().len(), 1);
+    assert!(secondary.received_requests().await.unwrap().is_empty());
 }
 
 #[test]

@@ -51,7 +51,9 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
-use super::request_deduplication::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY;
+use super::request_deduplication::{
+    EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY,
+};
 use super::utils::aws_sigv4;
 use super::utils::body_transform::is_json_content_type;
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
@@ -4688,6 +4690,17 @@ impl Plugin for AiFederation {
             return PluginResult::Continue;
         }
 
+        // `request_deduplication` may already own an in-flight key because its
+        // before-proxy hook runs earlier. Until provider I/O commits, every
+        // federation rejection is safe to retry and must release that ownership
+        // from the final committed-response hook. A committed or ambiguous
+        // provider call replaces this marker with the non-replayable external
+        // operation marker below.
+        ctx.metadata.insert(
+            RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+
         // Provider dispatch happens from the final-body hook so decompression,
         // request transforms, and earlier AI policy hooks all inspect and
         // produce the same representation that leaves the gateway.
@@ -4707,6 +4720,8 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: final body is empty or non-UTF-8, passing through by explicit opt-in"
                 );
+                ctx.metadata
+                    .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
         };
@@ -4727,6 +4742,8 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: request body is not valid JSON, passing through by explicit opt-in: {e}"
                 );
+                ctx.metadata
+                    .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
         };
@@ -4748,6 +4765,8 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: request has non-string 'model' field, passing through by explicit opt-in"
                 );
+                ctx.metadata
+                    .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
             None => {
@@ -4764,6 +4783,8 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: request missing 'model' field, passing through by explicit opt-in"
                 );
+                ctx.metadata
+                    .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
         };
@@ -4798,6 +4819,8 @@ impl Plugin for AiFederation {
                 model = %model,
                 "ai_federation: no provider matches model, passing through by explicit opt-in"
             );
+            ctx.metadata
+                .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
             return PluginResult::Continue;
         }
 
@@ -4889,6 +4912,15 @@ impl Plugin for AiFederation {
                     provider = %provider.name,
                     "ai_federation: skipping provider with open circuit"
                 );
+                if !self.fallback_enabled {
+                    return self.openai_error_response(
+                        503,
+                        "The selected AI provider circuit is open and fallback is disabled",
+                        "server_error",
+                        None,
+                        Some("provider_circuit_open"),
+                    );
+                }
                 continue;
             }
             if provider.circuit.is_some() {
@@ -5037,6 +5069,8 @@ impl Plugin for AiFederation {
                     // internal marker only after the final client-visible
                     // response is committed and publishes a non-replayable
                     // tombstone for an idempotency-key retry.
+                    ctx.metadata
+                        .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                     ctx.metadata.insert(
                         EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
                         "true".to_string(),
@@ -5050,6 +5084,8 @@ impl Plugin for AiFederation {
                         // Both must suppress an independent client retry under
                         // the same idempotency key even when provider fallback
                         // itself is disabled.
+                        ctx.metadata
+                            .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                         ctx.metadata.insert(
                             EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
                             "true".to_string(),
@@ -5131,6 +5167,17 @@ impl Plugin for AiFederation {
             };
 
             let status = response.status;
+            // Record provider provenance and its ORIGINAL status before
+            // normalization or bounded serialization can fail. In particular,
+            // `ai_rate_limiter` must treat a usage-less provider 2xx followed by
+            // a synthetic 502 as an unmetered provider success, not as a free
+            // gateway rejection that releases the pre-reservation.
+            ctx.metadata.insert(
+                "ai_federation_provider".to_string(),
+                provider.name.clone(),
+            );
+            ctx.metadata
+                .insert("ai_federation_status".to_string(), status.to_string());
             if self.fallback_status_codes.contains(&status) {
                 if let Some(circuit) = &provider.circuit {
                     circuit.record_failure(&provider.name, admission);
@@ -5251,20 +5298,8 @@ impl Plugin for AiFederation {
                     let mut resp_headers = response.headers;
                     resp_headers.insert("content-type".to_string(), "application/json".to_string());
 
-                    let status_code = status;
-                    // Record the synthetic response status alongside the token
-                    // metadata so `ai_rate_limiter` can reconcile a pre-reservation
-                    // against the provider's ORIGINAL status. This response is a
-                    // final-request-body short-circuit, so a later response-body
-                    // guardrail can replace it with a 5xx before `ai_rate_limiter`'s
-                    // after_proxy runs; without this signal a usage-less federation
-                    // response that gets guard-rejected would release the
-                    // reservation for a provider call that already consumed tokens.
-                    ctx.metadata
-                        .insert("ai_federation_status".to_string(), status_code.to_string());
-
                     return PluginResult::RejectBinary {
-                        status_code,
+                        status_code: status,
                         body: Bytes::from(bytes_received),
                         headers: resp_headers,
                     };
@@ -5472,6 +5507,12 @@ impl AiFederation {
 #[allow(dead_code)]
 pub mod test_helpers {
     use super::*;
+
+    /// Close the request semaphore so external regression tests can exercise
+    /// the deterministic pre-I/O concurrency rejection path.
+    pub fn close_request_slots_for_test(plugin: &AiFederation) {
+        plugin.request_slots.close();
+    }
 
     /// Expose glob matching for tests.
     pub fn glob_match(pattern: &str, input: &str) -> bool {

@@ -63,6 +63,12 @@ const DEDUP_REDIS_LOCK_TOKEN_METADATA: &str = "_dedup_redis_lock_token";
 /// provider request has a potentially committed outcome.
 pub(crate) const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str =
     "ferrum:external_operation_completed";
+/// Internal marker set by a later request-phase plugin when it is returning a
+/// synthetic response before any external operation could have started. The
+/// committed-response hook consumes it to release this request's in-flight
+/// ownership instead of retaining a false "already in progress" conflict.
+pub(crate) const RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY: &str =
+    "ferrum:release_dedup_inflight_on_commit";
 const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v2";
 const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
 const REDIS_INFLIGHT_KEY_COMPONENT: &str = "inflight";
@@ -2042,29 +2048,48 @@ impl Plugin for RequestDeduplication {
         _response_headers: &HashMap<String, String>,
         _body: &[u8],
     ) {
-        if !ctx
+        if ctx
             .metadata
             .contains_key(EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
+        {
+            // A synthetic response produced after a billable/side-effecting
+            // operation cannot safely be cached: replay would run response body
+            // transforms a second time, while storing it before the last guard could
+            // replay a representation that was rejected on the first request.
+            // Publish a small completed 409 tombstone instead. The original request
+            // still receives its final response, but an identical retry cannot issue
+            // the external operation again. If configured cache limits are too small
+            // even for the tombstone, `local_publish_completed` retains the local and
+            // Redis in-flight locks until their bounded expiry rather than failing
+            // open to an immediate duplicate.
+            let headers = HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("cache-control".to_string(), "no-store".to_string()),
+            ]);
+            let body = br#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
+            let _ = self.on_final_response_body(ctx, 409, &headers, body).await;
+            return;
+        }
+
+        if !ctx
+            .metadata
+            .contains_key(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY)
         {
             return;
         }
 
-        // A synthetic response produced after a billable/side-effecting
-        // operation cannot safely be cached: replay would run response body
-        // transforms a second time, while storing it before the last guard could
-        // replay a representation that was rejected on the first request.
-        // Publish a small completed 409 tombstone instead. The original request
-        // still receives its final response, but an identical retry cannot issue
-        // the external operation again. If configured cache limits are too small
-        // even for the tombstone, `local_publish_completed` retains the local and
-        // Redis in-flight locks until their bounded expiry rather than failing
-        // open to an immediate duplicate.
-        let headers = HashMap::from([
-            ("content-type".to_string(), "application/json".to_string()),
-            ("cache-control".to_string(), "no-store".to_string()),
-        ]);
-        let body = br#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
-        let _ = self.on_final_response_body(ctx, 409, &headers, body).await;
+        let Some(key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
+            return;
+        };
+        let Some(fingerprint) = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) else {
+            return;
+        };
+        if let Some(owner_token) = ctx.metadata.get(DEDUP_LOCAL_INFLIGHT_TOKEN_METADATA) {
+            self.remove_matching_local_inflight(key, fingerprint, owner_token);
+        }
+        if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+            self.redis_release_inflight(key, fingerprint, token).await;
+        }
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
