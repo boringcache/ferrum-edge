@@ -621,7 +621,13 @@ pub mod _test_support {
         headers: &HashMap<String, String>,
         body_bytes: Vec<u8>,
     ) -> Vec<u8> {
-        crate::proxy::apply_request_body_plugins(plugins, headers, body_bytes).await
+        crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            None,
+            headers,
+            body_bytes,
+        )
+        .await
     }
 
     pub fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {

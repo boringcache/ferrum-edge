@@ -442,7 +442,7 @@ async fn test_multiple_instances_share_one_absolute_deadline() {
         .expect("numeric timeout");
 
     assert_eq!(ctx.grpc_deadline_at(), Some(absolute));
-    assert!(first_forwarded <= 10_000 && first_forwarded >= 5_000);
+    assert!((5_000..=10_000).contains(&first_forwarded));
     assert!(
         second_forwarded <= first_forwarded && first_forwarded - second_forwarded <= 50,
         "a later instance may observe clock progress but must not deduct the original pre-plugin delay again: first={first_forwarded}, second={second_forwarded}"

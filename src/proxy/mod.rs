@@ -3265,14 +3265,6 @@ fn is_forwarded_token(value: &str) -> bool {
         })
 }
 
-pub(crate) async fn apply_request_body_plugins(
-    plugins: &[Arc<dyn Plugin>],
-    headers: &HashMap<String, String>,
-    body_bytes: Vec<u8>,
-) -> Vec<u8> {
-    apply_request_body_plugins_with_context(plugins, None, headers, body_bytes).await
-}
-
 pub(crate) async fn apply_request_body_plugins_with_context(
     plugins: &[Arc<dyn Plugin>],
     mut ctx: Option<&mut RequestContext>,
