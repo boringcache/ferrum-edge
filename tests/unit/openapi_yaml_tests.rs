@@ -316,8 +316,7 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
     assert_eq!(password_hash["pattern"], "^hmac_sha256:[0-9a-f]{64}$");
     assert!(password_hash.get("writeOnly").is_none());
 
-    let password =
-        &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]["password"];
+    let password = &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]["password"];
     let password_pattern = password["pattern"].as_str().expect("password pattern");
     assert_eq!(password_pattern, r"^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$");
     let password_pattern = Regex::new(password_pattern).expect("password pattern compiles");
