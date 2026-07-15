@@ -3640,6 +3640,12 @@ struct RequestConnectionMetadata {
     /// selection, after applying any Sidecar ingress listener-to-app alias.
     /// `None` for direct dials and non-mesh listeners.
     mesh_inbound_pre_handshake_app_port: Option<u16>,
+    /// Connection-scoped cache of the peer-cert SPIFFE extraction outcome,
+    /// created when the connection presented a client certificate. Arc-shared
+    /// so `spiffe_identity` derives the peer SPIFFE ID at most once per
+    /// connection instead of re-parsing the DER on every multiplexed request.
+    peer_spiffe_extraction_cache:
+        Option<Arc<crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache>>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -7990,6 +7996,8 @@ async fn handle_connection(
             mesh_direction,
             orig_dst,
             mesh_inbound_pre_handshake_app_port,
+            // Plaintext connections carry no client certificate.
+            peer_spiffe_extraction_cache: None,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -12642,6 +12650,12 @@ async fn handle_tls_connection(
     let mtls_auth_connection_cache = client_cert_der
         .as_ref()
         .map(|_| Arc::new(crate::plugins::mtls_auth::MtlsAuthConnectionCache::new()));
+    // Connection-scoped SPIFFE extraction cache: the peer cert is fixed for
+    // the connection, so `spiffe_identity` derives its outcome once and every
+    // multiplexed request reuses it without re-parsing the DER.
+    let peer_spiffe_extraction_cache = client_cert_der.as_ref().map(|_| {
+        Arc::new(crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache::new())
+    });
     let frontend_sni_hostname = tls_stream
         .get_ref()
         .1
@@ -12704,6 +12718,7 @@ async fn handle_tls_connection(
             orig_dst: tls_connection_metadata.orig_dst,
             mesh_inbound_pre_handshake_app_port: tls_connection_metadata
                 .mesh_inbound_pre_handshake_app_port,
+            peer_spiffe_extraction_cache: peer_spiffe_extraction_cache.clone(),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -13941,6 +13956,9 @@ pub async fn handle_proxy_request(
     let mtls_auth_connection_cache = tls_client_cert_der
         .as_ref()
         .map(|_| Arc::new(crate::plugins::mtls_auth::MtlsAuthConnectionCache::new()));
+    let peer_spiffe_extraction_cache = tls_client_cert_der.as_ref().map(|_| {
+        Arc::new(crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache::new())
+    });
     handle_proxy_request_on_frontend_port(
         req,
         Arc::new(state),
@@ -13949,7 +13967,10 @@ pub async fn handle_proxy_request(
         tls_client_cert_der,
         tls_client_cert_chain_der,
         mtls_auth_connection_cache,
-        RequestConnectionMetadata::default(),
+        RequestConnectionMetadata {
+            peer_spiffe_extraction_cache,
+            ..RequestConnectionMetadata::default()
+        },
     )
     .await
 }
@@ -14087,6 +14108,7 @@ async fn handle_proxy_request_inner(
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
+    ctx.peer_spiffe_extraction_cache = connection_metadata.peer_spiffe_extraction_cache;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
         // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
         // identity is the authenticated source workload for policy. It
