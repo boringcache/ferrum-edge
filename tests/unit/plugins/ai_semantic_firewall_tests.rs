@@ -3546,6 +3546,22 @@ async fn final_response_decodes_labeled_brotli_json_before_inspection() {
 }
 
 #[tokio::test]
+async fn decoded_json_shape_overrides_encoded_event_stream_label() {
+    let plaintext =
+        br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#;
+
+    for (encoding, body) in [
+        ("gzip", gzip_bytes(plaintext)),
+        ("br", brotli_bytes(plaintext)),
+    ] {
+        // This is a bare JSON document, not an SSE frame. The helper's
+        // response_leakage rejection proves the decoded body reached JSON
+        // extraction instead of the event-stream parser.
+        assert_encoded_json_is_inspected(Some("text/event-stream"), encoding, body).await;
+    }
+}
+
+#[tokio::test]
 async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
     let config = json!({
         "inspect": {"request": false, "response": true},

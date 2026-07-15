@@ -2407,12 +2407,12 @@ impl Plugin for AiSemanticFirewall {
             }
             // Once decoded bytes have a JSON shape, parse them with JSON
             // candidate semantics even if the origin mislabeled the media
-            // type. That preserves fail-closed handling for malformed decoded
-            // JSON instead of treating the parse error as ordinary text.
-            let decoded_content_type = if type_candidate {
-                content_type
-            } else {
+            // type as another candidate such as text/event-stream. Shape must
+            // win here so bare JSON cannot be routed through the SSE parser.
+            let decoded_content_type = if decoded_looks_like_json {
                 "application/json"
+            } else {
+                content_type
             };
             return self
                 .inspect_response_bytes(ctx, decoded_content_type, &decoded, was_governed)
