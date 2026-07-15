@@ -117,7 +117,7 @@ use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::{record_backend_outcome, record_backend_outcome_no_conn_end};
 use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
 use crate::proxy::headers::{
-    is_backend_response_strip_header, parse_connection_listed_headers,
+    apply_response_headers, is_backend_response_strip_header, parse_connection_listed_headers,
     strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
@@ -192,6 +192,7 @@ where
     pub xff_append_ip: &'a str,
     pub ctx: &'a mut RequestContext,
     pub plugins: &'a [Arc<dyn Plugin>],
+    pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     pub initial_response_header_policy_names: Arc<Vec<String>>,
     pub backend_admission_plugins: &'a [Arc<dyn Plugin>],
     pub preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
@@ -525,6 +526,7 @@ where
         xff_append_ip,
         ctx,
         plugins,
+        initial_response_header_policy_plugins,
         initial_response_header_policy_names,
         backend_admission_plugins,
         preacquired_backend_admission,
@@ -660,6 +662,7 @@ where
                 backend_start,
                 ctx,
                 plugins,
+                initial_response_header_policy_plugins.as_ref(),
                 initial_response_header_policy_names,
                 backend_admission_plugins,
                 requires_response_body_buffering,
@@ -2634,6 +2637,7 @@ async fn handle_h3_grpc_streaming_response<S>(
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_start: Instant,
     plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     sticky_cookie_needed: bool,
     bytes_sent: u64,
@@ -2685,12 +2689,13 @@ where
             Some(ErrorClass::RequestBodyTooLarge),
             backend_admission_start.elapsed(),
         );
-        let mut outcome = write_grpc_error_send(
+        let mut outcome = write_grpc_error_send_with_policy(
             stream,
             grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
             "Request payload exceeded backend limit",
             backend_start,
             bytes_sent,
+            initial_response_header_policy_plugins,
         )
         .await?;
         outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
@@ -3033,6 +3038,7 @@ async fn dispatch_grpc<S>(
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     initial_response_header_policy_names: Arc<Vec<String>>,
     backend_admission_plugins: &[Arc<dyn Plugin>],
     requires_response_body_buffering: bool,
@@ -3045,12 +3051,13 @@ where
     let hyper_method = match hyper::Method::from_bytes(method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
-            return write_grpc_error(
+            return write_grpc_error_with_policy(
                 stream,
                 grpc_proxy::grpc_status::UNIMPLEMENTED,
                 "Method Not Allowed",
                 backend_start,
                 0,
+                initial_response_header_policy_plugins,
             )
             .await;
         }
@@ -3078,12 +3085,13 @@ where
             current_cb_target_key.as_deref(),
             cb_retry_probe_slot_available,
         );
-        return write_grpc_error(
+        return write_grpc_error_with_policy(
             stream,
             grpc_proxy::grpc_status::UNAVAILABLE,
             message,
             backend_start,
             0,
+            initial_response_header_policy_plugins,
         )
         .await;
     }
@@ -3113,12 +3121,13 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                return write_grpc_error(
+                return write_grpc_error_with_policy(
                     stream,
                     grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Request body exceeds maximum size",
                     backend_start,
                     0,
+                    initial_response_header_policy_plugins,
                 )
                 .await;
             }
@@ -3134,12 +3143,13 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                return write_grpc_error(
+                return write_grpc_error_with_policy(
                     stream,
                     grpc_proxy::grpc_status::INVALID_ARGUMENT,
                     "Request body read error",
                     backend_start,
                     0,
+                    initial_response_header_policy_plugins,
                 )
                 .await;
             }
@@ -3150,12 +3160,13 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                return write_grpc_error(
+                return write_grpc_error_with_policy(
                     stream,
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Request body read timed out",
                     backend_start,
                     0,
+                    initial_response_header_policy_plugins,
                 )
                 .await;
             }
@@ -3357,12 +3368,13 @@ where
                     "cross-protocol H3→gRPC: retry rotated onto a mesh-transport-tagged target; \
                      refusing the direct dial and failing closed with gRPC UNAVAILABLE"
                 );
-                return write_grpc_error(
+                return write_grpc_error_with_policy(
                     stream,
                     grpc_proxy::grpc_status::UNAVAILABLE,
                     message,
                     backend_start,
                     bytes_sent,
+                    initial_response_header_policy_plugins,
                 )
                 .await;
             }
@@ -3469,6 +3481,12 @@ where
                     &resp.headers,
                     &resp.trailers,
                 );
+            let pristine_trailers_only_terminal_metadata =
+                (resp.body.is_empty() && resp.trailers.is_empty()).then(|| {
+                    crate::proxy::grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                        &resp.headers,
+                    )
+                });
             ctx.begin_buffered_initial_response_header_policy(
                 initial_response_header_policy_names,
                 &resp.headers,
@@ -3714,14 +3732,18 @@ where
                 &plugin_response_headers,
             );
             let mut response_headers = plugin_response_headers;
-            let preserve_terminal_metadata =
-                response_body.is_empty() && response_trailers.is_empty();
+            let authoritative_terminal_metadata =
+                if response_body.is_empty() && response_trailers.is_empty() {
+                    pristine_trailers_only_terminal_metadata.as_ref()
+                } else {
+                    None
+                };
             crate::proxy::grpc_proxy::finalize_buffered_grpc_split_response(
                 &mut response_headers,
                 &mut response_trailers,
                 &header_shadowed_trailer_keys,
                 buffered_initial_response_header_policy_state.as_deref(),
-                preserve_terminal_metadata,
+                authoritative_terminal_metadata,
                 original_trailer_set_cookie.as_deref(),
             );
             // Inject the sticky-affinity cookie onto the final initial headers,
@@ -3885,6 +3907,7 @@ where
                 &mut backend_admission_permits,
                 backend_admission_start,
                 plugins,
+                initial_response_header_policy_plugins,
                 ctx,
                 sticky_cookie_needed,
                 bytes_sent,
@@ -3962,12 +3985,13 @@ where
                 Some(error_class),
                 backend_admission_start.elapsed(),
             );
-            let mut outcome = write_grpc_error(
+            let mut outcome = write_grpc_error_with_policy(
                 stream,
                 grpc_status_code,
                 grpc_message,
                 backend_start,
                 bytes_sent,
+                initial_response_header_policy_plugins,
             )
             .await?;
             outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
@@ -4013,6 +4037,7 @@ pub(crate) async fn dispatch_grpc_streaming(
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error> {
@@ -4039,12 +4064,13 @@ pub(crate) async fn dispatch_grpc_streaming(
             current_cb_target_key.as_deref(),
             cb_is_half_open_probe,
         );
-        return write_grpc_error(
+        return write_grpc_error_with_policy(
             &mut stream,
             grpc_proxy::grpc_status::UNAVAILABLE,
             message,
             backend_start,
             0,
+            initial_response_header_policy_plugins,
         )
         .await;
     }
@@ -4052,12 +4078,13 @@ pub(crate) async fn dispatch_grpc_streaming(
     let hyper_method = match hyper::Method::from_bytes(method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
-            return write_grpc_error(
+            return write_grpc_error_with_policy(
                 &mut stream,
                 grpc_proxy::grpc_status::UNIMPLEMENTED,
                 "Method Not Allowed",
                 backend_start,
                 0,
+                initial_response_header_policy_plugins,
             )
             .await;
         }
@@ -4231,6 +4258,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 &mut backend_admission_permits,
                 backend_admission_start,
                 plugins,
+                initial_response_header_policy_plugins,
                 ctx,
                 sticky_cookie_needed,
                 bytes_sent,
@@ -4265,12 +4293,13 @@ pub(crate) async fn dispatch_grpc_streaming(
                 Some(ErrorClass::ProtocolError),
                 backend_admission_start.elapsed(),
             );
-            write_grpc_error_send(
+            write_grpc_error_send_with_policy(
                 &mut send_half,
                 grpc_proxy::grpc_status::INTERNAL,
                 "Internal gateway error",
                 backend_start,
                 bytes_sent,
+                initial_response_header_policy_plugins,
             )
             .await
             .map(|mut outcome| {
@@ -4355,12 +4384,13 @@ pub(crate) async fn dispatch_grpc_streaming(
                 Some(error_class),
                 backend_admission_start.elapsed(),
             );
-            write_grpc_error_send(
+            write_grpc_error_send_with_policy(
                 &mut send_half,
                 grpc_status_code,
                 grpc_message,
                 backend_start,
                 bytes_sent,
+                initial_response_header_policy_plugins,
             )
             .await
             .map(|mut outcome| {
@@ -5430,8 +5460,37 @@ async fn write_grpc_error<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let outcome =
-        write_grpc_error_send(stream, grpc_status, grpc_message, backend_start, bytes_sent).await?;
+    write_grpc_error_with_policy(
+        stream,
+        grpc_status,
+        grpc_message,
+        backend_start,
+        bytes_sent,
+        &[],
+    )
+    .await
+}
+
+async fn write_grpc_error_with_policy<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    grpc_status: u32,
+    grpc_message: &str,
+    backend_start: Instant,
+    bytes_sent: u64,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let outcome = write_grpc_error_send_with_policy(
+        stream,
+        grpc_status,
+        grpc_message,
+        backend_start,
+        bytes_sent,
+        initial_response_header_policy_plugins,
+    )
+    .await?;
     // Full-stream caller: STOP_SENDING the recv half so a bare drop is not seen
     // as RESET_STREAM(0x0). The send-only streaming-request path
     // (`dispatch_grpc_streaming`) calls `write_grpc_error_send` directly because
@@ -5454,15 +5513,37 @@ async fn write_grpc_error_send<S>(
 where
     S: SendStream<Bytes>,
 {
+    write_grpc_error_send_with_policy(
+        stream,
+        grpc_status,
+        grpc_message,
+        backend_start,
+        bytes_sent,
+        &[],
+    )
+    .await
+}
+
+async fn write_grpc_error_send_with_policy<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    grpc_status: u32,
+    grpc_message: &str,
+    backend_start: Instant,
+    bytes_sent: u64,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: SendStream<Bytes>,
+{
     let grpc_message = sanitize_h3_grpc_message_for_header(grpc_message);
-    let mut resp_builder = Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/grpc")
-        .header("grpc-status", grpc_status.to_string());
-    if !grpc_message.is_empty() {
-        resp_builder = resp_builder.header("grpc-message", grpc_message.as_str());
-    }
-    let resp = resp_builder
+    let mut headers = HashMap::new();
+    grpc_proxy::finalize_grpc_error_response_headers(
+        &mut headers,
+        grpc_status,
+        &grpc_message,
+        initial_response_header_policy_plugins,
+    );
+    let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC error response: {}", e))?;
     stream.send_response(resp).await?;

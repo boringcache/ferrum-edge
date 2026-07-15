@@ -348,7 +348,35 @@ fn parse_remove(object: &serde_json::Map<String, Value>) -> Result<Vec<String>, 
 fn parse_header_name(field: &str, name: &str) -> Result<String, String> {
     HeaderName::from_bytes(name.as_bytes())
         .map(|name| name.as_str().to_string())
-        .map_err(|_| format!("security_headers: '{field}' contains an invalid HTTP field name"))
+        .map_err(|_| {
+            format!(
+                "security_headers: '{field}' contains invalid HTTP field name '{}'",
+                render_invalid_header_name(name)
+            )
+        })
+}
+
+/// Render an untrusted invalid field name without allowing hostile config to
+/// inject control characters or create an unbounded validation error.
+fn render_invalid_header_name(name: &str) -> String {
+    const MAX_RENDERED_BYTES: usize = 96;
+
+    let mut rendered = String::with_capacity(MAX_RENDERED_BYTES + 3);
+    let mut chars = name.chars().peekable();
+    while let Some(character) = chars.next() {
+        let escaped = character.escape_default();
+        let escaped_len = escaped.clone().count();
+        if rendered.len() + escaped_len > MAX_RENDERED_BYTES {
+            rendered.push_str("...");
+            break;
+        }
+        rendered.extend(escaped);
+        if rendered.len() == MAX_RENDERED_BYTES && chars.peek().is_some() {
+            rendered.push_str("...");
+            break;
+        }
+    }
+    rendered
 }
 
 fn validate_header_value(key: &str, value: &str) -> Result<(), String> {

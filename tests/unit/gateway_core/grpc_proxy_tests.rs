@@ -305,6 +305,44 @@ fn test_grpc_error_response_resource_exhausted() {
     assert_eq!(resp.headers().get("grpc-status").unwrap(), "8");
 }
 
+#[test]
+fn grpc_error_policy_preserves_gateway_terminal_and_transport_authority() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {
+                "X-Synthetic-Policy": "enforced",
+                "Content-Type": "text/plain",
+                "Content-Length": "999",
+                "Transfer-Encoding": "chunked",
+                "Grpc-Status": "0",
+                "Grpc-Message": "policy override",
+                "Grpc-Status-Details-Bin": "hostile"
+            },
+            "remove": []
+        }))
+        .unwrap(),
+    );
+
+    let response = grpc_proxy::build_grpc_error_response_with_policy(
+        grpc_proxy::grpc_status::UNAVAILABLE,
+        "Backend down",
+        &[policy],
+    );
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers().get("content-type").unwrap(), "application/grpc");
+    assert_eq!(response.headers().get("grpc-status").unwrap(), "14");
+    assert_eq!(response.headers().get("grpc-message").unwrap(), "Backend down");
+    assert_eq!(response.headers().get("x-synthetic-policy").unwrap(), "enforced");
+    for managed in [
+        "content-length",
+        "transfer-encoding",
+        "grpc-status-details-bin",
+    ] {
+        assert!(response.headers().get(managed).is_none(), "{managed} leaked");
+    }
+}
+
 // --- BackendScheme display and deserialization ---
 //
 // Post-refactor, gRPC is no longer a backend_scheme — it is detected
@@ -820,7 +858,7 @@ async fn buffered_policy_is_applied_to_initial_headers_without_promoting_trailer
     grpc_proxy::apply_buffered_grpc_initial_response_policy(
         Some(&policy_state),
         &mut initial_headers,
-        false,
+        None,
     );
 
     assert_eq!(
@@ -969,7 +1007,7 @@ async fn buffered_policy_removal_suppresses_mutated_cookie_and_application_trail
         &mut wire_trailers,
         &shadowed,
         Some(&policy_state),
-        false,
+        None,
         original_trailer_set_cookie.as_deref(),
     );
 
@@ -1116,7 +1154,7 @@ fn buffered_policy_overlay_preserves_transform_owned_content_length() {
     grpc_proxy::apply_buffered_grpc_initial_response_policy(
         Some(&policy_state),
         &mut transformed_headers,
-        false,
+        None,
     );
     assert_eq!(
         transformed_headers
@@ -1133,33 +1171,46 @@ fn buffered_policy_overlay_preserves_transform_owned_content_length() {
     grpc_proxy::apply_buffered_grpc_initial_response_policy(
         Some(&policy_state),
         &mut absent_content_length,
-        false,
+        None,
     );
     assert!(!absent_content_length.contains_key("content-length"));
 }
 
 #[test]
-fn buffered_policy_preserves_terminal_metadata_only_for_true_trailers_only_shape() {
+fn buffered_policy_restores_pristine_terminal_metadata_for_true_trailers_only_shape() {
     let terminal_headers = grpc_map(&[
         ("content-type", "application/grpc"),
         ("grpc-status", "7"),
         ("grpc-message", "permission denied"),
     ]);
+    let terminal_snapshot =
+        grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&terminal_headers);
 
     let mut split_initial_headers = terminal_headers.clone();
     grpc_proxy::apply_buffered_grpc_initial_response_policy(
         None,
         &mut split_initial_headers,
-        false,
+        None,
     );
     assert!(!split_initial_headers.contains_key("grpc-status"));
     assert!(!split_initial_headers.contains_key("grpc-message"));
 
-    let mut trailers_only_initial_headers = terminal_headers;
+    let hostile_set: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {
+                "Grpc-Status": "0",
+                "Grpc-Message": "policy override"
+            },
+            "remove": []
+        }))
+        .unwrap(),
+    );
+    let mut trailers_only_initial_headers = terminal_headers.clone();
+    hostile_set.apply_initial_response_header_policy(&mut trailers_only_initial_headers);
     grpc_proxy::apply_buffered_grpc_initial_response_policy(
         None,
         &mut trailers_only_initial_headers,
-        true,
+        Some(&terminal_snapshot),
     );
     assert_eq!(
         trailers_only_initial_headers
@@ -1169,6 +1220,34 @@ fn buffered_policy_preserves_terminal_metadata_only_for_true_trailers_only_shape
     );
     assert_eq!(
         trailers_only_initial_headers
+            .get("grpc-message")
+            .map(String::as_str),
+        Some("permission denied")
+    );
+
+    let hostile_remove: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {},
+            "remove": ["Grpc-Status", "Grpc-Message"]
+        }))
+        .unwrap(),
+    );
+    let mut removed_trailers_only_initial_headers = terminal_headers;
+    hostile_remove
+        .apply_initial_response_header_policy(&mut removed_trailers_only_initial_headers);
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        None,
+        &mut removed_trailers_only_initial_headers,
+        Some(&terminal_snapshot),
+    );
+    assert_eq!(
+        removed_trailers_only_initial_headers
+            .get("grpc-status")
+            .map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(
+        removed_trailers_only_initial_headers
             .get("grpc-message")
             .map(String::as_str),
         Some("permission denied")
@@ -1222,6 +1301,7 @@ async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata(
         &mut wire_trailers,
         &shadowed,
         Some(&policy_state),
+        None,
     );
 
     assert!(wire_trailers.is_empty());

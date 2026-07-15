@@ -190,9 +190,19 @@ after any hook-mutated trailer cookie is rehomed. A final policy set/override
 remains initial-header policy and preserves the backend's application trailer.
 A backend Trailers-Only response that already carries terminal status in its
 END_STREAM initial HEADERS and has no trailers frame keeps that status there;
-policy replay cannot remove or replace it. This is also the path used after
+Ferrum snapshots the reserved terminal fields from the pristine backend
+headers before response hooks run, then restores that authoritative snapshot,
+so policy replay cannot remove or replace it. This is also the path used after
 gRPC-Web binary or text response framing, so security policy cannot disappear
 with the native trailer map.
+
+After route resolution, HTTP/3 method-filter errors and native-gRPC gateway
+errors (including request deadlines, size limits, backend unavailability, and
+mesh fail-closed responses) also apply the route's precomputed initial-response
+policy before the initial HEADERS write. gRPC status/message, content type, and
+transport framing are restored after policy. Errors rejected before a route is
+resolved have no plugin configuration and therefore remain outside this policy
+boundary.
 
 Either way, `grpc-status` reaches the H3 client intact.
 

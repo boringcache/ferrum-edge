@@ -8165,11 +8165,15 @@ fn build_websocket_error_response(
     );
     headers_mod::apply_response_headers(Response::builder().status(status), &response_headers)
         .body(ProxyBody::from_string(body))
-        .unwrap_or_else(|_| {
-            Response::new(ProxyBody::from_string(
-                r#"{"error":"Internal server error"}"#,
-            ))
-        })
+        .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
+}
+
+fn build_websocket_error_fallback_response(status: StatusCode) -> Response<ProxyBody> {
+    let mut response = Response::new(ProxyBody::from_string(
+        r#"{"error":"Internal server error"}"#,
+    ));
+    *response.status_mut() = status;
+    response
 }
 
 /// Handle WebSocket requests AFTER authentication and authorization plugins have run.
@@ -13593,6 +13597,58 @@ pub(crate) struct NormalizedRejectResponse {
     pub(crate) grpc_message: Option<String>,
 }
 
+/// Apply route policy to a gateway-generated plain HTTP response and then
+/// discard fields whose framing is owned by the frontend transport.
+pub(crate) fn finalize_plain_gateway_error_response_headers(
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    response_headers: &mut HashMap<String, String>,
+) {
+    crate::plugins::apply_initial_response_header_policies(
+        initial_response_header_policy_plugins,
+        response_headers,
+    );
+    response_headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("content-length")
+            && ![
+                "connection",
+                "keep-alive",
+                "proxy-authenticate",
+                "proxy-connection",
+                "te",
+                "trailer",
+                "transfer-encoding",
+                "upgrade",
+            ]
+            .iter()
+            .any(|managed| name.eq_ignore_ascii_case(managed))
+    });
+}
+
+fn finalize_synthesized_reject_headers(
+    reject: &mut NormalizedRejectResponse,
+    request_protocol: ProxyProtocol,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) {
+    if let Some(grpc_status) = reject.grpc_status {
+        grpc_proxy::finalize_grpc_error_response_headers(
+            &mut reject.headers,
+            grpc_status,
+            reject.grpc_message.as_deref().unwrap_or(""),
+            initial_response_header_policy_plugins,
+        );
+    } else if request_protocol == ProxyProtocol::WebSocket {
+        finalize_websocket_response_headers(
+            initial_response_header_policy_plugins,
+            &mut reject.headers,
+        );
+    } else {
+        finalize_plain_gateway_error_response_headers(
+            initial_response_header_policy_plugins,
+            &mut reject.headers,
+        );
+    }
+}
+
 fn grpc_status_reason(status: u32) -> &'static str {
     match status {
         grpc_proxy::grpc_status::INVALID_ARGUMENT => "Invalid argument",
@@ -14967,32 +15023,10 @@ async fn handle_proxy_request_inner(
     let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
     ctx.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
 
-    // Per-proxy HTTP method filtering (checked before plugins to save work)
-    if let Some(ref allowed) = proxy.allowed_methods
-        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
-    {
-        state.request_count.fetch_add(1, Ordering::Relaxed);
-        let allow_header = allowed.join(", ");
-        let mut reject_headers = HashMap::new();
-        reject_headers.insert("allow".to_string(), allow_header);
-        if matches!(flavor, HttpFlavor::WebSocket) {
-            let policy_plugins = epoch
-                .plugin_cache
-                .get_initial_response_header_policy_plugins(&proxy.id, ProxyProtocol::WebSocket);
-            finalize_websocket_response_headers(policy_plugins.as_ref(), &mut reject_headers);
-        }
-        let reject = normalize_reject_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            br#"{"error":"Method Not Allowed"}"#,
-            &reject_headers,
-            request_uses_grpc_content_type,
-        );
-        record_status(&state, reject.http_status.as_u16());
-        return Ok(build_response_from_normalized_reject(reject));
-    }
-
-    // gRPC-Web dispatch remains keyed by its original content type: it uses
-    // the plain HTTP backend flavor while loading the gRPC plugin policy set.
+    // Resolve the client-visible protocol before route-level rejects so every
+    // post-routing synthesized initial HEADERS block uses the same precomputed
+    // policy slice as normal responses. gRPC-Web dispatch remains plain HTTP
+    // while selecting the gRPC policy set.
     let grpc_web_response_content_type = req
         .headers()
         .get(hyper::header::CONTENT_TYPE)
@@ -15005,12 +15039,36 @@ async fn handle_proxy_request_inner(
     let request_protocol = match flavor {
         HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
-        // gRPC-Web requests are intentionally dispatched as plain HTTP on the
-        // backend path, but they still need gRPC-only policy plugins (e.g.
-        // grpc_method_router) in the request plugin chain.
         HttpFlavor::Plain if grpc_web_request => ProxyProtocol::Grpc,
         HttpFlavor::Plain => ProxyProtocol::Http,
     };
+    let initial_response_header_policy_plugins = epoch
+        .plugin_cache
+        .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
+
+    // Per-proxy HTTP method filtering (checked before plugins to save work)
+    if let Some(ref allowed) = proxy.allowed_methods
+        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
+    {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        let allow_header = allowed.join(", ");
+        let mut reject_headers = HashMap::new();
+        reject_headers.insert("allow".to_string(), allow_header);
+        let mut reject = normalize_reject_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            br#"{"error":"Method Not Allowed"}"#,
+            &reject_headers,
+            request_uses_grpc_content_type,
+        );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        record_status(&state, reject.http_status.as_u16());
+        return Ok(build_response_from_normalized_reject(reject));
+    }
+
     let allows_request_body_buffering = http_flavor_allows_request_body_buffering(flavor);
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
     if is_grpc_request {
@@ -15024,11 +15082,16 @@ async fn handle_proxy_request_inner(
     if is_grpc_request && method != "POST" {
         state.request_count.fetch_add(1, Ordering::Relaxed);
         warn!(method = %method, path = %path, "Rejected gRPC request: method must be POST");
-        let reject = normalize_reject_response(
+        let mut reject = normalize_reject_response(
             StatusCode::BAD_REQUEST,
             br#"{"error":"gRPC requires POST method"}"#,
             &EMPTY_HEADERS,
             true,
+        );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
         );
         record_status(&state, reject.http_status.as_u16());
         return Ok(build_response_from_normalized_reject(reject));
@@ -16243,9 +16306,10 @@ async fn handle_proxy_request_inner(
                             .as_ref(),
                     ));
                 }
-                return Ok(grpc_proxy::build_grpc_error_response(
+                return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                     14, // UNAVAILABLE
                     message,
+                    initial_response_header_policy_plugins.as_ref(),
                 ));
             }
         }
@@ -16330,9 +16394,10 @@ async fn handle_proxy_request_inner(
                 cb_is_half_open_probe,
             );
             record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-            return Ok(grpc_proxy::build_grpc_error_response(
+            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                 14,
                 "backend address blocked by egress policy",
+                initial_response_header_policy_plugins.as_ref(),
             ));
         }
         let grpc_effective_port = grpc_dispatch_proxy.backend_port;
@@ -16441,9 +16506,10 @@ async fn handle_proxy_request_inner(
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(e)) => {
                         record_request(&state, 500);
-                        return Ok(grpc_proxy::build_grpc_error_response(
+                        return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                             13, // INTERNAL
                             &format!("Failed to read gRPC request body: {:?}", e),
+                            initial_response_header_policy_plugins.as_ref(),
                         ));
                     }
                 };
@@ -16617,12 +16683,13 @@ async fn handle_proxy_request_inner(
                     && len > state.max_grpc_recv_size_bytes
                 {
                     record_request(&state, 200);
-                    return Ok(grpc_proxy::build_grpc_error_response(
+                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                         &format!(
                             "gRPC request payload size exceeds maximum of {} bytes",
                             state.max_grpc_recv_size_bytes
                         ),
+                        initial_response_header_policy_plugins.as_ref(),
                     ));
                 }
                 // Fully streaming fast path: forward request body frame-by-
@@ -17047,9 +17114,10 @@ async fn handle_proxy_request_inner(
                     {
                         return Ok(response);
                     }
-                    return Ok(grpc_proxy::build_grpc_error_response(
+                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         14, // UNAVAILABLE
                         "gRPC retry target requires a mesh transport that does not support retries",
+                        initial_response_header_policy_plugins.as_ref(),
                     ));
                 }
 
@@ -17074,9 +17142,10 @@ async fn handle_proxy_request_inner(
                         "Backend egress policy denied literal-IP gRPC retry target; not dialing"
                     );
                     record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-                    return Ok(grpc_proxy::build_grpc_error_response(
+                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         14,
                         "backend address blocked by egress policy",
+                        initial_response_header_policy_plugins.as_ref(),
                     ));
                 }
 
@@ -17619,9 +17688,10 @@ async fn handle_proxy_request_inner(
                     drop(backend_admission_permits.take());
                     drop(grpc_lb_connection_guard.take());
                     record_request(&state, 200);
-                    return Ok(grpc_proxy::build_grpc_error_response(
+                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                         "gRPC request payload size exceeds maximum",
+                        initial_response_header_policy_plugins.as_ref(),
                     ));
                 }
 
@@ -17832,9 +17902,10 @@ async fn handle_proxy_request_inner(
                                 .with_grpc_status(Some(grpc_proxy::grpc_status::UNAVAILABLE)),
                             );
                         }
-                        return Ok(grpc_proxy::build_grpc_error_response(
+                        return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                             grpc_proxy::grpc_status::UNAVAILABLE,
                             "Internal gateway error",
+                            initial_response_header_policy_plugins.as_ref(),
                         ));
                     }
                 }
@@ -17921,8 +17992,15 @@ async fn handle_proxy_request_inner(
                         &response_headers,
                         &response_trailers,
                     );
+                let initial_response_header_policy_names =
+                    plugin_cache_view.initial_response_header_policy_names();
+                let pristine_trailers_only_terminal_metadata = (response_body.is_empty()
+                    && response_trailers.is_empty())
+                    .then(|| {
+                        grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers)
+                    });
                 ctx.begin_buffered_initial_response_header_policy(
-                    plugin_cache_view.initial_response_header_policy_names(),
+                    initial_response_header_policy_names,
                     &response_headers,
                     &plugin_response_headers,
                 );
@@ -18178,6 +18256,7 @@ async fn handle_proxy_request_inner(
                         &mut response_trailers,
                         &header_shadowed_trailer_keys,
                         buffered_initial_response_header_policy_state.as_deref(),
+                        pristine_trailers_only_terminal_metadata.as_ref(),
                     );
                 } else {
                     // Non-empty gRPC responses must carry grpc-status in a
@@ -18194,7 +18273,7 @@ async fn handle_proxy_request_inner(
                         &mut response_trailers,
                         &header_shadowed_trailer_keys,
                         buffered_initial_response_header_policy_state.as_deref(),
-                        false,
+                        None,
                         original_trailer_set_cookie.as_deref(),
                     );
                 }
@@ -18349,9 +18428,10 @@ async fn handle_proxy_request_inner(
                 };
 
                 return Ok(resp_builder.body(body).unwrap_or_else(|_| {
-                    grpc_proxy::build_grpc_error_response(
+                    grpc_proxy::build_grpc_error_response_with_policy(
                         grpc_proxy::grpc_status::UNAVAILABLE,
                         "Internal gateway error",
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                 }));
             }
@@ -18527,7 +18607,13 @@ async fn handle_proxy_request_inner(
                 {
                     return Ok(response);
                 }
-                return Ok(grpc_proxy::build_grpc_error_response(grpc_code, msg));
+                return Ok(
+                    grpc_proxy::build_grpc_error_response_with_policy(
+                        grpc_code,
+                        msg,
+                        initial_response_header_policy_plugins.as_ref(),
+                    ),
+                );
             }
         }
     }
@@ -18681,9 +18767,10 @@ async fn handle_proxy_request_inner(
                         .as_ref(),
                 ));
             }
-            return Ok(grpc_proxy::build_grpc_error_response(
+            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                 14, // UNAVAILABLE
                 &message,
+                initial_response_header_policy_plugins.as_ref(),
             ));
         }
         record_request(&state, 502);
@@ -18770,7 +18857,13 @@ async fn handle_proxy_request_inner(
             {
                 return Ok(response);
             }
-            return Ok(grpc_proxy::build_grpc_error_response(14, &message));
+            return Ok(
+                grpc_proxy::build_grpc_error_response_with_policy(
+                    14,
+                    &message,
+                    initial_response_header_policy_plugins.as_ref(),
+                ),
+            );
         }
         record_request(&state, 502);
         return Ok(build_response(
@@ -23611,9 +23704,10 @@ fn build_request_body_timeout_response(
         );
     }
     if is_grpc_request {
-        return grpc_proxy::build_grpc_error_response(
+        return grpc_proxy::build_grpc_error_response_with_policy(
             grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
             MESSAGE,
+            initial_response_header_policy_plugins,
         );
     }
     build_response(
@@ -27615,6 +27709,12 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("application/grpc")
         );
+    }
+
+    #[test]
+    fn websocket_error_fallback_preserves_requested_status() {
+        let response = super::build_websocket_error_fallback_response(StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     use super::*;

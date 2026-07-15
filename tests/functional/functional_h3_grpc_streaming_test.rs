@@ -50,6 +50,7 @@ fn file_mode_yaml_with_response_buffering(
     backend_port: u16,
     buffer_response: bool,
     remove_buffered_trailer_fields: bool,
+    override_existing_security_headers: bool,
 ) -> String {
     let mut proxy = json!({
         "id": "h3-grpc-stream",
@@ -67,13 +68,18 @@ fn file_mode_yaml_with_response_buffering(
         proxy["response_body_mode"] = json!("buffer");
     }
     let mut security_config = json!({
-        "override_existing": false,
+        "override_existing": override_existing_security_headers,
         "hsts": true,
-        "set": { "X-Security-Policy": "gateway-enforced" },
+        "set": {
+            "X-Security-Policy": "gateway-enforced",
+        },
         "remove": [],
     });
     let mut plugin_configs = Vec::new();
-    if remove_buffered_trailer_fields {
+    if override_existing_security_headers {
+        security_config["set"]["Grpc-Status"] = json!("0");
+        security_config["set"]["Grpc-Message"] = json!("policy override");
+    } else if remove_buffered_trailer_fields {
         plugin_configs.push(json!({
             "id": "h3-grpc-cookie-transformer",
             "plugin_name": "response_transformer",
@@ -88,7 +94,15 @@ fn file_mode_yaml_with_response_buffering(
             "scope": "global",
             "enabled": true,
         }));
-        security_config["remove"] = json!(["Set-Cookie", "X-Powered-By"]);
+        security_config["remove"] = json!([
+            "Set-Cookie",
+            "X-Powered-By",
+            "Grpc-Status",
+            "Grpc-Message",
+        ]);
+        security_config["set"] = json!({
+            "X-Security-Policy": "gateway-enforced",
+        });
     }
     plugin_configs.push(json!({
         "id": "h3-grpc-security-headers",
@@ -114,17 +128,23 @@ async fn spawn_h3_grpc_gateway(
     backend_port: u16,
     extra_env: &[(&str, String)],
 ) -> (GatewayHarness, u16) {
-    spawn_h3_grpc_gateway_with_response_buffering(backend_port, extra_env, false, false).await
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, extra_env, false, false, false).await
 }
 
 async fn spawn_buffered_h3_grpc_gateway(backend_port: u16) -> (GatewayHarness, u16) {
-    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true, false).await
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true, false, false).await
+}
+
+async fn spawn_buffered_h3_grpc_gateway_with_hostile_terminal_set(
+    backend_port: u16,
+) -> (GatewayHarness, u16) {
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true, false, true).await
 }
 
 async fn spawn_buffered_h3_grpc_gateway_with_security_removals(
     backend_port: u16,
 ) -> (GatewayHarness, u16) {
-    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true, true).await
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true, true, false).await
 }
 
 async fn spawn_h3_grpc_gateway_with_response_buffering(
@@ -132,6 +152,7 @@ async fn spawn_h3_grpc_gateway_with_response_buffering(
     extra_env: &[(&str, String)],
     buffer_response: bool,
     remove_buffered_trailer_fields: bool,
+    override_existing_security_headers: bool,
 ) -> (GatewayHarness, u16) {
     // Outer retry (codex P3): `FERRUM_PROXY_HTTPS_PORT` is a fixed port we
     // reserve-then-drop before the subprocess binds it, so a parallel test can
@@ -152,6 +173,7 @@ async fn spawn_h3_grpc_gateway_with_response_buffering(
                 backend_port,
                 buffer_response,
                 remove_buffered_trailer_fields,
+                override_existing_security_headers,
             ))
             .log_level("info")
             .capture_output()
@@ -500,9 +522,9 @@ async fn h3_buffered_grpc_empty_split_response_keeps_terminal_metadata_in_traile
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn h3_buffered_grpc_trailers_only_preserves_initial_terminal_status() {
+async fn assert_h3_buffered_grpc_trailers_only_preserves_initial_terminal_status(
+    remove_terminal_metadata: bool,
+) {
     let backend_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind backend");
@@ -521,7 +543,11 @@ async fn h3_buffered_grpc_trailers_only_preserves_initial_terminal_status() {
         .spawn()
         .expect("spawn backend");
 
-    let (_harness, https_port) = spawn_buffered_h3_grpc_gateway(backend_port).await;
+    let (_harness, https_port) = if remove_terminal_metadata {
+        spawn_buffered_h3_grpc_gateway_with_security_removals(backend_port).await
+    } else {
+        spawn_buffered_h3_grpc_gateway_with_hostile_terminal_set(backend_port).await
+    };
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
     let mut stream = open_grpc_stream_with_retry(&client, &url).await;
@@ -554,6 +580,18 @@ async fn h3_buffered_grpc_trailers_only_preserves_initial_terminal_status() {
             .and_then(|value| value.to_str().ok()),
         Some("gateway-enforced")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_trailers_only_resists_hostile_terminal_set() {
+    assert_h3_buffered_grpc_trailers_only_preserves_initial_terminal_status(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_trailers_only_resists_terminal_removal() {
+    assert_h3_buffered_grpc_trailers_only_preserves_initial_terminal_status(true).await;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -686,5 +724,18 @@ async fn h3_grpc_streaming_enforces_max_request_size_incrementally() {
         headers.get("grpc-status").map(|v| v.to_str().unwrap()),
         Some("8"),
         "oversized streaming upload must map to RESOURCE_EXHAUSTED (8)"
+    );
+    assert_eq!(
+        headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced"),
+        "synthesized H3 gRPC errors must carry initial-response policy"
+    );
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/grpc")
     );
 }

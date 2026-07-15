@@ -2701,6 +2701,10 @@ HTTP responses, buffered native gRPC, gRPC-Web binary/text, and HTTP/1.1,
 HTTP/2, and HTTP/3 WebSocket success and gateway-failure handshakes. Native
 gRPC status and application metadata remain trailers; a security policy field
 is reapplied to initial headers rather than promoting a backend trailer value.
+For a genuine Trailers-Only response whose terminal metadata is carried in the
+initial END_STREAM HEADERS, Ferrum snapshots reserved gRPC fields before hooks
+and restores that pristine backend value after policy, so `set` and `remove`
+cannot redefine the RPC outcome.
 On buffered gRPC and gRPC-Web responses, a final policy removal suppresses both
 the initial-header compatibility copy and the application-trailer copy, while
 a final set/override remains initial-header policy and preserves the backend's
@@ -2708,13 +2712,23 @@ application trailer. The final replay runs after trailer-only cookie rehoming
 and preserves the transport-owned `Content-Length` produced by the last body
 transform.
 
+Post-routing gateway-generated initial HEADERS use the same precomputed policy
+slice: this includes plain HTTP method-filter responses and native-gRPC method,
+deadline, size-limit, backend-unavailable, and mesh fail-closed errors across
+H1/H2/H3 frontends. Protocol-owned gRPC status/message/content type and
+Content-Length/transfer framing remain authoritative. Pre-routing errors such
+as overload, malformed request, 0-RTT, and route-miss responses have no resolved
+plugin configuration and do not apply route policy.
+
 Configuration is fail-closed: unknown top-level keys and unknown keys inside
 the `hsts` object reject startup or reload, retaining the last-known-good
 runtime configuration on reload. Header names use the complete HTTP
 field-name token grammar, are limited to 65,535 ASCII bytes, and are
 canonicalized to lowercase. Configured values must pass the same `HeaderValue`
 validation as the downstream H1/H2/H3 response builders: C0 controls other
-than horizontal tab, DEL, and non-ASCII characters are rejected.
+than horizontal tab, DEL, and non-ASCII characters are rejected. Invalid-name
+diagnostics identify the `set` or `remove` entry and render at most 96 escaped
+bytes of the hostile name before a truncation marker.
 
 **Priority:** 4080
 

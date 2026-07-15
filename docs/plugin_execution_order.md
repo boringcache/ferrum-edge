@@ -84,6 +84,8 @@ When a plugin returns a replacement body from `transform_response_body`, the cor
 
 For gateway-generated rejection responses, a small set of header-only `after_proxy` plugins opt in to still run. This preserves headers such as `Access-Control-Allow-Origin`, `traceparent`, and request IDs on rejected responses without treating them as backend responses.
 
+Post-routing method-filter responses and native-gRPC gateway errors also apply the resolved route's precomputed initial-response policy at the client HEADERS boundary. Pre-routing failures have no resolved plugin configuration. Protocol-owned gRPC terminal metadata and HTTP framing are restored after policy.
+
 `after_proxy` rejections are also honored before anything is sent downstream. This matters for plugins like `response_size_limiting`, whose `Content-Length` fast path now replaces oversized backend responses instead of only logging a warning.
 
 `on_response_committed` is buffered-only and observe-only. It receives mutable request context plus the final client-visible status, headers, and body after every `on_final_response_body` hook and any rejection replacement. It cannot mutate or reject the response. Exporters use it for record construction while retaining fail-closed sink admission in an earlier rejecting hook. The proxy gates the phase on a precomputed per-protocol capability bit, so no plugin scan occurs on the normal buffered path when no exporter needs it.

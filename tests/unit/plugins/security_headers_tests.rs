@@ -217,16 +217,67 @@ fn rejects_names_outside_http_field_name_grammar_without_trimming() {
         set.insert(name.clone(), json!("value"));
         let err = SecurityHeaders::new(&json!({ "set": set })).unwrap_err();
         assert!(
-            err.contains("'set' contains an invalid HTTP field name"),
+            err.contains("'set' contains invalid HTTP field name"),
             "unexpected set error for {name:?}: {err}"
         );
 
         let err = SecurityHeaders::new(&json!({ "remove": [name] })).unwrap_err();
         assert!(
-            err.contains("'remove' contains an invalid HTTP field name"),
+            err.contains("'remove' contains invalid HTTP field name"),
             "unexpected remove error: {err}"
         );
     }
+}
+
+#[test]
+fn invalid_header_name_errors_identify_the_offending_set_or_remove_entry() {
+    let err = SecurityHeaders::new(&json!({
+        "set": {
+            "x-valid-name": "valid",
+            "x-bad name": "invalid"
+        }
+    }))
+    .unwrap_err();
+    assert!(err.contains("'set'"), "set path missing from: {err}");
+    assert!(
+        err.contains("x-bad name"),
+        "offending set entry missing from: {err}"
+    );
+    assert!(
+        !err.contains("x-valid-name"),
+        "the error must diagnose the invalid entry, not a neighboring valid entry: {err}"
+    );
+
+    let err = SecurityHeaders::new(&json!({
+        "remove": ["x-valid-name", "x-bad\tname"]
+    }))
+    .unwrap_err();
+    assert!(err.contains("'remove'"), "remove path missing from: {err}");
+    assert!(
+        err.contains(r"x-bad\tname"),
+        "offending remove entry must be escaped in: {err}"
+    );
+}
+
+#[test]
+fn invalid_header_name_error_rendering_is_escaped_and_bounded() {
+    let hostile = format!("x\r\n{}DO_NOT_ECHO", "a".repeat(8_192));
+    let err = SecurityHeaders::new(&json!({ "remove": [hostile] })).unwrap_err();
+
+    assert!(
+        err.contains(r"x\r\n"),
+        "control characters must be escaped in: {err}"
+    );
+    assert!(err.contains("..."), "truncated names must be marked: {err}");
+    assert!(
+        !err.contains("DO_NOT_ECHO"),
+        "unbounded hostile suffix leaked into: {err}"
+    );
+    assert!(
+        err.len() < 200,
+        "validation error must stay length-bounded, got {} bytes",
+        err.len()
+    );
 }
 
 #[test]

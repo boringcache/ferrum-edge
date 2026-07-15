@@ -1118,6 +1118,7 @@ async fn handle_h3_request(
             &mut stream,
             crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
             "gRPC requires POST method",
+            &[],
         )
         .await?;
         return Ok(());
@@ -1358,6 +1359,9 @@ async fn handle_h3_request(
     // initial response policy and transport-managed header stripping.
     let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);
     ctx.set_websocket_response_boundary(matches!(http_flavor, HttpFlavor::WebSocket));
+    let initial_response_header_policy_plugins = epoch
+        .plugin_cache
+        .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
 
     // Per-proxy HTTP method filtering (checked before plugins to save work)
     if let Some(ref allowed) = proxy.allowed_methods
@@ -1366,15 +1370,13 @@ async fn handle_h3_request(
         record_request(&state, 405);
         let mut headers = HashMap::new();
         headers.insert("allow".to_string(), allowed.join(", "));
-        if request_protocol == ProxyProtocol::WebSocket {
-            let policy_plugins = epoch
-                .plugin_cache
-                .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
-            crate::proxy::finalize_websocket_response_headers(
-                policy_plugins.as_ref(),
-                &mut headers,
-            );
-        }
+        finalize_h3_gateway_error_headers(
+            http_flavor,
+            StatusCode::METHOD_NOT_ALLOWED,
+            br#"{"error":"Method Not Allowed"}"#,
+            &mut headers,
+            initial_response_header_policy_plugins.as_ref(),
+        );
         send_h3_reject_flavor_aware(
             &mut stream,
             http_flavor,
@@ -1532,13 +1534,14 @@ async fn handle_h3_request(
             Ok(true) => {}
             Ok(false) => {
                 record_request(&state, 413);
-                send_h3_error_flavor_aware(
+                send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Request body exceeds maximum size",
+                    initial_response_header_policy_plugins.as_ref(),
                 )
                 .await?;
                 return Ok(());
@@ -1553,13 +1556,14 @@ async fn handle_h3_request(
                         StatusCode::REQUEST_TIMEOUT.as_u16()
                     },
                 );
-                send_h3_error_flavor_aware(
+                send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
                     StatusCode::REQUEST_TIMEOUT,
                     r#"{"error":"Request body read timed out"}"#,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Request body read timed out",
+                    initial_response_header_policy_plugins.as_ref(),
                 )
                 .await?;
                 return Ok(());
@@ -1684,13 +1688,14 @@ async fn handle_h3_request(
                 Ok(true) => {}
                 Ok(false) => {
                     record_request(&state, 413);
-                    send_h3_error_flavor_aware(
+                    send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
                         crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                         "Request body exceeds maximum size",
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                     .await?;
                     return Ok(());
@@ -1705,13 +1710,14 @@ async fn handle_h3_request(
                             StatusCode::REQUEST_TIMEOUT.as_u16()
                         },
                     );
-                    send_h3_error_flavor_aware(
+                    send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
                         StatusCode::REQUEST_TIMEOUT,
                         r#"{"error":"Request body read timed out"}"#,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                         "Request body read timed out",
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                     .await?;
                     return Ok(());
@@ -1723,13 +1729,14 @@ async fn handle_h3_request(
         if let Some(body_data) = prebuffered_body_data.as_ref() {
             if body_limit > 0 && body_data.len() > body_limit {
                 record_request(&state, 413);
-                send_h3_error_flavor_aware(
+                send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Request body exceeds maximum size",
+                    initial_response_header_policy_plugins.as_ref(),
                 )
                 .await?;
                 return Ok(());
@@ -1875,13 +1882,14 @@ async fn handle_h3_request(
             Ok(true) => {}
             Ok(false) => {
                 record_request(&state, 413);
-                send_h3_error_flavor_aware(
+                send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Request body exceeds maximum size",
+                    initial_response_header_policy_plugins.as_ref(),
                 )
                 .await?;
                 return Ok(());
@@ -1896,13 +1904,14 @@ async fn handle_h3_request(
                         StatusCode::REQUEST_TIMEOUT.as_u16()
                     },
                 );
-                send_h3_error_flavor_aware(
+                send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
                     StatusCode::REQUEST_TIMEOUT,
                     r#"{"error":"Request body read timed out"}"#,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Request body read timed out",
+                    initial_response_header_policy_plugins.as_ref(),
                 )
                 .await?;
                 return Ok(());
@@ -2189,13 +2198,14 @@ async fn handle_h3_request(
         && len > content_length_limit
     {
         record_request(&state, 413);
-        send_h3_error_flavor_aware(
+        send_h3_error_flavor_aware_with_policy(
             &mut stream,
             http_flavor,
             StatusCode::PAYLOAD_TOO_LARGE,
             r#"{"error":"Request body exceeds maximum size"}"#,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
             "Request body exceeds maximum size",
+            initial_response_header_policy_plugins.as_ref(),
         )
         .await?;
         return Ok(());
@@ -2428,13 +2438,14 @@ async fn handle_h3_request(
                         &HashMap::new(),
                     );
                     record_request(&state, metric_status);
-                    send_h3_error_flavor_aware(
+                    send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
                         crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                         "Request body exceeds maximum size",
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                     .await?;
                     return Ok(());
@@ -2466,13 +2477,14 @@ async fn handle_h3_request(
                             StatusCode::REQUEST_TIMEOUT.as_u16()
                         },
                     );
-                    send_h3_error_flavor_aware(
+                    send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
                         StatusCode::REQUEST_TIMEOUT,
                         r#"{"error":"Request body read timed out"}"#,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                         "Request body read timed out",
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                     .await?;
                     return Ok(());
@@ -2650,13 +2662,14 @@ async fn handle_h3_request(
             502
         };
         record_request(&state, reject_metric_status);
-        send_h3_error_flavor_aware(
+        send_h3_error_flavor_aware_with_policy(
             &mut stream,
             http_flavor,
             StatusCode::BAD_GATEWAY,
             r#"{"error":"backend address blocked by egress policy"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
             "backend address blocked by egress policy",
+            initial_response_header_policy_plugins.as_ref(),
         )
         .await?;
         return Ok(());
@@ -2734,8 +2747,15 @@ async fn handle_h3_request(
             502
         };
         record_request(&state, reject_metric_status);
-        let reason_headers =
+        let mut reason_headers =
             HashMap::from([("gateway-error-reason".to_string(), reason.to_string())]);
+        finalize_h3_gateway_error_headers(
+            http_flavor,
+            StatusCode::BAD_GATEWAY,
+            br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+            &mut reason_headers,
+            initial_response_header_policy_plugins.as_ref(),
+        );
         send_h3_reject_flavor_aware(
             &mut stream,
             http_flavor,
@@ -2779,8 +2799,6 @@ async fn handle_h3_request(
     // from reaching this branch, but the dedicated handler also emits
     // a 501 itself as defense in depth.
     if http_flavor == HttpFlavor::WebSocket {
-        let initial_response_header_policy_plugins =
-            plugin_cache_view.initial_response_header_policy_plugins();
         // CSWSH protection (RFC 6455 §10.2): reject WS upgrades from
         // origins not on the allow-list BEFORE dispatching into the
         // bridge. Mirrors the H1/H2 check in
@@ -2888,6 +2906,7 @@ async fn handle_h3_request(
             &plugins,
             backend_admission_plugins.as_ref(),
             &mut plugin_execution_ns,
+            initial_response_header_policy_plugins.as_ref(),
         )
         .await;
     }
@@ -2920,6 +2939,7 @@ async fn handle_h3_request(
                 backend_start,
                 &mut ctx,
                 &plugins,
+                initial_response_header_policy_plugins.as_ref(),
                 backend_admission_plugins.as_ref(),
                 sticky_cookie_needed,
             )
@@ -2971,13 +2991,14 @@ async fn handle_h3_request(
                                 false,
                                 backend_start.elapsed(),
                             );
-                            send_h3_error_flavor_aware(
+                            send_h3_error_flavor_aware_with_policy(
                                 &mut stream,
                                 http_flavor,
                                 StatusCode::PAYLOAD_TOO_LARGE,
                                 r#"{"error":"Request body exceeds maximum size"}"#,
                                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                                 "Request body exceeds maximum size",
+                                initial_response_header_policy_plugins.as_ref(),
                             )
                             .await?;
                             return Ok(());
@@ -3024,13 +3045,14 @@ async fn handle_h3_request(
                                     StatusCode::REQUEST_TIMEOUT.as_u16()
                                 },
                             );
-                            send_h3_error_flavor_aware(
+                            send_h3_error_flavor_aware_with_policy(
                                 &mut stream,
                                 http_flavor,
                                 StatusCode::REQUEST_TIMEOUT,
                                 r#"{"error":"Request body read timed out"}"#,
                                 crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                                 "Request body read timed out",
+                                initial_response_header_policy_plugins.as_ref(),
                             )
                             .await?;
                             return Ok(());
@@ -3080,6 +3102,9 @@ async fn handle_h3_request(
                 xff_append_ip: socket_ip,
                 ctx: &mut ctx,
                 plugins: &plugins,
+                initial_response_header_policy_plugins: Arc::clone(
+                    &initial_response_header_policy_plugins,
+                ),
                 initial_response_header_policy_names,
                 backend_admission_plugins: backend_admission_plugins.as_ref(),
                 preacquired_backend_admission,
@@ -4126,13 +4151,14 @@ async fn handle_h3_request(
                     &HashMap::new(),
                 );
                 record_request(&state, metric_status);
-                send_h3_error_flavor_aware(
+                send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Request body exceeds maximum size",
+                    initial_response_header_policy_plugins.as_ref(),
                 )
                 .await?;
                 return Ok(());
@@ -4161,13 +4187,14 @@ async fn handle_h3_request(
                         StatusCode::REQUEST_TIMEOUT.as_u16()
                     },
                 );
-                send_h3_error_flavor_aware(
+                send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
                     StatusCode::REQUEST_TIMEOUT,
                     r#"{"error":"Request body read timed out"}"#,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Request body read timed out",
+                    initial_response_header_policy_plugins.as_ref(),
                 )
                 .await?;
                 return Ok(());
@@ -6606,6 +6633,7 @@ async fn dispatch_grpc_native_h3(
     plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
     plugin_execution_ns: &mut u64,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Result<(), anyhow::Error> {
     // Backend admission (gRPC rejects are emitted as trailers-only errors).
     let mut backend_admission_permits = match run_h3_backend_admission_or_send_reject(
@@ -6911,7 +6939,12 @@ async fn dispatch_grpc_native_h3(
             // it on a client disconnect during the error write. Capture whether the
             // gRPC error actually reached the client so the transaction log's
             // `client_disconnected` stays accurate when the client already reset.
-            let error_sent = send_h3_grpc_error(stream, grpc_status, grpc_message)
+            let error_sent = send_h3_grpc_error(
+                stream,
+                grpc_status,
+                grpc_message,
+                initial_response_header_policy_plugins,
+            )
                 .await
                 .is_ok();
 
@@ -7013,14 +7046,16 @@ async fn dispatch_grpc_native_h3(
     let mut response_headers = h3_resp.headers;
     stamp_h3_original_response_metadata(ctx, response_status, &response_headers);
 
-    // Snapshot the backend's Trailers-Only `grpc-status` from the INITIAL headers
-    // before `run_h3_streaming_after_proxy_hooks` can rewrite/remove it, so the
-    // adaptive-concurrency sample trains on the backend's terminal status (mapped
-    // to 5xx for a non-OK code) rather than plugin-mutated HTTP 200. Mirrors the
-    // pre-hook `grpc_backend_dispatch_status` snapshot the cross-protocol gRPC
-    // bridge takes. (A normal response carries `grpc-status` in the trailers,
-    // captured later as `grpc_trailer_status`.)
-    let backend_header_grpc_status: Option<String> = response_headers.get("grpc-status").cloned();
+    // Snapshot reserved Trailers-Only metadata from pristine INITIAL headers
+    // before response hooks can rewrite/remove it. The status drives backend
+    // health, while status/message/details are the authoritative fallback if
+    // the backend ends without a trailers frame. A normal response supplies a
+    // real terminal trailer below, which wins over this fallback.
+    let pristine_initial_terminal_metadata =
+        crate::proxy::grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers);
+    let backend_header_grpc_status = pristine_initial_terminal_metadata
+        .grpc_status()
+        .map(str::to_owned);
 
     // Response body size ceiling (Content-Length fast path). Backend RESPONSE
     // bytes are bounded by `max_response_body_size_bytes` — the same limit the
@@ -7037,6 +7072,7 @@ async fn dispatch_grpc_native_h3(
             stream,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
             "Backend response exceeds maximum size",
+            initial_response_header_policy_plugins,
         )
         .await
         .is_ok();
@@ -7234,12 +7270,17 @@ async fn dispatch_grpc_native_h3(
     // authoritative — capturing it first so a genuine Trailers-Only response
     // (status only in the headers, no body, no trailers) is re-emitted as a
     // synthesized trailer in the relay loop below.
-    let wire_grpc_status: Option<String> = response_headers.get("grpc-status").cloned();
-    let wire_grpc_message: Option<String> = response_headers.get("grpc-message").cloned();
+    let wire_grpc_status = pristine_initial_terminal_metadata
+        .grpc_status()
+        .map(str::to_owned);
+    let wire_grpc_message = pristine_initial_terminal_metadata
+        .grpc_message()
+        .map(str::to_owned);
     // Rich error details (`grpc-status-details-bin`) also live in the Trailers-Only
     // header block and must survive the synthesized trailer, not just status/message.
-    let wire_grpc_status_details: Option<String> =
-        response_headers.get("grpc-status-details-bin").cloned();
+    let wire_grpc_status_details = pristine_initial_terminal_metadata
+        .grpc_status_details()
+        .map(str::to_owned);
     response_headers
         .retain(|k, _| !crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(k.as_str()));
 
@@ -8593,6 +8634,35 @@ fn reject_response_sets_content_type(headers: &HashMap<String, String>) -> bool 
         .any(|k| k.eq_ignore_ascii_case("content-type"))
 }
 
+fn finalize_h3_gateway_error_headers(
+    flavor: HttpFlavor,
+    http_status: StatusCode,
+    http_body: &[u8],
+    headers: &mut HashMap<String, String>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) {
+    if matches!(flavor, HttpFlavor::Grpc) {
+        let (grpc_status, grpc_message) =
+            h3_grpc_reject_signal(http_status, http_body, headers);
+        crate::proxy::grpc_proxy::finalize_grpc_error_response_headers(
+            headers,
+            grpc_status,
+            grpc_message.as_ref(),
+            initial_response_header_policy_plugins,
+        );
+    } else if matches!(flavor, HttpFlavor::WebSocket) {
+        crate::proxy::finalize_websocket_response_headers(
+            initial_response_header_policy_plugins,
+            headers,
+        );
+    } else {
+        crate::proxy::finalize_plain_gateway_error_response_headers(
+            initial_response_header_policy_plugins,
+            headers,
+        );
+    }
+}
+
 async fn send_h3_reject_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
@@ -8627,12 +8697,16 @@ async fn send_h3_grpc_error(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     grpc_status: u32,
     grpc_message: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Result<(), anyhow::Error> {
-    let resp = Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/grpc")
-        .header("grpc-status", grpc_status.to_string())
-        .header("grpc-message", grpc_message)
+    let mut headers = HashMap::new();
+    crate::proxy::grpc_proxy::finalize_grpc_error_response_headers(
+        &mut headers,
+        grpc_status,
+        grpc_message,
+        initial_response_header_policy_plugins,
+    );
+    let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC error response: {}", e))?;
     stream.send_response(resp).await?;
@@ -8714,8 +8788,35 @@ async fn send_h3_error_flavor_aware(
     grpc_status: u32,
     grpc_message: &str,
 ) -> Result<(), anyhow::Error> {
+    send_h3_error_flavor_aware_with_policy(
+        stream,
+        flavor,
+        http_status,
+        http_body,
+        grpc_status,
+        grpc_message,
+        &[],
+    )
+    .await
+}
+
+async fn send_h3_error_flavor_aware_with_policy(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    flavor: HttpFlavor,
+    http_status: StatusCode,
+    http_body: &str,
+    grpc_status: u32,
+    grpc_message: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Result<(), anyhow::Error> {
     if matches!(flavor, HttpFlavor::Grpc) {
-        send_h3_grpc_error(stream, grpc_status, grpc_message).await
+        send_h3_grpc_error(
+            stream,
+            grpc_status,
+            grpc_message,
+            initial_response_header_policy_plugins,
+        )
+        .await
     } else {
         send_h3_response(stream, http_status, http_body).await
     }

@@ -1418,7 +1418,9 @@ async fn grpc_buffered_security_removal_wins_over_cookie_rehome_and_trailer_repl
         "security removal must not restore the shadowed application trailer"
     );
     assert_eq!(
-        trailers.get("grpc-status").and_then(|value| value.to_str().ok()),
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
         Some("0"),
         "terminal gRPC status must remain on the trailer channel"
     );
