@@ -2,7 +2,7 @@
 fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
     let source = include_str!("../../../src/http3/server.rs");
     let selection = source
-        .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .find("let mut selection = crate::proxy::backend_dispatch::select_upstream_target(")
         .expect("H3 selected-target lookup must remain present");
     let after_selection = &source[selection..];
 
@@ -190,7 +190,7 @@ fn h3_grpc_streaming_bridge_keeps_unresolved_base_proxy_for_selected_target() {
 fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     let source = include_str!("../../../src/http3/server.rs");
     let selection = source
-        .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .find("let mut selection = crate::proxy::backend_dispatch::select_upstream_target(")
         .expect("H3 selected-target lookup must remain present");
     let after_selection = &source[selection..];
     let path_policy = after_selection
