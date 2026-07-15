@@ -2446,15 +2446,19 @@ where
 /// the timer is inert (effectively unbounded) rather than panicking the proxy
 /// path, matching the buffered gRPC path's `tokio::time::timeout` behavior.
 struct TotalDeadlineBody<B> {
-    inner: B,
+    inner: Option<B>,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    saw_data: bool,
+    done: bool,
 }
 
 impl<B> TotalDeadlineBody<B> {
     fn new(inner: B, deadline: Option<tokio::time::Instant>) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             deadline: deadline.map(tokio::time::sleep_until).map(Box::pin),
+            saw_data: false,
+            done: false,
         }
     }
 }
@@ -2479,6 +2483,9 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
         // Check the absolute deadline FIRST and on EVERY poll. Unlike the
         // per-frame idle timer it is armed once and never reset, so it must fire
         // at the client deadline even for a backend that streams frames
@@ -2487,25 +2494,74 @@ where
         if let Some(deadline) = this.deadline.as_mut()
             && std::future::Future::poll(deadline.as_mut(), cx).is_ready()
         {
+            this.done = true;
+            this.deadline = None;
+            // Cancel upstream work and release its stream/accounting guards as
+            // soon as the deadline fires, before the downstream polls again.
+            this.inner.take();
+            if !this.saw_data {
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", http::HeaderValue::from_static("4"));
+                trailers.insert(
+                    "grpc-message",
+                    http::HeaderValue::from_static("Deadline%20exceeded%20at%20gateway"),
+                );
+                return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+            }
             return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "gRPC streaming response exceeded the client grpc-timeout deadline",
+                "gRPC streaming response exceeded the client grpc-timeout deadline after response data",
             )) as BoxError)));
         }
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Ready(None) => Poll::Ready(None),
+        let Some(inner) = this.inner.as_mut() else {
+            this.done = true;
+            return Poll::Ready(None);
+        };
+        match Pin::new(inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if frame.data_ref().is_some_and(|data| !data.is_empty()) {
+                    this.saw_data = true;
+                }
+                if frame.trailers_ref().is_some() {
+                    this.done = true;
+                    this.deadline = None;
+                    this.inner.take();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.done = true;
+                this.deadline = None;
+                this.inner.take();
+                Poll::Ready(Some(Err(e.into())))
+            }
+            Poll::Ready(None) => {
+                this.done = true;
+                this.deadline = None;
+                this.inner.take();
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.done
+            || self
+                .inner
+                .as_ref()
+                .is_none_or(http_body::Body::is_end_stream)
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
+        if self.done {
+            http_body::SizeHint::with_exact(0)
+        } else {
+            self.inner
+                .as_ref()
+                .map(http_body::Body::size_hint)
+                .unwrap_or_else(|| http_body::SizeHint::with_exact(0))
+        }
     }
 }
 
@@ -3188,6 +3244,29 @@ mod tests {
             Self {
                 steps: steps.into(),
             }
+        }
+    }
+
+    struct DropTrackedPendingBody {
+        drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for DropTrackedPendingBody {
+        fn drop(&mut self) {
+            self.drops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl http_body::Body for DropTrackedPendingBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
         }
     }
 
@@ -4522,7 +4601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn total_deadline_body_fires_when_deadline_already_elapsed() {
+    async fn total_deadline_body_emits_status_four_trailers_before_response_data() {
         // A deadline already in the past fires on the first poll regardless of
         // the inner's state — the absolute cap is checked before the inner, so
         // it bounds the stream independent of frame cadence, the case a per-frame
@@ -4538,10 +4617,82 @@ mod tests {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let polled = Pin::new(&mut body).poll_frame(&mut cx);
-        let Poll::Ready(Some(Err(e))) = polled else {
-            panic!("expected a TimedOut error for an already-elapsed deadline");
+        let Poll::Ready(Some(Ok(frame))) = polled else {
+            panic!("expected terminal gRPC trailers for an already-elapsed deadline");
         };
-        let io = e
+        let trailers = frame.trailers_ref().expect("deadline frame is trailers");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "4");
+        assert_eq!(
+            trailers.get("grpc-message").unwrap(),
+            "Deadline%20exceeded%20at%20gateway"
+        );
+        assert!(body.is_end_stream(), "deadline trailers terminate the body");
+    }
+
+    #[tokio::test]
+    async fn total_deadline_body_cancels_upstream_exactly_once_before_emitting_trailers() {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deadline = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before now is representable");
+        let mut body = TotalDeadlineBody::new(
+            DropTrackedPendingBody {
+                drops: std::sync::Arc::clone(&drops),
+            },
+            Some(deadline),
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            panic!("elapsed deadline must emit terminal trailers");
+        };
+        assert!(frame.trailers_ref().is_some());
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "upstream body must be cancelled before the trailer is returned"
+        );
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(None)
+        ));
+        drop(body);
+        assert_eq!(
+            drops.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "terminal polls and wrapper drop must not cancel upstream twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn total_deadline_body_errors_after_response_data() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let inner = Coalescing::new(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from_static(b"partial")))),
+                MockStep::Pending,
+            ]),
+            100,
+            None,
+        );
+        let mut body = TotalDeadlineBody::new(inner, Some(deadline));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            panic!("expected the response data before deadline expiry");
+        };
+        assert_eq!(frame.data_ref().unwrap(), &Bytes::from_static(b"partial"));
+
+        body.deadline = Some(Box::pin(tokio::time::sleep_until(
+            tokio::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("one second before now is representable"),
+        )));
+        let Poll::Ready(Some(Err(error))) = Pin::new(&mut body).poll_frame(&mut cx) else {
+            panic!("partial response expiry must abort with a transport error");
+        };
+        let io = error
             .downcast_ref::<std::io::Error>()
             .expect("deadline error must be an io::Error");
         assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);

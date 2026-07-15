@@ -3095,8 +3095,9 @@ where
     let body = if let Some(buffered) = prebuffered_body {
         buffered
     } else {
-        match super::server::collect_h3_request_body_with_timeout(
+        match super::server::collect_h3_request_body_with_deadline(
             drain_h3_body(stream, state.max_grpc_recv_size_bytes),
+            ctx.grpc_deadline_at(),
             proxy.backend_read_timeout_ms,
         )
         .await
@@ -3249,6 +3250,7 @@ where
         &identity_proxy_headers,
         stream_grpc_response,
         state.max_response_body_size_bytes,
+        ctx.grpc_deadline_at(),
     )
     .await;
 
@@ -3317,7 +3319,20 @@ where
             cb_retry_probe_slot_available = false;
 
             let delay = crate::retry::retry_delay(retry_config, attempt);
-            tokio::time::sleep(delay).await;
+            if let Some(deadline) = ctx.grpc_deadline_at() {
+                if tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+                    .await
+                    .is_err()
+                {
+                    result = Err(grpc_proxy::GrpcProxyError::BackendTimeout {
+                        kind: grpc_proxy::GrpcTimeoutKind::Read,
+                        message: "gRPC deadline exceeded during retry backoff".to_string(),
+                    });
+                    break;
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+            }
             attempt += 1;
 
             if let Some((next_target, next_cb_target_key, next_url)) =
@@ -3417,6 +3432,7 @@ where
                 &identity_proxy_headers,
                 stream_grpc_response,
                 state.max_response_body_size_bytes,
+                ctx.grpc_deadline_at(),
             )
             .await;
         }
@@ -4190,6 +4206,7 @@ pub(crate) async fn dispatch_grpc_streaming(
         state.max_grpc_recv_size_bytes,
         Arc::clone(&body_size_exceeded),
         None,
+        ctx.grpc_deadline_at(),
     )
     .await;
 

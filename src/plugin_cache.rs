@@ -138,6 +138,9 @@ impl Plugin for PriorityOverridePlugin {
     fn priority(&self) -> u16 {
         self.priority
     }
+    fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
+        self.inner.prepare_grpc_deadline(ctx)
+    }
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.on_request_received(ctx).await
     }

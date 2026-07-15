@@ -1794,29 +1794,17 @@ pub fn grpc_mesh_dispatch_falls_through(
 /// Timeout regime for a STREAMING gRPC response body:
 /// `(per_frame_read_timeout_ms, absolute_total_deadline)`.
 ///
-/// A client `grpc-timeout` is an end-to-end RPC deadline (issue #1649), so it
-/// is honored as an ABSOLUTE deadline anchored at request receipt — the
-/// remaining budget is `client_deadline_ms` minus `elapsed_since_receipt` — and
-/// the per-frame idle timeout is disabled (`0`): a backend that sends headers
-/// just before the deadline then trickles body frames is cut at the client's
-/// deadline instead of resetting a per-frame window forever. Without a client
-/// deadline, the operator `fallback_read_timeout_ms` applies PER FRAME (`0` =
-/// unbounded, for long-lived server/bidi streams that legitimately idle). A
-/// pathologically large client deadline that overflows Tokio's `Instant` range
-/// yields `None` and is treated as unbounded rather than panicking the proxy
-/// path. Shared by the direct gRPC pool's streaming arm and the mesh-mTLS
-/// `StreamingH2` relay so the two regimes cannot drift.
+/// The typed absolute deadline was established once at request receipt, before
+/// plugin work. Consumers must pass it through unchanged; reconstructing it
+/// from the relative upstream header would deduct gateway elapsed time twice
+/// and re-arm every retry. Without an RPC deadline, the operator fallback is a
+/// per-frame idle timeout (`0` = unbounded).
 pub fn grpc_streaming_response_deadline(
-    client_deadline_ms: Option<u64>,
-    elapsed_since_receipt: std::time::Duration,
+    request_deadline: Option<tokio::time::Instant>,
     fallback_read_timeout_ms: u64,
 ) -> (u64, Option<tokio::time::Instant>) {
-    match client_deadline_ms {
-        Some(budget_ms) => {
-            let remaining =
-                std::time::Duration::from_millis(budget_ms).saturating_sub(elapsed_since_receipt);
-            (0u64, tokio::time::Instant::now().checked_add(remaining))
-        }
+    match request_deadline {
+        Some(deadline) => (0, Some(deadline)),
         None => (fallback_read_timeout_ms, None),
     }
 }
@@ -1874,19 +1862,13 @@ pub struct GrpcStreamingResponse {
     /// Per-frame idle read timeout (ms) the response-body consumer applies to
     /// the streaming `body` in the FALLBACK regime (no client `grpc-timeout`):
     /// `backend_read_timeout_ms`, or `0` for unbounded. Ignored when
-    /// [`Self::client_grpc_deadline_ms`] is `Some` — that regime uses an absolute
+    /// [`Self::grpc_deadline_at`] is `Some` — that regime uses an absolute
     /// end-to-end deadline instead. Without a bound a backend that sends headers
     /// then stalls would pin the streaming guards until the client disconnects.
     pub response_read_timeout_ms: u64,
-    /// The post-plugin client `grpc-timeout` in milliseconds, if the client set
-    /// one (issue #1649). When `Some`, the response-body consumer enforces it as
-    /// an ABSOLUTE end-to-end deadline (anchored at request receipt) via
-    /// `TotalDeadlineBody`, so a backend cannot keep the streaming body open past
-    /// the client's RPC deadline by trickling frames under a per-frame idle
-    /// interval. When `None`, the per-frame [`Self::response_read_timeout_ms`]
-    /// fallback applies. Uncapped: a pathologically large value is handled by the
-    /// consumer's overflow guard (treated as unbounded, never a panic).
-    pub client_grpc_deadline_ms: Option<u64>,
+    /// The request-scoped absolute deadline established before plugin awaits.
+    /// Every attempt and response-body wrapper shares this exact instant.
+    pub grpc_deadline_at: Option<tokio::time::Instant>,
 }
 
 /// Either a fully-buffered or streaming gRPC response.
@@ -1927,6 +1909,7 @@ pub async fn proxy_grpc_request_from_bytes(
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
     max_response_body_size_bytes: usize,
+    grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     proxy_grpc_request_core(
         method,
@@ -1939,6 +1922,7 @@ pub async fn proxy_grpc_request_from_bytes(
         proxy_headers,
         stream_response,
         max_response_body_size_bytes,
+        grpc_deadline_at,
     )
     .await
 }
@@ -1971,6 +1955,7 @@ pub async fn proxy_grpc_request_streaming(
     max_grpc_recv_size_bytes: usize,
     body_size_exceeded: Arc<AtomicBool>,
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
     let grpc_body = GrpcBody::Streaming {
@@ -1990,6 +1975,7 @@ pub async fn proxy_grpc_request_streaming(
         grpc_pool,
         max_grpc_recv_size_bytes,
         body_size_exceeded,
+        grpc_deadline_at,
     )
     .await
 }
@@ -2017,6 +2003,7 @@ pub async fn proxy_grpc_request_streaming_channel(
     max_grpc_recv_size_bytes: usize,
     body_size_exceeded: Arc<AtomicBool>,
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let grpc_body = GrpcBody::Channel {
         receiver,
@@ -2035,6 +2022,7 @@ pub async fn proxy_grpc_request_streaming_channel(
         grpc_pool,
         max_grpc_recv_size_bytes,
         body_size_exceeded,
+        grpc_deadline_at,
     )
     .await
 }
@@ -2059,6 +2047,7 @@ async fn proxy_grpc_streaming_dispatch(
     grpc_pool: &GrpcConnectionPool,
     max_grpc_recv_size_bytes: usize,
     body_size_exceeded: Arc<AtomicBool>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let uri: hyper::Uri = backend_url
         .parse()
@@ -2102,20 +2091,56 @@ async fn proxy_grpc_streaming_dispatch(
     // When no gRPC deadline is set: fall back to backend_read_timeout_ms
     // as a safety net against indefinitely stalled backends. Slow uploads
     // without deadlines should be bounded.
-    let effective_timeout_ms = streaming_effective_timeout_ms(&headers, proxy);
-    // Client end-to-end RPC deadline (issue #1649): when the client set a
-    // `grpc-timeout`, the streaming response body is bounded by an ABSOLUTE
-    // deadline rather than a per-frame idle timeout. Captured here before
-    // `headers` is moved into the backend request below.
-    let client_grpc_deadline_ms = parse_grpc_timeout_ms(&headers);
+    let effective_timeout_ms = grpc_deadline_at
+        .map(|deadline| {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let millis = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
+            millis.max(1)
+        })
+        .or_else(|| streaming_effective_timeout_ms(&headers, proxy));
 
     let mut backend_req = Request::new(grpc_body);
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;
 
-    let mut sender = grpc_pool.get_sender(proxy).await?;
-    let response = if let Some(timeout_ms) = effective_timeout_ms {
+    let mut sender = if let Some(deadline) = grpc_deadline_at {
+        tokio::time::timeout_at(deadline, grpc_pool.get_sender(proxy))
+            .await
+            .map_err(|_| GrpcProxyError::BackendTimeout {
+                kind: GrpcTimeoutKind::Read,
+                message: "gRPC deadline exceeded during backend connection acquisition"
+                    .to_string(),
+            })??
+    } else {
+        grpc_pool.get_sender(proxy).await?
+    };
+    let response = if let Some(deadline) = grpc_deadline_at {
+        tokio::time::timeout_at(deadline, sender.send_request(backend_req))
+            .await
+            .map_err(|_| {
+                warn!("gRPC deadline exceeded waiting for streaming RPC response headers");
+                GrpcProxyError::BackendTimeout {
+                    kind: GrpcTimeoutKind::Read,
+                    message: "gRPC deadline exceeded waiting for streaming RPC response headers"
+                        .to_string(),
+                }
+            })?
+            .map_err(|e| {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return GrpcProxyError::ResourceExhausted(format!(
+                        "gRPC request payload size exceeds maximum of {} bytes",
+                        max_grpc_recv_size_bytes
+                    ));
+                }
+                error!("gRPC backend request failed (streaming body): {}", e);
+                GrpcProxyError::backend_unavailable_with_source(
+                    GrpcBackendUnavailableKind::BackendRequest,
+                    format!("Backend request failed: {}", e),
+                    e,
+                )
+            })?
+    } else if let Some(timeout_ms) = effective_timeout_ms {
         let read_timeout = Duration::from_millis(timeout_ms);
         tokio::time::timeout(read_timeout, sender.send_request(backend_req))
             .await
@@ -2212,7 +2237,7 @@ async fn proxy_grpc_streaming_dispatch(
             None
         },
         response_read_timeout_ms: effective_timeout_ms.unwrap_or(0),
-        client_grpc_deadline_ms,
+        grpc_deadline_at,
     }))
 }
 
@@ -2226,12 +2251,14 @@ pub(crate) async fn collect_grpc_request_body(
     req: Request<Incoming>,
     max_grpc_recv_size_bytes: usize,
     request_body_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcRequestBodyCollectError> {
     let (parts, body) = req.into_parts();
     let body_bytes = if max_grpc_recv_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
-        let collected = super::collect_request_body_with_timeout(
+        let collected = super::collect_request_body_with_deadline(
             BodyExt::collect(limited),
+            grpc_deadline_at,
             request_body_read_timeout_ms,
         )
         .await
@@ -2253,8 +2280,9 @@ pub(crate) async fn collect_grpc_request_body(
             }
         }
     } else {
-        super::collect_request_body_with_timeout(
+        super::collect_request_body_with_deadline(
             BodyExt::collect(body),
+            grpc_deadline_at,
             request_body_read_timeout_ms,
         )
         .await
@@ -2287,9 +2315,8 @@ pub(crate) async fn proxy_grpc_request_core(
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
     max_response_body_size_bytes: usize,
+    grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
-    // Get or create HTTP/2 connection to backend (round-robins across pool)
-    let mut sender = grpc_pool.get_sender(proxy).await?;
     // Parse the backend URL to extract path and authority
     let uri: hyper::Uri = backend_url
         .parse()
@@ -2334,10 +2361,28 @@ pub(crate) async fn proxy_grpc_request_core(
     //    newly time out a large buffered response from a slow-but-progressing
     //    backend that previously succeeded, so the two phases stay independent —
     //    matching the long-standing operator semantics and the streaming path.
-    let (client_deadline_ms, per_phase_read_ms) = match parse_grpc_timeout_ms(&headers) {
-        Some(grpc_ms) if proxy.backend_read_timeout_ms > 0 => {
-            (Some(grpc_ms.min(proxy.backend_read_timeout_ms)), None)
-        }
+    let client_grpc_deadline_at = grpc_deadline_at.or_else(|| {
+        parse_grpc_timeout_ms(&headers).and_then(|grpc_ms| {
+            tokio::time::Instant::now().checked_add(Duration::from_millis(grpc_ms))
+        })
+    });
+    let dispatch_started_at = tokio::time::Instant::now();
+    let backend_read_deadline = if proxy.backend_read_timeout_ms > 0 {
+        dispatch_started_at.checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
+    } else {
+        None
+    };
+    let dispatch_deadline_at = match (client_grpc_deadline_at, backend_read_deadline) {
+        (Some(client), Some(read)) => Some(client.min(read)),
+        (Some(client), None) => Some(client),
+        (None, _) => None,
+    };
+    let request_deadline_remaining_ms = dispatch_deadline_at.map(|deadline| {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let millis = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
+        millis.max(1)
+    });
+    let (client_deadline_ms, per_phase_read_ms) = match request_deadline_remaining_ms {
         Some(grpc_ms) => (Some(grpc_ms), None),
         None if proxy.backend_read_timeout_ms > 0 => (None, Some(proxy.backend_read_timeout_ms)),
         None => (None, None),
@@ -2349,17 +2394,27 @@ pub(crate) async fn proxy_grpc_request_core(
     // rule as the streaming dispatch's header-wait deadline, so a backend that
     // streams headers then stalls cannot pin the streaming guards until the
     // client disconnects. Unused on the buffered path. 0 = unbounded.
-    let streaming_response_read_timeout_ms =
-        streaming_effective_timeout_ms(&headers, proxy).unwrap_or(0);
-    // Client end-to-end RPC deadline (issue #1649), captured before `headers` is
-    // moved below. When set, the streaming response body is bounded by an
-    // ABSOLUTE deadline rather than the per-frame idle fallback.
-    let streaming_client_grpc_deadline_ms = parse_grpc_timeout_ms(&headers);
+    let streaming_response_read_timeout_ms = if client_grpc_deadline_at.is_some() {
+        0
+    } else {
+        streaming_effective_timeout_ms(&headers, proxy).unwrap_or(0)
+    };
 
     let mut backend_req = Request::new(GrpcBody::Buffered(Full::new(body_bytes)));
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;
+    let mut sender = if let Some(deadline) = dispatch_deadline_at {
+        tokio::time::timeout_at(deadline, grpc_pool.get_sender(proxy))
+            .await
+            .map_err(|_| GrpcProxyError::BackendTimeout {
+                kind: GrpcTimeoutKind::Read,
+                message: "gRPC deadline exceeded during backend connection acquisition"
+                    .to_string(),
+            })??
+    } else {
+        grpc_pool.get_sender(proxy).await?
+    };
     let send_fut = sender.send_request(backend_req);
     let map_send_err = |e: hyper::Error| {
         error!("gRPC: backend request failed: {}", e);
@@ -2385,11 +2440,8 @@ pub(crate) async fn proxy_grpc_request_core(
     // form); on overflow the deadline is treated as effectively unbounded. The
     // operator fallback (`per_phase_read_ms`) instead arms a fresh per-phase
     // timer in each phase, preserving the prior per-read stall-guard semantics.
-    let client_deadline = client_deadline_ms.and_then(|ms| {
-        tokio::time::Instant::now()
-            .checked_add(Duration::from_millis(ms))
-            .map(|deadline| (ms, deadline))
-    });
+    let client_deadline = dispatch_deadline_at
+        .map(|deadline| (client_deadline_ms.unwrap_or(1), deadline));
     let response = if let Some((timeout_ms, deadline)) = client_deadline {
         tokio::time::timeout_at(deadline, send_fut)
             .await
@@ -2452,7 +2504,7 @@ pub(crate) async fn proxy_grpc_request_core(
             body: response.into_body(),
             request_body_exceeded: None, // buffered request body — already fully sent
             response_read_timeout_ms: streaming_response_read_timeout_ms,
-            client_grpc_deadline_ms: streaming_client_grpc_deadline_ms,
+            grpc_deadline_at: client_grpc_deadline_at,
         }));
     }
 
@@ -3301,21 +3353,23 @@ mod tests {
             .expect("failed to locate end of proxy_grpc_request_core body");
         let body = &tail[..fn_end];
 
-        // The client deadline is computed ONCE (a single shared Instant) and
-        // reused by both phases via timeout_at — never recomputed per phase.
-        let client_now = body.matches("tokio::time::Instant::now()").count();
-        assert_eq!(
-            client_now, 1,
-            "the client gRPC deadline must be computed ONCE and shared by both \
-             phases; found {client_now} `Instant::now()` call(s). A second one \
-             means the header wait and body collection no longer share one \
-             end-to-end budget (the F11 ~2x bug)."
+        // The caller-supplied typed deadline wins; parsing and anchoring the
+        // relative header is compatibility-only. The resulting dispatch
+        // instant is then reused by pool acquisition, header wait, and body
+        // collection rather than reconstructed per phase.
+        assert!(
+            body.contains("let client_grpc_deadline_at = grpc_deadline_at.or_else(||"),
+            "the request-scoped typed deadline must be the primary source"
+        );
+        assert!(
+            body.contains("let client_deadline = dispatch_deadline_at"),
+            "one dispatch deadline must be shared by response phases"
         );
         let timeout_at = body.matches("tokio::time::timeout_at(").count();
         assert_eq!(
-            timeout_at, 2,
-            "both the header wait and body collection must consume the SAME \
-             shared client deadline via timeout_at; found {timeout_at}."
+            timeout_at, 3,
+            "pool acquisition, header wait, and body collection must consume \
+             the SAME bounded dispatch deadline via timeout_at; found {timeout_at}."
         );
 
         // The deadline Instant add must be overflow-guarded (checked_add) so a

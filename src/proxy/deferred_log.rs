@@ -96,11 +96,26 @@ pub async fn run_response_stream_termination_hooks(
     response_status: u16,
     outcome: &BodyOutcome,
 ) {
-    crate::plugins::wait_for_response_stream_inspector(ctx).await;
+    if crate::plugins::await_grpc_deadline(
+        ctx.grpc_deadline_at(),
+        crate::plugins::wait_for_response_stream_inspector(ctx),
+    )
+    .await
+    .is_err()
+    {
+        crate::plugins::clear_response_stream_inspector_state(ctx);
+        return;
+    }
     for plugin in plugins {
-        plugin
-            .on_response_stream_terminated(ctx, response_status, outcome)
-            .await;
+        if crate::plugins::await_grpc_deadline(
+            ctx.grpc_deadline_at(),
+            plugin.on_response_stream_terminated(ctx, response_status, outcome),
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
     }
     crate::plugins::clear_response_stream_inspector_state(ctx);
 }

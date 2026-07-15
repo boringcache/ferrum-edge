@@ -19,6 +19,12 @@ use tracing::debug;
 use super::{GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
 
 const MAX_GRPC_TIMEOUT_VALUE: u64 = 99_999_999;
+const ALLOWED_CONFIG_KEYS: [&str; 4] = [
+    "max_deadline_ms",
+    "default_deadline_ms",
+    "subtract_gateway_processing",
+    "reject_no_deadline",
+];
 
 pub struct GrpcDeadline {
     max_deadline_ms: Option<u64>,
@@ -31,6 +37,15 @@ impl GrpcDeadline {
     pub fn new(config: &Value) -> Result<Self, String> {
         if !config.is_object() {
             return Err("grpc_deadline: config must be an object".to_string());
+        }
+        if let Some(object) = config.as_object()
+            && let Some(key) = object
+                .keys()
+                .find(|key| !ALLOWED_CONFIG_KEYS.contains(&key.as_str()))
+        {
+            return Err(format!(
+                "grpc_deadline: unknown configuration property 'config.{key}'"
+            ));
         }
 
         let max_deadline_ms = optional_u64(config, "max_deadline_ms")?;
@@ -94,7 +109,7 @@ impl GrpcDeadline {
 fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(Value::Null) | None => Ok(None),
+        None => Ok(None),
         Some(_) => Err(format!("grpc_deadline: '{key}' must be a boolean")),
     }
 }
@@ -105,7 +120,7 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
             .as_u64()
             .map(Some)
             .ok_or_else(|| format!("grpc_deadline: '{key}' must be an unsigned integer")),
-        Some(Value::Null) | None => Ok(None),
+        None => Ok(None),
         Some(_) => Err(format!(
             "grpc_deadline: '{key}' must be an unsigned integer"
         )),
@@ -190,8 +205,69 @@ fn format_grpc_timeout(d: Duration) -> String {
     timeout
 }
 
-fn duration_millis_saturating(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
+fn duration_millis_ceil_saturating(duration: Duration) -> Option<u64> {
+    if duration.is_zero() {
+        return None;
+    }
+    let nanos = duration.as_nanos();
+    let millis = nanos.div_ceil(1_000_000).min(u128::from(u64::MAX)) as u64;
+    Some(millis.max(1))
+}
+
+fn timeout_header<'a>(headers: &'a HashMap<String, String>) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("grpc-timeout"))
+        .map(|(_, value)| value.as_str())
+}
+
+fn initialize_deadline_from_headers(
+    ctx: &mut RequestContext,
+    headers: &HashMap<String, String>,
+) {
+    if ctx.grpc_deadline_initialized {
+        return;
+    }
+    let deadline_ms = timeout_header(headers)
+        .and_then(parse_grpc_timeout)
+        .and_then(duration_millis_ceil_saturating);
+    if let Some(original_ms) = deadline_ms {
+        ctx.metadata.insert(
+            "grpc_original_deadline_ms".to_string(),
+            original_ms.to_string(),
+        );
+    }
+    ctx.initialize_grpc_deadline_budget(deadline_ms);
+}
+
+/// Establish the request's single typed gRPC deadline before any plugin or
+/// request-body await. Policies are applied in configured execution order, so
+/// multiple scoped instances compose once without repeatedly deducting elapsed
+/// gateway time from a rewritten relative header.
+pub fn prepare_request_deadline(
+    plugins: &[std::sync::Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) -> PluginResult {
+    if !ctx.grpc_deadline_initialized {
+        let deadline_ms = timeout_header(&ctx.headers)
+            .and_then(parse_grpc_timeout)
+            .and_then(duration_millis_ceil_saturating);
+        if let Some(original_ms) = deadline_ms {
+            ctx.metadata.insert(
+                "grpc_original_deadline_ms".to_string(),
+                original_ms.to_string(),
+            );
+        }
+        ctx.initialize_grpc_deadline_budget(deadline_ms);
+    }
+    for plugin in plugins {
+        match plugin.prepare_grpc_deadline(ctx) {
+            PluginResult::Continue => {}
+            reject => return reject,
+        }
+    }
+    ctx.grpc_deadline_preflight_complete = true;
+    PluginResult::Continue
 }
 
 /// Returns a header map with `content-type: application/grpc`.
@@ -215,43 +291,14 @@ impl Plugin for GrpcDeadline {
         GRPC_ONLY_PROTOCOLS
     }
 
-    fn modifies_request_headers(&self) -> bool {
-        true
-    }
+    fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
+        let mut deadline_ms = ctx.grpc_deadline_budget_ms;
 
-    async fn before_proxy(
-        &self,
-        ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
-    ) -> PluginResult {
-        let mut deadline_ms: Option<u64> = match headers.get("grpc-timeout") {
-            Some(val) => match parse_grpc_timeout(val) {
-                Some(d) => {
-                    let original_ms = duration_millis_saturating(d);
-                    ctx.metadata.insert(
-                        "grpc_original_deadline_ms".to_string(),
-                        original_ms.to_string(),
-                    );
-                    Some(original_ms)
-                }
-                None => {
-                    debug!(
-                        timeout_val = %val,
-                        plugin = "grpc_deadline",
-                        "Could not parse grpc-timeout header"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-
-        // Handle missing deadline
         if deadline_ms.is_none() && self.reject_no_deadline {
-            debug!(plugin = "grpc_deadline", "Request missing grpc-timeout");
+            debug!(plugin = "grpc_deadline", "Request missing valid grpc-timeout");
             return PluginResult::Reject {
                 status_code: 400,
-                body: r#"{"error":"grpc-timeout header is required"}"#.to_string(),
+                body: r#"{"error":"a positive grpc-timeout header is required"}"#.to_string(),
                 headers: grpc_content_type_header(),
             };
         }
@@ -260,8 +307,6 @@ impl Plugin for GrpcDeadline {
         {
             deadline_ms = Some(default_ms);
         }
-
-        // Apply max deadline cap
         if let (Some(current), Some(max)) = (deadline_ms, self.max_deadline_ms)
             && current > max
         {
@@ -274,18 +319,57 @@ impl Plugin for GrpcDeadline {
             deadline_ms = Some(max);
         }
 
-        // Subtract gateway processing time
-        if self.subtract_gateway_processing
-            && let Some(current) = deadline_ms
-        {
-            let elapsed = chrono::Utc::now()
-                .signed_duration_since(ctx.timestamp_received)
-                .num_milliseconds()
-                .max(0) as u64;
-            if elapsed >= current {
+        ctx.set_grpc_deadline_budget(deadline_ms);
+        ctx.grpc_deadline_header_is_remaining |= self.subtract_gateway_processing;
+        PluginResult::Continue
+    }
+
+    fn modifies_request_headers(&self) -> bool {
+        true
+    }
+
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        // Direct plugin tests and custom embedders may call `before_proxy`
+        // without the gateway's receipt-time preparation pass. Preserve that
+        // API by initializing and applying this policy once on the fallback
+        // path; normal gateway requests arrive here already fully prepared.
+        if !ctx.grpc_deadline_preflight_complete {
+            if !ctx.grpc_deadline_initialized {
+                initialize_deadline_from_headers(ctx, headers);
+            }
+            if let reject @ (PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }) =
+                self.prepare_grpc_deadline(ctx)
+            {
+                return reject;
+            }
+        }
+
+        let Some(effective_ms) = ctx.grpc_deadline_budget_ms else {
+            if let Some(value) = timeout_header(headers) {
                 debug!(
-                    elapsed_ms = elapsed,
-                    deadline_ms = current,
+                    timeout_val = %value,
+                    plugin = "grpc_deadline",
+                    "Could not establish a positive grpc-timeout"
+                );
+            }
+            return PluginResult::Continue;
+        };
+
+        let deadline_ms = if ctx.grpc_deadline_header_is_remaining {
+            let remaining_ms = ctx.grpc_deadline_remaining_ms().unwrap_or_else(|| {
+                let elapsed = chrono::Utc::now()
+                    .signed_duration_since(ctx.timestamp_received)
+                    .num_milliseconds()
+                    .max(0) as u64;
+                effective_ms.saturating_sub(elapsed)
+            });
+            if remaining_ms == 0 {
+                debug!(
+                    deadline_ms = effective_ms,
                     plugin = "grpc_deadline",
                     "Deadline already exceeded after gateway processing"
                 );
@@ -301,16 +385,18 @@ impl Plugin for GrpcDeadline {
                     headers: resp_headers,
                 };
             }
-            deadline_ms = Some(current - elapsed);
-        }
+            remaining_ms
+        } else {
+            effective_ms
+        };
 
-        // Set the adjusted grpc-timeout header
-        if let Some(ms) = deadline_ms {
-            let timeout_val = format_grpc_timeout(Duration::from_millis(ms));
-            headers.insert("grpc-timeout".to_string(), timeout_val);
-            ctx.metadata
-                .insert("grpc_adjusted_deadline_ms".to_string(), ms.to_string());
-        }
+        let timeout_val = format_grpc_timeout(Duration::from_millis(deadline_ms));
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("grpc-timeout"));
+        headers.insert("grpc-timeout".to_string(), timeout_val);
+        ctx.metadata.insert(
+            "grpc_adjusted_deadline_ms".to_string(),
+            deadline_ms.to_string(),
+        );
 
         PluginResult::Continue
     }

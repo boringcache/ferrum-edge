@@ -4,12 +4,17 @@ Ferrum Edge executes plugins in a deterministic order based on two dimensions: *
 
 ## Lifecycle Phases
 
-Every HTTP-family request passes through the request/header phases in strict order. Buffered responses then run the body phases before logging; streamed non-buffered responses skip the buffered body phases and run a terminal stream hook before logging. WebSocket connections optionally enter a frame phase after the HTTP upgrade completes. Plugins only run in the phases they implement:
+Every HTTP-family request passes through the request/header phases in strict order. For gRPC requests, the gateway first runs the synchronous `grpc_deadline` policy preflight immediately after routing: it establishes one receipt-anchored monotonic deadline before any plugin or body await. The normal `before_proxy` hook later writes the relative remaining header for the backend; it does not create or re-arm the gateway timer. Buffered responses then run the body phases before logging; streamed non-buffered responses skip the buffered body phases and run a terminal stream hook before logging. WebSocket connections optionally enter a frame phase after the HTTP upgrade completes. Plugins only run in the phases they implement:
 
 ```
 Request In
     │
     ▼
+┌─────────────────────────┐
+│ 0. gRPC deadline policy │  Synchronous receipt-time budget preflight
+└────────────┬────────────┘
+             │
+             ▼
 ┌─────────────────────────┐
 │ 1. on_request_received  │  Pre-processing: CORS preflight
 └────────────┬────────────┘
@@ -338,7 +343,7 @@ Given all built-in plugins enabled, the execution order is:
 | 50 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 51 | `serverless_function` | 3025 | before_proxy |
 | 52 | `response_mock` | 3030 | before_proxy |
-| 53 | `grpc_deadline` | 3050 | before_proxy |
+| 53 | `grpc_deadline` | 3050 | receipt-time deadline preflight, before_proxy |
 | 54 | `request_mirror` | 3075 | before_proxy |
 | 55 | `load_testing` | 3080 | before_proxy |
 | 56 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |

@@ -463,6 +463,28 @@ pub struct RequestContext {
     /// compiled-in literal — zero allocation on the hot path.
     pub auth_method: Option<&'static str>,
     pub timestamp_received: DateTime<Utc>,
+    /// Whether the request's gRPC deadline state has been initialized from the
+    /// inbound `grpc-timeout` value. Initialization happens once, immediately
+    /// after routing and before any request-plugin or body-buffering await.
+    pub(crate) grpc_deadline_initialized: bool,
+    /// Monotonic receipt instant captured with the request context. Effective
+    /// budgets are added to this exact anchor, independent of wall-clock jumps.
+    pub(crate) grpc_deadline_received_at: tokio::time::Instant,
+    /// Whether the gateway's full ordered deadline-policy preflight completed.
+    /// Direct plugin callers that skip the preflight still apply each instance
+    /// from `before_proxy` for backward-compatible composition.
+    pub(crate) grpc_deadline_preflight_complete: bool,
+    /// Effective receipt-anchored gRPC budget after every `grpc_deadline`
+    /// policy has applied its default/cap decision. Kept separate from the
+    /// relative header forwarded upstream so retries never re-arm the budget.
+    pub(crate) grpc_deadline_budget_ms: Option<u64>,
+    /// Single monotonic absolute deadline shared by request phases, backend
+    /// attempts, retry backoff, and streaming response bodies.
+    pub(crate) grpc_deadline_at: Option<tokio::time::Instant>,
+    /// Once any `grpc_deadline` instance requests gateway-time subtraction,
+    /// every later instance forwards the same remaining budget instead of
+    /// subtracting receipt-to-hook elapsed time again.
+    pub(crate) grpc_deadline_header_is_remaining: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
     /// Credential header names precomputed by the plugin cache for safe
@@ -791,6 +813,12 @@ impl RequestContext {
             authenticated_identity_header: None,
             auth_method: None,
             timestamp_received: Utc::now(),
+            grpc_deadline_initialized: false,
+            grpc_deadline_received_at: tokio::time::Instant::now(),
+            grpc_deadline_preflight_complete: false,
+            grpc_deadline_budget_ms: None,
+            grpc_deadline_at: None,
+            grpc_deadline_header_is_remaining: false,
             metadata: HashMap::new(),
             request_headers_to_redact: None,
             ai_semantic_cache_embedding: None,
@@ -847,6 +875,42 @@ impl RequestContext {
         }
     }
 
+    /// Return the one absolute gRPC deadline established for this request.
+    /// The instant is monotonic and must be reused rather than reconstructed
+    /// from the relative `grpc-timeout` header on later backend attempts.
+    pub fn grpc_deadline_at(&self) -> Option<tokio::time::Instant> {
+        self.grpc_deadline_at
+    }
+
+    /// Remaining whole-millisecond gRPC budget, rounded up so a positive
+    /// sub-millisecond remainder can never become the invalid wire value `0m`.
+    pub fn grpc_deadline_remaining_ms(&self) -> Option<u64> {
+        let remaining = self
+            .grpc_deadline_at?
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Some(0);
+        }
+        let millis = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
+        Some(millis.max(1))
+    }
+
+    pub(crate) fn initialize_grpc_deadline_budget(&mut self, budget_ms: Option<u64>) {
+        if self.grpc_deadline_initialized {
+            return;
+        }
+        self.grpc_deadline_initialized = true;
+        self.set_grpc_deadline_budget(budget_ms);
+    }
+
+    pub(crate) fn set_grpc_deadline_budget(&mut self, budget_ms: Option<u64>) {
+        self.grpc_deadline_budget_ms = budget_ms;
+        self.grpc_deadline_at = budget_ms.and_then(|budget| {
+            self.grpc_deadline_received_at
+                .checked_add(Duration::from_millis(budget))
+        });
+    }
+
     /// Correlation id for the concrete response-stream inspector chain, when
     /// one attached to this request. Streaming plugins can key bounded shared
     /// state by this id in `response_stream_inspector`, then remove and fold it
@@ -879,6 +943,12 @@ impl RequestContext {
             authenticated_identity_header: self.authenticated_identity_header.clone(),
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
+            grpc_deadline_initialized: self.grpc_deadline_initialized,
+            grpc_deadline_received_at: self.grpc_deadline_received_at,
+            grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
+            grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
+            grpc_deadline_at: self.grpc_deadline_at,
+            grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             // Omit `request_body` (the full buffered prompt): no
             // `on_final_request_body` hook reads it from the context — they all
             // take the body as a `&[u8]` parameter — so copying it here would burn
@@ -1577,6 +1647,52 @@ pub enum PluginResult {
     },
 }
 
+/// Await one request-phase plugin hook under the RPC's absolute deadline.
+/// Returning a normal plugin rejection keeps every caller's existing
+/// protocol-specific reject finalizer and cleanup path in control.
+pub async fn await_request_plugin_deadline<F>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> PluginResult
+where
+    F: std::future::Future<Output = PluginResult>,
+{
+    match await_grpc_deadline(deadline, future).await {
+        Ok(result) => result,
+        Err(_) => grpc_deadline_exceeded_plugin_result(),
+    }
+}
+
+pub(crate) async fn await_grpc_deadline<F, T>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(deadline) = deadline else {
+        return Ok(future.await);
+    };
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| ())
+}
+
+pub(crate) fn grpc_deadline_exceeded_plugin_result() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 200,
+        body: String::new(),
+        headers: HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("grpc-status".to_string(), "4".to_string()),
+            (
+                "grpc-message".to_string(),
+                "Deadline exceeded at gateway".to_string(),
+            ),
+        ]),
+    }
+}
+
 /// Action returned by a [`ResponseStreamInspector`]'s per-chunk/end hooks
 /// ([`ResponseStreamInspector::on_chunk`] / [`ResponseStreamInspector::on_end`]),
 /// generalizing the WebSocket [`Plugin::on_ws_frame`] model to streaming HTTP
@@ -1848,16 +1964,23 @@ pub async fn normalize_response_body_for_inspection(
     let content_type = response_headers.get("content-type").cloned();
     let mut normalized = false;
     for plugin in plugins {
-        if let Some(body) = plugin
-            .normalize_response_body_with_context(
+        let deadline = ctx.grpc_deadline_at();
+        let body = match await_grpc_deadline(
+            deadline,
+            plugin.normalize_response_body_with_context(
                 ctx,
                 response_status,
                 response_body,
                 content_type.as_deref(),
                 response_headers,
-            )
-            .await
+            ),
+        )
+        .await
         {
+            Ok(body) => body,
+            Err(()) => break,
+        };
+        if let Some(body) = body {
             response_headers.insert("content-length".to_string(), body.len().to_string());
             *response_body = body;
             normalized = true;
@@ -2327,7 +2450,15 @@ pub async fn log_with_mirror(
         None
     };
     for plugin in plugins {
-        plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
+        if await_grpc_deadline(
+            ctx.grpc_deadline_at(),
+            plugin.log_with_mesh_key(summary, mesh_key.as_ref()),
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
 
@@ -2769,6 +2900,14 @@ pub trait Plugin: Send + Sync {
     /// See [`priority`] module for standard bands and assignments.
     fn priority(&self) -> u16 {
         priority::DEFAULT
+    }
+
+    /// Apply a request-receipt gRPC deadline policy synchronously, before any
+    /// plugin or request-body await. Only `grpc_deadline` overrides this hook.
+    /// It must not perform I/O or mutate the forwarded header; `before_proxy`
+    /// emits the relative upstream value from the typed absolute state.
+    fn prepare_grpc_deadline(&self, _ctx: &mut RequestContext) -> PluginResult {
+        PluginResult::Continue
     }
 
     /// Called when a request is first received (before routing).

@@ -96,6 +96,28 @@ fn test_invalid_field_types_rejected() {
 }
 
 #[test]
+fn test_unknown_and_null_fields_are_rejected() {
+    for (config, expected) in [
+        (
+            json!({"max_deadline_ms": 30000, "reject_no_deadine": true}),
+            "config.reject_no_deadine",
+        ),
+        (json!({"MAX_DEADLINE_MS": 30000}), "config.MAX_DEADLINE_MS"),
+        (json!({"max_deadline_ms": null}), "must be an unsigned integer"),
+        (json!({"reject_no_deadline": null}), "must be a boolean"),
+        (
+            json!({"max_deadline_ms": 30000, "unexpected": {"nested": true}}),
+            "config.unexpected",
+        ),
+    ] {
+        let error = create_plugin("grpc_deadline", &config)
+            .err()
+            .expect("strict grpc_deadline config should reject the fixture");
+        assert!(error.contains(expected), "expected {expected}, got {error}");
+    }
+}
+
+#[test]
 fn test_zero_max_deadline_rejected() {
     let err = create_plugin("grpc_deadline", &json!({ "max_deadline_ms": 0 }))
         .err()
@@ -157,6 +179,20 @@ fn test_subtract_gateway_processing_with_max_accepted() {
 fn test_reject_no_deadline_alone_accepted() {
     let result = create_plugin("grpc_deadline", &json!({ "reject_no_deadline": true }));
     assert!(result.is_ok());
+}
+
+#[test]
+fn test_false_only_rules_are_rejected_as_noop() {
+    let error = create_plugin(
+        "grpc_deadline",
+        &json!({
+            "subtract_gateway_processing": false,
+            "reject_no_deadline": false
+        }),
+    )
+    .err()
+    .expect("false-only rules are a no-op");
+    assert!(error.contains("no rules configured"), "got: {error}");
 }
 
 // ── grpc-timeout parsing ──
@@ -263,6 +299,127 @@ async fn test_parse_nanoseconds() {
 
     // 10,000,000 ns = 10 ms
     assert_eq!(ctx.metadata.get("grpc_original_deadline_ms").unwrap(), "10");
+}
+
+#[tokio::test]
+async fn test_zero_timeouts_are_missing_and_positive_submillisecond_rounds_up() {
+    let plugin = create_plugin(
+        "grpc_deadline",
+        &json!({"reject_no_deadline": true}),
+    )
+    .unwrap()
+    .unwrap();
+
+    for timeout in ["0H", "0M", "0S", "0m", "0u", "0n"] {
+        let mut ctx = create_grpc_context_with_timeout(Some(timeout));
+        let mut headers = HashMap::from([("grpc-timeout".to_string(), timeout.to_string())]);
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    }
+
+    for timeout in ["1u", "1n"] {
+        let mut ctx = create_grpc_context_with_timeout(Some(timeout));
+        let mut headers = HashMap::from([("grpc-timeout".to_string(), timeout.to_string())]);
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(headers.get("grpc-timeout").unwrap(), "1m");
+        assert_eq!(ctx.metadata.get("grpc_original_deadline_ms").unwrap(), "1");
+    }
+}
+
+#[tokio::test]
+async fn test_timeout_header_matching_is_case_insensitive_and_rewrites_canonically() {
+    let plugin = create_plugin("grpc_deadline", &json!({"max_deadline_ms": 5000}))
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::from([("Grpc-Timeout".to_string(), "10S".to_string())]);
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(headers.get("grpc-timeout").map(String::as_str), Some("5000m"));
+    assert_eq!(
+        headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("grpc-timeout"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_multiple_instances_share_one_absolute_deadline() {
+    let first = create_plugin(
+        "grpc_deadline",
+        &json!({"subtract_gateway_processing": true}),
+    )
+    .unwrap()
+    .unwrap();
+    let second = create_plugin("grpc_deadline", &json!({"max_deadline_ms": 10000}))
+        .unwrap()
+        .unwrap();
+    let plugins = vec![first, second];
+    let mut ctx = create_grpc_context_with_timeout(Some("10S"));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_continue(ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
+        &plugins,
+        &mut ctx,
+    ));
+    let absolute = ctx
+        .grpc_deadline_at()
+        .expect("valid timeout establishes an absolute deadline");
+    let mut headers = HashMap::from([("grpc-timeout".to_string(), "10S".to_string())]);
+    assert_continue(plugins[0].before_proxy(&mut ctx, &mut headers).await);
+    let first_forwarded: u64 = headers["grpc-timeout"]
+        .strip_suffix('m')
+        .expect("millisecond timeout")
+        .parse()
+        .expect("numeric timeout");
+    assert_continue(plugins[1].before_proxy(&mut ctx, &mut headers).await);
+    let second_forwarded: u64 = headers["grpc-timeout"]
+        .strip_suffix('m')
+        .expect("millisecond timeout")
+        .parse()
+        .expect("numeric timeout");
+
+    assert_eq!(ctx.grpc_deadline_at(), Some(absolute));
+    assert!(first_forwarded <= 10_000 && first_forwarded >= 5_000);
+    assert!(
+        second_forwarded <= first_forwarded && first_forwarded - second_forwarded <= 50,
+        "a later instance may observe clock progress but must not deduct the original pre-plugin delay again: first={first_forwarded}, second={second_forwarded}"
+    );
+}
+
+#[tokio::test]
+async fn test_preflight_deadline_cancels_request_plugin_work_with_status_four() {
+    let plugin = create_plugin(
+        "grpc_deadline",
+        &json!({"default_deadline_ms": 1}),
+    )
+    .unwrap()
+    .unwrap();
+    let plugins = vec![plugin];
+    let mut ctx = create_grpc_context_with_timeout(None);
+    assert_continue(ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
+        &plugins,
+        &mut ctx,
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let result = ferrum_edge::plugins::await_request_plugin_deadline(
+        ctx.grpc_deadline_at(),
+        std::future::pending(),
+    )
+    .await;
+    match result {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+        }
+        other => panic!("expired preflight must cancel plugin work: {other:?}"),
+    }
 }
 
 // ── Default deadline injection ──
@@ -406,14 +563,12 @@ async fn test_subtract_gateway_processing_deadline_exceeded() {
     });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
 
-    // Build a context whose timestamp_received is well in the past so that
-    // subtract_gateway_processing immediately consumes the entire budget.
     let mut ctx = create_grpc_context_with_timeout(None);
-    ctx.timestamp_received = chrono::Utc::now() - chrono::Duration::seconds(60);
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    // Effective deadline (1ms - 60s elapsed) is exceeded → trailers-only DEADLINE_EXCEEDED
+    // The 1ms receipt-anchored deadline elapsed before the hook ran.
     match result {
         PluginResult::Reject {
             status_code,
