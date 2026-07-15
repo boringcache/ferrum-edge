@@ -13848,10 +13848,7 @@ fn attach_auth_rejection_set_cookie(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
-    let Some(cookie) = ctx
-        .metadata
-        .remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY)
-    else {
+    let Some(cookie) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
         return;
     };
     let existing = headers.iter().find_map(|(name, value)| {

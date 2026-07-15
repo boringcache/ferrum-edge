@@ -316,7 +316,10 @@ async fn oidc_multi_auth_preserves_rotated_cookie_when_later_credential_rejects(
     )
     .await
     .expect("later invalid API key must keep the request rejected");
-    assert_eq!(status_code, 401, "the later client rejection must still win");
+    assert_eq!(
+        status_code, 401,
+        "the later client rejection must still win"
+    );
     assert_eq!(body.as_slice(), br#"{"error":"Invalid API key"}"#);
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
@@ -364,9 +367,9 @@ async fn oidc_multi_auth_preserves_rotated_cookie_when_later_credential_rejects(
         "reject finalization must emit exactly one session cookie"
     );
     assert_eq!(
-        response_headers.iter().find_map(|(name, value)| {
-            name.eq_ignore_ascii_case("set-cookie").then_some(value)
-        }),
+        response_headers
+            .iter()
+            .find_map(|(name, value)| { name.eq_ignore_ascii_case("set-cookie").then_some(value) }),
         Some(&set_cookie)
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -400,8 +403,7 @@ async fn oidc_multi_auth_uses_latest_rejected_session_cookie() {
 
     let rejection_plugin = |cookie_name: &str, token_path: &str| {
         let mut config = base_config();
-        config["providers"][0]["token_endpoint"] =
-            json!(format!("{}{token_path}", server.uri()));
+        config["providers"][0]["token_endpoint"] = json!(format!("{}{token_path}", server.uri()));
         config["providers"][0]["required_scopes"] = json!(["admin"]);
         config["providers"][0]["consumer_identity_claim"] = json!("email");
         config["session"]["cookie_name"] = json!(cookie_name);
@@ -429,15 +431,10 @@ async fn oidc_multi_auth_uses_latest_rejected_session_cookie() {
     )
     .unwrap();
     let first_pair = first_cookie.split(';').next().expect("first cookie pair");
-    let second_pair = second_cookie
-        .split(';')
-        .next()
-        .expect("second cookie pair");
+    let second_pair = second_cookie.split(';').next().expect("second cookie pair");
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
-    ctx.headers.insert(
-        "cookie".to_string(),
-        format!("{first_pair}; {second_pair}"),
-    );
+    ctx.headers
+        .insert("cookie".to_string(), format!("{first_pair}; {second_pair}"));
     let first_plugin: Arc<dyn Plugin> = first.clone();
     let second_plugin: Arc<dyn Plugin> = second.clone();
 
@@ -486,19 +483,16 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
         .await;
 
     let mut first_config = base_config();
-    first_config["providers"][0]["token_endpoint"] =
-        json!(format!("{}/token", server.uri()));
+    first_config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     first_config["providers"][0]["required_scopes"] = json!(["admin"]);
     first_config["providers"][0]["consumer_identity_claim"] = json!("email");
     first_config["session"]["cookie_name"] = json!("first_session");
-    let first = Arc::new(
-        OidcRelyingParty::new(&first_config, PluginHttpClient::default()).unwrap(),
-    );
+    let first =
+        Arc::new(OidcRelyingParty::new(&first_config, PluginHttpClient::default()).unwrap());
     let mut second_config = base_config();
     second_config["session"]["cookie_name"] = json!("second_session");
-    let second = Arc::new(
-        OidcRelyingParty::new(&second_config, PluginHttpClient::default()).unwrap(),
-    );
+    let second =
+        Arc::new(OidcRelyingParty::new(&second_config, PluginHttpClient::default()).unwrap());
     let now = chrono::Utc::now().timestamp();
     let first_cookie = oidc_sealed_due_refresh_session_cookie_for_test(
         &first,
@@ -564,13 +558,15 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
     );
 
     assert_continue(first.after_proxy(&mut ctx, status_code, &mut headers).await);
-    assert_continue(second.after_proxy(&mut ctx, status_code, &mut headers).await);
+    assert_continue(
+        second
+            .after_proxy(&mut ctx, status_code, &mut headers)
+            .await,
+    );
     assert_eq!(
         headers
             .iter()
-            .find_map(|(name, value)| {
-                name.eq_ignore_ascii_case("set-cookie").then_some(value)
-            })
+            .find_map(|(name, value)| { name.eq_ignore_ascii_case("set-cookie").then_some(value) })
             .map(|value| value.split('\n').count()),
         Some(2),
         "reject finalization must not duplicate either cookie"
