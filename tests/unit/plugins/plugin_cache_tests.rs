@@ -1017,6 +1017,27 @@ fn test_request_view_precomputes_authorize_plugins() {
 }
 
 #[test]
+fn test_request_view_precomputes_key_auth_header_redaction() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["keyauth"])],
+        vec![make_plugin_config_with_json(
+            "keyauth",
+            "key_auth",
+            json!({"key_location": "header:X-Tenant-Credential"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("p1", ProxyProtocol::Http);
+
+    assert_eq!(
+        view.request_headers_to_redact().as_ref(),
+        &["x-tenant-credential"]
+    );
+}
+
+#[test]
 fn test_authorize_plugin_default_preserves_legacy_custom_plugins() {
     let plugin: Arc<dyn Plugin> = Arc::new(LegacyAuthorizePlugin);
 
@@ -3798,6 +3819,43 @@ fn test_decoded_query_params_capability_preserved_with_priority_override() {
     assert!(
         caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
         "mesh_route_dispatch query-param rules must opt HTTP/3 into decoded query materialization"
+    );
+}
+
+#[test]
+fn test_key_auth_query_location_enables_decoded_h3_query_capability() {
+    let query_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["keyauth"])],
+        vec![make_plugin_config_with_json(
+            "keyauth",
+            "key_auth",
+            json!({"key_location": "query:api_key"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let query_cache = PluginCache::new(&query_config).unwrap();
+    assert!(
+        query_cache
+            .get_capabilities("p1", ProxyProtocol::Http)
+            .has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS)
+    );
+
+    let header_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["keyauth"])],
+        vec![make_plugin_config_with_json(
+            "keyauth",
+            "key_auth",
+            json!({"key_location": "header:X-API-Key"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let header_cache = PluginCache::new(&header_config).unwrap();
+    assert!(
+        !header_cache
+            .get_capabilities("p1", ProxyProtocol::Http)
+            .has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS)
     );
 }
 

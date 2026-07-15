@@ -3554,3 +3554,1169 @@ async fn aggregate_routed_call_forwards_upstream_negotiated_protocol_version() {
         Some("2025-06-18")
     );
 }
+
+/// Catch-all upstream serving one tool and empty prompt/resource/template
+/// families; the shared body doubles as an initialize/notification response.
+async fn start_mcp_single_tool_server(tool_name: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "upstream",
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "serverInfo": { "name": "single-tool", "version": "1" },
+                "tools": [
+                    { "name": tool_name, "inputSchema": { "type": "object" } }
+                ],
+                "prompts": [],
+                "resources": [],
+                "resourceTemplates": []
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn multi_server_tools_config(github_url: &str, flaky_url: &str) -> Value {
+    json!({
+        "enabled": true,
+        "mode": "aggregate_router",
+        "endpoint": { "path": "/mcp", "protocol_versions": ["2025-11-25"] },
+        "sessions": { "initialize_upstreams": "passthrough" },
+        "discovery": {
+            "aggregate_tools": true,
+            "aggregate_resources": false,
+            "aggregate_prompts": false,
+            "namespace_separator": ".",
+            "cache_ttl_seconds": 1,
+            "on_new_tool": "allow"
+        },
+        "policy": { "default_action": "allow" },
+        "servers": {
+            "github": {
+                "upstream_url": github_url,
+                "namespace": "github",
+                "enabled": true,
+                "expose_tools": true
+            },
+            "flaky": {
+                "upstream_url": flaky_url,
+                "namespace": "flaky",
+                "enabled": true,
+                "expose_tools": true
+            }
+        }
+    })
+}
+
+async fn tools_list_with_metadata(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    request_id: i64,
+) -> (u16, Value, ferrum_edge::plugins::RequestContext) {
+    aggregate_request_with_metadata(plugin, session_id, request_id, "tools/list", json!({})).await
+}
+
+async fn aggregate_request_with_metadata(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    request_id: i64,
+    method_name: &str,
+    params: Value,
+) -> (u16, Value, ferrum_edge::plugins::RequestContext) {
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": method_name,
+        "params": params
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    (status, body, ctx)
+}
+
+fn sorted_tool_names(body: &Value) -> Vec<String> {
+    let mut names: Vec<String> = body["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list result missing tools array: {body}"))
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+fn sorted_prompt_names(body: &Value) -> Vec<String> {
+    let mut names: Vec<String> = body["result"]["prompts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("prompts/list result missing prompts array: {body}"))
+        .iter()
+        .map(|prompt| prompt["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+fn sorted_resource_uris(body: &Value) -> Vec<String> {
+    let mut uris: Vec<String> = body["result"]["resources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("resources/list result missing resources array: {body}"))
+        .iter()
+        .map(|resource| resource["uri"].as_str().unwrap().to_string())
+        .collect();
+    uris.sort();
+    uris
+}
+
+fn collision_family_config(
+    one_url: &str,
+    two_url: &str,
+    aggregate_tools: bool,
+    aggregate_prompts: bool,
+    aggregate_resources: bool,
+) -> Value {
+    json!({
+        "enabled": true,
+        "mode": "aggregate_router",
+        "endpoint": { "path": "/mcp", "protocol_versions": ["2025-11-25"] },
+        "sessions": { "initialize_upstreams": "passthrough" },
+        "discovery": {
+            "aggregate_tools": aggregate_tools,
+            "aggregate_prompts": aggregate_prompts,
+            "aggregate_resources": aggregate_resources,
+            "namespace_separator": ".",
+            "cache_ttl_seconds": 1,
+            "on_new_tool": "allow"
+        },
+        "policy": { "default_action": "allow" },
+        "servers": {
+            "one": {
+                "upstream_url": one_url,
+                "namespace": "a",
+                "enabled": true,
+                "expose_tools": aggregate_tools,
+                "expose_prompts": aggregate_prompts,
+                "expose_resources": aggregate_resources
+            },
+            "two": {
+                "upstream_url": two_url,
+                "namespace": "a.b",
+                "enabled": true,
+                "expose_tools": aggregate_tools,
+                "expose_prompts": aggregate_prompts,
+                "expose_resources": aggregate_resources
+            }
+        }
+    })
+}
+
+fn single_server_family_config(
+    upstream_url: &str,
+    aggregate_tools: bool,
+    aggregate_prompts: bool,
+    aggregate_resources: bool,
+) -> Value {
+    json!({
+        "enabled": true,
+        "mode": "aggregate_router",
+        "endpoint": { "path": "/mcp", "protocol_versions": ["2025-11-25"] },
+        "sessions": { "initialize_upstreams": "passthrough" },
+        "discovery": {
+            "aggregate_tools": aggregate_tools,
+            "aggregate_prompts": aggregate_prompts,
+            "aggregate_resources": aggregate_resources,
+            "namespace_separator": ".",
+            "cache_ttl_seconds": 1,
+            "on_new_tool": "allow"
+        },
+        "policy": { "default_action": "allow" },
+        "servers": {
+            "github": {
+                "upstream_url": upstream_url,
+                "namespace": "github",
+                "enabled": true,
+                "expose_tools": aggregate_tools,
+                "expose_prompts": aggregate_prompts,
+                "expose_resources": aggregate_resources
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn aggregate_tools_family_outage_keeps_prompts_healthy_and_recovers_on_ttl() {
+    let server = MockServer::start().await;
+    let tool_requests = Arc::new(AtomicUsize::new(0));
+    let tool_counter = Arc::clone(&tool_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            if tool_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "tools",
+                    "result": {"tools": [
+                        {"name": "recovered_tool", "inputSchema": {"type": "object"}}
+                    ]}
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "prompts",
+            "result": {"prompts": [{"name": "healthy_prompt"}]}
+        })))
+        .mount(&server)
+        .await;
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, true, false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (status, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 101).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32006);
+    assert!(body["result"].is_null());
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("github:tools")
+    );
+
+    let (_, body, _) =
+        aggregate_request_with_metadata(&plugin, &session_id, 102, "prompts/list", json!({})).await;
+    assert_eq!(
+        body["result"]["prompts"][0]["name"],
+        "github.healthy_prompt"
+    );
+
+    // The failed family is cached as unavailable, not healthy-and-empty, and
+    // does not hammer the upstream again before the normal refresh window.
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 103).await;
+    assert_eq!(body["error"]["code"], -32006);
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        104,
+        "tools/call",
+        json!({"name": "github.missing", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32006);
+    assert_eq!(tool_requests.load(Ordering::SeqCst), 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 105).await;
+    assert_eq!(sorted_tool_names(&body), vec!["github.recovered_tool"]);
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
+    assert_eq!(tool_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn aggregate_prompts_family_outage_keeps_tools_healthy() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "result": {"tools": [
+                {"name": "healthy_tool", "inputSchema": {"type": "object"}}
+            ]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/list"})))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, true, false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (_, body, ctx) =
+        aggregate_request_with_metadata(&plugin, &session_id, 105, "prompts/list", json!({})).await;
+    assert_eq!(body["error"]["code"], -32006);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("github:prompts")
+    );
+
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 106).await;
+    assert_eq!(sorted_tool_names(&body), vec!["github.healthy_tool"]);
+
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        107,
+        "prompts/get",
+        json!({"name": "github.missing"}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32006);
+}
+
+#[tokio::test]
+async fn aggregate_resources_family_outage_keeps_tools_and_templates_healthy() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "result": {"tools": [
+                {"name": "healthy_tool", "inputSchema": {"type": "object"}}
+            ]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "resources/list"})))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "templates",
+            "result": {"resourceTemplates": [
+                {"uriTemplate": "file:///{path}", "name": "Healthy template"}
+            ]}
+        })))
+        .mount(&server)
+        .await;
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, false, true);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (_, body, _) =
+        aggregate_request_with_metadata(&plugin, &session_id, 108, "resources/list", json!({}))
+            .await;
+    assert_eq!(body["error"]["code"], -32006);
+
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 109).await;
+    assert_eq!(sorted_tool_names(&body), vec!["github.healthy_tool"]);
+
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        110,
+        "resources/templates/list",
+        json!({}),
+    )
+    .await;
+    let public_uri = body["result"]["resourceTemplates"][0]["uriTemplate"]
+        .as_str()
+        .expect("healthy template family must remain listable")
+        .replace("{path}", "README.md");
+    assert!(matches!(
+        route_resource_uri(&plugin, &session_id, 111, &public_uri).await,
+        PluginResult::Continue
+    ));
+
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        112,
+        "resources/read",
+        json!({"uri": "mcp://github/missing"}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32006);
+}
+
+#[tokio::test]
+async fn aggregate_resource_templates_distinguish_never_loaded_from_last_good_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "result": {"tools": [
+                {"name": "healthy_tool", "inputSchema": {"type": "object"}}
+            ]}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "resources/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "resources",
+            "result": {"resources": []}
+        })))
+        .mount(&server)
+        .await;
+    let template_requests = Arc::new(AtomicUsize::new(0));
+    let template_counter = Arc::clone(&template_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            match template_counter.fetch_add(1, Ordering::SeqCst) {
+                0 | 2 => ResponseTemplate::new(500),
+                1 => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "templates-empty",
+                    "result": {"resourceTemplates": []}
+                })),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "templates-recovered",
+                    "result": {"resourceTemplates": [
+                        {"uriTemplate": "file:///{path}", "name": "Recovered"}
+                    ]}
+                })),
+            }
+        })
+        .mount(&server)
+        .await;
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, false, true);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    // No successful template list exists yet, so the initial complete failure
+    // is unavailable rather than a successful empty catalog.
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        113,
+        "resources/templates/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32006);
+
+    // Another family remains isolated and usable during that outage.
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 114).await;
+    assert_eq!(sorted_tool_names(&body), vec!["github.healthy_tool"]);
+
+    // A successful empty list establishes last-good state. A later failure
+    // serves that empty result stale instead of reverting to unavailable.
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        115,
+        "resources/templates/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(body["result"]["resourceTemplates"], json!([]));
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        116,
+        "resources/templates/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(body["result"]["resourceTemplates"], json!([]));
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("github:resource_templates")
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        117,
+        "resources/templates/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["resourceTemplates"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
+    assert_eq!(template_requests.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn aggregate_partial_upstream_transport_failure_keeps_healthy_upstreams_usable() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    // Nothing listens on discard port 9: every list request to this upstream
+    // fails at the transport layer (connection refused).
+    config["servers"]["jira"] = json!({
+        "upstream_url": "http://127.0.0.1:9/mcp",
+        "namespace": "jira",
+        "enabled": true,
+        "expose_tools": true,
+        "expose_resources": true,
+        "expose_prompts": true
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (status, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 90).await;
+    assert_eq!(status, 200);
+    assert!(
+        body["error"].is_null(),
+        "healthy tools must not 32006: {body}"
+    );
+    assert_eq!(sorted_tool_names(&body), vec!["github.create_pr"]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("jira:prompts,jira:resources,jira:tools")
+    );
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 91,
+        "method": "prompts/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(body["result"]["prompts"][0]["name"], "github.code_review");
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 92,
+        "method": "resources/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["result"]["resources"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    // The healthy upstream's tool stays callable during the outage.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 93,
+        "method": "tools/call",
+        "params": { "name": "github.create_pr", "arguments": { "repo": "payments-api" } }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn aggregate_partial_upstream_non_2xx_failure_keeps_healthy_upstreams_usable() {
+    let server = start_mcp_catalog_server().await;
+    let failing = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&failing)
+        .await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["servers"]["flaky"] = json!({
+        "upstream_url": format!("{}/mcp", failing.uri()),
+        "namespace": "flaky",
+        "enabled": true,
+        "expose_tools": true
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (status, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 94).await;
+    assert_eq!(status, 200);
+    assert!(
+        body["error"].is_null(),
+        "healthy tools must not 32006: {body}"
+    );
+    assert_eq!(sorted_tool_names(&body), vec!["github.create_pr"]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("flaky:tools")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_partial_upstream_json_rpc_list_failure_keeps_healthy_upstreams_usable() {
+    let server = start_mcp_catalog_server().await;
+    let failing = start_mcp_error_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["servers"]["flaky"] = json!({
+        "upstream_url": format!("{}/mcp", failing.uri()),
+        "namespace": "flaky",
+        "enabled": true,
+        "expose_tools": true
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (status, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 95).await;
+    assert_eq!(status, 200);
+    assert!(
+        body["error"].is_null(),
+        "healthy tools must not 32006: {body}"
+    );
+    assert_eq!(sorted_tool_names(&body), vec!["github.create_pr"]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("flaky:tools")
+    );
+    // The failure was at the JSON-RPC layer: the upstream did answer tools/list.
+    let requests = failing.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        request
+            .body_json::<Value>()
+            .ok()
+            .and_then(|body| {
+                body.get("method")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .as_deref()
+            == Some("tools/list")
+    }));
+}
+
+#[tokio::test]
+async fn aggregate_failed_upstream_serves_last_good_entries_stale_and_recovers() {
+    let github = start_mcp_single_tool_server("steady_tool").await;
+    let flaky = MockServer::start().await;
+    let list_requests = Arc::new(AtomicUsize::new(0));
+    let response_counter = Arc::clone(&list_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            match response_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": "tools", "result": {"tools": [
+                        {"name": "flaky_tool", "inputSchema": {"type": "object"}}
+                    ]}
+                })),
+                1 => ResponseTemplate::new(500),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": "tools", "result": {"tools": [
+                        {"name": "replacement_tool", "inputSchema": {"type": "object"}}
+                    ]}
+                })),
+            }
+        })
+        .mount(&flaky)
+        .await;
+    let config = multi_server_tools_config(
+        &format!("{}/mcp", github.uri()),
+        &format!("{}/mcp", flaky.uri()),
+    );
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 96).await;
+    assert_eq!(
+        sorted_tool_names(&body),
+        vec!["flaky.flaky_tool", "github.steady_tool"]
+    );
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
+
+    // Outage: the failed upstream's last-good tool is served stale alongside
+    // the healthy upstream's fresh entries and the degraded state is emitted.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 97).await;
+    assert_eq!(
+        sorted_tool_names(&body),
+        vec!["flaky.flaky_tool", "github.steady_tool"]
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("flaky:tools")
+    );
+
+    // Recovery: a successful refresh replaces the stale entries and clears the
+    // degraded state.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 98).await;
+    assert_eq!(
+        sorted_tool_names(&body),
+        vec!["flaky.replacement_tool", "github.steady_tool"]
+    );
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
+    assert_eq!(list_requests.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn aggregate_serves_full_catalog_stale_when_all_upstreams_fail() {
+    let flaky = MockServer::start().await;
+    let list_requests = Arc::new(AtomicUsize::new(0));
+    let response_counter = Arc::clone(&list_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            if response_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": "tools", "result": {"tools": [
+                        {"name": "only_tool", "inputSchema": {"type": "object"}}
+                    ]}
+                }))
+            } else {
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&flaky)
+        .await;
+    let mut config = multi_server_tools_config(
+        &format!("{}/mcp", flaky.uri()),
+        &format!("{}/mcp", flaky.uri()),
+    );
+    config["servers"]["flaky"]["enabled"] = json!(false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 99).await;
+    assert_eq!(sorted_tool_names(&body), vec!["github.only_tool"]);
+
+    // With last-good entries available, a refresh where every upstream fails
+    // serves the previous catalog stale instead of erasing it with -32006.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 100).await;
+    assert_eq!(status, 200);
+    assert_eq!(sorted_tool_names(&body), vec!["github.only_tool"]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("github:tools")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_name_collision_tombstones_survive_partial_failure() {
+    let one = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "one-tools",
+            "result": {"tools": [
+                {"name": "b.c", "inputSchema": {"type": "object"}}
+            ]}
+        })))
+        .mount(&one)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "one-prompts",
+            "result": {"prompts": [{"name": "b.c"}]}
+        })))
+        .mount(&one)
+        .await;
+
+    let two = MockServer::start().await;
+    let tool_requests = Arc::new(AtomicUsize::new(0));
+    let tool_counter = Arc::clone(&tool_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            match tool_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-tools-collision",
+                    "result": {"tools": [
+                        {"name": "c", "inputSchema": {"type": "object"}}
+                    ]}
+                })),
+                1 => ResponseTemplate::new(500),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-tools-cleared",
+                    "result": {"tools": []}
+                })),
+            }
+        })
+        .mount(&two)
+        .await;
+    let prompt_requests = Arc::new(AtomicUsize::new(0));
+    let prompt_counter = Arc::clone(&prompt_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            match prompt_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-prompts-collision",
+                    "result": {"prompts": [{"name": "c"}]}
+                })),
+                1 => ResponseTemplate::new(500),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-prompts-cleared",
+                    "result": {"prompts": []}
+                })),
+            }
+        })
+        .mount(&two)
+        .await;
+
+    let config = collision_family_config(
+        &format!("{}/mcp", one.uri()),
+        &format!("{}/mcp", two.uri()),
+        true,
+        true,
+        false,
+    );
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 118).await;
+    assert_eq!(sorted_tool_names(&body), Vec::<String>::new());
+    let (_, body, _) =
+        aggregate_request_with_metadata(&plugin, &session_id, 119, "prompts/list", json!({})).await;
+    assert_eq!(sorted_prompt_names(&body), Vec::<String>::new());
+
+    // Both names were collision-suppressed and therefore absent from the old
+    // published maps. When server two fails, its healthy peer must not become
+    // the temporary winner for either catalog family.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 120).await;
+    assert_eq!(sorted_tool_names(&body), Vec::<String>::new());
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("two:prompts,two:tools")
+    );
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        121,
+        "tools/call",
+        json!({"name": "a.b.c", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32003);
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        122,
+        "prompts/get",
+        json!({"name": "a.b.c"}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32008);
+
+    // Only a fully successful family refresh can clear the tombstones. Server
+    // two now authoritatively reports empty lists, so server one's entries are
+    // safe to publish and route again.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) =
+        aggregate_request_with_metadata(&plugin, &session_id, 123, "prompts/list", json!({})).await;
+    assert_eq!(sorted_prompt_names(&body), vec!["a.b.c"]);
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 124).await;
+    assert_eq!(sorted_tool_names(&body), vec!["a.b.c"]);
+    assert_eq!(tool_requests.load(Ordering::SeqCst), 3);
+    assert_eq!(prompt_requests.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn aggregate_resource_collision_tombstone_requires_authoritative_refresh() {
+    let one = MockServer::start().await;
+    let one_resource_requests = Arc::new(AtomicUsize::new(0));
+    let one_resource_counter = Arc::clone(&one_resource_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "resources/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            match one_resource_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "one-resources-collision",
+                    "result": {"resources": [
+                        {"uri": "file:///shared", "name": "First"},
+                        {"uri": "file:///shared", "name": "Duplicate"}
+                    ]}
+                })),
+                1 => ResponseTemplate::new(500),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "one-resources-single",
+                    "result": {"resources": [
+                        {"uri": "file:///shared", "name": "Resolved"}
+                    ]}
+                })),
+            }
+        })
+        .mount(&one)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "one-templates",
+            "result": {"resourceTemplates": []}
+        })))
+        .mount(&one)
+        .await;
+
+    let two = MockServer::start().await;
+    let two_resource_requests = Arc::new(AtomicUsize::new(0));
+    let two_resource_counter = Arc::clone(&two_resource_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "resources/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            match two_resource_counter.fetch_add(1, Ordering::SeqCst) {
+                2 => ResponseTemplate::new(500),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-resources",
+                    "result": {"resources": [
+                        {"uri": "file:///other", "name": "Other"}
+                    ]}
+                })),
+            }
+        })
+        .mount(&two)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "two-templates",
+            "result": {"resourceTemplates": []}
+        })))
+        .mount(&two)
+        .await;
+
+    let config = collision_family_config(
+        &format!("{}/mcp", one.uri()),
+        &format!("{}/mcp", two.uri()),
+        false,
+        false,
+        true,
+    );
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let other_uri = "mcp://two/file%3A%2F%2F%2Fother";
+    let shared_uri = "mcp://one/file%3A%2F%2F%2Fshared";
+
+    let (_, body, _) =
+        aggregate_request_with_metadata(&plugin, &session_id, 125, "resources/list", json!({}))
+            .await;
+    assert_eq!(sorted_resource_uris(&body), vec![other_uri]);
+
+    // The colliding server fails while the other server succeeds. The old
+    // resource tombstone must survive even though its entries are absent from
+    // the published map.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) =
+        aggregate_request_with_metadata(&plugin, &session_id, 126, "resources/list", json!({}))
+            .await;
+    assert_eq!(sorted_resource_uris(&body), vec![other_uri]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("one:resources")
+    );
+
+    // On the next pass the former collision source succeeds with one entry,
+    // but the peer fails. That partial refresh is still not authoritative, so
+    // it cannot clear the prior tombstone or make the shared URI routable.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) =
+        aggregate_request_with_metadata(&plugin, &session_id, 127, "resources/list", json!({}))
+            .await;
+    assert_eq!(sorted_resource_uris(&body), vec![other_uri]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("two:resources")
+    );
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        128,
+        "resources/read",
+        json!({"uri": shared_uri}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32007);
+
+    // Both servers now list successfully, authoritatively proving that the
+    // duplicate disappeared and allowing the formerly suppressed URI back.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) =
+        aggregate_request_with_metadata(&plugin, &session_id, 129, "resources/list", json!({}))
+            .await;
+    assert_eq!(sorted_resource_uris(&body), vec![shared_uri, other_uri]);
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
+    assert_eq!(one_resource_requests.load(Ordering::SeqCst), 4);
+    assert_eq!(two_resource_requests.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn aggregate_initialize_negotiates_unsupported_newer_version_to_supported() {
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2026-03-01",
+            "capabilities": {},
+            "clientInfo": { "name": "unit-test", "version": "1" }
+        }
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, response_headers) = reject_json(result);
+    assert_eq!(status, 200);
+    assert!(
+        body["error"].is_null(),
+        "negotiation must not error: {body}"
+    );
+    assert_eq!(body["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.protocol_version_negotiated")
+            .map(String::as_str),
+        Some("2025-11-25")
+    );
+    let session_id = response_headers
+        .get("mcp-session-id")
+        .expect("negotiated initialize must mint a session")
+        .clone();
+
+    // The session carries the negotiated version: post-initialize requests on
+    // it succeed and the lazily initialized upstream receives it.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    headers.insert("mcp-protocol-version".to_string(), "2025-11-25".to_string());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(sorted_tool_names(&body), vec!["github.create_pr"]);
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        request.body_json::<Value>().ok().is_some_and(|body| {
+            body.get("method").and_then(Value::as_str) == Some("initialize")
+                && body
+                    .get("params")
+                    .and_then(|params| params.get("protocolVersion"))
+                    .and_then(Value::as_str)
+                    == Some("2025-11-25")
+        })
+    }));
+
+    // Post-initialize header validation stays fail-closed for the version the
+    // client originally requested.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    headers.insert("mcp-protocol-version".to_string(), "2026-03-01".to_string());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["message"], "Unsupported MCP protocol version");
+}
+
+#[tokio::test]
+async fn aggregate_initialize_negotiates_unsupported_older_version_to_supported() {
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "unit-test", "version": "1" }
+        }
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, response_headers) = reject_json(result);
+    assert_eq!(status, 200);
+    assert!(
+        body["error"].is_null(),
+        "negotiation must not error: {body}"
+    );
+    assert_eq!(body["result"]["protocolVersion"], "2025-11-25");
+    assert!(response_headers.contains_key("mcp-session-id"));
+}
+
+#[tokio::test]
+async fn aggregate_initialize_echoes_requested_supported_version() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["endpoint"]["protocol_versions"] = json!(["2025-11-25", "2025-06-18"]);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "unit-test", "version": "1" }
+        }
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, response_headers) = reject_json(result);
+    assert_eq!(status, 200);
+    // A supported requested version is echoed, not replaced by the preferred one.
+    assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+    assert!(!ctx.metadata.contains_key("mcp.protocol_version_negotiated"));
+    assert!(response_headers.contains_key("mcp-session-id"));
+}

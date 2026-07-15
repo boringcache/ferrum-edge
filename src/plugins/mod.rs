@@ -471,6 +471,10 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Credential header names precomputed by the plugin cache for safe
+    /// diagnostics and policy calls. Kept outside public metadata so plugin
+    /// configuration details do not enter transaction logs.
+    request_headers_to_redact: Option<Arc<Vec<String>>>,
     /// Semantic-cache embedding vector staged between `before_proxy` and
     /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
     /// vectors cannot enter transaction logs.
@@ -563,6 +567,13 @@ pub struct RequestContext {
     /// X.509 parsing and issuer-chain cryptography run once per plugin policy.
     #[doc(hidden)]
     pub mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
+    /// Connection-local cache of the peer-cert SPIFFE extraction outcome.
+    /// Shared by all HTTP/2 or HTTP/3 requests on the same TLS connection so
+    /// the `spiffe_identity` plugin parses the peer certificate DER once per
+    /// connection rather than once per multiplexed request.
+    #[doc(hidden)]
+    pub peer_spiffe_extraction_cache:
+        Option<Arc<crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache>>,
     /// Peer SPIFFE identity, populated by the `spiffe_identity` plugin when the
     /// client certificate carries a `spiffe://` URI SAN. `None` for non-mesh
     /// deployments and for clients that present a non-SPIFFE certificate.
@@ -798,6 +809,7 @@ impl RequestContext {
             auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
+            request_headers_to_redact: None,
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
@@ -821,6 +833,7 @@ impl RequestContext {
             tls_client_cert_der: None,
             tls_client_cert_chain_der: None,
             mtls_auth_connection_cache: None,
+            peer_spiffe_extraction_cache: None,
             peer_spiffe_id: None,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -899,6 +912,7 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            request_headers_to_redact: self.request_headers_to_redact.clone(),
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
@@ -922,6 +936,7 @@ impl RequestContext {
             tls_client_cert_der: self.tls_client_cert_der.clone(),
             tls_client_cert_chain_der: self.tls_client_cert_chain_der.clone(),
             mtls_auth_connection_cache: self.mtls_auth_connection_cache.clone(),
+            peer_spiffe_extraction_cache: self.peer_spiffe_extraction_cache.clone(),
             peer_spiffe_id: self.peer_spiffe_id.clone(),
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
@@ -962,6 +977,22 @@ impl RequestContext {
         self.metadata.retain(|key, _| !key.starts_with("waf."));
         self.waf_owned_metadata.clear();
         self.waf_metadata_initialized = true;
+    }
+
+    pub(crate) fn set_request_headers_to_redact(&mut self, headers: Arc<Vec<String>>) {
+        if !headers.is_empty() {
+            self.request_headers_to_redact = Some(headers);
+        }
+    }
+
+    pub(crate) fn request_header_requires_redaction(&self, header_name: &str) -> bool {
+        self.request_headers_to_redact
+            .as_ref()
+            .is_some_and(|headers| {
+                headers
+                    .iter()
+                    .any(|header| header_name.eq_ignore_ascii_case(header))
+            })
     }
 
     pub(crate) fn set_waf_metadata(&mut self, key: &str, value: impl Into<String>) {
@@ -2783,6 +2814,13 @@ pub trait Plugin: Send + Sync {
     /// auth plugin before multi-auth can stop at the first success, allowing
     /// later authorization plugins to omit every possible query credential.
     fn mark_query_credentials_for_redaction(&self, _ctx: &mut RequestContext) {}
+
+    /// Request header names whose values contain reusable credentials and must
+    /// be omitted from diagnostics and policy calls. Names are collected once
+    /// when the plugin cache is built, not rediscovered on the request hot path.
+    fn request_headers_to_redact(&self) -> &[String] {
+        &[]
+    }
 
     /// Authorization phase (after authentication).
     async fn authorize(&self, _ctx: &mut RequestContext) -> PluginResult {
