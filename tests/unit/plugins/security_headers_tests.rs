@@ -2,6 +2,7 @@ use ferrum_edge::plugins::security_headers::SecurityHeaders;
 use ferrum_edge::plugins::{
     Plugin, PluginFailurePolicy, PluginResult, RequestContext,
     apply_initial_response_header_policies, plugin_failure_policy,
+    replay_initial_response_header_policies_after_buffering,
 };
 use http::{Response, Version};
 use serde_json::json;
@@ -341,6 +342,41 @@ fn ordered_initial_response_policy_chain_matches_multiple_instance_semantics() {
 
     assert_eq!(headers.get("x-order").map(String::as_str), Some("second"));
     assert!(!headers.contains_key("x-removed"));
+}
+
+#[test]
+fn buffered_policy_replay_preserves_transport_owned_content_length() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {
+                "Content-Length": "1",
+                "X-Security-Policy": "gateway-enforced"
+            }
+        }))
+        .unwrap(),
+    );
+    let mut transformed_headers =
+        HashMap::from([("content-length".to_string(), "73".to_string())]);
+
+    replay_initial_response_header_policies_after_buffering(
+        std::slice::from_ref(&policy),
+        &mut transformed_headers,
+    );
+
+    assert_eq!(
+        transformed_headers.get("content-length").map(String::as_str),
+        Some("73")
+    );
+    assert_eq!(
+        transformed_headers
+            .get("x-security-policy")
+            .map(String::as_str),
+        Some("gateway-enforced")
+    );
+
+    let mut length_absent = HashMap::new();
+    replay_initial_response_header_policies_after_buffering(&[policy], &mut length_absent);
+    assert!(!length_absent.contains_key("content-length"));
 }
 
 #[test]

@@ -3700,7 +3700,7 @@ where
                 &response_trailers,
                 &header_shadowed_trailer_keys,
             );
-            crate::plugins::apply_initial_response_header_policies(
+            crate::plugins::replay_initial_response_header_policies_after_buffering(
                 initial_response_header_policy_plugins,
                 &mut response_headers,
             );

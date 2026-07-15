@@ -1417,10 +1417,10 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    let state = create_test_proxy_state_with_plugins(
-        vec![proxy],
-        vec![plugin, security_headers_plugin("grpc-web-security-headers")],
-    );
+    let mut security_headers = security_headers_plugin("grpc-web-security-headers");
+    security_headers.config["override_existing"] = serde_json::json!(true);
+    security_headers.config["set"]["Content-Length"] = serde_json::json!("1");
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin, security_headers]);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
     // The backend exchange can very rarely blip under heavy parallel CI load (a
@@ -1436,6 +1436,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     let mut content_type: Option<String> = None;
     let mut security_policy: Option<String> = None;
     let mut hsts: Option<String> = None;
+    let mut content_length: Option<usize> = None;
     let mut had_grpc_status_header = true;
     let mut body_bytes: Vec<u8> = Vec::new();
     let mut saw_native_trailers = false;
@@ -1477,6 +1478,11 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
             .get("strict-transport-security")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        content_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok());
         had_grpc_status_header = response.headers().get("grpc-status").is_some();
 
         body_bytes = Vec::new();
@@ -1519,6 +1525,11 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
         content_type.as_deref(),
         Some("application/grpc-web+proto"),
         "response content-type must be rewritten to the gRPC-Web variant"
+    );
+    assert_eq!(
+        content_length,
+        Some(body_bytes.len()),
+        "late security policy replay must preserve the transformed body length"
     );
     assert!(
         !had_grpc_status_header,

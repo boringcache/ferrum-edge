@@ -18010,7 +18010,7 @@ async fn handle_proxy_request_inner(
                     );
                     let initial_response_header_policy_plugins =
                         plugin_cache_view.initial_response_header_policy_plugins();
-                    crate::plugins::apply_initial_response_header_policies(
+                    crate::plugins::replay_initial_response_header_policies_after_buffering(
                         &initial_response_header_policy_plugins,
                         &mut response_headers,
                     );

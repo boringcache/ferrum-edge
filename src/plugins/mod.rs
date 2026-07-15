@@ -206,6 +206,27 @@ pub fn apply_initial_response_header_policies(
     }
 }
 
+/// Replay initial-response policy after buffered body transforms without
+/// allowing the replay to replace the transform-owned `content-length`.
+///
+/// Header policy already ran in `after_proxy`, before buffered transforms.
+/// Protocol bridges replay it at the final initial-header boundary to restore
+/// fields that could otherwise be confused with backend trailers. A body
+/// transform may have corrected or removed `content-length` in between those
+/// phases, so preserve that final transport value (including absence) across
+/// the replay. `remove_entry` retains the existing key allocation.
+pub fn replay_initial_response_header_policies_after_buffering(
+    policy_plugins: &[Arc<dyn Plugin>],
+    response_headers: &mut HashMap<String, String>,
+) {
+    let content_length = response_headers.remove_entry("content-length");
+    apply_initial_response_header_policies(policy_plugins, response_headers);
+    response_headers.remove("content-length");
+    if let Some((name, value)) = content_length {
+        response_headers.insert(name, value);
+    }
+}
+
 /// How plugin construction or validation failures affect cache publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginFailurePolicy {

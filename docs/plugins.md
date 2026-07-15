@@ -2701,6 +2701,8 @@ HTTP responses, buffered native gRPC, gRPC-Web binary/text, and HTTP/1.1,
 HTTP/2, and HTTP/3 WebSocket success and gateway-failure handshakes. Native
 gRPC status and application metadata remain trailers; a security policy field
 is reapplied to initial headers rather than promoting a backend trailer value.
+On buffered gRPC and gRPC-Web responses, this final replay preserves the
+transport-owned `Content-Length` produced by the last body transform.
 
 Configuration is fail-closed: unknown top-level keys and unknown keys inside
 the `hsts` object reject startup or reload, retaining the last-known-good
