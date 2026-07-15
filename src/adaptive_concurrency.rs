@@ -445,6 +445,7 @@ impl AdaptiveConcurrencyLimiter {
                     return Err(AdaptiveConcurrencyLimitExceeded {
                         current_in_flight: current,
                         limit,
+                        expose_headers: config.expose_headers,
                     });
                 }
 
@@ -613,6 +614,7 @@ impl AdaptiveConcurrencyLimiter {
         AdaptiveConcurrencyLimitExceeded {
             current_in_flight: self.policy.total_in_flight.load(Ordering::Acquire),
             limit: config.min_limit,
+            expose_headers: config.expose_headers,
         }
     }
 
@@ -841,6 +843,9 @@ impl AdaptiveConcurrencyLimiter {
                 return Err(AdaptiveConcurrencyLimitExceeded {
                     current_in_flight: current as u64,
                     limit: max_tracked_keys as u64,
+                    // Key-cap errors are internal sentinels: overflow targets
+                    // fail open and this value is never rendered to a client.
+                    expose_headers: false,
                 });
             }
             match self.tracked_keys.compare_exchange_weak(
@@ -926,6 +931,10 @@ impl AdaptiveConcurrencySnapshot {
 pub struct AdaptiveConcurrencyLimitExceeded {
     pub current_in_flight: u64,
     pub limit: u64,
+    /// Header policy from the same active configuration that made the
+    /// admission decision. A request pinned to an older compatible plugin
+    /// view must not render a rejection with that view's retired policy.
+    pub expose_headers: bool,
 }
 
 pub struct AdaptiveConcurrencyPermit {
@@ -1181,19 +1190,24 @@ fn invalidate_recovery_cohort_and_decrease(
     decrease_limit(&state.limit, config, limit_before_invalidation);
 }
 
-fn decrease_limit(
+pub(crate) fn decrease_limit(
     limit: &AtomicU64,
     config: &AdaptiveConcurrencyConfig,
     limit_before_invalidation: u64,
 ) {
-    let decreased = ((limit_before_invalidation as f64) * config.decrease_ratio).floor() as u64;
-    let target = decreased.max(config.min_limit).min(config.max_limit);
     let mut current = limit.load(Ordering::Acquire);
     loop {
-        if target >= current {
+        // The callback's pre-invalidation observation is a ceiling, not a
+        // fixed target. It prevents a stale success CAS from weakening this
+        // backoff, while recomputing from a lower observed value makes every
+        // racing failure/high-latency callback apply its own decrease.
+        let decrease_base = current.min(limit_before_invalidation);
+        let decreased = ((decrease_base as f64) * config.decrease_ratio).floor() as u64;
+        let next = decreased.max(config.min_limit).min(config.max_limit);
+        if next >= current {
             return;
         }
-        match limit.compare_exchange(current, target, Ordering::AcqRel, Ordering::Acquire) {
+        match limit.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return,
             Err(observed) => current = observed,
         }

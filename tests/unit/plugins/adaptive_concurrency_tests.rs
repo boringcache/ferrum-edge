@@ -1,9 +1,11 @@
 use std::collections::HashSet;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use ferrum_edge::_test_support::AdaptiveConcurrencyTransitionHarness;
+use ferrum_edge::_test_support::{
+    AdaptiveConcurrencyDecreaseHarness, AdaptiveConcurrencyTransitionHarness,
+};
 use ferrum_edge::PluginCache;
 use ferrum_edge::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
@@ -301,6 +303,46 @@ fn adaptive_concurrency_records_failure_by_shrinking_limit() {
         .snapshot(&proxy, None, AdaptiveConcurrencyKeyBy::Proxy)
         .expect("state should still exist after release");
     assert_eq!(snapshot.in_flight, 0);
+}
+
+#[test]
+fn adaptive_concurrency_concurrent_failures_each_apply_backoff() {
+    let limiter = Arc::new(AdaptiveConcurrencyDecreaseHarness::new(100, 1, 100, 0.8));
+    let observed_limit = limiter.limit();
+    let start = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+
+    for _ in 0..2 {
+        let limiter = Arc::clone(&limiter);
+        let start = Arc::clone(&start);
+        workers.push(thread::spawn(move || {
+            start.wait();
+            limiter.decrease_from_observed_limit(observed_limit);
+        }));
+    }
+    start.wait();
+    for worker in workers {
+        worker
+            .join()
+            .expect("concurrent failure callback should not panic");
+    }
+
+    assert_eq!(
+        limiter.limit(),
+        64,
+        "two callbacks that observed 100 must each apply their 0.8 backoff"
+    );
+}
+
+#[test]
+fn adaptive_concurrency_concurrent_failure_backoff_stops_at_minimum() {
+    let limiter = AdaptiveConcurrencyDecreaseHarness::new(5, 4, 5, 0.8);
+    let observed_limit = limiter.limit();
+
+    limiter.decrease_from_observed_limit(observed_limit);
+    limiter.decrease_from_observed_limit(observed_limit);
+
+    assert_eq!(limiter.limit(), 4);
 }
 
 #[test]
@@ -936,6 +978,48 @@ fn adaptive_concurrency_pinned_old_view_uses_replacement_admission_bounds() {
 }
 
 #[test]
+fn adaptive_concurrency_pinned_old_view_uses_replacement_header_policy() {
+    let config = cache_config(
+        "proxy",
+        json!({
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1,
+            "expose_headers": true
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let old_view = adaptive_plugin_from_cache(&cache);
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[0].config["expose_headers"] = json!(false);
+    cache
+        .rebuild(&reloaded)
+        .expect("compatible header policy change should publish");
+
+    let held = expect_admitted(acquire_from_plugin(&old_view, &config.proxies[0], None));
+    match acquire_from_plugin(&old_view, &config.proxies[0], None) {
+        BackendAdmissionDecision::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert!(
+                !headers.contains_key("x-adaptive-concurrency-limit"),
+                "the replacement policy disabled adaptive limit headers"
+            );
+            assert!(
+                !headers.contains_key("x-adaptive-concurrency-inflight"),
+                "the replacement policy disabled adaptive in-flight headers"
+            );
+        }
+        _ => panic!("the pinned old view should enforce the replacement limit"),
+    }
+    drop(held);
+}
+
+#[test]
 fn adaptive_concurrency_scoped_detach_and_reattach_starts_fresh_state() {
     for scope in ["proxy", "proxy_group"] {
         let config = cache_config(
@@ -1408,6 +1492,75 @@ fn adaptive_concurrency_route_non_destination_change_stays_compatible() {
 
     let second = expect_admitted(acquire_from_plugin(
         &adaptive_plugin_from_cache(&cache),
+        &effective_proxy,
+        None,
+    ));
+    drop(second);
+    drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_mesh_direct_host_normalization_stays_compatible() {
+    let mut config = cache_config(
+        "proxy",
+        json!({
+            "min_limit": 1,
+            "initial_limit": 2,
+            "max_limit": 2
+        }),
+    );
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "route-dispatch-1",
+            "namespace": "default",
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "proxy_group",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "override.local",
+                        "backend_port": 8080
+                    }
+                }]
+            }
+        }))
+        .expect("route dispatch config should deserialize"),
+    );
+    config.proxies[0].plugins.push(
+        serde_json::from_value(json!({"plugin_config_id": "route-dispatch-1"}))
+            .expect("route dispatch association should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let mut effective_proxy = config.proxies[0].clone();
+    effective_proxy.backend_host = "override.local".to_string();
+    let held = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_proxy,
+        None,
+    ));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[1].config["rules"][0]["destination"]["backend_host"] =
+        json!("  OVERRIDE.Local  ");
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from(["proxy-1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("normalized-equivalent direct host reload should publish");
+
+    let replacement = adaptive_plugin_from_cache(&cache);
+    let second = expect_admitted(acquire_from_plugin(
+        &replacement,
+        &effective_proxy,
+        None,
+    ));
+    assert_rejected(acquire_from_plugin(
+        &replacement,
         &effective_proxy,
         None,
     ));

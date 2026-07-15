@@ -79,6 +79,7 @@ pub use router_cache::{RouteMatch, RouterCache};
 #[doc(hidden)]
 pub mod _test_support {
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
     use hyper::StatusCode;
@@ -87,6 +88,49 @@ pub mod _test_support {
     use crate::plugins::Plugin;
 
     // ── adaptive_concurrency lifecycle ──────────────────────────────────────
+    pub struct AdaptiveConcurrencyDecreaseHarness {
+        limit: AtomicU64,
+        config: crate::adaptive_concurrency::AdaptiveConcurrencyConfig,
+    }
+
+    impl AdaptiveConcurrencyDecreaseHarness {
+        pub fn new(
+            initial_limit: u64,
+            min_limit: u64,
+            max_limit: u64,
+            decrease_ratio: f64,
+        ) -> Self {
+            Self {
+                limit: AtomicU64::new(initial_limit),
+                config: crate::adaptive_concurrency::AdaptiveConcurrencyConfig {
+                    key_by: crate::adaptive_concurrency::AdaptiveConcurrencyKeyBy::Proxy,
+                    max_tracked_keys: 1,
+                    min_limit,
+                    initial_limit,
+                    max_limit,
+                    min_samples: 1,
+                    target_latency_multiplier: 1.5,
+                    decrease_ratio,
+                    increase_step: 1,
+                    shadow_mode: false,
+                    expose_headers: false,
+                },
+            }
+        }
+
+        pub fn limit(&self) -> u64 {
+            self.limit.load(Ordering::Acquire)
+        }
+
+        pub fn decrease_from_observed_limit(&self, observed_limit: u64) {
+            crate::adaptive_concurrency::decrease_limit(
+                &self.limit,
+                &self.config,
+                observed_limit,
+            );
+        }
+    }
+
     pub struct AdaptiveConcurrencyTransitionHarness {
         transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition,
     }

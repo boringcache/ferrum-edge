@@ -97,7 +97,7 @@ impl Plugin for AdaptiveConcurrency {
             Ok(permit) => BackendAdmissionDecision::Admit(permit),
             Err(limit) => {
                 let mut headers = HashMap::new();
-                if self.config.expose_headers {
+                if limit.expose_headers {
                     headers.insert(
                         "x-adaptive-concurrency-limit".to_string(),
                         limit.limit.to_string(),

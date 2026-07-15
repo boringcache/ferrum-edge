@@ -851,9 +851,13 @@ fn push_direct_route_key(
 ) {
     keys.push(AdaptiveConcurrencyRouteKey {
         scope: adaptive_concurrency_scope(key_by, proxy, None),
-        host: Some(host.trim().to_ascii_lowercase()),
+        host: Some(normalize_adaptive_concurrency_direct_host(host)),
         port: Some(port),
     });
+}
+
+fn normalize_adaptive_concurrency_direct_host(host: &str) -> String {
+    host.trim().to_ascii_lowercase()
 }
 
 fn route_override_priority(pc: &PluginConfig) -> u16 {
@@ -942,7 +946,16 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
                                 .cloned();
                             let backend_host = destination
                                 .and_then(|value| value.get("backend_host"))
-                                .cloned();
+                                .map(|value| {
+                                    value.as_str().map_or_else(
+                                        || value.clone(),
+                                        |host| {
+                                            serde_json::Value::String(
+                                                normalize_adaptive_concurrency_direct_host(host),
+                                            )
+                                        },
+                                    )
+                                });
                             let backend_port = destination
                                 .and_then(|value| value.get("backend_port"))
                                 .cloned();
