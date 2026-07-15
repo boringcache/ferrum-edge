@@ -28,9 +28,9 @@ async fn opa_omits_dynamic_and_static_credential_headers_from_decision_input() {
         .expect("start key-auth OPA gateway");
 
     let response = reqwest::Client::new()
-        .get(gateway.proxy_url(
-            "/resource?api_key=query-secret&ordinary_query=ordinary-query-value",
-        ))
+        .get(
+            gateway.proxy_url("/resource?api_key=query-secret&ordinary_query=ordinary-query-value"),
+        )
         .header("X-Tenant-Credential", "test-api-key")
         .header("API-Key", "azure-secret")
         .header("X-Goog-Api-Key", "google-secret")
@@ -41,10 +41,7 @@ async fn opa_omits_dynamic_and_static_credential_headers_from_decision_input() {
         .expect("key-auth request completes");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let requests = opa
-        .received_requests()
-        .await
-        .expect("read OPA requests");
+    let requests = opa.received_requests().await.expect("read OPA requests");
     assert_eq!(requests.len(), 1, "expected one OPA decision request");
     let payload: Value = requests[0]
         .body_json()
@@ -63,7 +60,10 @@ async fn opa_omits_dynamic_and_static_credential_headers_from_decision_input() {
             "OPA input exposed credential header {credential_header}: {payload}"
         );
     }
-    assert_eq!(headers.get("x-ordinary"), Some(&json!("ordinary-header-value")));
+    assert_eq!(
+        headers.get("x-ordinary"),
+        Some(&json!("ordinary-header-value"))
+    );
     assert_eq!(
         payload["input"]["query"]["ordinary_query"],
         "ordinary-query-value"

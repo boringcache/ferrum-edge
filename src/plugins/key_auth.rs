@@ -63,9 +63,9 @@ impl KeyAuth {
             None => true,
         };
         let key_location = match config_obj.get("key_location") {
-            Some(value) => value
-                .as_str()
-                .ok_or_else(|| format!("key_auth: 'key_location' must be a string, got: {value}"))?,
+            Some(value) => value.as_str().ok_or_else(|| {
+                format!("key_auth: 'key_location' must be a string, got: {value}")
+            })?,
             None => "header:X-API-Key",
         };
         if key_location.is_empty() {
@@ -73,8 +73,7 @@ impl KeyAuth {
         }
         if key_location.trim() != key_location {
             return Err(
-                "key_auth: 'key_location' must not have leading or trailing whitespace"
-                    .to_string(),
+                "key_auth: 'key_location' must not have leading or trailing whitespace".to_string(),
             );
         }
 

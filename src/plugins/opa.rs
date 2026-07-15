@@ -263,8 +263,7 @@ impl Opa {
         let mut headers = Map::with_capacity(ctx.headers.len());
         for (name, value) in &ctx.headers {
             let lower = name.to_ascii_lowercase();
-            if self.redact_headers.contains(&lower)
-                || ctx.request_header_requires_redaction(&lower)
+            if self.redact_headers.contains(&lower) || ctx.request_header_requires_redaction(&lower)
             {
                 continue;
             }
