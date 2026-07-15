@@ -697,7 +697,10 @@ fn retained_adaptive_concurrency_states(
 ) -> AdaptiveConcurrencyInstanceMap {
     let mut retained = HashMap::new();
     for pc in &config.plugin_configs {
-        if !pc.enabled || pc.plugin_name != "adaptive_concurrency" {
+        if !pc.enabled
+            || pc.plugin_name != "adaptive_concurrency"
+            || !adaptive_concurrency_policy_is_active(pc, config)
+        {
             continue;
         }
         let identity = adaptive_concurrency_policy_id(pc);
@@ -708,6 +711,27 @@ fn retained_adaptive_concurrency_states(
         }
     }
     retained
+}
+
+fn adaptive_concurrency_policy_is_active(pc: &PluginConfig, config: &GatewayConfig) -> bool {
+    match &pc.scope {
+        PluginScope::Global => true,
+        PluginScope::Proxy => pc.proxy_id.as_deref().is_some_and(|proxy_id| {
+            config.proxies.iter().any(|proxy| {
+                proxy.id == proxy_id
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == pc.id)
+            })
+        }),
+        PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == pc.id)
+        }),
+    }
 }
 
 fn create_adaptive_concurrency_plugin(
@@ -1086,9 +1110,18 @@ impl PluginCacheInner {
         }
     }
 
-    pub(crate) fn activate_adaptive_concurrency_generations(&self) {
+    pub(crate) fn prepare_adaptive_concurrency_generations(&self) {
         for instance in self.adaptive_concurrency_instances.values() {
-            instance.limiter.activate_policy_generation(
+            instance.limiter.prepare_policy_generation(
+                instance.generation,
+                instance.drain_older_generation,
+            );
+        }
+    }
+
+    pub(crate) fn commit_adaptive_concurrency_generations(&self) {
+        for instance in self.adaptive_concurrency_instances.values() {
+            instance.limiter.commit_policy_generation(
                 instance.generation,
                 &instance.config,
                 instance.drain_older_generation,
@@ -1324,7 +1357,6 @@ impl PluginCache {
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
         let inner = Self::build_inner(config, &http_client)?;
-        inner.activate_adaptive_concurrency_generations();
         Ok(Self {
             inner: ArcSwap::new(inner),
             http_client,
@@ -1393,8 +1425,9 @@ impl PluginCache {
     }
 
     pub(crate) fn store_inner(&self, inner: Arc<PluginCacheInner>) {
-        inner.activate_adaptive_concurrency_generations();
-        self.inner.store(inner);
+        inner.prepare_adaptive_concurrency_generations();
+        self.inner.store(Arc::clone(&inner));
+        inner.commit_adaptive_concurrency_generations();
     }
 
     pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {

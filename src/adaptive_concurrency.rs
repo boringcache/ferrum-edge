@@ -107,6 +107,11 @@ impl AdaptiveConcurrencyState {
 struct AdaptiveConcurrencyPolicyLifecycle {
     /// Plugin-cache generation currently authorized to admit and train.
     active_generation: AtomicU64,
+    /// Validated replacement generation staged around the cache's atomic
+    /// publication. Compatible old/new plugins can both admit during this
+    /// handoff because they share the same target counters.
+    pending_generation: AtomicU64,
+    pending_requires_drain: AtomicBool,
     /// Permits across every target key. This is used only as a cold-generation
     /// transition barrier; ordinary admission remains target-local.
     total_in_flight: AtomicU64,
@@ -114,6 +119,9 @@ struct AdaptiveConcurrencyPolicyLifecycle {
     /// waits for this short synchronous critical section before clamping and
     /// publishing replacement policy bounds.
     feedback_in_progress: AtomicU64,
+    /// Brief commit barrier preventing feedback from crossing the generation
+    /// cutover while admission continues against generation-local bounds.
+    feedback_blocked: AtomicBool,
     /// Structural policy changes (scope or `key_by`) drain older permits and
     /// exclusively reset the retired target-key space before admitting under
     /// the replacement definition.
@@ -124,8 +132,11 @@ impl AdaptiveConcurrencyPolicyLifecycle {
     fn new() -> Self {
         Self {
             active_generation: AtomicU64::new(1),
+            pending_generation: AtomicU64::new(0),
+            pending_requires_drain: AtomicBool::new(false),
             total_in_flight: AtomicU64::new(0),
             feedback_in_progress: AtomicU64::new(0),
+            feedback_blocked: AtomicBool::new(false),
             transition_state: AtomicU8::new(POLICY_ACTIVE),
         }
     }
@@ -221,7 +232,14 @@ impl AdaptiveConcurrencyLimiter {
 
         loop {
             let current = state.in_flight.load(Ordering::Relaxed);
-            let limit = state.limit.load(Ordering::Acquire);
+            // During the two-phase cache handoff, compatible old/new plugin
+            // objects can briefly admit together. Each enforces its own
+            // validated bounds against the shared learned limit.
+            let limit = state
+                .limit
+                .load(Ordering::Acquire)
+                .max(config.min_limit)
+                .min(config.max_limit);
             if current >= limit && !config.shadow_mode {
                 state.rejections.fetch_add(1, Ordering::Relaxed);
                 self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -242,9 +260,7 @@ impl AdaptiveConcurrencyLimiter {
                     // Roll back instead of returning a permit owned by a
                     // retired policy generation or crossing a structural
                     // generation drain barrier.
-                    if self.policy.active_generation.load(Ordering::Acquire) != generation
-                        || self.policy.transition_state.load(Ordering::Acquire) != POLICY_ACTIVE
-                    {
+                    if !self.policy_generation_admitted(generation) {
                         state.in_flight.fetch_sub(1, Ordering::AcqRel);
                         self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
                         return Err(self.policy_transition_rejection(&config));
@@ -270,7 +286,7 @@ impl AdaptiveConcurrencyLimiter {
         config: &AdaptiveConcurrencyConfig,
     ) -> Result<(), AdaptiveConcurrencyLimitExceeded> {
         loop {
-            if self.policy.active_generation.load(Ordering::Acquire) != generation {
+            if !self.policy_generation_current(generation) {
                 return Err(self.policy_transition_rejection(config));
             }
 
@@ -319,13 +335,30 @@ impl AdaptiveConcurrencyLimiter {
             }
 
             self.policy.total_in_flight.fetch_add(1, Ordering::AcqRel);
-            if self.policy.active_generation.load(Ordering::Acquire) == generation
-                && self.policy.transition_state.load(Ordering::Acquire) == POLICY_ACTIVE
-            {
+            if self.policy_generation_admitted(generation) {
                 return Ok(());
             }
             self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
         }
+    }
+
+    fn policy_generation_admitted(&self, generation: u64) -> bool {
+        if self.policy.transition_state.load(Ordering::Acquire) != POLICY_ACTIVE {
+            return false;
+        }
+        self.policy_generation_current(generation)
+    }
+
+    fn policy_generation_current(&self, generation: u64) -> bool {
+        if self.policy.active_generation.load(Ordering::Acquire) == generation {
+            return true;
+        }
+        self.policy.pending_generation.load(Ordering::Acquire) == generation
+            && generation != 0
+            && !self
+                .policy
+                .pending_requires_drain
+                .load(Ordering::Acquire)
     }
 
     fn policy_transition_rejection(
@@ -338,17 +371,63 @@ impl AdaptiveConcurrencyLimiter {
         }
     }
 
-    /// Activate a fully validated plugin-cache generation. This runs on the
-    /// cold reload path immediately before the cache snapshot is published.
-    pub(crate) fn activate_policy_generation(
+    /// Stage a fully validated generation immediately before its plugin-cache
+    /// snapshot is published. The active generation remains authorized until
+    /// the snapshot store, avoiding a fail-closed gap for compatible reloads.
+    pub(crate) fn prepare_policy_generation(
+        &self,
+        generation: u64,
+        drain_older_generation: bool,
+    ) {
+        if generation <= self.policy.active_generation.load(Ordering::Acquire) {
+            return;
+        }
+        self.policy
+            .pending_requires_drain
+            .store(drain_older_generation, Ordering::Release);
+        self.policy
+            .pending_generation
+            .store(generation, Ordering::Release);
+    }
+
+    /// Commit the staged generation immediately after its cache snapshot is
+    /// published. Already-linearized feedback completes before replacement
+    /// bounds are clamped; later retired feedback is ignored.
+    pub(crate) fn commit_policy_generation(
         &self,
         generation: u64,
         config: &AdaptiveConcurrencyConfig,
         drain_older_generation: bool,
     ) {
         let mut current = self.policy.active_generation.load(Ordering::Acquire);
+        if generation <= current {
+            return;
+        }
+
+        self.policy.feedback_blocked.store(true, Ordering::Release);
+
+        // A callback that acquired its guard before the commit barrier is
+        // ordered before this activation. Later callbacks fail the barrier or
+        // generation checks and cannot mutate stale sampling or limit state.
+        let mut spins = 0_u8;
+        while self.policy.feedback_in_progress.load(Ordering::Acquire) != 0 {
+            if spins < 64 {
+                std::hint::spin_loop();
+                spins = spins.saturating_add(1);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+
+        if drain_older_generation {
+            self.policy
+                .transition_state
+                .store(POLICY_DRAINING, Ordering::Release);
+        }
+
         loop {
             if generation <= current {
+                self.policy.feedback_blocked.store(false, Ordering::Release);
                 return;
             }
             match self.policy.active_generation.compare_exchange(
@@ -361,34 +440,22 @@ impl AdaptiveConcurrencyLimiter {
                 Err(observed) => current = observed,
             }
         }
-
-        // Retire the old admission generation first. Plugin-cache publication
-        // happens only after this method returns, so the replacement cannot
-        // admit before its structural drain barrier is installed.
-        if drain_older_generation {
-            self.policy
-                .transition_state
-                .store(POLICY_DRAINING, Ordering::Release);
-        }
-
-        // A callback that acquired its guard before the generation CAS is
-        // ordered before this activation. Later callbacks fail their second
-        // generation check and cannot mutate stale sampling or limit state.
-        let mut spins = 0_u8;
-        while self.policy.feedback_in_progress.load(Ordering::Acquire) != 0 {
-            if spins < 64 {
-                std::hint::spin_loop();
-                spins = spins.saturating_add(1);
-            } else {
-                std::thread::yield_now();
-            }
-        }
+        let _ = self.policy.pending_generation.compare_exchange(
+            generation,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.policy
+            .pending_requires_drain
+            .store(false, Ordering::Release);
 
         // Learned state and in-flight accounting survive compatible config
         // changes, but the replacement bounds become authoritative at commit.
         for entry in &self.inner {
             clamp_limit(&entry.value().limit, config.min_limit, config.max_limit);
         }
+        self.policy.feedback_blocked.store(false, Ordering::Release);
     }
 
     fn reserve_key_slot(
@@ -499,13 +566,17 @@ pub struct AdaptiveConcurrencyPermit {
 
 impl AdaptiveConcurrencyPermit {
     fn begin_feedback(&self) -> Option<AdaptiveConcurrencyFeedbackGuard<'_>> {
-        if self.policy.active_generation.load(Ordering::Acquire) != self.policy_generation {
+        if self.policy.feedback_blocked.load(Ordering::Acquire)
+            || !self.feedback_generation_current()
+        {
             return None;
         }
         self.policy
             .feedback_in_progress
             .fetch_add(1, Ordering::AcqRel);
-        if self.policy.active_generation.load(Ordering::Acquire) != self.policy_generation {
+        if self.policy.feedback_blocked.load(Ordering::Acquire)
+            || !self.feedback_generation_current()
+        {
             self.policy
                 .feedback_in_progress
                 .fetch_sub(1, Ordering::AcqRel);
@@ -514,6 +585,11 @@ impl AdaptiveConcurrencyPermit {
         Some(AdaptiveConcurrencyFeedbackGuard {
             policy: self.policy.as_ref(),
         })
+    }
+
+    fn feedback_generation_current(&self) -> bool {
+        self.policy.active_generation.load(Ordering::Acquire) == self.policy_generation
+            || self.policy.pending_generation.load(Ordering::Acquire) == self.policy_generation
     }
 
     /// Feed one healthy backend sample into the limiter.

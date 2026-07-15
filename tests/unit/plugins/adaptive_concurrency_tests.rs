@@ -71,10 +71,10 @@ fn target(host: &str, port: u16) -> UpstreamTarget {
 
 fn cache_config(scope: &str, plugin_config: serde_json::Value) -> GatewayConfig {
     let proxy_id = (scope == "proxy").then_some("proxy-1");
-    let proxy_plugins = if scope == "proxy" {
-        json!([{"plugin_config_id": "adaptive-1"}])
-    } else {
+    let proxy_plugins = if scope == "global" {
         json!([])
+    } else {
+        json!([{"plugin_config_id": "adaptive-1"}])
     };
     serde_json::from_value(json!({
         "version": "1",
@@ -783,6 +783,48 @@ fn adaptive_concurrency_global_rebuild_keeps_old_session_accounted() {
     drop(held);
     let released = expect_admitted(acquire_from_cache(&cache, &reloaded));
     drop(released);
+}
+
+#[test]
+fn adaptive_concurrency_scoped_detach_and_reattach_starts_fresh_state() {
+    for scope in ["proxy", "proxy_group"] {
+        let config = cache_config(
+            scope,
+            json!({"min_limit": 1, "initial_limit": 1, "max_limit": 1}),
+        );
+        let cache = PluginCache::new(&config).expect("initial cache should build");
+        let detached_generation = expect_admitted(acquire_from_cache(&cache, &config));
+
+        let mut detached = config.clone();
+        detached.proxies[0].plugins.clear();
+        cache
+            .apply_delta(
+                &detached,
+                &HashSet::from(["proxy-1".to_string()]),
+                &[],
+                false,
+            )
+            .expect("last scoped association should detach");
+        assert!(
+            cache
+                .get_plugins("proxy-1")
+                .iter()
+                .all(|plugin| plugin.name() != "adaptive_concurrency"),
+            "{scope} policy should be absent after its last association is removed"
+        );
+
+        cache
+            .apply_delta(
+                &config,
+                &HashSet::from(["proxy-1".to_string()]),
+                &[],
+                false,
+            )
+            .expect("scoped policy should reattach");
+        let fresh_generation = expect_admitted(acquire_from_cache(&cache, &config));
+        drop(fresh_generation);
+        drop(detached_generation);
+    }
 }
 
 #[test]
