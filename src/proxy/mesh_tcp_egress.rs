@@ -29,10 +29,12 @@
 //! - any gate failure closes the client connection; nothing is ever guessed
 //!   or forwarded to a different destination.
 //!
-//! No per-request plugins run here (there is no request): destination-side
-//! `mesh_authz` on the outer CONNECT is the policy enforcement point, and the
-//! lookup table only ever contains slice-declared service VIPs, so
-//! REGISTRY_ONLY admission holds by construction. Passive-health/outlier
+//! No policy plugins run here (there is no request): destination-side
+//! `mesh_authz` on the outer CONNECT is the policy enforcement point. The
+//! workload-metrics stream lifecycle does run once for source-side CLIENT
+//! tracing, without invoking authorization a second time. The lookup table only
+//! ever contains slice-declared service VIPs, so REGISTRY_ONLY admission holds
+//! by construction. Passive-health/outlier
 //! recording is intentionally absent, matching the stream-proxy paths (raw
 //! TCP has no response status to classify); HBONE connection failures still
 //! feed the HBONE relay failure metric, and both transports feed the LB's
@@ -69,6 +71,16 @@ pub(crate) async fn handle_mesh_tcp_egress(
 ) {
     let proxy = entry.relay_proxy.as_ref();
     let lb = &epoch.load_balancer;
+    let mut observability = super::mesh_egress_observability::CapturedMeshEgressLifecycle::start(
+        epoch,
+        proxy,
+        crate::plugins::ProxyProtocol::Tcp,
+        remote_addr.ip(),
+        &entry.service_fqdn,
+        orig_dst.port(),
+        asserted_source_identity,
+    )
+    .await;
     // Scope passive health to the stream-family dispatch port whenever an
     // effective port override exists. The per-port LB lane is stricter: it only
     // engages for selection-affecting policy fields, so passive-health-only
@@ -142,6 +154,9 @@ pub(crate) async fn handle_mesh_tcp_egress(
         return;
     };
     let target = selection.target;
+    if let Some(observability) = observability.as_mut() {
+        observability.set_target(&target);
+    }
 
     // A loaded gateway SVID is required for either transport — never dial a
     // mesh peer identity-less. (The pools re-check this; the early gate just
@@ -375,6 +390,9 @@ pub(crate) async fn handle_mesh_tcp_egress(
         buffer_size,
     )
     .await;
+    if let Some(observability) = observability.as_mut() {
+        observability.complete_tcp(&result);
+    }
     state.adaptive_buffer.record_connection(
         &proxy.id,
         result

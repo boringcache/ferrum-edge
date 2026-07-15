@@ -76,6 +76,10 @@ pub enum H3Step {
     /// pairs. A `:status` pseudo-header MUST be present; the interpreter
     /// extracts it and sends the remaining headers as regular headers.
     RespondHeaders(Vec<(&'static str, String)>),
+    /// Send an H3 response header block and immediately FIN the response
+    /// stream. This is the HTTP/3 equivalent of a header-borne gRPC
+    /// Trailers-Only response and mirrors `H2Step::RespondHeadersEndStream`.
+    RespondHeadersEndStream(Vec<(&'static str, String)>),
     /// Send a chunk of response body.
     RespondData(Bytes),
     /// Send an H3 trailers (HEADERS) frame with the given `(name, value)`
@@ -511,7 +515,12 @@ async fn run_h3_script(
                 record_request(&state, &req).await;
                 response_stream = Some(stream);
             }
-            H3Step::RespondHeaders(pairs) => {
+            step @ (H3Step::RespondHeaders(_) | H3Step::RespondHeadersEndStream(_)) => {
+                let end_stream = matches!(&step, H3Step::RespondHeadersEndStream(_));
+                let pairs = match step {
+                    H3Step::RespondHeaders(pairs) | H3Step::RespondHeadersEndStream(pairs) => pairs,
+                    _ => unreachable!(),
+                };
                 let stream = match response_stream.as_mut() {
                     Some(s) => s,
                     None => {
@@ -572,6 +581,15 @@ async fn run_h3_script(
                     .send_response(resp)
                     .await
                     .map_err(|e| format!("send_response: {e}"))?;
+                if end_stream {
+                    stream
+                        .finish()
+                        .await
+                        .map_err(|e| format!("finish after headers: {e}"))?;
+                    if let Some(stream) = response_stream.take() {
+                        finished_response_streams.push(stream);
+                    }
+                }
             }
             H3Step::RespondData(bytes) => {
                 let stream = response_stream

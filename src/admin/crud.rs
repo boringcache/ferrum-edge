@@ -62,6 +62,32 @@ pub(crate) enum ValidationError {
     Message(String),
 }
 
+/// A write-preparation failure whose origin determines the HTTP status.
+pub(crate) enum PrepareWriteError {
+    InvalidRequest(String),
+    Internal(String),
+}
+
+impl PrepareWriteError {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::InvalidRequest(message) | Self::Internal(message) => message,
+        }
+    }
+}
+
+pub(crate) enum BatchPreparationError {
+    Validation(Vec<String>),
+    Internal(String),
+}
+
 const MTLS_ADMISSION_LOCK_SHARDS: usize = 64;
 static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
 
@@ -410,7 +436,7 @@ pub(crate) trait AdminResource:
 
     fn prepare_for_update(&mut self, _existing: &Self) {}
 
-    fn prepare_for_write(&mut self) -> Result<(), String> {
+    fn prepare_for_write(&mut self) -> Result<(), PrepareWriteError> {
         Ok(())
     }
 
@@ -722,20 +748,26 @@ pub(crate) fn prepare_batch_resource<R: AdminResource>(
     namespace: &str,
     now: DateTime<Utc>,
     validation_ctx: &ValidationCtx<'_>,
-) -> Result<(), Vec<String>> {
+) -> Result<(), BatchPreparationError> {
     if resource.id().is_empty() {
         resource.set_id(Uuid::new_v4().to_string());
     } else if let Err(message) = validate_resource_id(resource.id()) {
-        return Err(vec![message]);
+        return Err(BatchPreparationError::Validation(vec![message]));
     }
 
     resource.normalize();
     resource.set_namespace(namespace.to_string());
     resource
         .validate(validation_ctx)
-        .map_err(ValidationError::into_messages)?;
-    if let Err(message) = resource.prepare_for_write() {
-        return Err(vec![message]);
+        .map_err(ValidationError::into_messages)
+        .map_err(BatchPreparationError::Validation)?;
+    if let Err(error) = resource.prepare_for_write() {
+        return Err(match error {
+            PrepareWriteError::InvalidRequest(message) => {
+                BatchPreparationError::Validation(vec![message])
+            }
+            PrepareWriteError::Internal(message) => BatchPreparationError::Internal(message),
+        });
     }
     resource.set_created_at(now);
     resource.set_updated_at(now);
@@ -748,6 +780,10 @@ pub(crate) fn redact_consumer_for_response(consumer: &Consumer) -> Consumer {
 
 pub(crate) fn consumer_response_body(consumer: &Consumer) -> Value {
     json!(redact_consumer_for_response(consumer))
+}
+
+pub(crate) fn consumer_audit_body(consumer: &Consumer) -> Value {
+    json!(super::redact_consumer_credentials_for_audit(consumer))
 }
 
 pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
@@ -777,11 +813,15 @@ pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
     }
 }
 
-pub(crate) fn hash_consumer_credentials(consumer: &mut Consumer) -> Result<(), String> {
+pub(crate) fn hash_consumer_credentials(
+    consumer: &mut Consumer,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     super::hash_consumer_secrets(consumer)
 }
 
-pub(crate) fn hash_basic_auth_credentials(cred: &mut Value) -> Result<(), String> {
+pub(crate) fn hash_basic_auth_credentials(
+    cred: &mut Value,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     super::hash_credential_passwords(cred)
 }
 
@@ -2577,12 +2617,42 @@ impl AdminResource for Consumer {
         consumer_response_body(resource)
     }
 
+    fn audit_body(resource: &Self) -> Value {
+        consumer_audit_body(resource)
+    }
+
+    fn prepare_for_update(&mut self, existing: &Self) {
+        // Ordinary Consumer responses omit Basic credentials entirely. Preserve
+        // them when a client round-trips that response through PUT; explicit
+        // credential replacement and deletion use the credential endpoints.
+        if !self.credentials.contains_key("basicauth")
+            && let Some(basic_credentials) = existing.credentials.get("basicauth")
+        {
+            self.credentials
+                .insert("basicauth".to_string(), basic_credentials.clone());
+        }
+    }
+
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
         super::json_response(StatusCode::CONFLICT, &json!({"error": errors.join("; ")}))
     }
 
-    fn prepare_for_write(&mut self) -> Result<(), String> {
-        hash_consumer_credentials(self)
+    fn prepare_for_write(&mut self) -> Result<(), PrepareWriteError> {
+        let consumer_id = self.id.clone();
+        hash_consumer_credentials(self).map_err(|error| match error {
+            crate::config::types::BasicAuthCredentialPreparationError::InvalidCredential(
+                message,
+            ) => PrepareWriteError::InvalidRequest(format!(
+                "Failed to prepare Basic-auth credentials for consumer {}: {}",
+                consumer_id, message
+            )),
+            crate::config::types::BasicAuthCredentialPreparationError::ServerConfiguration(
+                message,
+            ) => PrepareWriteError::Internal(format!(
+                "Failed to prepare Basic-auth credentials for consumer {}: {}",
+                consumer_id, message
+            )),
+        })
     }
 
     fn map_persist_db_error(
@@ -2843,10 +2913,10 @@ async fn handle_write<R: AdminResource>(
         return Ok(map_after_validate_error::<R>(error));
     }
 
-    if let Err(message) = resource.prepare_for_write() {
+    if let Err(error) = resource.prepare_for_write() {
         return Ok(super::json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": message}),
+            error.status(),
+            &json!({"error": error.message()}),
         ));
     }
 

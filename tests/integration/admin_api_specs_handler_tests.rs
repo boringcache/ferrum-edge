@@ -1672,6 +1672,58 @@ async fn put_rejects_same_id_overlay_of_manual_hmac_plugin_without_mutation() {
     );
 }
 
+#[tokio::test]
+async fn disabled_basic_auth_spec_can_be_staged_before_plugin_construction() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let mut spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Disabled Basic auth staging", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [{
+            "id": uid("basic-auth"),
+            "plugin_name": "basic_auth",
+            "enabled": false,
+            // This unsupported field makes construction fail independently of
+            // the process environment, so successful staging proves that the
+            // disabled import path did not construct the plugin.
+            "config": {"realm": "staged-but-unused"}
+        }]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "disabled Basic auth config should be stageable: {body}"
+    );
+
+    let spec_id = body["id"].as_str().expect("created spec id");
+    spec["x-ferrum-plugins"][0]["enabled"] = json!(true);
+    let (status, body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "enabling must perform plugin construction and fail closed: {body}"
+    );
+    assert!(body["failures"].as_array().is_some_and(|failures| {
+        failures
+             .iter()
+             .any(|failure| failure["resource_type"] == "plugin")
+    }));
+}
+
 // ============================================================================
 // Gap #3: Multiple validation failures aggregated in one 422
 // ============================================================================

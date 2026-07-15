@@ -4446,6 +4446,352 @@ async fn aggregate_name_collision_tombstones_survive_partial_failure() {
 }
 
 #[tokio::test]
+async fn aggregate_collision_tombstones_use_all_server_list_bound() {
+    let generation = Arc::new(AtomicUsize::new(0));
+
+    let one = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "one-tools",
+            "result": {"tools": [
+                {"name": "z.c", "inputSchema": {"type": "object"}}
+            ]}
+        })))
+        .mount(&one)
+        .await;
+
+    let two = MockServer::start().await;
+    let two_generation = Arc::clone(&generation);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            if two_generation.load(Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-tools",
+                    "result": {"tools": [
+                        {"name": "c", "inputSchema": {"type": "object"}}
+                    ]}
+                }))
+            } else {
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&two)
+        .await;
+
+    let three = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "three-tools",
+            "result": {"tools": [
+                {"name": "a.c", "inputSchema": {"type": "object"}}
+            ]}
+        })))
+        .mount(&three)
+        .await;
+
+    let four = MockServer::start().await;
+    let four_generation = Arc::clone(&generation);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            if four_generation.load(Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "four-tools",
+                    "result": {"tools": [
+                        {"name": "c", "inputSchema": {"type": "object"}}
+                    ]}
+                }))
+            } else {
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&four)
+        .await;
+
+    let config = json!({
+        "enabled": true,
+        "mode": "aggregate_router",
+        "endpoint": {"path": "/mcp", "protocol_versions": ["2025-11-25"]},
+        "sessions": {"initialize_upstreams": "passthrough"},
+        "discovery": {
+            "aggregate_tools": true,
+            "aggregate_resources": false,
+            "aggregate_prompts": false,
+            "namespace_separator": ".",
+            "cache_ttl_seconds": 1,
+            "on_new_tool": "allow"
+        },
+        "policy": {"default_action": "allow"},
+        "validation": {"max_catalog_items_per_list": 1},
+        "servers": {
+            "one": {
+                "upstream_url": format!("{}/mcp", one.uri()),
+                "namespace": "root",
+                "enabled": true,
+                "expose_tools": true
+            },
+            "two": {
+                "upstream_url": format!("{}/mcp", two.uri()),
+                "namespace": "root.z",
+                "enabled": true,
+                "expose_tools": true
+            },
+            "three": {
+                "upstream_url": format!("{}/mcp", three.uri()),
+                "namespace": "other",
+                "enabled": true,
+                "expose_tools": true
+            },
+            "four": {
+                "upstream_url": format!("{}/mcp", four.uri()),
+                "namespace": "other.a",
+                "enabled": true,
+                "expose_tools": true
+            }
+        }
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    // Two current-cycle collisions exceed one server's list limit, but not the
+    // four-server aggregate bound. Neither may be selected away by lexical
+    // order while all four lists are authoritative.
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 130).await;
+    assert_eq!(sorted_tool_names(&body), Vec::<String>::new());
+
+    // The second member of each collision now fails. Both historical keys must
+    // remain suppressed; capping at one and retaining the lexical first would
+    // incorrectly republish root.z.c from the healthy server. Mock behavior is
+    // generation-controlled, so an extra TTL refresh between list and call
+    // assertions can only replay this same degraded state.
+    generation.store(1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 131).await;
+    assert_eq!(sorted_tool_names(&body), Vec::<String>::new());
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("four:tools,two:tools")
+    );
+    for (request_id, public_name) in [(132, "other.a.c"), (133, "root.z.c")] {
+        let (_, body, _) = aggregate_request_with_metadata(
+            &plugin,
+            &session_id,
+            request_id,
+            "tools/call",
+            json!({"name": public_name, "arguments": {}}),
+        )
+        .await;
+        assert_eq!(body["error"]["code"], -32003);
+    }
+}
+
+#[tokio::test]
+async fn aggregate_collision_tombstone_overflow_fails_closed_until_authoritative_refresh() {
+    let generation = Arc::new(AtomicUsize::new(0));
+
+    let one = MockServer::start().await;
+    let one_generation = Arc::clone(&generation);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            let refresh_generation = one_generation.load(Ordering::SeqCst);
+            let name = match refresh_generation {
+                0..=3 => format!("b.collision_{refresh_generation}"),
+                4 => "b.collision_0".to_string(),
+                _ => "safe".to_string(),
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": "one-tools",
+                "result": {"tools": [
+                    {"name": name, "inputSchema": {"type": "object"}}
+                ]}
+            }))
+        })
+        .mount(&one)
+        .await;
+
+    let two = MockServer::start().await;
+    let two_generation = Arc::clone(&generation);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            let refresh_generation = two_generation.load(Ordering::SeqCst);
+            let tools = if refresh_generation < 4 {
+                json!([{
+                    "name": format!("collision_{refresh_generation}"),
+                    "inputSchema": {"type": "object"}
+                }])
+            } else {
+                json!([])
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": "two-tools",
+                "result": {"tools": tools}
+            }))
+        })
+        .mount(&two)
+        .await;
+
+    let guard = MockServer::start().await;
+    let guard_generation = Arc::clone(&generation);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            if guard_generation.load(Ordering::SeqCst) <= 4 {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "guard-tools",
+                    "result": {"tools": []}
+                }))
+            }
+        })
+        .mount(&guard)
+        .await;
+
+    let config = json!({
+        "enabled": true,
+        "mode": "aggregate_router",
+        "endpoint": {"path": "/mcp", "protocol_versions": ["2025-11-25"]},
+        "sessions": {"initialize_upstreams": "passthrough"},
+        "discovery": {
+            "aggregate_tools": true,
+            "aggregate_resources": false,
+            "aggregate_prompts": false,
+            "namespace_separator": ".",
+            "cache_ttl_seconds": 1,
+            "on_new_tool": "allow"
+        },
+        "policy": {"default_action": "allow"},
+        "validation": {"max_catalog_items_per_list": 1},
+        "servers": {
+            "one": {
+                "upstream_url": format!("{}/mcp", one.uri()),
+                "namespace": "a",
+                "enabled": true,
+                "expose_tools": true
+            },
+            "two": {
+                "upstream_url": format!("{}/mcp", two.uri()),
+                "namespace": "a.b",
+                "enabled": true,
+                "expose_tools": true
+            },
+            "guard": {
+                "upstream_url": format!("{}/mcp", guard.uri()),
+                "namespace": "guard",
+                "enabled": true,
+                "expose_tools": true
+            }
+        }
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    // Three attempted lists with a one-item per-list limit permit exactly
+    // three retained collision keys. Repeated degraded refreshes reach that
+    // cap without selecting between current and historical collisions. Each
+    // mock response depends on the explicit generation rather than request
+    // count, so scheduler stalls cannot advance the scenario unexpectedly.
+    for (request_id, refresh_generation) in [(134, 0), (135, 1), (136, 2)] {
+        if refresh_generation != 0 {
+            generation.store(refresh_generation, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
+        let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, request_id).await;
+        assert_eq!(sorted_tool_names(&body), Vec::<String>::new());
+        assert_eq!(
+            ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+            Some("guard:tools")
+        );
+    }
+    for (request_id, public_name) in [(137, "a.b.collision_0"), (138, "a.b.collision_2")] {
+        let (_, body, _) = aggregate_request_with_metadata(
+            &plugin,
+            &session_id,
+            request_id,
+            "tools/call",
+            json!({"name": public_name, "arguments": {}}),
+        )
+        .await;
+        assert_eq!(body["error"]["code"], -32003);
+    }
+
+    // The fourth distinct degraded collision exceeds the aggregate bound. No
+    // lexical/current/history subset is retained: the entire tools family is
+    // unavailable, so neither list nor route lookup can resurrect a winner.
+    generation.store(3, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 139).await;
+    assert_eq!(body["error"]["code"], -32006);
+    assert_eq!(body["error"]["data"]["gateway"], "mcp_gateway");
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        140,
+        "tools/call",
+        json!({"name": "a.b.collision_3", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32006);
+
+    // On another degraded refresh, one upstream replays a previously
+    // suppressed name while the guard remains unavailable. The sticky
+    // overflow bit must keep both discovery and dispatch failed closed.
+    generation.store(4, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 141).await;
+    assert_eq!(body["error"]["code"], -32006);
+    assert_eq!(body["error"]["data"]["gateway"], "mcp_gateway");
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        142,
+        "tools/call",
+        json!({"name": "a.b.collision_0", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32006);
+
+    // A fully authoritative refresh can discard the uncertain history and
+    // publish only the current, non-colliding catalog.
+    generation.store(5, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 143).await;
+    assert_eq!(sorted_tool_names(&body), vec!["a.safe"]);
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 144,
+        "method": "tools/call",
+        "params": {"name": "a.safe", "arguments": {}}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn aggregate_resource_collision_tombstone_requires_authoritative_refresh() {
     let one = MockServer::start().await;
     let one_resource_requests = Arc::new(AtomicUsize::new(0));

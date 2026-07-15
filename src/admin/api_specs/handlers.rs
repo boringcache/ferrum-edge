@@ -1288,6 +1288,7 @@ async fn validate_bundle(
     }
 
     // Plugins
+    let known_plugins = crate::plugins::available_plugins();
     for plugin in &bundle.plugins {
         let mut plugin_errors: Vec<String> = Vec::new();
 
@@ -1299,14 +1300,22 @@ async fn validate_bundle(
             plugin_errors.extend(errs);
         }
 
-        // Plugin-specific config schema validation. Screen literal-IP plugin
-        // endpoints against the configured egress policy (same as direct admin
-        // POSTs and the file/db loaders).
-        if let Err(e) = crate::plugins::validate_plugin_config_with_policy(
-            &plugin.plugin_name,
-            &plugin.config,
-            &state.backend_allow_ips,
-        ) {
+        // Plugin names remain validated even while disabled. Construction and
+        // plugin-specific config validation are deferred until enabled, which
+        // lets operators stage configs whose runtime prerequisites are not yet
+        // provisioned without admitting unknown plugin types.
+        if !known_plugins.contains(&plugin.plugin_name.as_str()) {
+            plugin_errors.push(format!(
+                "Unknown plugin name '{}'. Available plugins: {:?}",
+                plugin.plugin_name, known_plugins
+            ));
+        } else if plugin.enabled
+            && let Err(e) = crate::plugins::validate_plugin_config_with_policy(
+                &plugin.plugin_name,
+                &plugin.config,
+                &state.backend_allow_ips,
+            )
+        {
             plugin_errors.push(e);
         }
 
