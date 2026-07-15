@@ -53,7 +53,7 @@ pub(crate) enum WriteAction<'a> {
 pub(crate) enum AfterValidateError {
     BadRequest(Vec<String>),
     Db(anyhow::Error),
-    Response(Response<Full<Bytes>>),
+    Response(Box<Response<Full<Bytes>>>),
 }
 
 /// Validation outcomes for resource-specific checks and generic field validation.
@@ -2364,13 +2364,13 @@ impl AdminResource for Proxy {
             && ctx.mode != "cp"
         {
             if ctx.reserved_ports.contains(&port) {
-                return Err(AfterValidateError::Response(super::json_response(
+                return Err(AfterValidateError::Response(Box::new(super::json_response(
                     StatusCode::CONFLICT,
                     &json!({"error": format!(
                         "listen_port {} conflicts with a gateway reserved port (proxy/admin/gRPC listener)",
                         port
                     )}),
-                )));
+                ))));
             }
 
             let port_changed = existing.and_then(|proxy| proxy.listen_port) != Some(port);
@@ -2386,13 +2386,13 @@ impl AdminResource for Proxy {
                 )
                 .await
             {
-                return Err(AfterValidateError::Response(super::json_response(
+                return Err(AfterValidateError::Response(Box::new(super::json_response(
                     StatusCode::CONFLICT,
                     &json!({"error": format!(
                         "listen_port {} is not available on the host: {}",
                         port, error
                     )}),
-                )));
+                ))));
             }
         }
 
@@ -2580,7 +2580,7 @@ fn map_after_validate_error<R: AdminResource>(error: AfterValidateError) -> Resp
     match error {
         AfterValidateError::BadRequest(field_errors) => R::map_after_validate_errors(&field_errors),
         AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
-        AfterValidateError::Response(response) => response,
+        AfterValidateError::Response(response) => *response,
     }
 }
 
