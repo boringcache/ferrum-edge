@@ -1565,6 +1565,17 @@ async fn buffered_grpc_upload_deadline_preserves_gateway_deadline_contract() {
     use http_body_util::StreamBody;
 
     let mut proxy = create_grpc_proxy("grpc-buffered-upload-deadline", "/grpc", 9);
+    // Retry requires replayable request bytes, so the direct gRPC path must
+    // collect the upload before it can dial. This makes the stalled upload a
+    // true pre-dispatch buffering case instead of racing a fast connection
+    // refusal from the intentionally unavailable test backend.
+    proxy.retry = Some(ferrum_edge::config::types::RetryConfig {
+        max_retries: 1,
+        retryable_status_codes: vec![502, 503],
+        retryable_methods: vec!["POST".to_string()],
+        backoff: Default::default(),
+        retry_on_connect_failure: true,
+    });
     let plugin_configs =
         attach_grpc_web_deadline_plugins(&mut proxy, serde_json::json!({"max_deadline_ms": 5_000}));
     let state = create_test_proxy_state_with_plugins(vec![proxy], plugin_configs);
