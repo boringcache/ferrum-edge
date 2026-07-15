@@ -1174,7 +1174,9 @@ impl OidcRelyingParty {
 
         // Authorize against the effective (possibly refreshed) claims.
         if let Err((status, body)) = self.check_session_authorization(&payload.claims) {
-            if refresh.mutated && let Some(cookie) = rolling_cookie {
+            if refresh.mutated
+                && let Some(cookie) = rolling_cookie
+            {
                 // The preflight proved this requester's session could own the
                 // request before the refresh grant. Preserve only its rotated
                 // token/backoff cookie on a post-refresh reject; claim headers
@@ -1189,12 +1191,12 @@ impl OidcRelyingParty {
         let mut attempt = AuthenticationAttempt::new();
         if authentication_attempt_can_commit(ctx, &outcome, true) {
             if let Some(cookie) = rolling_cookie {
-                attempt.stage_principal_metadata(
-                    SESSION_SET_COOKIE_METADATA_KEY.to_string(),
-                    cookie,
-                );
+                attempt
+                    .stage_principal_metadata(SESSION_SET_COOKIE_METADATA_KEY.to_string(), cookie);
             }
-        } else if refresh.mutated && let Some(cookie) = rolling_cookie {
+        } else if refresh.mutated
+            && let Some(cookie) = rolling_cookie
+        {
             // A refreshed ID token can remove the configured identity claim
             // after the grant has already rotated requester-owned state.
             ctx.metadata

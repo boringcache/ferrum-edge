@@ -192,6 +192,7 @@ async fn multi_auth_supersession_keeps_only_rotated_requester_session_state() {
         .await;
     let mut config = refresh_config(&format!("{}/token", server.uri()));
     config["providers"][0]["required_scopes"] = json!(["admin"]);
+    config["providers"][0]["claim_headers"] = json!({"email": "X-OIDC-Email"});
     let oidc = Arc::new(
         OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config"),
     );
@@ -233,7 +234,9 @@ async fn multi_auth_supersession_keeps_only_rotated_requester_session_state() {
             .map(|consumer| consumer.username.as_str()),
         Some("testuser")
     );
-    assert!(ctx.pending_claim_headers.is_empty());
+    let mut upstream_headers = HashMap::new();
+    assert_continue(oidc.before_proxy(&mut ctx, &mut upstream_headers).await);
+    assert!(!upstream_headers.contains_key("x-oidc-email"));
     let rotated = rolling_cookie(&oidc, &mut ctx)
         .await
         .expect("post-refresh reject must preserve requester-owned rotation");
