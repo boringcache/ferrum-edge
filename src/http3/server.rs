@@ -1108,22 +1108,6 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // gRPC spec mandates POST — reject non-POST gRPC with a trailers-only
-    // error before any routing work so the H3 listener matches the H1/H2
-    // dispatch contract.
-    if matches!(http_flavor, HttpFlavor::Grpc) && method != "POST" {
-        warn!(method = %method, "Rejected HTTP/3 gRPC request: method must be POST");
-        record_request(&state, 400);
-        send_h3_grpc_error(
-            &mut stream,
-            crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
-            "gRPC requires POST method",
-            &[],
-        )
-        .await?;
-        return Ok(());
-    }
-
     // Reject disallowed methods on 0-RTT early data connections (RFC 8470).
     // Early data is replayable, so only operator-configured safe methods are
     // permitted. Clients receive 425 Too Early and should retry after handshake.
@@ -1368,8 +1352,9 @@ async fn handle_h3_request(
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
     {
         record_request(&state, 405);
+        let allow_header = allowed.join(", ");
         let mut headers = HashMap::new();
-        headers.insert("allow".to_string(), allowed.join(", "));
+        headers.insert("allow".to_string(), allow_header.clone());
         finalize_h3_gateway_error_headers(
             http_flavor,
             StatusCode::METHOD_NOT_ALLOWED,
@@ -1377,12 +1362,29 @@ async fn handle_h3_request(
             &mut headers,
             initial_response_header_policy_plugins.as_ref(),
         );
+        crate::proxy::restore_authoritative_allow_header(&mut headers, &allow_header);
         send_h3_reject_flavor_aware(
             &mut stream,
             http_flavor,
             StatusCode::METHOD_NOT_ALLOWED,
             r#"{"error":"Method Not Allowed"}"#.as_bytes(),
             &headers,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // gRPC spec mandates POST. Route first so this synthesized trailers-only
+    // response receives the matched route's initial-header policy, matching
+    // the H1/H2 dispatch contract.
+    if matches!(http_flavor, HttpFlavor::Grpc) && method != "POST" {
+        warn!(method = %method, "Rejected HTTP/3 gRPC request: method must be POST");
+        record_request(&state, 400);
+        send_h3_grpc_error(
+            &mut stream,
+            crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            "gRPC requires POST method",
+            initial_response_header_policy_plugins.as_ref(),
         )
         .await?;
         return Ok(());

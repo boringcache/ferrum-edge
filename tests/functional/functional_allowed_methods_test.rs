@@ -81,6 +81,7 @@ plugin_configs:
     config:
       set:
         X-Synthetic-Policy: "enforced"
+        Allow: "DELETE"
       remove: []
 "#
     )
@@ -148,6 +149,11 @@ impl AllowedMethodsHarness {
 }
 
 fn assert_allow_header(headers: &HeaderMap, expected: &[&str]) {
+    assert_eq!(
+        headers.get_all(http::header::ALLOW).iter().count(),
+        1,
+        "405 response must carry exactly one authoritative Allow field"
+    );
     let actual = headers
         .get(http::header::ALLOW)
         .and_then(|v| v.to_str().ok())

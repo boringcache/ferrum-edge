@@ -8123,12 +8123,6 @@ fn is_websocket_transport_managed_response_header(name: &str) -> bool {
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
-fn strip_websocket_transport_managed_response_headers(headers: &mut hyper::HeaderMap) {
-    for name in WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS {
-        headers.remove(name);
-    }
-}
-
 pub(crate) fn strip_websocket_transport_managed_response_header_map(
     response_headers: &mut HashMap<String, String>,
 ) {
@@ -8219,6 +8213,11 @@ async fn handle_websocket_request_authenticated(
         remote_addr.ip()
     );
     let mut ctx = ctx;
+    // This dedicated handler is itself the authoritative flavor boundary.
+    // Stamp it again here so every rejection it owns is stripped before the
+    // generic finalizer invokes committed-response observers, independent of
+    // how the caller classified or constructed the request context.
+    ctx.set_websocket_response_boundary(true);
     let mut current_cb_target_key = cb_target_key;
 
     // Build backend URL using upstream target if available
@@ -8441,7 +8440,7 @@ async fn handle_websocket_request_authenticated(
                     current_cb_target_key.as_deref(),
                     ws_cb_probe_slot_available,
                 );
-                let mut response = handle_backend_admission_rejection(
+                let response = handle_backend_admission_rejection(
                     rejection,
                     &plugins,
                     &mut ctx,
@@ -8453,11 +8452,6 @@ async fn handle_websocket_request_authenticated(
                     None,
                 )
                 .await;
-                // The generic reject finalizer already ran security_headers;
-                // strip fields owned by the failed WebSocket transport only
-                // after that last plugin opportunity so policy cannot smuggle
-                // upgrade metadata onto a non-upgrade response.
-                strip_websocket_transport_managed_response_headers(response.headers_mut());
                 return Ok(response);
             }
         };
@@ -13624,6 +13618,18 @@ pub(crate) fn finalize_plain_gateway_error_response_headers(
     });
 }
 
+/// Restore the gateway-owned method retry contract after generic response
+/// policy has run. Policy may decorate a 405 response, but it must not remove,
+/// replace, or duplicate the authoritative `Allow` value derived from the
+/// matched route.
+pub(crate) fn restore_authoritative_allow_header(
+    response_headers: &mut HashMap<String, String>,
+    allow_value: &str,
+) {
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case("allow"));
+    response_headers.insert("allow".to_string(), allow_value.to_string());
+}
+
 fn finalize_synthesized_reject_headers(
     reject: &mut NormalizedRejectResponse,
     request_protocol: ProxyProtocol,
@@ -15060,7 +15066,7 @@ async fn handle_proxy_request_inner(
         state.request_count.fetch_add(1, Ordering::Relaxed);
         let allow_header = allowed.join(", ");
         let mut reject_headers = HashMap::new();
-        reject_headers.insert("allow".to_string(), allow_header);
+        reject_headers.insert("allow".to_string(), allow_header.clone());
         let mut reject = normalize_reject_response(
             StatusCode::METHOD_NOT_ALLOWED,
             br#"{"error":"Method Not Allowed"}"#,
@@ -15072,6 +15078,7 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
+        restore_authoritative_allow_header(&mut reject.headers, &allow_header);
         record_status(&state, reject.http_status.as_u16());
         return Ok(build_response_from_normalized_reject(reject));
     }

@@ -22,7 +22,7 @@ use crate::scaffolding::backends::{
     GrpcStep, H2Step, MatchHeaders, MatchRpc, ScriptedGrpcBackend, ScriptedH2Backend,
 };
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::Http3Client;
+use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
 use bytes::Bytes;
@@ -224,6 +224,46 @@ async fn open_grpc_stream_with_retry(
             }
         }
     }
+}
+
+// A route-resolved native-H3 gRPC method rejection must use the same
+// initial-response policy as H1/H2 instead of rejecting before routing with an
+// empty policy slice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_grpc_non_post_method_reject_applies_route_policy() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unused backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let (_harness, https_port) = spawn_h3_grpc_gateway(backend_port, &[]).await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
+    let response = client
+        .get_with_options(
+            &url,
+            GetOptions::default().header("content-type", "application/grpc"),
+        )
+        .await
+        .expect("non-POST gRPC request");
+
+    assert_eq!(response.status, http::StatusCode::OK);
+    assert!(response.body_bytes.is_empty());
+    assert_eq!(
+        response
+            .headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
