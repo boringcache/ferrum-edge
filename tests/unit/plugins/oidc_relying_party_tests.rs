@@ -13,9 +13,10 @@ use ferrum_edge::proxy::run_authentication_phase;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use url::Url;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
 
@@ -376,7 +377,7 @@ async fn oidc_multi_auth_preserves_rotated_cookie_when_later_credential_rejects(
 }
 
 #[tokio::test]
-async fn oidc_multi_auth_uses_latest_rejected_session_cookie() {
+async fn oidc_multi_auth_preserves_distinct_rejected_session_cookies() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/first-token"))
@@ -453,17 +454,127 @@ async fn oidc_multi_auth_uses_latest_rejected_session_cookie() {
     let set_cookie = set_cookies
         .next()
         .map(|(_, value)| value)
-        .expect("latest rejected session cookie must reach the client");
+        .expect("both rejected session cookies must reach the client");
     assert!(set_cookies.next().is_none());
-    assert!(set_cookie.starts_with("second_session="));
-    assert!(oidc_session_state_from_set_cookie_for_test(&first, set_cookie).is_none());
+    let cookies: Vec<&str> = set_cookie.split('\n').collect();
+    assert_eq!(cookies.len(), 2);
+    assert!(cookies[0].starts_with("second_session="));
+    assert!(cookies[1].starts_with("first_session="));
+    assert_eq!(
+        cookies
+            .iter()
+            .filter(|cookie| cookie.starts_with("first_session="))
+            .count(),
+        1
+    );
+    assert_eq!(
+        cookies
+            .iter()
+            .filter(|cookie| cookie.starts_with("second_session="))
+            .count(),
+        1
+    );
+    let first_state = oidc_session_state_from_set_cookie_for_test(&first, set_cookie)
+        .expect("first rejected session cookie must open with its owner");
+    assert_eq!(first_state.access_token, "first-access-token");
+    assert_eq!(
+        first_state.refresh_token.as_deref(),
+        Some("first-rotated-refresh-token")
+    );
+    let second_state = oidc_session_state_from_set_cookie_for_test(&second, set_cookie)
+        .expect("second rejected session cookie must open with its owner");
+    assert_eq!(second_state.access_token, "second-access-token");
+    assert_eq!(
+        second_state.refresh_token.as_deref(),
+        Some("second-rotated-refresh-token")
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_uses_later_same_name_rejected_session_cookie() {
+    let server = MockServer::start().await;
+    let response_number = Arc::new(AtomicUsize::new(0));
+    let response_number_for_mock = Arc::clone(&response_number);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(move |_: &Request| {
+            let response_number = response_number_for_mock.fetch_add(1, Ordering::SeqCst);
+            let (access_token, refresh_token) = if response_number == 0 {
+                ("first-access-token", "first-rotated-refresh-token")
+            } else {
+                ("second-access-token", "second-rotated-refresh-token")
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "refresh_token": refresh_token,
+                "expires_in": 3600
+            }))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let mut config = base_config();
+    config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
+    config["providers"][0]["required_scopes"] = json!(["admin"]);
+    config["providers"][0]["consumer_identity_claim"] = json!("email");
+    config["session"]["cookie_name"] = json!("shared_session");
+    let first = Arc::new(
+        OidcRelyingParty::new(&config, PluginHttpClient::default())
+            .expect("first OIDC config must be valid"),
+    );
+    let second = Arc::new(
+        OidcRelyingParty::new(&config, PluginHttpClient::default())
+            .expect("second OIDC config must be valid"),
+    );
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &first,
+        json!({
+            "sub": "oidc-subject",
+            "email": "rejected@example.test",
+            "scope": "viewer",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .unwrap();
+    let cookie_pair = cookie.split(';').next().expect("session cookie pair");
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.headers
+        .insert("cookie".to_string(), cookie_pair.to_string());
+    let first_plugin: Arc<dyn Plugin> = first;
+    let second_plugin: Arc<dyn Plugin> = second.clone();
+
+    let (status_code, _, headers) = run_authentication_phase(
+        AuthMode::Multi,
+        &[first_plugin, second_plugin],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("both scope-rejected sessions must reject");
+    assert_eq!(status_code, 403);
+    let mut set_cookies = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"));
+    let set_cookie = set_cookies
+        .next()
+        .map(|(_, value)| value)
+        .expect("the later rejected session cookie must reach the client");
+    assert!(set_cookies.next().is_none());
+    assert!(!set_cookie.contains('\n'));
+    assert!(set_cookie.starts_with("shared_session="));
     let state = oidc_session_state_from_set_cookie_for_test(&second, set_cookie)
-        .expect("latest rejected session cookie must open with its owner");
+        .expect("the later rejected session cookie must remain readable");
     assert_eq!(state.access_token, "second-access-token");
     assert_eq!(
         state.refresh_token.as_deref(),
         Some("second-rotated-refresh-token")
     );
+    assert_eq!(response_number.load(Ordering::SeqCst), 2);
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 

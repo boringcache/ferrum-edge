@@ -164,10 +164,12 @@ pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
     "ferrum:replaceable_rejection_response";
 
 /// One-shot handoff for requester-owned auth session state that changed before
-/// an authentication attempt rejected. The authentication phase removes this
-/// key on every exit: it attaches the cookie only to the final rejection and
-/// discards it when a later credential succeeds. The key contains "cookie" so
-/// metadata serialization still redacts the sealed value defensively.
+/// authentication attempts rejected. Distinct cookie names are newline-joined;
+/// a later attempt replaces an earlier candidate with the same exact name. The
+/// authentication phase removes this key on every exit: it attaches the cookies
+/// only to the final rejection and discards them when a later credential
+/// succeeds. The key contains "cookie" so metadata serialization still redacts
+/// the sealed values defensively.
 pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_set_cookie";
 
 /// Marker recorded in `ctx.metadata` for the duration of
@@ -13899,36 +13901,88 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     Some(name)
 }
 
+/// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
+/// earlier line when a later line owns the same exact, case-sensitive cookie
+/// name. Invalid cookie-pairs can only replace byte-identical lines.
+fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
+    for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
+        let candidate_name = set_cookie_name(candidate);
+        if let Some(index) = cookies.iter().position(|existing| {
+            existing == candidate
+                || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+        }) {
+            cookies.remove(index);
+        }
+        cookies.push(candidate.to_string());
+    }
+}
+
+fn set_cookie_conflicts(cookies: &[String], candidate: &str) -> bool {
+    let candidate_name = set_cookie_name(candidate);
+    cookies.iter().any(|existing| {
+        existing == candidate
+            || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+    })
+}
+
+/// Stage requester-owned cookies from rejecting auth attempts. This remains on
+/// the rejection path: successful authentication only removes the metadata.
+pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
+    let mut staged = Vec::new();
+    if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
+        collect_later_set_cookies(&mut staged, existing);
+    }
+    collect_later_set_cookies(&mut staged, &cookie);
+
+    if staged.is_empty() {
+        ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
+    } else {
+        ctx.metadata.insert(
+            AUTH_REJECTION_SET_COOKIE_METADATA_KEY.to_string(),
+            staged.join("\n"),
+        );
+    }
+}
+
 fn attach_auth_rejection_set_cookie(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
-    let Some(cookie) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
+    let Some(staged) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
         return;
     };
-    let existing = headers.iter().find_map(|(name, value)| {
-        name.eq_ignore_ascii_case("set-cookie")
-            .then(|| value.clone())
-    });
+
+    // A custom plugin can return multiple case variants because rejection
+    // headers use a String-keyed HashMap. Sort the variants by their exact key
+    // before merging so randomized HashMap iteration cannot select ownership.
+    // The canonical lowercase key sorts after uppercase variants and therefore
+    // wins same-name conflicts deterministically.
+    let mut selected_variants = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    selected_variants.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     headers.retain(|name, _| !name.eq_ignore_ascii_case("set-cookie"));
-    let mut merged = existing.unwrap_or_default();
-    for candidate in cookie.split('\n') {
-        let candidate_name = set_cookie_name(candidate);
-        // The selected (later) rejection owns conflicts. Preserve its exact
-        // value and order, appending only independently named earlier cookies.
-        let conflicts = merged.split('\n').any(|selected| {
-            selected == candidate
-                || candidate_name.is_some_and(|name| set_cookie_name(selected) == Some(name))
-        });
-        if conflicts {
-            continue;
-        }
-        if !merged.is_empty() {
-            merged.push('\n');
-        }
-        merged.push_str(candidate);
+
+    let mut merged = Vec::new();
+    for (_, value) in selected_variants {
+        collect_later_set_cookies(&mut merged, &value);
     }
-    headers.insert("set-cookie".to_string(), merged);
+
+    let mut staged_cookies = Vec::new();
+    collect_later_set_cookies(&mut staged_cookies, &staged);
+    for candidate in staged_cookies {
+        // The selected final rejection owns conflicts. Preserve each selected
+        // line's full attributes and deterministic order, appending only
+        // independently named requester-owned cookies from earlier rejects.
+        if !set_cookie_conflicts(&merged, &candidate) {
+            merged.push(candidate);
+        }
+    }
+    if !merged.is_empty() {
+        headers.insert("set-cookie".to_string(), merged.join("\n"));
+    }
 }
 
 pub async fn run_authentication_phase(

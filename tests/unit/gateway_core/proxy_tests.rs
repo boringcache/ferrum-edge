@@ -331,6 +331,10 @@ struct RejectingAuth {
     body: &'static str,
 }
 
+struct StagedCookieRejectingAuth;
+
+struct MixedCaseCookieRejectingAuth;
+
 #[async_trait]
 impl Plugin for RejectingAuth {
     fn name(&self) -> &str {
@@ -348,6 +352,69 @@ impl Plugin for RejectingAuth {
             status_code: 401,
             body: self.body.to_string(),
             headers: HashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for StagedCookieRejectingAuth {
+    fn name(&self) -> &str {
+        "staged_cookie_rejecting_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        ctx.metadata.insert(
+            "auth.rejection_set_cookie".to_string(),
+            "session=staged; Path=/staged; HttpOnly\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged"
+                .to_string(),
+        );
+        PluginResult::Reject {
+            status_code: 401,
+            body: r#"{"error":"staged rejection"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for MixedCaseCookieRejectingAuth {
+    fn name(&self) -> &str {
+        "mixed_case_cookie_rejecting_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"mixed-case rejection"}"#.to_string(),
+            headers: HashMap::from([
+                (
+                    "Set-Cookie".to_string(),
+                    "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nshared=1; Path=/"
+                        .to_string(),
+                ),
+                (
+                    "set-cookie".to_string(),
+                    "shared=1; Path=/\nlower_only=1; Path=/lower\nsession=selected-lower; Path=/lower; Secure; SameSite=Strict"
+                        .to_string(),
+                ),
+                ("X-Rejection".to_string(), "selected".to_string()),
+            ]),
         }
     }
 }
@@ -789,6 +856,58 @@ async fn test_multi_auth_preserves_specific_reject_when_surrounded_by_missing() 
     assert_eq!(body, br#"{"error":"Specific auth failure"}"#);
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
+}
+
+#[tokio::test]
+async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministically() {
+    let staged: Arc<dyn Plugin> = Arc::new(StagedCookieRejectingAuth);
+    let selected: Arc<dyn Plugin> = Arc::new(MixedCaseCookieRejectingAuth);
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let expected = "upper_only=1; Path=/upper\nshared=1; Path=/\nlower_only=1; Path=/lower\nsession=selected-lower; Path=/lower; Secure; SameSite=Strict\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged";
+
+    for _ in 0..32 {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/mixed-cookie-rejection".to_string(),
+        );
+        let (status_code, body, headers) = run_authentication_phase(
+            AuthMode::Multi,
+            &auth_plugins,
+            &mut ctx,
+            &consumer_index,
+        )
+        .await
+        .expect("both auth attempts must reject");
+
+        assert_eq!(status_code, 403);
+        assert_eq!(body, br#"{"error":"mixed-case rejection"}"#);
+        assert_eq!(
+            headers.get("X-Rejection").map(String::as_str),
+            Some("selected")
+        );
+        assert_eq!(headers.get("set-cookie").map(String::as_str), Some(expected));
+        assert_eq!(
+            headers
+                .keys()
+                .filter(|name| name.eq_ignore_ascii_case("set-cookie"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            headers["set-cookie"]
+                .split('\n')
+                .filter(|cookie| *cookie == "shared=1; Path=/")
+                .count(),
+            1,
+            "identical cookie lines must not multiply"
+        );
+        assert!(
+            !ctx.metadata.contains_key("auth.rejection_set_cookie"),
+            "the staged cookies must be consumed exactly once"
+        );
+    }
 }
 
 #[test]
