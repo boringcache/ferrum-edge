@@ -4496,25 +4496,20 @@ fn telemetry(
             let mut disabled_metrics = Vec::new();
             if let Some(overrides) = m.get("overrides").and_then(Value::as_array) {
                 for ovr in overrides {
-                    let matched_metric = ovr
+                    let matched_metric = match ovr
                         .get("match")
                         .and_then(|matcher| matcher.get("metric"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("ALL_METRICS");
-                    if ovr.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
-                        if matched_metric == "ALL_METRICS"
-                            && ovr
-                                .get("match")
-                                .and_then(|matcher| matcher.get("metric"))
-                                .is_none()
-                        {
-                            return Err(
-                                invalid_resource(
-                                    object,
-                                    "Telemetry metrics.overrides[].match.metric is required when disabled=true",
-                                )
-                            );
+                    {
+                        Some(Value::String(metric)) => metric.as_str(),
+                        Some(_) => {
+                            return Err(invalid_resource(
+                                object,
+                                "Telemetry metrics.overrides[].match.metric must be a string",
+                            ));
                         }
+                        None => "ALL_METRICS",
+                    };
+                    if ovr.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
                         disabled_metrics.push(matched_metric.to_string());
                     }
                     if let Some(tags) = ovr.get("tagOverrides").and_then(Value::as_object) {

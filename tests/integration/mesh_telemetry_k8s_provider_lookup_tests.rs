@@ -6,7 +6,8 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TelemetryTracingMode, TracingProvider};
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, TransactionSummary};
 use serde_json::{Value, json};
 
 fn options() -> K8sTranslationOptions {
@@ -427,6 +428,71 @@ async fn translated_unsupported_standard_metric_families_do_not_omit_plugin() {
     );
 }
 
+#[tokio::test]
+async fn translated_disabled_override_without_match_suppresses_all_mesh_metrics() {
+    let translation = translate_k8s_objects(
+        &[telemetry(json!({
+            "metrics": [{
+                "overrides": [{"disabled": true}]
+            }]
+        }))],
+        options(),
+    )
+    .expect("disabled override without match defaults to ALL_METRICS");
+    let metrics = translation
+        .config
+        .mesh
+        .expect("mesh config")
+        .telemetry_resources[0]
+        .config
+        .metrics
+        .clone()
+        .expect("metrics config");
+    assert_eq!(metrics.disabled_metrics, vec!["ALL_METRICS"]);
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/frontend",
+        "labels": {"app": "frontend"},
+        "metrics": serde_json::to_value(metrics).expect("serialize metrics")
+    }))
+    .expect("translated ALL_METRICS policy");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.metrics.disabled")
+            .map(String::as_str),
+        Some("request_count,request_duration")
+    );
+
+    let registry = MetricsRegistry::new();
+    registry.record(&TransactionSummary {
+        namespace: "default".to_string(),
+        timestamp_received: "2026-07-15T00:00:00Z".to_string(),
+        client_ip: "10.0.0.2".to_string(),
+        http_method: "GET".to_string(),
+        request_path: "/".to_string(),
+        proxy_id: Some("frontend".to_string()),
+        response_status_code: 200,
+        latency_total_ms: 12.0,
+        latency_backend_total_ms: 8.0,
+        metadata: ctx.metadata,
+        ..TransactionSummary::default()
+    });
+    let output = registry.render_uncached();
+    assert!(
+        !output.contains("ferrum_mesh_requests_total{"),
+        "ALL_METRICS must suppress the emitted counter family"
+    );
+    assert!(
+        !output.contains("ferrum_mesh_request_duration_ms_bucket{"),
+        "ALL_METRICS must suppress the emitted histogram family"
+    );
+}
+
 #[test]
 fn workload_metrics_still_rejects_unknown_or_malformed_metric_policy() {
     let unknown = WorkloadMetrics::new(&json!({
@@ -437,6 +503,24 @@ fn workload_metrics_still_rejects_unknown_or_malformed_metric_policy() {
         Err(error) => error,
     };
     assert!(unknown_error.contains("unsupported disabled metric"));
+
+    let malformed_translation = translate_k8s_objects(
+        &[telemetry(json!({
+            "metrics": [{
+                "overrides": [{
+                    "match": {"metric": 7},
+                    "disabled": true
+                }]
+            }]
+        }))],
+        options(),
+    )
+    .expect_err("non-string Istio metric selector must be rejected");
+    assert!(
+        malformed_translation
+            .to_string()
+            .contains("match.metric must be a string")
+    );
 
     let malformed = WorkloadMetrics::new(&json!({
         "metrics": {

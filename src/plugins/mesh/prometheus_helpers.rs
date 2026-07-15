@@ -1286,37 +1286,46 @@ pub fn render_mesh_histogram(
     gateway_ns_label: &str,
 ) {
     let base_labels = mesh_label_base_fragment(key);
+    let le_separator = if base_labels.is_empty() { "" } else { "," };
     for (i, boundary) in histogram.boundaries.iter().enumerate() {
         let count = histogram.counts[i].load(Ordering::Relaxed);
         let _ = writeln!(
             output,
-            "ferrum_mesh_request_duration_ms_bucket{{{},le=\"{}\"{}}} {}",
+            "ferrum_mesh_request_duration_ms_bucket{{{}{le_separator}le=\"{}\"{}}} {}",
             base_labels, boundary, gateway_ns_label, count
         );
     }
     let total_count = histogram.count.load(Ordering::Relaxed);
     let _ = writeln!(
         output,
-        "ferrum_mesh_request_duration_ms_bucket{{{},le=\"+Inf\"{}}} {}",
+        "ferrum_mesh_request_duration_ms_bucket{{{}{le_separator}le=\"+Inf\"{}}} {}",
         base_labels, gateway_ns_label, total_count
     );
+    let aggregate_gateway_ns_label = if base_labels.is_empty() {
+        gateway_ns_label.strip_prefix(',').unwrap_or(gateway_ns_label)
+    } else {
+        gateway_ns_label
+    };
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     let _ = writeln!(
         output,
         "ferrum_mesh_request_duration_ms_sum{{{}{}}} {:.2}",
-        base_labels, gateway_ns_label, sum
+        base_labels, aggregate_gateway_ns_label, sum
     );
     let _ = writeln!(
         output,
         "ferrum_mesh_request_duration_ms_count{{{}{}}} {}",
-        base_labels, gateway_ns_label, total_count
+        base_labels, aggregate_gateway_ns_label, total_count
     );
 }
 
 pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {
     let mut labels = mesh_label_base_fragment(key);
     if let Some(le) = le {
-        let _ = write!(labels, ",le=\"{}\"", le);
+        if !labels.is_empty() {
+            labels.push(',');
+        }
+        let _ = write!(labels, "le=\"{le}\"");
     }
     labels
 }

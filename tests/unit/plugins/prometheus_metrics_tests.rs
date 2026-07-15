@@ -1194,6 +1194,108 @@ async fn workload_metrics_response_code_override_changes_selected_metric_family(
 }
 
 #[tokio::test]
+async fn mesh_histogram_renders_valid_labels_when_all_base_labels_are_removed() {
+    let removed_labels = [
+        "source_workload",
+        "source_namespace",
+        "source_principal",
+        "source_app",
+        "source_service",
+        "destination_workload",
+        "destination_namespace",
+        "destination_principal",
+        "destination_app",
+        "destination_service",
+        "request_protocol",
+        "response_code",
+        "response_flags",
+        "connection_security_policy",
+    ];
+    let tag_overrides = removed_labels
+        .into_iter()
+        .map(|name| {
+            json!({
+                "metric": "REQUEST_DURATION",
+                "name": name,
+                "operation": {"type": "remove"}
+            })
+        })
+        .collect::<Vec<_>>();
+    let workload_metrics = WorkloadMetrics::new(&json!({
+        "metrics": {"tag_overrides": tag_overrides}
+    }))
+    .expect("remove every request-duration label");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::new();
+    let result = workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+
+    let mut summary = make_summary("label-free-histogram", "GET", 200, 42.0, 35.0);
+    summary.metadata = ctx.metadata;
+    let registry = MetricsRegistry::new();
+    registry.record(&summary);
+
+    let output = registry.render_uncached();
+    let buckets = output
+        .lines()
+        .filter(|line| line.starts_with("ferrum_mesh_request_duration_ms_bucket{"))
+        .collect::<Vec<_>>();
+    assert!(!buckets.is_empty(), "mesh histogram buckets: {output}");
+    assert!(
+        buckets.iter().all(|line| !line.contains("{,")),
+        "label-free buckets must not start with a comma: {buckets:?}"
+    );
+    assert!(
+        buckets
+            .iter()
+            .any(|line| line.starts_with("ferrum_mesh_request_duration_ms_bucket{le=\"")
+                && !line.contains("le=\"+Inf\"")),
+        "finite bucket must contain only a valid le label: {buckets:?}"
+    );
+    assert!(
+        buckets.iter().any(|line| {
+            line.starts_with("ferrum_mesh_request_duration_ms_bucket{le=\"+Inf\"} 1")
+        }),
+        "+Inf bucket must remain valid: {buckets:?}"
+    );
+    assert!(output.contains("ferrum_mesh_request_duration_ms_sum{} 42.00"));
+    assert!(output.contains("ferrum_mesh_request_duration_ms_count{} 1"));
+
+    registry.configure(5, 3600, 0, "mesh-system");
+    let namespaced_output = registry.render_uncached();
+    assert!(!namespaced_output.contains("{,"), "{namespaced_output}");
+    assert!(namespaced_output.contains(
+        "ferrum_mesh_request_duration_ms_bucket{le=\"+Inf\",gateway_namespace=\"mesh-system\"} 1"
+    ));
+    assert!(namespaced_output.contains(
+        "ferrum_mesh_request_duration_ms_sum{gateway_namespace=\"mesh-system\"} 42.00"
+    ));
+    assert!(namespaced_output.contains(
+        "ferrum_mesh_request_duration_ms_count{gateway_namespace=\"mesh-system\"} 1"
+    ));
+
+    let mut labeled_summary = summary.clone();
+    labeled_summary
+        .metadata
+        .remove("mesh.metrics.request_duration.tag_overrides");
+    let labeled_registry = MetricsRegistry::new();
+    labeled_registry.record(&labeled_summary);
+    let labeled_output = labeled_registry.render_uncached();
+    let labeled_bucket = labeled_output
+        .lines()
+        .find(|line| {
+            line.starts_with("ferrum_mesh_request_duration_ms_bucket{")
+                && !line.contains("le=\"+Inf\"")
+        })
+        .expect("normally labeled finite bucket");
+    assert!(labeled_bucket.contains("source_workload=\"unknown\","));
+    assert!(labeled_bucket.contains(",le=\""));
+}
+
+#[tokio::test]
 async fn test_namespace_label_with_stream_metrics() {
     let registry = MetricsRegistry::new();
     registry.configure(5, 3600, 0, "prod");
