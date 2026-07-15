@@ -56,7 +56,13 @@ struct BrowserChallenge {
 }
 
 async fn issue_browser_challenge(plugin: &OidcRelyingParty) -> BrowserChallenge {
-    let mut ctx = html_ctx();
+    issue_browser_challenge_for_context(plugin, html_ctx()).await
+}
+
+async fn issue_browser_challenge_for_context(
+    plugin: &OidcRelyingParty,
+    mut ctx: RequestContext,
+) -> BrowserChallenge {
     let PluginResult::Reject {
         status_code,
         headers,
@@ -88,6 +94,29 @@ async fn issue_browser_challenge(plugin: &OidcRelyingParty) -> BrowserChallenge 
         nonce,
         cookie,
     }
+}
+
+async fn assert_browser_challenge_fails_closed(
+    plugin: &OidcRelyingParty,
+    mut ctx: RequestContext,
+) {
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await
+    else {
+        panic!("expected browser challenge rejection");
+    };
+    assert_eq!(status_code, 400);
+    assert_eq!(
+        body,
+        r#"{"error":"OIDC callback host does not match request host"}"#
+    );
+    assert!(!headers.contains_key("location"));
+    assert!(!headers.contains_key("set-cookie"));
 }
 
 fn cookie_attribute<'a>(cookie: &'a str, expected_name: &str) -> Option<Option<&'a str>> {
@@ -225,6 +254,16 @@ fn new_rejects_none_client_auth_for_remote_token_endpoint() {
     assert!(error.contains("client_auth.method='none'"));
 }
 
+#[test]
+fn new_rejects_trailing_dot_redirect_host_for_host_only_cookie_scope() {
+    let mut config = base_config();
+    config["providers"][0]["redirect_uri"] = json!("https://app.example.com./oauth/callback");
+    let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
+        .err()
+        .expect("trailing-dot callback host must be rejected");
+    assert!(error.contains("valid cookie host"));
+}
+
 #[tokio::test]
 async fn new_accepts_uppercase_same_site_from_schema() {
     let mut config = base_config();
@@ -251,6 +290,114 @@ async fn unauthenticated_html_get_returns_302() {
             }));
         }
         _ => panic!("expected redirect"),
+    }
+}
+
+#[tokio::test]
+async fn browser_challenge_accepts_same_host_with_normalized_names_ips_and_ports() {
+    for (redirect_uri, request_host) in [
+        ("https://app.example.com/oauth/callback", "APP.EXAMPLE.COM:8443"),
+        ("https://app.example.com:443/oauth/callback", "app.example.com"),
+        ("https://[2001:db8::1]:443/oauth/callback", "[2001:0db8:0:0:0:0:0:1]:8443"),
+    ] {
+        let mut config = base_config();
+        config["providers"][0]["redirect_uri"] = json!(redirect_uri);
+        let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+        let mut ctx = html_ctx();
+        ctx.headers
+            .insert("host".to_string(), request_host.to_string());
+
+        let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
+        assert_host_only_correlation_cookie(&challenge.cookie, "600");
+    }
+}
+
+#[tokio::test]
+async fn loopback_http_challenge_remains_available_on_the_same_host() {
+    for (redirect_uri, request_host) in [
+        ("http://localhost:3000/oauth/callback", "LOCALHOST:5173"),
+        ("http://127.0.0.1:3000/oauth/callback", "127.0.0.1:5173"),
+        ("http://[::1]:3000/oauth/callback", "[0:0:0:0:0:0:0:1]:5173"),
+    ] {
+        let mut config = base_config();
+        config["providers"][0]["redirect_uri"] = json!(redirect_uri);
+        config["session"]["secure"] = json!(false);
+        let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+        let mut ctx = html_ctx();
+        ctx.headers
+            .insert("host".to_string(), request_host.to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
+
+        let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
+        assert_eq!(cookie_attribute(&challenge.cookie, "domain"), None);
+        assert_eq!(
+            cookie_attribute(&challenge.cookie, "path"),
+            Some(Some("/oauth/callback"))
+        );
+        assert_eq!(cookie_attribute(&challenge.cookie, "secure"), None);
+    }
+}
+
+#[tokio::test]
+async fn central_sibling_callback_host_fails_before_state_or_cookie_issuance() {
+    let mut config = base_config();
+    config["providers"][0]["redirect_uri"] = json!("https://auth.example.com/oauth/callback");
+    config["session"]["domain"] = json!("example.com");
+    config["behavior"]["state_cache_max_entries"] = json!(1);
+    config["behavior"]["state_cache_max_entries_per_source"] = json!(1);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let mut app_request = html_ctx();
+    app_request
+        .headers
+        .insert("host".to_string(), "app.example.com".to_string());
+    app_request.headers.insert(
+        "x-forwarded-host".to_string(),
+        "auth.example.com".to_string(),
+    );
+
+    assert_browser_challenge_fails_closed(&plugin, app_request).await;
+
+    // The mismatch must be rejected before a flow consumes the one-entry
+    // admission budget. A request on the configured callback host can still
+    // start the flow, and the durable session Domain setting remains separate.
+    let mut callback_host_request = html_ctx();
+    callback_host_request
+        .headers
+        .insert("host".to_string(), "auth.example.com".to_string());
+    let challenge = issue_browser_challenge_for_context(&plugin, callback_host_request).await;
+    assert_host_only_correlation_cookie(&challenge.cookie, "600");
+}
+
+#[tokio::test]
+async fn missing_or_ambiguous_request_authority_fails_before_browser_challenge() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
+    let mut contexts = Vec::new();
+
+    let mut missing = html_ctx();
+    missing.headers.remove("host");
+    missing.headers.insert(
+        "x-forwarded-host".to_string(),
+        "app.example.com".to_string(),
+    );
+    contexts.push(missing);
+
+    for host in [
+        "app.example.com.",
+        "app.example.com,auth.example.com",
+        "user@app.example.com",
+        "2001:db8::1",
+        "[2001:db8::1]:65536",
+    ] {
+        let mut malformed = html_ctx();
+        malformed
+            .headers
+            .insert("host".to_string(), host.to_string());
+        contexts.push(malformed);
+    }
+
+    for ctx in contexts {
+        assert_browser_challenge_fails_closed(&plugin, ctx).await;
     }
 }
 

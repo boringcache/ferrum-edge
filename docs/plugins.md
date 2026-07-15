@@ -1477,7 +1477,7 @@ Runs a browser-oriented OpenID Connect relying party flow with authorization cod
 | `providers[].userinfo_endpoint` | String (optional) | UserInfo endpoint used to enrich session claims |
 | `providers[].client_id` | String | OIDC client ID |
 | `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
-| `providers[].redirect_uri` | String | Absolute callback URI registered with the provider |
+| `providers[].redirect_uri` | String | Absolute callback URI registered with the provider; its host must match the browser request host before Ferrum issues a challenge (ports are ignored) |
 | `providers[].callback_path` | String | Callback path Ferrum handles (default: path from `redirect_uri`) |
 | `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`) |
 | `providers[].scopes` | String[] | OIDC scopes; must include `openid` |
@@ -1492,6 +1492,7 @@ Runs a browser-oriented OpenID Connect relying party flow with authorization cod
 | `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
 | `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
 | `session.max_cookie_bytes` | u64 | Maximum sealed cookie size (default: `8000`) |
+| `session.domain` | String (optional) | Domain for the durable session cookie only; short-lived correlation cookies always remain host-only |
 | `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
 | `behavior.trusted_redirect_hosts` | String[] | Hosts allowed for post-login redirect parameters |
 
