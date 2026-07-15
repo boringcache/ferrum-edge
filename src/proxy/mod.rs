@@ -24728,7 +24728,7 @@ async fn proxy_to_backend_hbone(
         stream_response,
         proxy,
         plugins,
-        response_decision_ctx,
+        ctx,
         status,
         &resp_headers,
     );
