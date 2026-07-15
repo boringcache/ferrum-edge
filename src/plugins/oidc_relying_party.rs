@@ -140,6 +140,7 @@ struct ProviderRuntime {
     scopes: Vec<String>,
     audiences: Vec<String>,
     redirect_uri: String,
+    redirect_cookie_host: CorrelationCookieHost,
     callback_path: String,
     logout_path: String,
     post_logout_redirect_uri: Option<String>,
@@ -153,6 +154,16 @@ struct ProviderRuntime {
     id_token_clock_skew: Duration,
     http_client: PluginHttpClient,
     warmup_hostnames: Vec<String>,
+}
+
+/// Canonical host identity used for the host-only correlation cookie.
+///
+/// Cookies are not scoped by port, while DNS host matching is
+/// case-insensitive and IP literals can have multiple equivalent spellings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CorrelationCookieHost {
+    Domain(String),
+    Ip(IpAddr),
 }
 
 #[derive(Clone)]
@@ -501,6 +512,12 @@ impl OidcRelyingParty {
         }
         let redirect_uri = required_string(provider_obj, "redirect_uri", "provider[0]")?;
         validate_redirect_uri(&redirect_uri)?;
+        let redirect_cookie_host = Url::parse(&redirect_uri)
+            .ok()
+            .and_then(|url| correlation_cookie_host_from_url(&url))
+            .ok_or_else(|| {
+                "oidc_relying_party: redirect_uri must include a valid cookie host".to_string()
+            })?;
         let callback_path = optional_string(provider_obj, "callback_path", "provider[0]")?
             .unwrap_or_else(|| "/oauth/callback".to_string());
         validate_path_only(&callback_path, "callback_path")?;
@@ -623,13 +640,7 @@ impl OidcRelyingParty {
             cookie_attrs,
             context_id: session_context_id,
             correlation_cookie_name_prefix,
-            correlation_cookie_attrs: build_cookie_attrs(
-                secure,
-                true,
-                "Lax",
-                domain.as_deref(),
-                &callback_path,
-            ),
+            correlation_cookie_attrs: build_correlation_cookie_attrs(secure, &callback_path),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
@@ -738,6 +749,7 @@ impl OidcRelyingParty {
             scopes,
             audiences: parse_string_array(provider_obj, "audiences", "provider[0]")?,
             redirect_uri,
+            redirect_cookie_host,
             callback_path,
             logout_path,
             post_logout_redirect_uri,
@@ -1406,6 +1418,23 @@ impl OidcRelyingParty {
 
     fn challenge(&self, ctx: &mut RequestContext, clear: bool) -> PluginResult {
         if is_browser_request(ctx, &self.behavior) {
+            // The correlation secret is deliberately host-only. Do not start a
+            // flow when the configured callback host differs from the host on
+            // which the browser would receive the cookie: the callback could
+            // never return the binding, and restoring a parent Domain would
+            // reintroduce sibling-host disclosure and overwrite attacks.
+            let Some(request_host) = correlation_cookie_host_from_request(ctx) else {
+                return reject(
+                    400,
+                    r#"{"error":"OIDC missing or malformed request authority"}"#.to_string(),
+                );
+            };
+            if request_host != self.provider.redirect_cookie_host {
+                return reject(
+                    400,
+                    r#"{"error":"OIDC callback host does not match request host"}"#.to_string(),
+                );
+            }
             let (state, flow, browser_binding) = match self.create_flow(ctx) {
                 Ok(flow) => flow,
                 Err(body) => return reject(503, body),
@@ -2571,6 +2600,42 @@ fn validate_redirect_uri(uri: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn correlation_cookie_host_from_url(url: &Url) -> Option<CorrelationCookieHost> {
+    match url.host()? {
+        Host::Domain(hostname) if hostname.ends_with('.') => None,
+        Host::Domain(hostname) => {
+            Some(CorrelationCookieHost::Domain(hostname.to_ascii_lowercase()))
+        }
+        Host::Ipv4(address) => Some(CorrelationCookieHost::Ip(IpAddr::V4(address))),
+        Host::Ipv6(address) => Some(CorrelationCookieHost::Ip(IpAddr::V6(address))),
+    }
+}
+
+fn correlation_cookie_host_from_request(ctx: &RequestContext) -> Option<CorrelationCookieHost> {
+    let raw = ctx.headers.get("host")?.trim();
+    // Reuse the proxy's admission parser so malformed ports, user-info,
+    // unbracketed IPv6, and ambiguous authority syntax fail closed here too.
+    crate::proxy::normalize_request_host_for_routing(raw)?;
+    let authority: http::uri::Authority = raw.parse().ok()?;
+    let host = authority.host();
+    if let Some(literal) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        return literal
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|address| CorrelationCookieHost::Ip(IpAddr::V6(address)));
+    }
+    if let Ok(address) = host.parse::<std::net::Ipv4Addr>() {
+        return Some(CorrelationCookieHost::Ip(IpAddr::V4(address)));
+    }
+    if host.ends_with('.') {
+        return None;
+    }
+    Some(CorrelationCookieHost::Domain(host.to_ascii_lowercase()))
+}
+
 fn validate_url_string(raw: &str, field: &str) -> Result<String, String> {
     let parsed =
         Url::parse(raw).map_err(|e| format!("oidc_relying_party: {field} invalid: {e}"))?;
@@ -2673,6 +2738,14 @@ fn build_cookie_attrs(
         attrs.push_str("; HttpOnly");
     }
     attrs
+}
+
+/// Build the fixed scope for the short-lived browser correlation secret.
+///
+/// Unlike the durable session cookie, this cookie must remain host-only: a
+/// parent `Domain` would let sibling hosts receive or overwrite the binding.
+fn build_correlation_cookie_attrs(secure: bool, callback_path: &str) -> String {
+    build_cookie_attrs(secure, true, "Lax", None, callback_path)
 }
 
 fn encoded_session_cookie_len(plaintext_len: usize) -> usize {
@@ -3310,6 +3383,8 @@ mod tests {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
         ctx.headers
             .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
 
         let mut issue_challenge = || {
             let PluginResult::Reject {
@@ -4538,6 +4613,8 @@ mod tests {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
         ctx.headers
             .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
         let before = plugin.session.state_cache.entries.len();
         match plugin.challenge(&mut ctx, false) {
             PluginResult::Reject {
@@ -4569,6 +4646,8 @@ mod tests {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
         ctx.headers
             .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
         match plugin.challenge(&mut ctx, false) {
             PluginResult::Reject {
                 status_code,
