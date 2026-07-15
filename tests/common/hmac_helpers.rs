@@ -7,6 +7,17 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
+struct HmacSignatureInput<'a> {
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+    date: &'a str,
+    username: &'a str,
+    authority: &'a str,
+    secret: &'a str,
+    digest_header: &'a str,
+}
+
 /// Generate an HMAC-SHA256 signature for a request, matching the signing
 /// string format expected by the `hmac_auth` plugin. No-query requests still
 /// include the empty query field in the signed string.
@@ -18,15 +29,16 @@ pub fn generate_hmac_signature(
     authority: &str,
     secret: &str,
 ) -> String {
-    generate_hmac_signature_with_digest(
+    generate_hmac_signature_from(HmacSignatureInput {
         method,
         path,
+        query: "",
         date,
         username,
         authority,
         secret,
-        &empty_digest_header(),
-    )
+        digest_header: &empty_digest_header(),
+    })
 }
 
 /// Generate an HMAC-SHA256 signature for a request with a raw query string.
@@ -39,7 +51,7 @@ pub fn generate_hmac_signature_with_query(
     authority: &str,
     secret: &str,
 ) -> String {
-    generate_hmac_signature_with_query_and_digest(
+    generate_hmac_signature_from(HmacSignatureInput {
         method,
         path,
         query,
@@ -47,8 +59,8 @@ pub fn generate_hmac_signature_with_query(
         username,
         authority,
         secret,
-        &empty_digest_header(),
-    )
+        digest_header: &empty_digest_header(),
+    })
 }
 
 /// Generate an HMAC-SHA256 signature for a no-query request with an explicit
@@ -62,34 +74,31 @@ pub fn generate_hmac_signature_with_digest(
     secret: &str,
     digest_header: &str,
 ) -> String {
-    generate_hmac_signature_with_query_and_digest(
+    generate_hmac_signature_from(HmacSignatureInput {
         method,
         path,
-        "",
+        query: "",
         date,
         username,
         authority,
         secret,
         digest_header,
-    )
+    })
 }
 
-fn generate_hmac_signature_with_query_and_digest(
-    method: &str,
-    path: &str,
-    query: &str,
-    date: &str,
-    username: &str,
-    authority: &str,
-    secret: &str,
-    digest_header: &str,
-) -> String {
+fn generate_hmac_signature_from(input: HmacSignatureInput<'_>) -> String {
     let signing_string = format!(
         "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        username, authority, method, path, query, date, digest_header
+        input.username,
+        input.authority,
+        input.method,
+        input.path,
+        input.query,
+        input.date,
+        input.digest_header
     );
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("Failed to create HMAC instance");
+    let mut mac = HmacSha256::new_from_slice(input.secret.as_bytes())
+        .expect("Failed to create HMAC instance");
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
