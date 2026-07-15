@@ -2352,7 +2352,10 @@ async fn admin_rejects_custom_request_body_transformer_beside_hmac() {
 
     let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
 
-    assert_eq!(status, 400, "custom body transformer was admitted: {body:?}");
+    assert_eq!(
+        status, 400,
+        "custom body transformer was admitted: {body:?}"
+    );
     assert!(
         body.to_string().contains("example_plugin"),
         "composition error must identify the custom transformer: {body:?}"
