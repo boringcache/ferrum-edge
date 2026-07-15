@@ -854,12 +854,13 @@ fn push_direct_route_key(
 }
 
 fn route_override_priority(pc: &PluginConfig) -> u16 {
-    pc.priority_override.unwrap_or(match pc.plugin_name.as_str() {
-        "ai_stream_router" => crate::plugins::priority::AI_STREAM_ROUTER,
-        "mcp_gateway" => crate::plugins::priority::MCP_GATEWAY,
-        "mesh_route_dispatch" => crate::plugins::priority::MESH_ROUTE_DISPATCH,
-        _ => crate::plugins::priority::DEFAULT,
-    })
+    pc.priority_override
+        .unwrap_or(match pc.plugin_name.as_str() {
+            "ai_stream_router" => crate::plugins::priority::AI_STREAM_ROUTER,
+            "mcp_gateway" => crate::plugins::priority::MCP_GATEWAY,
+            "mesh_route_dispatch" => crate::plugins::priority::MESH_ROUTE_DISPATCH,
+            _ => crate::plugins::priority::DEFAULT,
+        })
 }
 
 fn effective_route_override_configs_for_proxy<'a>(
@@ -1196,9 +1197,7 @@ fn collect_route_override_destinations(
                 .and_then(serde_json::Value::as_array)
             {
                 for endpoint in providers.iter().filter_map(|provider| {
-                    provider
-                        .get("endpoint")
-                        .and_then(serde_json::Value::as_str)
+                    provider.get("endpoint").and_then(serde_json::Value::as_str)
                 }) {
                     let parse_source = endpoint.replace("{model}", "__FERRUM_MODEL__");
                     if let Ok(parsed) = url::Url::parse(&parse_source)

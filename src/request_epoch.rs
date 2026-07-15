@@ -1041,11 +1041,12 @@ impl RequestEpochStore {
         // new plugin objects can both admit during this handoff because their
         // target counters are shared; structural replacements remain draining.
         next.plugin_cache.prepare_adaptive_concurrency_generations();
-        next.plugin_cache.prepare_adaptive_concurrency_lb_generation(
-            next.lb_generation,
-            &current.load_balancer,
-            &next.load_balancer,
-        );
+        next.plugin_cache
+            .prepare_adaptive_concurrency_lb_generation(
+                next.lb_generation,
+                &current.load_balancer,
+                &next.load_balancer,
+            );
         self.current.store(Arc::clone(&next));
         next.plugin_cache.commit_adaptive_concurrency_generations();
         next.plugin_cache.commit_adaptive_concurrency_lb_generation(
@@ -1081,11 +1082,13 @@ impl RequestEpochStore {
             route_generation: current.route_generation,
             lb_generation: current.lb_generation.saturating_add(1),
         });
-        current.plugin_cache.prepare_adaptive_concurrency_lb_generation(
-            next.lb_generation,
-            &current.load_balancer,
-            &next.load_balancer,
-        );
+        current
+            .plugin_cache
+            .prepare_adaptive_concurrency_lb_generation(
+                next.lb_generation,
+                &current.load_balancer,
+                &next.load_balancer,
+            );
         self.current.store(Arc::clone(&next));
         next.plugin_cache.commit_adaptive_concurrency_lb_generation(
             next.lb_generation,

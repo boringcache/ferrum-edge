@@ -1268,8 +1268,7 @@ fn adaptive_concurrency_route_non_destination_change_stays_compatible() {
     ));
 
     let mut reloaded = config.clone();
-    reloaded.plugin_configs[1].config["rules"][0]["rewrite"] =
-        json!({"uri": "/rewritten"});
+    reloaded.plugin_configs[1].config["rules"][0]["rewrite"] = json!({"uri": "/rewritten"});
     cache
         .apply_delta(
             &reloaded,
