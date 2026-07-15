@@ -1938,7 +1938,7 @@ impl Plugin for AiSemanticFirewall {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.enabled || !self.needs_governed_request_body() {
+        if !self.needs_governed_request_body() {
             return PluginResult::Continue;
         }
         if ctx.method != "POST" {
@@ -1958,9 +1958,6 @@ impl Plugin for AiSemanticFirewall {
         }
 
         let Some(body) = ctx.metadata.get("request_body").cloned() else {
-            if !self.needs_governed_request_body() {
-                return PluginResult::Continue;
-            }
             return self.engine.handle_uninspectable_body(
                 ctx,
                 Direction::Request,
