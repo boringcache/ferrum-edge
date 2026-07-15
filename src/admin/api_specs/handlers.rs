@@ -1703,6 +1703,37 @@ async fn validate_bundle(
         }
     }
 
+    if failures.is_empty() {
+        match crate::admin::crud::validate_hmac_request_transform_candidates(
+            db,
+            state,
+            namespace,
+            std::slice::from_ref(&bundle.proxy),
+            &bundle.plugins,
+            None,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(crate::admin::crud::AfterValidateError::BadRequest(errors)) => {
+                failures.push(ValidationFailure {
+                    resource_type: "plugin_composition",
+                    id: bundle.proxy.id.clone(),
+                    errors,
+                });
+            }
+            Err(crate::admin::crud::AfterValidateError::Db(error)) => {
+                return Err(classify_db_error(error));
+            }
+            Err(crate::admin::crud::AfterValidateError::Response(_)) => {
+                return Err(ApiSpecError::Internal(
+                    "HMAC request-transform candidate validation returned an unexpected response"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     if !failures.is_empty() {
         return Err(ApiSpecError::ValidationFailures {
             spec_version: metadata.version.clone(),

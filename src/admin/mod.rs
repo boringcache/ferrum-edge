@@ -4866,14 +4866,7 @@ async fn handle_restore(
                 }
             }
         }
-        match crud::validate_hmac_request_transform_restore_candidate(
-            db.as_ref(),
-            state,
-            namespace,
-            &temp_config,
-        )
-        .await
-        {
+        match crud::validate_hmac_request_transform_restore_candidate(state, &temp_config) {
             Ok(()) => {}
             Err(crud::AfterValidateError::BadRequest(errors)) => {
                 validation_errors.extend(errors);

@@ -692,11 +692,11 @@ struct ProxyGroupPluginInstance {
     config: PluginConfig,
 }
 
-/// Plugin types whose constructed instance can participate in the HMAC
-/// request-body composition invariant. Keep this list aligned with
-/// `Plugin::modifies_request_body()` implementations; candidate validation
-/// constructs only these plugins so admin admission remains side-effect-free
-/// for unrelated process-global/stateful plugin types.
+/// Built-in plugin types whose constructed instance can participate in the
+/// HMAC request-body composition invariant. Keep this list aligned with
+/// `Plugin::modifies_request_body()` implementations. Registered custom
+/// plugins are also constructed because their capability is defined by their
+/// `Plugin` implementation rather than a core allowlist.
 const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "hmac_auth",
     "request_transformer",
@@ -716,13 +716,22 @@ pub(crate) fn validate_hmac_request_transform_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
+    if !config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.enabled && plugin.plugin_name == "hmac_auth")
+    {
+        return Ok(());
+    }
     let mut errors = Vec::new();
     let mut global_plugins = Vec::new();
     let mut scoped_plugins: HmacCompositionPluginMap<'_> = HashMap::new();
+    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
 
     for plugin_config in &config.plugin_configs {
         if !plugin_config.enabled
-            || !HMAC_COMPOSITION_PLUGIN_NAMES.contains(&plugin_config.plugin_name.as_str())
+            || (!HMAC_COMPOSITION_PLUGIN_NAMES.contains(&plugin_config.plugin_name.as_str())
+                && !custom_plugin_names.contains(&plugin_config.plugin_name.as_str()))
         {
             continue;
         }

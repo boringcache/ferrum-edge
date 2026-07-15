@@ -659,6 +659,60 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_row
 }
 
 #[tokio::test]
+async fn load_full_config_rejects_hmac_request_body_transform_composition() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("cp_hmac_transform_validation.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    for (id, plugin_name, config) in [
+        (
+            "cp-global-hmac",
+            "hmac_auth",
+            json!({"clock_skew_seconds": 300}),
+        ),
+        (
+            "cp-global-transformer",
+            "request_transformer",
+            json!({"rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "gateway",
+                "value": "ferrum"
+            }]}),
+        ),
+    ] {
+        store
+            .create_plugin_config(&PluginConfig {
+                id: id.to_string(),
+                plugin_name: plugin_name.to_string(),
+                namespace: "ferrum".to_string(),
+                config,
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+    }
+
+    let error = store
+        .load_full_config("ferrum")
+        .await
+        .expect_err("CP/database loaders must reject an unsafe HMAC plugin chain");
+    assert!(
+        is_config_validation_rejection(&error),
+        "composition failure must use the shared semantic rejection marker: {error}"
+    );
+}
+
+#[tokio::test]
 async fn consumer_credential_index_updates_on_consumer_update() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("consumer_credential_index_update.db");

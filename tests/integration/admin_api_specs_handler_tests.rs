@@ -1141,6 +1141,66 @@ async fn post_with_failing_plugin_config_returns_422_via_real_validator() {
     );
 }
 
+#[tokio::test]
+async fn post_rejects_hmac_request_body_transformer_composition() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("hmac-transform-proxy");
+    let hmac_id = uid("hmac-plugin");
+    let transformer_id = uid("body-transformer");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "HMAC composition", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [
+            {
+                "id": hmac_id,
+                "plugin_name": "hmac_auth",
+                "config": {"clock_skew_seconds": 300}
+            },
+            {
+                "id": transformer_id,
+                "plugin_name": "request_transformer",
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "gateway",
+                    "value": "ferrum"
+                }]}
+            }
+        ]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "unsafe API-spec plugin bundle was admitted: {body}"
+    );
+    let composition_failure = body["failures"]
+        .as_array()
+        .and_then(|failures| {
+            failures
+                .iter()
+                .find(|failure| failure["resource_type"] == "plugin_composition")
+        })
+        .unwrap_or_else(|| panic!("missing plugin composition failure: {body}"));
+    assert!(
+        composition_failure["errors"]
+            .to_string()
+            .contains("hmac_auth cannot be combined with request-body transformer"),
+        "unexpected composition failure: {composition_failure}"
+    );
+}
+
 // ============================================================================
 // Gap #3: Multiple validation failures aggregated in one 422
 // ============================================================================

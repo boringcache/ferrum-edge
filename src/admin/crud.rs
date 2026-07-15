@@ -153,26 +153,13 @@ pub(crate) async fn validate_hmac_request_transform_candidates(
     plugins: &[PluginConfig],
     removed_plugin_id: Option<&str>,
 ) -> Result<(), AfterValidateError> {
-    let mut namespaces = db
-        .list_namespaces_authoritative()
+    // Global plugin scope is global within one runtime namespace. CP snapshots
+    // are filtered before broadcast and file/database modes load one namespace,
+    // so cross-namespace plugins must never create false admission conflicts.
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
         .await
         .map_err(AfterValidateError::Db)?;
-    namespaces.push(namespace.to_string());
-    namespaces.sort_unstable();
-    namespaces.dedup();
-
-    // Global plugin scope spans every proxy in a multi-namespace process, so
-    // validate the authoritative cross-namespace composition rather than only
-    // the namespace being mutated.
-    let mut candidate = GatewayConfig::default();
-    for candidate_namespace in namespaces {
-        let snapshot = db
-            .load_namespace_snapshot(&candidate_namespace)
-            .await
-            .map_err(AfterValidateError::Db)?;
-        candidate.proxies.extend(snapshot.proxies);
-        candidate.plugin_configs.extend(snapshot.plugin_configs);
-    }
 
     if let Some(removed_plugin_id) = removed_plugin_id {
         candidate
@@ -209,41 +196,14 @@ pub(crate) async fn validate_hmac_request_transform_candidates(
 }
 
 /// Validate a wholesale namespace replacement without retaining resources that
-/// the restore will delete. Global plugins span namespaces, so snapshots from
-/// every other namespace remain part of the authoritative candidate.
-pub(crate) async fn validate_hmac_request_transform_restore_candidate(
-    db: &dyn DatabaseBackend,
+/// the restore will delete. Runtime plugin chains are namespace-scoped, so the
+/// normalized replacement is the complete authoritative candidate.
+pub(crate) fn validate_hmac_request_transform_restore_candidate(
     state: &AdminState,
-    namespace: &str,
     replacement: &GatewayConfig,
 ) -> Result<(), AfterValidateError> {
-    let mut namespaces = db
-        .list_namespaces_authoritative()
-        .await
-        .map_err(AfterValidateError::Db)?;
-    namespaces.sort_unstable();
-    namespaces.dedup();
-    let mut candidate = GatewayConfig::default();
-    for candidate_namespace in namespaces {
-        if candidate_namespace == namespace {
-            continue;
-        }
-        let snapshot = db
-            .load_namespace_snapshot(&candidate_namespace)
-            .await
-            .map_err(AfterValidateError::Db)?;
-        candidate.proxies.extend(snapshot.proxies);
-        candidate.plugin_configs.extend(snapshot.plugin_configs);
-    }
-    candidate
-        .proxies
-        .extend(replacement.proxies.iter().cloned());
-    candidate
-        .plugin_configs
-        .extend(replacement.plugin_configs.iter().cloned());
-
     let http_client = super::plugin_validation_http_client(state);
-    crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
+    crate::plugin_cache::validate_hmac_request_transform_candidate(replacement, &http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))
 }
 

@@ -2257,6 +2257,109 @@ async fn plugin_delete_rejects_revealing_global_body_transformer_beside_hmac() {
 }
 
 #[tokio::test]
+async fn hmac_composition_admission_is_namespace_scoped() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let client = reqwest::Client::new();
+    let tenant_a = client
+        .post(format!("{base_url}/plugins/config"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Ferrum-Namespace", "tenant-a")
+        .json(&json!({
+            "id": "tenant-a-global-hmac",
+            "plugin_name": "hmac_auth",
+            "scope": "global",
+            "enabled": true,
+            "config": {"clock_skew_seconds": 300}
+        }))
+        .send()
+        .await
+        .expect("create tenant-a HMAC plugin");
+    assert_eq!(tenant_a.status(), reqwest::StatusCode::CREATED);
+
+    let tenant_b = client
+        .post(format!("{base_url}/plugins/config"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Ferrum-Namespace", "tenant-b")
+        .json(&json!({
+            "id": "tenant-b-global-transformer",
+            "plugin_name": "request_transformer",
+            "scope": "global",
+            "enabled": true,
+            "config": {"rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "gateway",
+                "value": "ferrum"
+            }]}
+        }))
+        .send()
+        .await
+        .expect("create tenant-b request transformer");
+    let status = tenant_b.status();
+    let body: Value = tenant_b.json().await.expect("tenant-b response body");
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "plugins in distinct runtime namespace slices must not conflict: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn admin_rejects_custom_request_body_transformer_beside_hmac() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let batch = json!({
+        "proxies": [{
+            "id": "custom-transform-proxy",
+            "listen_path": "/custom-transform",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "custom-transform-hmac"},
+                {"plugin_config_id": "custom-transform-plugin"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "custom-transform-hmac",
+                "plugin_name": "hmac_auth",
+                "scope": "proxy",
+                "proxy_id": "custom-transform-proxy",
+                "enabled": true,
+                "config": {"clock_skew_seconds": 300}
+            },
+            {
+                "id": "custom-transform-plugin",
+                "plugin_name": "example_plugin",
+                "scope": "proxy",
+                "proxy_id": "custom-transform-proxy",
+                "enabled": true,
+                "config": {"request_body_prefix": "custom:"}
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+
+    assert_eq!(status, 400, "custom body transformer was admitted: {body:?}");
+    assert!(
+        body.to_string().contains("example_plugin"),
+        "composition error must identify the custom transformer: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn restore_rejects_hmac_request_body_transformer_before_delete() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

@@ -489,3 +489,34 @@ fn test_redact_consumer_entry_without_target_field_unchanged() {
     );
     assert!(entry.get("secret").is_none());
 }
+
+#[test]
+fn cp_full_and_incremental_rejection_share_hmac_composition_validation() {
+    let shared = include_str!("../../../src/config/validation_pipeline.rs");
+    assert!(
+        shared.contains("validate_hmac_request_transform_candidate("),
+        "the shared rejecting contract must include HMAC composition"
+    );
+
+    let control_plane = include_str!("../../../src/modes/control_plane.rs");
+    let full_start = control_plane
+        .find("fn reject_invalid_cp_full_snapshot(")
+        .expect("CP full rejection function");
+    let incremental_start = control_plane
+        .find("fn collect_rejecting_cp_incremental_errors(")
+        .expect("CP incremental rejection function");
+    let tracker_start = control_plane[incremental_start..]
+        .find("struct CpRejectedDeltaTracker")
+        .map(|offset| incremental_start + offset)
+        .expect("CP rejected-delta tracker after incremental validation");
+    assert!(
+        control_plane[full_start..incremental_start]
+            .contains("collect_rejecting_runtime_config_errors(config)"),
+        "CP full snapshots must use the shared rejecting contract"
+    );
+    assert!(
+        control_plane[incremental_start..tracker_start]
+            .contains("collect_rejecting_runtime_config_errors"),
+        "CP incremental snapshots must use the shared rejecting contract"
+    );
+}
