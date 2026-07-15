@@ -3,7 +3,9 @@
 //! The shared wire classifier intentionally leaves `application/grpc-web*`
 //! as plain HTTP so the grpc_web plugin owns body translation. The H3 server
 //! must nevertheless promote the request to effective gRPC for method policy,
-//! early reject shaping, plugin selection, and backend transport dispatch.
+//! early reject shaping, and plugin selection. Backend transport is promoted
+//! only after the grpc_web plugin stamps its trusted translation marker;
+//! plugin-free deployments retain their original pass-through transport.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,11 +18,13 @@ use http::{Method, StatusCode};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-use crate::scaffolding::backends::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
+use crate::scaffolding::backends::{
+    GrpcStep, MatchRpc, ScriptedGrpcBackend, ScriptedTlsBackend, TcpStep, TlsConfig,
+};
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::ports::{reserve_port, unbound_port};
 
 fn grpc_frame(message: &[u8]) -> Vec<u8> {
     let mut framed = Vec::with_capacity(message.len() + 5);
@@ -363,6 +367,143 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
         "method and plugin rejects must not reach backend dispatch"
     );
     backend_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind pass-through backend");
+    let backend_port = backend_listener.local_addr().expect("backend addr").port();
+    let backend_ca = TestCa::new("h3-grpc-web-pass-through").expect("backend CA");
+    let (backend_cert, backend_key) = backend_ca.valid().expect("backend leaf");
+    let backend = ScriptedTlsBackend::builder(
+        backend_listener,
+        TlsConfig::new(backend_cert, backend_key).with_alpn(vec![b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 12\r\nconnection: close\r\n\r\npass-through"
+            .to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn pass-through backend");
+    let unavailable_port = unbound_port().await.expect("reserve unavailable backend port");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [
+            {
+                "id": "h3-grpc-web-pass-through",
+                "listen_path": "/pass-through",
+                "backend_scheme": "https",
+                "backend_host": "127.0.0.1",
+                "backend_port": backend_port,
+                "strip_listen_path": true,
+                "backend_connect_timeout_ms": 2000,
+                "backend_read_timeout_ms": 5000,
+                "backend_write_timeout_ms": 5000,
+                "backend_tls_verify_server_cert": false,
+                "plugins": [],
+            },
+            {
+                "id": "h3-grpc-web-pass-through-policy",
+                "listen_path": "/denied",
+                "backend_scheme": "https",
+                "backend_host": "127.0.0.1",
+                "backend_port": backend_port,
+                "strip_listen_path": true,
+                "backend_connect_timeout_ms": 2000,
+                "backend_read_timeout_ms": 5000,
+                "backend_write_timeout_ms": 5000,
+                "backend_tls_verify_server_cert": false,
+                "plugins": [{"plugin_config_id": "pass-through-method-policy"}],
+            },
+            {
+                "id": "h3-grpc-web-pass-through-unavailable",
+                "listen_path": "/unavailable",
+                "backend_scheme": "https",
+                "backend_host": "127.0.0.1",
+                "backend_port": unavailable_port,
+                "strip_listen_path": true,
+                "backend_connect_timeout_ms": 500,
+                "backend_read_timeout_ms": 1000,
+                "backend_write_timeout_ms": 1000,
+                "backend_tls_verify_server_cert": false,
+                "plugins": [],
+            },
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "pass-through-method-policy",
+            "plugin_name": "grpc_method_router",
+            "scope": "proxy",
+            "proxy_id": "h3-grpc-web-pass-through-policy",
+            "enabled": true,
+            "config": {"deny_methods": ["echo.Echo/Unary"]},
+        }],
+    });
+    let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let client = Http3Client::insecure().expect("H3 client");
+    let request = || {
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/grpc-web+proto")
+            .body(Bytes::from(grpc_frame(b"ping")))
+    };
+
+    let pass_through = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/pass-through/echo.Echo/Unary"),
+        request(),
+    )
+    .await;
+    assert_eq!(pass_through.status, StatusCode::OK);
+    assert_eq!(
+        pass_through
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(pass_through.body_bytes.as_ref(), b"pass-through");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let pass_through_connections = backend.accepted_connections();
+    assert!(
+        pass_through_connections >= 1,
+        "the pass-through request must reach the ordinary HTTP backend"
+    );
+
+    let denied = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/denied/echo.Echo/Unary"),
+        request(),
+    )
+    .await;
+    assert_grpc_web_error(&denied, "7", "application/grpc-web+proto");
+
+    let unavailable = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/unavailable/echo.Echo/Unary"),
+        request(),
+    )
+    .await;
+    assert_grpc_web_error(&unavailable, "14", "application/grpc-web+proto");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    backend.assert_no_step_errors().await;
+    assert_eq!(backend.accepted_connections(), pass_through_connections);
+    assert_eq!(backend.handshakes_completed(), pass_through_connections);
+    assert_eq!(
+        backend.last_alpn().await.as_deref(),
+        Some(b"http/1.1".as_slice())
+    );
+    let received = String::from_utf8_lossy(&backend.received_bytes().await).to_ascii_lowercase();
+    assert!(received.starts_with("post /echo.echo/unary http/1.1\r\n"));
+    assert!(received.contains("content-type: application/grpc-web+proto\r\n"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

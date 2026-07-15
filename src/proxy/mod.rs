@@ -13829,6 +13829,31 @@ fn build_grpc_web_error_response_from_parts(
         .unwrap_or_else(|_| grpc_proxy::build_grpc_error_response(status, message))
 }
 
+fn build_pre_plugin_reject_response(
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    request_uses_grpc_content_type: bool,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    let reject = normalize_reject_response(
+        status,
+        body,
+        headers,
+        request_uses_grpc_content_type || grpc_web_response_content_type.is_some(),
+    );
+    if let (Some(content_type), Some(grpc_status)) =
+        (grpc_web_response_content_type, reject.grpc_status)
+    {
+        let message = reject
+            .grpc_message
+            .as_deref()
+            .unwrap_or_else(|| grpc_status_reason(grpc_status));
+        return build_grpc_web_error_response(content_type, grpc_status, message);
+    }
+    build_response_from_normalized_reject(reject)
+}
+
 async fn build_grpc_web_reject_response(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -14693,7 +14718,23 @@ async fn handle_proxy_request_inner(
         },
         None => None,
     };
-    let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
+    // Classify before routing so route/method rejects can use the client's wire
+    // representation. WebSocket Upgrade / Extended CONNECT wins over any
+    // hostile Content-Type, matching backend dispatch and the H3 frontend.
+    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
+    let grpc_web_response_content_type = if flavor == HttpFlavor::WebSocket {
+        None
+    } else {
+        req.headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|content_type| {
+                crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+                    .then(|| crate::plugins::grpc_web::response_content_type(content_type))
+            })
+    };
+    let grpc_web_request = grpc_web_response_content_type.is_some();
     let epoch = state.request_epoch.load();
 
     // Direct Pod-IP HTTP mesh egress is selected by captured original
@@ -14733,14 +14774,15 @@ async fn handle_proxy_request_inner(
                 "Direct Pod-IP HTTP mesh egress destination is declared but not routable; rejecting captured request"
             );
             state.request_count.fetch_add(1, Ordering::Relaxed);
-            let reject = normalize_reject_response(
+            let response = build_pre_plugin_reject_response(
                 StatusCode::BAD_GATEWAY,
                 br#"{"error":"Original destination is not a mesh-routable direct workload HTTP destination"}"#,
                 &EMPTY_HEADERS,
                 request_uses_grpc_content_type,
+                grpc_web_response_content_type,
             );
-            record_status(&state, reject.http_status.as_u16());
-            return Ok(build_response_from_normalized_reject(reject));
+            record_status(&state, response.status().as_u16());
+            return Ok(response);
         }
         None => state.router_cache.find_proxy_in_snapshot(
             &epoch.route_table,
@@ -14816,14 +14858,15 @@ async fn handle_proxy_request_inner(
                             br#"{"error":"Original destination port is not a mesh-routable port of this service"}"#
                         }
                     };
-                    let reject = normalize_reject_response(
+                    let response = build_pre_plugin_reject_response(
                         StatusCode::BAD_GATEWAY,
                         body,
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
+                        grpc_web_response_content_type,
                     );
-                    record_status(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_status(&state, response.status().as_u16());
+                    return Ok(response);
                 }
             }
         }
@@ -14879,14 +14922,15 @@ async fn handle_proxy_request_inner(
                             br#"{"error":"Request port is not a mesh-routable port of the local service"}"#
                         }
                     };
-                    let reject = normalize_reject_response(
+                    let response = build_pre_plugin_reject_response(
                         StatusCode::BAD_GATEWAY,
                         body,
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
+                        grpc_web_response_content_type,
                     );
-                    record_status(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_status(&state, response.status().as_u16());
+                    return Ok(response);
                 }
             }
         }
@@ -14993,14 +15037,15 @@ async fn handle_proxy_request_inner(
                 None => {
                     debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
                     state.request_count.fetch_add(1, Ordering::Relaxed);
-                    let reject = normalize_reject_response(
+                    let response = build_pre_plugin_reject_response(
                         StatusCode::NOT_FOUND,
                         br#"{"error":"Not Found"}"#,
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
+                        grpc_web_response_content_type,
                     );
-                    record_status(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_status(&state, response.status().as_u16());
+                    return Ok(response);
                 }
             }
         }
@@ -15017,14 +15062,15 @@ async fn handle_proxy_request_inner(
         let allow_header = allowed.join(", ");
         let mut reject_headers = HashMap::new();
         reject_headers.insert("allow".to_string(), allow_header);
-        let reject = normalize_reject_response(
+        let response = build_pre_plugin_reject_response(
             StatusCode::METHOD_NOT_ALLOWED,
             br#"{"error":"Method Not Allowed"}"#,
             &reject_headers,
             request_uses_grpc_content_type,
+            grpc_web_response_content_type,
         );
-        record_status(&state, reject.http_status.as_u16());
-        return Ok(build_response_from_normalized_reject(reject));
+        record_status(&state, response.status().as_u16());
+        return Ok(response);
     }
 
     // Detect request flavor purely from the incoming traffic. WebSocket and
@@ -15034,16 +15080,6 @@ async fn handle_proxy_request_inner(
     // the same proxy config. The `detect_http_flavor` helper is shared with
     // the H3 frontend so both paths classify requests identically.
     let is_h2_ws = is_h2_websocket_connect(&req);
-    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
-    let grpc_web_response_content_type = req
-        .headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|ct| {
-            crate::plugins::grpc_web::is_grpc_web_content_type(ct)
-                .then(|| crate::plugins::grpc_web::response_content_type(ct))
-        });
-    let grpc_web_request = grpc_web_response_content_type.is_some();
     let request_protocol = match flavor {
         HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
@@ -15066,14 +15102,15 @@ async fn handle_proxy_request_inner(
     if is_grpc_request && method != "POST" {
         state.request_count.fetch_add(1, Ordering::Relaxed);
         warn!(method = %method, path = %path, "Rejected gRPC request: method must be POST");
-        let reject = normalize_reject_response(
+        let response = build_pre_plugin_reject_response(
             StatusCode::BAD_REQUEST,
             br#"{"error":"gRPC requires POST method"}"#,
             &EMPTY_HEADERS,
             true,
+            grpc_web_response_content_type,
         );
-        record_status(&state, reject.http_status.as_u16());
-        return Ok(build_response_from_normalized_reject(reject));
+        record_status(&state, response.status().as_u16());
+        return Ok(response);
     }
 
     // A mixed direct-listener posture may intentionally accept cert-less TLS
@@ -15145,7 +15182,7 @@ async fn handle_proxy_request_inner(
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code)
@@ -15153,9 +15190,17 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
+                        grpc_web_response_content_type.is_none(),
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
+                    let grpc_web_response = build_grpc_web_reject_response(
+                        &plugins,
+                        &mut ctx,
+                        grpc_web_response_content_type,
+                        &reject,
+                    )
+                    .await;
                     log_rejected_request(
                         &plugins,
                         &ctx,
@@ -15166,6 +15211,9 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     record_request(&state, reject.http_status.as_u16());
+                    if let Some(response) = grpc_web_response {
+                        return Ok(response);
+                    }
                     return Ok(build_response_from_normalized_reject(reject));
                 }
             }
@@ -15270,16 +15318,24 @@ async fn handle_proxy_request_inner(
         .await
         {
             plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
-            let reject = finalize_reject_response_with_after_proxy_hooks(
+            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
                 &body,
                 headers,
                 is_grpc_request,
+                grpc_web_response_content_type.is_none(),
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
+            let grpc_web_response = build_grpc_web_reject_response(
+                &plugins,
+                &mut ctx,
+                grpc_web_response_content_type,
+                &reject,
+            )
+            .await;
             log_rejected_request(
                 &plugins,
                 &ctx,
@@ -15290,6 +15346,9 @@ async fn handle_proxy_request_inner(
             )
             .await;
             record_request(&state, reject.http_status.as_u16());
+            if let Some(response) = grpc_web_response {
+                return Ok(response);
+            }
             return Ok(build_response_from_normalized_reject(reject));
         }
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
@@ -15399,16 +15458,24 @@ async fn handle_proxy_request_inner(
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
+                        grpc_web_response_content_type.is_none(),
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
+                    let grpc_web_response = build_grpc_web_reject_response(
+                        &plugins,
+                        &mut ctx,
+                        grpc_web_response_content_type,
+                        &reject,
+                    )
+                    .await;
                     log_rejected_request(
                         &plugins,
                         &ctx,
@@ -15419,6 +15486,9 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     record_request(&state, reject.http_status.as_u16());
+                    if let Some(response) = grpc_web_response {
+                        return Ok(response);
+                    }
                     return Ok(build_response_from_normalized_reject(reject));
                 }
             }
@@ -15558,16 +15628,24 @@ async fn handle_proxy_request_inner(
                 };
                 let status_code = plugin_reject.status_code;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                let reject = finalize_reject_response_with_after_proxy_hooks(
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &plugin_reject.body,
                     plugin_reject.headers,
                     is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
                 log_rejected_request(
                     &plugins,
                     &ctx,
@@ -15578,6 +15656,9 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
                 return Ok(build_response_from_normalized_reject(reject));
             }
         }
@@ -15612,16 +15693,24 @@ async fn handle_proxy_request_inner(
                 let status_code = plugin_reject.status_code;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 ctx.headers = tmp_headers;
-                let reject = finalize_reject_response_with_after_proxy_hooks(
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &plugin_reject.body,
                     plugin_reject.headers,
                     is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
                 log_rejected_request(
                     &plugins,
                     &ctx,
@@ -15632,6 +15721,9 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
                 return Ok(build_response_from_normalized_reject(reject));
             }
         }

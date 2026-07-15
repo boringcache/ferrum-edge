@@ -575,6 +575,27 @@ pub mod _test_support {
         crate::plugins::grpc_web::response_content_type(original_ct)
     }
 
+    pub async fn run_h3_reject_response_committed_hooks(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        flavor: crate::config::types::HttpFlavor,
+        grpc_web_response_content_type: Option<&str>,
+        http_status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) {
+        crate::http3::server::run_h3_reject_response_committed_hooks(
+            plugins,
+            ctx,
+            flavor,
+            grpc_web_response_content_type,
+            http_status,
+            body,
+            headers,
+        )
+        .await;
+    }
+
     // ── proxy/mod ────────────────────────────────────────────────────────────
     pub struct NormalizedRejectResponse {
         pub http_status: StatusCode,

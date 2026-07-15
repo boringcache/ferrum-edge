@@ -1,3 +1,14 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use ferrum_edge::config::types::HttpFlavor;
+use ferrum_edge::plugins::{Plugin, RequestContext, TransactionSummary};
+use http::StatusCode;
+
 #[test]
 fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
     let source = include_str!("../../../src/http3/server.rs");
@@ -17,7 +28,7 @@ fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
         "H3 effective proxy resolution must use the retry-capped selected base proxy"
     );
     let has_retry = after_selection
-        .find("let has_retry = match http_flavor")
+        .find("let has_retry = match backend_http_flavor")
         .expect("retry-dependent buffering decision must remain present");
     let native_h3_decision = after_selection
         .find("let backend_supports_native_h3 =")
@@ -293,7 +304,7 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
 }
 
 #[test]
-fn h3_grpc_web_effective_flavor_drives_policy_and_backend_dispatch() {
+fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
     let source = include_str!("../../../src/http3/server.rs");
     let detected = source
         .find("let detected_http_flavor =")
@@ -310,6 +321,12 @@ fn h3_grpc_web_effective_flavor_drives_policy_and_backend_dispatch() {
     let plugin_protocol = source
         .find("let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);")
         .expect("H3 plugin selection must use the effective flavor");
+    let backend_flavor = source
+        .find("let backend_http_flavor = if grpc_web_response_content_type.is_some()")
+        .expect("H3 must derive backend transport flavor after request plugins");
+    let translated_marker = source
+        .find("request_is_grpc_web_translated(&ctx)")
+        .expect("H3 backend promotion must require the trusted translation marker");
     let bridge = source
         .find(
             "crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest",
@@ -321,13 +338,20 @@ fn h3_grpc_web_effective_flavor_drives_policy_and_backend_dispatch() {
             && websocket_precedence < effective
             && effective < post_guard
             && post_guard < plugin_protocol
+            && plugin_protocol < backend_flavor
+            && backend_flavor <= translated_marker
             && plugin_protocol < bridge,
-        "wire classification, WebSocket precedence, effective promotion, POST policy, plugin \
-         selection, and backend dispatch must stay in that order"
+        "wire classification, WebSocket precedence, policy promotion, POST policy, plugin \
+         selection, translation-aware backend flavor, and dispatch must stay in that order"
     );
     assert!(
-        source[bridge..].contains("flavor: http_flavor,"),
-        "the backend bridge must receive the effective gRPC flavor"
+        source[bridge..].contains("flavor: backend_http_flavor,"),
+        "the backend bridge must receive the translation-aware transport flavor"
+    );
+    assert!(
+        source.contains("let has_retry = match backend_http_flavor")
+            && source.contains("let use_native_h3_grpc = backend_http_flavor == HttpFlavor::Grpc"),
+        "retry and native-gRPC transport decisions must use backend flavor"
     );
 
     let cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
@@ -336,6 +360,170 @@ fn h3_grpc_web_effective_flavor_drives_policy_and_backend_dispatch() {
             && cross_protocol.contains("translated_error_response("),
         "gRPC bridge failures must retain translated gRPC-Web client shaping"
     );
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommittedObservation {
+    status: u16,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+#[derive(Default)]
+struct CommittedCapturePlugin {
+    committed_calls: AtomicUsize,
+    log_saw_committed_calls: AtomicUsize,
+    observation: Mutex<Option<CommittedObservation>>,
+}
+
+#[async_trait]
+impl Plugin for CommittedCapturePlugin {
+    fn name(&self) -> &str {
+        "h3_committed_capture"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) {
+        self.committed_calls.fetch_add(1, Ordering::SeqCst);
+        *self.observation.lock().expect("observation lock") = Some(CommittedObservation {
+            status: response_status,
+            content_type: response_headers.get("content-type").cloned(),
+            body: body.to_vec(),
+        });
+    }
+
+    async fn log(&self, _summary: &TransactionSummary) {
+        self.log_saw_committed_calls.store(
+            self.committed_calls.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+    }
+}
+
+#[tokio::test]
+async fn h3_grpc_web_reject_commits_final_wire_shape_once_before_log() {
+    let capture = Arc::new(CommittedCapturePlugin::default());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![capture.clone()];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/pkg.Service/Denied".to_string(),
+    );
+
+    ferrum_edge::_test_support::run_h3_reject_response_committed_hooks(
+        &plugins,
+        &mut ctx,
+        HttpFlavor::Grpc,
+        Some("application/grpc-web-text+proto"),
+        StatusCode::FORBIDDEN,
+        br#"{"error":"blocked"}"#,
+        &HashMap::new(),
+    )
+    .await;
+    capture.log(&TransactionSummary::default()).await;
+
+    assert_eq!(capture.committed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(capture.log_saw_committed_calls.load(Ordering::SeqCst), 1);
+    let observed = capture
+        .observation
+        .lock()
+        .expect("observation lock")
+        .clone()
+        .expect("committed response observation");
+    assert_eq!(observed.status, StatusCode::OK.as_u16());
+    assert_eq!(
+        observed.content_type.as_deref(),
+        Some("application/grpc-web-text+proto")
+    );
+    let decoded = BASE64.decode(&observed.body).expect("decode text response");
+    assert_eq!(decoded.first(), Some(&0x80));
+    assert!(
+        decoded
+            .windows(b"grpc-status: 7\r\n".len())
+            .any(|window| window == b"grpc-status: 7\r\n")
+    );
+}
+
+#[test]
+fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let send_start = source
+        .find("async fn send_h3_grpc_web_reject(")
+        .expect("gRPC-Web reject sender must remain present");
+    let grpc_web_send_end = source[send_start..]
+        .find("pub(crate) async fn run_h3_reject_response_committed_hooks(")
+        .map(|offset| send_start + offset)
+        .expect("gRPC-Web sender must remain bounded");
+    let plugin_send_start = source
+        .find("async fn send_h3_plugin_reject_flavor_aware(")
+        .expect("plugin reject sender must remain present");
+    let plugin_send_end = source[plugin_send_start..]
+        .find("/// Send a trailers-only gRPC error response over H3.")
+        .map(|offset| plugin_send_start + offset)
+        .expect("plugin reject sender must remain bounded");
+    assert!(
+        !source[send_start..grpc_web_send_end].contains("on_response_committed(")
+            && !source[plugin_send_start..plugin_send_end].contains("on_response_committed("),
+        "wire send helpers must not run committed hooks after rejection logging"
+    );
+
+    let commit_occurrences = source
+        .matches("run_h3_reject_response_committed_hooks(")
+        .count();
+    let send_occurrences = source
+        .matches("send_h3_plugin_reject_flavor_aware(")
+        .count();
+    assert_eq!(
+        commit_occurrences, send_occurrences,
+        "every plugin-aware reject send must have exactly one explicit committed-hook boundary"
+    );
+
+    for (start_marker, end_marker, phase) in [
+        (
+            "// Execute on_request_received hooks",
+            "// Materialize query params before authentication.",
+            "on_request_received",
+        ),
+        (
+            "// Authentication phase (pre-computed auth plugin list",
+            "// Authorization plugins that inspect bodies buffer only after",
+            "authenticate",
+        ),
+        (
+            "// Authorization phase (pre-computed authorize plugin list",
+            "let maybe_needs_request_buffering =",
+            "authorize",
+        ),
+    ] {
+        let start = source.find(start_marker).expect("reject phase start");
+        let end = source[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .expect("reject phase end");
+        let phase_source = &source[start..end];
+        let committed = phase_source
+            .rfind("run_h3_reject_response_committed_hooks(")
+            .unwrap_or_else(|| panic!("{phase} must commit its final reject"));
+        let log = phase_source
+            .rfind("log_rejected_request(")
+            .unwrap_or_else(|| panic!("{phase} must log its reject"));
+        let send = phase_source
+            .rfind("send_h3_plugin_reject_flavor_aware(")
+            .unwrap_or_else(|| panic!("{phase} must send its reject"));
+        assert!(
+            committed < log && log < send,
+            "{phase} must commit exactly before log, then send"
+        );
+    }
 }
 
 #[test]

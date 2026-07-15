@@ -51,11 +51,13 @@
 //!   the H1/H2 gRPC ceiling (a single `https` proxy serves any HTTP
 //!   version uniformly rather than diverging by frontend).
 //!
-//! - **Error responses are flavor-aware.** Plain failures emit HTTP error
-//!   payloads (502 JSON, 413 JSON, etc.). gRPC failures emit trailers-only
-//!   gRPC responses (HTTP 200 + `grpc-status` + `grpc-message` in the
-//!   header block) so gRPC clients see `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/
-//!   `INVALID_ARGUMENT`/`UNIMPLEMENTED` rather than a transport error.
+//! - **Error responses are flavor-aware.** Ordinary Plain failures emit HTTP
+//!   error payloads (502 JSON, 413 JSON, etc.). Recognized gRPC-Web requests
+//!   that intentionally retain Plain backend transport still receive a
+//!   browser-safe trailer frame. Native gRPC failures emit trailers-only gRPC
+//!   responses (HTTP 200 + `grpc-status` + `grpc-message` in the header block)
+//!   so clients see `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/`INVALID_ARGUMENT`/
+//!   `UNIMPLEMENTED` rather than a transport error.
 //!
 //! - **Response body — streamed frame-by-frame with coalescing.** Identical
 //!   coalescing configuration (`http3_coalesce_min_bytes`,
@@ -373,35 +375,31 @@ where
             .await;
             let http_status = StatusCode::from_u16(rejection.status_code)
                 .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-            let mut outcome = if matches!(flavor, HttpFlavor::Grpc) {
-                let normalized = normalize_h3_grpc_reject(http_status, &rejection.body, &headers);
-                apply_h3_grpc_reject_metadata(ctx, &normalized);
-                if let Some(translated) = normalized.grpc_status.and_then(|grpc_status| {
-                    crate::plugins::grpc_web::translated_error_response(
-                        ctx,
-                        grpc_status,
-                        normalized.grpc_message.as_deref().unwrap_or(""),
-                    )
-                }) {
-                    write_reject_with_headers(
-                        stream,
-                        StatusCode::OK,
-                        &translated.body,
-                        &translated.headers,
-                        backend_start,
-                        bytes_sent,
-                    )
-                    .await?
-                } else {
-                    write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent)
-                        .await?
-                }
+            let (normalized, translated) = normalize_reject_for_client(
+                ctx,
+                http_status,
+                &rejection.body,
+                &headers,
+                matches!(flavor, HttpFlavor::Grpc),
+            );
+            let mut outcome = if let Some(translated) = translated {
+                write_reject_with_headers(
+                    stream,
+                    StatusCode::OK,
+                    &translated.body,
+                    &translated.headers,
+                    backend_start,
+                    bytes_sent,
+                )
+                .await?
+            } else if matches!(flavor, HttpFlavor::Grpc) {
+                write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await?
             } else {
                 write_reject_with_headers(
                     stream,
-                    http_status,
-                    &rejection.body,
-                    &headers,
+                    normalized.http_status,
+                    &normalized.body,
+                    &normalized.headers,
                     backend_start,
                     bytes_sent,
                 )
@@ -610,9 +608,10 @@ where
                 body,
             )
             .await;
-            // Run validators. Reject = emit a trailers-only gRPC error
-            // (Grpc flavor) or a plain JSON error (everything else) and
-            // return early WITHOUT dispatching to the backend.
+            // Run validators. Reject = emit a trailers-only native gRPC error,
+            // a gRPC-Web trailer frame when that client representation was
+            // retained, or a plain JSON error otherwise, then return early
+            // WITHOUT dispatching to the backend.
             match crate::proxy::run_final_request_body_hooks(
                 plugins,
                 Some(ctx),
@@ -924,6 +923,7 @@ async fn get_cross_protocol_client<S>(
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
     stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
     pending_slot_to_release_before_error: Option<
         &mut Option<crate::backend_pending_limit::BackendPendingGuard>,
     >,
@@ -953,10 +953,12 @@ where
             if let Some(slot) = pending_slot_to_release_before_error {
                 drop(slot.take());
             }
-            let mut outcome = write_error(
+            let mut outcome = write_plain_gateway_error(
                 stream,
+                ctx,
                 StatusCode::BAD_GATEWAY,
                 r#"{"error":"Bad Gateway"}"#,
+                None,
                 backend_start,
                 0,
             )
@@ -1042,6 +1044,7 @@ async fn run_plain_attempt_local_policy_or_reject<S>(
     dispatch_port: u16,
     bytes_sent: u64,
     halt_request_body_before_reject: bool,
+    ctx: &mut RequestContext,
 ) -> Result<
     Result<Option<crate::backend_pending_limit::BackendPendingGuard>, CrossProtocolOutcome>,
     anyhow::Error,
@@ -1079,8 +1082,9 @@ where
         if halt_request_body_before_reject {
             crate::http3::stream_util::halt_request_body(stream);
         }
-        let mut outcome = write_error_with_header(
+        let mut outcome = write_plain_gateway_error(
             stream,
+            ctx,
             StatusCode::BAD_GATEWAY,
             r#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
             Some(("gateway-error-reason", reason)),
@@ -1125,8 +1129,9 @@ where
         if halt_request_body_before_reject {
             crate::http3::stream_util::halt_request_body(stream);
         }
-        let mut outcome = write_error_with_header(
+        let mut outcome = write_plain_gateway_error(
             stream,
+            ctx,
             StatusCode::BAD_GATEWAY,
             r#"{"error":"backend address blocked by egress policy"}"#,
             Some(("gateway-error-reason", "backend-egress-policy-denied")),
@@ -1163,8 +1168,9 @@ where
         if halt_request_body_before_reject {
             crate::http3::stream_util::halt_request_body(stream);
         }
-        let mut outcome = write_error_with_header(
+        let mut outcome = write_plain_gateway_error(
             stream,
+            ctx,
             StatusCode::BAD_GATEWAY,
             r#"{"error":"Bad Gateway"}"#,
             Some((
@@ -1216,10 +1222,12 @@ where
             if halt_request_body_before_reject {
                 crate::http3::stream_util::halt_request_body(stream);
             }
-            let mut outcome = write_error(
+            let mut outcome = write_plain_gateway_error(
                 stream,
+                ctx,
                 StatusCode::SERVICE_UNAVAILABLE,
                 r#"{"error":"Upstream pending request queue full"}"#,
+                None,
                 backend_start,
                 bytes_sent,
             )
@@ -1290,14 +1298,21 @@ where
     let entry_effective_proxy =
         crate::proxy::resolve_effective_proxy_for_target(base_proxy, upstream_target);
     let proxy: &Proxy = entry_effective_proxy.as_ref();
+    let policy_flavor = if crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
+        HttpFlavor::Grpc
+    } else {
+        HttpFlavor::Plain
+    };
 
     let req_method = match parse_reqwest_method(method) {
         Some(m) => m,
         None => {
-            return write_error(
+            return write_plain_gateway_error(
                 stream,
+                ctx,
                 StatusCode::METHOD_NOT_ALLOWED,
                 r#"{"error":"Method Not Allowed"}"#,
+                None,
                 backend_start,
                 0,
             )
@@ -1368,6 +1383,7 @@ where
                         dispatch_port,
                         bytes_sent,
                         false,
+                        ctx,
                     )
                     .await?
                     {
@@ -1386,7 +1402,7 @@ where
                                 ctx,
                                 dispatch_proxy,
                                 current_target.as_deref(),
-                                HttpFlavor::Plain,
+                                policy_flavor,
                                 stream,
                                 backend_start,
                                 bytes_sent,
@@ -1419,6 +1435,7 @@ where
                         &mut backend_admission_permits,
                         backend_admission_start.elapsed(),
                         stream,
+                        ctx,
                         Some(&mut pending_slot),
                     )
                     .await?
@@ -1626,10 +1643,12 @@ where
                                 false,
                                 backend_start.elapsed(),
                             );
-                            let mut outcome = write_error(
+                            let mut outcome = write_plain_gateway_error(
                                 stream,
+                                ctx,
                                 StatusCode::BAD_GATEWAY,
                                 r#"{"error":"Bad Gateway"}"#,
+                                None,
                                 backend_start,
                                 bytes_sent,
                             )
@@ -1672,10 +1691,12 @@ where
                         current_cb_target_key.as_deref(),
                         cb_retry_probe_slot_available,
                     );
-                    return write_error(
+                    return write_plain_gateway_error(
                         stream,
+                        ctx,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
+                        None,
                         backend_start,
                         0,
                     )
@@ -1716,6 +1737,7 @@ where
                     dispatch_port,
                     0,
                     true,
+                    ctx,
                 )
                 .await?
                 {
@@ -1731,7 +1753,7 @@ where
                         ctx,
                         dispatch_proxy,
                         current_target.as_deref(),
-                        HttpFlavor::Plain,
+                        policy_flavor,
                         stream,
                         backend_start,
                         0,
@@ -1763,6 +1785,7 @@ where
                     &mut backend_admission_permits,
                     backend_admission_start.elapsed(),
                     stream,
+                    ctx,
                     Some(&mut pending_slot),
                 )
                 .await?
@@ -2010,10 +2033,12 @@ where
                         false,
                         backend_start.elapsed(),
                     );
-                    return write_error(
+                    return write_plain_gateway_error(
                         stream,
+                        ctx,
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
+                        None,
                         backend_start,
                         bytes_sent,
                     )
@@ -2066,10 +2091,12 @@ where
                             false,
                             backend_start.elapsed(),
                         );
-                        let mut outcome = write_error(
+                        let mut outcome = write_plain_gateway_error(
                             stream,
+                            ctx,
                             StatusCode::BAD_GATEWAY,
                             r#"{"error":"Bad Gateway"}"#,
+                            None,
                             backend_start,
                             bytes_sent,
                         )
@@ -2117,10 +2144,12 @@ where
             Some(ErrorClass::ResponseBodyTooLarge),
             backend_admission_elapsed,
         );
-        let mut outcome = write_error(
+        let mut outcome = write_plain_gateway_error(
             stream,
+            ctx,
             StatusCode::BAD_GATEWAY,
             r#"{"error":"Backend response body exceeds maximum size"}"#,
+            None,
             backend_start,
             bytes_sent,
         )
@@ -2170,7 +2199,8 @@ where
         );
         let reject_status =
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let normalized = crate::proxy::normalize_reject_response(
+        let (normalized, translated) = normalize_reject_for_client(
+            ctx,
             reject_status,
             &reject.body,
             &reject.headers,
@@ -2178,25 +2208,43 @@ where
         );
         if has_response_committed_hook {
             for plugin in plugins {
-                plugin
-                    .on_response_committed(
-                        ctx,
-                        normalized.http_status.as_u16(),
-                        &normalized.headers,
-                        &normalized.body,
-                    )
-                    .await;
+                if let Some(translated) = translated.as_ref() {
+                    plugin
+                        .on_response_committed(ctx, 200, &translated.headers, &translated.body)
+                        .await;
+                } else {
+                    plugin
+                        .on_response_committed(
+                            ctx,
+                            normalized.http_status.as_u16(),
+                            &normalized.headers,
+                            &normalized.body,
+                        )
+                        .await;
+                }
             }
         }
-        let mut outcome = write_reject_with_headers(
-            stream,
-            normalized.http_status,
-            &normalized.body,
-            &normalized.headers,
-            backend_start,
-            bytes_sent,
-        )
-        .await?;
+        let mut outcome = if let Some(translated) = translated {
+            write_reject_with_headers(
+                stream,
+                StatusCode::OK,
+                &translated.body,
+                &translated.headers,
+                backend_start,
+                bytes_sent,
+            )
+            .await?
+        } else {
+            write_reject_with_headers(
+                stream,
+                normalized.http_status,
+                &normalized.body,
+                &normalized.headers,
+                backend_start,
+                bytes_sent,
+            )
+            .await?
+        };
         outcome.backend_target = Some(strip_query_from_backend_url(&current_url));
         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
         return Ok(outcome);
@@ -2263,8 +2311,9 @@ where
                     backend_admission_elapsed,
                 );
                 let empty_headers = HashMap::new();
-                let mut outcome = write_reject_with_headers(
+                let mut outcome = write_plain_gateway_reject(
                     stream,
+                    ctx,
                     StatusCode::BAD_GATEWAY,
                     &error_body,
                     &empty_headers,
@@ -5189,6 +5238,103 @@ where
     })
 }
 
+fn normalize_reject_for_client(
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    native_grpc: bool,
+) -> (
+    crate::proxy::NormalizedRejectResponse,
+    Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+) {
+    let grpc_web = crate::plugins::grpc_web::client_uses_grpc_web(ctx);
+    let normalized = crate::proxy::normalize_reject_response(
+        status,
+        body,
+        headers,
+        native_grpc || grpc_web,
+    );
+    if native_grpc || grpc_web {
+        apply_h3_grpc_reject_metadata(ctx, &normalized);
+    }
+    let translated = if grpc_web {
+        normalized.grpc_status.and_then(|grpc_status| {
+            crate::plugins::grpc_web::translated_error_response(
+                ctx,
+                grpc_status,
+                normalized.grpc_message.as_deref().unwrap_or(""),
+            )
+        })
+    } else {
+        None
+    };
+    (normalized, translated)
+}
+
+async fn write_plain_gateway_error<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: &'static str,
+    extra_header: Option<(&'static str, &'static str)>,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let headers = extra_header
+        .map(|(name, value)| HashMap::from([(name.to_string(), value.to_string())]))
+        .unwrap_or_default();
+    write_plain_gateway_reject(
+        stream,
+        ctx,
+        status,
+        body.as_bytes(),
+        &headers,
+        backend_start,
+        bytes_sent,
+    )
+    .await
+}
+
+async fn write_plain_gateway_reject<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let (normalized, translated) =
+        normalize_reject_for_client(ctx, status, body, headers, false);
+    if let Some(translated) = translated {
+        return write_reject_with_headers(
+            stream,
+            StatusCode::OK,
+            &translated.body,
+            &translated.headers,
+            backend_start,
+            bytes_sent,
+        )
+        .await;
+    }
+    write_reject_with_headers(
+        stream,
+        normalized.http_status,
+        &normalized.body,
+        &normalized.headers,
+        backend_start,
+        bytes_sent,
+    )
+    .await
+}
+
 /// Write a plugin-driven rejection response (dynamic body + custom
 /// headers). Used when `after_proxy` or `on_final_request_body` returns
 /// `PluginResult::Reject` — the plugin's body/headers win over the
@@ -5284,10 +5430,12 @@ where
             )
             .await
         } else {
-            write_error(
+            write_plain_gateway_error(
                 stream,
+                ctx,
                 StatusCode::BAD_GATEWAY,
                 "{\"error\":\"Plugin rejection normalization failed\"}",
+                None,
                 backend_start,
                 bytes_sent,
             )
@@ -5304,26 +5452,13 @@ where
     )
     .await;
     let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
-    let normalized = crate::proxy::normalize_reject_response(
+    let (normalized, grpc_web_reject) = normalize_reject_for_client(
+        ctx,
         http_status,
         &parts.body,
         &headers,
         matches!(flavor, HttpFlavor::Grpc),
     );
-    if matches!(flavor, HttpFlavor::Grpc) {
-        apply_h3_grpc_reject_metadata(ctx, &normalized);
-    }
-    let grpc_web_reject = if matches!(flavor, HttpFlavor::Grpc) {
-        normalized.grpc_status.and_then(|grpc_status| {
-            crate::plugins::grpc_web::translated_error_response(
-                ctx,
-                grpc_status,
-                normalized.grpc_message.as_deref().unwrap_or(""),
-            )
-        })
-    } else {
-        None
-    };
     if has_response_committed_hook {
         for plugin in plugins {
             if let Some(translated) = grpc_web_reject.as_ref() {
@@ -5342,20 +5477,18 @@ where
             }
         }
     }
-    if matches!(flavor, HttpFlavor::Grpc) {
-        if let Some(translated) = grpc_web_reject {
-            write_reject_with_headers(
-                stream,
-                StatusCode::OK,
-                &translated.body,
-                &translated.headers,
-                backend_start,
-                bytes_sent,
-            )
-            .await
-        } else {
-            write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
-        }
+    if let Some(translated) = grpc_web_reject {
+        write_reject_with_headers(
+            stream,
+            StatusCode::OK,
+            &translated.body,
+            &translated.headers,
+            backend_start,
+            bytes_sent,
+        )
+        .await
+    } else if matches!(flavor, HttpFlavor::Grpc) {
+        write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
     } else {
         write_reject_with_headers(
             stream,
@@ -7135,7 +7268,9 @@ mod tests {
     fn h3_server_routes_streaming_safe_grpc_to_streaming_dispatch() {
         let src = include_str!("server.rs");
         assert!(
-            src.contains("if matches!(http_flavor, HttpFlavor::Grpc) && can_stream_request_body"),
+            src.contains(
+                "matches!(backend_http_flavor, HttpFlavor::Grpc) && can_stream_request_body"
+            ),
             "H3 server must gate the streaming gRPC bridge on flavor + can_stream_request_body"
         );
         assert!(
