@@ -1954,9 +1954,7 @@ impl McpGateway {
             &mut prompts,
             families.get("prompts"),
             prompts_tombstone_limit,
-            old_catalog
-                .collision_tombstone_overflow
-                .contains("prompts"),
+            old_catalog.collision_tombstone_overflow.contains("prompts"),
         ) {
             warn!(
                 family = "prompts",
@@ -4489,8 +4487,7 @@ fn reconcile_collision_tombstones<T>(
     max_tombstones: usize,
     previously_overflowed: bool,
 ) -> bool {
-    let fully_authoritative =
-        refresh_stats.is_some_and(FamilyRefreshStats::fully_authoritative);
+    let fully_authoritative = refresh_stats.is_some_and(FamilyRefreshStats::fully_authoritative);
     let mut overflowed = collisions.len() > max_tombstones;
 
     if !fully_authoritative {

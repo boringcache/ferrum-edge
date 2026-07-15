@@ -4719,10 +4719,7 @@ async fn aggregate_collision_tombstone_overflow_fails_closed_until_authoritative
             Some("guard:tools")
         );
     }
-    for (request_id, public_name) in [
-        (137, "a.b.collision_0"),
-        (138, "a.b.collision_2"),
-    ] {
+    for (request_id, public_name) in [(137, "a.b.collision_0"), (138, "a.b.collision_2")] {
         let (_, body, _) = aggregate_request_with_metadata(
             &plugin,
             &session_id,
