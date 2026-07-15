@@ -306,18 +306,42 @@ fn test_redact_consumer_keyauth_key_redacted() {
 }
 
 #[test]
-fn test_redact_consumer_basicauth_password_hash_redacted() {
+fn test_redact_consumer_basicauth_password_hash_omitted() {
     let mut consumer = make_consumer("c1", "alice");
     consumer.credentials.insert(
         "basicauth".into(),
         serde_json::json!([{"password_hash": "hmac_sha256:abc123def456"}]),
     );
     let redacted = redact_consumer_credentials(&consumer);
-    let basicauth = redacted.credentials.get("basicauth").unwrap();
-    assert_eq!(
-        basicauth[0]["password_hash"].as_str().unwrap(),
-        "[REDACTED]"
+    assert!(!redacted.credentials.contains_key("basicauth"));
+}
+
+#[test]
+fn test_redact_consumer_basicauth_plaintext_and_unknown_fields_omitted() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!([{"password": "plaintext", "unexpected": "also-sensitive"}]),
     );
+    let redacted = redact_consumer_credentials(&consumer);
+    assert!(!redacted.credentials.contains_key("basicauth"));
+}
+
+#[test]
+fn test_redact_consumer_basicauth_malformed_values_omitted() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!(["must-not-escape", 42, null]),
+    );
+    let redacted = redact_consumer_credentials(&consumer);
+    assert!(!redacted.credentials.contains_key("basicauth"));
+
+    consumer
+        .credentials
+        .insert("basicauth".into(), serde_json::json!("must-not-escape"));
+    let redacted = redact_consumer_credentials(&consumer);
+    assert!(!redacted.credentials.contains_key("basicauth"));
 }
 
 #[test]
@@ -382,13 +406,8 @@ fn test_redact_consumer_multiple_credential_types_all_redacted() {
 
     let redacted = redact_consumer_credentials(&consumer);
 
-    // basicauth password_hash redacted
-    assert_eq!(
-        redacted.credentials["basicauth"][0]["password_hash"]
-            .as_str()
-            .unwrap(),
-        "[REDACTED]"
-    );
+    // basicauth is redacted by omitting the credential type.
+    assert!(!redacted.credentials.contains_key("basicauth"));
     // jwt secret redacted
     assert_eq!(
         redacted.credentials["jwt"][0]["secret"].as_str().unwrap(),
@@ -459,16 +478,15 @@ fn test_redact_consumer_preserves_non_credential_fields() {
 }
 
 #[test]
-fn test_redact_consumer_object_format_basicauth_redacted() {
-    // The old single-object format (not array) — redact_field handles both
+fn test_redact_consumer_object_format_basicauth_omitted() {
+    // The old single-object format is omitted just like the canonical array.
     let mut consumer = make_consumer("c1", "alice");
     consumer.credentials.insert(
         "basicauth".into(),
         serde_json::json!({"password_hash": "hmac_sha256:oldhash"}),
     );
     let redacted = redact_consumer_credentials(&consumer);
-    let basicauth = redacted.credentials.get("basicauth").unwrap();
-    assert_eq!(basicauth["password_hash"].as_str().unwrap(), "[REDACTED]");
+    assert!(!redacted.credentials.contains_key("basicauth"));
 }
 
 #[test]

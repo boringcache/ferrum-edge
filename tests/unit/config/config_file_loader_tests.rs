@@ -1557,3 +1557,31 @@ plugin_configs: []
     assert_eq!(config.consumers[0].username, "alice");
     assert_eq!(config.consumers[0].namespace, "prod");
 }
+
+#[test]
+fn test_file_config_rejects_plaintext_basicauth_password() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers:
+  - id: "plaintext-basic"
+    username: "alice"
+    credentials:
+      basicauth:
+        - password: "must-not-enter-runtime-config"
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let error = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file mode must reject plaintext Basic-auth passwords");
+    let message = format!("{error:#}");
+    assert!(message.contains("file-mode Basic-auth credentials"));
+    assert!(!message.contains("must-not-enter-runtime-config"));
+}

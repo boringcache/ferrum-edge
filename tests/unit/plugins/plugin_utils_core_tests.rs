@@ -214,6 +214,15 @@ fn token_extract_extracts_bearer_token_from_authorization() {
 }
 
 #[test]
+fn token_extract_treats_foreign_authorization_scheme_as_missing() {
+    let ctx = ctx_with_header("authorization", "Basic dXNlcjpwYXNz");
+    assert!(matches!(
+        extract_authorization_bearer(&ctx),
+        ExtractedCredential::Missing
+    ));
+}
+
+#[test]
 fn token_extract_configured_header_prefix_mismatch_is_missing() {
     let ctx = ctx_with_header("x-token", "Token abc");
     let location = TokenLocation::Header(TokenHeaderLocation {
@@ -222,6 +231,27 @@ fn token_extract_configured_header_prefix_mismatch_is_missing() {
     });
     assert!(matches!(
         extract_from_location(&location, &ctx),
+        TokenLocationExtract::Missing
+    ));
+}
+
+#[test]
+fn token_extract_prefixless_authorization_location_classifies_bearer_scheme() {
+    let location = TokenLocation::Header(TokenHeaderLocation {
+        name: "authorization".to_string(),
+        prefix: None,
+    });
+
+    let bearer_ctx = ctx_with_header("authorization", "Bearer abc");
+    assert!(matches!(
+        extract_from_location(&location, &bearer_ctx),
+        TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token))
+            if token == "abc"
+    ));
+
+    let basic_ctx = ctx_with_header("authorization", "Basic dXNlcjpwYXNz");
+    assert!(matches!(
+        extract_from_location(&location, &basic_ctx),
         TokenLocationExtract::Missing
     ));
 }

@@ -1389,6 +1389,7 @@ async fn handle_h3_request(
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
+    ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
     // Pre-computed capability bitset — avoids per-request iter().any() scans.
     let capabilities = plugin_cache_view.capabilities();
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();

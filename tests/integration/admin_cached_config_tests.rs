@@ -3093,7 +3093,6 @@ async fn test_restore_hashes_consumer_secrets() {
                 "username": "hash_user",
                 "credentials": {
                     "basicauth": [{
-                        "username": "hash_user",
                         "password": "my_secret_password"
                     }]
                 }
@@ -4434,6 +4433,53 @@ async fn test_consumer_crud_create_update_delete() {
     // Verify gone
     let (status, _, _) = admin_get(&base_url, "/consumers/crud-consumer-1", &token).await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn test_consumer_put_preserves_basic_credentials_omitted_from_get_response() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let password_hash = format!("hmac_sha256:{}", "a".repeat(64));
+
+    let consumer = json!({
+        "id": "basic-roundtrip-consumer",
+        "username": "basic_roundtrip_user",
+        "credentials": {
+            "basicauth": [{"password_hash": password_hash.clone()}]
+        }
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
+    assert_eq!(status, 201, "Create consumer failed: {:?}", body);
+
+    let (status, mut roundtrip, _) =
+        admin_get(&base_url, "/consumers/basic-roundtrip-consumer", &token).await;
+    assert_eq!(status, 200);
+    assert!(roundtrip["credentials"].get("basicauth").is_none());
+
+    roundtrip["custom_id"] = json!("basic-roundtrip-custom-id");
+    let (status, body) = admin_put(
+        &base_url,
+        "/consumers/basic-roundtrip-consumer",
+        &token,
+        &roundtrip,
+    )
+    .await;
+    assert_eq!(status, 200, "Round-trip update failed: {:?}", body);
+
+    let (status, backup, _) = admin_get(&base_url, "/backup?resources=consumers", &token).await;
+    assert_eq!(status, 200);
+    let stored = backup["consumers"]
+        .as_array()
+        .expect("backup consumers array")
+        .iter()
+        .find(|consumer| consumer["id"] == "basic-roundtrip-consumer")
+        .expect("updated consumer in backup");
+    assert_eq!(
+        stored["credentials"]["basicauth"][0]["password_hash"].as_str(),
+        Some(password_hash.as_str())
+    );
 }
 
 #[tokio::test]

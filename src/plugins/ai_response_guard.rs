@@ -30,7 +30,8 @@ use super::{Plugin, PluginResult, RequestContext};
 /// JSON object keys that are structural metadata (IDs, timestamps, model
 /// names, roles, etc.) and must never be redacted, even in `ScanMode::All`.
 /// This protects timestamps and IDs that may incidentally match PII regexes.
-const STRUCTURAL_KEYS: &[&str] = &[
+const STRUCTURAL_KEY_COUNT: usize = 17;
+const STRUCTURAL_KEYS: [&str; STRUCTURAL_KEY_COUNT] = [
     "id",
     "object",
     "created",
@@ -1924,13 +1925,17 @@ fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
 
 /// Locate exact byte spans of string/number values held by structural keys in
 /// the root JSON object. Scanning the original serialization preserves
-/// duplicate members and contextual whitespace for the residual raw pass.
+/// contextual whitespace for the residual raw pass. For duplicate object
+/// members, a scalar is maskable only when it is the last occurrence of its
+/// structural key, matching the `serde_json::Value` that redaction actually
+/// inspected. A later non-scalar leaves no maskable span for that key, so no
+/// overwritten duplicate value is hidden from residual detection.
 fn top_level_structural_scalar_spans(
     raw: &str,
     json: &Value,
-) -> Option<Vec<std::ops::Range<usize>>> {
+) -> Option<[Option<std::ops::Range<usize>>; STRUCTURAL_KEY_COUNT]> {
     if !json.is_object() {
-        return Some(Vec::new());
+        return Some(std::array::from_fn(|_| None));
     }
 
     let bytes = raw.as_bytes();
@@ -1939,7 +1944,13 @@ fn top_level_structural_scalar_spans(
         return None;
     }
     index += 1;
-    let mut spans = Vec::new();
+    // One slot per known structural key records the scalar span from its last
+    // root-object occurrence. A later non-scalar explicitly clears the slot:
+    // serde retains that later value, so no earlier scalar was inspected by
+    // the structural redactor and none may be hidden from the raw pass. The
+    // fixed array avoids per-key strings and heap growth on the response path.
+    let mut last_scalar_spans: [Option<std::ops::Range<usize>>; STRUCTURAL_KEY_COUNT] =
+        std::array::from_fn(|_| None);
 
     loop {
         index = skip_json_whitespace(bytes, index);
@@ -1964,12 +1975,14 @@ fn top_level_structural_scalar_spans(
         let value_start = index;
         let value_end = json_value_end(bytes, value_start)?;
 
-        if STRUCTURAL_KEYS.contains(&key.as_ref()) {
-            let raw_value = raw.get(value_start..value_end)?;
-            let value = serde_json::from_str::<Value>(raw_value).ok()?;
-            if value.is_string() || value.is_number() {
-                spans.push(value_start..value_end);
-            }
+        if let Some(key_index) = STRUCTURAL_KEYS
+            .iter()
+            .position(|structural| *structural == key.as_ref())
+        {
+            last_scalar_spans[key_index] = match bytes.get(value_start) {
+                Some(b'"' | b'-' | b'0'..=b'9') => Some(value_start..value_end),
+                _ => None,
+            };
         }
 
         index = skip_json_whitespace(bytes, value_end);
@@ -1980,7 +1993,7 @@ fn top_level_structural_scalar_spans(
         }
     }
 
-    Some(spans)
+    Some(last_scalar_spans)
 }
 
 /// Mask top-level structural scalar bytes in one SSE event without otherwise
@@ -2021,7 +2034,7 @@ fn mask_sse_event_structural_scalars(lines: &[&str]) -> Result<Option<String>, (
     }
     let json = serde_json::from_str::<Value>(trimmed).map_err(|_| ())?;
     let spans = top_level_structural_scalar_spans(&joined, &json).ok_or(())?;
-    if spans.is_empty() {
+    if spans.iter().all(Option::is_none) {
         return Ok(None);
     }
 
@@ -2029,7 +2042,7 @@ fn mask_sse_event_structural_scalars(lines: &[&str]) -> Result<Option<String>, (
     // `max_scan_bytes`. Keeping a flat mask makes this O(body + spans), even
     // for attacker-controlled events with many data lines or root members.
     let mut mask = vec![false; joined.len()];
-    for span in spans {
+    for span in spans.into_iter().flatten() {
         let bytes = joined.as_bytes();
         let (start, end) = if span.end > span.start + 1
             && bytes.get(span.start) == Some(&b'"')

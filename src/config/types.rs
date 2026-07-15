@@ -81,6 +81,8 @@ pub const MAX_CREDENTIALS_SIZE: usize = 65_536; // 64 KiB
 pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
 /// Minimum length for JWT secrets (admin API and consumer credentials).
 pub const MIN_JWT_SECRET_LENGTH: usize = 32;
+/// Minimum byte length for the server-side Basic-auth HMAC secret.
+pub const MIN_BASIC_AUTH_HMAC_SECRET_LENGTH: usize = 32;
 /// Default maximum number of credential entries per type (for zero-downtime rotation).
 /// Overridable at runtime via `FERRUM_MAX_CREDENTIALS_PER_TYPE` env var / conf file.
 pub const DEFAULT_MAX_CREDENTIALS_PER_TYPE: usize = 2;
@@ -91,6 +93,73 @@ pub fn max_credentials_per_type() -> usize {
     crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_CREDENTIALS_PER_TYPE")
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_CREDENTIALS_PER_TYPE)
+}
+
+/// Validate the shared Basic-auth HMAC secret without exposing its value.
+pub fn validate_basic_auth_hmac_secret(secret: &str) -> Result<(), String> {
+    if secret.len() < MIN_BASIC_AUTH_HMAC_SECRET_LENGTH {
+        return Err(format!(
+            "FERRUM_BASIC_AUTH_HMAC_SECRET must be at least {} bytes",
+            MIN_BASIC_AUTH_HMAC_SECRET_LENGTH
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) enum BasicAuthCredentialPreparationError {
+    InvalidCredential(String),
+    ServerConfiguration(String),
+}
+
+impl std::fmt::Display for BasicAuthCredentialPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCredential(message) | Self::ServerConfiguration(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+fn basic_auth_credential_error(
+    credential: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&'static str> {
+    if credential.len() != 1 {
+        return Some("must contain exactly one of 'password' or 'password_hash'");
+    }
+
+    if let Some(password) = credential.get("password") {
+        return match password.as_str() {
+            Some("") => Some("password must not be empty"),
+            Some(password) if password.len() > MAX_CREDENTIAL_VALUE_LENGTH => {
+                Some("password must not exceed 4096 bytes")
+            }
+            Some(password) if contains_control_chars(password) => {
+                Some("password must not contain control characters")
+            }
+            Some(_) => None,
+            None => Some("password must be a string"),
+        };
+    }
+
+    if let Some(password_hash) = credential.get("password_hash") {
+        let valid = password_hash.as_str().is_some_and(|password_hash| {
+            password_hash
+                .strip_prefix("hmac_sha256:")
+                .is_some_and(|hex_hash| {
+                    hex_hash.len() == 64
+                        && hex_hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        });
+        return (!valid).then_some(
+            "password_hash must be a string in 'hmac_sha256:<64 lowercase hex>' format",
+        );
+    }
+
+    Some("must contain exactly one of 'password' or 'password_hash'")
 }
 /// Maximum number of ACL groups per consumer.
 pub const MAX_ACL_GROUPS_PER_CONSUMER: usize = 500;
@@ -5574,6 +5643,21 @@ impl Consumer {
                         None => {}
                     }
                 }
+                if cred_type == "basicauth"
+                    && let Some(error) = basic_auth_credential_error(obj)
+                {
+                    errors.push(format!("{} {}", prefix, error));
+                }
+                if cred_type == "keyauth" {
+                    match obj.get("key") {
+                        Some(serde_json::Value::String(key)) if !key.trim().is_empty() => {}
+                        Some(serde_json::Value::String(_)) => {
+                            errors.push(format!("{}.key must not be empty", prefix));
+                        }
+                        Some(_) => errors.push(format!("{}.key must be a string", prefix)),
+                        None => errors.push(format!("{}.key is required", prefix)),
+                    }
+                }
                 for (key, val) in *obj {
                     if let Some(s) = val.as_str() {
                         if s.len() > MAX_CREDENTIAL_VALUE_LENGTH {
@@ -5673,9 +5757,10 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
         }
     }
 
-    if let Some(basic) = redacted.credentials.get_mut("basicauth") {
-        redact_field(basic, "password_hash");
-    }
+    // Basic credentials have a strict request/backup schema. Omit the entire
+    // credential type from ordinary Consumer responses so those responses do
+    // not expose values or return a pattern-invalid redaction placeholder.
+    redacted.credentials.remove("basicauth");
     if let Some(hmac) = redacted.credentials.get_mut("hmac_auth") {
         redact_field(hmac, "secret");
     }
@@ -5689,68 +5774,102 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     redacted
 }
 
-pub(crate) fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
-    if let Some(serde_json::Value::Array(arr)) = consumer.credentials.get_mut("basicauth") {
-        for entry in arr.iter_mut() {
-            if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
-                let hash = hash_basic_auth_password(pass).map_err(|e| {
-                    format!(
-                        "Failed to hash password for consumer {}: {}",
-                        consumer.id, e
-                    )
-                })?;
-                entry["password_hash"] = serde_json::json!(hash);
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.remove("password");
-                }
-            }
-        }
+pub fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
+    let mut redacted = redact_consumer_credentials(consumer);
+    if consumer.credentials.contains_key("basicauth") {
+        // Audit events need to show that Basic credentials were present or
+        // changed, but must not disclose values, entry fields, or even the
+        // stored credential shape/cardinality. A single stable marker keeps
+        // the mutation visible without creating a credential side channel.
+        redacted
+            .credentials
+            .insert("basicauth".to_string(), serde_json::json!("[REDACTED]"));
+    }
+    redacted
+}
+
+pub(crate) fn hash_consumer_secrets(
+    consumer: &mut Consumer,
+) -> Result<(), BasicAuthCredentialPreparationError> {
+    if let Some(credentials) = consumer.credentials.get_mut("basicauth") {
+        hash_credential_passwords(credentials)?;
     }
 
     Ok(())
 }
 
-fn hash_basic_auth_password(password: &str) -> Result<String, String> {
+fn hash_basic_auth_password(password: &str) -> Result<String, BasicAuthCredentialPreparationError> {
+    let secret = crate::config::conf_file::resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET");
+    hash_basic_auth_password_with_secret(password, secret.as_deref())
+}
+
+pub(crate) fn hash_basic_auth_password_with_secret(
+    password: &str,
+    secret: Option<&str>,
+) -> Result<String, BasicAuthCredentialPreparationError> {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    let secret = crate::config::conf_file::resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "FERRUM_BASIC_AUTH_HMAC_SECRET must be set to hash basic-auth passwords. \
-             Set it to a unique, random value (>= 32 characters recommended)."
-                .to_string()
-        })?;
+    let secret = secret.ok_or_else(|| {
+        BasicAuthCredentialPreparationError::ServerConfiguration(
+            "FERRUM_BASIC_AUTH_HMAC_SECRET must be set to hash Basic-auth passwords".to_string(),
+        )
+    })?;
+    validate_basic_auth_hmac_secret(secret)
+        .map_err(BasicAuthCredentialPreparationError::ServerConfiguration)?;
 
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| format!("Failed to create HMAC instance: {}", e))?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|error| {
+        BasicAuthCredentialPreparationError::ServerConfiguration(format!(
+            "Failed to create HMAC instance: {error}"
+        ))
+    })?;
     mac.update(password.as_bytes());
     let hash = hex::encode(mac.finalize().into_bytes());
     Ok(format!("hmac_sha256:{}", hash))
 }
 
-pub(crate) fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<(), String> {
+pub(crate) fn hash_credential_passwords(
+    cred: &mut serde_json::Value,
+) -> Result<(), BasicAuthCredentialPreparationError> {
+    fn prepare_entry(
+        entry: &mut serde_json::Value,
+    ) -> Result<(), BasicAuthCredentialPreparationError> {
+        let object = entry.as_object().ok_or_else(|| {
+            BasicAuthCredentialPreparationError::InvalidCredential(
+                "Basic-auth credential entry must be a JSON object".to_string(),
+            )
+        })?;
+        if let Some(error) = basic_auth_credential_error(object) {
+            return Err(BasicAuthCredentialPreparationError::InvalidCredential(
+                format!("Basic-auth credential entry {error}"),
+            ));
+        }
+        let Some(password) = object.get("password").and_then(serde_json::Value::as_str) else {
+            return Ok(());
+        };
+        let hash = hash_basic_auth_password(password)?;
+        let object = entry.as_object_mut().ok_or_else(|| {
+            BasicAuthCredentialPreparationError::InvalidCredential(
+                "Basic-auth credential entry must be a JSON object".to_string(),
+            )
+        })?;
+        object.remove("password");
+        object.insert("password_hash".to_string(), serde_json::json!(hash));
+        Ok(())
+    }
+
     match cred {
-        serde_json::Value::Array(arr) => {
-            for entry in arr.iter_mut() {
-                if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
-                    let hash = hash_basic_auth_password(pass)?;
-                    entry["password_hash"] = serde_json::json!(hash);
-                    if let Some(obj) = entry.as_object_mut() {
-                        obj.remove("password");
-                    }
-                }
+        serde_json::Value::Array(entries) => {
+            for entry in entries {
+                prepare_entry(entry)?;
             }
         }
+        serde_json::Value::Object(_) => prepare_entry(cred)?,
         _ => {
-            if let Some(pass) = cred.get("password").and_then(|p| p.as_str()) {
-                let hash = hash_basic_auth_password(pass)?;
-                cred["password_hash"] = serde_json::json!(hash);
-                if let Some(obj) = cred.as_object_mut() {
-                    obj.remove("password");
-                }
-            }
+            return Err(BasicAuthCredentialPreparationError::InvalidCredential(
+                "Basic-auth credentials must be an object or array".to_string(),
+            ));
         }
     }
 
