@@ -3,8 +3,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use ferrum_edge::PluginCache;
 use ferrum_edge::_test_support::AdaptiveConcurrencyTransitionHarness;
+use ferrum_edge::PluginCache;
 use ferrum_edge::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
 };
@@ -1036,11 +1036,7 @@ fn adaptive_concurrency_overlapping_structural_reloads_keep_newest_reset_authori
 
     drop(retired_permit);
     let newest_permit = expect_admitted(acquire_from_cache(&cache, &newest_reload));
-    assert_rejected(acquire_from_plugin(
-        &oldest_view,
-        &config.proxies[0],
-        None,
-    ));
+    assert_rejected(acquire_from_plugin(&oldest_view, &config.proxies[0], None));
     assert_rejected(acquire_from_plugin(
         &middle_view,
         &first_reload.proxies[0],

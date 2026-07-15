@@ -114,10 +114,8 @@ impl AdaptiveConcurrencyPolicyTransition {
         if policy_transition_state(observed) != POLICY_DRAINING {
             return None;
         }
-        let resetting_word = policy_transition_word(
-            policy_transition_epoch(observed),
-            POLICY_RESETTING,
-        );
+        let resetting_word =
+            policy_transition_word(policy_transition_epoch(observed), POLICY_RESETTING);
         self.word
             .compare_exchange(
                 observed,
@@ -134,11 +132,7 @@ impl AdaptiveConcurrencyPolicyTransition {
 
     /// Release exclusive reset ownership to either active admission or a drain.
     /// The exact epoch CAS is the publication edge for the completed map clear.
-    pub(crate) fn finish_reset(
-        &self,
-        reset: AdaptiveConcurrencyResetEpoch,
-        drain: bool,
-    ) -> bool {
+    pub(crate) fn finish_reset(&self, reset: AdaptiveConcurrencyResetEpoch, drain: bool) -> bool {
         if !reset.can_reactivate {
             return false;
         }
@@ -147,10 +141,8 @@ impl AdaptiveConcurrencyPolicyTransition {
         } else {
             POLICY_ACTIVE
         };
-        let next = policy_transition_word(
-            policy_transition_epoch(reset.resetting_word),
-            next_state,
-        );
+        let next =
+            policy_transition_word(policy_transition_epoch(reset.resetting_word), next_state);
         self.word
             .compare_exchange(
                 reset.resetting_word,

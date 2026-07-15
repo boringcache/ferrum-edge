@@ -99,8 +99,7 @@ pub mod _test_support {
     impl AdaptiveConcurrencyTransitionHarness {
         pub fn new() -> Self {
             Self {
-                transition:
-                    crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition::new(),
+                transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition::new(),
             }
         }
 
