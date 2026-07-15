@@ -4,6 +4,7 @@ use ferrum_edge::plugins::{
     RequestContext,
     apply_initial_response_header_policies, plugin_failure_policy,
 };
+use ferrum_edge::proxy::headers::{append_set_cookie_header, apply_response_headers};
 use http::{Response, Version};
 use serde_json::json;
 use std::collections::HashMap;
@@ -328,6 +329,38 @@ fn ordered_initial_response_policy_chain_matches_multiple_instance_semantics() {
 
     assert_eq!(headers.get("x-order").map(String::as_str), Some("second"));
     assert!(!headers.contains_key("x-removed"));
+}
+
+#[test]
+fn websocket_sticky_cookie_appends_to_security_policy_cookie() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": { "Set-Cookie": "policy=value; Secure" }
+        }))
+        .unwrap(),
+    );
+    let mut headers = HashMap::new();
+
+    apply_initial_response_header_policies(&[policy], &mut headers);
+    append_set_cookie_header(&mut headers, "affinity=target-a; Secure".to_string());
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("policy=value; Secure\naffinity=target-a; Secure")
+    );
+    let response = apply_response_headers(Response::builder(), &headers)
+        .body(())
+        .unwrap();
+    let cookies: Vec<_> = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(
+        cookies,
+        vec!["policy=value; Secure", "affinity=target-a; Secure"]
+    );
 }
 
 #[test]

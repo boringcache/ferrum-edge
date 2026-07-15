@@ -421,18 +421,33 @@ async fn send_h3_reject_body<S>(
 ) where
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
+    ensure_h3_reject_content_type(&mut headers);
+    crate::proxy::finalize_websocket_response_headers(
+        initial_response_header_policy_plugins,
+        &mut headers,
+    );
+    write_h3_finalized_reject_body(stream, status, body, &headers).await;
+}
+
+fn ensure_h3_reject_content_type(headers: &mut HashMap<String, String>) {
     if !headers
         .keys()
         .any(|key| key.eq_ignore_ascii_case("content-type"))
     {
         headers.insert("content-type".to_string(), "application/json".to_string());
     }
-    crate::proxy::finalize_websocket_response_headers(
-        initial_response_header_policy_plugins,
-        &mut headers,
-    );
+}
+
+async fn write_h3_finalized_reject_body<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
     let builder =
-        crate::proxy::headers::apply_response_headers(Response::builder().status(status), &headers);
+        crate::proxy::headers::apply_response_headers(Response::builder().status(status), headers);
     let resp = match builder.body(()) {
         Ok(r) => r,
         Err(e) => {
@@ -460,7 +475,6 @@ async fn send_h3_backend_admission_rejection<S>(
     stream: &mut RequestStream<S, Bytes>,
     rejection: crate::proxy::backend_dispatch::BackendAdmissionRejection,
     plugins: &[Arc<dyn Plugin>],
-    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     state: &ProxyState,
     start_time: Instant,
@@ -471,6 +485,7 @@ async fn send_h3_backend_admission_rejection<S>(
 {
     let mut rejection = rejection;
     let mut headers = rejection.headers;
+    ensure_h3_reject_content_type(&mut headers);
     crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
@@ -479,6 +494,7 @@ async fn send_h3_backend_admission_rejection<S>(
         &mut headers,
     )
     .await;
+    crate::proxy::strip_websocket_transport_managed_response_header_map(&mut headers);
     let status =
         StatusCode::from_u16(rejection.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
     crate::proxy::log_rejected_request_with_path(
@@ -492,14 +508,7 @@ async fn send_h3_backend_admission_rejection<S>(
     )
     .await;
     crate::proxy::record_request(state, status.as_u16());
-    send_h3_reject_body(
-        stream,
-        status,
-        &rejection.body,
-        headers,
-        initial_response_header_policy_plugins,
-    )
-    .await;
+    write_h3_finalized_reject_body(stream, status, &rejection.body, &headers).await;
 }
 
 pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
@@ -867,7 +876,6 @@ pub(crate) async fn handle_h3_websocket(
                         &mut stream,
                         rejection,
                         &plugins,
-                        &initial_response_header_policy_plugins,
                         &mut ctx,
                         &state,
                         start_time,
@@ -1171,7 +1179,7 @@ pub(crate) async fn handle_h3_websocket(
                 .unwrap_or(&default_cc);
             let cookie_val =
                 crate::proxy::build_sticky_cookie_header(cookie_name, target, cookie_config);
-            response_headers.insert("set-cookie".to_string(), cookie_val);
+            crate::proxy::headers::append_set_cookie_header(&mut response_headers, cookie_val);
         }
     }
     let mut response_builder = crate::proxy::headers::apply_response_headers(

@@ -8129,6 +8129,12 @@ fn strip_websocket_transport_managed_response_headers(headers: &mut hyper::Heade
     }
 }
 
+pub(crate) fn strip_websocket_transport_managed_response_header_map(
+    response_headers: &mut HashMap<String, String>,
+) {
+    response_headers.retain(|name, _| !is_websocket_transport_managed_response_header(name));
+}
+
 /// Apply deterministic initial-response policy at the WebSocket boundary, then
 /// remove transport-managed fields. Successful handshake builders add their
 /// protocol-required Upgrade / Extended CONNECT metadata after this returns, so
@@ -8143,7 +8149,7 @@ pub(crate) fn finalize_websocket_response_headers(
         initial_response_header_policy_plugins,
         response_headers,
     );
-    response_headers.retain(|name, _| !is_websocket_transport_managed_response_header(name));
+    strip_websocket_transport_managed_response_header_map(response_headers);
 }
 
 fn build_websocket_error_response(
@@ -9033,7 +9039,7 @@ async fn handle_websocket_request_authenticated(
                 .and_then(|u| u.hash_on_cookie_config.as_ref())
                 .unwrap_or(&default_cc);
             let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
-            response_headers.insert("set-cookie".to_string(), cookie_val);
+            headers_mod::append_set_cookie_header(&mut response_headers, cookie_val);
         }
     }
 

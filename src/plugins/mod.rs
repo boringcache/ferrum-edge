@@ -110,7 +110,7 @@ use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -222,10 +222,11 @@ pub struct BufferedInitialResponseHeaderPolicyState {
     header_names: Arc<Vec<String>>,
     desired_headers: HashMap<String, String>,
     observed_headers: HashMap<String, String>,
-    /// Names whose policy value had to replace a trailer-only compatibility
-    /// value in the hook map. Unless a later non-policy hook changes the name,
-    /// the backend's application trailer remains authoritative on its channel.
-    policy_only_promoted_headers: HashSet<String>,
+    /// Application-trailer outcomes immediately before initial-header policy
+    /// first changed each name. A later non-policy hook clears the entry and
+    /// owns both visible copies; otherwise reconciliation restores this
+    /// pre-policy value (or removal) on the trailer channel.
+    pre_policy_application_trailers: HashMap<String, Option<String>>,
 }
 
 impl BufferedInitialResponseHeaderPolicyState {
@@ -243,7 +244,7 @@ impl BufferedInitialResponseHeaderPolicyState {
         Some(Self {
             desired_headers: Self::select_headers(&header_names, initial_headers),
             observed_headers: Self::select_headers(&header_names, merged_headers),
-            policy_only_promoted_headers: HashSet::new(),
+            pre_policy_application_trailers: HashMap::new(),
             header_names,
         })
     }
@@ -271,11 +272,11 @@ impl BufferedInitialResponseHeaderPolicyState {
         if plugin.is_initial_response_header_policy() {
             plugin.apply_initial_response_header_policy(&mut self.desired_headers);
             for name in self.header_names.iter() {
-                let hook_changed_value =
-                    self.observed_headers.get(name) != response_headers.get(name);
-                if hook_changed_value {
-                    self.policy_only_promoted_headers.remove(name);
-                } else if self.desired_headers.get(name) != response_headers.get(name) {
+                if self.observed_headers.get(name) != self.desired_headers.get(name) {
+                    let previous_value = self.observed_headers.get(name).cloned();
+                    self.pre_policy_application_trailers
+                        .entry(name.clone())
+                        .or_insert(previous_value);
                     match self.desired_headers.get(name) {
                         Some(value) => {
                             response_headers.insert(name.clone(), value.clone());
@@ -284,7 +285,6 @@ impl BufferedInitialResponseHeaderPolicyState {
                             response_headers.remove(name);
                         }
                     }
-                    self.policy_only_promoted_headers.insert(name.clone());
                 }
                 match response_headers.get(name) {
                     Some(value) if self.observed_headers.get(name) != Some(value) => {
@@ -309,21 +309,23 @@ impl BufferedInitialResponseHeaderPolicyState {
                 Some(value) => {
                     self.desired_headers.insert(name.clone(), value.clone());
                     self.observed_headers.insert(name.clone(), value.clone());
-                    self.policy_only_promoted_headers.remove(name);
+                    self.pre_policy_application_trailers.remove(name);
                 }
                 None => {
                     self.desired_headers.remove(name);
                     self.observed_headers.remove(name);
-                    self.policy_only_promoted_headers.remove(name);
+                    self.pre_policy_application_trailers.remove(name);
                 }
             }
         }
     }
 
-    /// Whether a trailer-only compatibility value was replaced solely so later
-    /// header hooks could observe the genuine initial-header policy outcome.
-    pub fn preserves_backend_application_trailer(&self, name: &str) -> bool {
-        self.policy_only_promoted_headers.contains(name)
+    /// Application-trailer value to restore when only initial-header policy
+    /// changed this name. `Some(None)` means policy observed a prior removal.
+    pub fn pre_policy_application_trailer(&self, name: &str) -> Option<Option<&str>> {
+        self.pre_policy_application_trailers
+            .get(name)
+            .map(|value| value.as_deref())
     }
 
     /// Apply the final ordered policy-owned fields to genuine initial HEADERS.

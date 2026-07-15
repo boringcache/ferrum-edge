@@ -402,11 +402,23 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
+        X-WS-Reject-Order: "security-policy"
         Upgrade: "policy-must-not-escape"
         Connection: "policy-must-not-escape"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
+    scope: global
+    enabled: true
+  - id: "plugin-response-transformer-ws-admission"
+    plugin_name: "response_transformer"
+    priority_override: 4090
+    config:
+      rules:
+        - operation: update
+          target: header
+          key: X-WS-Reject-Order
+          value: later-response-hook
     scope: global
     enabled: true
 "#,
@@ -853,6 +865,15 @@ fn assert_ws_security_policy(headers: &http::HeaderMap) {
             .get("strict-transport-security")
             .and_then(|value| value.to_str().ok()),
         Some("max-age=31536000; includeSubDomains")
+    );
+}
+
+fn assert_ws_later_reject_hook_wins(headers: &http::HeaderMap) {
+    assert_eq!(
+        headers
+            .get("x-ws-reject-order")
+            .and_then(|value| value.to_str().ok()),
+        Some("later-response-hook")
     );
 }
 
@@ -1555,6 +1576,7 @@ async fn test_websocket_backend_admission_reject_strips_transport_policy_fields(
         Err(WsError::Http(response)) => {
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_ws_security_policy(response.headers());
+            assert_ws_later_reject_hook_wins(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
             let body = response
@@ -1575,6 +1597,59 @@ async fn test_websocket_backend_admission_reject_strips_transport_policy_fields(
         .send(Message::Close(None))
         .await
         .expect("close first WebSocket");
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// H3 backend-admission rejection headers have already completed the ordered
+/// reject-hook chain. The transport boundary strips handshake-only fields but
+/// must not replay security_headers after a later response hook.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_backend_admission_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+    let url = format!("https://localhost:{gateway_https_port}/ws-echo");
+
+    let first_client = Http3Client::insecure().expect("first H3 client");
+    let mut first_ws = first_client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("first H3 WebSocket should hold the backend-admission permit");
+    assert_eq!(first_ws.status, StatusCode::OK);
+    assert_ws_security_policy(&first_ws.headers);
+
+    let second_client = Http3Client::insecure().expect("second H3 client");
+    let mut rejected = second_client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("second H3 WebSocket rejection response");
+    assert_eq!(rejected.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_ws_security_policy(&rejected.headers);
+    assert_ws_later_reject_hook_wins(&rejected.headers);
+    assert_no_ws_transport_policy_values(&rejected.headers);
+    assert_no_h1_only_websocket_headers(&rejected.headers);
+    assert!(
+        rejected
+            .recv_body_text()
+            .await
+            .expect("backend-admission rejection body")
+            .contains("Upstream concurrency limit reached")
+    );
+
+    first_ws.send_close().await.expect("close first H3 WebSocket");
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();

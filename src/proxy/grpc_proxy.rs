@@ -1554,26 +1554,34 @@ pub fn reconcile_grpc_trailers_from_view(
     header_shadowed_trailer_keys: &HashSet<String>,
     policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
 ) {
-    response_trailers.retain(|k, v| match plugin_response_headers.get(k) {
-        Some(plugin_value) => {
-            if header_shadowed_trailer_keys.contains(k) {
-                if original_response_headers.get(k) != Some(plugin_value) {
+    response_trailers.retain(|k, v| {
+        if let Some(pre_policy_value) =
+            policy_state.and_then(|state| state.pre_policy_application_trailer(k))
+        {
+            if let Some(pre_policy_value) = pre_policy_value {
+                if !header_shadowed_trailer_keys.contains(k)
+                    || original_response_headers.get(k).map(String::as_str)
+                        != Some(pre_policy_value)
+                {
+                    *v = pre_policy_value.to_string();
+                }
+                return true;
+            }
+            return false;
+        }
+        match plugin_response_headers.get(k) {
+            Some(plugin_value) => {
+                if header_shadowed_trailer_keys.contains(k) {
+                    if original_response_headers.get(k) != Some(plugin_value) {
+                        *v = plugin_value.clone();
+                    }
+                } else if plugin_value != v {
                     *v = plugin_value.clone();
                 }
-            } else if policy_state.is_some_and(|state| {
-                state.preserves_backend_application_trailer(k)
-            }) {
-                // A trailer-only value suppressed an override_existing=false
-                // initial-header policy in the merged compatibility view. The
-                // policy state promoted its genuine initial value so later
-                // hooks saw correct ordering; keep the untouched application
-                // trailer on its original channel.
-            } else if plugin_value != v {
-                *v = plugin_value.clone();
+                true
             }
-            true
+            None => false,
         }
-        None => false,
     });
 }
 

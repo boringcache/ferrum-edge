@@ -853,10 +853,61 @@ async fn buffered_policy_is_applied_to_initial_headers_without_promoting_trailer
 }
 
 #[tokio::test]
+async fn buffered_override_policy_preserves_application_trailer_value() {
+    let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
+    let backend_trailers = grpc_map(&[("grpc-status", "0"), ("x-policy", "application-value")]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": true,
+            "set": { "X-Policy": "gateway-enforced" }
+        }))
+        .unwrap(),
+    );
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
+
+    let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+
+    let mut wire_trailers = backend_trailers;
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        Some(&policy_state),
+    );
+    let mut initial_headers = plugin_view;
+    grpc_proxy::strip_non_initial_grpc_trailer_fields(
+        &mut initial_headers,
+        &wire_trailers,
+        &shadowed,
+    );
+    policy_state.apply_to_initial_headers(&mut initial_headers);
+
+    assert_eq!(
+        initial_headers.get("x-policy").map(String::as_str),
+        Some("gateway-enforced")
+    );
+    assert_eq!(
+        wire_trailers.get("x-policy").map(String::as_str),
+        Some("application-value"),
+        "initial-header policy must not overwrite application metadata"
+    );
+}
+
+#[tokio::test]
 async fn buffered_policy_state_preserves_later_header_mutator_order() {
     let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
     let backend_trailers = grpc_map(&[("grpc-status", "0"), ("x-policy", "backend-trailer")]);
-    let (mut plugin_view, _) =
+    let (mut plugin_view, shadowed) =
         grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
     let policy: Arc<dyn Plugin> = Arc::new(
         SecurityHeaders::new(&json!({
@@ -891,12 +942,25 @@ async fn buffered_policy_state_preserves_later_header_mutator_order() {
         .await;
     policy_state.record_after_proxy_plugin(later_mutator.as_ref(), &mut plugin_view);
 
+    let mut wire_trailers = backend_trailers;
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        Some(&policy_state),
+    );
     let mut final_initial_headers = backend_headers;
     policy_state.apply_to_initial_headers(&mut final_initial_headers);
     assert_eq!(
         final_initial_headers.get("x-policy").map(String::as_str),
         Some("later-transformer"),
         "a later response-header mutator must retain priority over policy"
+    );
+    assert_eq!(
+        wire_trailers.get("x-policy").map(String::as_str),
+        Some("later-transformer"),
+        "a later generic mutator still owns the application-trailer copy"
     );
 }
 
