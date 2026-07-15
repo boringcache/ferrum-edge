@@ -392,6 +392,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/plugins/config
 ```
 
+Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes.
+
 ## Upstreams
 
 ```bash
@@ -467,7 +469,7 @@ See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 ## Audit Log
 
-When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials.
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials. Basic credential mutations remain visible by type and action, but every Basic value, entry field, shape, and count is replaced by one stable `[REDACTED]` marker before persistence.
 
 `GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters.
 

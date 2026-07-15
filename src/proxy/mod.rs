@@ -13910,9 +13910,6 @@ pub async fn run_authentication_phase(
                 match auth_plugin.authenticate(ctx, consumer_index).await {
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
-                        if request_is_authenticated(ctx) {
-                            return None;
-                        }
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
                             return Some((reject.status_code, reject.body, reject.headers));
                         }

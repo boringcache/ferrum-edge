@@ -3024,7 +3024,9 @@ paths:
         Returns successful admin API mutation events for the selected namespace.
         Requires an admin-role JWT. Each event includes actor, action, resource
         identity, timestamp, and a JSON diff. Consumer credential data is
-        redacted before it is written to the audit log.
+        redacted before it is written to the audit log. Basic credential
+        mutations remain visible by type and action, but values, entry fields,
+        shape, and count are replaced by one stable `[REDACTED]` marker.
       tags: [Audit]
       parameters:
         - name: actor
@@ -5809,7 +5811,10 @@ components:
         diff:
           type: object
           additionalProperties: true
-          description: Redacted JSON before/after diff for the successful mutation
+          description: >-
+            Redacted JSON diff for the successful mutation. Basic credential
+            changes expose only the credential type, action, and a stable
+            `[REDACTED]` marker, never values, entry fields, shape, or count.
 
     AuditEventListResponse:
       type: object
@@ -6601,15 +6606,18 @@ components:
           type: object
           default: {}
           description: >-
-            Plugin-specific JSON configuration. Validated on create/update and
-            again when the plugin is instantiated at config reload time.
-            Enabled plugin configs are validation-fatal when the plugin cache is
-            built: unknown plugin names or invalid plugin-specific config block
-            gateway startup in file mode, and on DB/CP polling the new config
-            snapshot is rejected as a whole (the gateway keeps serving the
-            prior good config). Disabled plugin configs are not instantiated.
-            See
-            `PluginConfigs` section for per-plugin schema definitions.
+            Plugin-specific JSON configuration. Resource-level size and depth
+            constraints are always validated. Plugin-specific construction is
+            performed on create/update and config reload only when `enabled` is
+            true. Enabled plugin configs are validation-fatal when the plugin
+            cache is built: unknown plugin names or invalid plugin-specific
+            config block gateway startup in file mode, and on DB/CP polling the
+            new config snapshot is rejected as a whole (the gateway keeps
+            serving the prior good config). Disabled plugin configs are stored
+            without construction, allowing secret-dependent plugins such as
+            `basic_auth` to be staged before their runtime secret is provisioned.
+            Enabling performs full validation. See `PluginConfigs` section for
+            per-plugin schema definitions.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
@@ -6624,6 +6632,9 @@ components:
         enabled:
           type: boolean
           default: true
+          description: >-
+            Whether the plugin is active. Disabled configs are stored but not
+            constructed; enabling them performs full plugin-specific validation.
         priority_override:
           type: [integer, "null"]
           minimum: 0

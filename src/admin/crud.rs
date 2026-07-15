@@ -513,6 +513,10 @@ pub(crate) fn consumer_response_body(consumer: &Consumer) -> Value {
     json!(redact_consumer_for_response(consumer))
 }
 
+pub(crate) fn consumer_audit_body(consumer: &Consumer) -> Value {
+    json!(super::redact_consumer_credentials_for_audit(consumer))
+}
+
 pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
     if config_update_target_was_not_found(error) {
         return not_found_response::<Consumer>();
@@ -2289,6 +2293,10 @@ impl AdminResource for Consumer {
 
     fn response_body(resource: &Self) -> Value {
         consumer_response_body(resource)
+    }
+
+    fn audit_body(resource: &Self) -> Value {
+        consumer_audit_body(resource)
     }
 
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {

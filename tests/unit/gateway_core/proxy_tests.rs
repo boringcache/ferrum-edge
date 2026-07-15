@@ -352,6 +352,32 @@ impl Plugin for RejectingAuth {
     }
 }
 
+struct IdentityThenRejectAuth;
+
+#[async_trait]
+impl Plugin for IdentityThenRejectAuth {
+    fn name(&self) -> &str {
+        "identity_then_reject_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        ctx.authenticated_identity = Some("disabled-user".to_string());
+        PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"account disabled"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
 struct PermissiveMissingMeshAuth;
 
 #[async_trait]
@@ -636,6 +662,28 @@ async fn test_single_auth_stops_before_later_reject_after_success() {
 
     assert!(result.is_none());
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
+}
+
+#[tokio::test]
+async fn test_single_auth_preserves_reject_from_plugin_that_sets_identity() {
+    let plugin: Arc<dyn Plugin> = Arc::new(IdentityThenRejectAuth);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mixed-auth".to_string(),
+    );
+
+    let result = run_authentication_phase(
+        AuthMode::Single,
+        &[plugin],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await;
+
+    let (status, body, _headers) = result.expect("same-plugin rejection must remain terminal");
+    assert_eq!(status, 403);
+    assert_eq!(body, br#"{"error":"account disabled"}"#);
 }
 
 #[tokio::test]

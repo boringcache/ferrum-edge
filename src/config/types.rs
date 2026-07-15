@@ -5704,6 +5704,20 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     redacted
 }
 
+pub fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
+    let mut redacted = redact_consumer_credentials(consumer);
+    if consumer.credentials.contains_key("basicauth") {
+        // Audit events need to show that Basic credentials were present or
+        // changed, but must not disclose values, entry fields, or even the
+        // stored credential shape/cardinality. A single stable marker keeps
+        // the mutation visible without creating a credential side channel.
+        redacted
+            .credentials
+            .insert("basicauth".to_string(), serde_json::json!("[REDACTED]"));
+    }
+    redacted
+}
+
 pub(crate) fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
     if let Some(credentials) = consumer.credentials.get_mut("basicauth") {
         hash_credential_passwords(credentials).map_err(|error| {
@@ -5717,9 +5731,7 @@ pub(crate) fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), Strin
     Ok(())
 }
 
-fn hash_basic_auth_password(
-    password: &str,
-) -> Result<String, BasicAuthCredentialPreparationError> {
+fn hash_basic_auth_password(password: &str) -> Result<String, BasicAuthCredentialPreparationError> {
     let secret = crate::config::conf_file::resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET");
     hash_basic_auth_password_with_secret(password, secret.as_deref())
 }

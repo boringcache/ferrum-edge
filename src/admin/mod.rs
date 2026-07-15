@@ -3412,9 +3412,10 @@ async fn handle_update_credentials(
             "consumer_credentials",
             consumer_id,
             namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
+            audit::credential_update_diff(
+                cred_type,
+                crud::consumer_audit_body(&before),
+                crud::consumer_audit_body(&consumer),
             ),
         );
         if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
@@ -3463,9 +3464,10 @@ async fn handle_delete_credentials(
             "consumer_credentials",
             consumer_id,
             namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
+            audit::credential_update_diff(
+                cred_type,
+                crud::consumer_audit_body(&before),
+                crud::consumer_audit_body(&consumer),
             ),
         );
         if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
@@ -3574,9 +3576,10 @@ async fn handle_append_credential(
             "consumer_credentials",
             consumer_id,
             namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
+            audit::credential_update_diff(
+                cred_type,
+                crud::consumer_audit_body(&before),
+                crud::consumer_audit_body(&consumer),
             ),
         );
         if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
@@ -3670,9 +3673,10 @@ async fn handle_delete_credential_by_index(
             "consumer_credentials",
             consumer_id,
             namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
+            audit::credential_update_diff(
+                cred_type,
+                crud::consumer_audit_body(&before),
+                crud::consumer_audit_body(&consumer),
             ),
         );
         if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
@@ -3707,10 +3711,13 @@ fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClien
         })
 }
 
-fn validate_plugin_config_definition(
+pub(crate) fn validate_plugin_config_definition(
     pc: &PluginConfig,
     http_client: plugins::PluginHttpClient,
 ) -> Result<(), String> {
+    if !pc.enabled {
+        return Ok(());
+    }
     plugins::validate_plugin_config_with_http_client(&pc.plugin_name, &pc.config, http_client)
 }
 
@@ -5203,6 +5210,10 @@ fn is_unique_constraint_violation(error_msg: &str) -> bool {
 /// for safe inclusion in API responses.
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     crate::config::types::redact_consumer_credentials(consumer)
+}
+
+fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
+    crate::config::types::redact_consumer_credentials_for_audit(consumer)
 }
 
 fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {

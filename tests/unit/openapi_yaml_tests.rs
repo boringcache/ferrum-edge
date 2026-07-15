@@ -292,10 +292,24 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
         .expect("Consumer credentials description");
     assert!(credentials_description.contains("responses omit `basicauth` entirely"));
 
-    let password_hash = &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]
-        ["password_hash"];
+    let password_hash =
+        &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]["password_hash"];
     assert_eq!(password_hash["pattern"], "^hmac_sha256:[0-9a-f]{64}$");
     assert!(password_hash.get("writeOnly").is_none());
+
+    let plugin_config = &spec["components"]["schemas"]["PluginConfig"];
+    let config_description = plugin_config["properties"]["config"]["description"]
+        .as_str()
+        .expect("PluginConfig config description");
+    assert!(config_description.contains("Disabled plugin configs are stored without construction"));
+    assert!(config_description.contains("Enabling performs full validation"));
+
+    let audit_diff_description =
+        spec["components"]["schemas"]["AuditEvent"]["properties"]["diff"]["description"]
+            .as_str()
+            .expect("AuditEvent diff description");
+    assert!(audit_diff_description.contains("stable `[REDACTED]` marker"));
+    assert!(audit_diff_description.contains("never values, entry fields, shape, or count"));
 }
 
 fn normalized_path_template(path: &str) -> String {

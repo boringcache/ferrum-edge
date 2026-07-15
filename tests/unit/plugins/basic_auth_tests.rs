@@ -3,6 +3,7 @@
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, basic_auth::BasicAuth, priority,
+    utils::auth_flow::VerifyOutcome,
 };
 use hmac::{KeyInit, Mac};
 use serde_json::json;
@@ -125,10 +126,13 @@ async fn test_basic_auth_plugin_creation() {
     assert_eq!(plugin.name(), "basic_auth");
 }
 
-// NOTE: Testing the missing-HMAC-secret rejection path is not done here because
-// `std::env::remove_var` in a parallel test suite races with other tests that
-// need the env var. The rejection is verified by code inspection — the plugin
-// calls `.ok_or_else(...)` on the env var lookup.
+#[test]
+fn test_basic_auth_enabled_construction_requires_a_strong_hmac_secret() {
+    let construct = ferrum_edge::_test_support::basic_auth_construction_with_secret_for_test;
+    assert!(construct(&json!({}), None).is_err());
+    assert!(construct(&json!({}), Some("weak")).is_err());
+    assert!(construct(&json!({}), Some(TEST_HMAC_SECRET)).is_ok());
+}
 
 #[test]
 fn test_basic_auth_plugin_contract() {
@@ -545,4 +549,98 @@ async fn test_basic_auth_multi_password_wrong_password_rejected() {
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_basic_reject(result);
+}
+
+fn timing_consumer_with_hashes(hashes: Vec<String>) -> ferrum_edge::config::types::Consumer {
+    use chrono::Utc;
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    ferrum_edge::config::types::Consumer {
+        id: "basic-timing".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: "alice".to_string(),
+        custom_id: None,
+        credentials: HashMap::from([(
+            "basicauth".to_string(),
+            Value::Array(
+                hashes
+                    .into_iter()
+                    .map(|password_hash| json!({"password_hash": password_hash}))
+                    .collect(),
+            ),
+        )]),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn timing_password_hash(password: &str) -> String {
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+    let mut mac = HmacSha256::new_from_slice(&[b'x'; 32]).unwrap();
+    mac.update(password.as_bytes());
+    format!("hmac_sha256:{}", hex::encode(mac.finalize().into_bytes()))
+}
+
+#[test]
+fn test_verification_rounds_do_not_reveal_username_or_rotation_state() {
+    let dummy_password_hash = format!("hmac_sha256:{}", "0".repeat(64));
+
+    for (index, consumers) in [
+        Vec::new(),
+        vec![timing_consumer_with_hashes(vec![timing_password_hash(
+            "one",
+        )])],
+        vec![timing_consumer_with_hashes(vec![
+            timing_password_hash("one"),
+            timing_password_hash("two"),
+        ])],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let username = if index == 0 { "unknown" } else { "alice" };
+        let (outcome, verification_count) =
+            ferrum_edge::_test_support::basic_auth_verify_with_test_material_for_test(
+                dummy_password_hash.clone(),
+                2,
+                username,
+                "wrong",
+                &ConsumerIndex::new(&consumers),
+            );
+        assert!(matches!(outcome, VerifyOutcome::VerificationFailed(_)));
+        assert_eq!(verification_count, 2);
+    }
+}
+
+#[test]
+fn test_dummy_verification_round_cannot_authenticate_a_consumer() {
+    let consumers = [timing_consumer_with_hashes(vec![timing_password_hash(
+        "real-password",
+    )])];
+
+    let (outcome, verification_count) =
+        ferrum_edge::_test_support::basic_auth_verify_with_test_material_for_test(
+            timing_password_hash("dummy-password"),
+            2,
+            "alice",
+            "dummy-password",
+            &ConsumerIndex::new(&consumers),
+        );
+
+    assert!(matches!(outcome, VerifyOutcome::VerificationFailed(_)));
+    assert_eq!(verification_count, 2);
+}
+
+#[test]
+fn test_verification_rounds_are_bounded_by_serializable_credential_capacity() {
+    let bounded = ferrum_edge::_test_support::basic_auth_bounded_verification_rounds_for_test;
+    assert_eq!(bounded(0), 1);
+    assert_eq!(bounded(2), 2);
+    assert_eq!(
+        bounded(usize::MAX),
+        ferrum_edge::config::types::MAX_CREDENTIALS_SIZE / ("hmac_sha256:".len() + 64)
+    );
 }
