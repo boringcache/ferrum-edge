@@ -8,8 +8,8 @@ use ferrum_edge::plugins::prometheus_metrics::{
     global_registry,
 };
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Direction, Plugin, RequestContext, StreamTransactionSummary,
-    TransactionSummary, WsDisconnectContext,
+    ALL_PROTOCOLS, Direction, Plugin, RequestContext, StreamTransactionSummary, TransactionSummary,
+    WsDisconnectContext,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
@@ -1166,7 +1166,10 @@ async fn workload_metrics_response_code_override_changes_selected_metric_family(
     let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
     let mut headers = HashMap::new();
     let result = workload_metrics.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_edge::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
 
     let registry = MetricsRegistry::new();
     let mut summary = make_summary("response-code-override", "GET", 503, 10.0, 5.0);
@@ -1182,7 +1185,10 @@ async fn workload_metrics_response_code_override_changes_selected_metric_family(
         .find(|line| line.starts_with("ferrum_mesh_request_duration_ms_count{"))
         .expect("mesh request duration count");
 
-    assert!(counter.contains("response_code=\"server_error\""), "{counter}");
+    assert!(
+        counter.contains("response_code=\"server_error\""),
+        "{counter}"
+    );
     assert!(!duration.contains("response_code="), "{duration}");
     assert!(duration.contains("response_flags=\"503\""), "{duration}");
 }

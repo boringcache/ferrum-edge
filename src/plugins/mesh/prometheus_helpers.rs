@@ -1204,10 +1204,10 @@ fn metric_label_value(key: &MeshRequestKey, label: MeshMetricLabel) -> Arc<str> 
         MeshMetricLabel::RequestProtocol => Arc::clone(&key.request_protocol),
         MeshMetricLabel::ResponseFlags => Arc::clone(&key.response_flags),
         MeshMetricLabel::ConnectionSecurityPolicy => Arc::clone(&key.connection_security_policy),
-        MeshMetricLabel::ResponseCode => key.response_code_override.as_ref().map_or_else(
-            || intern_label(&key.response_code.to_string()),
-            Arc::clone,
-        ),
+        MeshMetricLabel::ResponseCode => key
+            .response_code_override
+            .as_ref()
+            .map_or_else(|| intern_label(&key.response_code.to_string()), Arc::clone),
     }
 }
 

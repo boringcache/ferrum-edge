@@ -430,10 +430,7 @@ impl WorkloadMetrics {
         // field, including locally generated context when the transformer adds
         // traceparent. Removed or malformed captured context stays suppressed
         // while the early IDs remain available for the local span/reject record.
-        let captured_traceparent = ctx
-            .metadata
-            .remove(CAPTURED_TRACEPARENT_METADATA)
-            .is_some();
+        let captured_traceparent = ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA).is_some();
         let captured_b3 = ctx.metadata.remove(CAPTURED_B3_METADATA).is_some();
         let final_traceparent = has_valid_traceparent(headers);
         let final_b3 = !final_traceparent && has_b3_trace_context(headers);

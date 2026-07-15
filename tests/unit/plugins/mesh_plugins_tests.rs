@@ -5657,10 +5657,7 @@ async fn workload_metrics_does_not_restore_b3_context_removed_by_transformer() {
     let mut ctx = request_context(None);
     ctx.headers = HashMap::from([
         ("x-b3-traceid".to_string(), original_trace_id.to_string()),
-        (
-            "x-b3-spanid".to_string(),
-            "bbbbbbbbbbbbbbbb".to_string(),
-        ),
+        ("x-b3-spanid".to_string(), "bbbbbbbbbbbbbbbb".to_string()),
         ("x-b3-sampled".to_string(), "1".to_string()),
     ]);
 
@@ -5679,9 +5676,11 @@ async fn workload_metrics_does_not_restore_b3_context_removed_by_transformer() {
     assert!(matches!(result, PluginResult::Continue));
 
     assert!(
-        headers.keys().all(|name| !name.eq_ignore_ascii_case("traceparent")
-            && !name.eq_ignore_ascii_case("b3")
-            && !name.to_ascii_lowercase().starts_with("x-b3-"))
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("traceparent")
+                && !name.eq_ignore_ascii_case("b3")
+                && !name.to_ascii_lowercase().starts_with("x-b3-"))
     );
     assert!(!ctx.metadata.contains_key("traceparent"));
     assert_eq!(
@@ -5730,10 +5729,7 @@ async fn workload_metrics_propagates_final_valid_b3_replacement() {
     let mut ctx = request_context(None);
     ctx.headers = HashMap::from([
         ("x-b3-traceid".to_string(), original_trace_id.to_string()),
-        (
-            "x-b3-spanid".to_string(),
-            "bbbbbbbbbbbbbbbb".to_string(),
-        ),
+        ("x-b3-spanid".to_string(), "bbbbbbbbbbbbbbbb".to_string()),
         ("x-b3-sampled".to_string(), "1".to_string()),
     ]);
 
