@@ -1462,10 +1462,8 @@ async fn handle_h3_request(
 
     // Map runtime HTTP flavor to the plugin-cache protocol key so H3 requests
     // load the same plugin/auth/capability set as the H1/H2 dispatch path.
-    let request_protocol = h3_plugin_protocol_for_request(
-        http_flavor,
-        grpc_web_response_content_type.is_some(),
-    );
+    let request_protocol =
+        h3_plugin_protocol_for_request(http_flavor, grpc_web_response_content_type.is_some());
     if request_protocol == ProxyProtocol::Grpc {
         ctx.metadata
             .entry("request_protocol".to_string())
@@ -2857,11 +2855,7 @@ async fn handle_h3_request(
         // (gRPC errors ride 200), so the recorded request status must match the
         // wire — 200 for gRPC, 502 otherwise — to agree with the H1/H2 gRPC
         // egress reject path.
-        let reject_metric_status = if is_grpc_request {
-            200
-        } else {
-            502
-        };
+        let reject_metric_status = if is_grpc_request { 200 } else { 502 };
         record_request(&state, reject_metric_status);
         send_h3_error_flavor_aware(
             &mut stream,
@@ -2941,11 +2935,7 @@ async fn handle_h3_request(
             false,
             backend_start.elapsed(),
         );
-        let reject_metric_status = if is_grpc_request {
-            200
-        } else {
-            502
-        };
+        let reject_metric_status = if is_grpc_request { 200 } else { 502 };
         record_request(&state, reject_metric_status);
         let reason_headers =
             HashMap::from([("gateway-error-reason".to_string(), reason.to_string())]);
@@ -9025,13 +9015,8 @@ async fn send_h3_reject_flavor_aware(
             }
             response.headers.insert(key.clone(), value.clone());
         }
-        return send_h3_reject_response(
-            stream,
-            StatusCode::OK,
-            &response.body,
-            &response.headers,
-        )
-        .await;
+        return send_h3_reject_response(stream, StatusCode::OK, &response.body, &response.headers)
+            .await;
     }
 
     // Build a trailers-only gRPC error that preserves any custom headers
@@ -9374,7 +9359,9 @@ mod native_h3_retry_refinement_tests {
             .expect("end of handle_h3_request not found");
         let handler = &handler_tail[..handler_end];
         assert!(handler.contains("(!has_retry || retry_response_needs_header_refinement)"));
-        assert!(handler.contains("let use_native_h3_pool = backend_http_flavor == HttpFlavor::Plain"));
+        assert!(
+            handler.contains("let use_native_h3_pool = backend_http_flavor == HttpFlavor::Plain")
+        );
         assert!(handler.contains("&& !is_grpc_request"));
         assert!(handler.contains("&& !forces_reqwest_dispatch"));
         assert!(handler.contains("&& backend_supports_native_h3"));

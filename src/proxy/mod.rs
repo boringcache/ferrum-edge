@@ -20182,10 +20182,8 @@ async fn handle_proxy_request_inner(
                     );
                 }
                 if let Some(deadline) = ctx.grpc_deadline_at() {
-                    inspected = inspected.with_client_grpc_deadline(
-                        deadline,
-                        grpc_web_response_content_type,
-                    );
+                    inspected = inspected
+                        .with_client_grpc_deadline(deadline, grpc_web_response_content_type);
                 }
                 inspected
             } else {
@@ -22057,11 +22055,7 @@ async fn proxy_to_backend(
             Ok(result) => result,
             Err(_) => {
                 return backend_dispatch_response(
-                    client_grpc_deadline_exceeded_response_for_request(
-                        request_ctx,
-                        headers,
-                        None,
-                    ),
+                    client_grpc_deadline_exceeded_response_for_request(request_ctx, headers, None),
                     None,
                     None,
                 );
@@ -22871,12 +22865,11 @@ async fn proxy_to_backend(
                             );
                         }
                         Err(RequestBodyWaitError::DeadlineExceeded) => {
-                            let response =
-                                client_grpc_deadline_exceeded_response_for_request(
-                                    request_ctx,
-                                    headers,
-                                    resolved_ip.clone(),
-                                );
+                            let response = client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip.clone(),
+                            );
                             return backend_dispatch_response(response, None, None);
                         }
                         Err(RequestBodyWaitError::TimedOut) => {
@@ -22918,12 +22911,11 @@ async fn proxy_to_backend(
                             );
                         }
                         Err(RequestBodyWaitError::DeadlineExceeded) => {
-                            let response =
-                                client_grpc_deadline_exceeded_response_for_request(
-                                    request_ctx,
-                                    headers,
-                                    resolved_ip.clone(),
-                                );
+                            let response = client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip.clone(),
+                            );
                             return backend_dispatch_response(response, None, None);
                         }
                         Err(RequestBodyWaitError::TimedOut) => {
@@ -24417,9 +24409,10 @@ fn client_grpc_deadline_exceeded_response_for_request(
     if crate::plugins::grpc_web::request_is_grpc_web_translated(request_ctx) {
         return client_grpc_deadline_exceeded_response(resolved_ip);
     }
-    let Some(content_type) = request_headers.get("content-type").filter(|content_type| {
-        crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
-    }) else {
+    let Some(content_type) = request_headers
+        .get("content-type")
+        .filter(|content_type| crate::plugins::grpc_web::is_grpc_web_content_type(content_type))
+    else {
         return client_grpc_deadline_exceeded_response(resolved_ip);
     };
     let translated = crate::plugins::grpc_web::error_response_for_content_type(

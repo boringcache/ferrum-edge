@@ -592,22 +592,22 @@ impl ProxyBody {
         let placeholder = ProxyBodyKind::Full(Full::default());
         let previous = std::mem::replace(&mut self.kind, placeholder);
         self.kind = match previous {
-            ProxyBodyKind::Stream(body) => ProxyBodyKind::Stream(Box::pin(
-                TotalDeadlineBody::with_deadline_frame(
+            ProxyBodyKind::Stream(body) => {
+                ProxyBodyKind::Stream(Box::pin(TotalDeadlineBody::with_deadline_frame(
                     body,
                     Some(deadline),
                     deadline_frame,
                     Arc::clone(&fired),
-                ),
-            )),
-            ProxyBodyKind::Tracked(body) => ProxyBodyKind::Stream(Box::pin(
-                TotalDeadlineBody::with_deadline_frame(
+                )))
+            }
+            ProxyBodyKind::Tracked(body) => {
+                ProxyBodyKind::Stream(Box::pin(TotalDeadlineBody::with_deadline_frame(
                     body,
                     Some(deadline),
                     deadline_frame,
                     Arc::clone(&fired),
-                ),
-            )),
+                )))
+            }
             full @ ProxyBodyKind::Full(_) => full,
         };
         self.client_grpc_deadline_fired = Some(fired);
@@ -954,16 +954,10 @@ impl http_body::Body for ProxyBody {
                                 .with_grpc_status(grpc_status),
                         );
                     }
-                    let terminal_class = client_deadline_fired
-                        .then_some(ErrorClass::ClientDisconnect);
-                    this.record_deferred_backend_admission(
-                        terminal_class,
-                        client_deadline_fired,
-                    );
-                    this.record_deferred_backend_dispatch(
-                        terminal_class,
-                        client_deadline_fired,
-                    );
+                    let terminal_class =
+                        client_deadline_fired.then_some(ErrorClass::ClientDisconnect);
+                    this.record_deferred_backend_admission(terminal_class, client_deadline_fired);
+                    this.record_deferred_backend_dispatch(terminal_class, client_deadline_fired);
                 }
             }
             Poll::Ready(Some(Err(e))) => {
@@ -988,8 +982,7 @@ impl http_body::Body for ProxyBody {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
                     logger.fire(crate::proxy::deferred_log::BodyOutcome::success(bytes));
                 }
-                let terminal_class =
-                    client_deadline_fired.then_some(ErrorClass::ClientDisconnect);
+                let terminal_class = client_deadline_fired.then_some(ErrorClass::ClientDisconnect);
                 this.record_deferred_backend_admission(terminal_class, client_deadline_fired);
                 this.record_deferred_backend_dispatch(terminal_class, client_deadline_fired);
             }
@@ -2537,12 +2530,7 @@ struct TotalDeadlineBody<B> {
 
 impl<B> TotalDeadlineBody<B> {
     fn new(inner: B, deadline: Option<tokio::time::Instant>) -> Self {
-        Self::with_deadline_frame(
-            inner,
-            deadline,
-            None,
-            Arc::new(AtomicBool::new(false)),
-        )
+        Self::with_deadline_frame(inner, deadline, None, Arc::new(AtomicBool::new(false)))
     }
 
     fn with_deadline_frame(
