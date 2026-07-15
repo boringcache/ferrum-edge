@@ -15443,6 +15443,15 @@ async fn handle_proxy_request_inner(
     let needs_final_request_body_context = requires_request_body_buffering
         && capabilities
             .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    // Provider-dispatch plugins synthesize the complete response from the
+    // finalized request body. Their hook is therefore the dispatch boundary,
+    // not a backend-response substitute: run it before any backend-only
+    // breaker, egress, admission, pool, or TLS work. This bit is precomputed at
+    // config reload so the hot path does not scan the plugin list.
+    let final_body_before_backend_dispatch = requires_request_body_buffering
+        && capabilities.has(
+            crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH,
+        );
     let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
@@ -15528,6 +15537,136 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
+    // A terminal final-body plugin (currently `ai_federation`) owns its own
+    // external dispatch and returns the complete response. Finalize and invoke
+    // it after inbound transport policy, but before the placeholder route's
+    // backend circuit breaker and every backend-only preflight. Besides
+    // preventing an unrelated backend policy from suppressing provider calls,
+    // returning here keeps synthetic provider outcomes out of backend health,
+    // breaker, and latency accounting.
+    if final_body_before_backend_dispatch {
+        let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &hook_headers,
+                    state.max_request_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        record_request(&state, 413);
+                        return Ok(build_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while finalizing terminal request body before backend dispatch"
+                        );
+                        record_request(&state, 499);
+                        return Ok(build_response(
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::TimedOut) => {
+                        let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
+                }
+            }
+            buffered => buffered,
+        };
+
+        client_request_body = match client_request_body {
+            ClientRequestBody::Buffered(body) => {
+                ctx.bytes_sent_observed
+                    .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                let mut body_hook_ctx = needs_final_request_body_context
+                    .then(|| ctx.clone_for_final_request_body_hooks());
+                let transformed = apply_request_body_plugins_with_context(
+                    &plugins,
+                    body_hook_ctx.as_mut(),
+                    &hook_headers,
+                    body,
+                )
+                .await;
+                let final_body_result = run_final_request_body_hooks(
+                    &plugins,
+                    body_hook_ctx.as_mut(),
+                    &hook_headers,
+                    &transformed,
+                )
+                .await;
+                if let Some(body_hook_ctx) = body_hook_ctx {
+                    let request_body = ctx.metadata.remove("request_body");
+                    ctx.metadata = body_hook_ctx.metadata;
+                    if let Some(body) = request_body {
+                        ctx.metadata.insert("request_body".to_string(), body);
+                    }
+                    ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                    ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
+                    ctx.waf_score = body_hook_ctx.waf_score;
+                }
+                match final_body_result {
+                    PluginResult::Continue => {
+                        request_body_prepared = true;
+                        ClientRequestBody::Buffered(transformed)
+                    }
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            record_request(&state, 500);
+                            return Ok(build_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                r#"{"error":"Internal error"}"#,
+                            ));
+                        };
+                        let status = StatusCode::from_u16(reject.status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let normalized = finalize_reject_response_with_after_proxy_hooks(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            &reject.body,
+                            reject.headers,
+                            is_grpc_request,
+                        )
+                        .await;
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        log_rejected_request_with_path(
+                            &plugins,
+                            &ctx,
+                            normalized.http_status.as_u16(),
+                            start_time,
+                            "on_final_request_body",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await;
+                        record_request(&state, normalized.http_status.as_u16());
+                        return Ok(build_response_from_normalized_reject(normalized));
+                    }
+                }
+            }
+            bodyless => bodyless,
+        };
+    }
+
     let upstream_balancer = selection.balancer;
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
@@ -15584,15 +15723,17 @@ async fn handle_proxy_request_inner(
             }
         };
 
-    // Finalize the body only after fail-fast routing and breaker gates have
-    // admitted the request. This preserves the open-breaker behavior (no slow
-    // upload drain or body-plugin I/O before the immediate 503) while still
-    // updating response buffering and transport preference before dispatch.
+    // For ordinary response-policy reevaluation, finalize the body only after
+    // fail-fast routing and breaker gates have admitted the request. This
+    // preserves the open-breaker behavior (no slow upload drain or body-plugin
+    // I/O before the immediate 503). Terminal dispatch plugins were finalized
+    // above and skip this second pass via `request_body_prepared`.
     let preparation_backend_host = upstream_target
         .as_deref()
         .map(|target| target.host.as_str())
         .unwrap_or(proxy.backend_host.as_str());
-    let preparation_requires_direct_h2_for_sni = reevaluate_response_policy_after_request_body
+    let preparation_requires_direct_h2_for_sni = !request_body_prepared
+        && reevaluate_response_policy_after_request_body
         && resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref())
             .resolved_tls
             .sni
@@ -15606,7 +15747,10 @@ async fn handle_proxy_request_inner(
         .is_some()
         || backend_dispatch::direct_http_mesh_transport_refusal(upstream_target.as_deref())
             .is_some();
-    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
+    if reevaluate_response_policy_after_request_body
+        && !request_body_prepared
+        && !preparation_blocked_by_dispatch_policy
+    {
         if !backend_admission_plugins.is_empty() {
             let admission_proxy =
                 resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());

@@ -3284,6 +3284,20 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns true when the final request-body hook is a terminal dispatch
+    /// boundary and must run before backend-only circuit-breaker, egress,
+    /// admission, pool, or TLS work.
+    ///
+    /// This is narrower than [`Plugin::needs_final_request_body_context`]. It
+    /// is intended for plugins such as provider federators that consume the
+    /// finalized HTTP request body, perform their own external dispatch, and
+    /// return the complete client response from the hook. Ordinary validators
+    /// should keep the default so fail-fast backend gates can reject without
+    /// first draining a client upload.
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        false
+    }
+
     /// Transform the response body before it is sent to the client.
     ///
     /// Called after `on_response_body` hooks, only for buffered responses

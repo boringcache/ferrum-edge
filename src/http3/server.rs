@@ -2513,12 +2513,14 @@ async fn handle_h3_request(
                     return Ok(());
                 };
                 let mut headers = reject.headers;
-                crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
+                crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
                     &plugins,
                     &mut ctx,
                     &mut reject.status_code,
-                    &mut reject.body,
                     &mut headers,
+                    &mut reject.body,
+                    matches!(http_flavor, HttpFlavor::Grpc),
+                    true,
                 )
                 .await;
                 let http_status =
@@ -4256,12 +4258,14 @@ async fn handle_h3_request(
                 return Ok(());
             };
             let mut headers = reject.headers;
-            crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
+            crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
                 &plugins,
                 &mut ctx,
                 &mut reject.status_code,
-                &mut reject.body,
                 &mut headers,
+                &mut reject.body,
+                matches!(http_flavor, HttpFlavor::Grpc),
+                true,
             )
             .await;
             let http_status =

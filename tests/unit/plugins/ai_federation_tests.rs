@@ -69,6 +69,7 @@ fn test_plugin_metadata_and_warmup_hostnames() {
     assert!(!plugin.requires_request_body_before_before_proxy());
     assert!(plugin.requires_request_body_buffering());
     assert!(plugin.needs_final_request_body_context());
+    assert!(plugin.requires_final_request_body_before_backend_dispatch());
     assert!(!plugin.requires_response_body_buffering());
     assert!(!plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());

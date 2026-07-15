@@ -4628,6 +4628,10 @@ impl Plugin for AiFederation {
         true
     }
 
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+        true
+    }
+
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         if ctx.method != "POST" {
             return false;

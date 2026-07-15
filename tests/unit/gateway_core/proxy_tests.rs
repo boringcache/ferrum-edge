@@ -3,6 +3,31 @@ use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayC
 use ferrum_edge::proxy::{build_backend_url, build_backend_url_with_target};
 use ferrum_edge::router_cache::RouterCache;
 
+#[test]
+fn terminal_final_body_dispatch_precedes_backend_breaker_and_transport() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let terminal_dispatch = src
+        .find("if final_body_before_backend_dispatch {")
+        .expect("terminal final-body dispatch gate must remain present");
+    let breaker = src[terminal_dispatch..]
+        .find("// Circuit breaker check")
+        .map(|offset| terminal_dispatch + offset)
+        .expect("backend circuit-breaker gate must remain present");
+    let provider_hook = src[terminal_dispatch..breaker]
+        .find("run_final_request_body_hooks(")
+        .expect("terminal final-body hook must run before the backend breaker");
+    let synthetic_pipeline = src[terminal_dispatch..breaker]
+        .find("finalize_reject_response_with_after_proxy_hooks(")
+        .expect("terminal response must use the synthetic response pipeline");
+    let backend_transport = src
+        .find("async fn proxy_to_backend(")
+        .expect("backend transport function must remain present");
+
+    assert!(provider_hook < synthetic_pipeline);
+    assert!(terminal_dispatch < breaker);
+    assert!(breaker < backend_transport);
+}
+
 fn test_proxy() -> Proxy {
     Proxy {
         id: "test".into(),
