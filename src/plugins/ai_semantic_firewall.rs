@@ -2288,6 +2288,9 @@ impl Plugin for AiSemanticFirewall {
         if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
             return PluginResult::Continue;
         }
+        if is_partial_response(ctx, response_status, response_headers) {
+            return PluginResult::Continue;
+        }
 
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let encoded_body = has_non_identity_content_encoding(response_headers)
@@ -2330,6 +2333,9 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
         if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
+            return PluginResult::Continue;
+        }
+        if is_partial_response(ctx, response_status, response_headers) {
             return PluginResult::Continue;
         }
 

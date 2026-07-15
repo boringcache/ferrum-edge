@@ -3642,14 +3642,16 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
     );
 }
 
-#[test]
-fn partial_encoded_responses_are_not_buffered() {
+#[tokio::test]
+async fn partial_encoded_responses_skip_buffering_and_response_hooks() {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
         "builtins": {"response_leakage": true}
     });
     let firewall = plugin(&config);
+    let complete_gzip = gzip_bytes(b"complete encoded representation");
+    let gzip_fragment = &complete_gzip[1..complete_gzip.len() - 1];
 
     for (status, headers) in [
         (
@@ -3671,14 +3673,75 @@ fn partial_encoded_responses_are_not_buffered() {
             ]),
         ),
     ] {
-        let ctx = create_test_context();
+        let mut ctx = create_test_context();
         assert!(!firewall.should_buffer_response_body_for_content_type(
             &ctx,
             Some("text/plain"),
             status,
             &headers,
         ));
+        assert_continue(
+            firewall
+                .on_response_body(&mut ctx, status, &headers, gzip_fragment)
+                .await,
+        );
+        assert_continue(
+            firewall
+                .on_final_response_body(&mut ctx, status, &headers, gzip_fragment)
+                .await,
+        );
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_semantic_firewall.uninspectable_body")
+        );
+        assert!(!ctx.metadata.contains_key("ai_semantic_firewall.rule_ids"));
     }
+}
+
+#[tokio::test]
+async fn original_range_marker_skips_final_hook_after_content_range_removal() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let complete_gzip = gzip_bytes(b"complete encoded representation");
+    let gzip_fragment = &complete_gzip[1..complete_gzip.len() - 1];
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+        (
+            "content-range".to_string(),
+            "bytes 0-99/5000".to_string(),
+        ),
+    ]);
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ferrum:range_response".to_string(), "true".to_string());
+
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 200, &headers, gzip_fragment)
+            .await,
+    );
+    headers.remove("content-range");
+    assert!(!firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/plain"),
+        200,
+        &headers,
+    ));
+    assert_continue(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, gzip_fragment)
+            .await,
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.uninspectable_body")
+    );
+    assert!(!ctx.metadata.contains_key("ai_semantic_firewall.rule_ids"));
 }
 
 #[test]
