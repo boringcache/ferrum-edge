@@ -304,10 +304,10 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
     assert!(config_description.contains("Disabled plugin configs are stored without construction"));
     assert!(config_description.contains("Enabling performs full validation"));
 
-    let audit_diff_description =
-        spec["components"]["schemas"]["AuditEvent"]["properties"]["diff"]["description"]
-            .as_str()
-            .expect("AuditEvent diff description");
+    let audit_diff_description = spec["components"]["schemas"]["AuditEvent"]["properties"]["diff"]
+        ["description"]
+        .as_str()
+        .expect("AuditEvent diff description");
     assert!(audit_diff_description.contains("stable `[REDACTED]` marker"));
     assert!(audit_diff_description.contains("never values, entry fields, shape, or count"));
 }
