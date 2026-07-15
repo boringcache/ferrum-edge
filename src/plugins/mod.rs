@@ -263,10 +263,7 @@ impl BufferedInitialResponseHeaderPolicyState {
         selected
     }
 
-    fn header_value_ci<'a>(
-        headers: &'a HashMap<String, String>,
-        name: &str,
-    ) -> Option<&'a String> {
+    fn header_value_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
         headers.get(name).or_else(|| {
             headers
                 .iter()

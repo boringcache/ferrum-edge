@@ -8844,8 +8844,7 @@ async fn send_h3_error_flavor_aware_with_policy(
             &mut headers,
             initial_response_header_policy_plugins,
         );
-        send_h3_finalized_reject_response(stream, http_status, http_body.as_bytes(), &headers)
-            .await
+        send_h3_finalized_reject_response(stream, http_status, http_body.as_bytes(), &headers).await
     }
 }
 

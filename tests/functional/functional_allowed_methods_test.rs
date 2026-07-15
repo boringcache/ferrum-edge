@@ -190,7 +190,11 @@ async fn functional_allowed_methods_http1_and_h2_enforced_before_backend() {
     let h1_blocked = h1.post(&url).send().await.expect("h1 blocked POST");
     assert_eq!(h1_blocked.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     assert_allow_header(h1_blocked.headers(), &["GET", "HEAD"]);
-    assert!(!h1_blocked.headers().contains_key(http::header::CONTENT_TYPE));
+    assert!(
+        !h1_blocked
+            .headers()
+            .contains_key(http::header::CONTENT_TYPE)
+    );
     assert_eq!(
         h1_blocked
             .headers()
@@ -220,7 +224,11 @@ async fn functional_allowed_methods_http1_and_h2_enforced_before_backend() {
     assert_eq!(h2_blocked.version(), reqwest::Version::HTTP_2);
     assert_eq!(h2_blocked.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     assert_allow_header(h2_blocked.headers(), &["GET", "HEAD"]);
-    assert!(!h2_blocked.headers().contains_key(http::header::CONTENT_TYPE));
+    assert!(
+        !h2_blocked
+            .headers()
+            .contains_key(http::header::CONTENT_TYPE)
+    );
     assert_eq!(
         h2_blocked
             .headers()
