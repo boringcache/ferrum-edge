@@ -4224,13 +4224,8 @@ fn gemini_prompt_is_blocked(resp: &Value) -> Result<bool, String> {
     };
     match reason.as_str() {
         Some(
-            "SAFETY"
-            | "BLOCKLIST"
-            | "PROHIBITED_CONTENT"
-            | "MODEL_ARMOR"
-            | "IMAGE_SAFETY"
-            | "JAILBREAK"
-            | "OTHER",
+            "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "MODEL_ARMOR" | "IMAGE_SAFETY"
+            | "JAILBREAK" | "OTHER",
         ) => Ok(true),
         Some("BLOCK_REASON_UNSPECIFIED" | "BLOCKED_REASON_UNSPECIFIED") => Ok(false),
         _ => Err("ai_federation: Gemini promptFeedback has an unsupported blockReason".to_string()),
