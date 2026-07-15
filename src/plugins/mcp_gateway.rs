@@ -13,7 +13,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_perc
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -379,6 +379,13 @@ struct RequestRewrite<'a> {
     response_resource_rewrite_possible: bool,
 }
 
+#[derive(Clone, Default)]
+struct CatalogCollisionTombstones {
+    tools: HashSet<String>,
+    prompts: HashSet<String>,
+    resources: HashSet<String>,
+}
+
 #[derive(Clone)]
 struct McpCatalog {
     tools: HashMap<String, ToolCatalogEntry>,
@@ -390,6 +397,27 @@ struct McpCatalog {
     resource_templates_refreshed_at: Option<Instant>,
     resource_templates_last_attempted_at: HashMap<String, Instant>,
     last_refreshed_wall: DateTime<Utc>,
+    // `(server_id, catalog family)` pairs whose most recent list refresh
+    // failed and whose entries (if any) are being served stale from the last
+    // good refresh. Bounded by configured servers x catalog families; exposed
+    // through `mcp.catalog_degraded` metadata.
+    degraded: BTreeSet<(String, &'static str)>,
+    // `(server_id, catalog family)` pairs with at least one successful list in
+    // this catalog's lifetime (a successful *empty* list counts). Carried
+    // forward across failed refreshes so "last-good empty" stays
+    // distinguishable from "never successfully listed"; availability is never
+    // inferred from entry counts. Bounded like `degraded`.
+    last_good: BTreeSet<(String, &'static str)>,
+    // Catalog families whose most recent refresh failed on every attempted
+    // upstream with no last-good state anywhere in the family. Requests for
+    // these families surface -32006 instead of a cached empty catalog until a
+    // refresh succeeds; other families stay usable.
+    unavailable: BTreeSet<&'static str>,
+    // Public keys suppressed by collision handling are absent from the maps
+    // above, so retain explicit tombstones across degraded refreshes. Otherwise
+    // a healthy upstream could become the temporary winner of a prior
+    // collision merely because another participant failed its list request.
+    collision_tombstones: CatalogCollisionTombstones,
 }
 
 impl Default for McpCatalog {
@@ -404,6 +432,10 @@ impl Default for McpCatalog {
             resource_templates_refreshed_at: None,
             resource_templates_last_attempted_at: HashMap::new(),
             last_refreshed_wall: Utc::now(),
+            degraded: BTreeSet::new(),
+            last_good: BTreeSet::new(),
+            unavailable: BTreeSet::new(),
+            collision_tombstones: CatalogCollisionTombstones::default(),
         }
     }
 }
@@ -421,6 +453,39 @@ impl McpCatalog {
             Some(refreshed) => refreshed.elapsed() >= ttl,
             None => true,
         }
+    }
+}
+
+/// Per-family success/failure accounting for one catalog refresh pass. A
+/// family is fully unavailable when every attempted upstream list failed and
+/// no attempted upstream has last-good state (a previous successful list,
+/// possibly empty) to serve stale — availability is deliberately not inferred
+/// from entry counts.
+#[derive(Default)]
+struct FamilyRefreshStats {
+    attempted: usize,
+    failed: usize,
+    has_last_good: bool,
+}
+
+impl FamilyRefreshStats {
+    fn record_success(&mut self) {
+        self.attempted += 1;
+        self.has_last_good = true;
+    }
+
+    fn record_failure(&mut self, had_last_good: bool) {
+        self.attempted += 1;
+        self.failed += 1;
+        self.has_last_good |= had_last_good;
+    }
+
+    fn fully_unavailable(&self) -> bool {
+        self.attempted > 0 && self.failed == self.attempted && !self.has_last_good
+    }
+
+    fn fully_authoritative(&self) -> bool {
+        self.attempted > 0 && self.failed == 0
     }
 }
 
@@ -673,6 +738,26 @@ impl McpGateway {
         ctx.metadata
             .entry("mcp.schema_validation".to_string())
             .or_insert_with(|| "skipped".to_string());
+    }
+
+    /// Emit the degraded (server, family) pairs a catalog is serving stale as
+    /// bounded `mcp.catalog_degraded` metadata (sorted `server:family` pairs).
+    /// Server ids are operator config, never upstream URLs or credentials.
+    fn emit_catalog_degraded_metadata(&self, ctx: &mut RequestContext, catalog: &McpCatalog) {
+        if !self.observability.emit_metadata || catalog.degraded.is_empty() {
+            return;
+        }
+        let mut degraded = String::new();
+        for (server_id, family) in &catalog.degraded {
+            if !degraded.is_empty() {
+                degraded.push(',');
+            }
+            degraded.push_str(server_id);
+            degraded.push(':');
+            degraded.push_str(family);
+        }
+        ctx.metadata
+            .insert("mcp.catalog_degraded".to_string(), degraded);
     }
 
     fn emit_envelope_metadata(&self, ctx: &mut RequestContext, envelope: &McpEnvelope) {
@@ -1247,10 +1332,19 @@ impl McpGateway {
         Ok(())
     }
 
+    /// The gateway's preferred protocol version: the first configured entry in
+    /// `endpoint.protocol_versions`. This is the version negotiated on
+    /// `initialize` when the client requests an unsupported version and the
+    /// default whenever no session version is known. Indexing is safe: config
+    /// validation rejects an empty `protocol_versions` list.
+    fn preferred_protocol_version(&self) -> &str {
+        &self.supported_protocol_versions[0]
+    }
+
     fn protocol_version_for_session(&self, downstream_session_id: &str) -> String {
         self.downstream_session_clone(downstream_session_id)
             .map(|session| session.protocol_version.clone())
-            .unwrap_or_else(|| self.supported_protocol_versions[0].clone())
+            .unwrap_or_else(|| self.preferred_protocol_version().to_string())
     }
 
     fn protocol_version_for_upstream(
@@ -1266,7 +1360,7 @@ impl McpGateway {
                     .and_then(|upstream| upstream.protocol_version.clone())
                     .or(Some(session.protocol_version))
             })
-            .unwrap_or_else(|| self.supported_protocol_versions[0].clone())
+            .unwrap_or_else(|| self.preferred_protocol_version().to_string())
     }
 
     /// Remove a session from the store without any upstream I/O. Splitting the
@@ -1638,14 +1732,22 @@ impl McpGateway {
         let mut tools = HashMap::new();
         let mut prompts = HashMap::new();
         let mut resources = HashMap::new();
-        let mut collided_tools = HashSet::new();
-        let mut collided_prompts = HashSet::new();
-        let mut collided_resources = HashSet::new();
+        let mut collision_tombstones = CatalogCollisionTombstones::default();
+        // A single unavailable upstream must not abort the whole refresh: each
+        // failed `*/list` keeps that (server, family)'s last-good entries stale
+        // and is recorded as degraded, while other upstreams and families
+        // refresh normally. Only iterated (enabled + exposed) servers can carry
+        // entries forward, so disabled/removed/unexposed servers still drop out.
+        // Availability is accounted per catalog family so a healthy family can
+        // never mask another family's total outage.
+        let mut degraded: Vec<(String, &'static str)> = Vec::new();
+        let mut last_good: BTreeSet<(String, &'static str)> = BTreeSet::new();
+        let mut families: BTreeMap<&'static str, FamilyRefreshStats> = BTreeMap::new();
         let discovered_at = Utc::now();
 
         for server in self.servers.values().filter(|server| server.enabled) {
             if self.discovery.aggregate_tools && server.expose_tools {
-                let items = self
+                match self
                     .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
@@ -1653,25 +1755,55 @@ impl McpGateway {
                         "tools/list",
                         "tools",
                     )
-                    .await?;
-                for item in items {
-                    if let Some(entry) =
-                        self.tool_entry_from_value(server, item, discovered_at, &old_catalog)
-                    {
-                        let public_name = entry.public_name.clone();
-                        insert_catalog_entry(
+                    .await
+                {
+                    Ok(items) => {
+                        families.entry("tools").or_default().record_success();
+                        last_good.insert((server.server_id.clone(), "tools"));
+                        for item in items {
+                            if let Some(entry) = self.tool_entry_from_value(
+                                server,
+                                item,
+                                discovered_at,
+                                &old_catalog,
+                            ) {
+                                let public_name = entry.public_name.clone();
+                                insert_catalog_entry(
+                                    &mut tools,
+                                    &mut collision_tombstones.tools,
+                                    public_name,
+                                    entry,
+                                    &server.server_id,
+                                    "tool",
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let had_last_good = old_catalog
+                            .last_good
+                            .contains(&(server.server_id.clone(), "tools"));
+                        if had_last_good {
+                            last_good.insert((server.server_id.clone(), "tools"));
+                        }
+                        families
+                            .entry("tools")
+                            .or_default()
+                            .record_failure(had_last_good);
+                        carry_stale_entries(
+                            &old_catalog.tools,
                             &mut tools,
-                            &mut collided_tools,
-                            public_name,
-                            entry,
+                            &mut collision_tombstones.tools,
+                            |entry| entry.server_id == server.server_id,
                             &server.server_id,
                             "tool",
                         );
+                        degraded.push((server.server_id.clone(), "tools"));
                     }
                 }
             }
             if self.discovery.aggregate_prompts && server.expose_prompts {
-                let items = self
+                match self
                     .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
@@ -1679,23 +1811,52 @@ impl McpGateway {
                         "prompts/list",
                         "prompts",
                     )
-                    .await?;
-                for item in items {
-                    if let Some(entry) = self.prompt_entry_from_value(server, item, discovered_at) {
-                        let public_name = entry.public_name.clone();
-                        insert_catalog_entry(
+                    .await
+                {
+                    Ok(items) => {
+                        families.entry("prompts").or_default().record_success();
+                        last_good.insert((server.server_id.clone(), "prompts"));
+                        for item in items {
+                            if let Some(entry) =
+                                self.prompt_entry_from_value(server, item, discovered_at)
+                            {
+                                let public_name = entry.public_name.clone();
+                                insert_catalog_entry(
+                                    &mut prompts,
+                                    &mut collision_tombstones.prompts,
+                                    public_name,
+                                    entry,
+                                    &server.server_id,
+                                    "prompt",
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let had_last_good = old_catalog
+                            .last_good
+                            .contains(&(server.server_id.clone(), "prompts"));
+                        if had_last_good {
+                            last_good.insert((server.server_id.clone(), "prompts"));
+                        }
+                        families
+                            .entry("prompts")
+                            .or_default()
+                            .record_failure(had_last_good);
+                        carry_stale_entries(
+                            &old_catalog.prompts,
                             &mut prompts,
-                            &mut collided_prompts,
-                            public_name,
-                            entry,
+                            &mut collision_tombstones.prompts,
+                            |entry| entry.server_id == server.server_id,
                             &server.server_id,
                             "prompt",
                         );
+                        degraded.push((server.server_id.clone(), "prompts"));
                     }
                 }
             }
             if self.discovery.aggregate_resources && server.expose_resources {
-                let items = self
+                match self
                     .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
@@ -1703,22 +1864,106 @@ impl McpGateway {
                         "resources/list",
                         "resources",
                     )
-                    .await?;
-                for item in items {
-                    if let Some(entry) = self.resource_entry_from_value(server, item, discovered_at)
-                    {
-                        let public_uri = entry.public_uri.clone();
-                        insert_catalog_entry(
+                    .await
+                {
+                    Ok(items) => {
+                        families.entry("resources").or_default().record_success();
+                        last_good.insert((server.server_id.clone(), "resources"));
+                        for item in items {
+                            if let Some(entry) =
+                                self.resource_entry_from_value(server, item, discovered_at)
+                            {
+                                let public_uri = entry.public_uri.clone();
+                                insert_catalog_entry(
+                                    &mut resources,
+                                    &mut collision_tombstones.resources,
+                                    public_uri,
+                                    entry,
+                                    &server.server_id,
+                                    "resource",
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let had_last_good = old_catalog
+                            .last_good
+                            .contains(&(server.server_id.clone(), "resources"));
+                        if had_last_good {
+                            last_good.insert((server.server_id.clone(), "resources"));
+                        }
+                        families
+                            .entry("resources")
+                            .or_default()
+                            .record_failure(had_last_good);
+                        carry_stale_entries(
+                            &old_catalog.resources,
                             &mut resources,
-                            &mut collided_resources,
-                            public_uri,
-                            entry,
+                            &mut collision_tombstones.resources,
+                            |entry| entry.server_id == server.server_id,
                             &server.server_id,
                             "resource",
                         );
+                        degraded.push((server.server_id.clone(), "resources"));
                     }
                 }
             }
+        }
+
+        // A degraded family is not authoritative evidence that a prior
+        // collision disappeared: the failed upstream may still expose the
+        // colliding key. Reapply old tombstones after merging fresh and stale
+        // entries, and clear them only when every attempted upstream for that
+        // family listed successfully. Resource keys use a server-id-qualified
+        // URI and cannot collide across servers, but retaining their defensive
+        // duplicate-key tombstones here keeps all collision-checked maps on the
+        // same fail-closed lifecycle.
+        preserve_collision_tombstones(
+            &old_catalog.collision_tombstones.tools,
+            &mut collision_tombstones.tools,
+            &mut tools,
+            families.get("tools"),
+        );
+        preserve_collision_tombstones(
+            &old_catalog.collision_tombstones.prompts,
+            &mut collision_tombstones.prompts,
+            &mut prompts,
+            families.get("prompts"),
+        );
+        preserve_collision_tombstones(
+            &old_catalog.collision_tombstones.resources,
+            &mut collision_tombstones.resources,
+            &mut resources,
+            families.get("resources"),
+        );
+
+        // A fully unavailable family (every attempted list failed, no last-good
+        // state anywhere in the family) must not be published as an empty
+        // catalog: that would misreport a total family outage as
+        // healthy-and-empty for the whole cache TTL. It is marked on the
+        // catalog instead, and requests for that family surface -32006 while
+        // healthy families keep serving.
+        let unavailable: BTreeSet<&'static str> = families
+            .iter()
+            .filter(|(_, stats)| stats.fully_unavailable())
+            .map(|(family, _)| *family)
+            .collect();
+        // Total outage with nothing to serve in any attempted family: keep the
+        // catalog stale (the next request retries) and surface the refresh
+        // error instead of publishing a misleading empty catalog. The
+        // per-request warnings above already carry the failure detail.
+        if !families.is_empty() && unavailable.len() == families.len() {
+            let attempted_lists: usize = families.values().map(|stats| stats.attempted).sum();
+            return Err(format!(
+                "all {attempted_lists} MCP upstream catalog list requests failed"
+            ));
+        }
+        for (server_id, family) in &degraded {
+            warn!(
+                server_id = %server_id,
+                family,
+                "MCP upstream catalog list failed; retaining last-good family state when available"
+            );
         }
 
         let mut catalog = catalog_lock.write().await;
@@ -1733,6 +1978,19 @@ impl McpGateway {
         catalog.tools = tools;
         catalog.prompts = prompts;
         catalog.resources = resources;
+        catalog
+            .degraded
+            .retain(|(_, family)| *family == "resource_templates");
+        catalog.degraded.extend(degraded);
+        catalog
+            .last_good
+            .retain(|(_, family)| *family == "resource_templates");
+        catalog.last_good.extend(last_good);
+        catalog
+            .unavailable
+            .retain(|family| *family == "resource_templates");
+        catalog.unavailable.extend(unavailable);
+        catalog.collision_tombstones = collision_tombstones;
         if changed || catalog.version == 0 {
             catalog.version = catalog.version.saturating_add(1);
         }
@@ -1747,7 +2005,15 @@ impl McpGateway {
         downstream_session_id: &str,
         catalog_lock: &Arc<RwLock<McpCatalog>>,
     ) -> Result<(), String> {
+        let old_catalog = catalog_lock.read().await.clone();
         let mut resource_templates = HashMap::new();
+        // Same per-upstream degradation policy as refresh_catalog: a failing
+        // upstream keeps its last-good templates stale instead of aborting the
+        // refresh for every other upstream. Public template URIs are prefixed
+        // with the server id, so carried entries cannot collide across servers.
+        let mut degraded: Vec<String> = Vec::new();
+        let mut last_good: BTreeSet<(String, &'static str)> = BTreeSet::new();
+        let mut stats = FamilyRefreshStats::default();
         let discovered_at = Utc::now();
 
         if self.discovery.aggregate_resources {
@@ -1756,7 +2022,7 @@ impl McpGateway {
                 .values()
                 .filter(|server| server.enabled && server.expose_resources)
             {
-                let items = self
+                match self
                     .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
@@ -1764,21 +2030,71 @@ impl McpGateway {
                         "resources/templates/list",
                         "resourceTemplates",
                     )
-                    .await?;
-                for item in items {
-                    if let Some(entry) =
-                        self.resource_template_entry_from_value(server, item, discovered_at)
-                    {
-                        resource_templates.insert(entry.public_uri_template.clone(), entry);
+                    .await
+                {
+                    Ok(items) => {
+                        stats.record_success();
+                        last_good.insert((server.server_id.clone(), "resource_templates"));
+                        for item in items {
+                            if let Some(entry) =
+                                self.resource_template_entry_from_value(server, item, discovered_at)
+                            {
+                                resource_templates.insert(entry.public_uri_template.clone(), entry);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let had_last_good = old_catalog
+                            .last_good
+                            .contains(&(server.server_id.clone(), "resource_templates"));
+                        if had_last_good {
+                            last_good.insert((server.server_id.clone(), "resource_templates"));
+                        }
+                        stats.record_failure(had_last_good);
+                        for (public_uri_template, entry) in &old_catalog.resource_templates {
+                            if entry.server_id != server.server_id {
+                                continue;
+                            }
+                            resource_templates.insert(public_uri_template.clone(), entry.clone());
+                        }
+                        warn!(
+                            server_id = %server.server_id,
+                            family = "resource_templates",
+                            "MCP upstream catalog list failed; retaining last-good family state when available"
+                        );
+                        degraded.push(server.server_id.clone());
                     }
                 }
             }
+        }
+
+        // Total template outage with no last-good state (a prior successful —
+        // possibly empty — list): keep the template catalog stale so the next
+        // request retries, and surface -32006 instead of publishing an empty
+        // template catalog.
+        if stats.fully_unavailable() {
+            return Err(format!(
+                "all {attempted} MCP upstream resource template list requests failed",
+                attempted = stats.attempted
+            ));
         }
 
         let mut catalog = catalog_lock.write().await;
         let changed = catalog.resource_templates.keys().collect::<HashSet<_>>()
             != resource_templates.keys().collect();
         catalog.resource_templates = resource_templates;
+        catalog
+            .degraded
+            .retain(|(_, family)| *family != "resource_templates");
+        catalog.degraded.extend(
+            degraded
+                .into_iter()
+                .map(|server_id| (server_id, "resource_templates")),
+        );
+        catalog
+            .last_good
+            .retain(|(_, family)| *family != "resource_templates");
+        catalog.last_good.extend(last_good);
         if changed || catalog.version == 0 {
             catalog.version = catalog.version.saturating_add(1);
         }
@@ -1811,7 +2127,7 @@ impl McpGateway {
             .get(server_id)
             .filter(|server| server.enabled && server.expose_resources)
             .ok_or_else(|| format!("unknown or disabled MCP resource server {server_id:?}"))?;
-        let items = self
+        let items = match self
             .request_upstream_list_pages(
                 ctx,
                 downstream_session_id,
@@ -1819,7 +2135,17 @@ impl McpGateway {
                 "resources/templates/list",
                 "resourceTemplates",
             )
-            .await?;
+            .await
+        {
+            Ok(items) => items,
+            Err(error) => {
+                let mut catalog = catalog_lock.write().await;
+                catalog
+                    .degraded
+                    .insert((server_id.to_string(), "resource_templates"));
+                return Err(error);
+            }
+        };
         let discovered_at = Utc::now();
         let mut resource_templates = HashMap::new();
         for item in items {
@@ -1842,6 +2168,12 @@ impl McpGateway {
             .resource_templates
             .retain(|_, entry| entry.server_id != server_id);
         catalog.resource_templates.extend(resource_templates);
+        catalog
+            .degraded
+            .remove(&(server_id.to_string(), "resource_templates"));
+        catalog
+            .last_good
+            .insert((server_id.to_string(), "resource_templates"));
         if changed || catalog.version == 0 {
             catalog.version = catalog.version.saturating_add(1);
         }
@@ -2123,6 +2455,10 @@ impl McpGateway {
                 catalog.version.to_string(),
             );
         }
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
+        if let Some(response) = family_unavailable_error(&catalog, "tools", envelope.id.clone()) {
+            return response;
+        }
         let tools: Vec<Value> = catalog
             .tools
             .values()
@@ -2167,6 +2503,10 @@ impl McpGateway {
                 catalog.version.to_string(),
             );
         }
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
+        if let Some(response) = family_unavailable_error(&catalog, "prompts", envelope.id.clone()) {
+            return response;
+        }
         let prompts: Vec<Value> = catalog
             .prompts
             .values()
@@ -2206,6 +2546,11 @@ impl McpGateway {
                 "mcp.catalog_version".to_string(),
                 catalog.version.to_string(),
             );
+        }
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
+        if let Some(response) = family_unavailable_error(&catalog, "resources", envelope.id.clone())
+        {
+            return response;
         }
         let resources: Vec<Value> = catalog
             .resources
@@ -2260,6 +2605,7 @@ impl McpGateway {
                 catalog.version.to_string(),
             );
         }
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
         json_response(
             200,
             json!({
@@ -2309,6 +2655,10 @@ impl McpGateway {
             return session_not_found_response();
         };
         let catalog = catalog_lock.read().await;
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
+        if let Some(response) = family_unavailable_error(&catalog, "tools", envelope.id.clone()) {
+            return response;
+        }
         let Some(entry) = catalog.tools.get(&public_name).cloned() else {
             if self.observability.emit_metadata {
                 ctx.metadata
@@ -2477,6 +2827,10 @@ impl McpGateway {
             return session_not_found_response();
         };
         let catalog = catalog_lock.read().await;
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
+        if let Some(response) = family_unavailable_error(&catalog, "prompts", envelope.id.clone()) {
+            return response;
+        }
         let Some(entry) = catalog.prompts.get(&public_name).cloned() else {
             return json_rpc_error(envelope.id.clone(), -32008, "Unknown MCP prompt", None);
         };
@@ -2573,6 +2927,7 @@ impl McpGateway {
                 return session_not_found_response();
             };
             let catalog = catalog_lock.read().await;
+            self.emit_catalog_degraded_metadata(ctx, &catalog);
             catalog.resources.get(&public_uri).map(|entry| {
                 (
                     entry.server_id.clone(),
@@ -2659,6 +3014,11 @@ impl McpGateway {
                 let Some((server_id, upstream_uri)) =
                     resource_template_route(&catalog, &public_uri)
                 else {
+                    if let Some(response) =
+                        family_unavailable_error(&catalog, "resources", envelope.id.clone())
+                    {
+                        return response;
+                    }
                     if let Some(error) = catalog_error {
                         return catalog_error_response(
                             envelope.id.clone(),
@@ -3004,16 +3364,30 @@ impl Plugin for McpGateway {
 
         match method {
             "initialize" => {
-                let version =
-                    protocol_version.unwrap_or_else(|| self.supported_protocol_versions[0].clone());
-                if !self.supported_protocol_versions.contains(&version) {
-                    return json_rpc_error(
-                        envelope.id.clone(),
-                        -32602,
-                        "Unsupported MCP protocol version",
-                        None,
-                    );
-                }
+                // MCP initialize is a negotiation, not a gate: echo a supported
+                // requested version; otherwise answer with the gateway's
+                // preferred supported version and let the client decide whether
+                // to continue on it. Post-initialize requests still fail closed
+                // above when the MCP-Protocol-Version header is unsupported.
+                let version = match protocol_version {
+                    Some(requested)
+                        if self
+                            .supported_protocol_versions
+                            .iter()
+                            .any(|supported| supported == &requested) =>
+                    {
+                        requested
+                    }
+                    Some(_) => {
+                        let negotiated = self.preferred_protocol_version().to_string();
+                        ctx.metadata.insert(
+                            "mcp.protocol_version_negotiated".to_string(),
+                            negotiated.clone(),
+                        );
+                        negotiated
+                    }
+                    None => self.preferred_protocol_version().to_string(),
+                };
                 let client_info = envelope
                     .params
                     .as_ref()
@@ -3913,6 +4287,28 @@ fn catalog_error_response(
     }
 }
 
+/// `-32006` when a request targets a catalog family whose most recent refresh
+/// failed on every attempted upstream with no last-good state to serve: a
+/// cached empty `200` catalog would misreport a total family outage as an
+/// empty (but healthy) catalog. Returns `None` when the family is available.
+fn family_unavailable_error(
+    catalog: &McpCatalog,
+    family: &'static str,
+    id: Option<Value>,
+) -> Option<PluginResult> {
+    if !catalog.unavailable.contains(family) {
+        return None;
+    }
+    Some(json_rpc_error(
+        id,
+        -32006,
+        "MCP catalog unavailable",
+        Some(format!(
+            "every upstream {family} list failed and no last-good {family} catalog exists"
+        )),
+    ))
+}
+
 fn json_response(
     status_code: u16,
     body: Value,
@@ -3975,6 +4371,55 @@ fn insert_catalog_entry<T>(
         return;
     }
     map.insert(key, entry);
+}
+
+/// Carry one failed upstream's last-good entries for a single catalog family
+/// into the rebuilt catalog so a per-upstream refresh failure degrades only
+/// that upstream. Carried entries still pass through `insert_catalog_entry`,
+/// so a stale name colliding with another upstream's fresh name is dropped for
+/// both and can never route ambiguously.
+fn carry_stale_entries<T: Clone>(
+    old_entries: &HashMap<String, T>,
+    entries: &mut HashMap<String, T>,
+    collided: &mut HashSet<String>,
+    belongs_to_server: impl Fn(&T) -> bool,
+    server_id: &str,
+    item_kind: &str,
+) {
+    for (key, entry) in old_entries {
+        if !belongs_to_server(entry) {
+            continue;
+        }
+        insert_catalog_entry(
+            entries,
+            collided,
+            key.clone(),
+            entry.clone(),
+            server_id,
+            item_kind,
+        );
+    }
+}
+
+/// Keep previously ambiguous public keys suppressed unless the current family
+/// refresh is authoritative. Collision-suppressed entries are intentionally
+/// absent from the published maps, so carrying only map entries cannot retain
+/// this fail-closed state when one prior collision participant is unavailable.
+fn preserve_collision_tombstones<T>(
+    old_collisions: &HashSet<String>,
+    collisions: &mut HashSet<String>,
+    entries: &mut HashMap<String, T>,
+    refresh_stats: Option<&FamilyRefreshStats>,
+) {
+    if old_collisions.is_empty()
+        || refresh_stats.is_some_and(FamilyRefreshStats::fully_authoritative)
+    {
+        return;
+    }
+    for key in old_collisions {
+        entries.remove(key);
+        collisions.insert(key.clone());
+    }
 }
 
 /// HTTP 400 for a request that requires an MCP session but carried no session

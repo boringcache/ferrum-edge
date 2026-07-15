@@ -527,6 +527,49 @@ async fn test_multi_auth_marks_query_credentials_before_first_success_short_circ
 }
 
 #[tokio::test]
+async fn test_multi_auth_strips_skipped_key_auth_credentials_before_backend() {
+    let external: Arc<dyn Plugin> = Arc::new(ExternalIdentityAuth);
+    let header_key_auth: Arc<dyn Plugin> =
+        Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
+    let query_key_auth: Arc<dyn Plugin> =
+        Arc::new(KeyAuth::new(&json!({"key_location": "query:api_key"})).unwrap());
+    let plugins = vec![external, header_key_auth, query_key_auth];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/multi-auth".to_string(),
+    );
+    ctx.headers.insert(
+        "x-api-key".to_string(),
+        "must-not-reach-backend".to_string(),
+    );
+    ctx.query_params
+        .insert("api_key".to_string(), "must-not-reach-backend".to_string());
+
+    let result =
+        run_authentication_phase(AuthMode::Multi, &plugins, &mut ctx, &consumer_index).await;
+    assert!(result.is_none(), "the earlier external auth should win");
+
+    let mut backend_headers = ctx.headers.clone();
+    for plugin in &plugins {
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut backend_headers).await,
+            PluginResult::Continue
+        ));
+    }
+
+    assert!(!backend_headers.contains_key("x-api-key"));
+    assert!(!ctx.query_params.contains_key("api_key"));
+    assert_eq!(
+        ctx.metadata
+            .get("auth.strip_query_param.api_key")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
 async fn test_single_auth_missing_credentials_rejects_before_backend() {
     let key_auth: Arc<dyn Plugin> = Arc::new(KeyAuth::new(&json!({})).unwrap());
     let auth_plugins: Vec<Arc<dyn Plugin>> = vec![key_auth];

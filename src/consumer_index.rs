@@ -378,8 +378,8 @@ impl ConsumerIndex {
                     let prev = keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
                     if let Some(existing) = prev {
                         warn!(
-                            "Credential collision: keyauth key '{}' for consumer '{}' overwrites consumer '{}'",
-                            key, consumer.id, existing.id
+                            "Credential collision: keyauth credential for consumer '{}' overwrites consumer '{}'",
+                            consumer.id, existing.id
                         );
                     }
                 }

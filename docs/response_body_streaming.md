@@ -179,7 +179,7 @@ Built-in plugins with per-request refinement:
 | `compression` | `Accept-Encoding` header is absent (nothing to compress) |
 | `ai_token_metrics` | Request is native gRPC, or the client asked for a stream (`Accept: text/event-stream` / a `stream: true` request) without `buffer_streaming_responses: true` (pre-header); additionally, after headers, when the response content type is not JSON, or is `text/event-stream` without `buffer_streaming_responses: true` |
 | `ai_rate_limiter` | Never for active HTTP/gRPC responses; response usage reconciliation needs the body. Its pre-request reservation path only buffers request bodies for JSON `POST` requests. |
-| `ai_response_guard` | Request is not POST+JSON |
+| `ai_response_guard` | Client requested SSE (`Accept: text/event-stream`) or an earlier AI request plugin marked the request as streaming; all other HTTP requests request buffering, then response status/content type determine inspection |
 
 The decision in code:
 
@@ -214,9 +214,9 @@ need the body (caching, compression, response transforms, or `waf` for an
 allowlisted type) are unaffected. With retries configured, ordinary responses
 stay buffered. An active buffering plugin may explicitly opt an inherently
 streaming representation out after headers arrive only when every other active
-buffering plugin reports that it does not need that content type; MCP uses this
-for `text/event-stream`, whose retry decision is complete from status and
-headers and whose body must not be collected to EOF.
+buffering plugin reports that it does not need that content type; the MCP and
+A2A gateways use this for `text/event-stream`, whose retry decision is complete
+from status and headers and whose body must not be collected to EOF.
 
 **Protocol coverage.** The downgrade applies on the HTTP/1.1 + HTTP/2 (reqwest),
 direct-HTTP/2, and HBONE backend paths. **Native HTTP/3**, the **HTTP/3

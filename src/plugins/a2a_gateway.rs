@@ -768,6 +768,27 @@ impl Plugin for A2aGateway {
         self.should_buffer_response_body(ctx)
     }
 
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        // Release only SSE, mirroring the non-retry content-type hook above:
+        // an unexpected `text/event-stream` response is inherently streaming
+        // and its retry decision is complete from status and headers. Every
+        // other content type (JSON and otherwise) stays buffered because
+        // `on_response_body` consumes the buffered body for metadata emission
+        // and agent-card rewriting.
+        self.should_buffer_response_body(ctx)
+            && header_value(response_headers, "content-type")
+                .is_some_and(is_event_stream_content_type)
+    }
+
     fn requires_response_stream_hooks(&self) -> bool {
         self.enabled && self.observability.emit_metadata
     }

@@ -621,6 +621,43 @@ fn test_basic_auth_hmac_secret_requires_32_bytes() {
 }
 
 #[test]
+fn test_consumer_keyauth_requires_nonempty_string_key() {
+    for credential in [
+        serde_json::json!({}),
+        serde_json::json!({"kee": "misspelled"}),
+        serde_json::json!({"key": 42}),
+        serde_json::json!({"key": ""}),
+        serde_json::json!({"key": "   "}),
+    ] {
+        let mut consumer = make_consumer("test", "alice");
+        consumer
+            .credentials
+            .insert("keyauth".into(), serde_json::json!([credential]));
+
+        let errors = consumer
+            .validate_fields()
+            .expect_err("malformed keyauth credentials must fail closed");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("credentials.keyauth[0].key")),
+            "unexpected errors: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn test_consumer_keyauth_accepts_valid_rotation_array() {
+    let mut consumer = make_consumer("test", "alice");
+    consumer.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "current-key"}, {"key": "next-key"}]),
+    );
+
+    assert!(consumer.validate_fields().is_ok());
+}
+
+#[test]
 fn test_consumer_credentials_total_size_limit() {
     let mut consumer = make_consumer("test", "alice");
     // Create a single credential value that exceeds 64KB

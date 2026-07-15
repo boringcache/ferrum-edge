@@ -149,6 +149,28 @@ fn test_disabled_basic_auth_config_skips_plugin_construction() {
 }
 
 #[test]
+fn test_disabled_unknown_plugin_name_remains_invalid() {
+    let now = chrono::Utc::now();
+    let plugin_config = ferrum_edge::config::types::PluginConfig {
+        id: "disabled-unknown-plugin".to_string(),
+        plugin_name: "not_a_registered_plugin".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({"staged": true}),
+        scope: ferrum_edge::config::types::PluginScope::Global,
+        proxy_id: None,
+        enabled: false,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    assert!(
+        ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config).is_err()
+    );
+}
+
+#[test]
 fn test_basic_auth_audit_redaction_uses_one_shape_independent_marker() {
     let password_hash = format!("hmac_sha256:{}", "a".repeat(64));
     let mut credentials = std::collections::HashMap::new();

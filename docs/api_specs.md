@@ -430,7 +430,7 @@ x-ferrum-plugins:
   - id: user-api-auth
     plugin_name: key_auth
     config:
-      key_names: [x-api-key]
+      key_location: header:X-API-Key
 
   - id: user-api-rate
     plugin_name: rate_limiting
