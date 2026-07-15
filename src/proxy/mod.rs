@@ -12993,9 +12993,10 @@ async fn run_after_proxy_hooks_on_rejection(
                 // reject hooks run), so a hook cannot replace it here — it is
                 // ignored and only logged. Known consequence: `ai_rate_limiter`'s
                 // `on_unmetered_response: "reject"` is best-effort for synthetic
-                // `before_proxy` responses such as `ai_federation`'s — a federated
-                // 2xx missing usage metadata is still returned to the client. See
-                // docs/plugins.md (ai_rate_limiter federation limitation).
+                // responses such as `ai_federation`'s final-request-body
+                // short-circuit — a federated 2xx missing usage metadata is still
+                // returned to the client. See docs/plugins.md (ai_rate_limiter
+                // federation limitation).
                 warn!(
                     rejecting_plugin = plugin.name(),
                     attempted_reject_status = reject_status,

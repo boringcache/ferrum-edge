@@ -123,10 +123,9 @@ compressed bytes actually sent upstream (this hook, not the metadata copy, is
 authoritative for the wire and is the only hook the HTTP/3 cross-protocol path
 invokes). For already-plaintext JSON uploads, `before_proxy` also rewrites
 `ctx.metadata["request_body"]` so direct dispatchers that consume that metadata
-can forward the compressed prompt. Compressed client uploads cannot be compressed
-for direct `ai_federation` dispatch because federation returns before
-request-body transforms run; use the standard backend-dispatch path for that
-combination.
+can forward the compressed prompt. `ai_federation` consumes the authoritative
+final body after request decompression and `transform_request_body`, so provider
+dispatch uses the same compressed representation as the standard backend path.
 
 If `ai_prompt_shield` is redacting, the compressor operates on the already
 redacted text, so redaction is preserved and then compressed.

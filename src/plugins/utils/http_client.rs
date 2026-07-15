@@ -11,6 +11,8 @@
 //! - **HTTP/2 multiplexing**: Multiple log/metric streams over one connection
 //! - **Idle timeout**: Stale connections cleaned up automatically
 //! - **DNS caching**: Uses the gateway's `DnsCache` for shared, warmed DNS
+//! - **No ambient proxy discovery**: standard client builders ignore
+//!   process-level proxy environment variables
 //! - **No redirect following**: outbound calls reach only the configured
 //!   endpoint; server-chosen 3xx targets (e.g. a cloud metadata IP) are never
 //!   followed — SSRF defense-in-depth
@@ -54,6 +56,18 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Sanitized failure from a redacted plugin HTTP request.
+///
+/// `request_reached_wire` is false for request-construction failures and for
+/// transport classes that prove no request bytes reached the destination. A
+/// caller sending a non-idempotent request can use this boundary to avoid
+/// replaying ambiguous outcomes.
+#[derive(Debug, Clone, Copy)]
+pub struct PluginHttpFailure {
+    pub error_class: ErrorClass,
+    pub request_reached_wire: bool,
+}
 
 /// Shared, pooled HTTP client for plugin outbound calls.
 ///
@@ -216,15 +230,18 @@ impl PluginTlsPosture {
 ///
 /// If even this minimal builder fails, build a no-DNS fallback that still keeps
 /// redirects disabled and applies the caller's TLS posture. If that cannot be
-/// constructed either, keep redirects disabled while dropping custom TLS posture
-/// before the final exceptional `reqwest::Client::new()` escape hatch.
+/// constructed either, drop custom TLS posture but keep redirects disabled. A
+/// process without a usable minimal reqwest TLS/client backend fails during
+/// construction rather than silently widening the redirect policy.
 fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     tls_posture: &PluginTlsPosture,
 ) -> reqwest::Client {
     // Never auto-follow redirects on a shared outbound client (SSRF posture,
     // matches src/connection_pool.rs and the configured clients above).
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = dns_cache {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
@@ -238,7 +255,11 @@ fn build_dns_cached_fallback_client(
             e
         );
         let builder = tls_posture
-            .apply(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()));
+            .apply(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none()),
+            );
         match builder.build() {
             Ok(client) => client,
             Err(e2) => {
@@ -248,16 +269,16 @@ fn build_dns_cached_fallback_client(
                     e2
                 );
                 reqwest::Client::builder()
+                    .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
-                    .unwrap_or_else(|e3| {
-                        tracing::error!(
-                            "Failed to build no-redirect fallback plugin client: {}. \
-                             Using reqwest::Client::new() as an exceptional last resort.",
-                            e3
-                        );
-                        reqwest::Client::new()
-                    })
+                    // Invariant: this final builder has no operator-provided
+                    // certificates, proxy settings, resolver, or pool tuning;
+                    // only reqwest's compiled-in client/TLS backend remains.
+                    // `reqwest::Client::new()` would assert the same invariant
+                    // internally while re-enabling default redirects, which is
+                    // forbidden for credential-bearing plugin egress.
+                    .expect("minimal no-redirect reqwest client backend must initialize")
             }
         }
     })
@@ -301,6 +322,7 @@ impl PluginHttpClient {
         let tls_posture = PluginTlsPosture::from_config(tls_no_verify, tls_ca_bundle_path);
 
         let mut builder = reqwest::Client::builder()
+            .no_proxy()
             .pool_max_idle_per_host(pool_config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))
@@ -396,6 +418,7 @@ impl PluginHttpClient {
     /// to share the gateway's DNS cache across all plugins.
     pub fn from_pool_config(config: &PoolConfig) -> Self {
         let mut builder = reqwest::Client::builder()
+            .no_proxy()
             .pool_max_idle_per_host(config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))
@@ -700,6 +723,30 @@ impl PluginHttpClient {
             .map_err(|e| {
                 let error_class = classify_reqwest_error(&e);
                 format!("{error_class} calling {redacted_url}")
+            })
+    }
+
+    /// Send a redacted, latency-tracked request while retaining a replay-safety
+    /// classification for non-idempotent callers.
+    pub async fn execute_redacted_tracked_classified(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        redacted_url: &str,
+        accumulator: &AtomicU64,
+    ) -> Result<reqwest::Response, PluginHttpFailure> {
+        let request = request.build().map_err(|error| PluginHttpFailure {
+            error_class: classify_reqwest_error(&error),
+            request_reached_wire: false,
+        })?;
+        self.execute_request(request, label, Some(accumulator), Some(redacted_url))
+            .await
+            .map_err(|error| {
+                let error_class = classify_reqwest_error(&error);
+                PluginHttpFailure {
+                    error_class,
+                    request_reached_wire: crate::retry::request_reached_wire(error_class),
+                }
             })
     }
 
