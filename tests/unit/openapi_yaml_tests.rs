@@ -906,6 +906,37 @@ fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
 }
 
 #[test]
+fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/JwksAuthConfig")
+        .expect("JwksAuthConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["from_headers"]["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        schema["properties"]["jwks_refresh_interval_secs"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_JWKS_REFRESH_INTERVAL_SECS)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_jti_cache_max_entries"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES)
+    );
+
+    let guide = include_str!("../../docs/cache_management.md");
+    assert!(guide.contains("`jwks_refresh_interval_secs`, default `900` seconds"));
+    assert!(guide.contains("| `jwks_auth` | `jwks_refresh_interval_secs` | `900` |"));
+    assert!(!guide.contains("| `jwks_auth` | `cache_ttl_seconds`"));
+}
+
+#[test]
 fn ai_tool_governor_schema_matches_runtime_invariants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -2307,5 +2338,65 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
         }),
     ] {
         assert_component_validity(&spec, "AiResponseGuardConfig", &invalid, false);
+    }
+}
+
+#[test]
+fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/SecurityHeadersConfig")
+        .expect("SecurityHeadersConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["hsts"]["oneOf"][3]["additionalProperties"],
+        false
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({
+            "hsts": { "max_age": 300 },
+            "set": { "X!#$%&'*+.^_`|~Policy": "one\ttwo" },
+            "remove": ["X!Policy"]
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "fram_options": false }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "hsts": { "include_subdomain": true } }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "set": { "X Policy": "on" } }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "set": { "X-Policy": "one\u{0001}two" } }),
+        false,
+    );
+    for non_ascii_value in [
+        json!({ "content_type_options": "caf\u{00e9}" }),
+        json!({ "frame_options": "caf\u{00e9}" }),
+        json!({ "referrer_policy": "caf\u{00e9}" }),
+        json!({ "hsts": "caf\u{00e9}" }),
+        json!({ "content_security_policy": "caf\u{00e9}" }),
+        json!({ "permissions_policy": "caf\u{00e9}" }),
+        json!({ "set": { "X-Policy": "caf\u{00e9}" } }),
+    ] {
+        assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
 }

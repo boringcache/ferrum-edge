@@ -19,12 +19,17 @@ use url::{Host, Url};
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::PluginHttpClient;
-use super::utils::auth_flow::{ExtractedCredential, VerifyOutcome};
+use super::utils::auth_attempt::AuthenticationAttempt;
+use super::utils::auth_flow::{
+    ExtractedCredential, VerifyOutcome, commit_authentication_attempt, nonblank_identity,
+};
 use super::utils::claim_header_fanout::{
-    ClaimHeaderMapping, apply_claim_headers_from_metadata, emit_claim_headers_to_metadata,
+    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
     parse_claim_headers,
 };
-use super::utils::claim_resolver::{extract_claim_string, parse_claim_path_value};
+use super::utils::claim_resolver::{
+    extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
+};
 use super::utils::introspection_cache::{CacheLookup, IntrospectionCache, TokenKey};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
@@ -432,21 +437,13 @@ impl Oauth2Introspection {
                 if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
                     return reject(status, body);
                 }
-                // Transactional commit: resolve the principal before staging
-                // any identity-derived side effects. A token that introspects
-                // as active but resolves no principal (blank/missing identity
-                // claim) must not leave claim-header or token-stripping
-                // metadata behind — in `auth_mode: multi` a later credential
-                // can authenticate this request and that staged state would be
-                // applied under the other credential's authority.
-                let outcome = self.resolve_identity(&claims, provider, consumer_index);
-                if outcome.establishes_principal() {
-                    self.emit_claim_headers(ctx, &claims, provider);
-                    if !provider.forward_original_token {
-                        self.mark_original_token_stripping_metadata(ctx, &token, candidate);
-                    }
+                let mut attempt = AuthenticationAttempt::new();
+                self.stage_claim_headers(&mut attempt, &claims, provider);
+                if !provider.forward_original_token {
+                    self.stage_original_token_stripping(&mut attempt, ctx, &token, candidate);
                 }
-                apply_verify_outcome(ctx, outcome, "oauth2_introspection")
+                let outcome = self.resolve_identity(&claims, provider, consumer_index);
+                apply_verify_outcome(ctx, attempt, outcome, "oauth2_introspection")
             }
         }
     }
@@ -766,11 +763,11 @@ impl Oauth2Introspection {
             .consumer_header_claim
             .as_deref()
             .unwrap_or(&self.consumer_header_claim);
-        let identity = extract_claim_string(claims, identity_claim);
+        let identity = nonblank_identity(extract_claim_string(claims, identity_claim));
         let header_value = if header_claim == identity_claim {
             identity.clone()
         } else {
-            extract_claim_string(claims, header_claim).or_else(|| identity.clone())
+            extract_claim_string_exact(claims, header_claim).or_else(|| identity.clone())
         };
         let consumer = identity
             .as_deref()
@@ -778,21 +775,22 @@ impl Oauth2Introspection {
         VerifyOutcome::success(consumer, identity, header_value)
     }
 
-    fn emit_claim_headers(
+    fn stage_claim_headers(
         &self,
-        ctx: &mut RequestContext,
+        attempt: &mut AuthenticationAttempt,
         claims: &Value,
         provider: &IntrospectionProvider,
     ) {
         if provider.claim_headers.is_empty() {
             return;
         }
-        emit_claim_headers_to_metadata(ctx, claims, &provider.claim_headers, ",");
+        emit_claim_headers_to_attempt(attempt, claims, &provider.claim_headers, ",");
     }
 
-    fn mark_original_token_stripping_metadata(
+    fn stage_original_token_stripping(
         &self,
-        ctx: &mut RequestContext,
+        attempt: &mut AuthenticationAttempt,
+        ctx: &RequestContext,
         accepted_token: &str,
         candidate: ProviderCandidate,
     ) {
@@ -804,19 +802,19 @@ impl Oauth2Introspection {
             );
             return;
         };
-        mark_credential_source_stripping_metadata(ctx, provider, candidate.source);
+        stage_credential_source_stripping(attempt, provider, candidate.source);
 
         // A client can repeat one credential in several supported locations.
         // Stripping only the location selected during routing would leave an
         // equivalent copy available to the backend, so remove every configured
         // occurrence of the accepted token while preserving unrelated values.
         if authorization_bearer_matches(ctx, accepted_token) {
-            mark_authorization_stripping_metadata(ctx);
+            stage_authorization_stripping(attempt);
         }
         for provider in &self.providers {
             for location in &provider.token_locations {
                 if token_location_matches(location, ctx, accepted_token) {
-                    mark_token_location_stripping_metadata(ctx, location);
+                    stage_token_location_stripping(attempt, location);
                 }
             }
         }
@@ -1213,7 +1211,7 @@ impl super::Plugin for Oauth2Introspection {
             ctx.metadata
                 .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
         }
-        apply_claim_headers_from_metadata(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
+        apply_claim_headers_from_context(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
         PluginResult::Continue
     }
 
@@ -1239,50 +1237,21 @@ impl super::Plugin for Oauth2Introspection {
 
 fn apply_verify_outcome(
     ctx: &mut RequestContext,
+    attempt: AuthenticationAttempt,
     outcome: VerifyOutcome,
     auth_method: &'static str,
 ) -> PluginResult {
-    match outcome {
-        VerifyOutcome::Success {
-            consumer,
-            external_identity,
-            external_identity_header,
-        } => {
-            let external_identity =
-                external_identity.filter(|identity| !identity.trim().is_empty());
-            let external_identity_header = external_identity_header
-                .filter(|identity_header| !identity_header.trim().is_empty());
-            let consumer_identified = consumer.is_some();
-            let external_identity_identified = external_identity.is_some();
-            // No principal resolved: commit nothing, including a nonblank
-            // header claim, so no identity residue survives into a request a
-            // later credential authenticates.
-            if !consumer_identified && !external_identity_identified {
-                return PluginResult::Continue;
-            }
-            if let Some(consumer) = consumer
-                && ctx.identified_consumer.is_none()
-            {
-                ctx.identified_consumer = Some(consumer);
-            }
-            if let Some(external_identity) = external_identity {
-                ctx.authenticated_identity = Some(external_identity);
-            }
-            if let Some(external_identity_header) = external_identity_header {
-                ctx.authenticated_identity_header = Some(external_identity_header);
-            }
-            if ctx.auth_method.is_none() {
-                ctx.auth_method = Some(auth_method);
-            }
+    match commit_authentication_attempt(ctx, attempt, outcome, auth_method, true) {
+        Ok(_) => PluginResult::Continue,
+        Err(VerifyOutcome::Forbidden(body)) => reject(403, body),
+        Err(VerifyOutcome::InvalidFormat(body)) => reject_bearer(401, body, "invalid_request"),
+        Err(VerifyOutcome::Invalid(body))
+        | Err(VerifyOutcome::ConsumerNotFound(body))
+        | Err(VerifyOutcome::VerificationFailed(body)) => reject_bearer(401, body, "invalid_token"),
+        Err(VerifyOutcome::Internal(body)) => reject(500, body),
+        Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
             PluginResult::Continue
         }
-        VerifyOutcome::Forbidden(body) => reject(403, body),
-        VerifyOutcome::InvalidFormat(body) => reject_bearer(401, body, "invalid_request"),
-        VerifyOutcome::Invalid(body)
-        | VerifyOutcome::ConsumerNotFound(body)
-        | VerifyOutcome::VerificationFailed(body) => reject_bearer(401, body, "invalid_token"),
-        VerifyOutcome::Internal(body) => reject(500, body),
-        VerifyOutcome::NotApplicable => PluginResult::Continue,
     }
 }
 
@@ -1890,13 +1859,13 @@ fn audience_matches(claims: &Value, audiences: &[String]) -> bool {
     }
 }
 
-fn mark_credential_source_stripping_metadata(
-    ctx: &mut RequestContext,
+fn stage_credential_source_stripping(
+    attempt: &mut AuthenticationAttempt,
     provider: &IntrospectionProvider,
     source: CredentialSource,
 ) {
     match source {
-        CredentialSource::Authorization => mark_authorization_stripping_metadata(ctx),
+        CredentialSource::Authorization => stage_authorization_stripping(attempt),
         CredentialSource::ProviderLocation(location_idx) => {
             let Some(location) = provider.token_locations.get(location_idx) else {
                 warn!(
@@ -1905,7 +1874,7 @@ fn mark_credential_source_stripping_metadata(
                 );
                 return;
             };
-            mark_token_location_stripping_metadata(ctx, location);
+            stage_token_location_stripping(attempt, location);
         }
     }
 }
@@ -1940,27 +1909,21 @@ fn token_location_matches(
     }
 }
 
-fn mark_authorization_stripping_metadata(ctx: &mut RequestContext) {
-    ctx.metadata.insert(
-        STRIP_AUTHORIZATION_METADATA_KEY.to_string(),
-        "true".to_string(),
-    );
+fn stage_authorization_stripping(attempt: &mut AuthenticationAttempt) {
+    attempt.stage_stripping_metadata(STRIP_AUTHORIZATION_METADATA_KEY.to_string());
 }
 
-fn mark_token_location_stripping_metadata(ctx: &mut RequestContext, location: &TokenLocation) {
+fn stage_token_location_stripping(attempt: &mut AuthenticationAttempt, location: &TokenLocation) {
     match location {
         TokenLocation::Header(header) => {
-            ctx.metadata.insert(
-                format!("{STRIP_HEADER_METADATA_PREFIX}{}", header.name),
-                "true".to_string(),
-            );
+            attempt
+                .stage_stripping_metadata(format!("{STRIP_HEADER_METADATA_PREFIX}{}", header.name));
         }
         TokenLocation::QueryParam(name) => {
-            ctx.metadata.insert(
+            attempt.stage_query_param_strip(
                 format!("{STRIP_QUERY_PARAM_METADATA_PREFIX}{name}"),
-                "true".to_string(),
+                name.clone(),
             );
-            ctx.query_params.remove(name);
         }
     }
 }

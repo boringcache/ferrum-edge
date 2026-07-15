@@ -121,7 +121,9 @@ Use `priority_override` to control the relative execution order of instances tha
 
 ## Multi-Authentication Mode
 
-With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one succeeds; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned. After authentication, the Access Control plugin can apply consumer or group policy.
+With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one establishes a nonblank mapped Consumer or permitted external principal; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned.
+
+In either mode, rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, rolling session cookie, or backend token-stripping state for another credential to inherit. Requester-owned cookies from rejected attempts are retained only when authentication ultimately rejects and are merged with the selected rejection's cookies by exact cookie name; a later successful credential discards them. After authentication, the Access Control plugin can apply consumer or group policy.
 
 ## Consumer Identity Headers
 
@@ -1365,8 +1367,8 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | Parameter | Type | Description |
 |---|---|---|
 | `providers` | Array | Array of identity provider configurations (required) |
-| `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint |
-| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
+| `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or `localhost`; URL userinfo is rejected |
+| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). HTTPS is required except for literal loopback or `localhost`, and URL userinfo is rejected. SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
 | `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
 | `providers[].issuer` | String (optional) | Expected JWT `iss` claim — routes tokens to this provider |
 | `providers[].audience` | String (optional) | Expected JWT `aud` claim |
@@ -1400,6 +1402,9 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
+Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. Shared stores use the minimum refresh interval requested by active consumers, and full or incremental reloads reschedule the single refresh worker without dropping cached keys. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement.
+
+Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A rejected refresh retains the last-known-good keys. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
 
 ### `oauth2_introspection`
 
@@ -2715,6 +2720,39 @@ Body rules support the same dot-notation features as `request_transformer`: nest
 Adds secure response header defaults and strips common fingerprinting headers
 after the backend response is available. It also runs for plugin rejection
 responses so locally generated errors receive the same response hardening.
+Policy is enforced on the client-visible initial-header boundary for ordinary
+HTTP responses, buffered native gRPC, gRPC-Web binary/text, and HTTP/1.1,
+HTTP/2, and HTTP/3 WebSocket success and gateway-failure handshakes. Native
+gRPC status and application metadata remain trailers; a security policy field
+is reapplied to initial headers rather than promoting a backend trailer value.
+For a genuine Trailers-Only response whose terminal metadata is carried in the
+initial END_STREAM HEADERS, Ferrum snapshots reserved gRPC fields before hooks
+and restores that pristine backend value after policy, so `set` and `remove`
+cannot redefine the RPC outcome.
+On buffered gRPC and gRPC-Web responses, a final policy removal suppresses both
+the initial-header compatibility copy and the application-trailer copy, while
+a final set/override remains initial-header policy and preserves the backend's
+application trailer. The final replay runs after trailer-only cookie rehoming
+and preserves the transport-owned `Content-Length` produced by the last body
+transform.
+
+Post-routing gateway-generated initial HEADERS use the same precomputed policy
+slice: this includes plain HTTP method-filter responses and native-gRPC method,
+deadline, size-limit, backend-unavailable, and mesh fail-closed errors across
+H1/H2/H3 frontends. Protocol-owned gRPC status/message/content type and
+Content-Length/transfer framing remain authoritative. Pre-routing errors such
+as overload, malformed request, 0-RTT, and route-miss responses have no resolved
+plugin configuration and do not apply route policy.
+
+Configuration is fail-closed: unknown top-level keys and unknown keys inside
+the `hsts` object reject startup or reload, retaining the last-known-good
+runtime configuration on reload. Header names use the complete HTTP
+field-name token grammar, are limited to 65,535 ASCII bytes, and are
+canonicalized to lowercase. Configured values must pass the same `HeaderValue`
+validation as the downstream H1/H2/H3 response builders: C0 controls other
+than horizontal tab, DEL, and non-ASCII characters are rejected. Invalid-name
+diagnostics identify the `set` or `remove` entry and render at most 96 escaped
+bytes of the hostile name before a truncation marker.
 
 **Priority:** 4080
 
@@ -2726,8 +2764,8 @@ responses so locally generated errors receive the same response hardening.
 | `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, or an object may set `max_age`, `include_subdomains`, and `preload`. |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
-| `set` | object/null | `{}` | Additional headers to set. Values must be strings and header values must not contain CR, LF, or NUL. |
-| `remove` | string[]/null | `["server","x-powered-by"]` | Header names to remove case-insensitively; `null` disables built-in removals. |
+| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar and values must pass downstream HTTP header-value validation. |
+| `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively; `null` disables built-in removals. |
 | `override_existing` | bool | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. |
 
 ```yaml

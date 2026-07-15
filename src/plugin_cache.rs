@@ -18,6 +18,7 @@
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::types::{GatewayConfig, PluginScope};
 use tracing::{error, warn};
@@ -27,7 +28,7 @@ use crate::adaptive_concurrency::{
     adaptive_concurrency_scope,
 };
 use crate::config::types::PluginConfig;
-use crate::plugins::utils::jwks_cache::retain_active_uris;
+use crate::plugins::utils::jwks_cache::retain_active_requirements;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
 };
@@ -223,6 +224,19 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .after_proxy(ctx, response_status, response_headers)
             .await
+    }
+    fn is_initial_response_header_policy(&self) -> bool {
+        self.inner.is_initial_response_header_policy()
+    }
+    fn apply_initial_response_header_policy(
+        &self,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner
+            .apply_initial_response_header_policy(response_headers);
+    }
+    fn initial_response_header_policy_names(&self) -> &[String] {
+        self.inner.initial_response_header_policy_names()
     }
     fn may_modify_response_content_type(
         &self,
@@ -567,6 +581,9 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn active_jwks_uris(&self) -> Vec<String> {
         self.inner.active_jwks_uris()
+    }
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+        self.inner.active_jwks_refresh_requirements()
     }
 }
 
@@ -1782,6 +1799,11 @@ pub struct PluginPhaseData {
     pub backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Credential-bearing request header names used by safe downstream views.
     pub request_headers_to_redact: Arc<Vec<String>>,
+    /// Deterministic initial-response header policy plugins, already filtered
+    /// and kept in configured priority order for protocol boundary paths.
+    pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Unique canonical field names touched by initial-response policy.
+    pub initial_response_header_policy_names: Arc<Vec<String>>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
 }
@@ -1793,6 +1815,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut authorize = Vec::new();
     let mut backend_admission = Vec::new();
     let mut request_headers_to_redact = Vec::new();
+    let mut initial_response_header_policy_plugins = Vec::new();
+    let mut initial_response_header_policy_names = Vec::new();
     for p in plugins {
         if p.is_auth_plugin() {
             caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
@@ -1803,6 +1827,14 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.is_backend_admission_plugin() {
             backend_admission.push(Arc::clone(p));
+        }
+        if p.is_initial_response_header_policy() {
+            initial_response_header_policy_plugins.push(Arc::clone(p));
+            for name in p.initial_response_header_policy_names() {
+                if !initial_response_header_policy_names.contains(name) {
+                    initial_response_header_policy_names.push(name.clone());
+                }
+            }
         }
         for header in p.request_headers_to_redact() {
             if !request_headers_to_redact
@@ -1848,6 +1880,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         authorize_plugins: Arc::new(authorize),
         backend_admission_plugins: Arc::new(backend_admission),
         request_headers_to_redact: Arc::new(request_headers_to_redact),
+        initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
+        initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
         capabilities: PluginCapabilities(caps),
     }
 }
@@ -1929,20 +1963,23 @@ fn build_protocol_snapshot(
 /// Collect all JWKS URIs actively referenced by `jwks_auth` plugin instances
 /// across all proxies and global plugins. Used to clean up stale JWKS cache
 /// entries (and abort their background refresh tasks) on config reload.
-fn collect_active_jwks_uris(
+fn collect_active_jwks_requirements(
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
-) -> HashSet<String> {
-    let mut uris = HashSet::new();
-    for plugins in proxy_map.values() {
-        for plugin in plugins.iter() {
-            uris.extend(plugin.active_jwks_uris());
+) -> HashMap<String, Duration> {
+    let mut requirements = HashMap::new();
+    for plugin in globals
+        .iter()
+        .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
+    {
+        for (uri, interval) in plugin.active_jwks_refresh_requirements() {
+            requirements
+                .entry(uri)
+                .and_modify(|current: &mut Duration| *current = (*current).min(interval))
+                .or_insert(interval);
         }
     }
-    for plugin in globals {
-        uris.extend(plugin.active_jwks_uris());
-    }
-    uris
+    requirements
 }
 
 fn start_background_tasks(
@@ -2144,6 +2181,26 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_initial_response_header_policy_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.initial_response_header_policy_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn get_initial_response_header_policy_names(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<String>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.initial_response_header_policy_names))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_capabilities(
         &self,
         proxy_id: &str,
@@ -2186,6 +2243,10 @@ impl PluginCacheInner {
             authorize_plugins: self.get_authorize_plugins(proxy_id, protocol),
             backend_admission_plugins: self.get_backend_admission_plugins(proxy_id, protocol),
             request_headers_to_redact: self.get_request_headers_to_redact(proxy_id, protocol),
+            initial_response_header_policy_plugins: self
+                .get_initial_response_header_policy_plugins(proxy_id, protocol),
+            initial_response_header_policy_names: self
+                .get_initial_response_header_policy_names(proxy_id, protocol),
             capabilities: self.get_capabilities(proxy_id, protocol),
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
@@ -2206,6 +2267,8 @@ pub struct PluginCacheRequestView {
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     request_headers_to_redact: Arc<Vec<String>>,
+    initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    initial_response_header_policy_names: Arc<Vec<String>>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -2236,6 +2299,16 @@ impl PluginCacheRequestView {
     /// Get credential-bearing request headers precomputed for safe downstream views.
     pub fn request_headers_to_redact(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.request_headers_to_redact)
+    }
+
+    /// Get the pre-filtered deterministic initial-response header policy chain.
+    pub fn initial_response_header_policy_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
+        Arc::clone(&self.initial_response_header_policy_plugins)
+    }
+
+    /// Get canonical field names touched by initial-response policy.
+    pub fn initial_response_header_policy_names(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.initial_response_header_policy_names)
     }
 
     /// Get pre-computed capability bitset from this request view.
@@ -2401,8 +2474,9 @@ impl PluginCache {
     }
 
     pub(crate) fn retain_active_uris_for_inner(inner: &PluginCacheInner) {
-        let active_uris = collect_active_jwks_uris(&inner.proxy_plugins, &inner.global_plugins);
-        retain_active_uris(&active_uris);
+        let requirements =
+            collect_active_jwks_requirements(&inner.proxy_plugins, &inner.global_plugins);
+        retain_active_requirements(&requirements);
     }
 
     /// Build a request-scoped view of plugin-cache values for one proxy/protocol.
