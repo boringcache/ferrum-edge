@@ -5,6 +5,7 @@
 //! authorization point; no authn/authz plugin is run a second time here.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
@@ -37,6 +38,7 @@ pub(crate) struct CapturedMeshEgressLifecycle {
     disconnect_direction: Option<Direction>,
     disconnect_cause: Option<DisconnectCause>,
     udp_outcome_signal: Option<Arc<CapturedUdpOutcomeSignal>>,
+    udp_byte_counters: Option<(Arc<AtomicU64>, Arc<AtomicU64>)>,
     completion_recorded: bool,
 }
 
@@ -146,12 +148,21 @@ impl CapturedMeshEgressLifecycle {
             disconnect_direction: Some(Direction::ClientToBackend),
             disconnect_cause: Some(DisconnectCause::BackendError),
             udp_outcome_signal: None,
+            udp_byte_counters: None,
             completion_recorded: false,
         })
     }
 
     pub(crate) fn set_udp_outcome_signal(&mut self, outcome_signal: Arc<CapturedUdpOutcomeSignal>) {
         self.udp_outcome_signal = Some(outcome_signal);
+    }
+
+    pub(crate) fn set_udp_byte_counters(
+        &mut self,
+        bytes_sent: Arc<AtomicU64>,
+        bytes_received: Arc<AtomicU64>,
+    ) {
+        self.udp_byte_counters = Some((bytes_sent, bytes_received));
     }
 
     pub(crate) fn set_target(&mut self, target: &crate::config::types::UpstreamTarget) {
@@ -265,7 +276,17 @@ impl Drop for CapturedMeshEgressLifecycle {
                 .as_ref()
                 .and_then(|signal| signal.producer_shutdown_outcome())
         {
-            self.complete_udp(self.bytes_sent, self.bytes_received, outcome);
+            let (bytes_sent, bytes_received) = self
+                .udp_byte_counters
+                .as_ref()
+                .map(|(sent, received)| {
+                    (
+                        sent.load(Ordering::Relaxed),
+                        received.load(Ordering::Relaxed),
+                    )
+                })
+                .unwrap_or((self.bytes_sent, self.bytes_received));
+            self.complete_udp(bytes_sent, bytes_received, outcome);
         }
         let Some(summary) = self.take_summary() else {
             return;
@@ -360,6 +381,7 @@ mod tests {
             disconnect_direction: Some(Direction::ClientToBackend),
             disconnect_cause: Some(DisconnectCause::BackendError),
             udp_outcome_signal: None,
+            udp_byte_counters: None,
             completion_recorded: false,
         };
         lifecycle.complete_tcp(&crate::proxy::tcp_proxy::StreamCopyResult {
@@ -408,6 +430,7 @@ mod tests {
             disconnect_direction: Some(Direction::ClientToBackend),
             disconnect_cause: Some(DisconnectCause::BackendError),
             udp_outcome_signal: None,
+            udp_byte_counters: None,
             completion_recorded: false,
         };
         lifecycle.complete_udp(7, 9, CapturedUdpOutcome::IdleTimeout);
@@ -427,5 +450,53 @@ mod tests {
         assert!(summary.disconnect_direction.is_none());
         assert_eq!(summary.bytes_sent, 7);
         assert_eq!(summary.bytes_received, 9);
+    }
+
+    #[tokio::test]
+    async fn producer_shutdown_drop_preserves_live_udp_byte_counts() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let plugin: Arc<dyn Plugin> = Arc::new(SummaryCapture {
+            tx: Mutex::new(Some(tx)),
+        });
+        let outcome_signal = Arc::new(CapturedUdpOutcomeSignal::new());
+        let bytes_sent = Arc::new(AtomicU64::new(37));
+        let bytes_received = Arc::new(AtomicU64::new(41));
+        let mut lifecycle = CapturedMeshEgressLifecycle {
+            plugins: vec![plugin],
+            stream_ctx: Some(stream_context()),
+            namespace: "default".to_string(),
+            proxy_id: "mesh-egress".to_string(),
+            proxy_name: Some("dns.kube-system.svc.cluster.local".to_string()),
+            client_ip: "10.0.0.2".to_string(),
+            backend_target: "10.0.0.8:53".to_string(),
+            protocol: "udp".to_string(),
+            connected_wall_at: chrono::Utc::now(),
+            connected_at: std::time::Instant::now(),
+            bytes_sent: 0,
+            bytes_received: 0,
+            connection_error: Some("setup failed".to_string()),
+            error_class: Some(ErrorClass::ConnectionPoolError),
+            disconnect_direction: Some(Direction::ClientToBackend),
+            disconnect_cause: Some(DisconnectCause::BackendError),
+            udp_outcome_signal: Some(Arc::clone(&outcome_signal)),
+            udp_byte_counters: None,
+            completion_recorded: false,
+        };
+        lifecycle.set_udp_byte_counters(bytes_sent, bytes_received);
+        outcome_signal.mark_producer_shutdown();
+
+        drop(lifecycle);
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("disconnect callback timeout")
+            .expect("disconnect summary");
+
+        assert_eq!(summary.bytes_sent, 37);
+        assert_eq!(summary.bytes_received, 41);
+        assert_eq!(
+            summary.disconnect_cause,
+            Some(DisconnectCause::GracefulShutdown)
+        );
+        assert!(summary.connection_error.is_none());
     }
 }

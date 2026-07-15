@@ -46,6 +46,15 @@ const TRACEPARENT_HEADER: &str = "traceparent";
 const TRACESTATE_HEADER: &str = "tracestate";
 const CAPTURED_TRACEPARENT_METADATA: &str = "workload_metrics.captured_traceparent";
 const CAPTURED_TRACESTATE_METADATA: &str = "workload_metrics.captured_tracestate";
+const CAPTURED_B3_METADATA: &str = "workload_metrics.captured_b3";
+const B3_TRACE_HEADERS: [&str; 6] = [
+    "b3",
+    "x-b3-traceid",
+    "x-b3-spanid",
+    "x-b3-parentspanid",
+    "x-b3-sampled",
+    "x-b3-flags",
+];
 const MAX_CUSTOM_TAGS: usize = 32;
 const MAX_CUSTOM_TAG_NAME_BYTES: usize = 128;
 const MAX_CUSTOM_TAG_VALUE_BYTES: usize = 1024;
@@ -319,7 +328,9 @@ impl WorkloadMetrics {
         self.insert_common_metadata(&mut ctx.metadata);
         self.apply_telemetry_metadata(&mut ctx.metadata, headers);
         if self.should_ensure_http_trace_context(&ctx.metadata, headers) {
-            import_b3_trace_metadata(&mut ctx.metadata, headers);
+            if !has_valid_traceparent(headers) {
+                import_b3_trace_metadata(&mut ctx.metadata, headers);
+            }
             ensure_trace_metadata(&mut ctx.metadata, headers);
             if let Some(tracestate) = header_value(headers, TRACESTATE_HEADER) {
                 ctx.metadata
@@ -412,30 +423,46 @@ impl WorkloadMetrics {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) {
-        // `on_request_received` captures inbound W3C context so authorization
+        // `on_request_received` imports inbound context early so authorization
         // rejects remain observable. For accepted requests, request_transformer
         // runs before this hook and its final header policy is authoritative.
-        // A valid final value replaces every early-derived trace field; a
-        // removed or malformed value stays suppressed while the early IDs and
-        // sampling decision remain available for the local span/reject record.
-        if ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA).is_some() {
-            if has_valid_traceparent(headers) {
-                for key in [
-                    "trace_id",
-                    "span_id",
-                    "parent_span_id",
-                    "trace_sampled",
-                    TRACEPARENT_HEADER,
-                ] {
-                    ctx.metadata.remove(key);
-                }
-                ensure_trace_metadata(&mut ctx.metadata, headers);
-            } else {
+        // A valid final W3C or B3 value replaces every early-derived trace
+        // field, including locally generated context when the transformer adds
+        // traceparent. Removed or malformed captured context stays suppressed
+        // while the early IDs remain available for the local span/reject record.
+        let captured_traceparent = ctx
+            .metadata
+            .remove(CAPTURED_TRACEPARENT_METADATA)
+            .is_some();
+        let captured_b3 = ctx.metadata.remove(CAPTURED_B3_METADATA).is_some();
+        let final_traceparent = has_valid_traceparent(headers);
+        let final_b3 = !final_traceparent && has_b3_trace_context(headers);
+
+        if final_traceparent || final_b3 {
+            for key in [
+                "trace_id",
+                "span_id",
+                "parent_span_id",
+                "trace_sampled",
+                TRACEPARENT_HEADER,
+            ] {
+                ctx.metadata.remove(key);
+            }
+        } else {
+            if captured_traceparent {
                 ctx.metadata.remove(TRACEPARENT_HEADER);
                 // A transformer may replace a valid inbound value with malformed
                 // hostile input. Drop that value rather than forwarding it or
                 // replacing it with the early cached context.
                 headers.retain(|name, _| !name.eq_ignore_ascii_case(TRACEPARENT_HEADER));
+            }
+            if captured_b3 {
+                ctx.metadata.remove(TRACEPARENT_HEADER);
+                headers.retain(|name, _| {
+                    !B3_TRACE_HEADERS
+                        .iter()
+                        .any(|header| name.eq_ignore_ascii_case(header))
+                });
             }
         }
         if ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA).is_some()
@@ -550,6 +577,14 @@ impl WorkloadMetrics {
                 "trace_sampled".to_string(),
                 if sampled { "true" } else { "false" }.to_string(),
             );
+        }
+        // This method runs both before authorization and after request
+        // transformers. Clear header-backed values before rebuilding the final
+        // view so a removed or over-limit header cannot leave stale metadata.
+        // Literal values are then reapplied as the documented fallback before a
+        // present valid header takes precedence.
+        for key in self.custom_header_tags.keys() {
+            metadata.remove(key);
         }
         for (key, value) in &self.custom_tags {
             metadata.insert(key.clone(), value.clone());
@@ -770,6 +805,7 @@ impl Plugin for WorkloadMetrics {
         // after route selection for accepted requests.
         let headers = std::mem::take(&mut ctx.headers);
         let captured_traceparent = has_valid_traceparent(&headers);
+        let captured_b3 = has_b3_trace_context(&headers);
         let captured_tracestate = header_value(&headers, TRACESTATE_HEADER).is_some();
         self.annotate_http_context(ctx, &headers);
         if captured_traceparent && ctx.metadata.contains_key(TRACEPARENT_HEADER) {
@@ -781,6 +817,10 @@ impl Plugin for WorkloadMetrics {
         if captured_tracestate && ctx.metadata.contains_key(TRACESTATE_HEADER) {
             ctx.metadata
                 .insert(CAPTURED_TRACESTATE_METADATA.to_string(), "true".to_string());
+        }
+        if captured_b3 && ctx.metadata.contains_key(TRACEPARENT_HEADER) {
+            ctx.metadata
+                .insert(CAPTURED_B3_METADATA.to_string(), "true".to_string());
         }
         ctx.headers = headers;
         PluginResult::Continue
@@ -836,6 +876,7 @@ impl Plugin for WorkloadMetrics {
         // discard the temporary provenance markers before transaction logging.
         ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA);
         ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA);
+        ctx.metadata.remove(CAPTURED_B3_METADATA);
         PluginResult::Continue
     }
 

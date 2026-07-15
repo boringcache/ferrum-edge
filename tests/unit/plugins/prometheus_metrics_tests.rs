@@ -2,13 +2,14 @@
 
 use ferrum_edge::ebpf::NodeAgentMetrics;
 use ferrum_edge::plugins::mesh::prometheus_helpers;
+use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::prometheus_metrics::{
     CounterKey, HboneRelayFailureKey, MeshTcpEgressConnKey, MetricsRegistry, PrometheusMetrics,
     global_registry,
 };
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Direction, Plugin, StreamTransactionSummary, TransactionSummary,
-    WsDisconnectContext,
+    ALL_PROTOCOLS, Direction, Plugin, RequestContext, StreamTransactionSummary,
+    TransactionSummary, WsDisconnectContext,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
@@ -1141,6 +1142,49 @@ fn test_mesh_metrics_use_distinct_gateway_namespace_label() {
     assert!(output.contains(
         r#"ferrum_mesh_ca_health{ca_type="gateway_namespace_test",gateway_namespace="staging"} 1"#
     ));
+}
+
+#[tokio::test]
+async fn workload_metrics_response_code_override_changes_selected_metric_family() {
+    let workload_metrics = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [
+                {
+                    "metric": "REQUEST_COUNT",
+                    "name": "response_code",
+                    "operation": {"type": "set", "value": "server_error"}
+                },
+                {
+                    "metric": "REQUEST_DURATION",
+                    "name": "response_code",
+                    "operation": {"type": "rename", "new_name": "response_flags"}
+                }
+            ]
+        }
+    }))
+    .expect("response_code metric overrides");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::new();
+    let result = workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, ferrum_edge::plugins::PluginResult::Continue));
+
+    let registry = MetricsRegistry::new();
+    let mut summary = make_summary("response-code-override", "GET", 503, 10.0, 5.0);
+    summary.metadata = ctx.metadata;
+    registry.record(&summary);
+    let output = registry.render_uncached();
+    let counter = output
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+        .expect("mesh request counter");
+    let duration = output
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_request_duration_ms_count{"))
+        .expect("mesh request duration count");
+
+    assert!(counter.contains("response_code=\"server_error\""), "{counter}");
+    assert!(!duration.contains("response_code="), "{duration}");
+    assert!(duration.contains("response_flags=\"503\""), "{duration}");
 }
 
 #[tokio::test]

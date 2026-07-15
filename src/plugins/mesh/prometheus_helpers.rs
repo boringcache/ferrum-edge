@@ -66,6 +66,7 @@ pub struct MeshRequestKey {
     pub destination_service: Arc<str>,
     pub request_protocol: Arc<str>,
     pub response_code: u16,
+    response_code_override: Option<Arc<str>>,
     pub response_flags: Arc<str>,
     pub connection_security_policy: Arc<str>,
     /// Bitset of labels removed by a Telemetry metric tag override. The
@@ -126,6 +127,7 @@ pub(crate) enum MeshMetricLabel {
     RequestProtocol = 10,
     ResponseFlags = 11,
     ConnectionSecurityPolicy = 12,
+    ResponseCode = 13,
 }
 
 impl MeshMetricLabel {
@@ -156,6 +158,7 @@ impl MeshMetricLabel {
             "mesh.connection_security_policy" | "connection_security_policy" => {
                 Some(Self::ConnectionSecurityPolicy)
             }
+            "mesh.response_code" | "response_code" => Some(Self::ResponseCode),
             _ => None,
         }
     }
@@ -179,6 +182,7 @@ impl MeshMetricLabel {
             10 => Some(Self::RequestProtocol),
             11 => Some(Self::ResponseFlags),
             12 => Some(Self::ConnectionSecurityPolicy),
+            13 => Some(Self::ResponseCode),
             _ => None,
         }
     }
@@ -1044,6 +1048,7 @@ pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> 
         destination_service,
         request_protocol,
         response_code: summary.response_status_code,
+        response_code_override: None,
         response_flags,
         connection_security_policy,
         removed_labels: 0,
@@ -1089,7 +1094,7 @@ fn normalize_removed_labels(key: &mut MeshRequestKey) {
         return;
     }
     static REMOVED_LABEL_SENTINEL: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
-    for index in 0u8..=12 {
+    for index in 0u8..=MeshMetricLabel::ResponseCode.index() {
         if key.removed_labels & (1u16 << index) == 0 {
             continue;
         }
@@ -1199,6 +1204,10 @@ fn metric_label_value(key: &MeshRequestKey, label: MeshMetricLabel) -> Arc<str> 
         MeshMetricLabel::RequestProtocol => Arc::clone(&key.request_protocol),
         MeshMetricLabel::ResponseFlags => Arc::clone(&key.response_flags),
         MeshMetricLabel::ConnectionSecurityPolicy => Arc::clone(&key.connection_security_policy),
+        MeshMetricLabel::ResponseCode => key.response_code_override.as_ref().map_or_else(
+            || intern_label(&key.response_code.to_string()),
+            Arc::clone,
+        ),
     }
 }
 
@@ -1217,6 +1226,10 @@ fn set_metric_label_value(key: &mut MeshRequestKey, label: MeshMetricLabel, valu
         MeshMetricLabel::RequestProtocol => key.request_protocol = value,
         MeshMetricLabel::ResponseFlags => key.response_flags = value,
         MeshMetricLabel::ConnectionSecurityPolicy => key.connection_security_policy = value,
+        MeshMetricLabel::ResponseCode => {
+            key.response_code = 0;
+            key.response_code_override = Some(value);
+        }
     }
 }
 
@@ -1387,10 +1400,19 @@ fn mesh_label_base_fragment(key: &MeshRequestKey) -> String {
         "request_protocol",
         &key.request_protocol,
     );
-    if !labels.is_empty() {
-        labels.push(',');
+    if key.removed_labels & (1u16 << MeshMetricLabel::ResponseCode.index()) == 0 {
+        if !labels.is_empty() {
+            labels.push(',');
+        }
+        match key.response_code_override.as_deref() {
+            Some(value) => {
+                let _ = write!(labels, "response_code=\"{}\"", escape_label_value(value));
+            }
+            None => {
+                let _ = write!(labels, "response_code=\"{}\"", key.response_code);
+            }
+        }
     }
-    let _ = write!(labels, "response_code=\"{}\"", key.response_code);
     write_optional_mesh_label(
         &mut labels,
         key,
@@ -1473,6 +1495,7 @@ mod tests {
             destination_service: Arc::from("backend"),
             request_protocol: Arc::from("http"),
             response_code: 200,
+            response_code_override: None,
             response_flags: Arc::from("-"),
             connection_security_policy: Arc::from("mutual_tls"),
             removed_labels: 0,

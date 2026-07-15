@@ -1578,6 +1578,10 @@ async fn run_udp_egress_session(
     let return_socket = reply_socket.clone();
     let return_activity = last_activity.clone();
     let bytes_received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    if let Some(observability) = observability.as_mut() {
+        observability.set_udp_byte_counters(bytes_sent.clone(), bytes_received.clone());
+    }
     let return_bytes_received = std::sync::Arc::clone(&bytes_received);
     let return_path = async move {
         let mut buf = bytes::BytesMut::with_capacity(super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
@@ -1613,7 +1617,6 @@ async fn run_udp_egress_session(
     // by `write_deadline` so a stalled HBONE peer tears the session down instead
     // of leaking this task (codex r2 P2).
     let egress_activity = last_activity.clone();
-    let bytes_sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let egress_bytes_sent = std::sync::Arc::clone(&bytes_sent);
     // Moved into the egress loop: it is the sole drainer, so it owns releasing
     // the byte reservations. (The recv loop only ever ADDS to this counter.)
