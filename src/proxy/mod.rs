@@ -21040,13 +21040,7 @@ pub(crate) async fn proxy_to_backend_retry(
     let resolved_ip_result = if let Some(deadline) = request_ctx.grpc_deadline_at() {
         match tokio::time::timeout_at(deadline, resolve_backend_ip).await {
             Ok(result) => result,
-            Err(_) => {
-                return backend_dispatch_response(
-                    mesh_grpc_deadline_exceeded_response(None),
-                    None,
-                    None,
-                );
-            }
+            Err(_) => return mesh_grpc_deadline_exceeded_response(None),
         }
     } else {
         resolve_backend_ip.await
