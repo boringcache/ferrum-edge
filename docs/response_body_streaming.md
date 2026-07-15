@@ -221,11 +221,13 @@ from status and headers and whose body must not be collected to EOF.
 
 Because this check can only release a previously buffered response, complete-body
 inspectors must treat opaque representation metadata conservatively. For example,
-`ai_semantic_firewall` keeps eligible origin responses with any non-identity
-`Content-Encoding` buffered even when `Content-Type` is missing or non-JSON. Its
-final hook then decodes supported gzip/Brotli within the inspection cap and
-routes empty, malformed, unsupported, or oversized encodings through the
-configured `on_error` policy (fail-closed by default). No encoding (or an
+`ai_semantic_firewall` keeps eligible complete origin responses with any
+non-identity `Content-Encoding` buffered even when `Content-Type` is missing or
+non-JSON. Its final hook then decodes supported gzip/Brotli within the inspection
+cap and routes empty, malformed, unsupported, or oversized encodings through the
+configured `on_error` policy (fail-closed by default). Partial responses (`206`
+or `Content-Range`) and unrelated event streams remain on the streaming path
+because they are not complete encoded representations. No encoding (or an
 identity-only encoding list) still lets ordinary non-AI text stream, and a
 gateway-planned compression transform is not mistaken for already-encoded
 origin bytes.

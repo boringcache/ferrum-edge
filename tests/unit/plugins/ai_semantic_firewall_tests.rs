@@ -3532,7 +3532,10 @@ async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
         ("br", truncated_brotli),
         ("zstd", b"unsupported encoded bytes".to_vec()),
         ("gzip, br", b"unsupported encoding list".to_vec()),
-        ("identity, gzip", b"unsupported mixed encoding list".to_vec()),
+        (
+            "identity, gzip",
+            b"unsupported mixed encoding list".to_vec(),
+        ),
     ] {
         let headers = HashMap::from([
             ("content-type".to_string(), "text/plain".to_string()),
@@ -3637,6 +3640,72 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
             .map(String::as_str),
         Some("encoded_body")
     );
+}
+
+#[test]
+fn partial_encoded_responses_are_not_buffered() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+
+    for (status, headers) in [
+        (
+            206,
+            HashMap::from([
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("content-encoding".to_string(), "gzip".to_string()),
+            ]),
+        ),
+        (
+            200,
+            HashMap::from([
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("content-encoding".to_string(), "gzip".to_string()),
+                (
+                    "content-range".to_string(),
+                    "bytes 0-99/5000".to_string(),
+                ),
+            ]),
+        ),
+    ] {
+        let ctx = create_test_context();
+        assert!(!firewall.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/plain"),
+            status,
+            &headers,
+        ));
+    }
+}
+
+#[test]
+fn encoded_unflagged_event_stream_remains_streaming() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let ctx = create_test_context();
+    let headers = HashMap::from([
+        (
+            "content-type".to_string(),
+            "text/event-stream".to_string(),
+        ),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+
+    assert!(firewall.should_buffer_response_body(&ctx));
+    assert!(!firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &headers,
+    ));
 }
 
 #[test]

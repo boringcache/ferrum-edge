@@ -2137,6 +2137,30 @@ impl Plugin for AiSemanticFirewall {
             return false;
         }
 
+        // A range body is only a fragment of the selected representation, so
+        // its bytes are not a complete gzip/Brotli stream and cannot be decoded
+        // safely. Do not pin partial responses onto the buffered inspection
+        // path, including when an earlier response hook stripped Content-Range
+        // after the proxy stamped the original-response marker.
+        if is_partial_response(ctx, response_status, response_headers) {
+            return false;
+        }
+
+        if content_type.is_some_and(is_event_stream_content_type) {
+            // Pin an event stream onto the buffered path only when `buffer` mode
+            // actually flagged THIS request from a detected `stream: true` JSON
+            // POST (the request-path marker). Unrelated SSE — a `GET` EventSource
+            // endpoint, or a backend that unexpectedly returns an unbounded
+            // stream — must keep streaming; buffering it would collect until
+            // `max_response_body_size_bytes` and 502 instead. An `inspect`-marked
+            // event stream stays streaming too (the windowed inspector handles it).
+            // A `skip`-marked event stream is the fail-open opt-out's target: it
+            // also keeps streaming (downgrade back to the uninspected path).
+            // (Already-buffered bodies are still inspected in `on_response_body`.)
+            return self.streaming_response == StreamingResponsePolicy::Buffer
+                && buffer_streaming_marker_set(ctx);
+        }
+
         // The final buffered hook is the only phase that can safely classify
         // an origin-encoded response by its decoded shape. Keep every eligible
         // non-identity encoding on the bounded decode path even when the origin
@@ -2160,21 +2184,6 @@ impl Plugin for AiSemanticFirewall {
         let Some(content_type) = content_type else {
             return false;
         };
-
-        if is_event_stream_content_type(content_type) {
-            // Pin an event stream onto the buffered path only when `buffer` mode
-            // actually flagged THIS request from a detected `stream: true` JSON
-            // POST (the request-path marker). Unrelated SSE — a `GET` EventSource
-            // endpoint, or a backend that unexpectedly returns an unbounded
-            // stream — must keep streaming; buffering it would collect until
-            // `max_response_body_size_bytes` and 502 instead. An `inspect`-marked
-            // event stream stays streaming too (the windowed inspector handles it).
-            // A `skip`-marked event stream is the fail-open opt-out's target: it
-            // also keeps streaming (downgrade back to the uninspected path).
-            // (Already-buffered bodies are still inspected in `on_response_body`.)
-            return self.streaming_response == StreamingResponsePolicy::Buffer
-                && buffer_streaming_marker_set(ctx);
-        }
 
         if is_json_content_type(content_type) {
             // A marked `inspect` request whose backend returned JSON (not the SSE
@@ -4949,6 +4958,18 @@ fn content_encoding_value(headers: &HashMap<String, String>) -> Option<&str> {
 
 fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
     content_encoding_value(headers).is_some()
+}
+
+fn is_partial_response(
+    ctx: &RequestContext,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    response_status == 206
+        || header_value(response_headers, "content-range").is_some()
+        || ctx
+            .metadata
+            .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)
 }
 
 fn response_content_type_is_inspection_candidate(content_type: &str) -> bool {
