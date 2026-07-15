@@ -273,6 +273,76 @@ fn mtls_auth_schemas_match_runtime_contract() {
     }
 }
 
+#[test]
+fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let auth_mode = spec["components"]["schemas"]["AuthMode"]["description"]
+        .as_str()
+        .expect("AuthMode description");
+    let scoped_scheme_contract = "For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, \
+                                  `jwks_auth`, and `oauth2_introspection`, a foreign \
+                                  `Authorization` scheme is skipped; other mechanisms are not \
+                                  covered by this guarantee.";
+    let normalized_auth_mode = auth_mode.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized_auth_mode.contains(scoped_scheme_contract));
+    assert!(normalized_auth_mode.contains("Any rejection returned by a plugin is terminal"));
+    assert!(normalized_auth_mode.contains("run sequentially until one succeeds"));
+    assert!(normalized_auth_mode.contains("server rejection takes precedence"));
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(plugin_docs.contains(scoped_scheme_contract));
+
+    let basic_roundtrip_contract = "When `basicauth` is omitted from the request, an existing \
+                                    Basic credential type is preserved; use `DELETE \
+                                    /consumers/{id}/credentials/basicauth` to remove it.";
+    let consumer_update = spec["paths"]["/consumers/{id}"]["put"]["description"]
+        .as_str()
+        .expect("Consumer update description");
+    assert!(consumer_update.contains(basic_roundtrip_contract));
+    let admin_docs = include_str!("../../docs/admin_api.md");
+    assert!(admin_docs.contains(basic_roundtrip_contract));
+
+    let consumer_credentials =
+        &spec["components"]["schemas"]["Consumer"]["properties"]["credentials"];
+    let credentials_description = consumer_credentials["description"]
+        .as_str()
+        .expect("Consumer credentials description");
+    assert!(credentials_description.contains("responses omit `basicauth` entirely"));
+
+    let password_hash =
+        &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]["password_hash"];
+    assert_eq!(password_hash["pattern"], "^hmac_sha256:[0-9a-f]{64}$");
+    assert!(password_hash.get("writeOnly").is_none());
+
+    let password = &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]["password"];
+    let password_pattern = password["pattern"].as_str().expect("password pattern");
+    assert_eq!(password_pattern, r"^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$");
+    let password_pattern = Regex::new(password_pattern).expect("password pattern compiles");
+    assert!(!password_pattern.is_match("embedded\0null"));
+    assert!(password_pattern.is_match("tabs\tand\nnewlines\rremain valid"));
+
+    let plugin_config = &spec["components"]["schemas"]["PluginConfig"];
+    let config_description = plugin_config["properties"]["config"]["description"]
+        .as_str()
+        .expect("PluginConfig config description");
+    assert!(config_description.contains("Disabled plugin configs are stored without construction"));
+    assert!(config_description.contains("Enabling performs full validation"));
+
+    let audit_diff_description = spec["components"]["schemas"]["AuditEvent"]["properties"]["diff"]
+        ["description"]
+        .as_str()
+        .expect("AuditEvent diff description");
+    assert!(audit_diff_description.contains("stable `[REDACTED]` marker"));
+    assert!(audit_diff_description.contains("never values, entry fields, shape, or count"));
+
+    assert_eq!(
+        spec["paths"]["/batch"]["post"]["responses"]["500"]["$ref"],
+        "#/components/responses/InternalServerError"
+    );
+}
+
 fn normalized_path_template(path: &str) -> String {
     static PATH_PARAMETER: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\{[^}]+\}").expect("path-template regex compiles"));

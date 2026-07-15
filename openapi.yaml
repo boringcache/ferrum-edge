@@ -3024,7 +3024,9 @@ paths:
         Returns successful admin API mutation events for the selected namespace.
         Requires an admin-role JWT. Each event includes actor, action, resource
         identity, timestamp, and a JSON diff. Consumer credential data is
-        redacted before it is written to the audit log.
+        redacted before it is written to the audit log. Basic credential
+        mutations remain visible by type and action, but values, entry fields,
+        shape, and count are replaced by one stable `[REDACTED]` marker.
       tags: [Audit]
       parameters:
         - name: actor
@@ -3095,6 +3097,9 @@ paths:
 
         All fields within each resource follow the same schema as the
         individual create endpoints. IDs are auto-generated if omitted.
+        Plaintext Basic-auth passwords require a configured
+        `FERRUM_BASIC_AUTH_HMAC_SECRET` of at least 32 bytes; missing or weak
+        operator configuration fails the batch with 500 before persistence.
       tags: [Batch]
       requestBody:
         required: true
@@ -3129,6 +3134,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3580,6 +3587,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3614,6 +3623,10 @@ paths:
     put:
       operationId: updateConsumer
       summary: Update a consumer
+      description: >-
+        When `basicauth` is omitted from the request, an existing Basic
+        credential type is preserved; use `DELETE
+        /consumers/{id}/credentials/basicauth` to remove it.
       tags: [Consumers]
       requestBody:
         required: true
@@ -3636,6 +3649,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3715,6 +3730,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3752,6 +3769,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -5809,7 +5828,10 @@ components:
         diff:
           type: object
           additionalProperties: true
-          description: Redacted JSON before/after diff for the successful mutation
+          description: >-
+            Redacted JSON diff for the successful mutation. Basic credential
+            changes expose only the credential type, action, and a stable
+            `[REDACTED]` marker, never values, entry fields, shape, or count.
 
     AuditEventListResponse:
       type: object
@@ -6343,8 +6365,15 @@ components:
       enum: [single, multi]
       default: single
       description: |
-        `single` — first successful auth plugin wins.
-        `multi` — all auth plugins run; no single rejection blocks the request.
+        `single` — auth plugins run in priority order until the first success.
+        For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`,
+        and `oauth2_introspection`, a foreign `Authorization` scheme is skipped;
+        other mechanisms are not covered by this guarantee. Any rejection
+        returned by a plugin is terminal.
+        `multi` — auth plugins run sequentially until one succeeds. If none
+        succeeds, a server rejection takes precedence over the last ordinary
+        rejection; an all-missing chain returns the first available challenge
+        in plugin priority order, skipping challenge-less mechanisms.
 
     PluginAssociation:
       type: object
@@ -6400,6 +6429,8 @@ components:
             Credential values that serve as lookup keys must be unique across all
             consumers and across all entries within arrays. Max entries per type is
             controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
+            Ordinary Consumer responses omit `basicauth` entirely; authenticated
+            backup responses retain canonical unredacted values for restoration.
           properties:
             keyauth:
               type: array
@@ -6412,7 +6443,7 @@ components:
               items:
                 $ref: "#/components/schemas/BasicAuthCredential"
               minItems: 1
-              description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`.
+              description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`; omitted from ordinary Consumer responses.
             jwt:
               type: array
               items:
@@ -6479,19 +6510,31 @@ components:
 
     BasicAuthCredential:
       type: object
+      additionalProperties: false
+      oneOf:
+        - required: [password]
+        - required: [password_hash]
       properties:
         password:
           type: string
+          minLength: 1
+          maxLength: 4096
+          pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           writeOnly: true
           description: >-
             Plaintext password (automatically hashed on write using HMAC-SHA256
             with the server secret `FERRUM_BASIC_AUTH_HMAC_SECRET`). Mutually
-            exclusive with `password_hash`.
+            exclusive with `password_hash`. Must not contain ASCII control bytes
+            other than horizontal tab, line feed, and carriage return.
         password_hash:
           type: string
+          maxLength: 76
+          pattern: "^hmac_sha256:[0-9a-f]{64}$"
           description: >-
-            Pre-hashed password in `hmac_sha256:<hex>` format (constant-time,
-            ~1μs). On read, this field is always returned instead of `password`.
+            Pre-hashed password in `hmac_sha256:<64 lowercase hex>` format
+            (constant-time, ~1μs). Ordinary Consumer responses omit the
+            entire `basicauth` credential type; authenticated backups return
+            this canonical unredacted value for restoration.
       description: >-
         Basic auth credential for the `basic_auth` plugin. Supply either
         `password` (auto-hashed) or `password_hash` (pre-hashed). Indexed by
@@ -6587,15 +6630,18 @@ components:
           type: object
           default: {}
           description: >-
-            Plugin-specific JSON configuration. Validated on create/update and
-            again when the plugin is instantiated at config reload time.
-            Enabled plugin configs are validation-fatal when the plugin cache is
-            built: unknown plugin names or invalid plugin-specific config block
-            gateway startup in file mode, and on DB/CP polling the new config
-            snapshot is rejected as a whole (the gateway keeps serving the
-            prior good config). Disabled plugin configs are not instantiated.
-            See
-            `PluginConfigs` section for per-plugin schema definitions.
+            Plugin-specific JSON configuration. Resource-level size and depth
+            constraints are always validated. Plugin-specific construction is
+            performed on create/update and config reload only when `enabled` is
+            true. Enabled plugin configs are validation-fatal when the plugin
+            cache is built: unknown plugin names or invalid plugin-specific
+            config block gateway startup in file mode, and on DB/CP polling the
+            new config snapshot is rejected as a whole (the gateway keeps
+            serving the prior good config). Disabled plugin configs are stored
+            without construction, allowing secret-dependent plugins such as
+            `basic_auth` to be staged before their runtime secret is provisioned.
+            Enabling performs full validation. See `PluginConfigs` section for
+            per-plugin schema definitions.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
@@ -6610,6 +6656,9 @@ components:
         enabled:
           type: boolean
           default: true
+          description: >-
+            Whether the plugin is active. Disabled configs are stored but not
+            constructed; enabling them performs full plugin-specific validation.
         priority_override:
           type: [integer, "null"]
           minimum: 0

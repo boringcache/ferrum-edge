@@ -510,6 +510,121 @@ async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
 }
 
 #[tokio::test]
+async fn basic_credential_mutations_emit_shape_independent_audit_markers() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+
+    let consumer = json!({
+        "id": "audit-basic-consumer",
+        "username": "audit-basic-user",
+        "credentials": {}
+    });
+    let (status, body) = post_json(&base, "/consumers", &admin, &consumer).await;
+    assert_eq!(status, 201, "consumer create failed: {body:?}");
+    // Audit persistence is asynchronous. Observe each event before the next
+    // mutation so the test's two-connection SQLite pool does not race writers.
+    wait_for_audit_total(
+        &base,
+        "/audit?resource_type=consumer&resource_id=audit-basic-consumer",
+        &admin,
+        1,
+    )
+    .await;
+
+    let old_hash = format!("hmac_sha256:{}", "a".repeat(64));
+    let new_hash = format!("hmac_sha256:{}", "b".repeat(64));
+    let client = reqwest::Client::new();
+    let credential_audit_path =
+        "/audit?resource_type=consumer_credentials&resource_id=audit-basic-consumer";
+
+    let response = client
+        .put(format!(
+            "{base}/consumers/audit-basic-consumer/credentials/basicauth"
+        ))
+        .bearer_auth(&admin)
+        .json(&json!([{"password_hash": old_hash.clone()}]))
+        .send()
+        .await
+        .expect("PUT Basic credentials");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status, 200, "PUT Basic credentials failed: {body:?}");
+    assert!(body["credentials"].get("basicauth").is_none());
+    wait_for_audit_total(&base, credential_audit_path, &admin, 1).await;
+
+    let response = client
+        .post(format!(
+            "{base}/consumers/audit-basic-consumer/credentials/basicauth"
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({"password_hash": new_hash.clone()}))
+        .send()
+        .await
+        .expect("POST Basic credential");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status, 200, "POST Basic credential failed: {body:?}");
+    assert!(body["credentials"].get("basicauth").is_none());
+    wait_for_audit_total(&base, credential_audit_path, &admin, 2).await;
+
+    let response = client
+        .delete(format!(
+            "{base}/consumers/audit-basic-consumer/credentials/basicauth/0"
+        ))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .expect("DELETE Basic credential by index");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status, 200, "DELETE Basic credential failed: {body:?}");
+    assert!(body["credentials"].get("basicauth").is_none());
+    wait_for_audit_total(&base, credential_audit_path, &admin, 3).await;
+
+    let response = client
+        .delete(format!(
+            "{base}/consumers/audit-basic-consumer/credentials/basicauth"
+        ))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .expect("DELETE all Basic credentials");
+    assert_eq!(response.status().as_u16(), 204);
+
+    let audit_body = wait_for_audit_total(&base, credential_audit_path, &admin, 4).await;
+    let items = audit_body["items"].as_array().expect("audit items");
+    let actions: std::collections::HashSet<&str> = items
+        .iter()
+        .filter_map(|event| event["action"].as_str())
+        .collect();
+    assert_eq!(
+        actions,
+        std::collections::HashSet::from([
+            "update_credentials",
+            "append_credential",
+            "delete_credential",
+            "delete_credentials",
+        ])
+    );
+
+    for event in items {
+        assert_eq!(event["diff"]["credential_type"], "basicauth");
+        assert_eq!(event["diff"]["credential_change"], "[REDACTED]");
+        for side in ["before", "after"] {
+            if let Some(marker) = event["diff"][side]["credentials"].get("basicauth") {
+                assert_eq!(marker, "[REDACTED]");
+            }
+        }
+        let serialized = event["diff"].to_string();
+        assert!(!serialized.contains(&old_hash));
+        assert!(!serialized.contains(&new_hash));
+        assert!(!serialized.contains("password_hash"));
+    }
+}
+
+#[tokio::test]
 async fn upstream_consul_token_redacted_in_audit_diff() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);

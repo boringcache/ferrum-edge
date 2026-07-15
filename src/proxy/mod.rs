@@ -13844,6 +13844,9 @@ fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
 ) -> (u16, Vec<u8>, HashMap<String, String>) {
     let mut headers = HashMap::new();
+    // Challenge selection follows configured priority order: mechanisms that
+    // do not advertise a challenge are skipped, and the first available
+    // challenge wins.
     let challenge = auth_plugins
         .iter()
         .find_map(|plugin| plugin.authentication_challenge())
@@ -13916,6 +13919,9 @@ pub async fn run_authentication_phase(
         }
         AuthMode::Single => {
             for auth_plugin in auth_plugins {
+                if request_is_authenticated(ctx) {
+                    return None;
+                }
                 match auth_plugin.authenticate(ctx, consumer_index).await {
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -13923,7 +13929,11 @@ pub async fn run_authentication_phase(
                             return Some((reject.status_code, reject.body, reject.headers));
                         }
                     }
-                    PluginResult::Continue => {}
+                    PluginResult::Continue => {
+                        if request_is_authenticated(ctx) {
+                            return None;
+                        }
+                    }
                 }
             }
             let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1

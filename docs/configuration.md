@@ -664,7 +664,7 @@ See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full TCP/UDP proxy documentation.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | `ferrum-edge-change-me-in-production` | Server secret for HMAC-SHA256 password verification (~1μs). The Admin API stores `hmac_sha256:<hex>` hashes. **Must be changed in production** — using the default allows anyone who knows it to compute valid credential hashes. |
+| `FERRUM_BASIC_AUTH_HMAC_SECRET` | When `basic_auth` is enabled | — | Unique random server secret of at least 32 bytes for HMAC-SHA256 password verification. The Admin API stores `hmac_sha256:<64 lowercase hex>` hashes. There is no default; missing or weak values fail plugin construction. Rotating this secret invalidates every existing Basic-auth password hash, so re-hash credentials as part of the same rollout. |
 | `FERRUM_MAX_CREDENTIALS_PER_TYPE` | No | `2` | Maximum active credential entries per type per consumer |
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
 | `FERRUM_BACKEND_ALLOW_IPS` | No | `both` | Backend egress mode: `both` (any IP), `private` (only private/reserved), or `public` (only public — blocks all private/reserved). Composes with the CIDR lists and the dangerous-range baseline below |
