@@ -2364,13 +2364,15 @@ impl AdminResource for Proxy {
             && ctx.mode != "cp"
         {
             if ctx.reserved_ports.contains(&port) {
-                return Err(AfterValidateError::Response(Box::new(super::json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": format!(
-                        "listen_port {} conflicts with a gateway reserved port (proxy/admin/gRPC listener)",
-                        port
-                    )}),
-                ))));
+                return Err(AfterValidateError::Response(Box::new(
+                    super::json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} conflicts with a gateway reserved port (proxy/admin/gRPC listener)",
+                            port
+                        )}),
+                    ),
+                )));
             }
 
             let port_changed = existing.and_then(|proxy| proxy.listen_port) != Some(port);
@@ -2386,13 +2388,15 @@ impl AdminResource for Proxy {
                 )
                 .await
             {
-                return Err(AfterValidateError::Response(Box::new(super::json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": format!(
-                        "listen_port {} is not available on the host: {}",
-                        port, error
-                    )}),
-                ))));
+                return Err(AfterValidateError::Response(Box::new(
+                    super::json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} is not available on the host: {}",
+                            port, error
+                        )}),
+                    ),
+                )));
             }
         }
 
