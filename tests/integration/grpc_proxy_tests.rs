@@ -1845,8 +1845,7 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    let mut gateway_error_security =
-        security_headers_plugin("grpc-web-backend-error-security");
+    let mut gateway_error_security = security_headers_plugin("grpc-web-backend-error-security");
     gateway_error_security.config["set"] = serde_json::json!({
         "X-Security-Policy": "gateway-enforced",
         "Connection": "close",
@@ -1858,10 +1857,8 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         "Transfer-Encoding": "chunked",
         "Upgrade": "h2c"
     });
-    let state = create_test_proxy_state_with_plugins(
-        vec![proxy],
-        vec![plugin, gateway_error_security],
-    );
+    let state =
+        create_test_proxy_state_with_plugins(vec![proxy], vec![plugin, gateway_error_security]);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
     let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();

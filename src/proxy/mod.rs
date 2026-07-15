@@ -17416,9 +17416,10 @@ async fn handle_proxy_request_inner(
                 // (#1649 R8 finding 1): the body-terminal observer must then be
                 // suppressed so the ended body's `Drop` can't deliver a second
                 // (ClientDisconnect) terminal that neutralizes the deferred success.
-                let pristine_streaming_trailers_only_terminal_metadata = grpc_body_ended.then(|| {
-                    grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers)
-                });
+                let pristine_streaming_trailers_only_terminal_metadata =
+                    grpc_body_ended.then(|| {
+                        grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers)
+                    });
                 let mut grpc_recorder_owns_ended_response = false;
                 let grpc_cb_recorded_eagerly = if grpc_skip_final_cb_record {
                     // A rotated retry already recorded (and released) the prior
@@ -18049,11 +18050,10 @@ async fn handle_proxy_request_inner(
                             true,
                         );
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
-                        authoritative_trailers_only_terminal_metadata = Some(
-                            grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                        authoritative_trailers_only_terminal_metadata =
+                            Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
                                 &normalized.headers,
-                            ),
-                        );
+                            ));
                         response_status = normalized.http_status.as_u16();
                         response_headers = normalized.headers;
                         plugin_response_headers = response_headers.clone();
@@ -18099,11 +18099,10 @@ async fn handle_proxy_request_inner(
                                         &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
-                                authoritative_trailers_only_terminal_metadata = Some(
-                                    grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                authoritative_trailers_only_terminal_metadata =
+                                    Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
                                         &normalized.headers,
-                                    ),
-                                );
+                                    ));
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
                                 plugin_response_headers = response_headers.clone();
@@ -18195,11 +18194,10 @@ async fn handle_proxy_request_inner(
                                         &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
-                                authoritative_trailers_only_terminal_metadata = Some(
-                                    grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                authoritative_trailers_only_terminal_metadata =
+                                    Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
                                         &normalized.headers,
-                                    ),
-                                );
+                                    ));
                                 if let (Some(grpc_web_ct), Some(grpc_status)) =
                                     (grpc_web_response_content_type, normalized.grpc_status)
                                 {
