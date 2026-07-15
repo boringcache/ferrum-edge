@@ -619,13 +619,10 @@ impl OidcRelyingParty {
             cookie_attrs,
             context_id: session_context_id,
             correlation_cookie_name_prefix,
-            correlation_cookie_attrs: build_cookie_attrs(
-                secure,
-                true,
-                "Lax",
-                domain.as_deref(),
-                &callback_path,
-            ),
+            // Correlation cookies bind the authorization-code state to this host.
+            // They must not inherit a parent session Domain because sibling
+            // subdomains could receive or overwrite the state-binding secret.
+            correlation_cookie_attrs: build_cookie_attrs(secure, true, "Lax", None, &callback_path),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),

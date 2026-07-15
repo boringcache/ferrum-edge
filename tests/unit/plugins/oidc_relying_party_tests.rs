@@ -139,7 +139,7 @@ async fn unauthenticated_html_get_returns_302() {
 }
 
 #[tokio::test]
-async fn correlation_cookie_preserves_configured_session_domain() {
+async fn correlation_cookie_ignores_configured_session_domain() {
     let mut config = base_config();
     config["session"]["domain"] = json!("example.com");
     let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
@@ -153,7 +153,8 @@ async fn correlation_cookie_preserves_configured_session_domain() {
             let cookie = headers
                 .get("set-cookie")
                 .expect("browser challenge correlation cookie");
-            assert!(cookie.contains("Domain=example.com"));
+            assert!(!cookie.contains("Domain=example.com"));
+            assert!(!cookie.contains("Domain="));
             assert!(cookie.contains("Path=/oauth/callback"));
             assert!(cookie.contains("SameSite=Lax"));
             assert!(cookie.contains("Secure"));
