@@ -150,7 +150,7 @@ async fn earlier_single_mode_principal_prevents_later_oidc_refresh_and_slide() {
         json!({
             "sub": "oidc-subject",
             "email": "oidc@example.test",
-            "exp": now + 3600
+            "exp": now - 120
         }),
         Some("refresh-token".to_string()),
         true,
@@ -178,11 +178,16 @@ async fn earlier_single_mode_principal_prevents_later_oidc_refresh_and_slide() {
 }
 
 #[tokio::test]
-async fn multi_auth_supersession_discards_oidc_reject_without_refresh_state() {
+async fn multi_auth_supersession_keeps_only_rotated_requester_session_state() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(ResponseTemplate::new(500))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "rotated-refresh-token",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
         .mount(&server)
         .await;
     let mut config = refresh_config(&format!("{}/token", server.uri()));
@@ -222,8 +227,20 @@ async fn multi_auth_supersession_discards_oidc_reject_without_refresh_state() {
         .is_none()
     );
     assert_eq!(ctx.auth_method, Some("key_auth"));
-    assert!(rolling_cookie(&oidc, &mut ctx).await.is_none());
-    assert_eq!(server.received_requests().await.expect("requests").len(), 0);
+    assert_eq!(
+        ctx.identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str()),
+        Some("testuser")
+    );
+    assert!(ctx.pending_claim_headers.is_empty());
+    let rotated = rolling_cookie(&oidc, &mut ctx)
+        .await
+        .expect("post-refresh reject must preserve requester-owned rotation");
+    let payload = oidc_open_session_cookie_for_test(&oidc, &rotated)
+        .expect("rotated requester session opens");
+    assert_eq!(payload["refresh_token_b64"], json!("rotated-refresh-token"));
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
 }
 
 #[tokio::test]

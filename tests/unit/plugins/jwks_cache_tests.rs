@@ -1,9 +1,8 @@
 use ferrum_edge::_test_support::jwks_discovery_candidate_for_test;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::utils::jwks_cache::{
-    RETIRED_STORE_REAP_MAX_ATTEMPTS, cached_reaper_generation, cached_refresh_state,
-    clear_jwks_cache, get_or_create_jwks_store, retain_active_requirements, retain_active_uris,
-    retire_jwks_store_if_unreferenced,
+    cached_reaper_generation, cached_refresh_state, clear_jwks_cache, get_or_create_jwks_store,
+    retain_active_requirements, retain_active_uris, retire_jwks_store_if_unreferenced,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -238,7 +237,7 @@ async fn cancelled_discovery_candidate_retires_cache_entry_at_acquisition_bounda
 }
 
 #[tokio::test]
-async fn discarded_candidate_uses_bounded_reaper_for_active_shared_store() {
+async fn discarded_candidate_does_not_reap_or_poll_active_shared_store() {
     let server = wiremock::MockServer::start().await;
     let uri = format!("{}/active-shared/jwks.json", server.uri());
     let _guard = cache_test_lock().lock().await;
@@ -253,10 +252,9 @@ async fn discarded_candidate_uses_bounded_reaper_for_active_shared_store() {
 
     assert_eq!(
         cached_reaper_generation(&uri),
-        Some(1),
-        "discarding a shared candidate should schedule one bounded reaper"
+        Some(0),
+        "discarding a candidate must not schedule a reaper for an active shared store"
     );
-    assert_eq!(RETIRED_STORE_REAP_MAX_ATTEMPTS, 100);
     let still_active = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
     assert!(Arc::ptr_eq(&active_store, &still_active));
 

@@ -1129,14 +1129,8 @@ impl OidcRelyingParty {
         // refresh-token grant or sliding the cookie. Both operations mutate
         // requester-owned state that cannot safely be discarded after IdP
         // rotation, nor published by a principal-less/rejected/later attempt.
-        if let Err((status, body)) = self.check_session_authorization(&payload.claims) {
-            return reject(status, body);
-        }
         let preflight_outcome = self.resolve_identity(&payload.claims, consumer_index);
         if !authentication_attempt_can_commit(ctx, &preflight_outcome, true) {
-            if claims_expired_before_refresh {
-                return self.challenge(ctx, true);
-            }
             return apply_verify_outcome(ctx, AuthenticationAttempt::new(), preflight_outcome);
         }
 
@@ -1160,30 +1154,52 @@ impl OidcRelyingParty {
             return self.challenge(ctx, true);
         }
 
-        let mut attempt = AuthenticationAttempt::new();
         let mut mutated = refresh.mutated || refresh.refreshed || backfilled_claims_expiry;
         mutated |= self.maybe_slide_session(&mut payload, now);
-        if mutated {
+        let rolling_cookie = if mutated {
             match self.seal_session_cookie(&payload) {
-                Ok(cookie) => {
-                    attempt.stage_principal_metadata(
-                        SESSION_SET_COOKIE_METADATA_KEY.to_string(),
-                        cookie,
-                    );
-                }
+                Ok(cookie) => Some(cookie),
                 Err(error) => {
                     warn!(
                         plugin = "oidc_relying_party",
                         error = %error,
                         "failed to re-seal rolling session cookie; serving with the existing session"
                     );
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
 
         // Authorize against the effective (possibly refreshed) claims.
         if let Err((status, body)) = self.check_session_authorization(&payload.claims) {
+            if refresh.mutated && let Some(cookie) = rolling_cookie {
+                // The preflight proved this requester's session could own the
+                // request before the refresh grant. Preserve only its rotated
+                // token/backoff cookie on a post-refresh reject; claim headers
+                // and principal state remain uncommitted.
+                ctx.metadata
+                    .entry(SESSION_SET_COOKIE_METADATA_KEY.to_string())
+                    .or_insert(cookie);
+            }
             return reject(status, body);
+        }
+        let outcome = self.resolve_identity(&payload.claims, consumer_index);
+        let mut attempt = AuthenticationAttempt::new();
+        if authentication_attempt_can_commit(ctx, &outcome, true) {
+            if let Some(cookie) = rolling_cookie {
+                attempt.stage_principal_metadata(
+                    SESSION_SET_COOKIE_METADATA_KEY.to_string(),
+                    cookie,
+                );
+            }
+        } else if refresh.mutated && let Some(cookie) = rolling_cookie {
+            // A refreshed ID token can remove the configured identity claim
+            // after the grant has already rotated requester-owned state.
+            ctx.metadata
+                .entry(SESSION_SET_COOKIE_METADATA_KEY.to_string())
+                .or_insert(cookie);
         }
         emit_claim_headers_to_attempt(
             &mut attempt,
@@ -1191,7 +1207,6 @@ impl OidcRelyingParty {
             &self.provider.claim_headers,
             ",",
         );
-        let outcome = self.resolve_identity(&payload.claims, consumer_index);
         apply_verify_outcome(ctx, attempt, outcome)
     }
 
