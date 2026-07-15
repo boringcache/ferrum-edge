@@ -395,6 +395,39 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
 }
 
 #[test]
+fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let routing_hook = source
+        .rfind("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .expect("deferred routing-header hook must remain present");
+    let after_routing_hook = &source[routing_hook..];
+    let refresh = after_routing_hook
+        .find("refresh_effective_backend_consumer_identity_headers(")
+        .expect("identity headers must be refreshed after deferred routing hooks");
+    let hash_selection = after_routing_hook
+        .find("backend_dispatch::upstream_selection_hash_key(")
+        .expect("deferred headers must still drive target reselection");
+    assert!(
+        refresh < hash_selection,
+        "gateway identity must be restored before header-hash target selection"
+    );
+
+    let remaining_hook = source
+        .rfind("BackendPathBeforeProxyPass::RemainingDeferred")
+        .expect("remaining deferred hook pass must remain present");
+    assert!(
+        source[remaining_hook..]
+            .contains("refresh_effective_backend_consumer_identity_headers("),
+        "gateway identity must be restored after every deferred hook pass"
+    );
+    assert!(
+        source.contains("name.eq_ignore_ascii_case(\"x-consumer-username\")")
+            && source.contains("name.eq_ignore_ascii_case(\"x-consumer-custom-id\")"),
+        "the shared scrub must reject case variants of reserved identity headers"
+    );
+}
+
+#[test]
 fn test_longest_prefix_match() {
     let config = GatewayConfig {
         version: "1".to_string(),

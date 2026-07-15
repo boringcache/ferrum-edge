@@ -9370,8 +9370,51 @@ fn push_forwardable_header_override(
 }
 
 fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, String>) {
-    headers.remove("x-consumer-username");
-    headers.remove("x-consumer-custom-id");
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("x-consumer-username")
+            && !name.eq_ignore_ascii_case("x-consumer-custom-id")
+    });
+}
+
+/// Remove plugin-controlled consumer identity headers and restore only the
+/// gateway-authenticated values for backend dispatch.
+pub(crate) fn refresh_backend_consumer_identity_headers(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    let principal_username = ctx.backend_consumer_username().map(str::to_string);
+    let principal_custom_id = principal_username
+        .as_ref()
+        .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
+    let source_has_reserved_identity = principal_username.is_none()
+        && headers.keys().any(|name| {
+            name.eq_ignore_ascii_case("x-consumer-username")
+                || name.eq_ignore_ascii_case("x-consumer-custom-id")
+        });
+    if principal_username.is_none() && !source_has_reserved_identity {
+        return;
+    }
+
+    sanitize_reserved_consumer_identity_headers(headers);
+    if let Some(username) = principal_username {
+        headers.insert("x-consumer-username".to_string(), username);
+        if let Some(custom_id) = principal_custom_id {
+            headers.insert("x-consumer-custom-id".to_string(), custom_id);
+        }
+    }
+}
+
+fn refresh_effective_backend_consumer_identity_headers(
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    if let Some(headers) = owned_proxy_headers.as_mut() {
+        refresh_backend_consumer_identity_headers(ctx, headers);
+    } else {
+        let mut headers = std::mem::take(&mut ctx.headers);
+        refresh_backend_consumer_identity_headers(ctx, &mut headers);
+        ctx.headers = headers;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -15641,17 +15684,18 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // Inject identity headers when authentication resolved a principal.
-    if let Some(username) = ctx.backend_consumer_username() {
+    // Strip plugin-controlled identity headers and inject only the gateway's
+    // authenticated values. The common no-header/no-principal path avoids
+    // materializing an owned header map.
+    let source_has_reserved_identity = owned_proxy_headers.as_ref().is_some_and(|headers| {
+        headers.keys().any(|name| {
+            name.eq_ignore_ascii_case("x-consumer-username")
+                || name.eq_ignore_ascii_case("x-consumer-custom-id")
+        })
+    });
+    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        sanitize_reserved_consumer_identity_headers(headers);
-        headers.insert("x-consumer-username".to_string(), username.to_string());
-        if let Some(custom_id) = ctx.backend_consumer_custom_id() {
-            headers.insert("x-consumer-custom-id".to_string(), custom_id.to_string());
-        }
-    } else if ctx.suppresses_backend_consumer_identity_headers() {
-        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        sanitize_reserved_consumer_identity_headers(headers);
+        refresh_backend_consumer_identity_headers(&ctx, headers);
     }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.
@@ -15824,6 +15868,14 @@ async fn handle_proxy_request_inner(
             break;
         }
 
+        // A deferred routing function can return arbitrary headers. Reserved
+        // consumer identity must be restored before those headers participate
+        // in hash-based target selection or reach any backend transport.
+        refresh_effective_backend_consumer_identity_headers(
+            &mut ctx,
+            &mut owned_proxy_headers,
+        );
+
         let selected_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
         if selected_headers != &headers_before
             && backend_dispatch::upstream_selection_hash_key(
@@ -15887,6 +15939,12 @@ async fn handle_proxy_request_inner(
             };
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
             ctx.path = backend_ctx_path;
+        }
+        if matches!(deferred_result, PluginResult::Continue) {
+            refresh_effective_backend_consumer_identity_headers(
+                &mut ctx,
+                &mut owned_proxy_headers,
+            );
         }
         match deferred_result {
             PluginResult::Continue => {}

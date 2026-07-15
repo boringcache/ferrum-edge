@@ -133,7 +133,11 @@ request semantics even when mesh routing rewrote the backend path. A deferred
 hook that can inject routing headers runs after the initial access preview; if
 it changes the load-balancer hash key, Ferrum reselects the target and performs
 the single state-consuming enforcement against the settled effective path
-before any remaining external or synthetic hook.
+before any remaining external or synthetic hook. After each deferred pass, the
+gateway removes every case variant of the reserved `x-consumer-username` and
+`x-consumer-custom-id` headers and restores only authenticated gateway values;
+plugin-returned headers therefore cannot spoof backend identity or influence
+header-hash routing under a forged identity.
 
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
 

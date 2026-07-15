@@ -2149,10 +2149,6 @@ async fn handle_h3_request(
     // plugins use lowercase). To preserve the zero-alloc hot path, only
     // materialize/scrub when a principal must be injected OR a reserved header is
     // actually present in the effective source.
-    let principal_username = ctx.backend_consumer_username().map(str::to_string);
-    let principal_custom_id = principal_username
-        .as_ref()
-        .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
     let source_has_reserved_identity = owned_proxy_headers
         .as_ref()
         .unwrap_or(&ctx.headers)
@@ -2161,18 +2157,9 @@ async fn handle_h3_request(
             k.eq_ignore_ascii_case("x-consumer-username")
                 || k.eq_ignore_ascii_case("x-consumer-custom-id")
         });
-    if principal_username.is_some() || source_has_reserved_identity {
+    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        headers.retain(|k, _| {
-            !k.eq_ignore_ascii_case("x-consumer-username")
-                && !k.eq_ignore_ascii_case("x-consumer-custom-id")
-        });
-        if let Some(username) = principal_username {
-            headers.insert("X-Consumer-Username".to_string(), username);
-            if let Some(custom_id) = principal_custom_id {
-                headers.insert("X-Consumer-Custom-Id".to_string(), custom_id);
-            }
-        }
+        crate::proxy::refresh_backend_consumer_identity_headers(&ctx, headers);
     }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing
     // ctx.headers while ctx is passed as &mut to proxy functions downstream.
@@ -2387,6 +2374,10 @@ async fn handle_h3_request(
             break;
         }
 
+        // Re-establish gateway-authenticated identity before a deferred
+        // function's headers can affect target selection or backend dispatch.
+        crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+
         if proxy_headers != headers_before
             && crate::proxy::backend_dispatch::upstream_selection_hash_key(
                 &routing_proxy,
@@ -2444,6 +2435,9 @@ async fn handle_h3_request(
             .await;
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
             ctx.path = backend_ctx_path;
+        }
+        if matches!(deferred_result, PluginResult::Continue) {
+            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
         }
         match deferred_result {
             PluginResult::Continue => {}

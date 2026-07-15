@@ -309,3 +309,31 @@ fn h3_grpc_web_initial_before_proxy_reject_uses_grpc_web_shape() {
         "both H3 header-handling branches must emit the gRPC-Web trailer-frame reject shape"
     );
 }
+
+#[test]
+fn h3_deferred_hooks_cannot_spoof_backend_consumer_identity() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let routing_hook = source
+        .rfind("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .expect("H3 deferred routing-header hook must remain present");
+    let after_routing_hook = &source[routing_hook..];
+    let refresh = after_routing_hook
+        .find("refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers)")
+        .expect("H3 must refresh identity after deferred routing hooks");
+    let hash_selection = after_routing_hook
+        .find("upstream_selection_hash_key(")
+        .expect("H3 deferred headers must still drive target reselection");
+    assert!(
+        refresh < hash_selection,
+        "H3 must restore gateway identity before header-hash target selection"
+    );
+
+    let remaining_hook = source
+        .rfind("BackendPathBeforeProxyPass::RemainingDeferred")
+        .expect("H3 remaining deferred hook pass must remain present");
+    assert!(
+        source[remaining_hook..]
+            .contains("refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers)"),
+        "H3 must restore gateway identity after every deferred hook pass"
+    );
+}
