@@ -13224,7 +13224,8 @@ components:
         allow-list is not applied to unmapped external identities. Use
         ip_restriction for IP/CIDR rules. Rule entries match principal values
         byte-for-byte (no trimming) and must contain at least one
-        non-whitespace character.
+        non-whitespace character. Whitespace admission follows Rust
+        `str::trim` Unicode `White_Space` semantics.
       allOf:
         - anyOf:
             - required: [allowed_consumers]
@@ -13269,7 +13270,7 @@ components:
             type: string
             minLength: 1
             maxLength: 255
-            pattern: '\S'
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             Consumer usernames that are explicitly allowed. Empty list disables
@@ -13280,7 +13281,7 @@ components:
             type: string
             minLength: 1
             maxLength: 4096
-            pattern: '\S'
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             Consumer usernames or, when allow_authenticated_identity is true,
@@ -13295,7 +13296,7 @@ components:
             type: string
             minLength: 1
             maxLength: 255
-            pattern: '\S'
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             ACL group names that are explicitly allowed. The check matches if
@@ -13306,7 +13307,7 @@ components:
             type: string
             minLength: 1
             maxLength: 255
-            pattern: '\S'
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             ACL group names that are explicitly denied. If any of the consumer's

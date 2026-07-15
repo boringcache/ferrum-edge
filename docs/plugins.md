@@ -1888,6 +1888,8 @@ UDP+DTLS streams via certificate-based consumer mapping.
 | `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy. All checks use `HashSet<String>` for O(1) membership.
+Whitespace-only rule admission follows Rust `str::trim` Unicode `White_Space`
+semantics; accepted rule values are still stored and matched byte-for-byte.
 
 `allow_authenticated_identity: true` cannot be combined with an allow-list
 (`allowed_consumers` or `allowed_groups`): the allow-list matches mapped Consumer

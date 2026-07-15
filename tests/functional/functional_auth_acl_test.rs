@@ -18,7 +18,7 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::time::Duration;
 
-fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
+pub(super) fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("test-key-1".to_string());
     encode(
@@ -29,7 +29,7 @@ fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> Str
     .expect("Failed to encode RS256 token")
 }
 
-fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
+pub(super) fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     let pem_str = std::str::from_utf8(public_key_pem).expect("Invalid public key PEM");
