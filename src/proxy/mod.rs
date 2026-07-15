@@ -15449,9 +15449,8 @@ async fn handle_proxy_request_inner(
     // breaker, egress, admission, pool, or TLS work. This bit is precomputed at
     // config reload so the hot path does not scan the plugin list.
     let final_body_before_backend_dispatch = requires_request_body_buffering
-        && capabilities.has(
-            crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH,
-        );
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH);
     let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
@@ -29215,8 +29214,7 @@ mod tests {
         });
         let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
         let mut ctx = request_ctx_with_ai_body(request_body);
-        let headers =
-            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
         let synthetic = plugins[0]
             .on_final_request_body_with_context(&mut ctx, &headers, &request_body_bytes)
             .await;

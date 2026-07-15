@@ -2318,12 +2318,9 @@ fn canonicalize_openai_tool_arguments(body: &mut Value) -> Result<(), String> {
             .get_mut("tool_calls")
             .and_then(Value::as_array_mut)
             .ok_or_else(|| {
-                format!(
-                    "ai_federation: messages[{message_index}].tool_calls must be an array"
-                )
+                format!("ai_federation: messages[{message_index}].tool_calls must be an array")
             })?;
-        for (tool_index, (tool_call, parsed)) in
-            tool_calls.iter_mut().zip(parsed_calls).enumerate()
+        for (tool_index, (tool_call, parsed)) in tool_calls.iter_mut().zip(parsed_calls).enumerate()
         {
             let function = tool_call
                 .get_mut("function")

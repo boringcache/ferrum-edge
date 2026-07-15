@@ -2200,9 +2200,8 @@ async fn handle_h3_request(
     // admission, egress, pool, and TLS work. The capability is precomputed at
     // reload, so ordinary H3 requests pay only this bit check.
     let final_body_before_backend_dispatch = plugin_needs_request_buffering
-        && capabilities.has(
-            crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH,
-        );
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH);
     let mut request_body_prepared = false;
     let mut prepared_raw_request_body_bytes: Option<u64> = None;
 
