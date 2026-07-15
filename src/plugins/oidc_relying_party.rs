@@ -22,7 +22,8 @@ use crate::consumer_index::ConsumerIndex;
 use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::{
-    VerifyOutcome, commit_authentication_attempt, constant_time_eq, nonblank_identity,
+    VerifyOutcome, authentication_attempt_can_commit, commit_authentication_attempt,
+    constant_time_eq, nonblank_identity,
 };
 use super::utils::claim_header_fanout::{
     ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
@@ -1123,6 +1124,22 @@ impl OidcRelyingParty {
             payload.claims_expires_at_unix = claims_expires_at;
         }
         let claims_expired_before_refresh = now > claims_expires_at.saturating_add(leeway);
+
+        // Establish that this session can own the request before invoking the
+        // refresh-token grant or sliding the cookie. Both operations mutate
+        // requester-owned state that cannot safely be discarded after IdP
+        // rotation, nor published by a principal-less/rejected/later attempt.
+        if let Err((status, body)) = self.check_session_authorization(&payload.claims) {
+            return reject(status, body);
+        }
+        let preflight_outcome = self.resolve_identity(&payload.claims, consumer_index);
+        if !authentication_attempt_can_commit(ctx, &preflight_outcome, true) {
+            if claims_expired_before_refresh {
+                return self.challenge(ctx, true);
+            }
+            return apply_verify_outcome(ctx, AuthenticationAttempt::new(), preflight_outcome);
+        }
+
         if claims_expired_before_refresh && payload.refresh_token_b64.is_some() {
             payload.refresh_after_unix = now;
         }
@@ -1165,16 +1182,7 @@ impl OidcRelyingParty {
         }
 
         // Authorize against the effective (possibly refreshed) claims.
-        if let Err((status, body)) = scope_role_check::check(
-            &payload.claims,
-            &ScopeRoleRequirements {
-                required_scopes: &self.provider.required_scopes,
-                required_roles: &self.provider.required_roles,
-                scope_claim: &self.provider.scope_claim,
-                role_claim: &self.provider.role_claim,
-                plugin_name: "oidc_relying_party",
-            },
-        ) {
+        if let Err((status, body)) = self.check_session_authorization(&payload.claims) {
             return reject(status, body);
         }
         emit_claim_headers_to_attempt(
@@ -1185,6 +1193,19 @@ impl OidcRelyingParty {
         );
         let outcome = self.resolve_identity(&payload.claims, consumer_index);
         apply_verify_outcome(ctx, attempt, outcome)
+    }
+
+    fn check_session_authorization(&self, claims: &Value) -> Result<(), (u16, String)> {
+        scope_role_check::check(
+            claims,
+            &ScopeRoleRequirements {
+                required_scopes: &self.provider.required_scopes,
+                required_roles: &self.provider.required_roles,
+                scope_claim: &self.provider.scope_claim,
+                role_claim: &self.provider.role_claim,
+                plugin_name: "oidc_relying_party",
+            },
+        )
     }
 
     /// Advance the sliding idle window. To keep the response `Set-Cookie` (and the
@@ -1455,6 +1476,49 @@ impl OidcRelyingParty {
             "{}={}; {}",
             self.session.cookie_name, value, self.session.cookie_attrs
         ))
+    }
+
+    // Reached only through the lib target's `_test_support` shim by external
+    // unit tests; the bin target recompiles this module without that caller.
+    #[allow(dead_code)]
+    pub(crate) fn sealed_refresh_session_cookie_for_tests(
+        &self,
+        claims: Value,
+        refresh_token: Option<String>,
+        refresh_due: bool,
+        rolling_due: bool,
+    ) -> Result<String, String> {
+        let now = chrono::Utc::now().timestamp();
+        let claims_expires_at = claim_expiry(&claims).unwrap_or(now + 3600);
+        let sub = required_subject(&claims, "ID token")?.to_string();
+        let touch_age = if rolling_due {
+            (self.session.idle_ttl.as_secs() as i64 / 2).max(1)
+        } else {
+            0
+        };
+        self.seal_session_cookie(&SessionPayload {
+            version: SESSION_PAYLOAD_VERSION,
+            context_id: self.session.context_id.clone(),
+            sub,
+            id_token_b64: "test-id-token".to_string(),
+            access_token_b64: "test-access-token".to_string(),
+            refresh_token_b64: refresh_token,
+            expires_at_unix: now + 3600,
+            claims_expires_at_unix: claims_expires_at,
+            refresh_after_unix: if refresh_due { now - 1 } else { now + 3600 },
+            issued_at_unix: now - touch_age,
+            last_touch_unix: now - touch_age,
+            nonce: "test-nonce".to_string(),
+            claims,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn open_session_cookie_for_tests(&self, cookie: &str) -> Option<Value> {
+        let cookie_pair = cookie.split(';').next()?;
+        let (_, value) = cookie_pair.split_once('=')?;
+        let payload = self.open_session(value)?;
+        serde_json::to_value(payload).ok()
     }
 
     fn open_session(&self, value: &str) -> Option<SessionPayload> {

@@ -245,14 +245,7 @@ pub fn commit_authentication_attempt(
         return Ok(false);
     }
 
-    let principal_already_committed = ctx
-        .identified_consumer
-        .as_ref()
-        .is_some_and(|consumer| !consumer.username.trim().is_empty())
-        || ctx
-            .authenticated_identity
-            .as_deref()
-            .is_some_and(|identity| !identity.trim().is_empty());
+    let principal_already_committed = request_principal_is_committed(ctx);
 
     // Cleanup is additive for every accepted credential, including later
     // instances in single-auth mode. Failed and principal-less attempts never
@@ -276,6 +269,45 @@ pub fn commit_authentication_attempt(
     }
 
     Ok(true)
+}
+
+/// Whether this attempt could become the first accepted request principal.
+/// Callers with irreversible side effects can use this as a non-mutating
+/// preflight before performing them; the final commit still revalidates the
+/// outcome at the transaction boundary.
+pub fn authentication_attempt_can_commit(
+    ctx: &RequestContext,
+    outcome: &VerifyOutcome,
+    allow_external_identity: bool,
+) -> bool {
+    if request_principal_is_committed(ctx) {
+        return false;
+    }
+    let VerifyOutcome::Success {
+        consumer,
+        external_identity,
+        ..
+    } = outcome
+    else {
+        return false;
+    };
+    consumer
+        .as_ref()
+        .is_some_and(|consumer| !consumer.username.trim().is_empty())
+        || (allow_external_identity
+            && external_identity
+                .as_deref()
+                .is_some_and(|identity| !identity.trim().is_empty()))
+}
+
+fn request_principal_is_committed(ctx: &RequestContext) -> bool {
+    ctx.identified_consumer
+        .as_ref()
+        .is_some_and(|consumer| !consumer.username.trim().is_empty())
+        || ctx
+            .authenticated_identity
+            .as_deref()
+            .is_some_and(|identity| !identity.trim().is_empty())
 }
 
 /// Retain an identity claim byte-for-byte when it contains a non-whitespace

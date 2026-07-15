@@ -1,7 +1,9 @@
+use ferrum_edge::_test_support::jwks_discovery_candidate_for_test;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::utils::jwks_cache::{
-    cached_refresh_state, clear_jwks_cache, get_or_create_jwks_store, retain_active_requirements,
-    retain_active_uris, retire_jwks_store_if_unreferenced,
+    RETIRED_STORE_REAP_MAX_ATTEMPTS, cached_reaper_generation, cached_refresh_state,
+    clear_jwks_cache, get_or_create_jwks_store, retain_active_requirements, retain_active_uris,
+    retire_jwks_store_if_unreferenced,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -207,6 +209,59 @@ async fn superseded_store_is_reaped_after_transient_owner_drops() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(weak.upgrade().is_none());
+
+    clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn cancelled_discovery_candidate_retires_cache_entry_at_acquisition_boundary() {
+    let server = wiremock::MockServer::start().await;
+    let uri = format!("{}/cancelled-candidate/jwks.json", server.uri());
+    let _guard = cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let candidate = jwks_discovery_candidate_for_test(&uri, client(), Duration::from_secs(300));
+    assert_eq!(cached_reaper_generation(&uri), Some(0));
+
+    let task = tokio::spawn(async move {
+        let _candidate = candidate;
+        std::future::pending::<()>().await;
+    });
+    task.abort();
+    let error = task
+        .await
+        .expect_err("aborting the discovery task must cancel it");
+    assert!(error.is_cancelled());
+    assert!(cached_refresh_state(&uri).is_none());
+
+    clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn discarded_candidate_uses_bounded_reaper_for_active_shared_store() {
+    let server = wiremock::MockServer::start().await;
+    let uri = format!("{}/active-shared/jwks.json", server.uri());
+    let _guard = cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let active_store = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
+    retain_active_requirements(&HashMap::from([(
+        uri.clone(),
+        Duration::from_secs(300),
+    )]));
+    assert_eq!(cached_reaper_generation(&uri), Some(0));
+
+    let discarded = jwks_discovery_candidate_for_test(&uri, client(), Duration::from_secs(300));
+    drop(discarded);
+
+    assert_eq!(
+        cached_reaper_generation(&uri),
+        Some(1),
+        "discarding a shared candidate should schedule one bounded reaper"
+    );
+    assert_eq!(RETIRED_STORE_REAP_MAX_ATTEMPTS, 100);
+    let still_active = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
+    assert!(Arc::ptr_eq(&active_store, &still_active));
 
     clear_jwks_cache();
 }

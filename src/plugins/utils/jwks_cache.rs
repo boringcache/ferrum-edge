@@ -29,9 +29,12 @@ struct JwksCacheEntry {
     refresh_interval: Duration,
     refresh_generation: u64,
     retirement_epoch: Arc<AtomicU64>,
+    reaper_generation: AtomicU64,
 }
 
 const RETIRED_STORE_REAP_INTERVAL: Duration = Duration::from_millis(100);
+#[doc(hidden)]
+pub const RETIRED_STORE_REAP_MAX_ATTEMPTS: usize = 100;
 
 /// Global, process-wide cache of JWKS key stores keyed by `jwks_uri`.
 static JWKS_CACHE: OnceLock<Arc<DashMap<String, JwksCacheEntry>>> = OnceLock::new();
@@ -92,6 +95,7 @@ pub fn get_or_create_jwks_store(
             refresh_interval,
             refresh_generation: 1,
             retirement_epoch: Arc::new(AtomicU64::new(0)),
+            reaper_generation: AtomicU64::new(0),
         }
     });
     entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
@@ -184,11 +188,12 @@ fn schedule_retired_store_reaper(uri: String, entry: &JwksCacheEntry) {
     let epoch = retirement_epoch
         .fetch_add(1, Ordering::AcqRel)
         .wrapping_add(1);
+    entry.reaper_generation.fetch_add(1, Ordering::AcqRel);
     let store = Arc::downgrade(&entry.store);
     let cache = Arc::clone(global_cache());
 
     tokio::spawn(async move {
-        loop {
+        for _ in 0..RETIRED_STORE_REAP_MAX_ATTEMPTS {
             tokio::time::sleep(RETIRED_STORE_REAP_INTERVAL).await;
             if retirement_epoch.load(Ordering::Acquire) != epoch {
                 return;
@@ -214,6 +219,51 @@ fn schedule_retired_store_reaper(uri: String, entry: &JwksCacheEntry) {
     });
 }
 
+/// A provisional discovery acquisition. Dropping it before the caller has
+/// published or explicitly retired the candidate releases its store reference
+/// first, then retires a cache entry that has no committed owner. This makes
+/// task cancellation safe at every await point after acquisition.
+pub(crate) struct DiscoveryStoreCandidate {
+    jwks_uri: String,
+    store: Option<Arc<JwksKeyStore>>,
+}
+
+impl DiscoveryStoreCandidate {
+    pub(crate) fn acquire(
+        jwks_uri: &str,
+        http_client: &PluginHttpClient,
+        refresh_interval: Duration,
+    ) -> Self {
+        Self {
+            jwks_uri: jwks_uri.to_string(),
+            store: Some(get_or_create_jwks_store(
+                jwks_uri,
+                http_client,
+                refresh_interval,
+            )),
+        }
+    }
+
+    pub(crate) fn store(&self) -> Option<&Arc<JwksKeyStore>> {
+        self.store.as_ref()
+    }
+
+    pub(crate) fn publish(&mut self) {
+        drop(self.store.take());
+    }
+}
+
+impl Drop for DiscoveryStoreCandidate {
+    fn drop(&mut self) {
+        let store = self.store.take();
+        if store.is_none() {
+            return;
+        }
+        drop(store);
+        retire_jwks_store_if_unreferenced(&self.jwks_uri);
+    }
+}
+
 /// Record a validated discovery result so an equivalent replacement plugin
 /// generation can acquire the last-good store synchronously before rediscovery.
 pub fn remember_discovered_jwks_uri(discovery_url: &str, jwks_uri: &str) {
@@ -234,20 +284,21 @@ fn forget_discovered_jwks_uri(jwks_uri: &str) {
 }
 
 /// Retire a superseded or rejected discovery store. A sole-owner cache entry
-/// is removed immediately; transient or shared owners keep it alive until the
-/// epoch-bound reaper can remove it safely. A committed active consumer revives
-/// the epoch during publication reconciliation.
+/// is removed immediately; transient owners keep it alive until the epoch-bound
+/// reaper can remove it safely. The reaper has a finite retry budget, so a URI
+/// held by another active provider cannot leave an indefinitely polling task;
+/// its strong store owner also prevents premature removal.
 pub fn retire_jwks_store_if_unreferenced(jwks_uri: &str) {
     let cache = global_cache();
-    if let Some(entry) = cache.get(jwks_uri)
-        && Arc::strong_count(&entry.store) > 1
-    {
-        // A prior plugin generation or in-flight authentication still owns
-        // this superseded store. Reuse the epoch-bound reaper so its refresh
-        // task stops as soon as those transient owners finish; a concurrent
-        // active consumer revives the epoch and cancels this retirement.
-        schedule_retired_store_reaper(jwks_uri.to_string(), entry.value());
-        return;
+    if let Some(entry) = cache.get(jwks_uri) {
+        if Arc::strong_count(&entry.store) > 1 {
+            // A prior plugin generation or in-flight authentication still owns
+            // this superseded store. Reuse the epoch-bound reaper so its refresh
+            // task stops as soon as those transient owners finish; a concurrent
+            // active consumer revives the epoch and cancels this retirement.
+            schedule_retired_store_reaper(jwks_uri.to_string(), entry.value());
+            return;
+        }
     }
     if let Some((_, stale)) =
         cache.remove_if(jwks_uri, |_, entry| Arc::strong_count(&entry.store) == 1)
@@ -271,6 +322,15 @@ pub fn cached_refresh_state(jwks_uri: &str) -> Option<(Duration, u64)> {
             entry.value().refresh_generation,
         )
     })
+}
+
+/// Return reaper-scheduling state for lifecycle tests.
+#[doc(hidden)]
+#[allow(dead_code)] // exercised by external unit tests
+pub fn cached_reaper_generation(jwks_uri: &str) -> Option<u64> {
+    global_cache()
+        .get(jwks_uri)
+        .map(|entry| entry.value().reaper_generation.load(Ordering::Acquire))
 }
 
 /// Clear the global JWKS cache. Used in tests to isolate state between runs.

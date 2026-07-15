@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use http::header::HeaderName;
 use serde_json::Map;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -25,8 +26,8 @@ use super::utils::claim_header_fanout::{
 use super::utils::claim_resolver::{extract_claim_string, parse_claim_path_value};
 use super::utils::dpop::{self, DpopJtiCache, DpopVerifyInput};
 use super::utils::jwks_cache::{
-    get_or_create_jwks_store, last_discovered_jwks_uri, remember_discovered_jwks_uri,
-    retire_jwks_store_if_unreferenced,
+    DiscoveryStoreCandidate, get_or_create_jwks_store, last_discovered_jwks_uri,
+    remember_discovered_jwks_uri, retire_jwks_store_if_unreferenced,
 };
 use super::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
 use super::utils::jwt_verifier::{JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks};
@@ -113,6 +114,8 @@ pub struct JwksAuth {
     http_client: PluginHttpClient,
     refresh_interval: Duration,
     discovery_tasks: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    discovery_owner_live: Arc<AtomicBool>,
+    discovery_publication_gate: Arc<Mutex<()>>,
 }
 
 /// A single identity provider configuration.
@@ -205,13 +208,40 @@ const PROVIDER_FIELDS: &[&str] = &[
 
 impl Drop for JwksAuth {
     fn drop(&mut self) {
-        let tasks = match self.discovery_tasks.get_mut() {
-            Ok(tasks) => tasks,
+        let _publication = match self.discovery_publication_gate.lock() {
+            Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(tasks) = tasks.take() {
-            for task in tasks {
-                task.abort();
+        self.discovery_owner_live.store(false, Ordering::Release);
+        {
+            let tasks = match self.discovery_tasks.get_mut() {
+                Ok(tasks) => tasks,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(tasks) = tasks.take() {
+                for task in tasks {
+                    task.abort();
+                }
+            }
+        }
+
+        // A plugin generation can be discarded after its discovery task
+        // published a candidate into the local slot but before the generation
+        // itself was committed. Release those local owners and retire only
+        // entries that no other committed provider still uses.
+        for provider in &self.providers {
+            if matches!(&provider.jwks_source, JwksSource::Inline) {
+                continue;
+            }
+            let current = provider.jwks_store.swap(Arc::new(None));
+            let jwks_uri = current
+                .as_ref()
+                .as_ref()
+                .filter(|store| store.is_refreshable())
+                .map(|store| store.jwks_uri().to_string());
+            drop(current);
+            if let Some(jwks_uri) = jwks_uri {
+                retire_jwks_store_if_unreferenced(&jwks_uri);
             }
         }
     }
@@ -443,6 +473,8 @@ impl JwksAuth {
             http_client,
             refresh_interval,
             discovery_tasks: Mutex::new(None),
+            discovery_owner_live: Arc::new(AtomicBool::new(true)),
+            discovery_publication_gate: Arc::new(Mutex::new(())),
         })
     }
 
@@ -966,6 +998,8 @@ impl super::Plugin for JwksAuth {
                         self.http_client.clone(),
                         discovery_url.clone(),
                         self.refresh_interval,
+                        Arc::clone(&self.discovery_owner_live),
+                        Arc::clone(&self.discovery_publication_gate),
                     ));
                 }
             }
@@ -1082,6 +1116,8 @@ fn spawn_discovery_task(
     client: PluginHttpClient,
     discovery_url: String,
     refresh_interval: Duration,
+    owner_live: Arc<AtomicBool>,
+    publication_gate: Arc<Mutex<()>>,
 ) -> tokio::task::JoinHandle<()> {
     runtime.spawn(async move {
         const INITIAL_BACKOFF_SECS: u64 = 2;
@@ -1107,14 +1143,32 @@ fn spawn_discovery_task(
                         "jwks_auth OIDC discovery resolved a JWKS endpoint at {}",
                         redacted_jwks_uri(&uri)
                     );
-                    let store = get_or_create_jwks_store(&uri, &client, refresh_interval);
+                    let mut candidate = DiscoveryStoreCandidate::acquire(
+                        &uri,
+                        &client,
+                        refresh_interval,
+                    );
+                    let Some(store) = candidate.store().cloned() else {
+                        warn!(
+                            "jwks_auth OIDC: discovery candidate disappeared before publication"
+                        );
+                        return;
+                    };
                     let previous = slot.load().as_ref().as_ref().cloned();
 
                     if previous
                         .as_ref()
                         .is_some_and(|current| current.jwks_uri() == uri)
                     {
+                        let _publication = match publication_gate.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        if !owner_live.load(Ordering::Acquire) {
+                            return;
+                        }
                         remember_discovered_jwks_uri(&discovery_url, &uri);
+                        candidate.publish();
                         return;
                     }
 
@@ -1127,7 +1181,6 @@ fn spawn_discovery_task(
                                     "jwks_auth OIDC: discovered replacement JWKS endpoint has no usable keys; retaining last-known-good store"
                                 );
                                 drop(store);
-                                retire_jwks_store_if_unreferenced(&uri);
                                 attempt = attempt.saturating_add(1);
                                 continue;
                             }
@@ -1137,7 +1190,6 @@ fn spawn_discovery_task(
                                     error
                                 );
                                 drop(store);
-                                retire_jwks_store_if_unreferenced(&uri);
                                 attempt = attempt.saturating_add(1);
                                 continue;
                             }
@@ -1147,8 +1199,17 @@ fn spawn_discovery_task(
                     let previous_uri = previous
                         .as_ref()
                         .map(|current| current.jwks_uri().to_string());
-                    slot.store(Arc::new(Some(Arc::clone(&store))));
-                    remember_discovered_jwks_uri(&discovery_url, &uri);
+                    {
+                        let _publication = match publication_gate.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        if !owner_live.load(Ordering::Acquire) {
+                            return;
+                        }
+                        slot.store(Arc::new(Some(Arc::clone(&store))));
+                        remember_discovered_jwks_uri(&discovery_url, &uri);
+                    }
 
                     if !previous_has_keys
                         && let Err(error) = store.fetch_keys_if_empty().await
@@ -1162,6 +1223,16 @@ fn spawn_discovery_task(
                     {
                         retire_jwks_store_if_unreferenced(&previous_uri);
                     }
+                    let _publication = match publication_gate.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if !owner_live.load(Ordering::Acquire) {
+                        let discarded = slot.swap(Arc::new(None));
+                        drop(discarded);
+                        return;
+                    }
+                    candidate.publish();
                     return;
                 }
                 Err(error) => {

@@ -853,17 +853,10 @@ fn collect_active_jwks_requirements(
     globals: &[Arc<dyn Plugin>],
 ) -> HashMap<String, Duration> {
     let mut requirements = HashMap::new();
-    for plugins in proxy_map.values() {
-        for plugin in plugins.iter() {
-            for (uri, interval) in plugin.active_jwks_refresh_requirements() {
-                requirements
-                    .entry(uri)
-                    .and_modify(|current: &mut Duration| *current = (*current).min(interval))
-                    .or_insert(interval);
-            }
-        }
-    }
-    for plugin in globals {
+    for plugin in globals
+        .iter()
+        .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
+    {
         for (uri, interval) in plugin.active_jwks_refresh_requirements() {
             requirements
                 .entry(uri)
