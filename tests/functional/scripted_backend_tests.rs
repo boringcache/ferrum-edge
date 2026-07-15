@@ -645,3 +645,221 @@ async fn wait_for_h2_downgraded_entry(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// a2a_gateway + retries — unexpected SSE must stream incrementally (#2169).
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `a2a_gateway` classifies `message/send` as non-streaming, making it an
+// active response-buffering plugin for the request. With connection-failure
+// retries configured, the proxy hands the buffer→stream downgrade a
+// retry-marked decision context, and an inherently streaming response can be
+// released only when every active buffering plugin implements the retry
+// release hooks. Before the fix the plugin lacked them, so an unexpected
+// `text/event-stream` response was collected to EOF: no incremental delivery,
+// TTFB equal to the full stream duration, and a 502 once the response cap was
+// hit.
+//
+// The scripted backend writes one SSE event, holds the connection open for
+// several seconds, then writes the terminal event and closes. Incremental
+// delivery is proven by requiring status + headers + the first event well
+// before the backend's mid-stream pause elapses — a buffered response cannot
+// yield any client bytes until the backend closes the stream.
+
+fn a2a_retry_file_config(backend_port: u16, plugin_config: serde_json::Value) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "a2a-retry",
+            "listen_path": "/a2a",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "backend_connect_timeout_ms": 2000,
+            // Disabled: the SSE script intentionally pauses mid-stream for
+            // longer than the scaffolding's usual 5s read timeout.
+            "backend_read_timeout_ms": 0,
+            "backend_write_timeout_ms": 5000,
+            "retry": {
+                "max_retries": 1,
+                "retry_on_connect_failure": true,
+            },
+            "plugins": [{"plugin_config_id": "a2a"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "a2a",
+            "proxy_id": "a2a-retry",
+            "plugin_name": "a2a_gateway",
+            "scope": "proxy",
+            "enabled": true,
+            "config": plugin_config,
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn a2a_retry_configured_unexpected_sse_streams_incrementally() {
+    const EVENT_ONE: &str = "data: {\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"kind\":\"status-update\",\"taskId\":\"task-1\"}}\n\n";
+    const EVENT_TWO: &str = "data: {\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"kind\":\"status-update\",\"final\":true}}\n\n";
+    // Long enough that a force-buffered response (which yields nothing until
+    // backend close) cannot satisfy the first-event deadline below even on a
+    // slow CI machine.
+    const MID_STREAM_PAUSE: Duration = Duration::from_secs(5);
+    const FIRST_EVENT_DEADLINE: Duration = Duration::from_millis(2500);
+
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "message/send",
+        "params": {"message": {"role": "user", "parts": []}}
+    })
+    .to_string();
+
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let response_head =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+    let backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+        .step(TcpStep::ReadExact(request_body.len()))
+        .step(TcpStep::Write(
+            format!("{response_head}{EVENT_ONE}").into_bytes(),
+        ))
+        .step(TcpStep::Sleep(MID_STREAM_PAUSE))
+        .step(TcpStep::Write(EVENT_TWO.as_bytes().to_vec()))
+        .step(TcpStep::Drop)
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = a2a_retry_file_config(backend_port, json!({}));
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let (mut response, first_chunk) = tokio::time::timeout(FIRST_EVENT_DEADLINE, async {
+        let mut response = client
+            .request(reqwest::Method::POST, &harness.proxy_url("/a2a"))
+            .header("content-type", "application/json")
+            .body(request_body.clone())
+            .send()
+            .await
+            .expect("gateway returns response headers");
+        let first_chunk = response
+            .chunk()
+            .await
+            .expect("read first SSE chunk")
+            .expect("stream must not end before the first event");
+        (response, first_chunk)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "first SSE event did not arrive within {FIRST_EVENT_DEADLINE:?} \
+             (elapsed {:?}) — the retry-marked decision context force-buffered \
+             the event-stream response instead of releasing it",
+            started.elapsed()
+        )
+    });
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream"),
+    );
+    let mut body = String::from_utf8_lossy(&first_chunk).into_owned();
+    assert!(
+        body.contains("status-update"),
+        "first chunk should carry the first SSE event, got: {body:?}"
+    );
+    assert!(
+        !body.contains("\"final\":true"),
+        "terminal event must not have been delivered yet — receiving both \
+         events at once means the response was buffered, got: {body:?}"
+    );
+
+    // Drain the rest of the stream: the terminal event must arrive after the
+    // backend's pause, completing the incremental delivery.
+    let drained = tokio::time::timeout(MID_STREAM_PAUSE + Duration::from_secs(5), async {
+        while let Some(chunk) = response.chunk().await.expect("read SSE chunk") {
+            body.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "stream should end after the backend closes"
+    );
+    assert!(
+        body.contains("\"final\":true"),
+        "terminal SSE event should arrive after the pause, got: {body:?}"
+    );
+    backend.assert_no_step_errors().await;
+}
+
+// Companion retention guard: with the same retry configuration, a JSON
+// response must stay on the buffered path so Agent Card URL rewriting (and
+// metadata extraction) keep working — the retry release is SSE-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn a2a_retry_configured_json_agent_card_is_still_rewritten() {
+    let card_body = json!({
+        "protocolVersion": "0.3.0",
+        "name": "planner",
+        "description": "planning agent",
+        "url": "https://planner.internal/a2a"
+    })
+    .to_string();
+
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        card_body.len(),
+        card_body
+    );
+    let backend = ScriptedTcpBackend::builder(reservation.into_listener())
+        .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+        .step(TcpStep::Write(response.into_bytes()))
+        .step(TcpStep::Drop)
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = a2a_retry_file_config(
+        backend_port,
+        json!({
+            "discovery": {"public_base_url": "https://gateway.example.com"}
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .get(&harness.proxy_url("/a2a/.well-known/agent-card.json"))
+        .await
+        .expect("gateway returns agent card");
+    assert_eq!(resp.status, StatusCode::OK);
+    let card: serde_json::Value =
+        serde_json::from_str(&resp.body_text()).expect("agent card should be JSON");
+    assert_eq!(
+        card["url"], "https://gateway.example.com/a2a",
+        "agent card URL must be rewritten — the buffered JSON path must not \
+         be released under retries"
+    );
+    backend.assert_no_step_errors().await;
+}
