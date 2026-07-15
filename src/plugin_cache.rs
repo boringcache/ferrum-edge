@@ -151,6 +151,9 @@ impl Plugin for PriorityOverridePlugin {
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
         self.inner.mark_query_credentials_for_redaction(ctx);
     }
+    fn request_headers_to_redact(&self) -> &[String] {
+        self.inner.request_headers_to_redact()
+    }
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.authorize(ctx).await
     }
@@ -707,6 +710,8 @@ pub struct PluginPhaseData {
     pub authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Backend-admission plugins only (pre-filtered from the protocol plugin list).
     pub backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Credential-bearing request header names used by safe downstream views.
+    pub request_headers_to_redact: Arc<Vec<String>>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
 }
@@ -717,6 +722,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut auth = Vec::new();
     let mut authorize = Vec::new();
     let mut backend_admission = Vec::new();
+    let mut request_headers_to_redact = Vec::new();
     for p in plugins {
         if p.is_auth_plugin() {
             caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
@@ -727,6 +733,14 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.is_backend_admission_plugin() {
             backend_admission.push(Arc::clone(p));
+        }
+        for header in p.request_headers_to_redact() {
+            if !request_headers_to_redact
+                .iter()
+                .any(|known: &String| known.eq_ignore_ascii_case(header))
+            {
+                request_headers_to_redact.push(header.clone());
+            }
         }
         if p.modifies_request_headers() {
             caps |= PluginCapabilities::MODIFIES_REQUEST_HEADERS;
@@ -763,6 +777,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         auth_plugins: Arc::new(auth),
         authorize_plugins: Arc::new(authorize),
         backend_admission_plugins: Arc::new(backend_admission),
+        request_headers_to_redact: Arc::new(request_headers_to_redact),
         capabilities: PluginCapabilities(caps),
     }
 }
@@ -995,6 +1010,16 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_request_headers_to_redact(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<String>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.request_headers_to_redact))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_capabilities(
         &self,
         proxy_id: &str,
@@ -1036,6 +1061,7 @@ impl PluginCacheInner {
             auth_plugins: self.get_auth_plugins(proxy_id, protocol),
             authorize_plugins: self.get_authorize_plugins(proxy_id, protocol),
             backend_admission_plugins: self.get_backend_admission_plugins(proxy_id, protocol),
+            request_headers_to_redact: self.get_request_headers_to_redact(proxy_id, protocol),
             capabilities: self.get_capabilities(proxy_id, protocol),
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
@@ -1055,6 +1081,7 @@ pub struct PluginCacheRequestView {
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    request_headers_to_redact: Arc<Vec<String>>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -1080,6 +1107,11 @@ impl PluginCacheRequestView {
     /// Get pre-computed backend admission plugins from this request view.
     pub fn backend_admission_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.backend_admission_plugins)
+    }
+
+    /// Get credential-bearing request headers precomputed for safe downstream views.
+    pub fn request_headers_to_redact(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.request_headers_to_redact)
     }
 
     /// Get pre-computed capability bitset from this request view.
