@@ -43,7 +43,7 @@ use tracing::{debug, error, warn};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
-use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
+use crate::plugins::BufferedInitialResponseHeaderPolicyState;
 use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
