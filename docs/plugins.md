@@ -1895,13 +1895,15 @@ UDP+DTLS streams via certificate-based consumer mapping.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. |
-| `disallowed_consumers` | String[] | `[]` | Consumer usernames explicitly denied. Takes precedence over every allow rule. |
-| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. |
-| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. |
-| `allow_authenticated_identity` | bool | `false` | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
+| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. |
+| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy. All checks use `HashSet<String>` for O(1) membership.
+Whitespace-only rule admission follows Rust `str::trim` Unicode `White_Space`
+semantics; accepted rule values are still stored and matched byte-for-byte.
 
 `allow_authenticated_identity: true` cannot be combined with an allow-list
 (`allowed_consumers` or `allowed_groups`): the allow-list matches mapped Consumer
@@ -1910,7 +1912,13 @@ so the combination would silently bypass the allow-list for every
 externally-authenticated-but-unmapped caller. The combination is rejected at
 config validation. The `disallowed_consumers` deny-list is still applied to the
 external identity string, so it may be combined with `allow_authenticated_identity`
-to revoke a compromised principal.
+to revoke a compromised principal. External identities longer than the 4096-character
+exact-rule bound fail closed instead of bypassing the deny-list.
+
+An authenticated external identity that is not enabled by this policy is an
+authorization denial: HTTP requests receive 403 and native gRPC requests receive
+trailers-only `PERMISSION_DENIED` (status 7). Requests with no meaningful mapped
+or external identity receive HTTP 401 / gRPC `UNAUTHENTICATED` (status 16).
 
 **Evaluation order:** deny (consumer username → group) → allow (consumer username → group).
 If both `allowed_consumers` and `allowed_groups` are set, matching _either_ grants access.
@@ -2704,6 +2712,39 @@ Body rules support the same dot-notation features as `request_transformer`: nest
 Adds secure response header defaults and strips common fingerprinting headers
 after the backend response is available. It also runs for plugin rejection
 responses so locally generated errors receive the same response hardening.
+Policy is enforced on the client-visible initial-header boundary for ordinary
+HTTP responses, buffered native gRPC, gRPC-Web binary/text, and HTTP/1.1,
+HTTP/2, and HTTP/3 WebSocket success and gateway-failure handshakes. Native
+gRPC status and application metadata remain trailers; a security policy field
+is reapplied to initial headers rather than promoting a backend trailer value.
+For a genuine Trailers-Only response whose terminal metadata is carried in the
+initial END_STREAM HEADERS, Ferrum snapshots reserved gRPC fields before hooks
+and restores that pristine backend value after policy, so `set` and `remove`
+cannot redefine the RPC outcome.
+On buffered gRPC and gRPC-Web responses, a final policy removal suppresses both
+the initial-header compatibility copy and the application-trailer copy, while
+a final set/override remains initial-header policy and preserves the backend's
+application trailer. The final replay runs after trailer-only cookie rehoming
+and preserves the transport-owned `Content-Length` produced by the last body
+transform.
+
+Post-routing gateway-generated initial HEADERS use the same precomputed policy
+slice: this includes plain HTTP method-filter responses and native-gRPC method,
+deadline, size-limit, backend-unavailable, and mesh fail-closed errors across
+H1/H2/H3 frontends. Protocol-owned gRPC status/message/content type and
+Content-Length/transfer framing remain authoritative. Pre-routing errors such
+as overload, malformed request, 0-RTT, and route-miss responses have no resolved
+plugin configuration and do not apply route policy.
+
+Configuration is fail-closed: unknown top-level keys and unknown keys inside
+the `hsts` object reject startup or reload, retaining the last-known-good
+runtime configuration on reload. Header names use the complete HTTP
+field-name token grammar, are limited to 65,535 ASCII bytes, and are
+canonicalized to lowercase. Configured values must pass the same `HeaderValue`
+validation as the downstream H1/H2/H3 response builders: C0 controls other
+than horizontal tab, DEL, and non-ASCII characters are rejected. Invalid-name
+diagnostics identify the `set` or `remove` entry and render at most 96 escaped
+bytes of the hostile name before a truncation marker.
 
 **Priority:** 4080
 
@@ -2715,8 +2756,8 @@ responses so locally generated errors receive the same response hardening.
 | `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, or an object may set `max_age`, `include_subdomains`, and `preload`. |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
-| `set` | object/null | `{}` | Additional headers to set. Values must be strings and header values must not contain CR, LF, or NUL. |
-| `remove` | string[]/null | `["server","x-powered-by"]` | Header names to remove case-insensitively; `null` disables built-in removals. |
+| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar and values must pass downstream HTTP header-value validation. |
+| `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively; `null` disables built-in removals. |
 | `override_existing` | bool | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. |
 
 ```yaml

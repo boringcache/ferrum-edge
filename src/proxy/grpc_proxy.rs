@@ -43,6 +43,7 @@ use tracing::{debug, error, warn};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
+use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
 use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
@@ -1499,6 +1500,59 @@ pub(crate) fn is_reserved_grpc_terminal_metadata(key: &str) -> bool {
     )
 }
 
+/// Authoritative terminal metadata captured from a pristine gRPC header map.
+///
+/// A genuine Trailers-Only backend response carries these fields in its first
+/// and only HEADERS block. Buffered response hooks operate later, so the
+/// preserve path must restore this pre-hook snapshot instead of whatever a
+/// policy left in the compatibility view.
+#[derive(Debug, Default)]
+pub struct GrpcTerminalMetadataSnapshot {
+    grpc_status: Option<String>,
+    grpc_message: Option<String>,
+    grpc_status_details: Option<String>,
+}
+
+impl GrpcTerminalMetadataSnapshot {
+    pub fn from_headers(headers: &HashMap<String, String>) -> Self {
+        Self {
+            grpc_status: headers.get("grpc-status").cloned(),
+            grpc_message: headers.get("grpc-message").cloned(),
+            grpc_status_details: headers.get("grpc-status-details-bin").cloned(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.grpc_status.is_none()
+            && self.grpc_message.is_none()
+            && self.grpc_status_details.is_none()
+    }
+
+    pub fn grpc_status(&self) -> Option<&str> {
+        self.grpc_status.as_deref()
+    }
+
+    pub fn grpc_message(&self) -> Option<&str> {
+        self.grpc_message.as_deref()
+    }
+
+    pub fn grpc_status_details(&self) -> Option<&str> {
+        self.grpc_status_details.as_deref()
+    }
+
+    fn restore_into(&self, headers: &mut HashMap<String, String>) {
+        for (name, value) in [
+            ("grpc-status", self.grpc_status.as_ref()),
+            ("grpc-message", self.grpc_message.as_ref()),
+            ("grpc-status-details-bin", self.grpc_status_details.as_ref()),
+        ] {
+            if let Some(value) = value {
+                headers.insert(name.to_string(), value.clone());
+            }
+        }
+    }
+}
+
 /// Build the merged header+trailer view buffered gRPC response-hook plugins run
 /// on, plus the set of trailer keys the backend ALSO sent as real initial
 /// headers ("header-shadowed" keys).
@@ -1545,26 +1599,206 @@ pub fn build_grpc_plugin_header_view(
 /// wire trailer (a sanitizer must scrub every client-visible copy); an
 /// untouched shadowed trailer keeps the backend's true trailing value. A
 /// non-shadowed (trailer-only) key whose view value changed was edited by a
-/// hook; copy it.
+/// hook; copy it. Initial-header policy provenance is handled separately: a
+/// final set/override preserves the pre-policy application trailer, while a
+/// final removal suppresses it. Reserved gRPC terminal metadata is the sole
+/// removal exception and retains its authoritative pre-policy trailer value.
 pub fn reconcile_grpc_trailers_from_view(
     response_trailers: &mut HashMap<String, String>,
     plugin_response_headers: &HashMap<String, String>,
     original_response_headers: &HashMap<String, String>,
     header_shadowed_trailer_keys: &HashSet<String>,
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
 ) {
-    response_trailers.retain(|k, v| match plugin_response_headers.get(k) {
-        Some(plugin_value) => {
-            if header_shadowed_trailer_keys.contains(k) {
-                if original_response_headers.get(k) != Some(plugin_value) {
+    response_trailers.retain(|k, v| {
+        if let Some((pre_policy_value, final_policy_value_present)) = policy_state
+            .and_then(|state| state.application_trailer_initial_response_policy_outcome(k))
+        {
+            if !final_policy_value_present && !is_reserved_grpc_terminal_metadata(k) {
+                return false;
+            }
+            if let Some(pre_policy_value) = pre_policy_value {
+                if !header_shadowed_trailer_keys.contains(k)
+                    || original_response_headers.get(k).map(String::as_str)
+                        != Some(pre_policy_value)
+                {
+                    *v = pre_policy_value.to_string();
+                }
+                return true;
+            }
+            return false;
+        }
+        match plugin_response_headers.get(k) {
+            Some(plugin_value) => {
+                if header_shadowed_trailer_keys.contains(k) {
+                    if original_response_headers.get(k) != Some(plugin_value) {
+                        *v = plugin_value.clone();
+                    }
+                } else if plugin_value != v {
                     *v = plugin_value.clone();
                 }
-            } else if plugin_value != v {
-                *v = plugin_value.clone();
+                true
             }
-            true
+            None => false,
         }
-        None => false,
     });
+}
+
+/// Remove compatibility-view trailer copies from buffered gRPC initial headers
+/// before the ordered response-policy outcome is applied to the initial map.
+///
+/// Buffered response hooks historically receive one merged header+trailer map.
+/// After trailer reconciliation, ordinary trailer-only fields must return to the
+/// trailer channel. Callers then apply the policy provenance state so policy
+/// values land in initial HEADERS without ever promoting an application
+/// trailer value.
+///
+/// Header-shadowed trailers already have a genuine initial-header copy and are
+/// left alone. Reserved gRPC terminal metadata is never considered shadowed by
+/// the collector and therefore remains trailer-authoritative for non-empty
+/// responses.
+pub fn strip_non_initial_grpc_trailer_fields(
+    response_headers: &mut HashMap<String, String>,
+    response_trailers: &HashMap<String, String>,
+    header_shadowed_trailer_keys: &HashSet<String>,
+) {
+    for name in response_trailers.keys() {
+        if !header_shadowed_trailer_keys.contains(name) {
+            response_headers.remove(name);
+        }
+    }
+}
+
+/// Keep gRPC terminal metadata out of initial HEADERS on non-empty responses.
+///
+/// Initial-response policy is reapplied after trailer provenance is restored.
+/// An operator may deliberately name a gRPC metadata field in a generic header
+/// policy, but the protocol boundary must still keep terminal status on the
+/// trailer channel.
+pub fn strip_grpc_terminal_metadata_from_initial(response_headers: &mut HashMap<String, String>) {
+    response_headers.remove("grpc-status");
+    response_headers.remove("grpc-message");
+    response_headers.remove("grpc-status-details-bin");
+}
+
+/// Apply the buffered initial-header policy outcome while protecting gRPC terminal
+/// metadata owned by a legitimate Trailers-Only initial HEADERS block.
+///
+/// Policy-supplied terminal fields are always discarded. A caller preserving
+/// true Trailers-Only metadata supplies the snapshot captured from pristine
+/// backend initial headers before hooks ran; otherwise terminal metadata
+/// remains exclusive to the wire trailer channel. The transform-owned
+/// `content-length` is preserved across the policy overlay.
+pub fn apply_buffered_grpc_initial_response_policy(
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
+    response_headers: &mut HashMap<String, String>,
+    authoritative_terminal_metadata: Option<&GrpcTerminalMetadataSnapshot>,
+) {
+    let content_length = response_headers.remove_entry("content-length");
+    strip_grpc_terminal_metadata_from_initial(response_headers);
+
+    if let Some(policy_state) = policy_state {
+        policy_state.apply_to_initial_headers(response_headers);
+    }
+    response_headers.remove("content-length");
+    if let Some((name, value)) = content_length {
+        response_headers.insert(name, value);
+    }
+    strip_grpc_terminal_metadata_from_initial(response_headers);
+
+    if let Some(authoritative_terminal_metadata) = authoritative_terminal_metadata {
+        authoritative_terminal_metadata.restore_into(response_headers);
+    }
+}
+
+/// Restore the split gRPC wire channels and apply the final initial-header
+/// policy outcome in one order-preserving boundary operation.
+///
+/// Trailer-derived compatibility fields are removed from initial HEADERS
+/// first. A hook-mutated trailer-only `set-cookie` is then re-homed so the
+/// ordered policy overlay gets the final decision: a later removal suppresses
+/// it, while a later set/override wins without bypassing hook priority. Other
+/// application trailers remain on the trailer channel unless the provenance
+/// state records a final policy removal.
+///
+/// Shared by the H1/H2 buffered response path and the H3 cross-protocol bridge
+/// so channel ownership and policy order cannot drift between frontends.
+pub fn finalize_buffered_grpc_split_response(
+    response_headers: &mut HashMap<String, String>,
+    response_trailers: &mut HashMap<String, String>,
+    header_shadowed_trailer_keys: &HashSet<String>,
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
+    authoritative_terminal_metadata: Option<&GrpcTerminalMetadataSnapshot>,
+    original_trailer_set_cookie: Option<&str>,
+) {
+    strip_non_initial_grpc_trailer_fields(
+        response_headers,
+        response_trailers,
+        header_shadowed_trailer_keys,
+    );
+    rehome_hook_mutated_trailer_set_cookie(
+        response_headers,
+        response_trailers,
+        original_trailer_set_cookie,
+    );
+    apply_buffered_grpc_initial_response_policy(
+        policy_state,
+        response_headers,
+        authoritative_terminal_metadata,
+    );
+}
+
+/// Collapse a buffered gRPC Trailers-Only response into its initial HEADERS
+/// while keeping trailer provenance from defeating initial-header policy.
+///
+/// Trailer-only fields are removed before the first replay, so a policy using
+/// `override_existing: false` evaluates against genuine initial headers. When
+/// trailers are collapsed, policy-produced values retain precedence; a second
+/// replay applies configured removals to application trailers. Reserved gRPC
+/// terminal metadata is always restored from the authoritative trailer value.
+/// A trailer-originated `content-length` is never promoted: framing remains
+/// owned by the final buffered representation.
+pub fn collapse_grpc_trailers_only_with_initial_response_policies(
+    response_headers: &mut HashMap<String, String>,
+    response_trailers: &mut HashMap<String, String>,
+    header_shadowed_trailer_keys: &HashSet<String>,
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
+    pristine_initial_terminal_metadata: Option<&GrpcTerminalMetadataSnapshot>,
+) {
+    let trailer_terminal_metadata = GrpcTerminalMetadataSnapshot::from_headers(response_trailers);
+    let authoritative_terminal_metadata = if trailer_terminal_metadata.is_empty() {
+        pristine_initial_terminal_metadata
+    } else {
+        Some(&trailer_terminal_metadata)
+    };
+    strip_non_initial_grpc_trailer_fields(
+        response_headers,
+        response_trailers,
+        header_shadowed_trailer_keys,
+    );
+    apply_buffered_grpc_initial_response_policy(
+        policy_state,
+        response_headers,
+        authoritative_terminal_metadata,
+    );
+
+    for (name, value) in response_trailers.drain() {
+        if name == "content-length" {
+            continue;
+        }
+        if is_reserved_grpc_terminal_metadata(&name) || header_shadowed_trailer_keys.contains(&name)
+        {
+            response_headers.insert(name, value);
+        } else {
+            response_headers.entry(name).or_insert(value);
+        }
+    }
+
+    apply_buffered_grpc_initial_response_policy(
+        policy_state,
+        response_headers,
+        authoritative_terminal_metadata,
+    );
 }
 
 /// Re-home a hook-mutated trailer-only `set-cookie` onto the buffered gRPC
@@ -1590,11 +1824,11 @@ pub fn reconcile_grpc_trailers_from_view(
 ///   (`original_trailer_set_cookie` differs from the current wire trailer). An
 ///   untouched backend trailer keeps the backend's faithful split wire shape.
 ///
-/// Must be called AFTER the strip loop and BEFORE sticky-cookie injection (so an
-/// injected sticky `set-cookie` cannot mask the trailer-only check) and BEFORE
-/// the gRPC-Web trailer-clear guard. Shared by the main buffered gRPC path
-/// (`proxy::handle_proxy_request`) and the H3 cross-protocol bridge
-/// (`http3::cross_protocol`) so both stay byte-for-byte identical (#1614).
+/// Must be called AFTER the strip loop and BEFORE the final initial-header
+/// policy overlay, sticky-cookie injection (so an injected sticky `set-cookie`
+/// cannot mask the trailer-only check), and the gRPC-Web trailer-clear guard.
+/// [`finalize_buffered_grpc_split_response`] owns this ordering for both the
+/// main buffered gRPC path and the H3 cross-protocol bridge (#1614).
 pub fn rehome_hook_mutated_trailer_set_cookie(
     response_headers: &mut HashMap<String, String>,
     response_trailers: &mut HashMap<String, String>,
@@ -1821,18 +2055,81 @@ pub fn grpc_streaming_response_deadline(
     }
 }
 
-/// Build a gRPC error response with proper Trailers-Only encoding.
+const GRPC_ERROR_TRANSPORT_MANAGED_HEADERS: [&str; 13] = [
+    "connection",
+    "content-length",
+    "content-type",
+    "grpc-message",
+    "grpc-status",
+    "grpc-status-details-bin",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Apply initial-response policy to a synthesized Trailers-Only gRPC response,
+/// then restore the protocol-owned terminal metadata and framing fields.
 ///
-/// gRPC errors use HTTP 200 with `grpc-status` and `grpc-message` as headers
-/// (Trailers-Only responses pack trailers into the header block).
+/// Callers may seed `response_headers` with legitimate gateway metadata such
+/// as `allow`; configured policy is applied to that initial-header surface.
+/// A hostile policy cannot replace the authoritative gRPC outcome or add
+/// Content-Length / transfer framing to the empty response.
+pub fn finalize_grpc_error_response_headers(
+    response_headers: &mut HashMap<String, String>,
+    status: u32,
+    message: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) {
+    crate::plugins::apply_initial_response_header_policies(
+        initial_response_header_policy_plugins,
+        response_headers,
+    );
+    response_headers.retain(|name, _| {
+        !GRPC_ERROR_TRANSPORT_MANAGED_HEADERS
+            .iter()
+            .any(|managed| name.eq_ignore_ascii_case(managed))
+    });
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    response_headers.insert("grpc-status".to_string(), status.to_string());
+    if !message.is_empty() {
+        response_headers.insert("grpc-message".to_string(), message.to_string());
+    }
+}
+
+/// Build a gRPC error response with proper Trailers-Only encoding and the
+/// precomputed initial-response policy for the resolved route.
+pub fn build_grpc_error_response_with_policy(
+    status: u32,
+    message: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> hyper::Response<super::ProxyBody> {
+    let mut response_headers = HashMap::new();
+    finalize_grpc_error_response_headers(
+        &mut response_headers,
+        status,
+        message,
+        initial_response_header_policy_plugins,
+    );
+    crate::proxy::headers::apply_response_headers(
+        hyper::Response::builder().status(StatusCode::OK),
+        &response_headers,
+    )
+    .body(super::ProxyBody::empty())
+    .unwrap_or_else(|_| {
+        let mut response = hyper::Response::new(super::ProxyBody::empty());
+        *response.status_mut() = StatusCode::OK;
+        response
+    })
+}
+
+/// Build a gRPC error response without route policy. Pre-routing callers use
+/// this form because no resolved plugin configuration exists yet.
 pub fn build_grpc_error_response(status: u32, message: &str) -> hyper::Response<super::ProxyBody> {
-    hyper::Response::builder()
-        .status(200)
-        .header("content-type", "application/grpc")
-        .header("grpc-status", status.to_string())
-        .header("grpc-message", message)
-        .body(super::ProxyBody::empty())
-        .unwrap_or_else(|_| hyper::Response::new(super::ProxyBody::empty()))
+    build_grpc_error_response_with_policy(status, message, &[])
 }
 
 /// Collected gRPC response with body and trailers.

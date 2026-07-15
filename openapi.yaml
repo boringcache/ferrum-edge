@@ -13332,7 +13332,10 @@ components:
         keys are rejected. `allow_authenticated_identity=true` cannot be combined
         with an allow-list (`allowed_consumers`/`allowed_groups`) because the
         allow-list is not applied to unmapped external identities. Use
-        ip_restriction for IP/CIDR rules.
+        ip_restriction for IP/CIDR rules. Rule entries match principal values
+        byte-for-byte (no trimming) and must contain at least one
+        non-whitespace character. Whitespace admission follows Rust
+        `str::trim` Unicode `White_Space` semantics.
       allOf:
         - anyOf:
             - required: [allowed_consumers]
@@ -13375,6 +13378,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             Consumer usernames that are explicitly allowed. Empty list disables
@@ -13383,14 +13389,24 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 4096
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
-            Consumer usernames that are explicitly denied. Takes precedence
-            over every allow rule.
+            Consumer usernames or, when allow_authenticated_identity is true,
+            exact external principals that are explicitly denied. Takes
+            precedence over every allow rule. The 4096-character bound is
+            independent of the 255-character gateway Consumer username ceiling
+            so JWT, OIDC, and SPIFFE-style principals can be revoked; longer
+            external identities fail closed at runtime.
         allowed_groups:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             ACL group names that are explicitly allowed. The check matches if
@@ -13399,6 +13415,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             ACL group names that are explicitly denied. If any of the consumer's
@@ -13410,7 +13429,8 @@ components:
           description: >-
             Allow requests whose `ctx.authenticated_identity` is set by an
             external auth plugin (e.g. jwks_auth) even when no gateway Consumer
-            was mapped. Cannot be combined with an allow-list
+            was mapped. Empty or whitespace-only identities are unauthenticated.
+            Cannot be combined with an allow-list
             (`allowed_consumers`/`allowed_groups`); the deny-list
             `disallowed_consumers` is still applied to the external identity.
 
@@ -13764,12 +13784,14 @@ components:
 
     SecurityHeadersConfig:
       type: object
-      description: "Plugin: security_headers — Injects response security headers (secure defaults) and strips fingerprinting headers in after_proxy."
+      additionalProperties: false
+      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected."
       properties:
         content_type_options:
           oneOf:
             - type: boolean
             - type: string
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
           default: nosniff
           description: "X-Content-Type-Options. true = nosniff (default); a string sets a custom value; false/null disables."
@@ -13777,6 +13799,7 @@ components:
           oneOf:
             - type: boolean
             - type: string
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
           default: SAMEORIGIN
           description: "X-Frame-Options. Default SAMEORIGIN; string overrides; false disables."
@@ -13784,6 +13807,7 @@ components:
           oneOf:
             - type: boolean
             - type: string
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
           default: strict-origin-when-cross-origin
           description: "Referrer-Policy. Default strict-origin-when-cross-origin; string overrides; false disables."
@@ -13792,8 +13816,10 @@ components:
           oneOf:
             - type: boolean
             - type: string
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
             - type: object
+              additionalProperties: false
               properties:
                 max_age:
                   type: integer
@@ -13807,21 +13833,32 @@ components:
                   default: false
         content_security_policy:
           type: [string, "null"]
+          pattern: '^[\u0009\u0020-\u007E]*$'
           description: "Content-Security-Policy value (opt-in; application-specific)."
         permissions_policy:
           type: [string, "null"]
+          pattern: '^[\u0009\u0020-\u007E]*$'
           description: "Permissions-Policy value (opt-in)."
         set:
           type: [object, "null"]
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 65535
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties:
             type: string
-          description: "Arbitrary response headers to set (name -> value). Values must not contain CR, LF, or NUL."
+            pattern: '^[\u0009\u0020-\u007E]*$'
+          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
         remove:
           type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            maxLength: 65535
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: [server, x-powered-by]
-          description: "Response header names to strip (case-insensitive). Defaults to Server and X-Powered-By; set [] to strip nothing."
+          description: "Valid HTTP field names (maximum 65,535 ASCII bytes) to strip case-insensitively. Names are canonicalized to lowercase. Defaults to Server and X-Powered-By; set [] to strip nothing."
         override_existing:
           type: boolean
           default: true

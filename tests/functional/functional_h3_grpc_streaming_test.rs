@@ -22,7 +22,7 @@ use crate::scaffolding::backends::{
     GrpcStep, H2Step, MatchHeaders, MatchRpc, ScriptedGrpcBackend, ScriptedH2Backend,
 };
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::Http3Client;
+use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
 use bytes::Bytes;
@@ -46,24 +46,73 @@ fn write_frontend_certs(scratch: &std::path::Path) -> (String, String) {
 
 /// File-mode YAML for one HTTPS proxy (gRPC is a runtime flavor of `https`)
 /// pointing at `(127.0.0.1, backend_port)`.
-fn file_mode_yaml(backend_port: u16) -> String {
+fn file_mode_yaml_with_response_buffering(
+    backend_port: u16,
+    buffer_response: bool,
+    remove_buffered_trailer_fields: bool,
+    override_existing_security_headers: bool,
+) -> String {
+    let mut proxy = json!({
+        "id": "h3-grpc-stream",
+        "listen_path": "/api",
+        "backend_scheme": "https",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port,
+        "strip_listen_path": true,
+        "backend_connect_timeout_ms": 2000,
+        "backend_read_timeout_ms": 5000,
+        "backend_write_timeout_ms": 5000,
+        "backend_tls_verify_server_cert": false,
+    });
+    if buffer_response {
+        proxy["response_body_mode"] = json!("buffer");
+    }
+    let mut security_config = json!({
+        "override_existing": override_existing_security_headers,
+        "hsts": true,
+        "set": {
+            "X-Security-Policy": "gateway-enforced",
+        },
+        "remove": [],
+    });
+    let mut plugin_configs = Vec::new();
+    if override_existing_security_headers {
+        security_config["set"]["Grpc-Status"] = json!("0");
+        security_config["set"]["Grpc-Message"] = json!("policy override");
+    } else if remove_buffered_trailer_fields {
+        plugin_configs.push(json!({
+            "id": "h3-grpc-cookie-transformer",
+            "plugin_name": "response_transformer",
+            "config": {
+                "rules": [{
+                    "target": "header",
+                    "operation": "update",
+                    "key": "Set-Cookie",
+                    "value": "session=mutated",
+                }],
+            },
+            "scope": "global",
+            "enabled": true,
+        }));
+        security_config["remove"] =
+            json!(["Set-Cookie", "X-Powered-By", "Grpc-Status", "Grpc-Message",]);
+        security_config["set"] = json!({
+            "X-Security-Policy": "gateway-enforced",
+        });
+    }
+    plugin_configs.push(json!({
+        "id": "h3-grpc-security-headers",
+        "plugin_name": "security_headers",
+        "config": security_config,
+        "scope": "global",
+        "enabled": true,
+    }));
     let config = json!({
         "version": "1",
-        "proxies": [{
-            "id": "h3-grpc-stream",
-            "listen_path": "/api",
-            "backend_scheme": "https",
-            "backend_host": "127.0.0.1",
-            "backend_port": backend_port,
-            "strip_listen_path": true,
-            "backend_connect_timeout_ms": 2000,
-            "backend_read_timeout_ms": 5000,
-            "backend_write_timeout_ms": 5000,
-            "backend_tls_verify_server_cert": false,
-        }],
+        "proxies": [proxy],
         "consumers": [],
         "upstreams": [],
-        "plugin_configs": [],
+        "plugin_configs": plugin_configs,
     });
     serde_yaml::to_string(&config).expect("yaml serialize")
 }
@@ -74,6 +123,33 @@ fn file_mode_yaml(backend_port: u16) -> String {
 async fn spawn_h3_grpc_gateway(
     backend_port: u16,
     extra_env: &[(&str, String)],
+) -> (GatewayHarness, u16) {
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, extra_env, false, false, false)
+        .await
+}
+
+async fn spawn_buffered_h3_grpc_gateway(backend_port: u16) -> (GatewayHarness, u16) {
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true, false, false).await
+}
+
+async fn spawn_buffered_h3_grpc_gateway_with_hostile_terminal_set(
+    backend_port: u16,
+) -> (GatewayHarness, u16) {
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true, false, true).await
+}
+
+async fn spawn_buffered_h3_grpc_gateway_with_security_removals(
+    backend_port: u16,
+) -> (GatewayHarness, u16) {
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true, true, false).await
+}
+
+async fn spawn_h3_grpc_gateway_with_response_buffering(
+    backend_port: u16,
+    extra_env: &[(&str, String)],
+    buffer_response: bool,
+    remove_buffered_trailer_fields: bool,
+    override_existing_security_headers: bool,
 ) -> (GatewayHarness, u16) {
     // Outer retry (codex P3): `FERRUM_PROXY_HTTPS_PORT` is a fixed port we
     // reserve-then-drop before the subprocess binds it, so a parallel test can
@@ -90,7 +166,12 @@ async fn spawn_h3_grpc_gateway(
         let (cert_path, key_path) = write_frontend_certs(scratch.path());
 
         let mut builder = GatewayHarness::builder()
-            .file_config(file_mode_yaml(backend_port))
+            .file_config(file_mode_yaml_with_response_buffering(
+                backend_port,
+                buffer_response,
+                remove_buffered_trailer_fields,
+                override_existing_security_headers,
+            ))
             .log_level("info")
             .capture_output()
             .env("FERRUM_ENABLE_HTTP3", "true")
@@ -145,6 +226,46 @@ async fn open_grpc_stream_with_retry(
     }
 }
 
+// A route-resolved native-H3 gRPC method rejection must use the same
+// initial-response policy as H1/H2 instead of rejecting before routing with an
+// empty policy slice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_grpc_non_post_method_reject_applies_route_policy() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unused backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let (_harness, https_port) = spawn_h3_grpc_gateway(backend_port, &[]).await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
+    let response = client
+        .get_with_options(
+            &url,
+            GetOptions::default().header("content-type", "application/grpc"),
+        )
+        .await
+        .expect("non-POST gRPC request");
+
+    assert_eq!(response.status, http::StatusCode::OK);
+    assert!(response.body_bytes.is_empty());
+    assert_eq!(
+        response
+            .headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // 1. Regression: unary H3 → H2 gRPC still succeeds through the streaming path,
 //    including grpc-status / grpc-message trailers.
@@ -177,13 +298,25 @@ async fn h3_grpc_streaming_unary_roundtrip() {
     let mut stream = open_grpc_stream_with_retry(&client, &url).await;
     stream.send_message(b"ping").await.expect("send message");
     stream.finish().await.expect("finish");
-    let (status, _headers) = stream.recv_response().await.expect("recv response");
+    let (status, headers) = stream.recv_response().await.expect("recv response");
     let (body, trailers) = stream
         .recv_body_and_trailers()
         .await
         .expect("recv body+trailers");
 
     assert_eq!(status.as_u16(), 200, "gRPC rides on HTTP 200");
+    assert_eq!(
+        headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+    assert_eq!(
+        headers
+            .get("strict-transport-security")
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=31536000; includeSubDomains")
+    );
     assert_eq!(
         body.as_ref(),
         grpc_frame(b"pong").as_slice(),
@@ -194,6 +327,308 @@ async fn h3_grpc_streaming_unary_roundtrip() {
         Some("0"),
         "grpc-status trailer must be preserved through the streaming bridge"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_security_policy_preserves_initial_and_trailer_provenance() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let ca = TestCa::new("h3-grpc-buffered-policy-be").expect("ca");
+    let (be_cert, be_key) = ca.valid().expect("backend leaf");
+    let _backend = ScriptedH2Backend::builder_tls(backend_listener, &be_cert, &be_key)
+        .expect("backend tls")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from(grpc_frame(b"buffered-reply")),
+            end_stream: false,
+        })
+        .step(H2Step::RespondTrailers(vec![
+            ("grpc-status", "0".into()),
+            ("grpc-message", "OK".into()),
+            ("x-security-policy", "backend-trailer-value".into()),
+            ("x-application-trailer", "application-value".into()),
+        ]))
+        .spawn()
+        .expect("spawn backend");
+
+    let (_harness, https_port) = spawn_buffered_h3_grpc_gateway(backend_port).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    stream.send_message(b"ping").await.expect("send message");
+    stream.finish().await.expect("finish");
+    let (status, headers) = stream.recv_response().await.expect("recv response");
+    let (body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("recv body+trailers");
+
+    assert_eq!(status.as_u16(), 200);
+    assert_eq!(body.as_ref(), grpc_frame(b"buffered-reply").as_slice());
+    assert_eq!(
+        headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+    assert_eq!(
+        headers
+            .get("strict-transport-security")
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=31536000; includeSubDomains")
+    );
+    assert!(headers.get("grpc-status").is_none());
+    assert!(headers.get("grpc-message").is_none());
+    assert!(headers.get("x-application-trailer").is_none());
+    assert_eq!(
+        trailers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("backend-trailer-value")
+    );
+    assert_eq!(
+        trailers
+            .get("x-application-trailer")
+            .and_then(|value| value.to_str().ok()),
+        Some("application-value")
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("0")
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
+        Some("OK")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_security_removal_wins_over_cookie_rehome_and_trailer_replay() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let ca = TestCa::new("h3-grpc-buffered-removal-be").expect("ca");
+    let (be_cert, be_key) = ca.valid().expect("backend leaf");
+    let _backend = ScriptedH2Backend::builder_tls(backend_listener, &be_cert, &be_key)
+        .expect("backend tls")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+            ("x-powered-by", "backend-header".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from(grpc_frame(b"buffered-removal-reply")),
+            end_stream: false,
+        })
+        .step(H2Step::RespondTrailers(vec![
+            ("grpc-status", "0".into()),
+            ("grpc-message", "OK".into()),
+            ("set-cookie", "session=backend".into()),
+            ("x-powered-by", "backend-trailer".into()),
+        ]))
+        .spawn()
+        .expect("spawn backend");
+
+    let (_harness, https_port) =
+        spawn_buffered_h3_grpc_gateway_with_security_removals(backend_port).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    stream.send_message(b"ping").await.expect("send message");
+    stream.finish().await.expect("finish");
+    let (status, headers) = stream.recv_response().await.expect("recv response");
+    let (body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("recv body+trailers");
+
+    assert_eq!(status.as_u16(), 200);
+    assert_eq!(
+        body.as_ref(),
+        grpc_frame(b"buffered-removal-reply").as_slice()
+    );
+    assert!(
+        headers.get("set-cookie").is_none(),
+        "final H3 security policy must suppress the transformed trailer cookie after rehoming"
+    );
+    assert!(
+        headers.get("x-powered-by").is_none(),
+        "final H3 security policy must suppress the shadowed initial header"
+    );
+    assert!(
+        trailers.get("set-cookie").is_none(),
+        "final H3 security policy must suppress the transformed application trailer"
+    );
+    assert!(
+        trailers.get("x-powered-by").is_none(),
+        "final H3 security policy must not restore removed shadowed metadata"
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("0"),
+        "terminal status must remain on the H3 trailer channel"
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
+        Some("OK")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_empty_split_response_keeps_terminal_metadata_in_trailers() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let ca = TestCa::new("h3-grpc-empty-split-be").expect("ca");
+    let (be_cert, be_key) = ca.valid().expect("backend leaf");
+    let _backend = ScriptedH2Backend::builder_tls(backend_listener, &be_cert, &be_key)
+        .expect("backend tls")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+        ]))
+        .step(H2Step::RespondTrailers(vec![
+            ("grpc-status", "0".into()),
+            ("grpc-message", "OK".into()),
+            ("x-application-trailer", "application-value".into()),
+        ]))
+        .spawn()
+        .expect("spawn backend");
+
+    let (_harness, https_port) = spawn_buffered_h3_grpc_gateway(backend_port).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    stream.send_message(b"ping").await.expect("send message");
+    stream.finish().await.expect("finish");
+    let (status, headers) = stream.recv_response().await.expect("recv response");
+    let (body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("recv body+trailers");
+
+    assert_eq!(status.as_u16(), 200);
+    assert!(body.is_empty());
+    assert!(headers.get("grpc-status").is_none());
+    assert!(headers.get("grpc-message").is_none());
+    assert!(headers.get("x-application-trailer").is_none());
+    assert_eq!(
+        headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("0")
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
+        Some("OK")
+    );
+    assert_eq!(
+        trailers
+            .get("x-application-trailer")
+            .and_then(|value| value.to_str().ok()),
+        Some("application-value")
+    );
+}
+
+async fn assert_h3_buffered_grpc_trailers_only_preserves_initial_terminal_status(
+    remove_terminal_metadata: bool,
+) {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let ca = TestCa::new("h3-grpc-trailers-only-be").expect("ca");
+    let (be_cert, be_key) = ca.valid().expect("backend leaf");
+    let _backend = ScriptedH2Backend::builder_tls(backend_listener, &be_cert, &be_key)
+        .expect("backend tls")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeadersEndStream(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+            ("grpc-status", "7".into()),
+            ("grpc-message", "permission denied".into()),
+        ]))
+        .spawn()
+        .expect("spawn backend");
+
+    let (_harness, https_port) = if remove_terminal_metadata {
+        spawn_buffered_h3_grpc_gateway_with_security_removals(backend_port).await
+    } else {
+        spawn_buffered_h3_grpc_gateway_with_hostile_terminal_set(backend_port).await
+    };
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    stream.send_message(b"ping").await.expect("send message");
+    stream.finish().await.expect("finish");
+    let (status, headers) = stream.recv_response().await.expect("recv response");
+    let (body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("recv body+trailers");
+
+    assert_eq!(status.as_u16(), 200);
+    assert!(body.is_empty());
+    assert!(trailers.is_empty());
+    assert_eq!(
+        headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("7")
+    );
+    assert_eq!(
+        headers
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
+        Some("permission denied")
+    );
+    assert_eq!(
+        headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_trailers_only_resists_hostile_terminal_set() {
+    assert_h3_buffered_grpc_trailers_only_preserves_initial_terminal_status(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_trailers_only_resists_terminal_removal() {
+    assert_h3_buffered_grpc_trailers_only_preserves_initial_terminal_status(true).await;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -326,5 +761,18 @@ async fn h3_grpc_streaming_enforces_max_request_size_incrementally() {
         headers.get("grpc-status").map(|v| v.to_str().unwrap()),
         Some("8"),
         "oversized streaming upload must map to RESOURCE_EXHAUSTED (8)"
+    );
+    assert_eq!(
+        headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced"),
+        "synthesized H3 gRPC errors must carry initial-response policy"
+    );
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/grpc")
     );
 }

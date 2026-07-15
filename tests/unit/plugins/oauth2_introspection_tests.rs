@@ -3,7 +3,7 @@ use base64::Engine as _;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::AuthMode;
 use ferrum_edge::plugins::{
-    Plugin, PluginHttpClient, PluginResult, RequestContext,
+    Plugin, PluginHttpClient, PluginResult, RequestContext, key_auth::KeyAuth,
     oauth2_introspection::Oauth2Introspection, priority,
 };
 use ferrum_edge::proxy::run_authentication_phase;
@@ -16,7 +16,7 @@ use std::time::Duration;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::plugin_utils::assert_continue;
+use super::plugin_utils::{assert_continue, create_test_consumer};
 
 struct InvalidSecondaryAuth;
 
@@ -308,6 +308,86 @@ async fn active_token_sets_authenticated_identity_when_no_consumer_match() {
     assert_continue(result);
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
     assert_eq!(ctx.auth_method, Some("oauth2_introspection"));
+}
+
+#[tokio::test]
+async fn active_token_with_blank_identity_does_not_authenticate_principal() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "   \t"
+        })))
+        .mount(&server)
+        .await;
+
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(&config(&endpoint), PluginHttpClient::default()).unwrap();
+    let mut ctx = make_ctx("blank-identity-token");
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+
+    assert_continue(result);
+    assert!(ctx.authenticated_identity.is_none());
+    assert!(ctx.effective_identity().is_none());
+    assert!(ctx.auth_method.is_none());
+}
+
+#[tokio::test]
+async fn oauth_multi_auth_does_not_commit_blank_principal_side_effects() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "   ",
+            "email": "untrusted@example.test"
+        })))
+        .mount(&server)
+        .await;
+
+    let oauth = Arc::new(
+        Oauth2Introspection::new(
+            &json!({
+                "providers": [{
+                    "introspection_endpoint": format!("{}/introspect", server.uri()),
+                    "client_auth": {"method": "none"},
+                    "forward_original_token": false,
+                    "claim_headers": {"email": "X-Untrusted-Email"}
+                }]
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    );
+    let key_auth: Arc<dyn Plugin> =
+        Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
+    let consumers = [create_test_consumer()];
+    let consumer_index = ConsumerIndex::new(&consumers);
+    let mut ctx = make_ctx("blank-principal-token");
+    ctx.headers
+        .insert("x-api-key".to_string(), "test-api-key".to_string());
+    let oauth_plugin: Arc<dyn Plugin> = oauth.clone();
+
+    let rejection = run_authentication_phase(
+        AuthMode::Multi,
+        &[oauth_plugin, key_auth],
+        &mut ctx,
+        &consumer_index,
+    )
+    .await;
+    assert!(rejection.is_none(), "later key_auth must authenticate");
+    assert_eq!(ctx.auth_method, Some("key_auth"));
+
+    let mut headers = ctx.headers.clone();
+    assert_continue(oauth.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer blank-principal-token")
+    );
+    assert!(!headers.contains_key("x-untrusted-email"));
 }
 
 #[tokio::test]
@@ -898,18 +978,26 @@ async fn provider_unavailable_survives_later_multi_auth_401() {
         .respond_with(ResponseTemplate::new(503))
         .mount(&server)
         .await;
-    let oauth: Arc<dyn Plugin> = Arc::new(
+    let oauth = Arc::new(
         Oauth2Introspection::new(
-            &config(&format!("{}/introspect", server.uri())),
+            &json!({
+                "providers": [{
+                    "introspection_endpoint": format!("{}/introspect", server.uri()),
+                    "client_auth": {"method": "none"},
+                    "forward_original_token": false,
+                    "claim_headers": {"email": "X-Untrusted-Email"}
+                }]
+            }),
             PluginHttpClient::default(),
         )
         .unwrap(),
     );
+    let oauth_plugin: Arc<dyn Plugin> = oauth.clone();
     let invalid_secondary: Arc<dyn Plugin> = Arc::new(InvalidSecondaryAuth);
     let mut ctx = make_ctx("provider-outage-token");
     let rejection = run_authentication_phase(
         AuthMode::Multi,
-        &[oauth, invalid_secondary],
+        &[oauth_plugin, invalid_secondary],
         &mut ctx,
         &ConsumerIndex::new(&[]),
     )
@@ -922,6 +1010,13 @@ async fn provider_unavailable_survives_later_multi_auth_401() {
             .keys()
             .all(|name| !name.eq_ignore_ascii_case("www-authenticate"))
     );
+    let mut headers = ctx.headers.clone();
+    assert_continue(oauth.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer provider-outage-token")
+    );
+    assert!(!headers.contains_key("x-untrusted-email"));
 }
 
 #[tokio::test]

@@ -82,6 +82,9 @@ impl VerifyOutcome {
         external_identity: Option<String>,
         external_identity_header: Option<String>,
     ) -> Self {
+        let external_identity = external_identity.filter(|identity| !identity.trim().is_empty());
+        let external_identity_header =
+            external_identity_header.filter(|identity_header| !identity_header.trim().is_empty());
         Self::Success {
             consumer,
             external_identity,
@@ -91,6 +94,26 @@ impl VerifyOutcome {
 
     pub fn consumer(consumer: Arc<Consumer>) -> Self {
         Self::success(Some(consumer), None, None)
+    }
+
+    /// True when this outcome established a principal: a mapped Consumer or a
+    /// nonblank external identity. Auth attempts must treat this as the commit
+    /// gate for every identity-derived side effect (claim-header fanout,
+    /// token-stripping metadata, identity header staging): an attempt that
+    /// verifies a credential but resolves no principal is not an
+    /// authentication, and in `auth_mode: multi` a later credential can still
+    /// authenticate the request — any state staged by the failed attempt would
+    /// then be applied under that other credential's authority.
+    pub fn establishes_principal(&self) -> bool {
+        matches!(
+            self,
+            Self::Success {
+                consumer,
+                external_identity,
+                ..
+            } if consumer.is_some()
+                || crate::plugins::meaningful_identity(external_identity.as_deref()).is_some()
+        )
     }
 }
 
@@ -197,9 +220,26 @@ async fn run_auth_impl<M: AuthMechanism>(
                 external_identity,
                 external_identity_header,
             } => {
+                let external_identity =
+                    external_identity.filter(|identity| !identity.trim().is_empty());
+                let external_identity_header = external_identity_header
+                    .filter(|identity_header| !identity_header.trim().is_empty());
                 let consumer_identified = consumer.is_some();
                 let external_identity_identified =
                     allow_external_identity && external_identity.is_some();
+
+                // Transactional commit: an attempt that verified a credential
+                // but resolved no principal contributes nothing to the request
+                // context. Without this, a nonblank header claim paired with a
+                // blank identity claim would stage `authenticated_identity_header`
+                // residue that a later successful credential then forwards.
+                if !consumer_identified && !external_identity_identified {
+                    debug!(
+                        "{}: credential verified but no principal resolved; skipping identity commit",
+                        mechanism.mechanism_name()
+                    );
+                    return PluginResult::Continue;
+                }
 
                 if let Some(consumer) = consumer
                     && ctx.identified_consumer.is_none()
@@ -221,9 +261,7 @@ async fn run_auth_impl<M: AuthMechanism>(
                     }
                 }
 
-                if ctx.auth_method.is_none()
-                    && (consumer_identified || external_identity_identified)
-                {
+                if ctx.auth_method.is_none() {
                     ctx.auth_method = Some(mechanism.mechanism_name());
                 }
                 PluginResult::Continue
@@ -519,6 +557,28 @@ mod tests {
 
         run_auth_external_identity(&mechanism, &mut ctx, &index).await;
 
+        assert!(ctx.effective_identity().is_none());
+        assert!(ctx.auth_method.is_none());
+    }
+
+    #[tokio::test]
+    async fn blank_external_identity_does_not_authenticate() {
+        let mechanism = FakeMechanism {
+            extracted: ExtractedCredential::BearerToken("token".to_string()),
+            outcome: VerifyOutcome::Success {
+                consumer: None,
+                external_identity: Some("   \t".to_string()),
+                external_identity_header: Some(" \n".to_string()),
+            },
+        };
+        let mut ctx = test_ctx();
+        let index = ConsumerIndex::new(&[]);
+
+        let result = run_auth_external_identity(&mechanism, &mut ctx, &index).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(ctx.authenticated_identity.is_none());
+        assert!(ctx.authenticated_identity_header.is_none());
         assert!(ctx.effective_identity().is_none());
         assert!(ctx.auth_method.is_none());
     }
