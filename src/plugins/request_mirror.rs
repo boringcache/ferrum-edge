@@ -359,6 +359,10 @@ impl Plugin for RequestMirror {
         self.mirror_hostname.iter().cloned().collect()
     }
 
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        true
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

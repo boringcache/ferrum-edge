@@ -150,6 +150,20 @@ fn h3_websocket_bridge_keeps_unresolved_base_proxy_for_retries() {
         proxy_arg < effective_proxy_arg,
         "H3 WebSocket bridge must not inherit the first target's effective proxy"
     );
+    assert!(
+        websocket_args.contains("backend_path_is_policy_bound,"),
+        "H3 WebSocket retries must receive the backend-path policy binding"
+    );
+
+    let websocket_source = include_str!("../../../src/http3/websocket.rs");
+    assert!(
+        websocket_source.contains("retry_target_preserves_backend_path("),
+        "H3 WebSocket target rotation must preserve the authorized backend path"
+    );
+    assert!(
+        websocket_source.contains("if retry_admitted_by_cb && !retry_path_mismatch"),
+        "H3 WebSocket path mismatches must abort rather than retry the failed target"
+    );
 }
 
 #[test]
@@ -203,6 +217,29 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         policy_block.contains("run_h3_backend_path_plugins_or_send_reject("),
         "H3 policy rejections must be emitted before dispatch"
     );
+    assert!(
+        source.contains("h3_plugin_protocol_for_request(http_flavor, grpc_web_request)"),
+        "H3 gRPC-Web requests must load the gRPC plugin policy chain"
+    );
+    assert!(
+        policy_block.contains("grpc_web_response_content_type.as_deref()"),
+        "H3 backend-path rejects must retain the client's gRPC-Web response encoding"
+    );
+    let native_retry = source
+        .find("// Resolve and validate the retry target before charging this")
+        .expect("native H3 retry path must preflight the candidate path");
+    let after_native_retry = &source[native_retry..];
+    let native_mismatch = after_native_retry
+        .find("Aborting H3 retry because the candidate would change")
+        .expect("native H3 retry must reject a path-changing candidate");
+    let native_intermediate_record = after_native_retry
+        .find("record_h3_backend_admission_outcome(")
+        .expect("native H3 retry intermediate accounting must remain present");
+    assert!(
+        native_mismatch < native_intermediate_record
+            && after_native_retry[native_mismatch..native_intermediate_record].contains("break;"),
+        "native H3 path mismatch must abort before intermediate retry accounting"
+    );
 
     let cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
     let retry_policy = cross_protocol
@@ -214,5 +251,24 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     assert!(
         retry_policy < retry_url,
         "retry target path policy must run before rebuilding the backend URL"
+    );
+    assert!(
+        cross_protocol.contains("CrossProtocolRetryTarget::BackendPathMismatch"),
+        "cross-protocol retries must distinguish a path mismatch from no target rotation"
+    );
+    let grpc_retry = cross_protocol
+        .rfind("let retry_target = select_next_cross_protocol_retry_target(")
+        .expect("cross-protocol gRPC retry selection must remain present");
+    let after_grpc_retry = &cross_protocol[grpc_retry..];
+    let mismatch = after_grpc_retry
+        .find("CrossProtocolRetryTarget::BackendPathMismatch")
+        .expect("cross-protocol gRPC retry must inspect the mismatch result");
+    let failure_record = after_grpc_retry
+        .find("let retry_error_class =")
+        .expect("cross-protocol gRPC retry failure recording must remain present");
+    assert!(
+        mismatch < failure_record
+            && after_grpc_retry[mismatch..failure_record].contains("break;"),
+        "cross-protocol gRPC retries must abort before recording an intermediate retry attempt"
     );
 }

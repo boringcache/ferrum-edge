@@ -2,7 +2,8 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → `on_backend_path_resolved` → `transform_request_body` →
+//! `before_proxy` → `on_backend_path_resolved` → deferred `before_proxy` hooks →
+//! `transform_request_body` →
 //! `on_final_request_body` → `backend_admission` → `after_proxy` →
 //! `normalize_response_body` → `on_response_body` →
 //! `transform_response_body` → `on_final_response_body` →
@@ -2907,6 +2908,16 @@ pub trait Plugin: Send + Sync {
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Returns `true` when `before_proxy` can dispatch external work or
+    /// synthesize a terminal response and therefore must wait until an active
+    /// backend-path policy has authorized the resolved route and target path.
+    ///
+    /// The ordinary plugin pipeline is unchanged when no backend-path plugin
+    /// is active. Opt-in hooks retain their relative order in a deferred pass.
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        false
     }
 
     /// Returns `true` when this plugin must inspect the backend-effective path

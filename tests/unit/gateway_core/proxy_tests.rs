@@ -312,6 +312,44 @@ fn test_backend_path_policy_pins_target_path_across_retries() {
 }
 
 #[test]
+fn test_backend_path_bound_retries_abort_in_every_h1_h2_dispatch_family() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    assert!(source.contains(
+        "Aborting gRPC retry because the candidate would change the authorized backend method path"
+    ));
+    assert!(source.contains(
+        "Aborting retry because the candidate would change the authorized backend method path"
+    ));
+    assert!(source.contains(
+        "Aborting WebSocket retry because the candidate would change the authorized backend method path"
+    ));
+    assert!(source.contains("if retry_admitted_by_cb && !retry_path_mismatch"));
+}
+
+#[test]
+fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let path_policy = source
+        .find(".on_backend_path_resolved(&mut ctx, &backend_path)")
+        .expect("backend-path policy hook must remain present");
+    let deferred = source
+        .find("// Hooks that can dispatch external work or synthesize a terminal response")
+        .expect("deferred before_proxy pass must remain present");
+    assert!(path_policy < deferred);
+
+    for plugin_source in [
+        include_str!("../../../src/plugins/request_mirror.rs"),
+        include_str!("../../../src/plugins/response_mock.rs"),
+        include_str!("../../../src/plugins/serverless_function.rs"),
+        include_str!("../../../src/plugins/load_testing.rs"),
+    ] {
+        assert!(plugin_source.contains(
+            "fn defer_before_proxy_until_backend_path_resolved(&self) -> bool"
+        ));
+    }
+}
+
+#[test]
 fn test_longest_prefix_match() {
     let config = GatewayConfig {
         version: "1".to_string(),

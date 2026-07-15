@@ -838,6 +838,10 @@ impl Plugin for ServerlessFunction {
         self.mode == InvocationMode::PreProxy
     }
 
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        true
+    }
+
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.requires_body
     }

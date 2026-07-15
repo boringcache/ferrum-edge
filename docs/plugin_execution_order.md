@@ -26,12 +26,17 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 4. before_proxy         │  Request transformation before backend call
+│ 4. before_proxy         │  Route/header preparation before backend-path policy
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
 │ 5. backend path policy  │  Backend-effective path after routing/target selection
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 5b. deferred before_proxy │  External/synthetic work after path authorization
 └────────────┬────────────┘
              │
              ▼
@@ -85,17 +90,29 @@ Request In
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
-`on_backend_path_resolved` is an opt-in, route-sensitive boundary after all
-`before_proxy` overrides and initial load balancing, but before circuit-breaker
-or backend dispatch. The gateway assembles the same path segments used by the
-backend URL builder, including regex/exact/prefix match length, encoded-slash
-normalization, `strip_listen_path`, `backend_path`, and the selected target's
-path. `grpc_method_router` uses this phase so allow/deny/rate policy and
-`grpc_*` metadata describe the method placed on the backend wire. Its
+`on_backend_path_resolved` is an opt-in, route-sensitive boundary after
+route/header-shaping `before_proxy` hooks and initial load balancing, but before
+circuit-breaker or backend dispatch. The gateway assembles the same path
+segments used by the backend URL builder, including regex/exact/prefix match
+length, encoded-slash normalization, `strip_listen_path`, `backend_path`, and
+the selected target's path. `grpc_method_router` uses this phase so
+allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
+backend wire. Its
 pre-filtered plugin list is built on reload; proxies without an opt-in plugin do
 not scan the chain or allocate an effective-path string. Once policy binds the
-first target's path, retries may rotate host/port but retain that target-path
-component so retry cannot silently change the authorized method.
+first target's path, retries may rotate host/port only when the candidate keeps
+that target-path component. A candidate with a different path aborts the retry
+instead of redialing the failed target or silently changing the authorized
+method. This applies to HTTP, native and bridged gRPC/H3, and WebSocket retry
+loops.
+
+When backend-path policy is active, `before_proxy` hooks that can dispatch
+external work or synthesize a terminal response opt into phase 5b. Ferrum runs
+them in their normal relative priority order only after path authorization.
+`request_mirror`, pre-proxy `serverless_function`, `response_mock`, and
+`load_testing` use this boundary, so a backend-effective gRPC deny cannot be
+mirrored, invoked, mocked, or load-fanned-out before it is enforced. Proxies
+without a backend-path policy retain the ordinary single `before_proxy` pass.
 
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
 

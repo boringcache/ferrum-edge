@@ -417,6 +417,12 @@ fn record_cross_protocol_retry_failure(
     }
 }
 
+enum CrossProtocolRetryTarget {
+    Unchanged,
+    Selected(Arc<UpstreamTarget>, String, String),
+    BackendPathMismatch,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_next_cross_protocol_retry_target(
     state: &ProxyState,
@@ -430,13 +436,15 @@ fn select_next_cross_protocol_retry_target(
     query_string: &str,
     client_ip: &str,
     proxy_headers: &HashMap<String, String>,
-) -> Option<(Arc<UpstreamTarget>, String, String)> {
-    let (prev_target, hash_key) = (current_target?, lb_hash_key?);
+) -> CrossProtocolRetryTarget {
+    let (Some(prev_target), Some(hash_key)) = (current_target, lb_hash_key) else {
+        return CrossProtocolRetryTarget::Unchanged;
+    };
 
     // Centralised in `backend_dispatch::select_next_retry_target` —
     // see that helper for the per-port `hash_on` recomputation contract
     // shared with the HTTP/H2/gRPC/WS retry sites.
-    let next = crate::proxy::backend_dispatch::select_next_retry_target(
+    let Some(next) = crate::proxy::backend_dispatch::select_next_retry_target(
         state,
         epoch,
         proxy,
@@ -444,7 +452,9 @@ fn select_next_cross_protocol_retry_target(
         hash_key,
         client_ip,
         proxy_headers,
-    )?;
+    ) else {
+        return CrossProtocolRetryTarget::Unchanged;
+    };
 
     if !crate::proxy::retry_target_preserves_backend_path(
         backend_path_is_policy_bound,
@@ -453,9 +463,9 @@ fn select_next_cross_protocol_retry_target(
     ) {
         warn!(
             proxy_id = %proxy.id,
-            "Keeping the current cross-protocol retry target because the candidate would change the authorized backend method path"
+            "Aborting cross-protocol retry because the candidate would change the authorized backend method path"
         );
-        return None;
+        return CrossProtocolRetryTarget::BackendPathMismatch;
     }
 
     let next_url = crate::proxy::build_backend_url_with_target(
@@ -468,7 +478,7 @@ fn select_next_cross_protocol_retry_target(
         next.path.as_deref(),
     );
     let next_cb_target_key = crate::circuit_breaker::target_key(&next.host, next.port);
-    Some((next, next_cb_target_key, next_url))
+    CrossProtocolRetryTarget::Selected(next, next_cb_target_key, next_url)
 }
 
 async fn resolve_cross_protocol_backend_ip(
@@ -1429,54 +1439,63 @@ where
                                     attempt,
                                 )
                             {
-                                record_cross_protocol_backend_admission_outcome(
-                                    &mut backend_admission_permits,
-                                    attempt_result.status_code,
-                                    false,
-                                    None,
-                                    backend_admission_start.elapsed(),
-                                );
-                                record_cross_protocol_retry_failure(
+                                let retry_target = select_next_cross_protocol_retry_target(
                                     state,
+                                    epoch,
                                     proxy,
-                                    upstream_balancer,
-                                    current_target.as_deref(),
-                                    current_cb_target_key.as_deref(),
-                                    attempt_result.status_code,
-                                    false,
-                                    cb_retry_probe_slot_available,
+                                    lb_hash_key,
+                                    current_target.as_ref(),
+                                    strip_len,
+                                    backend_path_is_policy_bound,
+                                    path,
+                                    query_string,
+                                    client_ip,
+                                    proxy_headers,
                                 );
-                                cb_retry_probe_slot_available = false;
-                                let delay = crate::retry::retry_delay(retry_config, attempt);
-                                tokio::time::sleep(delay).await;
-                                attempt += 1;
-                                if let Some((next_target, next_cb_target_key, next_url)) =
-                                    select_next_cross_protocol_retry_target(
+                                if !matches!(
+                                    &retry_target,
+                                    CrossProtocolRetryTarget::BackendPathMismatch
+                                ) {
+                                    record_cross_protocol_backend_admission_outcome(
+                                        &mut backend_admission_permits,
+                                        attempt_result.status_code,
+                                        false,
+                                        None,
+                                        backend_admission_start.elapsed(),
+                                    );
+                                    record_cross_protocol_retry_failure(
                                         state,
-                                        epoch,
                                         proxy,
-                                        lb_hash_key,
-                                        current_target.as_ref(),
-                                        strip_len,
-                                        backend_path_is_policy_bound,
-                                        path,
-                                        query_string,
-                                        client_ip,
-                                        proxy_headers,
-                                    )
-                                {
-                                    current_target = Some(next_target);
-                                    current_cb_target_key = Some(next_cb_target_key);
-                                    current_url = next_url;
+                                        upstream_balancer,
+                                        current_target.as_deref(),
+                                        current_cb_target_key.as_deref(),
+                                        attempt_result.status_code,
+                                        false,
+                                        cb_retry_probe_slot_available,
+                                    );
+                                    cb_retry_probe_slot_available = false;
+                                    let delay = crate::retry::retry_delay(retry_config, attempt);
+                                    tokio::time::sleep(delay).await;
+                                    attempt += 1;
+                                    if let CrossProtocolRetryTarget::Selected(
+                                        next_target,
+                                        next_cb_target_key,
+                                        next_url,
+                                    ) = retry_target
+                                    {
+                                        current_target = Some(next_target);
+                                        current_cb_target_key = Some(next_cb_target_key);
+                                        current_url = next_url;
+                                    }
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        attempt = attempt,
+                                        max_retries = retry_config.max_retries,
+                                        connection_error = false,
+                                        "Retrying cross-protocol H3→HTTP backend request"
+                                    );
+                                    continue;
                                 }
-                                warn!(
-                                    proxy_id = %proxy.id,
-                                    attempt = attempt,
-                                    max_retries = retry_config.max_retries,
-                                    connection_error = false,
-                                    "Retrying cross-protocol H3→HTTP backend request"
-                                );
-                                continue;
                             }
                             final_backend_admission_elapsed = backend_admission_start.elapsed();
                             final_backend_admission_permits = backend_admission_permits;
@@ -1499,54 +1518,63 @@ where
                                     attempt,
                                 )
                             {
-                                record_cross_protocol_backend_admission_outcome(
-                                    &mut backend_admission_permits,
-                                    attempt_result.status_code,
-                                    attempt_result.connection_error,
-                                    attempt_result.error_class,
-                                    backend_admission_start.elapsed(),
-                                );
-                                record_cross_protocol_retry_failure(
+                                let retry_target = select_next_cross_protocol_retry_target(
                                     state,
+                                    epoch,
                                     proxy,
-                                    upstream_balancer,
-                                    current_target.as_deref(),
-                                    current_cb_target_key.as_deref(),
-                                    attempt_result.status_code,
-                                    attempt_result.connection_error,
-                                    cb_retry_probe_slot_available,
+                                    lb_hash_key,
+                                    current_target.as_ref(),
+                                    strip_len,
+                                    backend_path_is_policy_bound,
+                                    path,
+                                    query_string,
+                                    client_ip,
+                                    proxy_headers,
                                 );
-                                cb_retry_probe_slot_available = false;
-                                let delay = crate::retry::retry_delay(retry_config, attempt);
-                                tokio::time::sleep(delay).await;
-                                attempt += 1;
-                                if let Some((next_target, next_cb_target_key, next_url)) =
-                                    select_next_cross_protocol_retry_target(
+                                if !matches!(
+                                    &retry_target,
+                                    CrossProtocolRetryTarget::BackendPathMismatch
+                                ) {
+                                    record_cross_protocol_backend_admission_outcome(
+                                        &mut backend_admission_permits,
+                                        attempt_result.status_code,
+                                        attempt_result.connection_error,
+                                        attempt_result.error_class,
+                                        backend_admission_start.elapsed(),
+                                    );
+                                    record_cross_protocol_retry_failure(
                                         state,
-                                        epoch,
                                         proxy,
-                                        lb_hash_key,
-                                        current_target.as_ref(),
-                                        strip_len,
-                                        backend_path_is_policy_bound,
-                                        path,
-                                        query_string,
-                                        client_ip,
-                                        proxy_headers,
-                                    )
-                                {
-                                    current_target = Some(next_target);
-                                    current_cb_target_key = Some(next_cb_target_key);
-                                    current_url = next_url;
+                                        upstream_balancer,
+                                        current_target.as_deref(),
+                                        current_cb_target_key.as_deref(),
+                                        attempt_result.status_code,
+                                        attempt_result.connection_error,
+                                        cb_retry_probe_slot_available,
+                                    );
+                                    cb_retry_probe_slot_available = false;
+                                    let delay = crate::retry::retry_delay(retry_config, attempt);
+                                    tokio::time::sleep(delay).await;
+                                    attempt += 1;
+                                    if let CrossProtocolRetryTarget::Selected(
+                                        next_target,
+                                        next_cb_target_key,
+                                        next_url,
+                                    ) = retry_target
+                                    {
+                                        current_target = Some(next_target);
+                                        current_cb_target_key = Some(next_cb_target_key);
+                                        current_url = next_url;
+                                    }
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        attempt = attempt,
+                                        max_retries = retry_config.max_retries,
+                                        connection_error = attempt_result.connection_error,
+                                        "Retrying cross-protocol H3→HTTP backend request"
+                                    );
+                                    continue;
                                 }
-                                warn!(
-                                    proxy_id = %proxy.id,
-                                    attempt = attempt,
-                                    max_retries = retry_config.max_retries,
-                                    connection_error = attempt_result.connection_error,
-                                    "Retrying cross-protocol H3→HTTP backend request"
-                                );
-                                continue;
                             }
 
                             let final_backend_resolved_ip = resolve_cross_protocol_backend_ip(
@@ -3322,6 +3350,26 @@ where
                 break;
             }
 
+            let retry_target = select_next_cross_protocol_retry_target(
+                state,
+                epoch,
+                proxy,
+                lb_hash_key,
+                current_target.as_ref(),
+                strip_len,
+                backend_path_is_policy_bound,
+                path,
+                query_string,
+                client_ip,
+                proxy_headers,
+            );
+            if matches!(
+                &retry_target,
+                CrossProtocolRetryTarget::BackendPathMismatch
+            ) {
+                break;
+            }
+
             let retry_error_class = result
                 .as_ref()
                 .err()
@@ -3349,20 +3397,11 @@ where
             tokio::time::sleep(delay).await;
             attempt += 1;
 
-            if let Some((next_target, next_cb_target_key, next_url)) =
-                select_next_cross_protocol_retry_target(
-                    state,
-                    epoch,
-                    proxy,
-                    lb_hash_key,
-                    current_target.as_ref(),
-                    strip_len,
-                    backend_path_is_policy_bound,
-                    path,
-                    query_string,
-                    client_ip,
-                    proxy_headers,
-                )
+            if let CrossProtocolRetryTarget::Selected(
+                next_target,
+                next_cb_target_key,
+                next_url,
+            ) = retry_target
             {
                 current_target = Some(next_target);
                 current_cb_target_key = Some(next_cb_target_key);

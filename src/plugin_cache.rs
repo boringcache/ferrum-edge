@@ -194,6 +194,10 @@ impl Plugin for PriorityOverridePlugin {
     ) -> PluginResult {
         self.inner.before_proxy(ctx, headers).await
     }
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        self.inner
+            .defer_before_proxy_until_backend_path_resolved()
+    }
     fn requires_backend_path_resolution(&self) -> bool {
         self.inner.requires_backend_path_resolution()
     }

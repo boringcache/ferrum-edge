@@ -1460,6 +1460,100 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
     );
 }
 
+/// A backend-effective method rejection happens after prefix stripping and
+/// target selection, but gRPC-Web clients must still receive the browser-safe
+/// trailer-frame representation instead of a native gRPC Trailers-Only reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
+    let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
+
+    let mut proxy = create_grpc_proxy("grpc-web-method-policy", "/grpc", backend_addr.port());
+    proxy.plugins = vec![
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-method-policy-bridge".to_string(),
+        },
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-method-policy-router".to_string(),
+        },
+    ];
+    let grpc_web = PluginConfig {
+        id: "grpc-web-method-policy-bridge".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_web".to_string(),
+        enabled: true,
+        config: serde_json::json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-web-method-policy".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let method_router = PluginConfig {
+        id: "grpc-web-method-policy-router".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_method_router".to_string(),
+        enabled: true,
+        config: serde_json::json!({
+            "deny_methods": ["my.Service/Unary"]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-web-method-policy".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![grpc_web, method_router]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/grpc/my.Service/Unary")
+        .header("content-type", "application/grpc-web+proto")
+        .body(Full::new(Bytes::from_static(&[0u8, 0, 0, 0, 0])))
+        .unwrap();
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("method-policy request send failed");
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/grpc-web+proto")
+    );
+    assert!(response.headers().get("grpc-status").is_none());
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes().to_vec())
+        .unwrap_or_default();
+    assert!(
+        body.contains(&0x80),
+        "gRPC-Web reject must contain a trailer frame"
+    );
+    assert!(
+        body.windows(b"grpc-status: 7".len())
+            .any(|window| window == b"grpc-status: 7"),
+        "method policy reject must embed PERMISSION_DENIED in the gRPC-Web body"
+    );
+}
+
 /// Fix 4: with retry configured, a gRPC server-streaming response with
 /// multiple data frames separated by delays must still reach the client
 /// as distinct frames — the `grpc-status` trailer must NOT be delayed by

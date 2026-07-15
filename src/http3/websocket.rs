@@ -557,6 +557,7 @@ pub(crate) async fn handle_h3_websocket(
     requires_ws_frame_hooks: bool,
     is_early_data: bool,
     strip_len: usize,
+    backend_path_is_policy_bound: bool,
     // The client-requested path before any VirtualService `rewrite.uri` was
     // applied. Used for `request_path` in transaction logs so that access
     // logs record what the client sent, not the backend-rewritten path in
@@ -951,12 +952,10 @@ pub(crate) async fn handle_h3_websocket(
                         cb_failure_already_recorded = true;
                     }
 
-                    tokio::time::sleep(delay).await;
-                    ws_attempt += 1;
-
                     let mut retry_backend_url = current_backend_url.clone();
                     let mut retry_target = current_target.clone();
                     let mut retry_cb_target_key = current_cb_target_key.clone();
+                    let mut retry_path_mismatch = false;
 
                     if let (Some(_upstream_id), Some(prev_target), Some(hash_key)) =
                         (&proxy.upstream_id, &current_target, lb_hash_key.as_deref())
@@ -970,22 +969,42 @@ pub(crate) async fn handle_h3_websocket(
                             &proxy_headers,
                         )
                     {
-                        retry_backend_url = crate::proxy::build_websocket_backend_url_with_target(
-                            &proxy,
-                            &ctx.path,
-                            &query_string,
-                            &next.host,
-                            next.port,
-                            strip_len,
-                            next.path.as_deref(),
-                        );
-                        retry_cb_target_key =
-                            Some(crate::circuit_breaker::target_key(&next.host, next.port));
-                        retry_target = Some(next);
+                        if !crate::proxy::retry_target_preserves_backend_path(
+                            backend_path_is_policy_bound,
+                            prev_target,
+                            &next,
+                        ) {
+                            retry_path_mismatch = true;
+                            warn!(
+                                proxy_id = %proxy.id,
+                                "Aborting H3 WebSocket retry because the candidate would change the authorized backend method path"
+                            );
+                        } else {
+                            retry_backend_url =
+                                crate::proxy::build_websocket_backend_url_with_target(
+                                    &proxy,
+                                    &ctx.path,
+                                    &query_string,
+                                    &next.host,
+                                    next.port,
+                                    strip_len,
+                                    next.path.as_deref(),
+                                );
+                            retry_cb_target_key =
+                                Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                            retry_target = Some(next);
+                        }
+                    }
+
+                    if !retry_path_mismatch {
+                        tokio::time::sleep(delay).await;
+                        ws_attempt += 1;
                     }
 
                     let mut retry_admitted_by_cb = true;
-                    if let Some(cb_config) = &proxy.circuit_breaker {
+                    if !retry_path_mismatch
+                        && let Some(cb_config) = &proxy.circuit_breaker
+                    {
                         match state.circuit_breaker_cache.can_execute(
                             &proxy.id,
                             retry_cb_target_key.as_deref(),
@@ -1005,7 +1024,7 @@ pub(crate) async fn handle_h3_websocket(
                         }
                     }
 
-                    if retry_admitted_by_cb {
+                    if retry_admitted_by_cb && !retry_path_mismatch {
                         current_backend_url = retry_backend_url;
                         current_target = retry_target;
                         current_cb_target_key = retry_cb_target_key;
