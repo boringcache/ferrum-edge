@@ -373,6 +373,104 @@ async fn oidc_multi_auth_preserves_rotated_cookie_when_later_credential_rejects(
 }
 
 #[tokio::test]
+async fn oidc_multi_auth_uses_latest_rejected_session_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/first-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "first-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "first-rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/second-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "second-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "second-rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let rejection_plugin = |cookie_name: &str, token_path: &str| {
+        let mut config = base_config();
+        config["providers"][0]["token_endpoint"] =
+            json!(format!("{}{token_path}", server.uri()));
+        config["providers"][0]["required_scopes"] = json!(["admin"]);
+        config["providers"][0]["consumer_identity_claim"] = json!("email");
+        config["session"]["cookie_name"] = json!(cookie_name);
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap()
+    };
+    let first = Arc::new(rejection_plugin("first_session", "/first-token"));
+    let second = Arc::new(rejection_plugin("second_session", "/second-token"));
+    let now = chrono::Utc::now().timestamp();
+    let claims = json!({
+        "sub": "oidc-subject",
+        "email": "rejected@example.test",
+        "scope": "viewer",
+        "exp": now + 3600
+    });
+    let first_cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &first,
+        claims.clone(),
+        "first-original-refresh-token",
+    )
+    .unwrap();
+    let second_cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &second,
+        claims,
+        "second-original-refresh-token",
+    )
+    .unwrap();
+    let first_pair = first_cookie.split(';').next().expect("first cookie pair");
+    let second_pair = second_cookie
+        .split(';')
+        .next()
+        .expect("second cookie pair");
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.headers.insert(
+        "cookie".to_string(),
+        format!("{first_pair}; {second_pair}"),
+    );
+    let first_plugin: Arc<dyn Plugin> = first.clone();
+    let second_plugin: Arc<dyn Plugin> = second.clone();
+
+    let (status_code, _, headers) = run_authentication_phase(
+        AuthMode::Multi,
+        &[first_plugin, second_plugin],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("both scope-rejected sessions must reject");
+    assert_eq!(status_code, 403);
+    let mut set_cookies = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"));
+    let set_cookie = set_cookies
+        .next()
+        .map(|(_, value)| value)
+        .expect("latest rejected session cookie must reach the client");
+    assert!(set_cookies.next().is_none());
+    assert!(set_cookie.starts_with("second_session="));
+    assert!(oidc_session_state_from_set_cookie_for_test(&first, set_cookie).is_none());
+    let state = oidc_session_state_from_set_cookie_for_test(&second, set_cookie)
+        .expect("latest rejected session cookie must open with its owner");
+    assert_eq!(state.access_token, "second-access-token");
+    assert_eq!(
+        state.refresh_token.as_deref(),
+        Some("second-rotated-refresh-token")
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn oidc_multi_auth_preserves_refresh_backoff_when_later_credential_rejects() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

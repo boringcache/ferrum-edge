@@ -1203,10 +1203,13 @@ impl OidcRelyingParty {
                     // one-shot candidate lets multi-auth move the same sealed
                     // state onto a later final rejection. The phase discards
                     // the candidate if a later credential succeeds, so keep it
-                    // separate from successful-principal attempt staging.
-                    ctx.metadata
-                        .entry(crate::proxy::AUTH_REJECTION_SET_COOKIE_METADATA_KEY.to_string())
-                        .or_insert_with(|| cookie.clone());
+                    // separate from successful-principal attempt staging. A
+                    // later rejected session attempt replaces this candidate
+                    // to match multi-auth's last-client-rejection selection.
+                    ctx.metadata.insert(
+                        crate::proxy::AUTH_REJECTION_SET_COOKIE_METADATA_KEY.to_string(),
+                        cookie.clone(),
+                    );
                     headers.insert("set-cookie".to_string(), cookie);
                 }
                 Err(error) => {
