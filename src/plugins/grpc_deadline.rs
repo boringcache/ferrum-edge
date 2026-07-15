@@ -214,17 +214,14 @@ fn duration_millis_ceil_saturating(duration: Duration) -> Option<u64> {
     Some(millis.max(1))
 }
 
-fn timeout_header<'a>(headers: &'a HashMap<String, String>) -> Option<&'a str> {
+fn timeout_header(headers: &HashMap<String, String>) -> Option<&str> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("grpc-timeout"))
         .map(|(_, value)| value.as_str())
 }
 
-fn initialize_deadline_from_headers(
-    ctx: &mut RequestContext,
-    headers: &HashMap<String, String>,
-) {
+fn initialize_deadline_from_headers(ctx: &mut RequestContext, headers: &HashMap<String, String>) {
     if ctx.grpc_deadline_initialized {
         return;
     }
@@ -295,7 +292,10 @@ impl Plugin for GrpcDeadline {
         let mut deadline_ms = ctx.grpc_deadline_budget_ms;
 
         if deadline_ms.is_none() && self.reject_no_deadline {
-            debug!(plugin = "grpc_deadline", "Request missing valid grpc-timeout");
+            debug!(
+                plugin = "grpc_deadline",
+                "Request missing valid grpc-timeout"
+            );
             return PluginResult::Reject {
                 status_code: 400,
                 body: r#"{"error":"a positive grpc-timeout header is required"}"#.to_string(),

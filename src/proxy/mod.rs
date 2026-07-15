@@ -3312,12 +3312,7 @@ pub(crate) async fn apply_request_body_plugins_with_context(
                     }
                 } else {
                     plugin
-                        .transform_request_body_with_context(
-                            ctx,
-                            &current,
-                            content_type,
-                            headers,
-                        )
+                        .transform_request_body_with_context(ctx, &current, content_type, headers)
                         .await
                 }
             } else {
@@ -15054,8 +15049,7 @@ async fn handle_proxy_request_inner(
             let reject = finalize_reject_response_with_after_proxy_hooks(
                 &plugins,
                 &mut ctx,
-                StatusCode::from_u16(plugin_reject.status_code)
-                    .unwrap_or(StatusCode::BAD_REQUEST),
+                StatusCode::from_u16(plugin_reject.status_code).unwrap_or(StatusCode::BAD_REQUEST),
                 &plugin_reject.body,
                 plugin_reject.headers,
                 true,
@@ -16508,7 +16502,7 @@ async fn handle_proxy_request_inner(
                 .or_insert_with(|| path.clone());
             let mut body_hook_ctx = (needs_final_request_body_context
                 || ctx.grpc_deadline_at().is_some())
-            .then(|| ctx.clone_for_final_request_body_hooks());
+                .then(|| ctx.clone_for_final_request_body_hooks());
             let grpc_req_body = bytes::Bytes::from(
                 apply_request_body_plugins_with_context(
                     &plugins,
@@ -18330,11 +18324,12 @@ async fn handle_proxy_request_inner(
                             "Deadline exceeded at gateway",
                         );
                         if let Some(content_type) = grpc_web_response_content_type {
-                            let translated = crate::plugins::grpc_web::error_response_for_content_type(
-                                content_type,
-                                grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                "Deadline exceeded at gateway",
-                            );
+                            let translated =
+                                crate::plugins::grpc_web::error_response_for_content_type(
+                                    content_type,
+                                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                    "Deadline exceeded at gateway",
+                                );
                             response_status = 200;
                             response_headers = translated.headers;
                             response_body = translated.body;
@@ -18364,15 +18359,13 @@ async fn handle_proxy_request_inner(
                         proxy.dns_override.as_deref(),
                         proxy.dns_cache_ttl_seconds,
                     );
-                    let grpc_resolved_ip = match crate::plugins::await_grpc_deadline(
-                        ctx.grpc_deadline_at(),
-                        resolve,
-                    )
-                    .await
-                    {
-                        Ok(result) => result.ok().map(|ip| ip.to_string()),
-                        Err(()) => None,
-                    };
+                    let grpc_resolved_ip =
+                        match crate::plugins::await_grpc_deadline(ctx.grpc_deadline_at(), resolve)
+                            .await
+                        {
+                            Ok(result) => result.ok().map(|ip| ip.to_string()),
+                            Err(()) => None,
+                        };
                     let bytes_sent = ctx
                         .bytes_sent_observed
                         .load(std::sync::atomic::Ordering::Acquire);
@@ -18874,13 +18867,12 @@ async fn handle_proxy_request_inner(
         let mut final_upstream_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
-        let mut body_hook_ctx = if needs_final_request_body_context
-            || ctx.grpc_deadline_at().is_some()
-        {
-            Some(ctx.clone_for_final_request_body_hooks())
-        } else {
-            None
-        };
+        let mut body_hook_ctx =
+            if needs_final_request_body_context || ctx.grpc_deadline_at().is_some() {
+                Some(ctx.clone_for_final_request_body_hooks())
+            } else {
+                None
+            };
         let initial_dispatch = proxy_to_backend(
             &state,
             &proxy,
@@ -18991,9 +18983,8 @@ async fn handle_proxy_request_inner(
                     .await
                     .is_err()
                 {
-                    result = client_grpc_deadline_exceeded_response(
-                        result.backend_resolved_ip.clone(),
-                    );
+                    result =
+                        client_grpc_deadline_exceeded_response(result.backend_resolved_ip.clone());
                     break;
                 }
             } else {
@@ -19255,13 +19246,12 @@ async fn handle_proxy_request_inner(
         }
         (result, current_cb_target_key, final_upstream_target)
     } else {
-        let mut body_hook_ctx = if needs_final_request_body_context
-            || ctx.grpc_deadline_at().is_some()
-        {
-            Some(ctx.clone_for_final_request_body_hooks())
-        } else {
-            None
-        };
+        let mut body_hook_ctx =
+            if needs_final_request_body_context || ctx.grpc_deadline_at().is_some() {
+                Some(ctx.clone_for_final_request_body_hooks())
+            } else {
+                None
+            };
         let dispatch = proxy_to_backend(
             &state,
             &proxy,
@@ -22722,11 +22712,7 @@ async fn proxy_to_backend(
                         Err(RequestBodyWaitError::TimedOut) => {
                             let response =
                                 request_body_timeout_backend_response(resolved_ip.clone());
-                            return backend_dispatch_response(
-                                response,
-                                None,
-                                None,
-                            );
+                            return backend_dispatch_response(response, None, None);
                         }
                     }
                 } else {
@@ -22769,11 +22755,7 @@ async fn proxy_to_backend(
                         Err(RequestBodyWaitError::TimedOut) => {
                             let response =
                                 request_body_timeout_backend_response(resolved_ip.clone());
-                            return backend_dispatch_response(
-                                response,
-                                None,
-                                None,
-                            );
+                            return backend_dispatch_response(response, None, None);
                         }
                     }
                 };
@@ -25172,8 +25154,8 @@ async fn proxy_to_backend_mesh_mtls(
     let is_grpc_flavored = headers
         .get("content-type")
         .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
-    let is_grpc_web_translated = is_grpc_flavored
-        && crate::plugins::grpc_web::request_is_grpc_web_translated(request_ctx);
+    let is_grpc_web_translated =
+        is_grpc_flavored && crate::plugins::grpc_web::request_is_grpc_web_translated(request_ctx);
     let is_native_grpc = is_grpc_flavored && !is_grpc_web_translated;
 
     // Client end-to-end RPC deadline. Prefer the receipt-anchored monotonic
@@ -26279,16 +26261,13 @@ async fn proxy_to_backend_http2(
         }
     } else {
         // Buffer the full response body
-        let collect = collect_hyper_body_with_limit(
-            response.into_body(),
-            0,
-            proxy.backend_read_timeout_ms,
-        );
-        let collect_result = match crate::plugins::await_grpc_deadline(grpc_deadline_at, collect).await
-        {
-            Ok(result) => result,
-            Err(()) => return mesh_grpc_deadline_exceeded_response(resolved_ip),
-        };
+        let collect =
+            collect_hyper_body_with_limit(response.into_body(), 0, proxy.backend_read_timeout_ms);
+        let collect_result =
+            match crate::plugins::await_grpc_deadline(grpc_deadline_at, collect).await {
+                Ok(result) => result,
+                Err(()) => return mesh_grpc_deadline_exceeded_response(resolved_ip),
+            };
         let body_bytes = match collect_result {
             Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {

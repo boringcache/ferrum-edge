@@ -284,8 +284,7 @@ async fn expired_grpc_deadline_still_runs_stream_cleanup_before_log() {
         outcome,
         summaries,
     });
-    let plugins: Arc<Vec<Arc<dyn Plugin>>> =
-        Arc::new(vec![deadline_plugin, capturing_plugin]);
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![deadline_plugin, capturing_plugin]);
     let mut ctx = make_ctx();
     ctx.headers.insert(
         "content-type".to_string(),

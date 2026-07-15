@@ -845,11 +845,7 @@ async fn grpc_deadline_expiry_after_headers_emits_deadline_exceeded_trailers() {
             headers.as_ref().map_or(&[], |headers| headers.as_slice());
         let response = tokio::time::timeout(
             Duration::from_secs(4),
-            client.unary_with_headers(
-                "/grpc/ferrum.Echo/Ping",
-                Bytes::new(),
-                extra_headers,
-            ),
+            client.unary_with_headers("/grpc/ferrum.Echo/Ping", Bytes::new(), extra_headers),
         )
         .await
         .unwrap_or_else(|_| panic!("{case}: RPC exceeded its deadline envelope"))
@@ -869,8 +865,16 @@ async fn grpc_deadline_expiry_after_headers_emits_deadline_exceeded_trailers() {
             Some("4"),
             "{case}: missing DEADLINE_EXCEEDED trailer: {response:?}"
         );
-        assert_eq!(response.effective_grpc_status(), 4, "{case}: semantic status");
-        assert_eq!(backend.received_stream_count(), 1, "{case}: backend attempts");
+        assert_eq!(
+            response.effective_grpc_status(),
+            4,
+            "{case}: semantic status"
+        );
+        assert_eq!(
+            backend.received_stream_count(),
+            1,
+            "{case}: backend attempts"
+        );
     }
 }
 

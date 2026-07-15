@@ -1305,8 +1305,7 @@ fn grpc_streaming_response_deadline_preserves_already_elapsed_instant() {
 
 #[test]
 fn grpc_streaming_response_deadline_no_client_budget_falls_back_per_frame() {
-    let (per_frame_ms, deadline) =
-        grpc_proxy::grpc_streaming_response_deadline(None, 30_000);
+    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(None, 30_000);
     assert_eq!(
         per_frame_ms, 30_000,
         "without a client deadline the operator read timeout applies per frame"
@@ -1314,8 +1313,7 @@ fn grpc_streaming_response_deadline_no_client_budget_falls_back_per_frame() {
     assert!(deadline.is_none());
     // 0 + None (no client deadline, no operator fallback) = unbounded, for
     // long-lived server/bidi streams that legitimately idle.
-    let (per_frame_ms, deadline) =
-        grpc_proxy::grpc_streaming_response_deadline(None, 0);
+    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(None, 0);
     assert_eq!(per_frame_ms, 0);
     assert!(deadline.is_none());
 }

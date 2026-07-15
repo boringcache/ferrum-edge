@@ -46,12 +46,11 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
     let deadline_plugin = create_plugin("grpc_deadline", &json!({ "default_deadline_ms": 1 }))
         .unwrap()
         .unwrap();
-    let plugins: Vec<Arc<dyn Plugin>> =
-        vec![deadline_plugin, Arc::new(StalledResponseNormalizer)];
+    let plugins: Vec<Arc<dyn Plugin>> = vec![deadline_plugin, Arc::new(StalledResponseNormalizer)];
     let mut ctx = create_grpc_context_with_timeout(None);
-    assert_continue(ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
-        &plugins, &mut ctx,
-    ));
+    assert_continue(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
+    );
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     let mut headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
@@ -165,7 +164,10 @@ fn test_unknown_and_null_fields_are_rejected() {
             "config.reject_no_deadine",
         ),
         (json!({"MAX_DEADLINE_MS": 30000}), "config.MAX_DEADLINE_MS"),
-        (json!({"max_deadline_ms": null}), "must be an unsigned integer"),
+        (
+            json!({"max_deadline_ms": null}),
+            "must be an unsigned integer",
+        ),
         (json!({"reject_no_deadline": null}), "must be a boolean"),
         (
             json!({"max_deadline_ms": 30000, "unexpected": {"nested": true}}),
@@ -365,12 +367,9 @@ async fn test_parse_nanoseconds() {
 
 #[tokio::test]
 async fn test_zero_timeouts_are_missing_and_positive_submillisecond_rounds_up() {
-    let plugin = create_plugin(
-        "grpc_deadline",
-        &json!({"reject_no_deadline": true}),
-    )
-    .unwrap()
-    .unwrap();
+    let plugin = create_plugin("grpc_deadline", &json!({"reject_no_deadline": true}))
+        .unwrap()
+        .unwrap();
 
     for timeout in ["0H", "0M", "0S", "0m", "0u", "0n"] {
         let mut ctx = create_grpc_context_with_timeout(Some(timeout));
@@ -396,7 +395,10 @@ async fn test_timeout_header_matching_is_case_insensitive_and_rewrites_canonical
     let mut headers = HashMap::from([("Grpc-Timeout".to_string(), "10S".to_string())]);
 
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert_eq!(headers.get("grpc-timeout").map(String::as_str), Some("5000m"));
+    assert_eq!(
+        headers.get("grpc-timeout").map(String::as_str),
+        Some("5000m")
+    );
     assert_eq!(
         headers
             .keys()
@@ -421,10 +423,9 @@ async fn test_multiple_instances_share_one_absolute_deadline() {
     let mut ctx = create_grpc_context_with_timeout(Some("10S"));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    assert_continue(ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
-        &plugins,
-        &mut ctx,
-    ));
+    assert_continue(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
+    );
     let absolute = ctx
         .grpc_deadline_at()
         .expect("valid timeout establishes an absolute deadline");
@@ -452,18 +453,14 @@ async fn test_multiple_instances_share_one_absolute_deadline() {
 
 #[tokio::test]
 async fn test_preflight_deadline_cancels_request_plugin_work_with_status_four() {
-    let plugin = create_plugin(
-        "grpc_deadline",
-        &json!({"default_deadline_ms": 1}),
-    )
-    .unwrap()
-    .unwrap();
+    let plugin = create_plugin("grpc_deadline", &json!({"default_deadline_ms": 1}))
+        .unwrap()
+        .unwrap();
     let plugins = vec![plugin];
     let mut ctx = create_grpc_context_with_timeout(None);
-    assert_continue(ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
-        &plugins,
-        &mut ctx,
-    ));
+    assert_continue(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
+    );
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     let result = ferrum_edge::plugins::await_request_plugin_deadline(

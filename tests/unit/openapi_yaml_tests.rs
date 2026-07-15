@@ -1403,12 +1403,7 @@ fn grpc_deadline_schema_matches_runtime_validation_contract() {
         ),
     ];
     for (config, expected_valid) in parity_cases {
-        assert_component_validity(
-            &spec,
-            "GrpcDeadlineConfig",
-            &config,
-            expected_valid,
-        );
+        assert_component_validity(&spec, "GrpcDeadlineConfig", &config, expected_valid);
         let runtime_valid = ferrum_edge::plugins::create_plugin("grpc_deadline", &config).is_ok();
         assert_eq!(
             runtime_valid, expected_valid,

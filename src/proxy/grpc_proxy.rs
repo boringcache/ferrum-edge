@@ -2456,8 +2456,8 @@ pub(crate) async fn proxy_grpc_request_core(
     // form); on overflow the deadline is treated as effectively unbounded. The
     // operator fallback (`per_phase_read_ms`) instead arms a fresh per-phase
     // timer in each phase, preserving the prior per-read stall-guard semantics.
-    let client_deadline = dispatch_deadline_at
-        .map(|deadline| (client_deadline_ms.unwrap_or(1), deadline));
+    let client_deadline =
+        dispatch_deadline_at.map(|deadline| (client_deadline_ms.unwrap_or(1), deadline));
     let response = if let Some((timeout_ms, deadline)) = client_deadline {
         tokio::time::timeout_at(deadline, send_fut)
             .await

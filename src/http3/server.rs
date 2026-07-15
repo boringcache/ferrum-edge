@@ -4380,13 +4380,12 @@ async fn handle_h3_request(
     let final_body_result = if request_body_prepared {
         PluginResult::Continue
     } else {
-        let body_hook_ctx: Option<&mut RequestContext> = if needs_ctx_headers_for_body_hooks
-            || ctx.grpc_deadline_at().is_some()
-        {
-            Some(&mut ctx)
-        } else {
-            None
-        };
+        let body_hook_ctx: Option<&mut RequestContext> =
+            if needs_ctx_headers_for_body_hooks || ctx.grpc_deadline_at().is_some() {
+                Some(&mut ctx)
+            } else {
+                None
+            };
         crate::proxy::run_final_request_body_hooks(
             &plugins,
             body_hook_ctx,
