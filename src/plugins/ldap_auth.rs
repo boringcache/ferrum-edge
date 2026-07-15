@@ -775,7 +775,7 @@ impl LdapAuth {
     async fn check_group_membership(
         &self,
         user_dn: &str,
-        presented_username: &str,
+        canonical_identity: &str,
     ) -> Result<bool, AuthError> {
         if self.required_groups.is_empty() {
             return Ok(true);
@@ -783,7 +783,7 @@ impl LdapAuth {
 
         let group_base = self.group_base_dn.as_deref().unwrap_or_default();
 
-        let filter = self.group_search_filter(user_dn, presented_username);
+        let filter = self.group_search_filter(user_dn, canonical_identity);
 
         // Bind with the service account when one is configured; otherwise the
         // group search runs over an ANONYMOUS-bound connection. Many directories
@@ -849,7 +849,7 @@ impl LdapAuth {
                  anonymous bind; this is either a genuine no-membership result or the directory \
                  restricts anonymous reads of group objects — configure 'service_account_dn'/\
                  'service_account_password' if groups are not being matched",
-                presented_username, group_base
+                canonical_identity, group_base
             );
         }
 
@@ -876,7 +876,7 @@ impl LdapAuth {
                 break;
             }
             match self
-                .returned_group_proves_membership(&mut ldap, &entry.dn, user_dn, presented_username)
+                .returned_group_proves_membership(&mut ldap, &entry.dn, user_dn, canonical_identity)
                 .await
             {
                 Ok(true) => {
@@ -906,14 +906,13 @@ impl LdapAuth {
         Ok(false)
     }
 
-    fn group_search_filter(&self, user_dn: &str, presented_username: &str) -> String {
-        // `{username}` retains its documented meaning as the login value used
-        // by the user search. The canonical identity is for Ferrum identity
-        // export/Consumer mapping and may intentionally differ (for example,
-        // email login versus an immutable directory ID).
-        let default_filter = group_membership_filter(user_dn, presented_username);
+    fn group_search_filter(&self, user_dn: &str, canonical_identity: &str) -> String {
+        // Group authorization must use the authenticated account identity, not
+        // the client-presented login value that may be an alias in
+        // search-then-bind mode.
+        let default_filter = group_membership_filter(user_dn, canonical_identity);
         let escaped_user_dn = escape_filter_value(user_dn);
-        let escaped_username = escape_filter_value(presented_username);
+        let escaped_username = escape_filter_value(canonical_identity);
         self.group_filter
             .as_ref()
             .map(|filter| {
@@ -944,9 +943,9 @@ impl LdapAuth {
         ldap: &mut Ldap,
         group_dn: &str,
         user_dn: &str,
-        presented_username: &str,
+        canonical_identity: &str,
     ) -> Result<bool, AuthError> {
-        let membership_filter = group_membership_filter(user_dn, presented_username);
+        let membership_filter = group_membership_filter(user_dn, canonical_identity);
         let (entries, _result) = ldap
             .with_search_options(
                 SearchOptions::new()
@@ -979,9 +978,9 @@ impl LdapAuth {
     }
 }
 
-fn group_membership_filter(user_dn: &str, presented_username: &str) -> String {
+fn group_membership_filter(user_dn: &str, canonical_identity: &str) -> String {
     let escaped_user_dn = escape_filter_value(user_dn);
-    let escaped_username = escape_filter_value(presented_username);
+    let escaped_username = escape_filter_value(canonical_identity);
     format!(
         "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_username}))"
     )
@@ -1552,7 +1551,10 @@ impl LdapAuth {
 
         if !self.required_groups.is_empty() {
             match self
-                .check_group_membership(&authenticated_user.dn, presented_username)
+                .check_group_membership(
+                    &authenticated_user.dn,
+                    &authenticated_user.canonical_identity,
+                )
                 .await
             {
                 Ok(true) => {}
@@ -1681,7 +1683,7 @@ mod tests {
     }
 
     #[test]
-    fn group_username_placeholder_keeps_the_presented_login_value() {
+    fn group_username_placeholder_uses_the_authenticated_canonical_identity() {
         let plugin = must(
             LdapAuth::new(
                 &serde_json::json!({
@@ -1703,9 +1705,9 @@ mod tests {
         assert_eq!(
             plugin.group_search_filter(
                 "entryUUID=immutable-id,ou=users,dc=example,dc=com",
-                "alice@example.com",
+                "immutable-id",
             ),
-            "(memberUid=alice@example.com)"
+            "(memberUid=immutable-id)"
         );
     }
 
