@@ -19,7 +19,7 @@ use ferrum_edge::{
     },
     config::{
         db_loader::{DatabaseStore, DbPoolConfig},
-        types::{Proxy, Upstream},
+        types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream},
     },
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -347,6 +347,329 @@ fn minimal_json_spec(proxy_id: &str) -> Value {
             "listen_path": format!("/{proxy_id}")
         }
     })
+}
+
+fn json_spec_with_plugin(
+    proxy_id: &str,
+    backend_host: &str,
+    plugin_id: &str,
+    plugin_name: &str,
+    plugin_config: Value,
+) -> Value {
+    json!({
+        "openapi": "3.1.0",
+        "info": {"title": "HMAC replacement candidate", "version": "2.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": backend_host,
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [{
+            "id": plugin_id,
+            "plugin_name": plugin_name,
+            "config": plugin_config
+        }]
+    })
+}
+
+fn hmac_plugin_config() -> Value {
+    json!({"clock_skew_seconds": 300})
+}
+
+fn request_body_transformer_config() -> Value {
+    json!({
+        "rules": [{
+            "operation": "add",
+            "target": "body",
+            "key": "gateway",
+            "value": "ferrum"
+        }]
+    })
+}
+
+fn manual_proxy_plugin(
+    plugin_id: &str,
+    proxy_id: &str,
+    plugin_name: &str,
+    config: Value,
+) -> PluginConfig {
+    PluginConfig {
+        id: plugin_id.to_string(),
+        namespace: "ferrum".to_string(),
+        plugin_name: plugin_name.to_string(),
+        config,
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+async fn convert_spec_owned_plugin_to_global(
+    store: &DatabaseStore,
+    proxy_id: &str,
+    plugin_id: &str,
+) {
+    let mut proxy = store
+        .get_proxy("ferrum", proxy_id)
+        .await
+        .expect("get spec proxy")
+        .expect("spec proxy must exist");
+    proxy
+        .plugins
+        .retain(|association| association.plugin_config_id != plugin_id);
+    assert!(
+        store.update_proxy(&proxy).await.expect("remove association"),
+        "spec proxy must exist while removing the global association"
+    );
+
+    let mut plugin = store
+        .get_plugin_config("ferrum", plugin_id)
+        .await
+        .expect("get spec-owned plugin")
+        .expect("spec-owned plugin must exist");
+    assert!(
+        plugin.api_spec_id.is_some(),
+        "seed plugin must retain spec ownership"
+    );
+    plugin.scope = PluginScope::Global;
+    plugin.proxy_id = None;
+    assert!(
+        store
+            .update_plugin_config(&plugin)
+            .await
+            .expect("promote spec-owned plugin to global"),
+        "spec-owned plugin must exist while promoting it to global"
+    );
+}
+
+async fn attach_manual_proxy_plugin(
+    store: &DatabaseStore,
+    proxy_id: &str,
+    plugin: &PluginConfig,
+) {
+    store
+        .create_plugin_config(plugin)
+        .await
+        .expect("create manual plugin");
+    let mut proxy = store
+        .get_proxy("ferrum", proxy_id)
+        .await
+        .expect("get proxy for manual association")
+        .expect("proxy must exist for manual association");
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: plugin.id.clone(),
+    });
+    assert!(
+        store
+            .update_proxy(&proxy)
+            .await
+            .expect("attach manual plugin"),
+        "proxy must exist while attaching manual plugin"
+    );
+}
+
+async fn assert_put_replaces_removed_spec_owned_global(
+    old_plugin_name: &str,
+    old_plugin_config: Value,
+    incoming_plugin_name: &str,
+    incoming_plugin_config: Value,
+) {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("replace-global-proxy");
+    let old_plugin_id = uid("old-spec-global");
+    let incoming_plugin_id = uid("incoming-spec-plugin");
+    let initial_spec = json_spec_with_plugin(
+        &proxy_id,
+        "old-backend.internal",
+        &old_plugin_id,
+        old_plugin_name,
+        old_plugin_config,
+    );
+    let (post_status, post_body) = client.post_json("/api-specs", &initial_spec).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "initial API spec failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+    convert_spec_owned_plugin_to_global(&store, &proxy_id, &old_plugin_id).await;
+
+    let replacement_spec = json_spec_with_plugin(
+        &proxy_id,
+        "replacement-backend.internal",
+        &incoming_plugin_id,
+        incoming_plugin_name,
+        incoming_plugin_config,
+    );
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &replacement_spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::OK,
+        "removed spec-owned global polluted replacement validation: {put_body}"
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &old_plugin_id)
+            .await
+            .expect("read removed spec-owned global")
+            .is_none(),
+        "removed spec-owned global must be deleted by replacement"
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &incoming_plugin_id)
+            .await
+            .expect("read incoming spec plugin")
+            .is_some(),
+        "incoming spec plugin must be persisted"
+    );
+    let runtime_config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("successful replacement must remain runtime-loadable");
+    assert!(
+        runtime_config
+            .plugin_configs
+            .iter()
+            .all(|plugin| plugin.id != old_plugin_id),
+        "removed spec-owned global leaked into runtime config"
+    );
+    assert!(
+        runtime_config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.id == incoming_plugin_id),
+        "incoming spec plugin missing from runtime config"
+    );
+}
+
+async fn assert_put_rejects_preserved_manual_association(
+    manual_plugin_name: &str,
+    manual_plugin_config: Value,
+    incoming_plugin_name: &str,
+    incoming_plugin_config: Value,
+) {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("preserved-manual-proxy");
+    let manual_plugin_id = uid("manual-plugin");
+    let incoming_plugin_id = uid("incoming-spec-plugin");
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "initial API spec failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+    let manual_plugin = manual_proxy_plugin(
+        &manual_plugin_id,
+        &proxy_id,
+        manual_plugin_name,
+        manual_plugin_config,
+    );
+    attach_manual_proxy_plugin(&store, &proxy_id, &manual_plugin).await;
+
+    let spec_before = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read API spec before rejected PUT")
+        .expect("API spec must exist before rejected PUT");
+    let proxy_before = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("read proxy before rejected PUT")
+        .expect("proxy must exist before rejected PUT");
+    let replacement_spec = json_spec_with_plugin(
+        &proxy_id,
+        "replacement-backend.internal",
+        &incoming_plugin_id,
+        incoming_plugin_name,
+        incoming_plugin_config,
+    );
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &replacement_spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "PUT reported success despite an invalid preserved manual association: {put_body}"
+    );
+    assert!(
+        put_body
+            .to_string()
+            .contains("hmac_auth cannot be combined with request-body transformer"),
+        "missing HMAC composition rejection: {put_body}"
+    );
+
+    let spec_after = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read API spec after rejected PUT")
+        .expect("API spec must survive rejected PUT");
+    assert_eq!(spec_after.content_hash, spec_before.content_hash);
+    assert_eq!(spec_after.resource_hash, spec_before.resource_hash);
+    assert_eq!(spec_after.updated_at, spec_before.updated_at);
+    let proxy_after = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("read proxy after rejected PUT")
+        .expect("proxy must survive rejected PUT");
+    assert_eq!(proxy_after.backend_host, proxy_before.backend_host);
+    assert_eq!(proxy_after.updated_at, proxy_before.updated_at);
+    let associations_after: Vec<&str> = proxy_after
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    assert!(
+        associations_after.contains(&manual_plugin_id.as_str()),
+        "rejected PUT removed the preserved manual association: {associations_after:?}"
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &incoming_plugin_id)
+            .await
+            .expect("read rejected incoming plugin")
+            .is_none(),
+        "rejected incoming spec plugin must not be persisted"
+    );
+    let runtime_config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("rejected replacement must leave the prior runtime config loadable");
+    assert!(
+        runtime_config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.id == proxy_id)
+            .is_some_and(|proxy| {
+                proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == manual_plugin_id)
+            }),
+        "prior runtime config lost the preserved manual association"
+    );
 }
 
 /// Minimal valid YAML spec string.
@@ -1199,6 +1522,50 @@ async fn post_rejects_hmac_request_body_transformer_composition() {
             .contains("hmac_auth cannot be combined with request-body transformer"),
         "unexpected composition failure: {composition_failure}"
     );
+}
+
+#[tokio::test]
+async fn put_excludes_removed_spec_owned_global_hmac_before_adding_body_transformer() {
+    assert_put_replaces_removed_spec_owned_global(
+        "hmac_auth",
+        hmac_plugin_config(),
+        "request_transformer",
+        request_body_transformer_config(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn put_excludes_removed_spec_owned_global_body_transformer_before_adding_hmac() {
+    assert_put_replaces_removed_spec_owned_global(
+        "request_transformer",
+        request_body_transformer_config(),
+        "hmac_auth",
+        hmac_plugin_config(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn put_rejects_body_transformer_beside_preserved_manual_hmac_association() {
+    assert_put_rejects_preserved_manual_association(
+        "hmac_auth",
+        hmac_plugin_config(),
+        "request_transformer",
+        request_body_transformer_config(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn put_rejects_hmac_beside_preserved_manual_body_transformer_association() {
+    assert_put_rejects_preserved_manual_association(
+        "request_transformer",
+        request_body_transformer_config(),
+        "hmac_auth",
+        hmac_plugin_config(),
+    )
+    .await;
 }
 
 // ============================================================================

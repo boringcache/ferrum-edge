@@ -195,6 +195,93 @@ pub(crate) async fn validate_hmac_request_transform_candidates(
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))
 }
 
+/// Validate the exact post-PUT API-spec replacement candidate.
+///
+/// The persistence contract deletes plugin configs owned by the replaced spec,
+/// removes associations declared only by the previous spec, preserves manual
+/// associations, and then overlays the incoming proxy and plugins. Build that
+/// same graph here so admission neither rejects a valid replacement because of
+/// removed globals nor admits an invalid chain by dropping retained manual
+/// associations.
+pub(crate) async fn validate_hmac_request_transform_api_spec_replacement_candidate(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    existing_spec: &crate::config::types::ApiSpec,
+    proxy: &Proxy,
+    plugins: &[PluginConfig],
+) -> Result<(), AfterValidateError> {
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let replaced_plugins = db
+        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let replaced_plugin_ids: HashSet<String> = replaced_plugins
+        .into_iter()
+        .map(|plugin| plugin.id)
+        .collect();
+
+    candidate
+        .plugin_configs
+        .retain(|plugin| !replaced_plugin_ids.contains(&plugin.id));
+    for candidate_proxy in &mut candidate.proxies {
+        candidate_proxy.plugins.retain(|association| {
+            !replaced_plugin_ids.contains(&association.plugin_config_id)
+        });
+    }
+
+    let previous_declared_assoc_ids =
+        crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec(
+            existing_spec,
+        );
+    let incoming_assoc_ids: HashSet<&str> = proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    let mut replacement_proxy = proxy.clone();
+    let mut preserved_associations = candidate
+        .proxies
+        .iter()
+        .find(|item| item.namespace == namespace && item.id == proxy.id)
+        .map(|item| item.plugins.clone())
+        .unwrap_or_default();
+    preserved_associations.retain(|association| {
+        !previous_declared_assoc_ids.contains(&association.plugin_config_id)
+            && !incoming_assoc_ids.contains(association.plugin_config_id.as_str())
+    });
+    preserved_associations.extend(proxy.plugins.iter().cloned());
+    replacement_proxy.plugins = preserved_associations;
+
+    if let Some(existing) = candidate
+        .proxies
+        .iter_mut()
+        .find(|item| item.namespace == namespace && item.id == proxy.id)
+    {
+        *existing = replacement_proxy;
+    } else {
+        candidate.proxies.push(replacement_proxy);
+    }
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
+        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+}
+
 /// Validate a wholesale namespace replacement without retaining resources that
 /// the restore will delete. Runtime plugin chains are namespace-scoped, so the
 /// normalized replacement is the complete authoritative candidate.

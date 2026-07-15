@@ -2869,43 +2869,6 @@ mod inner {
         }
     }
 
-    fn declared_proxy_plugin_association_ids_from_spec(
-        spec: &ApiSpec,
-    ) -> Result<HashSet<String>, anyhow::Error> {
-        if spec.content_encoding != "gzip" {
-            warn!(
-                "api_spec '{}' uses unsupported content_encoding '{}'",
-                spec.id, spec.content_encoding
-            );
-            return Ok(HashSet::new());
-        }
-        let cap = usize::try_from(spec.uncompressed_size).unwrap_or(usize::MAX);
-        let body = match crate::admin::spec_codec::decompress_gzip_capped(&spec.spec_content, cap) {
-            Ok(body) => body,
-            Err(e) => {
-                warn!(
-                    "failed to decompress stored api_spec '{}' proxy plugin associations: {}",
-                    spec.id, e
-                );
-                return Ok(HashSet::new());
-            }
-        };
-        let ids = match crate::admin::api_specs::extract_declared_proxy_plugin_association_ids(
-            &body,
-            Some(spec.spec_format),
-        ) {
-            Ok(ids) => ids,
-            Err(e) => {
-                warn!(
-                    "failed to parse stored api_spec '{}' proxy plugin associations: {}",
-                    spec.id, e
-                );
-                return Ok(HashSet::new());
-            }
-        };
-        Ok(ids.into_iter().collect())
-    }
-
     fn store_canonical_resource_hash(
         bundle: &crate::admin::api_specs::ExtractedBundle,
     ) -> Result<String, anyhow::Error> {
@@ -7720,8 +7683,9 @@ mod inner {
                 .transpose()?;
             let previous_declared_assoc_ids = existing_spec
                 .as_ref()
-                .map(declared_proxy_plugin_association_ids_from_spec)
-                .transpose()?
+                .map(
+                    crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec,
+                )
                 .unwrap_or_default();
             let desired_resource_hash = store_canonical_resource_hash(bundle)?;
 

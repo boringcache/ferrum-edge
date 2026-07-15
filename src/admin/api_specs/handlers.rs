@@ -1169,6 +1169,8 @@ struct ValidatedBundle {
 /// Passed as a single value to [`validate_bundle`] so the function stays under
 /// the 7-argument clippy limit while keeping all PUT-specific fields together.
 struct PutContext<'a> {
+    /// Stored API spec whose owned resources are being replaced.
+    spec: &'a ApiSpec,
     /// ID of the proxy being replaced (excluded from uniqueness checks).
     proxy_id: &'a str,
     /// ID of the upstream currently owned by the spec (excluded from name checks).
@@ -1704,16 +1706,28 @@ async fn validate_bundle(
     }
 
     if failures.is_empty() {
-        match crate::admin::crud::validate_hmac_request_transform_candidates(
-            db,
-            state,
-            namespace,
-            std::slice::from_ref(&bundle.proxy),
-            &bundle.plugins,
-            None,
-        )
-        .await
-        {
+        let validation_result = if let Some(put_ctx) = put_ctx.as_ref() {
+            crate::admin::crud::validate_hmac_request_transform_api_spec_replacement_candidate(
+                db,
+                state,
+                namespace,
+                put_ctx.spec,
+                &bundle.proxy,
+                &bundle.plugins,
+            )
+            .await
+        } else {
+            crate::admin::crud::validate_hmac_request_transform_candidates(
+                db,
+                state,
+                namespace,
+                std::slice::from_ref(&bundle.proxy),
+                &bundle.plugins,
+                None,
+            )
+            .await
+        };
+        match validation_result {
             Ok(()) => {}
             Err(crate::admin::crud::AfterValidateError::BadRequest(errors)) => {
                 failures.push(ValidationFailure {
@@ -2468,6 +2482,7 @@ pub async fn handle_put_api_spec(
         db.as_ref(),
         state,
         Some(PutContext {
+            spec: &existing_spec,
             proxy_id: &existing_spec.proxy_id,
             upstream_id: existing_upstream_id,
             proxy: existing_proxy_row.as_ref(),
