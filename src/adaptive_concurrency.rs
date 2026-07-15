@@ -6,8 +6,8 @@
 //! shared, and compatible cache generations reuse that state across reloads.
 
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
@@ -21,9 +21,167 @@ use crate::plugins::{BackendAdmissionOutcome, BackendAdmissionPermit};
 const EWMA_PREVIOUS_WEIGHT: u64 = 8;
 const EWMA_SAMPLE_WEIGHT: u64 = 2;
 const EWMA_WEIGHT_SUM: u64 = EWMA_PREVIOUS_WEIGHT + EWMA_SAMPLE_WEIGHT;
-const POLICY_ACTIVE: u8 = 0;
-const POLICY_DRAINING: u8 = 1;
-const POLICY_RESETTING: u8 = 2;
+const POLICY_STATE_BITS: u32 = 2;
+const POLICY_STATE_MASK: u64 = (1_u64 << POLICY_STATE_BITS) - 1;
+const POLICY_ACTIVE: u64 = 0;
+const POLICY_DRAINING: u64 = 1;
+const POLICY_RESETTING: u64 = 2;
+const MAX_POLICY_TRANSITION_EPOCH: u64 = u64::MAX >> POLICY_STATE_BITS;
+
+#[derive(Clone, Copy)]
+pub(crate) struct AdaptiveConcurrencyResetEpoch {
+    resetting_word: u64,
+    can_reactivate: bool,
+}
+
+/// Epoch-tagged structural lifecycle.
+///
+/// The state and its reset epoch share one atomic word so a drain completer can
+/// reactivate only the exact epoch it claimed. A structural writer may claim
+/// `ACTIVE` or `DRAINING`, but never overwrite a `RESETTING` owner; this keeps a
+/// stale map clear from crossing a newer writer's clear/commit boundary.
+pub(crate) struct AdaptiveConcurrencyPolicyTransition {
+    word: AtomicU64,
+}
+
+impl AdaptiveConcurrencyPolicyTransition {
+    pub(crate) fn new() -> Self {
+        Self {
+            word: AtomicU64::new(policy_transition_word(0, POLICY_ACTIVE)),
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        policy_transition_state(self.word.load(Ordering::Acquire)) == POLICY_ACTIVE
+    }
+
+    pub(crate) fn load(&self) -> u64 {
+        self.word.load(Ordering::Acquire)
+    }
+
+    /// Claim a new structural reset epoch. Reset ownership is exclusive: a
+    /// newer writer waits for an existing resetter to finish instead of
+    /// replacing an indistinguishable `RESETTING` value.
+    pub(crate) fn begin_structural_reset(&self) -> AdaptiveConcurrencyResetEpoch {
+        let mut spins = 0_u8;
+        loop {
+            if let Some(reset) = self.try_begin_structural_reset() {
+                return reset;
+            }
+            wait_for_policy_transition(&mut spins);
+        }
+    }
+
+    /// Attempt one exact writer claim; the blocking production path retries
+    /// when another reset owner or lifecycle transition wins.
+    pub(crate) fn try_begin_structural_reset(&self) -> Option<AdaptiveConcurrencyResetEpoch> {
+        let observed = self.word.load(Ordering::Acquire);
+        if policy_transition_state(observed) == POLICY_RESETTING {
+            return None;
+        }
+        let current_epoch = policy_transition_epoch(observed);
+        let (next_epoch, can_reactivate) = if current_epoch == MAX_POLICY_TRANSITION_EPOCH {
+            // More than 2^62 structural resets cannot occur in a process in
+            // practice. If the counter is nevertheless exhausted, claim the
+            // reset but leave the lifecycle fail-closed rather than permit an
+            // ABA reactivation with a reused epoch.
+            (current_epoch, false)
+        } else {
+            (current_epoch + 1, true)
+        };
+        let resetting_word = policy_transition_word(next_epoch, POLICY_RESETTING);
+        self.word
+            .compare_exchange(
+                observed,
+                resetting_word,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| AdaptiveConcurrencyResetEpoch {
+                resetting_word,
+                can_reactivate,
+            })
+    }
+
+    /// Upgrade the exact observed draining epoch to exclusive reset ownership.
+    /// If a newer writer won after the observation, this CAS fails without
+    /// disturbing that writer's epoch.
+    pub(crate) fn try_begin_drain_reset(
+        &self,
+        observed: u64,
+    ) -> Option<AdaptiveConcurrencyResetEpoch> {
+        if policy_transition_state(observed) != POLICY_DRAINING {
+            return None;
+        }
+        let resetting_word = policy_transition_word(
+            policy_transition_epoch(observed),
+            POLICY_RESETTING,
+        );
+        self.word
+            .compare_exchange(
+                observed,
+                resetting_word,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| AdaptiveConcurrencyResetEpoch {
+                resetting_word,
+                can_reactivate: true,
+            })
+    }
+
+    /// Release exclusive reset ownership to either active admission or a drain.
+    /// The exact epoch CAS is the publication edge for the completed map clear.
+    pub(crate) fn finish_reset(
+        &self,
+        reset: AdaptiveConcurrencyResetEpoch,
+        drain: bool,
+    ) -> bool {
+        if !reset.can_reactivate {
+            return false;
+        }
+        let next_state = if drain {
+            POLICY_DRAINING
+        } else {
+            POLICY_ACTIVE
+        };
+        let next = policy_transition_word(
+            policy_transition_epoch(reset.resetting_word),
+            next_state,
+        );
+        self.word
+            .compare_exchange(
+                reset.resetting_word,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+fn policy_transition_word(epoch: u64, state: u64) -> u64 {
+    (epoch << POLICY_STATE_BITS) | state
+}
+
+fn policy_transition_epoch(word: u64) -> u64 {
+    word >> POLICY_STATE_BITS
+}
+
+fn policy_transition_state(word: u64) -> u64 {
+    word & POLICY_STATE_MASK
+}
+
+fn wait_for_policy_transition(spins: &mut u8) {
+    if *spins < 64 {
+        std::hint::spin_loop();
+        *spins = spins.saturating_add(1);
+    } else {
+        std::thread::yield_now();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdaptiveConcurrencyKeyBy {
@@ -106,6 +264,10 @@ impl AdaptiveConcurrencyState {
 }
 
 struct AdaptiveConcurrencyPolicyLifecycle {
+    /// Serializes cold generation commits sharing this lifecycle. Request
+    /// admission never takes this lock; it only prevents overlapping config/LB
+    /// writers from dropping each other's feedback barrier or reset ownership.
+    commit_lock: Mutex<()>,
     /// Plugin-cache generation currently authorized to admit and train.
     active_generation: AtomicU64,
     /// Oldest compatible plugin-cache generation still authorized to admit.
@@ -141,10 +303,10 @@ struct AdaptiveConcurrencyPolicyLifecycle {
     /// Brief commit barrier preventing feedback from crossing the generation
     /// cutover while admission continues against generation-local bounds.
     feedback_blocked: AtomicBool,
-    /// Structural policy changes (scope or `key_by`) drain older permits and
-    /// exclusively reset the retired target-key space before admitting under
-    /// the replacement definition.
-    transition_state: AtomicU8,
+    /// Structural policy, route, or load-balancer changes drain older permits
+    /// and exclusively reset the retired target-key space before admitting
+    /// under the replacement definition.
+    transition: AdaptiveConcurrencyPolicyTransition,
 }
 
 struct AdaptiveConcurrencyPolicyConfig {
@@ -155,6 +317,7 @@ struct AdaptiveConcurrencyPolicyConfig {
 impl AdaptiveConcurrencyPolicyLifecycle {
     fn new() -> Self {
         Self {
+            commit_lock: Mutex::new(()),
             active_generation: AtomicU64::new(1),
             minimum_admission_generation: AtomicU64::new(1),
             active_lb_generation: AtomicU64::new(1),
@@ -167,7 +330,7 @@ impl AdaptiveConcurrencyPolicyLifecycle {
             total_in_flight: AtomicU64::new(0),
             feedback_in_progress: AtomicU64::new(0),
             feedback_blocked: AtomicBool::new(false),
-            transition_state: AtomicU8::new(POLICY_ACTIVE),
+            transition: AdaptiveConcurrencyPolicyTransition::new(),
         }
     }
 }
@@ -377,44 +540,31 @@ impl AdaptiveConcurrencyLimiter {
                 return Err(self.policy_transition_rejection(config));
             }
 
-            match self.policy.transition_state.load(Ordering::Acquire) {
+            let observed_transition = self.policy.transition.load();
+            match policy_transition_state(observed_transition) {
                 POLICY_ACTIVE => {}
                 POLICY_DRAINING => {
                     if self.policy.total_in_flight.load(Ordering::Acquire) != 0 {
                         return Err(self.policy_transition_rejection(config));
                     }
-                    if self
+                    let Some(reset) = self
                         .policy
-                        .transition_state
-                        .compare_exchange(
-                            POLICY_DRAINING,
-                            POLICY_RESETTING,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_err()
-                    {
+                        .transition
+                        .try_begin_drain_reset(observed_transition)
+                    else {
                         continue;
-                    }
+                    };
                     // No permit from either generation exists once the total
                     // reaches zero. Clear the retired key space before making
                     // the replacement policy visible to competing acquirers.
+                    // The reset epoch remains exclusively owned across the
+                    // clears, so a newer writer cannot publish over them.
                     self.inner.clear();
                     self.scope_cache.clear();
                     self.tracked_keys.store(0, Ordering::Release);
-                    if self
-                        .policy
-                        .transition_state
-                        .compare_exchange(
-                            POLICY_RESETTING,
-                            POLICY_ACTIVE,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_err()
-                    {
-                        // A newer structural generation requested another
-                        // drain while this reset was running.
+                    if !self.policy.transition.finish_reset(reset, false) {
+                        // Epoch exhaustion or an invariant violation stays
+                        // fail-closed; retrying can never reopen another epoch.
                         continue;
                     }
                 }
@@ -430,7 +580,7 @@ impl AdaptiveConcurrencyLimiter {
     }
 
     fn policy_generation_admitted(&self, generation: u64, lb_generation: u64) -> bool {
-        if self.policy.transition_state.load(Ordering::Acquire) != POLICY_ACTIVE {
+        if !self.policy.transition.is_active() {
             return false;
         }
         self.policy_generation_current(generation, lb_generation)
@@ -498,6 +648,14 @@ impl AdaptiveConcurrencyLimiter {
         config: Arc<AdaptiveConcurrencyConfig>,
         drain_older_generation: bool,
     ) {
+        // Poison only means an earlier cold writer panicked. The atomic
+        // lifecycle remains fail-closed, so recover the guard and inspect the
+        // published generations instead of making the request path take a lock.
+        let _commit_guard = self
+            .policy
+            .commit_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut current = self.policy.active_generation.load(Ordering::Acquire);
         if generation <= current {
             return;
@@ -518,18 +676,18 @@ impl AdaptiveConcurrencyLimiter {
             }
         }
 
-        if drain_older_generation {
+        let structural_reset = if drain_older_generation {
             // Exclusively block admission before retiring the older key-space
-            // generations. In particular, an older request view must not be
-            // allowed to observe DRAINING, perform the zero-permit reset, and
-            // reactivate itself before `active_generation` advances.
-            self.policy
-                .transition_state
-                .store(POLICY_RESETTING, Ordering::Release);
+            // generations. The epoch claim waits for an in-progress drain
+            // completer rather than stealing its RESETTING state.
+            let reset = self.policy.transition.begin_structural_reset();
             self.policy
                 .minimum_admission_generation
                 .fetch_max(generation, Ordering::AcqRel);
-        }
+            Some(reset)
+        } else {
+            None
+        };
 
         let replacement_config = Arc::new(AdaptiveConcurrencyPolicyConfig {
             generation,
@@ -561,34 +719,32 @@ impl AdaptiveConcurrencyLimiter {
                 Err(observed) => current = observed,
             }
         }
-        let _ = self.policy.pending_generation.compare_exchange(
-            generation,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.policy
-            .pending_requires_drain
-            .store(false, Ordering::Release);
+        if self
+            .policy
+            .pending_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.policy
+                .pending_requires_drain
+                .store(false, Ordering::Release);
+        }
 
         // Learned state and in-flight accounting survive compatible config
         // changes, but the replacement bounds become authoritative at commit.
         for entry in &self.inner {
             clamp_limit(&entry.value().limit, config.min_limit, config.max_limit);
         }
-        if drain_older_generation {
-            if self.policy.total_in_flight.load(Ordering::Acquire) == 0 {
+        if let Some(reset) = structural_reset {
+            let drain = self.policy.total_in_flight.load(Ordering::Acquire) != 0;
+            if !drain {
                 self.inner.clear();
                 self.scope_cache.clear();
                 self.tracked_keys.store(0, Ordering::Release);
-                self.policy
-                    .transition_state
-                    .store(POLICY_ACTIVE, Ordering::Release);
-            } else {
-                self.policy
-                    .transition_state
-                    .store(POLICY_DRAINING, Ordering::Release);
             }
+            // Release publishes the completed clear, or the generation/floor
+            // commit that requests must observe before completing the drain.
+            let _ = self.policy.transition.finish_reset(reset, drain);
         }
         self.policy.feedback_blocked.store(false, Ordering::Release);
     }
@@ -614,6 +770,11 @@ impl AdaptiveConcurrencyLimiter {
     /// before clearing the retired key space, so an old pinned request cannot
     /// recreate an endpoint after the drain completes.
     pub(crate) fn commit_lb_generation(&self, generation: u64, drain_older_generation: bool) {
+        let _commit_guard = self
+            .policy
+            .commit_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut current = self.policy.active_lb_generation.load(Ordering::Acquire);
         if generation <= current {
             return;
@@ -630,14 +791,15 @@ impl AdaptiveConcurrencyLimiter {
             }
         }
 
-        if drain_older_generation {
-            self.policy
-                .transition_state
-                .store(POLICY_RESETTING, Ordering::Release);
+        let structural_reset = if drain_older_generation {
+            let reset = self.policy.transition.begin_structural_reset();
             self.policy
                 .minimum_lb_admission_generation
                 .fetch_max(generation, Ordering::AcqRel);
-        }
+            Some(reset)
+        } else {
+            None
+        };
 
         loop {
             if generation <= current {
@@ -654,29 +816,25 @@ impl AdaptiveConcurrencyLimiter {
                 Err(observed) => current = observed,
             }
         }
-        let _ = self.policy.pending_lb_generation.compare_exchange(
-            generation,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.policy
-            .pending_lb_requires_drain
-            .store(false, Ordering::Release);
+        if self
+            .policy
+            .pending_lb_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.policy
+                .pending_lb_requires_drain
+                .store(false, Ordering::Release);
+        }
 
-        if drain_older_generation {
-            if self.policy.total_in_flight.load(Ordering::Acquire) == 0 {
+        if let Some(reset) = structural_reset {
+            let drain = self.policy.total_in_flight.load(Ordering::Acquire) != 0;
+            if !drain {
                 self.inner.clear();
                 self.scope_cache.clear();
                 self.tracked_keys.store(0, Ordering::Release);
-                self.policy
-                    .transition_state
-                    .store(POLICY_ACTIVE, Ordering::Release);
-            } else {
-                self.policy
-                    .transition_state
-                    .store(POLICY_DRAINING, Ordering::Release);
             }
+            let _ = self.policy.transition.finish_reset(reset, drain);
         }
         self.policy.feedback_blocked.store(false, Ordering::Release);
     }

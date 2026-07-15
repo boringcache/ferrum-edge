@@ -86,6 +86,64 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    // ── adaptive_concurrency lifecycle ──────────────────────────────────────
+    pub struct AdaptiveConcurrencyTransitionHarness {
+        transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition,
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct AdaptiveConcurrencyResetToken {
+        reset: crate::adaptive_concurrency::AdaptiveConcurrencyResetEpoch,
+    }
+
+    impl AdaptiveConcurrencyTransitionHarness {
+        pub fn new() -> Self {
+            Self {
+                transition:
+                    crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition::new(),
+            }
+        }
+
+        pub fn observe(&self) -> u64 {
+            self.transition.load()
+        }
+
+        pub fn begin_structural_reset(&self) -> AdaptiveConcurrencyResetToken {
+            AdaptiveConcurrencyResetToken {
+                reset: self.transition.begin_structural_reset(),
+            }
+        }
+
+        pub fn try_begin_structural_reset(&self) -> Option<AdaptiveConcurrencyResetToken> {
+            self.transition
+                .try_begin_structural_reset()
+                .map(|reset| AdaptiveConcurrencyResetToken { reset })
+        }
+
+        pub fn try_begin_observed_drain_reset(
+            &self,
+            observed: u64,
+        ) -> Option<AdaptiveConcurrencyResetToken> {
+            self.transition
+                .try_begin_drain_reset(observed)
+                .map(|reset| AdaptiveConcurrencyResetToken { reset })
+        }
+
+        pub fn finish_reset(&self, reset: AdaptiveConcurrencyResetToken, drain: bool) -> bool {
+            self.transition.finish_reset(reset.reset, drain)
+        }
+
+        pub fn is_active(&self) -> bool {
+            self.transition.is_active()
+        }
+    }
+
+    impl Default for AdaptiveConcurrencyTransitionHarness {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)

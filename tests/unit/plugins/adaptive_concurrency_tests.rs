@@ -1,8 +1,10 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::Duration;
 
 use ferrum_edge::PluginCache;
+use ferrum_edge::_test_support::AdaptiveConcurrencyTransitionHarness;
 use ferrum_edge::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
 };
@@ -145,6 +147,89 @@ fn assert_rejected(decision: BackendAdmissionDecision) {
         BackendAdmissionDecision::Reject { status_code, .. } => assert_eq!(status_code, 503),
         _ => panic!("request should be rejected"),
     }
+}
+
+#[test]
+fn adaptive_concurrency_newer_writer_wins_after_drain_observation() {
+    let transition = Arc::new(AdaptiveConcurrencyTransitionHarness::new());
+
+    let first_writer = transition.begin_structural_reset();
+    assert!(transition.finish_reset(first_writer, true));
+    let request_observation = transition.observe();
+
+    // Deterministically place the newer writer after the request's DRAINING
+    // observation and before that request can claim/reset/reactivate it.
+    let writer_transition = Arc::clone(&transition);
+    let (writer_claimed_tx, writer_claimed_rx) = mpsc::sync_channel(0);
+    let writer = thread::spawn(move || {
+        let newer_writer = writer_transition.begin_structural_reset();
+        writer_claimed_tx
+            .send(newer_writer)
+            .expect("request side should receive the claimed writer epoch");
+    });
+    let newer_writer = writer_claimed_rx
+        .recv()
+        .expect("newer writer should claim its reset epoch");
+    writer
+        .join()
+        .expect("newer structural writer should not panic");
+    assert!(
+        transition
+            .try_begin_observed_drain_reset(request_observation)
+            .is_none(),
+        "a stale drain observation must not claim a newer writer's reset epoch"
+    );
+    assert!(
+        !transition.is_active(),
+        "the newer structural writer must remain fail-closed until it commits"
+    );
+    assert!(transition.finish_reset(newer_writer, false));
+    assert!(transition.is_active());
+}
+
+#[test]
+fn adaptive_concurrency_drain_reset_owner_cannot_be_overwritten_by_newer_writer() {
+    let transition = Arc::new(AdaptiveConcurrencyTransitionHarness::new());
+    let first_writer = transition.begin_structural_reset();
+    assert!(transition.finish_reset(first_writer, true));
+
+    let observed = transition.observe();
+    let request_reset = transition
+        .try_begin_observed_drain_reset(observed)
+        .expect("the request should own the observed drain epoch");
+
+    // Force a newer writer to attempt its claim while the request owns the
+    // exact RESETTING epoch. Unlike the old unconditional store, it cannot
+    // replace that ownership with an indistinguishable state value.
+    let writer_transition = Arc::clone(&transition);
+    let writer = thread::spawn(move || writer_transition.try_begin_structural_reset().is_some());
+    assert!(
+        !writer
+            .join()
+            .expect("newer structural writer should not panic"),
+        "a newer writer must wait for the exact reset owner to publish"
+    );
+    assert!(!transition.is_active());
+    assert!(transition.finish_reset(request_reset, false));
+
+    let newer_writer = transition.begin_structural_reset();
+    assert!(!transition.is_active());
+    assert!(transition.finish_reset(newer_writer, false));
+    assert!(transition.is_active());
+}
+
+#[test]
+fn adaptive_concurrency_ordinary_drain_completion_reactivates_its_exact_epoch() {
+    let transition = AdaptiveConcurrencyTransitionHarness::new();
+    let writer = transition.begin_structural_reset();
+    assert!(transition.finish_reset(writer, true));
+
+    let observed = transition.observe();
+    let drain_reset = transition
+        .try_begin_observed_drain_reset(observed)
+        .expect("the unchanged draining epoch should be claimable");
+    assert!(transition.finish_reset(drain_reset, false));
+    assert!(transition.is_active());
 }
 
 #[test]
@@ -916,6 +1001,53 @@ fn adaptive_concurrency_structural_config_change_drains_old_key_space() {
     let new_generation = expect_admitted(acquire_from_cache(&cache, &reloaded));
     assert_rejected(acquire_from_plugin(&old_view, &config.proxies[0], None));
     drop(new_generation);
+}
+
+#[test]
+fn adaptive_concurrency_overlapping_structural_reloads_keep_newest_reset_authoritative() {
+    let config = cache_config(
+        "proxy",
+        json!({
+            "key_by": "proxy_target",
+            "max_tracked_keys": 1,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let oldest_view = adaptive_plugin_from_cache(&cache);
+    let retired_permit = expect_admitted(acquire_from_cache(&cache, &config));
+
+    let mut first_reload = config.clone();
+    first_reload.plugin_configs[0].config["key_by"] = json!("backend_target");
+    cache
+        .rebuild(&first_reload)
+        .expect("first structural generation should publish");
+    let middle_view = adaptive_plugin_from_cache(&cache);
+    assert_rejected(acquire_from_cache(&cache, &first_reload));
+
+    let mut newest_reload = first_reload.clone();
+    newest_reload.plugin_configs[0].config["key_by"] = json!("upstream_target");
+    cache
+        .rebuild(&newest_reload)
+        .expect("overlapping structural generation should publish");
+    assert_rejected(acquire_from_cache(&cache, &newest_reload));
+
+    drop(retired_permit);
+    let newest_permit = expect_admitted(acquire_from_cache(&cache, &newest_reload));
+    assert_rejected(acquire_from_plugin(
+        &oldest_view,
+        &config.proxies[0],
+        None,
+    ));
+    assert_rejected(acquire_from_plugin(
+        &middle_view,
+        &first_reload.proxies[0],
+        None,
+    ));
+    assert_rejected(acquire_from_cache(&cache, &newest_reload));
+    drop(newest_permit);
 }
 
 #[test]
