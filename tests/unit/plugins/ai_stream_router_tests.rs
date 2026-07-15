@@ -343,7 +343,7 @@ async fn test_non_streaming_request_continues() {
     let plugin = build(openai_and_anthropic_config());
     let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
     let mut ctx = post_ctx(&body);
-    let headers = json_headers();
+    let mut headers = json_headers();
     let res = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(res, PluginResult::Continue));
     // Not claimed → no route override, no coordination marker.
@@ -357,7 +357,7 @@ async fn test_non_post_continues() {
     let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
     let mut ctx = post_ctx(&body);
     ctx.method = "GET".to_string();
-    let headers = json_headers();
+    let mut headers = json_headers();
     let res = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(res, PluginResult::Continue));
     assert!(ctx.route_override_backend_host.is_none());
@@ -368,7 +368,7 @@ async fn test_streaming_missing_model_rejects_by_default() {
     let plugin = build(openai_and_anthropic_config());
     let body = json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]});
     let mut ctx = post_ctx(&body);
-    let headers = json_headers();
+    let mut headers = json_headers();
     let res = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_eq!(reject_status(&res), Some(400));
 }
@@ -1329,7 +1329,7 @@ async fn test_ai_federation_rejects_streaming_without_marker() {
     let body =
         json!({"model": "gpt-4o", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
     let mut ctx = post_ctx(&body);
-    let mut headers = json_headers();
+    let headers = json_headers();
     let res = run_federation_final_body(&fed, &mut ctx, &headers).await;
     assert_eq!(reject_status(&res), Some(501));
 }
@@ -1344,7 +1344,7 @@ async fn test_ai_federation_defers_to_claimed_stream_router_request() {
     let mut ctx = post_ctx(&body);
     ctx.metadata
         .insert("ai_stream_router_claimed".to_string(), "true".to_string());
-    let mut headers = json_headers();
+    let headers = json_headers();
     let res = run_federation_final_body(&fed, &mut ctx, &headers).await;
     assert!(
         matches!(res, PluginResult::Continue),
@@ -1361,7 +1361,7 @@ async fn test_ai_federation_defers_to_stream_router_pass_through() {
         "ai_stream_router_pass_through".to_string(),
         "true".to_string(),
     );
-    let mut headers = json_headers();
+    let headers = json_headers();
     let res = run_federation_final_body(&fed, &mut ctx, &headers).await;
     assert!(
         matches!(res, PluginResult::Continue),
