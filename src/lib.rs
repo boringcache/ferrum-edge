@@ -79,8 +79,8 @@ pub use router_cache::{RouteMatch, RouterCache};
 #[doc(hidden)]
 pub mod _test_support {
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use hyper::StatusCode;
 
@@ -123,11 +123,7 @@ pub mod _test_support {
         }
 
         pub fn decrease_from_observed_limit(&self, observed_limit: u64) {
-            crate::adaptive_concurrency::decrease_limit(
-                &self.limit,
-                &self.config,
-                observed_limit,
-            );
+            crate::adaptive_concurrency::decrease_limit(&self.limit, &self.config, observed_limit);
         }
     }
 

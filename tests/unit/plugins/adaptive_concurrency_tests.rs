@@ -1554,16 +1554,8 @@ fn adaptive_concurrency_mesh_direct_host_normalization_stays_compatible() {
         .expect("normalized-equivalent direct host reload should publish");
 
     let replacement = adaptive_plugin_from_cache(&cache);
-    let second = expect_admitted(acquire_from_plugin(
-        &replacement,
-        &effective_proxy,
-        None,
-    ));
-    assert_rejected(acquire_from_plugin(
-        &replacement,
-        &effective_proxy,
-        None,
-    ));
+    let second = expect_admitted(acquire_from_plugin(&replacement, &effective_proxy, None));
+    assert_rejected(acquire_from_plugin(&replacement, &effective_proxy, None));
     drop(second);
     drop(held);
 }
