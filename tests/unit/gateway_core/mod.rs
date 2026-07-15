@@ -36,6 +36,7 @@ mod runtime_metrics_tests;
 mod service_discovery_tests;
 mod sni_tests;
 mod socket_opts_tests;
+mod spiffe_identity_listener_wiring_tests;
 mod startup_tests;
 mod stream_health_check_tests;
 mod stream_listener_tests;

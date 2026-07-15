@@ -40,9 +40,9 @@ fn derive_peer_spiffe_extraction(der: &[u8]) -> PeerSpiffeExtraction {
     match crate::identity::spiffe::try_extract_spiffe_id(der) {
         Ok(Some(id)) => PeerSpiffeExtraction::Id(id),
         Ok(None) => PeerSpiffeExtraction::NoSpiffeId,
-        Err(
-            error @ (UriSanError::MultipleUriSans { .. } | UriSanError::InvalidSpiffeId { .. }),
-        ) => PeerSpiffeExtraction::Invalid(error.to_string()),
+        Err(error) if uri_san_error_requires_rejection(&error) => {
+            PeerSpiffeExtraction::Invalid(error.to_string())
+        }
         Err(error) => PeerSpiffeExtraction::Unparsed(error.to_string()),
     }
 }
@@ -106,22 +106,23 @@ impl SpiffeIdentity {
     }
 }
 
-fn reject_invalid_spiffe_cert(error: &UriSanError) -> Option<PluginResult> {
-    if !matches!(
+fn uri_san_error_requires_rejection(error: &UriSanError) -> bool {
+    matches!(
         error,
         UriSanError::MultipleUriSans { .. } | UriSanError::InvalidSpiffeId { .. }
-    ) {
-        return None;
-    }
+    )
+}
+
+fn invalid_svid_reject(error: impl std::fmt::Display) -> PluginResult {
     debug!(
         "spiffe_identity: rejecting peer cert with invalid SPIFFE URI SAN: {}",
         error
     );
-    Some(PluginResult::Reject {
+    PluginResult::Reject {
         status_code: 403,
         body: "invalid SPIFFE identity certificate".to_string(),
         headers: std::collections::HashMap::new(),
-    })
+    }
 }
 
 #[async_trait]
@@ -167,17 +168,7 @@ impl Plugin for SpiffeIdentity {
                 PluginResult::Continue
             }
             PeerSpiffeExtraction::NoSpiffeId => PluginResult::Continue,
-            PeerSpiffeExtraction::Invalid(error) => {
-                debug!(
-                    "spiffe_identity: rejecting peer cert with invalid SPIFFE URI SAN: {}",
-                    error
-                );
-                PluginResult::Reject {
-                    status_code: 403,
-                    body: "invalid SPIFFE identity certificate".to_string(),
-                    headers: std::collections::HashMap::new(),
-                }
-            }
+            PeerSpiffeExtraction::Invalid(error) => invalid_svid_reject(error),
             PeerSpiffeExtraction::Unparsed(error) => {
                 debug!(
                     "spiffe_identity: could not parse peer cert for SPIFFE ID: {}",
@@ -209,8 +200,8 @@ impl Plugin for SpiffeIdentity {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    if let Some(reject) = reject_invalid_spiffe_cert(&e) {
-                        return reject;
+                    if uri_san_error_requires_rejection(&e) {
+                        return invalid_svid_reject(&e);
                     }
                     debug!(
                         "spiffe_identity: could not parse stream peer cert for SPIFFE ID: {}",
