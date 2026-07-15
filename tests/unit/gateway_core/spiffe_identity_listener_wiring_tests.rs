@@ -24,9 +24,8 @@ fn h1_h2_tls_listener_shares_spiffe_cache_with_request_contexts() {
         "the H1/H2 TLS connection handler must construct a connection-local SPIFFE cache"
     );
     assert!(
-        connection_handler.contains(
-            "peer_spiffe_extraction_cache:peer_spiffe_extraction_cache.clone(),"
-        ),
+        connection_handler
+            .contains("peer_spiffe_extraction_cache:peer_spiffe_extraction_cache.clone(),"),
         "every H1/H2 request must receive the shared cache through RequestConnectionMetadata"
     );
 
@@ -58,9 +57,8 @@ fn h3_connection_shares_spiffe_cache_with_request_contexts() {
         "the H3 connection handler must construct a connection-local SPIFFE cache"
     );
     assert!(
-        connection_handler.contains(
-            "letpeer_spiffe_extraction_cache=peer_spiffe_extraction_cache.clone();"
-        ),
+        connection_handler
+            .contains("letpeer_spiffe_extraction_cache=peer_spiffe_extraction_cache.clone();"),
         "every H3 request task must clone the connection's shared SPIFFE cache"
     );
     let request_call = connection_handler
