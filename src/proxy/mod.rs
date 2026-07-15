@@ -13854,8 +13854,19 @@ fn attach_auth_rejection_set_cookie(
     else {
         return;
     };
+    let existing = headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("set-cookie")
+            .then(|| value.clone())
+    });
     headers.retain(|name, _| !name.eq_ignore_ascii_case("set-cookie"));
-    headers.insert("set-cookie".to_string(), cookie);
+    let mut merged = existing.unwrap_or_default();
+    if !merged.split('\n').any(|value| value == cookie.as_str()) {
+        if !merged.is_empty() {
+            merged.push('\n');
+        }
+        merged.push_str(&cookie);
+    }
+    headers.insert("set-cookie".to_string(), merged);
 }
 
 pub async fn run_authentication_phase(
