@@ -1938,7 +1938,7 @@ impl Plugin for AiSemanticFirewall {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.enabled {
+        if !self.enabled || !self.needs_governed_request_body() {
             return PluginResult::Continue;
         }
         if ctx.method != "POST" {

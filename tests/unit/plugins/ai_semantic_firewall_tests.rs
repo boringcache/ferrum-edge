@@ -919,7 +919,7 @@ async fn default_response_rules_stream_true_does_not_bypass_in_strict_mode() {
 }
 
 #[tokio::test]
-async fn dry_run_response_rules_stream_true_uses_skip_default() {
+async fn dry_run_response_rules_stream_true_is_no_op_without_governed_body_need() {
     let mut config = config_with_builtin("response_leakage");
     config["inspect"] = json!({"request": false, "response": true});
     config["mode"] = json!("dry_run");
@@ -936,15 +936,14 @@ async fn dry_run_response_rules_stream_true_uses_skip_default() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
 
     assert_continue(result);
-    assert_eq!(
-        ctx.metadata.get("ai_request_streaming").map(String::as_str),
-        Some("true")
+    assert!(
+        !ctx.metadata.contains_key("ai_request_streaming"),
+        "dry-run response-only implicit-skip firewall must not mark shared streaming state when it does not govern the request body"
     );
-    assert_eq!(
-        ctx.metadata
-            .get("ai_semantic_firewall.response_inspection_skipped")
-            .map(String::as_str),
-        Some("streaming")
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.response_inspection_skipped"),
+        "dry-run response-only implicit-skip firewall must not emit streaming skip metadata from another plugin's buffered request body"
     );
 }
 
