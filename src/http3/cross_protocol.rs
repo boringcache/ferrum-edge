@@ -7174,7 +7174,9 @@ mod tests {
     fn h3_server_routes_streaming_safe_grpc_to_streaming_dispatch() {
         let src = include_str!("server.rs");
         assert!(
-            src.contains("if matches!(http_flavor, HttpFlavor::Grpc) && can_stream_request_body"),
+            src.contains(
+                "if backend_http_flavor == HttpFlavor::Grpc && can_stream_request_body"
+            ),
             "H3 server must gate the streaming gRPC bridge on flavor + can_stream_request_body"
         );
         assert!(

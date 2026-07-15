@@ -58,6 +58,10 @@ pub struct ProxyBody {
     _backend_admission_permits: Option<crate::plugins::BackendAdmissionPermitSet>,
     backend_admission_outcome: Option<DeferredBackendAdmissionOutcome>,
     backend_dispatch_outcome: Option<DeferredBackendDispatchOutcome>,
+    /// Set by absolute client-RPC deadline wrappers when they synthesize the
+    /// terminal deadline frame (or abort after partial DATA). Deferred backend
+    /// accounting uses this signal to keep a client-chosen expiry neutral.
+    client_grpc_deadline_fired: Option<Arc<AtomicBool>>,
     /// Deferred logger that fires after body completion, allowing
     /// `TransactionSummary.body_completed` / `body_error_class` /
     /// `client_disconnected` / `bytes_streamed` to reflect the
@@ -359,6 +363,7 @@ impl ProxyBody {
             _backend_admission_permits: None,
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
+            client_grpc_deadline_fired: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
@@ -382,6 +387,7 @@ impl ProxyBody {
             _backend_admission_permits: None,
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
+            client_grpc_deadline_fired: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
@@ -564,6 +570,55 @@ impl ProxyBody {
         self
     }
 
+    /// Apply one absolute client gRPC deadline to an already-built streaming
+    /// body. Before any response DATA this emits the protocol-appropriate
+    /// terminal status: native gRPC uses HTTP trailers, while gRPC-Web uses an
+    /// encoded trailer frame in DATA. After partial DATA it aborts safely,
+    /// because a complete gRPC message boundary cannot be proven.
+    pub(crate) fn with_client_grpc_deadline(
+        mut self,
+        deadline: tokio::time::Instant,
+        grpc_web_response_content_type: Option<&str>,
+    ) -> Self {
+        let deadline_frame = grpc_web_response_content_type.map(|content_type| {
+            let response = crate::plugins::grpc_web::error_response_for_content_type(
+                content_type,
+                crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                "Deadline exceeded at gateway",
+            );
+            Frame::data(Bytes::from(response.body))
+        });
+        let fired = Arc::new(AtomicBool::new(false));
+        let placeholder = ProxyBodyKind::Full(Full::default());
+        let previous = std::mem::replace(&mut self.kind, placeholder);
+        self.kind = match previous {
+            ProxyBodyKind::Stream(body) => ProxyBodyKind::Stream(Box::pin(
+                TotalDeadlineBody::with_deadline_frame(
+                    body,
+                    Some(deadline),
+                    deadline_frame,
+                    Arc::clone(&fired),
+                ),
+            )),
+            ProxyBodyKind::Tracked(body) => ProxyBodyKind::Stream(Box::pin(
+                TotalDeadlineBody::with_deadline_frame(
+                    body,
+                    Some(deadline),
+                    deadline_frame,
+                    Arc::clone(&fired),
+                ),
+            )),
+            full @ ProxyBodyKind::Full(_) => full,
+        };
+        self.client_grpc_deadline_fired = Some(fired);
+        self
+    }
+
+    fn with_client_grpc_deadline_fired_flag(mut self, fired: Arc<AtomicBool>) -> Self {
+        self.client_grpc_deadline_fired = Some(fired);
+        self
+    }
+
     /// Attach the gRPC streaming request-body-overflow flag to an already-set
     /// deferred backend-admission outcome. When the flag has tripped by the time
     /// the body terminates, the recorded outcome is forced to `RequestBodyTooLarge`
@@ -625,6 +680,7 @@ impl ProxyBody {
             _backend_admission_permits: None,
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
+            client_grpc_deadline_fired: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
@@ -837,6 +893,10 @@ impl http_body::Body for ProxyBody {
             ProxyBodyKind::Stream(body) => body.as_mut().poll_frame(cx),
             ProxyBodyKind::Tracked(body) => Pin::new(body).poll_frame(cx),
         };
+        let client_deadline_fired = this
+            .client_grpc_deadline_fired
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
 
         // Fast path: when no deferred logger is attached, the byte counter
         // has no consumer — skip the atomic fetch_add entirely. The vast
@@ -894,13 +954,24 @@ impl http_body::Body for ProxyBody {
                                 .with_grpc_status(grpc_status),
                         );
                     }
-                    this.record_deferred_backend_admission(None, false);
-                    this.record_deferred_backend_dispatch(None, false);
+                    let terminal_class = client_deadline_fired
+                        .then_some(ErrorClass::ClientDisconnect);
+                    this.record_deferred_backend_admission(
+                        terminal_class,
+                        client_deadline_fired,
+                    );
+                    this.record_deferred_backend_dispatch(
+                        terminal_class,
+                        client_deadline_fired,
+                    );
                 }
             }
             Poll::Ready(Some(Err(e))) => {
-                let (class, disconnected) =
-                    crate::retry::classify_body_error(&**e as &dyn std::error::Error);
+                let (class, disconnected) = if client_deadline_fired {
+                    (ErrorClass::ClientDisconnect, true)
+                } else {
+                    crate::retry::classify_body_error(&**e as &dyn std::error::Error)
+                };
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
                     logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
@@ -917,8 +988,10 @@ impl http_body::Body for ProxyBody {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
                     logger.fire(crate::proxy::deferred_log::BodyOutcome::success(bytes));
                 }
-                this.record_deferred_backend_admission(None, false);
-                this.record_deferred_backend_dispatch(None, false);
+                let terminal_class =
+                    client_deadline_fired.then_some(ErrorClass::ClientDisconnect);
+                this.record_deferred_backend_admission(terminal_class, client_deadline_fired);
+                this.record_deferred_backend_dispatch(terminal_class, client_deadline_fired);
             }
             Poll::Pending => {}
         }
@@ -947,6 +1020,10 @@ impl Drop for ProxyBody {
     fn drop(&mut self) {
         let mut deferred_admission_error_class = None;
         let mut deferred_admission_client_disconnected = false;
+        let client_deadline_fired = self
+            .client_grpc_deadline_fired
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
         if let Some(logger) = self.logger.take() {
             let bytes = self.bytes_streamed.load(Ordering::Relaxed);
 
@@ -1026,6 +1103,10 @@ impl Drop for ProxyBody {
                 .success_on_drop_after_bytes
                 .is_none_or(|expected| self.bytes_streamed.load(Ordering::Relaxed) != expected)
         {
+            deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
+            deferred_admission_client_disconnected = true;
+        }
+        if client_deadline_fired {
             deferred_admission_error_class = Some(ErrorClass::ClientDisconnect);
             deferred_admission_client_disconnected = true;
         }
@@ -2448,18 +2529,40 @@ where
 struct TotalDeadlineBody<B> {
     inner: Option<B>,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    deadline_frame: Option<Frame<Bytes>>,
+    deadline_fired: Arc<AtomicBool>,
     saw_data: bool,
     done: bool,
 }
 
 impl<B> TotalDeadlineBody<B> {
     fn new(inner: B, deadline: Option<tokio::time::Instant>) -> Self {
+        Self::with_deadline_frame(
+            inner,
+            deadline,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn with_deadline_frame(
+        inner: B,
+        deadline: Option<tokio::time::Instant>,
+        deadline_frame: Option<Frame<Bytes>>,
+        deadline_fired: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             inner: Some(inner),
             deadline: deadline.map(tokio::time::sleep_until).map(Box::pin),
+            deadline_frame,
+            deadline_fired,
             saw_data: false,
             done: false,
         }
+    }
+
+    fn deadline_fired_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.deadline_fired)
     }
 }
 
@@ -2472,10 +2575,10 @@ where
     // Boxed error for the same reason as `IdleReadTimeoutBody`: this wrapper sits
     // OUTERMOST around the coalescer (whose `Error` is already `BoxError`). The
     // deadline is emitted as a boxed `io::Error` of kind `TimedOut`, which
-    // `retry::classify_typed_chain` maps to `ErrorClass::ReadWriteTimeout` (a
-    // post-wire read timeout, NOT a connection error), exactly like the
-    // per-frame idle path, so deferred backend/admission accounting classifies
-    // it identically.
+    // retains the transport-level timeout signal after partial DATA. The shared
+    // `deadline_fired` flag lets the outer `ProxyBody` override that generic
+    // classification to a health-neutral client expiry for deferred backend and
+    // admission accounting.
     type Error = BoxError;
 
     fn poll_frame(
@@ -2496,10 +2599,14 @@ where
         {
             this.done = true;
             this.deadline = None;
+            this.deadline_fired.store(true, Ordering::Release);
             // Cancel upstream work and release its stream/accounting guards as
             // soon as the deadline fires, before the downstream polls again.
             this.inner.take();
             if !this.saw_data {
+                if let Some(frame) = this.deadline_frame.take() {
+                    return Poll::Ready(Some(Ok(frame)));
+                }
                 let mut trailers = http::HeaderMap::new();
                 trailers.insert("grpc-status", http::HeaderValue::from_static("4"));
                 trailers.insert(
@@ -2901,7 +3008,9 @@ pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
     let stripped = StripHopByHopTrailers::new(body);
     let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
     if let Some(deadline) = total_deadline {
-        ProxyBody::streaming(Box::pin(TotalDeadlineBody::new(coalescing, Some(deadline))))
+        let timed = TotalDeadlineBody::new(coalescing, Some(deadline));
+        let fired = timed.deadline_fired_handle();
+        ProxyBody::streaming(Box::pin(timed)).with_client_grpc_deadline_fired_flag(fired)
     } else if read_timeout_ms > 0 {
         ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(
             coalescing,
@@ -2932,7 +3041,9 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
     let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
     let coalescing = Coalescing::new(limited, coalesce_target, content_length);
     if let Some(deadline) = total_deadline {
-        ProxyBody::streaming(Box::pin(TotalDeadlineBody::new(coalescing, Some(deadline))))
+        let timed = TotalDeadlineBody::new(coalescing, Some(deadline));
+        let fired = timed.deadline_fired_handle();
+        ProxyBody::streaming(Box::pin(timed)).with_client_grpc_deadline_fired_flag(fired)
     } else if read_timeout_ms > 0 {
         ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::new(
             coalescing,
@@ -2967,8 +3078,9 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     // `BoxError`, so no `map_err` is needed in those branches.
     if let Some(deadline) = total_deadline {
         let timed = TotalDeadlineBody::new(direct, Some(deadline));
+        let fired = timed.deadline_fired_handle();
         let stripped = StripHopByHopTrailers::new(timed);
-        ProxyBody::streaming(Box::pin(stripped))
+        ProxyBody::streaming(Box::pin(stripped)).with_client_grpc_deadline_fired_flag(fired)
     } else if read_timeout_ms > 0 {
         let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
         let stripped = StripHopByHopTrailers::new(timed);

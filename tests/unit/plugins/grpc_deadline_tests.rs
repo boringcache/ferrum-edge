@@ -9,6 +9,65 @@ use std::sync::Arc;
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
 #[test]
+fn h3_grpc_web_requests_load_grpc_policy_plugins() {
+    use ferrum_edge::_test_support::h3_plugin_protocol_for_request_for_test;
+    use ferrum_edge::config::types::HttpFlavor;
+    use ferrum_edge::plugins::ProxyProtocol;
+
+    assert_eq!(
+        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain, true),
+        ProxyProtocol::Grpc
+    );
+    assert_eq!(
+        h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain, false),
+        ProxyProtocol::Http
+    );
+}
+
+#[tokio::test]
+async fn streaming_grpc_web_deadline_emits_encoded_status_before_backend_data() {
+    use bytes::Bytes;
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, parse_grpc_frames, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_for_test,
+    };
+    use ferrum_edge::proxy::body::ProxyBodyError;
+    use futures_util::stream;
+    use http_body::{Body, Frame};
+    use http_body_util::{BodyExt, StreamBody};
+
+    let inner = StreamBody::new(stream::pending::<Result<Frame<Bytes>, ProxyBodyError>>());
+    let body = proxy_body_streaming_for_test(Box::pin(inner));
+    let deadline = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("one second before now is representable");
+    let mut body = proxy_body_with_client_grpc_deadline_for_test(
+        body,
+        deadline,
+        Some("application/grpc-web+proto"),
+    );
+
+    let frame = body
+        .frame()
+        .await
+        .expect("deadline must emit a terminal frame")
+        .expect("terminal deadline frame must be readable");
+    let data = frame
+        .data_ref()
+        .expect("gRPC-Web terminal status is encoded as DATA");
+    let frames = parse_grpc_frames(data);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
+    assert!(
+        frames[0]
+            .1
+            .windows(b"grpc-status: 4".len())
+            .any(|window| window == b"grpc-status: 4")
+    );
+    assert!(Body::is_end_stream(&body));
+}
+
+#[test]
 fn remaining_duration_rounds_up_to_the_next_wire_millisecond() {
     use ferrum_edge::_test_support::grpc_deadline_duration_millis_ceil_saturating_for_test;
     use std::time::Duration;

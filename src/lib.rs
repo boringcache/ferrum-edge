@@ -785,4 +785,19 @@ pub mod _test_support {
     ) -> crate::proxy::ProxyBody {
         crate::proxy::body::ProxyBody::streaming(body)
     }
+
+    pub fn proxy_body_with_client_grpc_deadline_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: tokio::time::Instant,
+        grpc_web_response_content_type: Option<&str>,
+    ) -> crate::proxy::ProxyBody {
+        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
+    }
+
+    pub fn h3_plugin_protocol_for_request_for_test(
+        flavor: crate::config::types::HttpFlavor,
+        grpc_web_request: bool,
+    ) -> crate::plugins::ProxyProtocol {
+        crate::http3::server::h3_plugin_protocol_for_request(flavor, grpc_web_request)
+    }
 }
