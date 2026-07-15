@@ -4,8 +4,8 @@ use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext, ResponseStreamAction,
-    ai_response_guard::AiResponseGuard, ai_semantic_firewall::AiSemanticFirewall, create_plugin,
-    create_plugin_with_http_client, priority,
+    ai_response_guard::AiResponseGuard, ai_semantic_firewall::AiSemanticFirewall,
+    compression::CompressionPlugin, create_plugin, create_plugin_with_http_client, priority,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -3643,6 +3643,40 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
 }
 
 #[tokio::test]
+async fn final_response_fails_closed_for_malformed_decoded_json_shape() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    let body = gzip_bytes(br#"{"choices":["#);
+    let mut ctx = create_test_context();
+
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+    );
+    assert_reject(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+        Some(502),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("malformed_json")
+    );
+}
+
+#[tokio::test]
 async fn partial_encoded_responses_skip_buffering_and_response_hooks() {
     let config = json!({
         "inspect": {"request": false, "response": true},
@@ -3692,6 +3726,52 @@ async fn partial_encoded_responses_skip_buffering_and_response_hooks() {
                 .contains_key("ai_semantic_firewall.uninspectable_body")
         );
         assert!(!ctx.metadata.contains_key("ai_semantic_firewall.rule_ids"));
+    }
+}
+
+#[tokio::test]
+async fn partial_unencoded_json_responses_remain_inspected() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let body =
+        br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#;
+
+    for (status, headers) in [
+        (
+            206,
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        ),
+        (
+            200,
+            HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("content-range".to_string(), "bytes 0-99/5000".to_string()),
+            ]),
+        ),
+    ] {
+        let mut ctx = create_test_context();
+        assert!(firewall.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            status,
+            &headers,
+        ));
+        assert_reject(
+            firewall
+                .on_response_body(&mut ctx, status, &headers, body)
+                .await,
+            Some(502),
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.rule_ids")
+                .map(String::as_str),
+            Some("response_leakage")
+        );
     }
 }
 
@@ -3762,8 +3842,8 @@ fn encoded_unflagged_event_stream_remains_streaming() {
     ));
 }
 
-#[test]
-fn default_stream_refinement_releases_only_unencoded_non_ai_text() {
+#[tokio::test]
+async fn default_stream_refinement_releases_only_unencoded_non_ai_text() {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
@@ -3796,17 +3876,42 @@ fn default_stream_refinement_releases_only_unencoded_non_ai_text() {
         ));
     }
 
-    // The compression plugin may have advertised a future gateway encoding
-    // while the body is still plaintext. That is not an origin encoding and
-    // must not pin ordinary text to the buffered path.
-    let mut planned_ctx = ctx.clone();
-    planned_ctx
+    // Public metadata cannot claim ownership of an origin encoding. Only the
+    // compression plugin's private marker can release the plaintext body.
+    let mut forged_ctx = ctx.clone();
+    forged_ctx
         .metadata
         .insert("compression:algorithm".to_string(), "gzip".to_string());
-    let planned_headers = HashMap::from([
+    let encoded_headers = HashMap::from([
         ("content-type".to_string(), "text/plain".to_string()),
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
+    assert!(firewall.should_buffer_response_body_for_content_type(
+        &forged_ctx,
+        Some("text/plain"),
+        200,
+        &encoded_headers,
+    ));
+
+    // The compression plugin may advertise a future gateway encoding while
+    // the body is still plaintext. That owned marker proves this is not an
+    // origin encoding and must not pin ordinary text to the firewall path.
+    let compression = CompressionPlugin::new(&json!({
+        "algorithms": ["gzip"],
+        "min_content_length": 0
+    }))
+    .unwrap();
+    let mut planned_ctx = ctx.clone();
+    planned_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut planned_headers =
+        HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    assert_continue(
+        compression
+            .after_proxy(&mut planned_ctx, 200, &mut planned_headers)
+            .await,
+    );
     assert!(!firewall.should_buffer_response_body_for_content_type(
         &planned_ctx,
         Some("text/plain"),
@@ -3832,13 +3937,17 @@ async fn planned_gateway_compression_inspects_plaintext_before_encoding() {
         "builtins": {"response_leakage": true}
     });
     let firewall = plugin(&config);
-    let headers = HashMap::from([
-        ("content-type".to_string(), "application/json".to_string()),
-        ("content-encoding".to_string(), "gzip".to_string()),
-    ]);
+    let compression = CompressionPlugin::new(&json!({
+        "algorithms": ["gzip"],
+        "min_content_length": 0
+    }))
+    .unwrap();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let mut ctx = create_test_context();
-    ctx.metadata
-        .insert("compression:algorithm".to_string(), "gzip".to_string());
+    ctx.headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    assert_continue(compression.after_proxy(&mut ctx, 200, &mut headers).await);
 
     assert_reject(
         firewall
@@ -3854,6 +3963,184 @@ async fn planned_gateway_compression_inspects_plaintext_before_encoding() {
     assert!(
         !ctx.metadata
             .contains_key("ai_semantic_firewall.uninspectable_body")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
+async fn gateway_compressed_oversized_non_candidate_skips_final_decode() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let compression = CompressionPlugin::new(&json!({
+        "algorithms": ["gzip"],
+        "min_content_length": 0
+    }))
+    .unwrap();
+    let plaintext = vec![b'x'; 10 * 1024 * 1024 + 1];
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-length".to_string(), plaintext.len().to_string()),
+    ]);
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+
+    assert_continue(compression.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert!(!firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/plain"),
+        200,
+        &headers,
+    ));
+    assert!(compression.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/plain"),
+        200,
+        &headers,
+    ));
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 200, &headers, &plaintext)
+            .await,
+    );
+
+    let encoded = compression
+        .transform_response_body_with_context(
+            &mut ctx,
+            &plaintext,
+            Some("text/plain"),
+            &headers,
+        )
+        .await
+        .expect("planned gateway compression should transform the body");
+    assert!(encoded.len() < plaintext.len());
+    assert_continue(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &encoded)
+            .await,
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.uninspectable_body")
+    );
+}
+
+#[tokio::test]
+async fn public_compression_metadata_cannot_claim_encoded_origin_response() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let compression = CompressionPlugin::new(&json!({
+        "algorithms": ["gzip"],
+        "min_content_length": 0
+    }))
+    .unwrap();
+    let origin_body = gzip_bytes(
+        br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
+    );
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    ctx.metadata
+        .insert("compression:algorithm".to_string(), "gzip".to_string());
+
+    // Existing Content-Encoding makes the compression plugin decline the
+    // response, so the public key above must not become an ownership marker.
+    assert_continue(compression.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert!(firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/plain"),
+        200,
+        &headers,
+    ));
+    assert!(
+        compression
+            .transform_response_body_with_context(
+                &mut ctx,
+                &origin_body,
+                Some("text/plain"),
+                &headers,
+            )
+            .await
+            .is_none()
+    );
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 200, &headers, &origin_body)
+            .await,
+    );
+    assert_reject(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &origin_body)
+            .await,
+        Some(502),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
+async fn stamped_origin_encoding_survives_live_header_removal() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let body = gzip_bytes(
+        br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
+    );
+    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    let mut ctx = create_test_context();
+    ctx.metadata.insert(
+        "ferrum:original_response_metadata_stamped".to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata.insert(
+        "ferrum:origin_encoded_response".to_string(),
+        "gzip".to_string(),
+    );
+
+    assert!(firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/plain"),
+        200,
+        &headers,
+    ));
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+    );
+    assert_reject(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+        Some(502),
     );
     assert_eq!(
         ctx.metadata

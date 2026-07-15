@@ -507,6 +507,12 @@ pub struct RequestContext {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Encoding selected by the built-in compression plugin for the response it
+    /// will create at the gateway. This is authoritative ownership state for
+    /// distinguishing planned gateway compression from an already-encoded
+    /// origin response; public plugin metadata is not trusted for that security
+    /// decision.
+    gateway_response_compression_algorithm: Option<&'static str>,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -801,6 +807,7 @@ impl RequestContext {
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
+            gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -855,6 +862,14 @@ impl RequestContext {
         self.response_stream_id
     }
 
+    pub(crate) fn mark_gateway_response_compression(&mut self, algorithm: &'static str) {
+        self.gateway_response_compression_algorithm = Some(algorithm);
+    }
+
+    pub(crate) fn gateway_response_compression_algorithm(&self) -> Option<&'static str> {
+        self.gateway_response_compression_algorithm
+    }
+
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
     /// transforms. Only `metadata` is copied back to the real context by the
@@ -900,6 +915,8 @@ impl RequestContext {
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
+            gateway_response_compression_algorithm: self
+                .gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,

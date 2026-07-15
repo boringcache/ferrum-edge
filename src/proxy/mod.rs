@@ -220,9 +220,10 @@ pub(crate) const ORIGINAL_RESPONSE_METADATA_STAMPED_KEY: &str =
 pub(crate) const ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY: &str =
     "ferrum:original_response_content_length";
 
-/// Marker that the original backend response carried a non-identity
-/// `Content-Encoding`. This distinguishes origin encoding from an encoding
-/// selected later by the gateway compression plugin.
+/// Exact non-identity `Content-Encoding` from the original backend response.
+/// This distinguishes origin encoding from an encoding selected later by the
+/// gateway compression plugin and preserves the decoder input if a response
+/// header transform subsequently removes or renames the live header.
 pub(crate) const ORIGIN_ENCODED_RESPONSE_METADATA_KEY: &str = "ferrum:origin_encoded_response";
 
 /// The ORIGINAL backend HTTP status, captured at the start of
@@ -307,13 +308,18 @@ pub(crate) fn stamp_original_response_metadata(
         );
     }
     ctx.metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
-    if response_headers
+    if let Some(encoding) = response_headers
         .get("content-encoding")
-        .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+        .filter(|encoding| {
+            encoding
+                .split(',')
+                .map(str::trim)
+                .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
+        })
     {
         ctx.metadata.insert(
             ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
-            "true".to_string(),
+            encoding.clone(),
         );
     }
     if response_status == 206 || response_headers.contains_key("content-range") {
