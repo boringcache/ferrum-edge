@@ -4398,14 +4398,8 @@ async fn aggregate_name_collision_tombstones_survive_partial_failure() {
 
     let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 118).await;
     assert_eq!(sorted_tool_names(&body), Vec::<String>::new());
-    let (_, body, _) = aggregate_request_with_metadata(
-        &plugin,
-        &session_id,
-        119,
-        "prompts/list",
-        json!({}),
-    )
-    .await;
+    let (_, body, _) =
+        aggregate_request_with_metadata(&plugin, &session_id, 119, "prompts/list", json!({})).await;
     assert_eq!(sorted_prompt_names(&body), Vec::<String>::new());
 
     // Both names were collision-suppressed and therefore absent from the old
@@ -4441,14 +4435,8 @@ async fn aggregate_name_collision_tombstones_survive_partial_failure() {
     // two now authoritatively reports empty lists, so server one's entries are
     // safe to publish and route again.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let (_, body, ctx) = aggregate_request_with_metadata(
-        &plugin,
-        &session_id,
-        123,
-        "prompts/list",
-        json!({}),
-    )
-    .await;
+    let (_, body, ctx) =
+        aggregate_request_with_metadata(&plugin, &session_id, 123, "prompts/list", json!({})).await;
     assert_eq!(sorted_prompt_names(&body), vec!["a.b.c"]);
     assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
     let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 124).await;
@@ -4545,28 +4533,18 @@ async fn aggregate_resource_collision_tombstone_requires_authoritative_refresh()
     let other_uri = "mcp://two/file%3A%2F%2F%2Fother";
     let shared_uri = "mcp://one/file%3A%2F%2F%2Fshared";
 
-    let (_, body, _) = aggregate_request_with_metadata(
-        &plugin,
-        &session_id,
-        125,
-        "resources/list",
-        json!({}),
-    )
-    .await;
+    let (_, body, _) =
+        aggregate_request_with_metadata(&plugin, &session_id, 125, "resources/list", json!({}))
+            .await;
     assert_eq!(sorted_resource_uris(&body), vec![other_uri]);
 
     // The colliding server fails while the other server succeeds. The old
     // resource tombstone must survive even though its entries are absent from
     // the published map.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let (_, body, ctx) = aggregate_request_with_metadata(
-        &plugin,
-        &session_id,
-        126,
-        "resources/list",
-        json!({}),
-    )
-    .await;
+    let (_, body, ctx) =
+        aggregate_request_with_metadata(&plugin, &session_id, 126, "resources/list", json!({}))
+            .await;
     assert_eq!(sorted_resource_uris(&body), vec![other_uri]);
     assert_eq!(
         ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
@@ -4577,14 +4555,9 @@ async fn aggregate_resource_collision_tombstone_requires_authoritative_refresh()
     // but the peer fails. That partial refresh is still not authoritative, so
     // it cannot clear the prior tombstone or make the shared URI routable.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let (_, body, ctx) = aggregate_request_with_metadata(
-        &plugin,
-        &session_id,
-        127,
-        "resources/list",
-        json!({}),
-    )
-    .await;
+    let (_, body, ctx) =
+        aggregate_request_with_metadata(&plugin, &session_id, 127, "resources/list", json!({}))
+            .await;
     assert_eq!(sorted_resource_uris(&body), vec![other_uri]);
     assert_eq!(
         ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
@@ -4603,14 +4576,9 @@ async fn aggregate_resource_collision_tombstone_requires_authoritative_refresh()
     // Both servers now list successfully, authoritatively proving that the
     // duplicate disappeared and allowing the formerly suppressed URI back.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let (_, body, ctx) = aggregate_request_with_metadata(
-        &plugin,
-        &session_id,
-        129,
-        "resources/list",
-        json!({}),
-    )
-    .await;
+    let (_, body, ctx) =
+        aggregate_request_with_metadata(&plugin, &session_id, 129, "resources/list", json!({}))
+            .await;
     assert_eq!(sorted_resource_uris(&body), vec![shared_uri, other_uri]);
     assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
     assert_eq!(one_resource_requests.load(Ordering::SeqCst), 4);
