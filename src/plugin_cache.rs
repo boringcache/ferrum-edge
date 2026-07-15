@@ -151,7 +151,8 @@ fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> R
         {
             return Err(format!(
                 "hmac_auth cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; HMAC authenticates the client-to-gateway representation and Ferrum will not forward stale signed digest metadata",
-                transformer.name(), protocol
+                transformer.name(),
+                protocol
             ));
         }
     }
@@ -731,10 +732,7 @@ pub(crate) fn validate_hmac_request_transform_candidate(
             }
             Ok(Some(plugin)) => {
                 scoped_plugins.insert(
-                    (
-                        plugin_config.namespace.as_str(),
-                        plugin_config.id.as_str(),
-                    ),
+                    (plugin_config.namespace.as_str(), plugin_config.id.as_str()),
                     (plugin_config, plugin),
                 );
             }
@@ -757,9 +755,7 @@ pub(crate) fn validate_hmac_request_transform_candidate(
                 continue;
             };
             let applies = match plugin_config.scope {
-                PluginScope::Proxy => {
-                    plugin_config.proxy_id.as_deref() == Some(proxy.id.as_str())
-                }
+                PluginScope::Proxy => plugin_config.proxy_id.as_deref() == Some(proxy.id.as_str()),
                 PluginScope::ProxyGroup => plugin_config.proxy_id.is_none(),
                 PluginScope::Global => false,
             };

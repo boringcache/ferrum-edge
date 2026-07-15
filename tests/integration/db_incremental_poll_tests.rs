@@ -323,7 +323,9 @@ async fn consumer_delete_requires_authoritative_reload_for_quarantine_rehydratio
     };
     assert!(is_incremental_full_reload_required(&error));
     assert!(
-        error.to_string().contains("rehydrate quarantined credentials"),
+        error
+            .to_string()
+            .contains("rehydrate quarantined credentials"),
         "consumer change escalation must explain the quarantine repair path: {error}"
     );
 }

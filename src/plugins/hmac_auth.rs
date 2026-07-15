@@ -482,8 +482,8 @@ impl HmacAuth {
             .decode(&credential.signature)
             .ok()
             .filter(|signature| signature.len() == expected_signature_len)?;
-        let consumer = consumer_index
-            .find_hmac_by_identity(&credential.namespace, &credential.username)?;
+        let consumer =
+            consumer_index.find_hmac_by_identity(&credential.namespace, &credential.username)?;
         let hmac_entries = consumer.credential_entries("hmac_auth");
         if hmac_entries.is_empty() {
             return None;
@@ -518,7 +518,10 @@ impl HmacAuth {
         };
         if !constant_time_eq(&cached.authorization_fingerprint, &current_fingerprint)
             || ctx.request_authority.as_deref() != Some(cached.authority.as_str())
-            || ctx.matched_proxy.as_ref().map(|proxy| proxy.namespace.as_str())
+            || ctx
+                .matched_proxy
+                .as_ref()
+                .map(|proxy| proxy.namespace.as_str())
                 != Some(cached.namespace.as_str())
             || ctx.method != cached.method
             || ctx.path != cached.path

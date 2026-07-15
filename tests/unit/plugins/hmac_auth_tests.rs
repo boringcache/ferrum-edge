@@ -571,9 +571,7 @@ async fn test_signature_and_identity_lookup_are_namespace_scoped() {
         "authorization".to_string(),
         hmac_auth_header("bob", Some("hmac-sha256"), &tenant_b_signature),
     );
-    valid_tenant_b
-        .headers
-        .insert("date".to_string(), date);
+    valid_tenant_b.headers.insert("date".to_string(), date);
     assert_continue(
         plugin
             .authenticate(&mut valid_tenant_b, &consumer_index)
