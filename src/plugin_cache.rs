@@ -840,8 +840,7 @@ fn push_upstream_route(
                 .iter()
                 .filter(|target| target_matches_subset(upstream, target, subset))
                 .filter(|target| {
-                    port_scope
-                        .is_none_or(|port| target.dispatch_policy_port() == port)
+                    port_scope.is_none_or(|port| target.dispatch_policy_port() == port)
                 })
                 .map(|target| AdaptiveConcurrencyRouteKey {
                     scope: scope.clone(),
@@ -868,8 +867,7 @@ fn adaptive_concurrency_resolved_port_override_keys(
         .port_overrides
         .iter()
         .filter_map(|(port, value)| {
-            crate::config::types::ResolvedPortOverride::from_upstream_override(value)
-                .map(|_| *port)
+            crate::config::types::ResolvedPortOverride::from_upstream_override(value).map(|_| *port)
         })
         .collect::<Vec<_>>();
     keys.sort_unstable();
@@ -1432,8 +1430,7 @@ fn adaptive_concurrency_effective_lb_keys(
                         target_matches_subset(upstream, target, route.subset.as_deref())
                     })
                     .filter(|target| {
-                        port_scope
-                            .is_none_or(|port| target.dispatch_policy_port() == port)
+                        port_scope.is_none_or(|port| target.dispatch_policy_port() == port)
                     })
                     .map(|target| AdaptiveConcurrencyRouteKey {
                         scope: route.scope.clone(),

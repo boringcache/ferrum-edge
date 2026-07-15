@@ -1747,8 +1747,8 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
     ));
 
     let mut normalized_equivalent = config.clone();
-    normalized_equivalent.plugin_configs[1].config["rules"][0]["destination"]["backend_tls"]
-        ["sni"] = json!("first.route.local");
+    normalized_equivalent.plugin_configs[1].config["rules"][0]["destination"]["backend_tls"]["sni"] =
+        json!("first.route.local");
     cache
         .apply_delta(
             &normalized_equivalent,
