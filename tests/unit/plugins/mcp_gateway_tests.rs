@@ -4447,6 +4447,8 @@ async fn aggregate_name_collision_tombstones_survive_partial_failure() {
 
 #[tokio::test]
 async fn aggregate_collision_tombstones_use_all_server_list_bound() {
+    let generation = Arc::new(AtomicUsize::new(0));
+
     let one = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/mcp"))
@@ -4462,13 +4464,12 @@ async fn aggregate_collision_tombstones_use_all_server_list_bound() {
         .await;
 
     let two = MockServer::start().await;
-    let two_requests = Arc::new(AtomicUsize::new(0));
-    let two_counter = Arc::clone(&two_requests);
+    let two_generation = Arc::clone(&generation);
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .and(body_partial_json(json!({"method": "tools/list"})))
         .respond_with(move |_: &wiremock::Request| {
-            if two_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            if two_generation.load(Ordering::SeqCst) == 0 {
                 ResponseTemplate::new(200).set_body_json(json!({
                     "jsonrpc": "2.0",
                     "id": "two-tools",
@@ -4498,13 +4499,12 @@ async fn aggregate_collision_tombstones_use_all_server_list_bound() {
         .await;
 
     let four = MockServer::start().await;
-    let four_requests = Arc::new(AtomicUsize::new(0));
-    let four_counter = Arc::clone(&four_requests);
+    let four_generation = Arc::clone(&generation);
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .and(body_partial_json(json!({"method": "tools/list"})))
         .respond_with(move |_: &wiremock::Request| {
-            if four_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            if four_generation.load(Ordering::SeqCst) == 0 {
                 ResponseTemplate::new(200).set_body_json(json!({
                     "jsonrpc": "2.0",
                     "id": "four-tools",
@@ -4572,7 +4572,10 @@ async fn aggregate_collision_tombstones_use_all_server_list_bound() {
 
     // The second member of each collision now fails. Both historical keys must
     // remain suppressed; capping at one and retaining the lexical first would
-    // incorrectly republish root.z.c from the healthy server.
+    // incorrectly republish root.z.c from the healthy server. Mock behavior is
+    // generation-controlled, so an extra TTL refresh between list and call
+    // assertions can only replay this same degraded state.
+    generation.store(1, Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 131).await;
     assert_eq!(sorted_tool_names(&body), Vec::<String>::new());
@@ -4591,24 +4594,23 @@ async fn aggregate_collision_tombstones_use_all_server_list_bound() {
         .await;
         assert_eq!(body["error"]["code"], -32003);
     }
-    assert_eq!(two_requests.load(Ordering::SeqCst), 2);
-    assert_eq!(four_requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
 async fn aggregate_collision_tombstone_overflow_fails_closed_until_authoritative_refresh() {
+    let generation = Arc::new(AtomicUsize::new(0));
+
     let one = MockServer::start().await;
-    let one_requests = Arc::new(AtomicUsize::new(0));
-    let one_counter = Arc::clone(&one_requests);
+    let one_generation = Arc::clone(&generation);
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .and(body_partial_json(json!({"method": "tools/list"})))
         .respond_with(move |_: &wiremock::Request| {
-            let refresh = one_counter.fetch_add(1, Ordering::SeqCst);
-            let name = if refresh < 4 {
-                format!("b.collision_{refresh}")
-            } else {
-                "safe".to_string()
+            let refresh_generation = one_generation.load(Ordering::SeqCst);
+            let name = match refresh_generation {
+                0..=3 => format!("b.collision_{refresh_generation}"),
+                4 => "b.collision_0".to_string(),
+                _ => "safe".to_string(),
             };
             ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0",
@@ -4622,16 +4624,15 @@ async fn aggregate_collision_tombstone_overflow_fails_closed_until_authoritative
         .await;
 
     let two = MockServer::start().await;
-    let two_requests = Arc::new(AtomicUsize::new(0));
-    let two_counter = Arc::clone(&two_requests);
+    let two_generation = Arc::clone(&generation);
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .and(body_partial_json(json!({"method": "tools/list"})))
         .respond_with(move |_: &wiremock::Request| {
-            let refresh = two_counter.fetch_add(1, Ordering::SeqCst);
-            let tools = if refresh < 4 {
+            let refresh_generation = two_generation.load(Ordering::SeqCst);
+            let tools = if refresh_generation < 4 {
                 json!([{
-                    "name": format!("collision_{refresh}"),
+                    "name": format!("collision_{refresh_generation}"),
                     "inputSchema": {"type": "object"}
                 }])
             } else {
@@ -4647,13 +4648,12 @@ async fn aggregate_collision_tombstone_overflow_fails_closed_until_authoritative
         .await;
 
     let guard = MockServer::start().await;
-    let guard_requests = Arc::new(AtomicUsize::new(0));
-    let guard_counter = Arc::clone(&guard_requests);
+    let guard_generation = Arc::clone(&generation);
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .and(body_partial_json(json!({"method": "tools/list"})))
         .respond_with(move |_: &wiremock::Request| {
-            if guard_counter.fetch_add(1, Ordering::SeqCst) < 4 {
+            if guard_generation.load(Ordering::SeqCst) <= 4 {
                 ResponseTemplate::new(500)
             } else {
                 ResponseTemplate::new(200).set_body_json(json!({
@@ -4707,9 +4707,12 @@ async fn aggregate_collision_tombstone_overflow_fails_closed_until_authoritative
 
     // Three attempted lists with a one-item per-list limit permit exactly
     // three retained collision keys. Repeated degraded refreshes reach that
-    // cap without selecting between current and historical collisions.
-    for request_id in 134..=136 {
-        if request_id != 134 {
+    // cap without selecting between current and historical collisions. Each
+    // mock response depends on the explicit generation rather than request
+    // count, so scheduler stalls cannot advance the scenario unexpectedly.
+    for (request_id, refresh_generation) in [(134, 0), (135, 1), (136, 2)] {
+        if refresh_generation != 0 {
+            generation.store(refresh_generation, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         }
         let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, request_id).await;
@@ -4734,6 +4737,7 @@ async fn aggregate_collision_tombstone_overflow_fails_closed_until_authoritative
     // The fourth distinct degraded collision exceeds the aggregate bound. No
     // lexical/current/history subset is retained: the entire tools family is
     // unavailable, so neither list nor route lookup can resurrect a winner.
+    generation.store(3, Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 139).await;
     assert_eq!(body["error"]["code"], -32006);
@@ -4748,16 +4752,35 @@ async fn aggregate_collision_tombstone_overflow_fails_closed_until_authoritative
     .await;
     assert_eq!(body["error"]["code"], -32006);
 
+    // On another degraded refresh, one upstream replays a previously
+    // suppressed name while the guard remains unavailable. The sticky
+    // overflow bit must keep both discovery and dispatch failed closed.
+    generation.store(4, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 141).await;
+    assert_eq!(body["error"]["code"], -32006);
+    assert_eq!(body["error"]["data"]["gateway"], "mcp_gateway");
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        142,
+        "tools/call",
+        json!({"name": "a.b.collision_0", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32006);
+
     // A fully authoritative refresh can discard the uncertain history and
     // publish only the current, non-colliding catalog.
+    generation.store(5, Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 141).await;
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 143).await;
     assert_eq!(sorted_tool_names(&body), vec!["a.safe"]);
     assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
 
     let (mut ctx, mut headers) = mcp_ctx(json!({
         "jsonrpc": "2.0",
-        "id": 142,
+        "id": 144,
         "method": "tools/call",
         "params": {"name": "a.safe", "arguments": {}}
     }));
@@ -4766,9 +4789,6 @@ async fn aggregate_collision_tombstone_overflow_fails_closed_until_authoritative
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
-    assert_eq!(one_requests.load(Ordering::SeqCst), 5);
-    assert_eq!(two_requests.load(Ordering::SeqCst), 5);
-    assert_eq!(guard_requests.load(Ordering::SeqCst), 5);
 }
 
 #[tokio::test]
