@@ -523,10 +523,21 @@ async fn basic_credential_mutations_emit_shape_independent_audit_markers() {
     });
     let (status, body) = post_json(&base, "/consumers", &admin, &consumer).await;
     assert_eq!(status, 201, "consumer create failed: {body:?}");
+    // Audit persistence is asynchronous. Observe each event before the next
+    // mutation so the test's two-connection SQLite pool does not race writers.
+    wait_for_audit_total(
+        &base,
+        "/audit?resource_type=consumer&resource_id=audit-basic-consumer",
+        &admin,
+        1,
+    )
+    .await;
 
     let old_hash = format!("hmac_sha256:{}", "a".repeat(64));
     let new_hash = format!("hmac_sha256:{}", "b".repeat(64));
     let client = reqwest::Client::new();
+    let credential_audit_path =
+        "/audit?resource_type=consumer_credentials&resource_id=audit-basic-consumer";
 
     let response = client
         .put(format!(
@@ -541,6 +552,7 @@ async fn basic_credential_mutations_emit_shape_independent_audit_markers() {
     let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
     assert_eq!(status, 200, "PUT Basic credentials failed: {body:?}");
     assert!(body["credentials"].get("basicauth").is_none());
+    wait_for_audit_total(&base, credential_audit_path, &admin, 1).await;
 
     let response = client
         .post(format!(
@@ -555,6 +567,7 @@ async fn basic_credential_mutations_emit_shape_independent_audit_markers() {
     let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
     assert_eq!(status, 200, "POST Basic credential failed: {body:?}");
     assert!(body["credentials"].get("basicauth").is_none());
+    wait_for_audit_total(&base, credential_audit_path, &admin, 2).await;
 
     let response = client
         .delete(format!(
@@ -568,6 +581,7 @@ async fn basic_credential_mutations_emit_shape_independent_audit_markers() {
     let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
     assert_eq!(status, 200, "DELETE Basic credential failed: {body:?}");
     assert!(body["credentials"].get("basicauth").is_none());
+    wait_for_audit_total(&base, credential_audit_path, &admin, 3).await;
 
     let response = client
         .delete(format!(
@@ -579,13 +593,7 @@ async fn basic_credential_mutations_emit_shape_independent_audit_markers() {
         .expect("DELETE all Basic credentials");
     assert_eq!(response.status().as_u16(), 204);
 
-    let audit_body = wait_for_audit_total(
-        &base,
-        "/audit?resource_type=consumer_credentials&resource_id=audit-basic-consumer",
-        &admin,
-        4,
-    )
-    .await;
+    let audit_body = wait_for_audit_total(&base, credential_audit_path, &admin, 4).await;
     let items = audit_body["items"].as_array().expect("audit items");
     let actions: std::collections::HashSet<&str> = items
         .iter()
