@@ -109,6 +109,15 @@ fn response_headers() -> HashMap<String, String> {
     HashMap::from([("content-type".to_string(), "application/json".to_string())])
 }
 
+fn gzip_bytes(body: &[u8]) -> Vec<u8> {
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).unwrap();
+    encoder.finish().unwrap()
+}
+
 async fn nonmatching_embedding_server() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3338,6 +3347,42 @@ async fn encoded_origin_response_fails_closed_without_provider_call() {
 }
 
 #[tokio::test]
+async fn final_response_decodes_mislabeled_gzip_json_before_scope_decision() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    let body = gzip_bytes(
+        br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
+    );
+    let mut ctx = create_test_context();
+
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+    );
+    assert_reject(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+        Some(502),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
 async fn planned_gateway_compression_inspects_plaintext_before_encoding() {
     let config = json!({
         "inspect": {"request": false, "response": true},
@@ -3448,13 +3493,14 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
     let mut encoded_html_ctx = create_test_context();
+    let encoded_html = gzip_bytes(b"<html><body>ordinary page</body></html>");
     assert_continue(
         firewall
             .on_response_body(
                 &mut encoded_html_ctx,
                 200,
                 &encoded_html_headers,
-                b"opaque origin bytes",
+                &encoded_html,
             )
             .await,
     );
@@ -3464,7 +3510,7 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
                 &mut encoded_html_ctx,
                 200,
                 &encoded_html_headers,
-                b"opaque origin bytes",
+                &encoded_html,
             )
             .await,
     );
