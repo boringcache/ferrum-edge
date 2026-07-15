@@ -266,7 +266,39 @@ fn parse_ca_certificate_pem(pem: &str, context: &str) -> Result<Vec<u8>, String>
             "mtls_auth: '{context}.ca_certificate_pem' must contain a CA certificate"
         ));
     }
+    if !parsed.validity().is_valid() {
+        return Err(format!(
+            "mtls_auth: '{context}.ca_certificate_pem' must be currently valid"
+        ));
+    }
+    if !parsed
+        .key_usage()
+        .ok()
+        .flatten()
+        .is_some_and(|usage| usage.value.key_cert_sign())
+    {
+        return Err(format!(
+            "mtls_auth: '{context}.ca_certificate_pem' keyUsage must include keyCertSign"
+        ));
+    }
     Ok(der)
+}
+
+/// Return true only for a currently valid certificate that can issue another
+/// certificate in the pinned path. Requiring both extensions also fails closed
+/// on malformed or duplicate extension encodings reported by x509-parser.
+fn is_valid_ca_issuer(cert: &X509Certificate<'_>) -> bool {
+    cert.validity().is_valid()
+        && cert
+            .basic_constraints()
+            .ok()
+            .flatten()
+            .is_some_and(|constraints| constraints.value.ca)
+        && cert
+            .key_usage()
+            .ok()
+            .flatten()
+            .is_some_and(|usage| usage.value.key_cert_sign())
 }
 
 /// mTLS authentication plugin.
@@ -427,6 +459,9 @@ impl MtlsAuth {
         let Ok((_, pinned_ca)) = X509Certificate::from_der(pinned_ca_der) else {
             return false;
         };
+        if !leaf.validity().is_valid() {
+            return false;
+        }
 
         // 0 = unseen, 1 = reachable and pending, 2 = processed. Reusing one
         // state vector as the work queue keeps path search iterative and
@@ -434,7 +469,8 @@ impl MtlsAuth {
         let mut states = vec![0u8; chain.len()];
         let mut current = leaf;
         loop {
-            if current.issuer() == pinned_ca.subject()
+            if is_valid_ca_issuer(&pinned_ca)
+                && current.issuer() == pinned_ca.subject()
                 && current
                     .verify_signature(Some(pinned_ca.public_key()))
                     .is_ok()
@@ -449,7 +485,8 @@ impl MtlsAuth {
                 let Ok((_, candidate)) = X509Certificate::from_der(cert_der) else {
                     continue;
                 };
-                if candidate.subject() == current.issuer()
+                if is_valid_ca_issuer(&candidate)
+                    && candidate.subject() == current.issuer()
                     && current
                         .verify_signature(Some(candidate.public_key()))
                         .is_ok()
@@ -478,6 +515,9 @@ impl MtlsAuth {
         let Ok((_, mut current)) = X509Certificate::from_der(leaf_der) else {
             return verified_chain;
         };
+        if !current.validity().is_valid() {
+            return verified_chain;
+        }
 
         let mut used = vec![false; chain.len()];
         loop {
@@ -489,7 +529,7 @@ impl MtlsAuth {
                 let Ok((_, candidate)) = X509Certificate::from_der(cert_der) else {
                     continue;
                 };
-                if candidate.subject() != current.issuer() {
+                if !is_valid_ca_issuer(&candidate) || candidate.subject() != current.issuer() {
                     continue;
                 }
                 if current

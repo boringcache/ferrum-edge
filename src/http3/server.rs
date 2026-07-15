@@ -742,6 +742,12 @@ async fn handle_h3_connection(
     let mtls_auth_connection_cache = client_cert_der
         .as_ref()
         .map(|_| Arc::new(crate::plugins::mtls_auth::MtlsAuthConnectionCache::new()));
+    // Connection-scoped SPIFFE extraction cache: the peer cert is fixed for
+    // the QUIC connection, so `spiffe_identity` derives its outcome once and
+    // every multiplexed request stream reuses it without re-parsing the DER.
+    let peer_spiffe_extraction_cache = client_cert_der.as_ref().map(|_| {
+        Arc::new(crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache::new())
+    });
     let frontend_sni_hostname = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
@@ -791,6 +797,7 @@ async fn handle_h3_connection(
                 let cert = client_cert_der.clone();
                 let chain = client_cert_chain_der.clone();
                 let mtls_auth_connection_cache = mtls_auth_connection_cache.clone();
+                let peer_spiffe_extraction_cache = peer_spiffe_extraction_cache.clone();
                 let frontend_sni_hostname = frontend_sni_hostname.clone();
                 let socket_ip = Arc::clone(&socket_ip);
                 // Snapshot the early-data flag NOW — before spawning the task.
@@ -811,6 +818,7 @@ async fn handle_h3_connection(
                                 cert,
                                 chain,
                                 mtls_auth_connection_cache,
+                                peer_spiffe_extraction_cache,
                                 is_early_data,
                             )
                             .await
@@ -851,6 +859,9 @@ async fn handle_h3_request(
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
+    peer_spiffe_extraction_cache: Option<
+        Arc<crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache>,
+    >,
     is_early_data: bool,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
@@ -907,6 +918,7 @@ async fn handle_h3_request(
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
+    ctx.peer_spiffe_extraction_cache = peer_spiffe_extraction_cache;
 
     // Validate header sizes without materializing headers into owned Strings.
     // The raw HeaderMap is stored on ctx for deferred materialization.
@@ -1376,6 +1388,7 @@ async fn handle_h3_request(
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
+    ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
     // Pre-computed capability bitset — avoids per-request iter().any() scans.
     let capabilities = plugin_cache_view.capabilities();
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();

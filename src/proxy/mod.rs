@@ -41,6 +41,7 @@ pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
+mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
 mod mesh_tcp_inbound;
@@ -3647,6 +3648,12 @@ struct RequestConnectionMetadata {
     /// selection, after applying any Sidecar ingress listener-to-app alias.
     /// `None` for direct dials and non-mesh listeners.
     mesh_inbound_pre_handshake_app_port: Option<u16>,
+    /// Connection-scoped cache of the peer-cert SPIFFE extraction outcome,
+    /// created when the connection presented a client certificate. Arc-shared
+    /// so `spiffe_identity` derives the peer SPIFFE ID at most once per
+    /// connection instead of re-parsing the DER on every multiplexed request.
+    peer_spiffe_extraction_cache:
+        Option<Arc<crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache>>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -7997,6 +8004,8 @@ async fn handle_connection(
             mesh_direction,
             orig_dst,
             mesh_inbound_pre_handshake_app_port,
+            // Plaintext connections carry no client certificate.
+            peer_spiffe_extraction_cache: None,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -12649,6 +12658,12 @@ async fn handle_tls_connection(
     let mtls_auth_connection_cache = client_cert_der
         .as_ref()
         .map(|_| Arc::new(crate::plugins::mtls_auth::MtlsAuthConnectionCache::new()));
+    // Connection-scoped SPIFFE extraction cache: the peer cert is fixed for
+    // the connection, so `spiffe_identity` derives its outcome once and every
+    // multiplexed request reuses it without re-parsing the DER.
+    let peer_spiffe_extraction_cache = client_cert_der.as_ref().map(|_| {
+        Arc::new(crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache::new())
+    });
     let frontend_sni_hostname = tls_stream
         .get_ref()
         .1
@@ -12711,6 +12726,7 @@ async fn handle_tls_connection(
             orig_dst: tls_connection_metadata.orig_dst,
             mesh_inbound_pre_handshake_app_port: tls_connection_metadata
                 .mesh_inbound_pre_handshake_app_port,
+            peer_spiffe_extraction_cache: peer_spiffe_extraction_cache.clone(),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -13836,6 +13852,9 @@ fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
 ) -> (u16, Vec<u8>, HashMap<String, String>) {
     let mut headers = HashMap::new();
+    // Challenge selection follows configured priority order: mechanisms that
+    // do not advertise a challenge are skipped, and the first available
+    // challenge wins.
     let challenge = auth_plugins
         .iter()
         .find_map(|plugin| plugin.authentication_challenge())
@@ -13931,6 +13950,9 @@ pub async fn run_authentication_phase(
         }
         AuthMode::Single => {
             for auth_plugin in auth_plugins {
+                if request_is_authenticated(ctx) {
+                    return None;
+                }
                 match auth_plugin.authenticate(ctx, consumer_index).await {
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -13940,7 +13962,11 @@ pub async fn run_authentication_phase(
                             return Some(reject);
                         }
                     }
-                    PluginResult::Continue => {}
+                    PluginResult::Continue => {
+                        if request_is_authenticated(ctx) {
+                            return None;
+                        }
+                    }
                 }
             }
             let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1
@@ -13974,6 +14000,9 @@ pub async fn handle_proxy_request(
     let mtls_auth_connection_cache = tls_client_cert_der
         .as_ref()
         .map(|_| Arc::new(crate::plugins::mtls_auth::MtlsAuthConnectionCache::new()));
+    let peer_spiffe_extraction_cache = tls_client_cert_der.as_ref().map(|_| {
+        Arc::new(crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache::new())
+    });
     handle_proxy_request_on_frontend_port(
         req,
         Arc::new(state),
@@ -13982,7 +14011,10 @@ pub async fn handle_proxy_request(
         tls_client_cert_der,
         tls_client_cert_chain_der,
         mtls_auth_connection_cache,
-        RequestConnectionMetadata::default(),
+        RequestConnectionMetadata {
+            peer_spiffe_extraction_cache,
+            ..RequestConnectionMetadata::default()
+        },
     )
     .await
 }
@@ -14120,6 +14152,7 @@ async fn handle_proxy_request_inner(
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
+    ctx.peer_spiffe_extraction_cache = connection_metadata.peer_spiffe_extraction_cache;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
         // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
         // identity is the authenticated source workload for policy. It
@@ -14868,6 +14901,7 @@ async fn handle_proxy_request_inner(
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
+    ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
     // Pre-computed capability bitset and phase-specific plugin lists — avoids
     // per-request `iter().filter().collect()` and `iter().any()` scans.
     let capabilities = plugin_cache_view.capabilities();
@@ -31098,7 +31132,7 @@ mod tests {
 
         let stripped = query_string_after_plugin_strips(
             &ctx,
-            "a=1&access_token=secret&encoded%20token=secret2&keep=2",
+            "a=1&access_token=first&encoded%20token=secret2&access_token=last&keep=2",
         );
 
         assert_eq!(stripped.as_ref(), "a=1&keep=2");

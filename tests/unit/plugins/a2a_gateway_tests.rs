@@ -1257,6 +1257,95 @@ async fn streaming_jsonrpc_does_not_force_response_buffering() {
 }
 
 #[tokio::test]
+async fn retry_marked_sse_response_is_released_while_json_stays_buffered() {
+    let plugin = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-retry",
+        "method": "message/send",
+        "params": {}
+    }));
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    // Classified non-streaming: the pre-flight decision buffers, and the
+    // plugin must advertise the retry release so retry-enabled dispatch
+    // keeps a header-first transport instead of committing to collection.
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+
+    // Backend unexpectedly answers with SSE: released under retries, exactly
+    // matching the non-retry content-type escape hatch.
+    let sse_headers = HashMap::from([(
+        "content-type".to_string(),
+        "text/event-stream; charset=utf-8".to_string(),
+    )]);
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &sse_headers));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream; charset=utf-8"),
+        200,
+        &sse_headers,
+    ));
+
+    // JSON responses stay buffered on both paths so metadata extraction,
+    // agent-card rewriting, and retry replay keep working.
+    let json_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &json_headers));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &json_headers,
+    ));
+
+    // Non-JSON, non-SSE responses also stay buffered under retries: the
+    // non-retry path buffers them for `a2a.response_body_size` and payload
+    // metadata, and the retry release must never be broader than that.
+    let text_headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &text_headers));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &HashMap::new()));
+}
+
+#[tokio::test]
+async fn retry_release_is_not_advertised_without_an_active_buffering_decision() {
+    let plugin = plugin(json!({}));
+    let sse_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+
+    // Streaming-classified request: the plugin is not an active buffering
+    // plugin, so it must not advertise the retry release either.
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-stream",
+        "method": "message/stream"
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(!plugin.may_release_response_body_under_retries(&ctx));
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &sse_headers));
+
+    // Undetected request: same.
+    let undetected_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/unrelated".to_string(),
+    );
+    assert!(!plugin.may_release_response_body_under_retries(&undetected_ctx));
+    assert!(!plugin.should_release_response_body_under_retries(&undetected_ctx, 200, &sse_headers));
+
+    // Native gRPC A2A request: capture is HTTP-only, so no retry release.
+    let (mut grpc_ctx, mut grpc_headers) = grpc_ctx("SendMessage", "application/grpc");
+    let result = plugin.before_proxy(&mut grpc_ctx, &mut grpc_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!plugin.should_buffer_response_body(&grpc_ctx));
+    assert!(!plugin.may_release_response_body_under_retries(&grpc_ctx));
+}
+
+#[tokio::test]
 async fn streaming_jsonrpc_inspector_extracts_multichunk_sse_terminal_metadata() {
     let plugin = plugin(json!({}));
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&plugin)];

@@ -23,6 +23,7 @@ use tracing::debug;
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::token_extract::bearer_credential_from_authorization_value;
 use super::{RequestContext, strip_auth_scheme};
 
 /// Unsafe validation that skips signature verification, used only to extract
@@ -114,21 +115,37 @@ impl JwtAuth {
         })
     }
 
-    fn extract_token(&self, ctx: &RequestContext) -> Option<String> {
+    fn extract_credential(&self, ctx: &RequestContext) -> ExtractedCredential {
         match &self.token_lookup {
             TokenLookup::Header {
                 lower_name,
                 original_name,
-            } => ctx
-                .headers
-                .get(lower_name.as_str())
-                .or_else(|| ctx.headers.get(original_name.as_str()))
-                .map(|v| {
-                    strip_auth_scheme(v, "Bearer")
-                        .unwrap_or(v.as_str())
-                        .to_string()
-                }),
-            TokenLookup::Query(param_name) => ctx.query_params.get(param_name.as_str()).cloned(),
+            } => {
+                let Some(value) = ctx
+                    .headers
+                    .get(lower_name.as_str())
+                    .or_else(|| ctx.headers.get(original_name.as_str()))
+                else {
+                    return ExtractedCredential::Missing;
+                };
+                if lower_name.eq_ignore_ascii_case("authorization") {
+                    // Shared with JWKS/OAuth: a foreign scheme is not
+                    // applicable, but an empty `Bearer` value must reject so
+                    // single mode cannot skip a malformed applicable
+                    // credential and authenticate via a later mechanism.
+                    bearer_credential_from_authorization_value(value)
+                } else {
+                    ExtractedCredential::BearerToken(
+                        strip_auth_scheme(value, "Bearer")
+                            .unwrap_or(value.as_str())
+                            .to_string(),
+                    )
+                }
+            }
+            TokenLookup::Query(param_name) => match ctx.query_params.get(param_name.as_str()) {
+                Some(token) => ExtractedCredential::BearerToken(token.clone()),
+                None => ExtractedCredential::Missing,
+            },
         }
     }
 }
@@ -161,10 +178,7 @@ impl AuthMechanism for JwtAuth {
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        match self.extract_token(ctx) {
-            Some(token) => ExtractedCredential::BearerToken(token),
-            None => ExtractedCredential::Missing,
-        }
+        self.extract_credential(ctx)
     }
 
     async fn verify(

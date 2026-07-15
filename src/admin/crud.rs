@@ -4,7 +4,10 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 use crate::admin::AdminState;
@@ -59,6 +62,62 @@ pub(crate) enum ValidationError {
     Message(String),
 }
 
+/// A write-preparation failure whose origin determines the HTTP status.
+pub(crate) enum PrepareWriteError {
+    InvalidRequest(String),
+    Internal(String),
+}
+
+impl PrepareWriteError {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::InvalidRequest(message) | Self::Internal(message) => message,
+        }
+    }
+}
+
+pub(crate) enum BatchPreparationError {
+    Validation(Vec<String>),
+    Internal(String),
+}
+
+const MTLS_ADMISSION_LOCK_SHARDS: usize = 64;
+static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+
+/// Best-effort serialization of mTLS-sensitive admin mutations for a namespace
+/// from candidate validation through persistence. A bounded process-global
+/// lock set covers every `AdminState` served by this process without retaining
+/// attacker-chosen namespace strings indefinitely.
+///
+/// The datastore's exact mTLS credential index remains the authoritative
+/// cross-process backstop for exact identities. The additional ASCII-folded
+/// `san_dns` constraint is conditional on effective plugin associations, so it
+/// cannot use an unconditional case-folded unique index without rejecting valid
+/// case variants used by exact-match policies. Fully serializing that dynamic
+/// check across SQL and MongoDB writers requires backend-specific transactions;
+/// this lock deliberately does not claim to coordinate separate admin processes.
+/// Every credential mutation takes this lock, even for non-mTLS types, because
+/// those endpoints persist the complete `Consumer` and could otherwise replay
+/// stale `mtls_auth` entries loaded before a concurrent mTLS mutation.
+pub(crate) async fn lock_mtls_admission(namespace: &str) -> MutexGuard<'static, ()> {
+    let locks = MTLS_ADMISSION_LOCKS.get_or_init(|| {
+        (0..MTLS_ADMISSION_LOCK_SHARDS)
+            .map(|_| Mutex::new(()))
+            .collect()
+    });
+    let mut hasher = DefaultHasher::new();
+    namespace.hash(&mut hasher);
+    let shard = hasher.finish() as usize % MTLS_ADMISSION_LOCK_SHARDS;
+    locks[shard].lock().await
+}
+
 async fn validate_mtls_auth_candidate(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -93,11 +152,16 @@ async fn validate_mtls_auth_candidate(
             .plugin_configs
             .retain(|plugin| plugin.id != removed_plugin_id);
     }
+    if proxy
+        .is_some_and(|candidate| !config.has_effective_mtls_auth_for_proxy(candidate.id.as_str()))
+    {
+        return Ok(());
+    }
     let mut errors = config
         .validate_mtls_auth_compatibility()
         .err()
         .unwrap_or_default();
-    if let Err(credential_errors) = config.validate_unique_consumer_credentials() {
+    if let Err(credential_errors) = config.validate_unique_mtls_credentials() {
         errors.extend(credential_errors);
     }
     if errors.is_empty() {
@@ -123,7 +187,7 @@ pub(crate) async fn mtls_consumer_candidate_errors(
         config.consumers.push(consumer.clone());
     }
     Ok(config
-        .validate_unique_consumer_credentials()
+        .validate_unique_mtls_credentials()
         .err()
         .unwrap_or_default())
 }
@@ -146,6 +210,7 @@ pub(crate) trait AdminResource:
     const VALIDATION_ERROR_LABEL: &'static str;
     const NOT_FOUND_MESSAGE: &'static str;
     const ID_CONFLICT_LABEL: &'static str = Self::RESOURCE_LABEL;
+    const SERIALIZE_MTLS_ADMISSION: bool = false;
 
     fn id(&self) -> &str;
     fn set_id(&mut self, id: String);
@@ -178,7 +243,7 @@ pub(crate) trait AdminResource:
 
     fn prepare_for_update(&mut self, _existing: &Self) {}
 
-    fn prepare_for_write(&mut self) -> Result<(), String> {
+    fn prepare_for_write(&mut self) -> Result<(), PrepareWriteError> {
         Ok(())
     }
 
@@ -444,6 +509,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
+    let _mtls_admission_guard = if R::SERIALIZE_MTLS_ADMISSION {
+        Some(lock_mtls_admission(namespace).await)
+    } else {
+        None
+    };
 
     let existing = match R::db_get_for_write(db, namespace, id).await {
         Ok(None) => {
@@ -485,20 +555,26 @@ pub(crate) fn prepare_batch_resource<R: AdminResource>(
     namespace: &str,
     now: DateTime<Utc>,
     validation_ctx: &ValidationCtx<'_>,
-) -> Result<(), Vec<String>> {
+) -> Result<(), BatchPreparationError> {
     if resource.id().is_empty() {
         resource.set_id(Uuid::new_v4().to_string());
     } else if let Err(message) = validate_resource_id(resource.id()) {
-        return Err(vec![message]);
+        return Err(BatchPreparationError::Validation(vec![message]));
     }
 
     resource.normalize();
     resource.set_namespace(namespace.to_string());
     resource
         .validate(validation_ctx)
-        .map_err(ValidationError::into_messages)?;
-    if let Err(message) = resource.prepare_for_write() {
-        return Err(vec![message]);
+        .map_err(ValidationError::into_messages)
+        .map_err(BatchPreparationError::Validation)?;
+    if let Err(error) = resource.prepare_for_write() {
+        return Err(match error {
+            PrepareWriteError::InvalidRequest(message) => {
+                BatchPreparationError::Validation(vec![message])
+            }
+            PrepareWriteError::Internal(message) => BatchPreparationError::Internal(message),
+        });
     }
     resource.set_created_at(now);
     resource.set_updated_at(now);
@@ -511,6 +587,10 @@ pub(crate) fn redact_consumer_for_response(consumer: &Consumer) -> Consumer {
 
 pub(crate) fn consumer_response_body(consumer: &Consumer) -> Value {
     json!(redact_consumer_for_response(consumer))
+}
+
+pub(crate) fn consumer_audit_body(consumer: &Consumer) -> Value {
+    json!(super::redact_consumer_credentials_for_audit(consumer))
 }
 
 pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
@@ -526,11 +606,15 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     super::json_response(status, &json!({"error": message}))
 }
 
-pub(crate) fn hash_consumer_credentials(consumer: &mut Consumer) -> Result<(), String> {
+pub(crate) fn hash_consumer_credentials(
+    consumer: &mut Consumer,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     super::hash_consumer_secrets(consumer)
 }
 
-pub(crate) fn hash_basic_auth_credentials(cred: &mut Value) -> Result<(), String> {
+pub(crate) fn hash_basic_auth_credentials(
+    cred: &mut Value,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     super::hash_credential_passwords(cred)
 }
 
@@ -1537,6 +1621,7 @@ impl AdminResource for PluginConfig {
     const RESOURCE_LABEL: &'static str = "Plugin config";
     const VALIDATION_ERROR_LABEL: &'static str = "plugin config fields";
     const NOT_FOUND_MESSAGE: &'static str = "Plugin config not found";
+    const SERIALIZE_MTLS_ADMISSION: bool = true;
     const ID_CONFLICT_LABEL: &'static str = "PluginConfig";
 
     fn id(&self) -> &str {
@@ -1826,6 +1911,7 @@ impl AdminResource for Proxy {
     const RESOURCE_LABEL: &'static str = "Proxy";
     const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
+    const SERIALIZE_MTLS_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id
@@ -2175,9 +2261,12 @@ impl AdminResource for Proxy {
             Err(error) => return Err(AfterValidateError::Db(error)),
         }
 
-        if resource.effective_scheme().is_stream() {
-            validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
-        }
+        // HTTP proxy associations can make a dormant/global `san_dns` policy
+        // effective just as stream proxies can. The candidate helper checks
+        // every transport but returns immediately when this proxy has no
+        // effective `mtls_auth` association; compatibility validation itself
+        // remains stream-specific.
+        validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
 
         if resource.dispatch_kind.is_stream()
             && let Some(port) = resource.listen_port
@@ -2248,6 +2337,7 @@ impl AdminResource for Consumer {
     const RESOURCE_LABEL: &'static str = "Consumer";
     const VALIDATION_ERROR_LABEL: &'static str = "consumer fields";
     const NOT_FOUND_MESSAGE: &'static str = "Consumer not found";
+    const SERIALIZE_MTLS_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id
@@ -2289,12 +2379,42 @@ impl AdminResource for Consumer {
         consumer_response_body(resource)
     }
 
+    fn audit_body(resource: &Self) -> Value {
+        consumer_audit_body(resource)
+    }
+
+    fn prepare_for_update(&mut self, existing: &Self) {
+        // Ordinary Consumer responses omit Basic credentials entirely. Preserve
+        // them when a client round-trips that response through PUT; explicit
+        // credential replacement and deletion use the credential endpoints.
+        if !self.credentials.contains_key("basicauth")
+            && let Some(basic_credentials) = existing.credentials.get("basicauth")
+        {
+            self.credentials
+                .insert("basicauth".to_string(), basic_credentials.clone());
+        }
+    }
+
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
         super::json_response(StatusCode::CONFLICT, &json!({"error": errors.join("; ")}))
     }
 
-    fn prepare_for_write(&mut self) -> Result<(), String> {
-        hash_consumer_credentials(self)
+    fn prepare_for_write(&mut self) -> Result<(), PrepareWriteError> {
+        let consumer_id = self.id.clone();
+        hash_consumer_credentials(self).map_err(|error| match error {
+            crate::config::types::BasicAuthCredentialPreparationError::InvalidCredential(
+                message,
+            ) => PrepareWriteError::InvalidRequest(format!(
+                "Failed to prepare Basic-auth credentials for consumer {}: {}",
+                consumer_id, message
+            )),
+            crate::config::types::BasicAuthCredentialPreparationError::ServerConfiguration(
+                message,
+            ) => PrepareWriteError::Internal(format!(
+                "Failed to prepare Basic-auth credentials for consumer {}: {}",
+                consumer_id, message
+            )),
+        })
     }
 
     fn map_persist_db_error(
@@ -2435,6 +2555,11 @@ async fn handle_write<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
+    let _mtls_admission_guard = if R::SERIALIZE_MTLS_ADMISSION {
+        Some(lock_mtls_admission(namespace).await)
+    } else {
+        None
+    };
 
     if let Err(message) = R::validate_raw_body(body) {
         return Ok(super::json_response(
@@ -2541,10 +2666,10 @@ async fn handle_write<R: AdminResource>(
         return Ok(map_after_validate_error::<R>(error));
     }
 
-    if let Err(message) = resource.prepare_for_write() {
+    if let Err(error) = resource.prepare_for_write() {
         return Ok(super::json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": message}),
+            error.status(),
+            &json!({"error": error.message()}),
         ));
     }
 

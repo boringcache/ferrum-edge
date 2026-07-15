@@ -58,20 +58,25 @@ pub enum TokenLocationExtract {
 pub fn extract_authorization_bearer(ctx: &RequestContext) -> ExtractedCredential {
     match ctx.headers.get("authorization") {
         None => ExtractedCredential::Missing,
-        Some(value) => match value.split_once(' ') {
-            Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => {
-                if token.is_empty() {
-                    ExtractedCredential::InvalidFormat(
-                        r#"{"error":"Empty bearer token"}"#.to_string(),
-                    )
-                } else {
-                    ExtractedCredential::BearerToken(token.to_string())
-                }
-            }
-            _ => ExtractedCredential::InvalidFormat(
-                r#"{"error":"Missing Bearer token"}"#.to_string(),
-            ),
-        },
+        Some(value) => bearer_credential_from_authorization_value(value),
+    }
+}
+
+/// Classify an `Authorization` header value against the `Bearer` scheme. A
+/// foreign scheme is `Missing` (not applicable, so multi-auth may continue),
+/// while an applicable `Bearer` value with an empty token is `InvalidFormat`
+/// so single mode rejects it instead of skipping to a later mechanism.
+pub fn bearer_credential_from_authorization_value(value: &str) -> ExtractedCredential {
+    let scheme = value
+        .split(|c: char| c.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return ExtractedCredential::Missing;
+    }
+    match crate::plugins::strip_auth_scheme(value, "Bearer") {
+        Some(token) => ExtractedCredential::BearerToken(token.to_string()),
+        None => ExtractedCredential::InvalidFormat(r#"{"error":"Empty bearer token"}"#.to_string()),
     }
 }
 
@@ -81,7 +86,15 @@ pub fn extract_from_location(
 ) -> TokenLocationExtract {
     match location {
         TokenLocation::Header(header) => match ctx.headers.get(&header.name) {
-            Some(value) => extract_location_value(value, header.prefix.as_deref()),
+            Some(value) => {
+                if header.name.eq_ignore_ascii_case("authorization") && header.prefix.is_none() {
+                    return match bearer_credential_from_authorization_value(value) {
+                        ExtractedCredential::Missing => TokenLocationExtract::Missing,
+                        credential => TokenLocationExtract::Credential(credential),
+                    };
+                }
+                extract_location_value(value, header.prefix.as_deref())
+            }
             None => TokenLocationExtract::Missing,
         },
         TokenLocation::QueryParam(name) => match ctx.query_params.get(name) {
