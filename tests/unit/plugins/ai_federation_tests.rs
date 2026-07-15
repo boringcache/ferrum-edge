@@ -2404,7 +2404,10 @@ fn test_base_url_unparseable_rejected() {
 fn test_base_url_unsupported_scheme_rejected() {
     let err = test_helpers::validate_base_url_test("openai", "file:///etc/passwd", false, "both")
         .unwrap_err();
-    assert!(err.contains("unsupported scheme"), "got: {err}");
+    assert!(
+        err.contains("must use a lowercase explicit https:// or http:// scheme"),
+        "got: {err}"
+    );
 }
 
 #[test]

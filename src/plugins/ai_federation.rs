@@ -1949,11 +1949,11 @@ fn validate_openai_content_parts(content: &Value, message_index: usize) -> Resul
                     ));
                 }
             }
-            _ => {
-                return Err(format!(
-                    "ai_federation: messages[{message_index}].content[{part_index}] has an unsupported content-part type"
-                ));
-            }
+            // Provider-specific policy decides whether an otherwise
+            // well-formed non-text part can be translated, passed through, or
+            // intentionally dropped by `text_only_with_warning`. Rejecting the
+            // type here would make that explicit drop policy inert.
+            _ => {}
         }
     }
     Ok(())
@@ -3140,12 +3140,32 @@ fn translate_to_anthropic(
             continue;
         }
 
-        let mut content = anthropic_content_blocks(openai_content_to_anthropic(
+        let translated_content = openai_content_to_anthropic(
             &message["content"],
             provider.multimodal_mode,
-        )?);
-        if role == "assistant" {
-            for call in parse_openai_tool_calls(message, message_index)? {
+        )?;
+        let tool_calls = if role == "assistant" {
+            parse_openai_tool_calls(message, message_index)?
+        } else {
+            Vec::new()
+        };
+        let content = if tool_calls.is_empty() {
+            let representable = match &translated_content {
+                Value::String(text) => !text.is_empty(),
+                Value::Array(blocks) => !blocks.is_empty(),
+                _ => false,
+            };
+            if !representable {
+                return Err(format!(
+                    "ai_federation: messages[{message_index}] has no Anthropic-representable content"
+                ));
+            }
+            // Anthropic accepts either a string or a content-block array. Keep
+            // the client's string shape when no tool block has to be appended.
+            translated_content
+        } else {
+            let mut content = anthropic_content_blocks(translated_content);
+            for call in tool_calls {
                 content.push(json!({
                     "type": "tool_use",
                     "id": call.id,
@@ -3153,12 +3173,8 @@ fn translate_to_anthropic(
                     "input": call.arguments,
                 }));
             }
-        }
-        if content.is_empty() {
-            return Err(format!(
-                "ai_federation: messages[{message_index}] has no Anthropic-representable content"
-            ));
-        }
+            Value::Array(content)
+        };
         filtered_messages.push(json!({
             "role": role,
             "content": content,
@@ -4141,12 +4157,6 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
                 }
             }
         }
-        if text.is_empty() && tool_calls.is_empty() {
-            return Err(format!(
-                "ai_federation: Gemini candidates[{candidate_index}] has no non-empty text or function calls"
-            ));
-        }
-
         let native_finish = candidate["finishReason"].as_str().ok_or_else(|| {
             format!("ai_federation: Gemini candidates[{candidate_index}] missing finishReason")
         })?;
@@ -4177,6 +4187,11 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
                 }
             }
         };
+        if text.is_empty() && tool_calls.is_empty() && finish_reason != "content_filter" {
+            return Err(format!(
+                "ai_federation: Gemini candidates[{candidate_index}] has no non-empty text or function calls"
+            ));
+        }
         let mut message = json!({
             "role": "assistant",
             "content": if text.is_empty() { Value::Null } else { Value::String(text) },

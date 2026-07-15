@@ -236,6 +236,13 @@ enum LocalCompletionAction {
     Stale,
 }
 
+struct LocalCompletionInput<'a> {
+    status_code: u16,
+    headers: HashMap<String, String>,
+    body: &'a [u8],
+    retain_inflight_on_skip: bool,
+}
+
 enum CompletionSkipReason {
     EntryTooLarge {
         entry_size: usize,
@@ -854,11 +861,14 @@ impl RequestDeduplication {
         key: &str,
         fingerprint: &str,
         owner_token: &str,
-        status_code: u16,
-        headers: HashMap<String, String>,
-        body: &[u8],
-        retain_inflight_on_skip: bool,
+        input: LocalCompletionInput<'_>,
     ) -> LocalCompletionAction {
+        let LocalCompletionInput {
+            status_code,
+            headers,
+            body,
+            retain_inflight_on_skip,
+        } = input;
         let entry_size = cached_response_retained_size(body.len(), &headers);
         let _guard = self.accounting_guard();
         let mut entry = match self.local_cache.entry(key.to_string()) {
@@ -1929,10 +1939,12 @@ impl Plugin for RequestDeduplication {
             &key,
             &fingerprint,
             &local_inflight_owner_token,
-            response_status,
-            safe_headers,
-            body,
-            retain_inflight_on_skip,
+            LocalCompletionInput {
+                status_code: response_status,
+                headers: safe_headers,
+                body,
+                retain_inflight_on_skip,
+            },
         ) {
             LocalCompletionAction::Published {
                 cached,

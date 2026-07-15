@@ -33,7 +33,7 @@ fn h3_final_body_rejects_use_complete_synthetic_response_pipeline() {
         .find("let raw_request_body_bytes = body_data.len() as u64;")
         .expect("H3 early request-body finalization must remain present");
     let early_end = src[early_start..]
-        .find("// Determine streaming vs buffered mode")
+        .find("// --- Upstream target selection and circuit breaker ---")
         .map(|offset| early_start + offset)
         .expect("H3 early finalization boundary must remain present");
     let early = &src[early_start..early_end];
