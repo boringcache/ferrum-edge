@@ -416,8 +416,7 @@ fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
         .rfind("BackendPathBeforeProxyPass::RemainingDeferred")
         .expect("remaining deferred hook pass must remain present");
     assert!(
-        source[remaining_hook..]
-            .contains("refresh_effective_backend_consumer_identity_headers("),
+        source[remaining_hook..].contains("refresh_effective_backend_consumer_identity_headers("),
         "gateway identity must be restored after every deferred hook pass"
     );
     assert!(

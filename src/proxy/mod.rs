@@ -15871,10 +15871,7 @@ async fn handle_proxy_request_inner(
         // A deferred routing function can return arbitrary headers. Reserved
         // consumer identity must be restored before those headers participate
         // in hash-based target selection or reach any backend transport.
-        refresh_effective_backend_consumer_identity_headers(
-            &mut ctx,
-            &mut owned_proxy_headers,
-        );
+        refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
 
         let selected_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
         if selected_headers != &headers_before
@@ -15941,10 +15938,7 @@ async fn handle_proxy_request_inner(
             ctx.path = backend_ctx_path;
         }
         if matches!(deferred_result, PluginResult::Continue) {
-            refresh_effective_backend_consumer_identity_headers(
-                &mut ctx,
-                &mut owned_proxy_headers,
-            );
+            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
         }
         match deferred_result {
             PluginResult::Continue => {}
