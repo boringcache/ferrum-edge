@@ -32,7 +32,7 @@ use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
     extract_authorization_bearer, extract_from_location, mark_present_query_credential_locations,
 };
-use super::{PluginResult, RequestContext};
+use super::{PluginResult, RequestContext, strip_auth_scheme};
 
 const STRIP_AUTHORIZATION_METADATA_KEY: &str = "oauth2_introspection.strip_authorization";
 const STRIP_HEADER_METADATA_PREFIX: &str = "oauth2_introspection.strip_header.";
@@ -1894,10 +1894,8 @@ fn mark_credential_source_stripping_metadata(
 fn authorization_bearer_matches(ctx: &RequestContext, expected_token: &str) -> bool {
     ctx.headers
         .get("authorization")
-        .and_then(|value| value.split_once(' '))
-        .is_some_and(|(scheme, token)| {
-            scheme.eq_ignore_ascii_case("bearer") && token == expected_token
-        })
+        .and_then(|value| strip_auth_scheme(value, "Bearer"))
+        .is_some_and(|token| token == expected_token)
 }
 
 fn token_location_matches(

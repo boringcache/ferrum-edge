@@ -1142,6 +1142,51 @@ async fn accepted_token_is_stripped_from_every_duplicate_location() {
 }
 
 #[tokio::test]
+async fn duplicate_authorization_token_stripping_uses_shared_bearer_syntax() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"active": true, "username": "u"})),
+        )
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": format!("{}/introspect", server.uri()),
+                "client_auth": {"method": "none"},
+                "from_params": ["access_token"],
+                "forward_original_token": false
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for authorization in ["Bearer\tduplicate-token", "Bearer  duplicate-token"] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
+        ctx.headers
+            .insert("authorization".to_string(), authorization.to_string());
+        ctx.query_params
+            .insert("access_token".to_string(), "duplicate-token".to_string());
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+
+        let mut headers = ctx.headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            headers
+                .keys()
+                .all(|name| !name.eq_ignore_ascii_case("authorization"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn provider_specific_location_routes_without_disclosing_to_siblings() {
     let provider_a = MockServer::start().await;
     Mock::given(method("POST"))
