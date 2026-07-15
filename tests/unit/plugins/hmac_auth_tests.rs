@@ -113,19 +113,17 @@ fn current_date() -> String {
 /// `make_ctx` produces requests with no
 /// query, so the helpers below sign an empty query by default; tests that set
 /// a query string use `sign_sha256_with_query`.
-fn build_signing_string(
-    namespace: &str,
-    username: &str,
-    authority: &str,
-    method: &str,
-    path: &str,
-    query: &str,
-    date: &str,
-    digest_header: &str,
-) -> String {
+fn build_signing_string(input: HmacSigningInput<'_>) -> String {
     format!(
         "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        namespace, username, authority, method, path, query, date, digest_header
+        input.namespace,
+        input.username,
+        input.authority,
+        input.method,
+        input.path,
+        input.query,
+        input.date,
+        input.digest_header
     )
 }
 
@@ -137,16 +135,16 @@ fn sign_sha256(secret: &str, method: &str, path: &str, date: &str) -> String {
 /// Compute an HMAC-SHA512 signature over an empty-body, no-query request.
 fn sign_sha512(secret: &str, method: &str, path: &str, date: &str) -> String {
     let digest_header = sha256_digest_header(&[]);
-    let signing_string = build_signing_string(
-        ferrum_edge::config::types::DEFAULT_NAMESPACE,
-        TEST_USERNAME,
-        TEST_AUTHORITY,
+    let signing_string = build_signing_string(HmacSigningInput {
+        namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+        username: TEST_USERNAME,
+        authority: TEST_AUTHORITY,
         method,
         path,
-        "",
+        query: "",
         date,
-        &digest_header,
-    );
+        digest_header: &digest_header,
+    });
     let mut mac = HmacSha512::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
@@ -188,16 +186,7 @@ struct HmacSigningInput<'a> {
 }
 
 fn sign_sha256_for_identity(secret: &str, input: HmacSigningInput<'_>) -> String {
-    let signing_string = build_signing_string(
-        input.namespace,
-        input.username,
-        input.authority,
-        input.method,
-        input.path,
-        input.query,
-        input.date,
-        input.digest_header,
-    );
+    let signing_string = build_signing_string(input);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
