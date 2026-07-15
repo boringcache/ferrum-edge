@@ -1605,10 +1605,10 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 **Signing string**:
 
 ```text
-ferrum-hmac-v1\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
+ferrum-hmac-v1\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
 ```
 
-`{USERNAME}` is the decoded username auth-param. `{AUTHORITY}` is the validated request authority with an ASCII-lowercased hostname, no trailing DNS dot, no default `:80`/`:443` port, and any explicit non-default port retained; bracketed IPv6 remains bracketed. `{PATH}` is the request path component only and `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query). `DIGEST_HEADER_VALUE` is the literal value of the selected digest field. Binding username and authority prevents captured signatures from being relabeled to another Consumer or replayed across virtual hosts; binding the raw query prevents query alteration.
+`{NAMESPACE}` is the namespace of the matched proxy (the default is `ferrum`) and HMAC Consumer identity lookup is restricted to that namespace. `{USERNAME}` is the decoded username auth-param. `{AUTHORITY}` is the validated request authority with an ASCII-lowercased hostname, no trailing DNS dot, no default `:80`/`:443` port, and any explicit non-default port retained; bracketed IPv6 remains bracketed. `{PATH}` is the request path component only and `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query). `DIGEST_HEADER_VALUE` is the literal value of the selected digest field. Binding namespace, username, and authority prevents a captured signature from being relabeled to another Consumer, namespace, or virtual host; binding the raw query prevents query alteration.
 
 For RFC 9530 `Content-Digest`, use structured-field byte-sequence syntax such as `sha-256=:<base64-of-sha256-of-body>:`. Legacy `Digest` compatibility accepts `sha-256=<base64-of-sha256-of-body>`. SHA-512 is also supported. Ferrum verifies the digest against the original client bytes and signs its literal field value.
 

@@ -37,6 +37,9 @@ pub enum ExtractedCredential {
 /// [`ExtractedCredential::HmacAuth`].
 #[derive(Debug, Clone)]
 pub struct HmacAuthCredential {
+    /// Namespace of the matched proxy. HMAC identity resolution is scoped to
+    /// this namespace and the value is bound into the signing base.
+    pub namespace: String,
     pub username: String,
     /// Canonical client-request authority bound into the versioned signature
     /// base so a captured request cannot cross virtual-host boundaries.

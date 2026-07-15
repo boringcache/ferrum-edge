@@ -6424,7 +6424,7 @@ components:
               items:
                 $ref: "#/components/schemas/HmacAuthCredential"
               minItems: 1
-              description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username in Authorization header; all secrets tried.
+              description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username within the matched proxy namespace; all secrets tried.
             mtls_auth:
               type: array
               items:
@@ -6529,8 +6529,8 @@ components:
             namespaces may reuse the same secret.
       description: >-
         HMAC auth credential for the `hmac_auth` plugin. Consumer is looked up
-        by username in the Authorization header; all secrets are tried until one
-        verifies the signature.
+        by username within the matched proxy namespace; all secrets are tried
+        until one verifies the namespace-bound signature.
 
     MtlsAuthCredential:
       type: object
@@ -11892,8 +11892,9 @@ components:
         mandatory request-body integrity protection. RFC 9530 defines
         Content-Digest; this is not RFC 9421 HTTP Message Signatures. Requests
         must include Digest or Content-Digest matching the original body.
-        Version 1 signs the credential identity, normalized authority, method,
-        path, raw query, Date, and literal digest value. HBONE CONNECT and
+        Version 1 signs the matched proxy namespace, credential identity,
+        normalized authority, method, path, raw query, Date, and literal digest
+        value. HBONE CONNECT and
         request-body-transformer compositions fail closed. The
         pre-authentication body path has a 10 MiB hard ceiling. Date provides a
         bounded freshness window, not single-use replay prevention.

@@ -12,7 +12,7 @@
 //! Signatures. Version 1 signs these newline-separated fields:
 //!
 //!   ```text
-//!   ferrum-hmac-v1\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
+//!   ferrum-hmac-v1\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
 //!   ```
 //!
 //! `{PATH}` is the request path component only; `{QUERY}` is the raw query
@@ -223,6 +223,7 @@ fn parse_hmac_authorization(params: &str) -> Result<ParsedHmacAuthorization, &'s
 
 struct CachedHmacAuthorization {
     authorization_fingerprint: [u8; 32],
+    namespace: String,
     username: String,
     authority: String,
     date: String,
@@ -481,13 +482,15 @@ impl HmacAuth {
             .decode(&credential.signature)
             .ok()
             .filter(|signature| signature.len() == expected_signature_len)?;
-        let consumer = consumer_index.find_by_identity(&credential.username)?;
+        let consumer = consumer_index
+            .find_hmac_by_identity(&credential.namespace, &credential.username)?;
         let hmac_entries = consumer.credential_entries("hmac_auth");
         if hmac_entries.is_empty() {
             return None;
         }
 
         let signing_string = build_signing_string(
+            &credential.namespace,
             &credential.username,
             &credential.authority,
             &credential.method,
@@ -524,6 +527,8 @@ impl HmacAuth {
         };
         if !constant_time_eq(&cached.authorization_fingerprint, &current_fingerprint)
             || ctx.request_authority.as_deref() != Some(cached.authority.as_str())
+            || ctx.matched_proxy.as_ref().map(|proxy| proxy.namespace.as_str())
+                != Some(cached.namespace.as_str())
             || ctx.method != cached.method
             || ctx.path != cached.path
             || ctx.raw_query_string().unwrap_or_default() != cached.query
@@ -534,7 +539,7 @@ impl HmacAuth {
         }
 
         consumer_index
-            .find_by_identity(&cached.username)
+            .find_hmac_by_identity(&cached.namespace, &cached.username)
             .is_some_and(|current_consumer| {
                 Arc::ptr_eq(&current_consumer, &cached.preverified_consumer)
             })
@@ -567,6 +572,7 @@ impl HmacAuth {
             return false;
         };
         let auth_flow::HmacAuthCredential {
+            namespace,
             username,
             authority,
             date,
@@ -578,6 +584,7 @@ impl HmacAuth {
         } = *credential;
         ctx.hmac_prebuffer_state.stage(CachedHmacAuthorization {
             authorization_fingerprint,
+            namespace,
             username,
             authority,
             date,
@@ -689,8 +696,18 @@ impl AuthMechanism for HmacAuth {
                 r#"{"error":"Missing request authority for HMAC authorization"}"#.to_string(),
             );
         };
+        let Some(namespace) = ctx
+            .matched_proxy
+            .as_ref()
+            .map(|proxy| proxy.namespace.clone())
+        else {
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"Missing proxy namespace for HMAC authorization"}"#.to_string(),
+            );
+        };
 
         ExtractedCredential::HmacAuth(Box::new(auth_flow::HmacAuthCredential {
+            namespace,
             username,
             authority,
             algorithm,
@@ -835,7 +852,7 @@ fn parse_u64_field(value: Option<&Value>, field: &str, default_value: u64) -> Re
 }
 
 /// Build Ferrum HMAC signing-base version 1. Fields are newline-separated:
-/// `ferrum-hmac-v1\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST}`.
+/// `ferrum-hmac-v1\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST}`.
 ///
 /// `query` is the raw request query string as received (percent-encoded, no
 /// leading `?`), empty when the request has no query. Binding it prevents an
@@ -843,6 +860,7 @@ fn parse_u64_field(value: Option<&Value>, field: &str, default_value: u64) -> Re
 /// altered or added query parameters. Clients must sign the byte-for-byte raw
 /// query string the gateway receives.
 fn build_signing_string(
+    namespace: &str,
     username: &str,
     authority: &str,
     method: &str,
@@ -853,6 +871,7 @@ fn build_signing_string(
 ) -> String {
     let mut signing_string = String::with_capacity(
         HMAC_SIGNING_VERSION.len()
+            + namespace.len()
             + username.len()
             + authority.len()
             + method.len()
@@ -860,9 +879,11 @@ fn build_signing_string(
             + query.len()
             + date.len()
             + digest_header.len()
-            + 7,
+            + 8,
     );
     signing_string.push_str(HMAC_SIGNING_VERSION);
+    signing_string.push('\n');
+    signing_string.push_str(namespace);
     signing_string.push('\n');
     signing_string.push_str(username);
     signing_string.push('\n');

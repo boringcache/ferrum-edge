@@ -4218,7 +4218,16 @@ async fn handle_batch_create(
             if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
                 validation_errors.extend(errors);
             }
-            if let Err(errors) = candidate_config.validate_unique_hmac_credentials() {
+            // Match single-resource admission: legacy duplicates are already
+            // quarantined at load time and must not block unrelated batch
+            // writes. Re-evaluate the authoritative candidate only when this
+            // batch submits a Consumer that carries HMAC credentials.
+            if batch
+                .consumers
+                .iter()
+                .any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
+                && let Err(errors) = candidate_config.validate_unique_hmac_credentials()
+            {
                 validation_errors.extend(errors);
             }
         }
@@ -4226,6 +4235,31 @@ async fn handle_batch_create(
             "Failed to load namespace config for credential candidate validation: {}",
             error
         )),
+    }
+
+    if !batch.proxies.is_empty() || !batch.plugin_configs.is_empty() {
+        match crud::validate_hmac_request_transform_candidates(
+            db.as_ref(),
+            state,
+            namespace,
+            &batch.proxies,
+            &batch.plugin_configs,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(crud::AfterValidateError::BadRequest(errors)) => {
+                validation_errors.extend(errors);
+            }
+            Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
+                "Failed to load config for HMAC request-transform candidate validation: {}",
+                error
+            )),
+            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
+                "HMAC request-transform candidate validation returned an unexpected response"
+                    .to_string(),
+            ),
+        }
     }
 
     match ValidationPipeline::new(&mut batch_config)

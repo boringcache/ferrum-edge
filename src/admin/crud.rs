@@ -145,6 +145,62 @@ async fn validate_mtls_auth_candidate(
     }
 }
 
+pub(crate) async fn validate_hmac_request_transform_candidates(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    proxies: &[Proxy],
+    plugins: &[PluginConfig],
+) -> Result<(), AfterValidateError> {
+    let mut namespaces = db
+        .list_namespaces_authoritative()
+        .await
+        .map_err(AfterValidateError::Db)?;
+    namespaces.push(namespace.to_string());
+    namespaces.sort_unstable();
+    namespaces.dedup();
+
+    // Global plugin scope spans every proxy in a multi-namespace process, so
+    // validate the authoritative cross-namespace composition rather than only
+    // the namespace being mutated.
+    let mut candidate = GatewayConfig::default();
+    for candidate_namespace in namespaces {
+        let snapshot = db
+            .load_namespace_snapshot(&candidate_namespace)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        candidate.proxies.extend(snapshot.proxies);
+        candidate.plugin_configs.extend(snapshot.plugin_configs);
+    }
+
+    for proxy in proxies {
+        if let Some(existing) = candidate
+            .proxies
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == proxy.id)
+        {
+            *existing = proxy.clone();
+        } else {
+            candidate.proxies.push(proxy.clone());
+        }
+    }
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
+        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+}
+
 async fn consumer_candidate_config(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -1825,6 +1881,14 @@ impl AdminResource for PluginConfig {
         {
             validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
         }
+        validate_hmac_request_transform_candidates(
+            db,
+            state,
+            namespace,
+            &[],
+            std::slice::from_ref(resource),
+        )
+        .await?;
 
         Ok(())
     }
@@ -2269,6 +2333,14 @@ impl AdminResource for Proxy {
         // effective `mtls_auth` association; compatibility validation itself
         // remains stream-specific.
         validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
+        validate_hmac_request_transform_candidates(
+            db,
+            state,
+            namespace,
+            std::slice::from_ref(resource),
+            &[],
+        )
+        .await?;
 
         if resource.dispatch_kind.is_stream()
             && let Some(port) = resource.listen_port

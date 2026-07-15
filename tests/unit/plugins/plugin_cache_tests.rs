@@ -3751,6 +3751,7 @@ fn test_hmac_auth_rejects_request_body_transformer_composition() {
         .expect("composition must fail closed");
     assert!(error.contains("hmac_auth cannot be combined"));
     assert!(error.contains("request_transformer"));
+    assert!(error.contains("protocol Http"));
 }
 
 #[test]

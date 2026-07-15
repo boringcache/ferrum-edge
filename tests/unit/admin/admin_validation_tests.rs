@@ -5,6 +5,60 @@
 
 use serde_json::json;
 
+#[test]
+fn test_proxy_and_plugin_writes_run_hmac_transform_candidate_validation() {
+    let source = include_str!("../../../src/admin/crud.rs");
+    assert!(
+        source
+            .matches("validate_hmac_request_transform_candidates(")
+            .count()
+            >= 3,
+        "the helper definition plus Proxy and PluginConfig admission calls must exist"
+    );
+    assert!(
+        source.matches("std::slice::from_ref(resource)").count() >= 2,
+        "both resource write paths must overlay their candidate"
+    );
+    let validation = source
+        .rfind("validate_hmac_request_transform_candidates(")
+        .expect("candidate validation call must exist");
+    let persistence = source
+        .rfind("resource.prepare_for_write()")
+        .expect("CRUD persistence boundary must exist");
+    assert!(
+        validation < persistence,
+        "candidate composition must be rejected before persistence"
+    );
+}
+
+#[test]
+fn test_batch_writes_run_hmac_transform_candidate_validation() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    assert!(
+        source.contains("crud::validate_hmac_request_transform_candidates("),
+        "batch Proxy and PluginConfig admission must validate the candidate chain"
+    );
+    assert!(source.contains("&batch.proxies,"));
+    assert!(source.contains("&batch.plugin_configs,"));
+}
+
+#[test]
+fn test_batch_hmac_uniqueness_is_gated_on_submitted_hmac_consumers() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    let gate = r#".any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())"#;
+    let validation = "candidate_config.validate_unique_hmac_credentials()";
+    let gate_position = source
+        .find(gate)
+        .expect("batch admission must detect submitted HMAC consumers");
+    let validation_position = source
+        .find(validation)
+        .expect("batch admission must validate the authoritative HMAC candidate");
+    assert!(
+        gate_position < validation_position,
+        "legacy HMAC duplicates must not block unrelated batch writes"
+    );
+}
+
 // --- Credential type whitelist tests ---
 
 #[test]

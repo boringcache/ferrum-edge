@@ -11,8 +11,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::plugin_utils::{assert_continue, assert_reject};
+use super::plugin_utils::{assert_continue, assert_reject, create_test_proxy};
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
@@ -85,6 +86,7 @@ fn make_ctx(method: &str, path: &str) -> RequestContext {
     ctx.request_body_sha256 = Some(Sha256::digest(&empty_body).into());
     ctx.request_body_sha512 = Some(Sha512::digest(&empty_body).into());
     ctx.request_authority = Some(TEST_AUTHORITY.to_string());
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     ctx
 }
 
@@ -94,6 +96,12 @@ fn make_ctx_with_query(method: &str, path: &str, query: &str) -> RequestContext 
     let mut ctx = make_ctx(method, path);
     ctx.set_raw_query_string(query.to_string());
     ctx
+}
+
+fn set_ctx_namespace(ctx: &mut RequestContext, namespace: &str) {
+    let mut proxy = create_test_proxy();
+    proxy.namespace = namespace.to_string();
+    ctx.matched_proxy = Some(Arc::new(proxy));
 }
 
 /// Generate a current RFC 2822 date string.
@@ -106,6 +114,7 @@ fn current_date() -> String {
 /// query, so the helpers below sign an empty query by default; tests that set
 /// a query string use `sign_sha256_with_query`.
 fn build_signing_string(
+    namespace: &str,
     username: &str,
     authority: &str,
     method: &str,
@@ -115,8 +124,8 @@ fn build_signing_string(
     digest_header: &str,
 ) -> String {
     format!(
-        "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        username, authority, method, path, query, date, digest_header
+        "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        namespace, username, authority, method, path, query, date, digest_header
     )
 }
 
@@ -129,6 +138,7 @@ fn sign_sha256(secret: &str, method: &str, path: &str, date: &str) -> String {
 fn sign_sha512(secret: &str, method: &str, path: &str, date: &str) -> String {
     let digest_header = sha256_digest_header(&[]);
     let signing_string = build_signing_string(
+        ferrum_edge::config::types::DEFAULT_NAMESPACE,
         TEST_USERNAME,
         TEST_AUTHORITY,
         method,
@@ -154,6 +164,7 @@ fn sign_sha256_with_digest(
     sign_sha256_for_identity(
         secret,
         HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
             username: TEST_USERNAME,
             authority: TEST_AUTHORITY,
             method,
@@ -166,6 +177,7 @@ fn sign_sha256_with_digest(
 }
 
 struct HmacSigningInput<'a> {
+    namespace: &'a str,
     username: &'a str,
     authority: &'a str,
     method: &'a str,
@@ -177,6 +189,7 @@ struct HmacSigningInput<'a> {
 
 fn sign_sha256_for_identity(secret: &str, input: HmacSigningInput<'_>) -> String {
     let signing_string = build_signing_string(
+        input.namespace,
         input.username,
         input.authority,
         input.method,
@@ -202,6 +215,7 @@ fn sign_sha256_with_query(
     sign_sha256_for_identity(
         secret,
         HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
             username: TEST_USERNAME,
             authority: TEST_AUTHORITY,
             method,
@@ -374,6 +388,7 @@ async fn test_auth_params_accept_quoted_commas_escapes_and_mixed_case_names() {
     let signature = sign_sha256_for_identity(
         TEST_SECRET,
         HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
             username,
             authority: TEST_AUTHORITY,
             method,
@@ -432,6 +447,7 @@ async fn test_signature_binds_authority_and_username() {
     let signature = sign_sha256_for_identity(
         shared,
         HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
             username: "alice",
             authority: TEST_AUTHORITY,
             method: "GET",
@@ -463,6 +479,109 @@ async fn test_signature_binds_authority_and_username() {
     assert_reject(
         plugin.authenticate(&mut cross_host, &consumer_index).await,
         Some(401),
+    );
+}
+
+#[tokio::test]
+async fn test_signature_and_identity_lookup_are_namespace_scoped() {
+    let shared = "cross-namespace-reused-hmac-secret-at-least-32-characters";
+    let mut tenant_a = create_hmac_consumer_named("tenant-a-id", "alice", shared);
+    tenant_a.namespace = "tenant-a".to_string();
+    let mut tenant_b = create_hmac_consumer_named("tenant-b-id", "bob", shared);
+    tenant_b.namespace = "tenant-b".to_string();
+    let consumer_index = ConsumerIndex::new(&[tenant_a, tenant_b]);
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let date = current_date();
+    let digest = sha256_digest_header(&[]);
+
+    let tenant_a_signature = sign_sha256_for_identity(
+        shared,
+        HmacSigningInput {
+            namespace: "tenant-a",
+            username: "alice",
+            authority: TEST_AUTHORITY,
+            method: "GET",
+            path: "/bound",
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
+    );
+    let mut replayed_in_tenant_b = make_ctx("GET", "/bound");
+    set_ctx_namespace(&mut replayed_in_tenant_b, "tenant-b");
+    replayed_in_tenant_b.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("alice", Some("hmac-sha256"), &tenant_a_signature),
+    );
+    replayed_in_tenant_b
+        .headers
+        .insert("date".to_string(), date.clone());
+    assert_reject(
+        plugin
+            .authenticate(&mut replayed_in_tenant_b, &consumer_index)
+            .await,
+        Some(401),
+    );
+
+    let tenant_b_wrong_identity = sign_sha256_for_identity(
+        shared,
+        HmacSigningInput {
+            namespace: "tenant-b",
+            username: "alice",
+            authority: TEST_AUTHORITY,
+            method: "GET",
+            path: "/bound",
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
+    );
+    let mut wrong_identity = make_ctx("GET", "/bound");
+    set_ctx_namespace(&mut wrong_identity, "tenant-b");
+    wrong_identity.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("alice", Some("hmac-sha256"), &tenant_b_wrong_identity),
+    );
+    wrong_identity
+        .headers
+        .insert("date".to_string(), date.clone());
+    assert_reject(
+        plugin
+            .authenticate(&mut wrong_identity, &consumer_index)
+            .await,
+        Some(401),
+    );
+
+    let tenant_b_signature = sign_sha256_for_identity(
+        shared,
+        HmacSigningInput {
+            namespace: "tenant-b",
+            username: "bob",
+            authority: TEST_AUTHORITY,
+            method: "GET",
+            path: "/bound",
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
+    );
+    let mut valid_tenant_b = make_ctx("GET", "/bound");
+    set_ctx_namespace(&mut valid_tenant_b, "tenant-b");
+    valid_tenant_b.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("bob", Some("hmac-sha256"), &tenant_b_signature),
+    );
+    valid_tenant_b
+        .headers
+        .insert("date".to_string(), date);
+    assert_continue(
+        plugin
+            .authenticate(&mut valid_tenant_b, &consumer_index)
+            .await,
+    );
+    assert_eq!(
+        valid_tenant_b.identified_consumer.unwrap().id,
+        "tenant-b-id"
     );
 }
 

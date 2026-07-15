@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 type HmacSha256 = Hmac<Sha256>;
 
 struct HmacSignatureInput<'a> {
+    namespace: &'a str,
     method: &'a str,
     path: &'a str,
     query: &'a str,
@@ -30,6 +31,7 @@ pub fn generate_hmac_signature(
     secret: &str,
 ) -> String {
     generate_hmac_signature_from(HmacSignatureInput {
+        namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
         method,
         path,
         query: "",
@@ -52,6 +54,7 @@ pub fn generate_hmac_signature_with_query(
     secret: &str,
 ) -> String {
     generate_hmac_signature_from(HmacSignatureInput {
+        namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
         method,
         path,
         query,
@@ -75,6 +78,7 @@ pub fn generate_hmac_signature_with_digest(
     digest_header: &str,
 ) -> String {
     generate_hmac_signature_from(HmacSignatureInput {
+        namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
         method,
         path,
         query: "",
@@ -88,7 +92,8 @@ pub fn generate_hmac_signature_with_digest(
 
 fn generate_hmac_signature_from(input: HmacSignatureInput<'_>) -> String {
     let signing_string = format!(
-        "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        input.namespace,
         input.username,
         input.authority,
         input.method,
