@@ -19,9 +19,9 @@
 //! 9. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
 //!    Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
 //! 10. **Plugin: after_proxy** — CORS headers, response caching metadata, response transforms,
-//!    response size limiting, AI rate limiter
+//!     response size limiting, AI rate limiter
 //! 11. **Plugin: on_response_body** — raw backend body inspection before transforms:
-//!    AI token metrics, AI rate limiter
+//!     AI token metrics, AI rate limiter
 //! 12. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
 //! 13. **Plugin: on_final_response_body** — buffered body validation/storage:
 //!     body validation, response size limiting, response caching
