@@ -738,6 +738,12 @@ pub struct RequestContext {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Encoding selected by the built-in compression plugin for the response it
+    /// will create at the gateway. This is authoritative ownership state for
+    /// distinguishing planned gateway compression from an already-encoded
+    /// origin response; public plugin metadata is not trusted for that security
+    /// decision.
+    gateway_response_compression_algorithm: Option<&'static str>,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -1041,6 +1047,7 @@ impl RequestContext {
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
+            gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -1093,6 +1100,14 @@ impl RequestContext {
     /// into `ctx.metadata` from `on_response_stream_terminated`.
     pub fn response_stream_id(&self) -> Option<u64> {
         self.response_stream_id
+    }
+
+    pub(crate) fn mark_gateway_response_compression(&mut self, algorithm: &'static str) {
+        self.gateway_response_compression_algorithm = Some(algorithm);
+    }
+
+    pub(crate) fn gateway_response_compression_algorithm(&self) -> Option<&'static str> {
+        self.gateway_response_compression_algorithm
     }
 
     /// Begin tracking initial-response policy against genuine initial headers
@@ -1175,6 +1190,7 @@ impl RequestContext {
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
+            gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
@@ -3481,9 +3497,13 @@ pub trait Plugin: Send + Sync {
     /// decision, which is why this is a separate hook.
     ///
     /// The full `response_headers` map (and `response_status`) are also passed so
-    /// a plugin can release a response it will decline to transform once headers
-    /// are known — e.g. `compression` skips `206 Partial Content` / `Content-Range`
-    /// responses, so it must not pin them onto the buffered path either.
+    /// the refinement can account for representation metadata beyond
+    /// `Content-Type`. A plugin can release a response it will decline to
+    /// transform once headers are known — e.g. `compression` skips `206 Partial
+    /// Content` / `Content-Range` responses, so it must not pin them onto the
+    /// buffered path either. Conversely, a buffered final hook that must decode
+    /// or reject a non-identity `Content-Encoding` must keep that representation
+    /// buffered; releasing opaque wire bytes would bypass the final hook.
     ///
     /// Contract: this MUST only narrow `should_buffer_response_body` — it may
     /// return `false` where the unconditional check returned `true`, but never
