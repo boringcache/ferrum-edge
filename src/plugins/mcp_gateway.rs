@@ -379,6 +379,13 @@ struct RequestRewrite<'a> {
     response_resource_rewrite_possible: bool,
 }
 
+#[derive(Clone, Default)]
+struct CatalogCollisionTombstones {
+    tools: HashSet<String>,
+    prompts: HashSet<String>,
+    resources: HashSet<String>,
+}
+
 #[derive(Clone)]
 struct McpCatalog {
     tools: HashMap<String, ToolCatalogEntry>,
@@ -406,6 +413,11 @@ struct McpCatalog {
     // these families surface -32006 instead of a cached empty catalog until a
     // refresh succeeds; other families stay usable.
     unavailable: BTreeSet<&'static str>,
+    // Public keys suppressed by collision handling are absent from the maps
+    // above, so retain explicit tombstones across degraded refreshes. Otherwise
+    // a healthy upstream could become the temporary winner of a prior
+    // collision merely because another participant failed its list request.
+    collision_tombstones: CatalogCollisionTombstones,
 }
 
 impl Default for McpCatalog {
@@ -423,6 +435,7 @@ impl Default for McpCatalog {
             degraded: BTreeSet::new(),
             last_good: BTreeSet::new(),
             unavailable: BTreeSet::new(),
+            collision_tombstones: CatalogCollisionTombstones::default(),
         }
     }
 }
@@ -469,6 +482,10 @@ impl FamilyRefreshStats {
 
     fn fully_unavailable(&self) -> bool {
         self.attempted > 0 && self.failed == self.attempted && !self.has_last_good
+    }
+
+    fn fully_authoritative(&self) -> bool {
+        self.attempted > 0 && self.failed == 0
     }
 }
 
@@ -1715,9 +1732,7 @@ impl McpGateway {
         let mut tools = HashMap::new();
         let mut prompts = HashMap::new();
         let mut resources = HashMap::new();
-        let mut collided_tools = HashSet::new();
-        let mut collided_prompts = HashSet::new();
-        let mut collided_resources = HashSet::new();
+        let mut collision_tombstones = CatalogCollisionTombstones::default();
         // A single unavailable upstream must not abort the whole refresh: each
         // failed `*/list` keeps that (server, family)'s last-good entries stale
         // and is recorded as degraded, while other upstreams and families
@@ -1755,7 +1770,7 @@ impl McpGateway {
                                 let public_name = entry.public_name.clone();
                                 insert_catalog_entry(
                                     &mut tools,
-                                    &mut collided_tools,
+                                    &mut collision_tombstones.tools,
                                     public_name,
                                     entry,
                                     &server.server_id,
@@ -1778,7 +1793,7 @@ impl McpGateway {
                         carry_stale_entries(
                             &old_catalog.tools,
                             &mut tools,
-                            &mut collided_tools,
+                            &mut collision_tombstones.tools,
                             |entry| entry.server_id == server.server_id,
                             &server.server_id,
                             "tool",
@@ -1808,7 +1823,7 @@ impl McpGateway {
                                 let public_name = entry.public_name.clone();
                                 insert_catalog_entry(
                                     &mut prompts,
-                                    &mut collided_prompts,
+                                    &mut collision_tombstones.prompts,
                                     public_name,
                                     entry,
                                     &server.server_id,
@@ -1831,7 +1846,7 @@ impl McpGateway {
                         carry_stale_entries(
                             &old_catalog.prompts,
                             &mut prompts,
-                            &mut collided_prompts,
+                            &mut collision_tombstones.prompts,
                             |entry| entry.server_id == server.server_id,
                             &server.server_id,
                             "prompt",
@@ -1861,7 +1876,7 @@ impl McpGateway {
                                 let public_uri = entry.public_uri.clone();
                                 insert_catalog_entry(
                                     &mut resources,
-                                    &mut collided_resources,
+                                    &mut collision_tombstones.resources,
                                     public_uri,
                                     entry,
                                     &server.server_id,
@@ -1884,7 +1899,7 @@ impl McpGateway {
                         carry_stale_entries(
                             &old_catalog.resources,
                             &mut resources,
-                            &mut collided_resources,
+                            &mut collision_tombstones.resources,
                             |entry| entry.server_id == server.server_id,
                             &server.server_id,
                             "resource",
@@ -1894,6 +1909,33 @@ impl McpGateway {
                 }
             }
         }
+
+        // A degraded family is not authoritative evidence that a prior
+        // collision disappeared: the failed upstream may still expose the
+        // colliding key. Reapply old tombstones after merging fresh and stale
+        // entries, and clear them only when every attempted upstream for that
+        // family listed successfully. Resource keys use a server-id-qualified
+        // URI and cannot collide across servers, but retaining their defensive
+        // duplicate-key tombstones here keeps all collision-checked maps on the
+        // same fail-closed lifecycle.
+        preserve_collision_tombstones(
+            &old_catalog.collision_tombstones.tools,
+            &mut collision_tombstones.tools,
+            &mut tools,
+            families.get("tools"),
+        );
+        preserve_collision_tombstones(
+            &old_catalog.collision_tombstones.prompts,
+            &mut collision_tombstones.prompts,
+            &mut prompts,
+            families.get("prompts"),
+        );
+        preserve_collision_tombstones(
+            &old_catalog.collision_tombstones.resources,
+            &mut collision_tombstones.resources,
+            &mut resources,
+            families.get("resources"),
+        );
 
         // A fully unavailable family (every attempted list failed, no last-good
         // state anywhere in the family) must not be published as an empty
@@ -1948,6 +1990,7 @@ impl McpGateway {
             .unavailable
             .retain(|family| *family == "resource_templates");
         catalog.unavailable.extend(unavailable);
+        catalog.collision_tombstones = collision_tombstones;
         if changed || catalog.version == 0 {
             catalog.version = catalog.version.saturating_add(1);
         }
@@ -4355,6 +4398,27 @@ fn carry_stale_entries<T: Clone>(
             server_id,
             item_kind,
         );
+    }
+}
+
+/// Keep previously ambiguous public keys suppressed unless the current family
+/// refresh is authoritative. Collision-suppressed entries are intentionally
+/// absent from the published maps, so carrying only map entries cannot retain
+/// this fail-closed state when one prior collision participant is unavailable.
+fn preserve_collision_tombstones<T>(
+    old_collisions: &HashSet<String>,
+    collisions: &mut HashSet<String>,
+    entries: &mut HashMap<String, T>,
+    refresh_stats: Option<&FamilyRefreshStats>,
+) {
+    if old_collisions.is_empty()
+        || refresh_stats.is_some_and(FamilyRefreshStats::fully_authoritative)
+    {
+        return;
+    }
+    for key in old_collisions {
+        entries.remove(key);
+        collisions.insert(key.clone());
     }
 }
 

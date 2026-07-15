@@ -3651,6 +3651,70 @@ fn sorted_tool_names(body: &Value) -> Vec<String> {
     names
 }
 
+fn sorted_prompt_names(body: &Value) -> Vec<String> {
+    let mut names: Vec<String> = body["result"]["prompts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("prompts/list result missing prompts array: {body}"))
+        .iter()
+        .map(|prompt| prompt["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+fn sorted_resource_uris(body: &Value) -> Vec<String> {
+    let mut uris: Vec<String> = body["result"]["resources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("resources/list result missing resources array: {body}"))
+        .iter()
+        .map(|resource| resource["uri"].as_str().unwrap().to_string())
+        .collect();
+    uris.sort();
+    uris
+}
+
+fn collision_family_config(
+    one_url: &str,
+    two_url: &str,
+    aggregate_tools: bool,
+    aggregate_prompts: bool,
+    aggregate_resources: bool,
+) -> Value {
+    json!({
+        "enabled": true,
+        "mode": "aggregate_router",
+        "endpoint": { "path": "/mcp", "protocol_versions": ["2025-11-25"] },
+        "sessions": { "initialize_upstreams": "passthrough" },
+        "discovery": {
+            "aggregate_tools": aggregate_tools,
+            "aggregate_prompts": aggregate_prompts,
+            "aggregate_resources": aggregate_resources,
+            "namespace_separator": ".",
+            "cache_ttl_seconds": 1,
+            "on_new_tool": "allow"
+        },
+        "policy": { "default_action": "allow" },
+        "servers": {
+            "one": {
+                "upstream_url": one_url,
+                "namespace": "a",
+                "enabled": true,
+                "expose_tools": aggregate_tools,
+                "expose_prompts": aggregate_prompts,
+                "expose_resources": aggregate_resources
+            },
+            "two": {
+                "upstream_url": two_url,
+                "namespace": "a.b",
+                "enabled": true,
+                "expose_tools": aggregate_tools,
+                "expose_prompts": aggregate_prompts,
+                "expose_resources": aggregate_resources
+            }
+        }
+    })
+}
+
 fn single_server_family_config(
     upstream_url: &str,
     aggregate_tools: bool,
@@ -4246,6 +4310,311 @@ async fn aggregate_serves_full_catalog_stale_when_all_upstreams_fail() {
         ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
         Some("github:tools")
     );
+}
+
+#[tokio::test]
+async fn aggregate_name_collision_tombstones_survive_partial_failure() {
+    let one = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "one-tools",
+            "result": {"tools": [
+                {"name": "b.c", "inputSchema": {"type": "object"}}
+            ]}
+        })))
+        .mount(&one)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "one-prompts",
+            "result": {"prompts": [{"name": "b.c"}]}
+        })))
+        .mount(&one)
+        .await;
+
+    let two = MockServer::start().await;
+    let tool_requests = Arc::new(AtomicUsize::new(0));
+    let tool_counter = Arc::clone(&tool_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            match tool_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-tools-collision",
+                    "result": {"tools": [
+                        {"name": "c", "inputSchema": {"type": "object"}}
+                    ]}
+                })),
+                1 => ResponseTemplate::new(500),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-tools-cleared",
+                    "result": {"tools": []}
+                })),
+            }
+        })
+        .mount(&two)
+        .await;
+    let prompt_requests = Arc::new(AtomicUsize::new(0));
+    let prompt_counter = Arc::clone(&prompt_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            match prompt_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-prompts-collision",
+                    "result": {"prompts": [{"name": "c"}]}
+                })),
+                1 => ResponseTemplate::new(500),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-prompts-cleared",
+                    "result": {"prompts": []}
+                })),
+            }
+        })
+        .mount(&two)
+        .await;
+
+    let config = collision_family_config(
+        &format!("{}/mcp", one.uri()),
+        &format!("{}/mcp", two.uri()),
+        true,
+        true,
+        false,
+    );
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 118).await;
+    assert_eq!(sorted_tool_names(&body), Vec::<String>::new());
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        119,
+        "prompts/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(sorted_prompt_names(&body), Vec::<String>::new());
+
+    // Both names were collision-suppressed and therefore absent from the old
+    // published maps. When server two fails, its healthy peer must not become
+    // the temporary winner for either catalog family.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 120).await;
+    assert_eq!(sorted_tool_names(&body), Vec::<String>::new());
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("two:prompts,two:tools")
+    );
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        121,
+        "tools/call",
+        json!({"name": "a.b.c", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32003);
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        122,
+        "prompts/get",
+        json!({"name": "a.b.c"}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32008);
+
+    // Only a fully successful family refresh can clear the tombstones. Server
+    // two now authoritatively reports empty lists, so server one's entries are
+    // safe to publish and route again.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        123,
+        "prompts/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(sorted_prompt_names(&body), vec!["a.b.c"]);
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 124).await;
+    assert_eq!(sorted_tool_names(&body), vec!["a.b.c"]);
+    assert_eq!(tool_requests.load(Ordering::SeqCst), 3);
+    assert_eq!(prompt_requests.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn aggregate_resource_collision_tombstone_requires_authoritative_refresh() {
+    let one = MockServer::start().await;
+    let one_resource_requests = Arc::new(AtomicUsize::new(0));
+    let one_resource_counter = Arc::clone(&one_resource_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "resources/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            match one_resource_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "one-resources-collision",
+                    "result": {"resources": [
+                        {"uri": "file:///shared", "name": "First"},
+                        {"uri": "file:///shared", "name": "Duplicate"}
+                    ]}
+                })),
+                1 => ResponseTemplate::new(500),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "one-resources-single",
+                    "result": {"resources": [
+                        {"uri": "file:///shared", "name": "Resolved"}
+                    ]}
+                })),
+            }
+        })
+        .mount(&one)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "one-templates",
+            "result": {"resourceTemplates": []}
+        })))
+        .mount(&one)
+        .await;
+
+    let two = MockServer::start().await;
+    let two_resource_requests = Arc::new(AtomicUsize::new(0));
+    let two_resource_counter = Arc::clone(&two_resource_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "resources/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            match two_resource_counter.fetch_add(1, Ordering::SeqCst) {
+                2 => ResponseTemplate::new(500),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "two-resources",
+                    "result": {"resources": [
+                        {"uri": "file:///other", "name": "Other"}
+                    ]}
+                })),
+            }
+        })
+        .mount(&two)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "two-templates",
+            "result": {"resourceTemplates": []}
+        })))
+        .mount(&two)
+        .await;
+
+    let config = collision_family_config(
+        &format!("{}/mcp", one.uri()),
+        &format!("{}/mcp", two.uri()),
+        false,
+        false,
+        true,
+    );
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let other_uri = "mcp://two/file%3A%2F%2F%2Fother";
+    let shared_uri = "mcp://one/file%3A%2F%2F%2Fshared";
+
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        125,
+        "resources/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(sorted_resource_uris(&body), vec![other_uri]);
+
+    // The colliding server fails while the other server succeeds. The old
+    // resource tombstone must survive even though its entries are absent from
+    // the published map.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        126,
+        "resources/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(sorted_resource_uris(&body), vec![other_uri]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("one:resources")
+    );
+
+    // On the next pass the former collision source succeeds with one entry,
+    // but the peer fails. That partial refresh is still not authoritative, so
+    // it cannot clear the prior tombstone or make the shared URI routable.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        127,
+        "resources/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(sorted_resource_uris(&body), vec![other_uri]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("two:resources")
+    );
+    let (_, body, _) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        128,
+        "resources/read",
+        json!({"uri": shared_uri}),
+    )
+    .await;
+    assert_eq!(body["error"]["code"], -32007);
+
+    // Both servers now list successfully, authoritatively proving that the
+    // duplicate disappeared and allowing the formerly suppressed URI back.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = aggregate_request_with_metadata(
+        &plugin,
+        &session_id,
+        129,
+        "resources/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(sorted_resource_uris(&body), vec![shared_uri, other_uri]);
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
+    assert_eq!(one_resource_requests.load(Ordering::SeqCst), 4);
+    assert_eq!(two_resource_requests.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]
