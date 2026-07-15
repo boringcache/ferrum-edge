@@ -8816,8 +8816,18 @@ async fn send_h3_error_flavor_aware_with_policy(
             initial_response_header_policy_plugins,
         )
         .await
-    } else {
+    } else if initial_response_header_policy_plugins.is_empty() {
         send_h3_response(stream, http_status, http_body).await
+    } else {
+        let mut headers = HashMap::new();
+        finalize_h3_gateway_error_headers(
+            flavor,
+            http_status,
+            http_body.as_bytes(),
+            &mut headers,
+            initial_response_header_policy_plugins,
+        );
+        send_h3_reject_response(stream, http_status, http_body.as_bytes(), &headers).await
     }
 }
 
