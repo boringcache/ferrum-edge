@@ -1814,6 +1814,8 @@ pub(crate) fn validate_hmac_request_transform_candidate(
     let mut global_plugins = Vec::new();
     let mut scoped_plugins: HmacCompositionPluginMap<'_> = HashMap::new();
     let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
+    let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+    let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
 
     for plugin_config in &config.plugin_configs {
         if !plugin_config.enabled
@@ -1822,7 +1824,13 @@ pub(crate) fn validate_hmac_request_transform_candidate(
         {
             continue;
         }
-        match try_create_plugin(plugin_config, http_client) {
+        match try_create_plugin(
+            plugin_config,
+            config,
+            http_client,
+            &current_adaptive_states,
+            &mut staged_adaptive_states,
+        ) {
             Ok(Some(plugin)) if plugin_config.scope == PluginScope::Global => {
                 global_plugins.push(plugin);
             }
