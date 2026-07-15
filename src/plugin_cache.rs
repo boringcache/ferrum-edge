@@ -210,7 +210,9 @@ impl Plugin for PriorityOverridePlugin {
         backend_path: &str,
         phase: BackendPathPolicyPhase,
     ) -> PluginResult {
-        self.inner.on_backend_path_resolved(ctx, backend_path, phase).await
+        self.inner
+            .on_backend_path_resolved(ctx, backend_path, phase)
+            .await
     }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();

@@ -13838,7 +13838,10 @@ async fn run_backend_path_plugins_or_build_reject(
 ) -> Option<Response<ProxyBody>> {
     let phase_start = Instant::now();
     for plugin in backend_path_plugins {
-        match plugin.on_backend_path_resolved(ctx, backend_path, phase).await {
+        match plugin
+            .on_backend_path_resolved(ctx, backend_path, phase)
+            .await
+        {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;

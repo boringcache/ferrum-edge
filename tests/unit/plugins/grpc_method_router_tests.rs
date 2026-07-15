@@ -19,7 +19,9 @@ async fn enforce_effective_path(
     ctx: &mut ferrum_edge::plugins::RequestContext,
 ) -> PluginResult {
     let path = ctx.path.clone();
-    plugin.on_backend_path_resolved(ctx, &path, BackendPathPolicyPhase::Enforce).await
+    plugin
+        .on_backend_path_resolved(ctx, &path, BackendPathPolicyPhase::Enforce)
+        .await
 }
 
 // ── Plugin creation ──
@@ -191,11 +193,7 @@ async fn test_stripped_prefix_is_enforced_as_backend_effective_method() {
     assert!(!ctx.metadata.contains_key("grpc_full_method"));
 
     let result = plugin
-        .on_backend_path_resolved(
-            &mut ctx,
-            "/pkg.Svc/Denied",
-            BackendPathPolicyPhase::Enforce,
-        )
+        .on_backend_path_resolved(&mut ctx, "/pkg.Svc/Denied", BackendPathPolicyPhase::Enforce)
         .await;
     assert_reject(result, Some(403));
     assert_eq!(
@@ -374,11 +372,7 @@ async fn test_backend_path_preview_does_not_charge_method_rate_limit() {
 
     for _ in 0..2 {
         let result = plugin
-            .on_backend_path_resolved(
-                &mut ctx,
-                "/pkg.Svc/Create",
-                BackendPathPolicyPhase::Preview,
-            )
+            .on_backend_path_resolved(&mut ctx, "/pkg.Svc/Create", BackendPathPolicyPhase::Preview)
             .await;
         assert_continue(result);
     }

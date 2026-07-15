@@ -5571,7 +5571,10 @@ async fn run_h3_backend_path_plugins_or_send_reject(
 ) -> Result<bool, anyhow::Error> {
     let phase_start = std::time::Instant::now();
     for plugin in backend_path_plugins {
-        match plugin.on_backend_path_resolved(ctx, backend_path, phase).await {
+        match plugin
+            .on_backend_path_resolved(ctx, backend_path, phase)
+            .await
+        {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
