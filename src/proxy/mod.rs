@@ -13863,6 +13863,42 @@ fn missing_authentication_reject(
     (401, MISSING_AUTHENTICATION_BODY.to_vec(), headers)
 }
 
+/// Return the RFC 6265 cookie-name from the leading cookie-pair only.
+/// Attributes, padded names, and lines without a valid token are not names.
+fn set_cookie_name(set_cookie: &str) -> Option<&str> {
+    let cookie_pair = set_cookie
+        .split_once(';')
+        .map_or(set_cookie, |(pair, _)| pair);
+    let (name, _) = cookie_pair.split_once('=')?;
+    if name.is_empty()
+        || !name.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'a'..=b'z'
+                    | b'|'
+                    | b'~'
+            )
+        })
+    {
+        return None;
+    }
+    Some(name)
+}
+
 fn attach_auth_rejection_set_cookie(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
@@ -13876,11 +13912,21 @@ fn attach_auth_rejection_set_cookie(
     });
     headers.retain(|name, _| !name.eq_ignore_ascii_case("set-cookie"));
     let mut merged = existing.unwrap_or_default();
-    if !merged.split('\n').any(|value| value == cookie.as_str()) {
+    for candidate in cookie.split('\n') {
+        let candidate_name = set_cookie_name(candidate);
+        // The selected (later) rejection owns conflicts. Preserve its exact
+        // value and order, appending only independently named earlier cookies.
+        let conflicts = merged.split('\n').any(|selected| {
+            selected == candidate
+                || candidate_name.is_some_and(|name| set_cookie_name(selected) == Some(name))
+        });
+        if conflicts {
+            continue;
+        }
         if !merged.is_empty() {
             merged.push('\n');
         }
-        merged.push_str(&cookie);
+        merged.push_str(candidate);
     }
     headers.insert("set-cookie".to_string(), merged);
 }

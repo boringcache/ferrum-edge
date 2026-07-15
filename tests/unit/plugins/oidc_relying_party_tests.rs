@@ -486,7 +486,9 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
     first_config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
     first_config["providers"][0]["required_scopes"] = json!(["admin"]);
     first_config["providers"][0]["consumer_identity_claim"] = json!("email");
-    first_config["session"]["cookie_name"] = json!("first_session");
+    // The selected correlation cookie starts with `ferrum_`; the shorter
+    // requester cookie name proves conflict checks use the complete name.
+    first_config["session"]["cookie_name"] = json!("ferrum");
     let first =
         Arc::new(OidcRelyingParty::new(&first_config, PluginHttpClient::default()).unwrap());
     let mut second_config = base_config();
@@ -536,11 +538,11 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
     let cookies: Vec<&str> = set_cookie.split('\n').collect();
     assert_eq!(cookies.len(), 2);
     assert!(cookies[0].contains("Path=/oauth/callback"));
-    assert!(cookies[1].starts_with("first_session="));
+    assert!(cookies[1].starts_with("ferrum="));
     assert_eq!(
         cookies
             .iter()
-            .filter(|cookie| cookie.starts_with("first_session="))
+            .filter(|cookie| cookie.starts_with("ferrum="))
             .count(),
         1
     );
@@ -570,6 +572,89 @@ async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
             .map(|value| value.split('\n').count()),
         Some(2),
         "reject finalization must not duplicate either cookie"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_keeps_later_clear_for_shared_session_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut first_config = base_config();
+    first_config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
+    first_config["providers"][0]["required_scopes"] = json!(["admin"]);
+    first_config["providers"][0]["consumer_identity_claim"] = json!("email");
+    first_config["session"]["cookie_name"] = json!("ferrum");
+    let first =
+        Arc::new(OidcRelyingParty::new(&first_config, PluginHttpClient::default()).unwrap());
+    let mut second_config = base_config();
+    second_config["session"]["cookie_name"] = json!("ferrum");
+    let second =
+        Arc::new(OidcRelyingParty::new(&second_config, PluginHttpClient::default()).unwrap());
+    let now = chrono::Utc::now().timestamp();
+    let first_cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &first,
+        json!({
+            "sub": "oidc-subject",
+            "email": "rejected@example.test",
+            "scope": "viewer",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .unwrap();
+    let first_pair = first_cookie.split(';').next().expect("session cookie pair");
+    let mut ctx = html_ctx();
+    ctx.headers
+        .insert("cookie".to_string(), first_pair.to_string());
+    let first_plugin: Arc<dyn Plugin> = first.clone();
+    let second_plugin: Arc<dyn Plugin> = second;
+
+    let (status_code, _, headers) = run_authentication_phase(
+        AuthMode::Multi,
+        &[first_plugin, second_plugin],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("the later browser challenge must reject");
+    assert_eq!(status_code, 302);
+    assert!(
+        headers
+            .get("location")
+            .is_some_and(|location| location.starts_with("https://issuer.example.com/authorize"))
+    );
+    let set_cookie = headers
+        .iter()
+        .find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("set-cookie")
+                .then_some(value.as_str())
+        })
+        .expect("the selected challenge cookies must reach the client");
+    let cookies: Vec<&str> = set_cookie.split('\n').collect();
+    assert_eq!(cookies.len(), 2);
+    assert!(cookies[0].starts_with("ferrum_oidc_state_"));
+    assert!(cookies[0].contains("Path=/oauth/callback"));
+    assert_eq!(
+        cookies[1],
+        "ferrum=; Max-Age=0; Path=/; SameSite=lax; Secure; HttpOnly"
+    );
+    assert!(oidc_session_state_from_set_cookie_for_test(&first, set_cookie).is_none());
+    assert!(
+        ctx.metadata
+            .keys()
+            .all(|key| !key.contains("rejection_set_cookie"))
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
