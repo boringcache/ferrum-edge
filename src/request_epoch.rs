@@ -79,14 +79,15 @@ fn changed_upstream_endpoint_ids(
 ) -> HashSet<String> {
     let mut changed = HashSet::new();
     for (upstream_id, replacement_upstream) in replacement.upstreams() {
-        let endpoints_changed = current
-            .upstreams()
-            .get(upstream_id)
-            .is_none_or(|current_upstream| {
-                upstream_endpoint_keys(current_upstream)
-                    != upstream_endpoint_keys(replacement_upstream)
-                    || current_upstream.subsets != replacement_upstream.subsets
-            });
+        let endpoints_changed =
+            current
+                .upstreams()
+                .get(upstream_id)
+                .is_none_or(|current_upstream| {
+                    upstream_endpoint_keys(current_upstream)
+                        != upstream_endpoint_keys(replacement_upstream)
+                        || current_upstream.subsets != replacement_upstream.subsets
+                });
         if endpoints_changed {
             changed.insert(upstream_id.clone());
         }
@@ -711,7 +712,10 @@ mod tests {
             "route",
             "mesh_route_dispatch",
             json!({
-                "rules": [{"destination": {"upstream_id": "canary"}}]
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "canary"}
+                }]
             }),
         );
         let initial = config(
@@ -729,11 +733,8 @@ mod tests {
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
                 .unwrap_or_else(|| panic!("adaptive plugin should be cached"));
-            let mut ctx = RequestContext::new(
-                "192.0.2.10".to_string(),
-                "GET".to_string(),
-                "/".to_string(),
-            );
+            let mut ctx =
+                RequestContext::new("192.0.2.10".to_string(), "GET".to_string(), "/".to_string());
             ctx.lb_generation = epoch.lb_generation;
             let admission = BackendAdmissionContext {
                 proxy: &epoch.config.proxies[0],
@@ -814,11 +815,8 @@ mod tests {
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
                 .unwrap_or_else(|| panic!("adaptive plugin should be cached"));
-            let mut ctx = RequestContext::new(
-                "192.0.2.10".to_string(),
-                "GET".to_string(),
-                "/".to_string(),
-            );
+            let mut ctx =
+                RequestContext::new("192.0.2.10".to_string(), "GET".to_string(), "/".to_string());
             ctx.lb_generation = epoch.lb_generation;
             let admission = BackendAdmissionContext {
                 proxy: &epoch.config.proxies[0],
@@ -922,11 +920,8 @@ mod tests {
             .find(|plugin| plugin.name() == "adaptive_concurrency")
             .cloned()
             .unwrap_or_else(|| panic!("adaptive plugin should be cached"));
-        let mut ctx = RequestContext::new(
-            "192.0.2.10".to_string(),
-            "GET".to_string(),
-            "/".to_string(),
-        );
+        let mut ctx =
+            RequestContext::new("192.0.2.10".to_string(), "GET".to_string(), "/".to_string());
         ctx.lb_generation = pinned_epoch.lb_generation;
         let admission = BackendAdmissionContext {
             proxy: &pinned_epoch.config.proxies[0],

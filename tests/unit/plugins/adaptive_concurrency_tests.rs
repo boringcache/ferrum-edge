@@ -845,16 +845,8 @@ fn adaptive_concurrency_pinned_old_view_uses_replacement_admission_bounds() {
         .rebuild(&reloaded)
         .expect("compatible emergency limit decrease should publish");
 
-    let held = expect_admitted(acquire_from_plugin(
-        &old_view,
-        &config.proxies[0],
-        None,
-    ));
-    assert_rejected(acquire_from_plugin(
-        &old_view,
-        &config.proxies[0],
-        None,
-    ));
+    let held = expect_admitted(acquire_from_plugin(&old_view, &config.proxies[0], None));
+    assert_rejected(acquire_from_plugin(&old_view, &config.proxies[0], None));
     drop(held);
 }
 

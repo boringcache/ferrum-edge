@@ -989,8 +989,7 @@ fn create_adaptive_concurrency_plugin(
     let parsed = Arc::new(crate::plugins::adaptive_concurrency::parse_config_value(
         &pc.config,
     )?);
-    let route_definition =
-        adaptive_concurrency_route_definition(pc, parsed.key_by, gateway_config);
+    let route_definition = adaptive_concurrency_route_definition(pc, parsed.key_by, gateway_config);
     if let Some(existing) = staged.get(&identity) {
         if !adaptive_definition_matches(existing, pc, &route_definition) {
             return Err(format!(
@@ -1027,7 +1026,9 @@ fn create_adaptive_concurrency_plugin(
         )
     } else {
         (
-            Arc::new(AdaptiveConcurrencyLimiter::new(http_client.pool_shard_amount())),
+            Arc::new(AdaptiveConcurrencyLimiter::new(
+                http_client.pool_shard_amount(),
+            )),
             1,
             false,
         )
