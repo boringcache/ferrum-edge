@@ -951,34 +951,33 @@ fn search_result_done(message_id: u8, result_code: u8) -> Vec<u8> {
     )
 }
 
-async fn read_ldap_message_bytes(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+async fn try_read_ldap_message_bytes(
+    stream: &mut tokio::net::TcpStream,
+) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
 
     let mut header = [0u8; 2];
-    stream
-        .read_exact(&mut header)
-        .await
-        .expect("read LDAP message header");
+    stream.read_exact(&mut header).await?;
     assert_eq!(header[0], 0x30, "LDAP message must be a BER sequence");
     let body_len = if header[1] & 0x80 == 0 {
         usize::from(header[1])
     } else {
         let length_octets = usize::from(header[1] & 0x7f);
         let mut encoded_len = vec![0u8; length_octets];
-        stream
-            .read_exact(&mut encoded_len)
-            .await
-            .expect("read LDAP long-form length");
+        stream.read_exact(&mut encoded_len).await?;
         encoded_len
             .into_iter()
             .fold(0usize, |length, octet| (length << 8) | usize::from(octet))
     };
     let mut body = vec![0u8; body_len];
-    stream
-        .read_exact(&mut body)
+    stream.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+async fn read_ldap_message_bytes(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    try_read_ldap_message_bytes(stream)
         .await
-        .expect("read LDAP message body");
-    body
+        .expect("read LDAP message")
 }
 
 async fn read_ldap_message(stream: &mut tokio::net::TcpStream) {
@@ -1133,6 +1132,7 @@ async fn test_search_bind_rejects_ambiguous_results() {
 
 async fn assert_search_bind_group_checks_use_canonical_identity(
     custom_group_filter: Option<&str>,
+    canonical_identity_is_member: bool,
 ) {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
@@ -1205,20 +1205,22 @@ async fn assert_search_bind_group_checks_use_canonical_identity(
             !ldap_message_contains(&group_search, PRESENTED_ALIAS),
             "group search reused the client-presented alias"
         );
-        group_stream
-            .write_all(&search_result_entry(
-                2,
-                GROUP_DN,
-                &[("cn", &["gateway-admins"])],
-            ))
-            .await
-            .expect("write required group search entry");
+        if canonical_identity_is_member {
+            group_stream
+                .write_all(&search_result_entry(
+                    2,
+                    GROUP_DN,
+                    &[("cn", &["gateway-admins"])],
+                ))
+                .await
+                .expect("write required group search entry");
+        }
         group_stream
             .write_all(&search_result_done(2, 0))
             .await
             .expect("write required group search done");
 
-        if expects_exact_group_proof {
+        if expects_exact_group_proof && canonical_identity_is_member {
             let exact_group_proof = read_ldap_message_bytes(&mut group_stream).await;
             assert!(
                 ldap_message_contains(&exact_group_proof, CANONICAL_IDENTITY),
@@ -1240,6 +1242,29 @@ async fn assert_search_bind_group_checks_use_canonical_identity(
                 .write_all(&search_result_done(3, 0))
                 .await
                 .expect("write exact returned-group proof done");
+        }
+
+        if !canonical_identity_is_member {
+            let trailing_request = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                try_read_ldap_message_bytes(&mut group_stream),
+            )
+            .await;
+            match trailing_request {
+                Ok(Ok(request)) => assert!(
+                    !ldap_message_contains(&request, PRESENTED_ALIAS),
+                    "group denial triggered a fallback request using the presented alias"
+                ),
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Ok(Err(error)) => panic!("read trailing group-check request: {error}"),
+                Err(_) => {}
+            }
         }
     });
 
@@ -1267,22 +1292,37 @@ async fn assert_search_bind_group_checks_use_canonical_identity(
     let result = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
         .await;
-    assert_continue(result);
-    assert_eq!(
-        ctx.authenticated_identity.as_deref(),
-        Some(CANONICAL_IDENTITY)
-    );
+    if canonical_identity_is_member {
+        assert_continue(result);
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some(CANONICAL_IDENTITY)
+        );
+    } else {
+        assert_reject(result, Some(403));
+        assert!(ctx.authenticated_identity.is_none());
+    }
     task.await.expect("canonical group-check LDAP server");
 }
 
 #[tokio::test]
 async fn test_search_bind_default_member_uid_uses_canonical_identity() {
-    assert_search_bind_group_checks_use_canonical_identity(None).await;
+    assert_search_bind_group_checks_use_canonical_identity(None, true).await;
 }
 
 #[tokio::test]
 async fn test_search_bind_custom_username_and_exact_proof_use_canonical_identity() {
-    assert_search_bind_group_checks_use_canonical_identity(Some("(memberUid={username})")).await;
+    assert_search_bind_group_checks_use_canonical_identity(Some("(memberUid={username})"), true)
+        .await;
+}
+
+#[tokio::test]
+async fn test_search_bind_denies_alias_only_group_membership_without_fallback() {
+    // Model the advisory shape: the presented alias is a memberUid value, but
+    // the authenticated entry's immutable identity is not. The canonical query
+    // therefore returns no groups, and any alias-bearing retry is a bypass.
+    assert_search_bind_group_checks_use_canonical_identity(Some("(memberUid={username})"), false)
+        .await;
 }
 
 async fn assert_group_search_result(

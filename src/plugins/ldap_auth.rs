@@ -911,17 +911,21 @@ impl LdapAuth {
         // Group authorization must use the authenticated account identity, not
         // the client-presented login value that may be an alias in
         // search-then-bind mode.
-        let default_filter = group_membership_filter(user_dn, canonical_identity);
-        let escaped_user_dn = escape_filter_value(user_dn);
-        let escaped_username = escape_filter_value(canonical_identity);
-        self.group_filter
-            .as_ref()
-            .map(|filter| {
-                filter
-                    .replace("{user_dn}", &escaped_user_dn)
-                    .replace("{username}", &escaped_username)
-            })
-            .unwrap_or(default_filter)
+        match self.group_filter.as_ref() {
+            Some(filter) => {
+                let mut resolved_filter = filter.clone();
+                if filter.contains("{user_dn}") {
+                    let escaped_user_dn = escape_filter_value(user_dn);
+                    resolved_filter = resolved_filter.replace("{user_dn}", &escaped_user_dn);
+                }
+                if filter.contains("{username}") {
+                    let escaped_identity = escape_filter_value(canonical_identity);
+                    resolved_filter = resolved_filter.replace("{username}", &escaped_identity);
+                }
+                resolved_filter
+            }
+            None => group_membership_filter(user_dn, canonical_identity),
+        }
     }
 
     fn entry_matches_required_group(&self, entry: &SearchEntry) -> Result<bool, AuthError> {
@@ -981,9 +985,9 @@ impl LdapAuth {
 
 fn group_membership_filter(user_dn: &str, canonical_identity: &str) -> String {
     let escaped_user_dn = escape_filter_value(user_dn);
-    let escaped_username = escape_filter_value(canonical_identity);
+    let escaped_identity = escape_filter_value(canonical_identity);
     format!(
-        "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_username}))"
+        "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_identity}))"
     )
 }
 
