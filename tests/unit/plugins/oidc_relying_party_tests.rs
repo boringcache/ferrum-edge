@@ -142,8 +142,7 @@ async fn earlier_single_mode_principal_prevents_later_oidc_refresh_and_slide() {
         )
         .expect("valid refresh config"),
     );
-    let key_auth: Arc<dyn Plugin> =
-        Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
+    let key_auth = Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
     let now = chrono::Utc::now().timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &oidc,
@@ -160,12 +159,13 @@ async fn earlier_single_mode_principal_prevents_later_oidc_refresh_and_slide() {
     let mut ctx = session_ctx(&cookie);
     ctx.headers
         .insert("x-api-key".to_string(), "test-api-key".to_string());
+    let key_auth_plugin: Arc<dyn Plugin> = key_auth.clone();
     let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
 
     assert!(
         run_authentication_phase(
             AuthMode::Single,
-            &[key_auth, oidc_plugin],
+            &[key_auth_plugin, oidc_plugin],
             &mut ctx,
             &ConsumerIndex::new(&[create_test_consumer()]),
         )
@@ -173,6 +173,10 @@ async fn earlier_single_mode_principal_prevents_later_oidc_refresh_and_slide() {
         .is_none()
     );
     assert_eq!(ctx.auth_method, Some("key_auth"));
+    let mut upstream_headers = ctx.headers.clone();
+    assert_continue(key_auth.before_proxy(&mut ctx, &mut upstream_headers).await);
+    assert_continue(oidc.before_proxy(&mut ctx, &mut upstream_headers).await);
+    assert!(!upstream_headers.contains_key("x-api-key"));
     assert!(rolling_cookie(&oidc, &mut ctx).await.is_none());
     assert_eq!(server.received_requests().await.expect("requests").len(), 0);
 }
@@ -196,8 +200,7 @@ async fn multi_auth_supersession_keeps_only_rotated_requester_session_state() {
     let oidc = Arc::new(
         OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config"),
     );
-    let key_auth: Arc<dyn Plugin> =
-        Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
+    let key_auth = Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
     let now = chrono::Utc::now().timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &oidc,
@@ -215,12 +218,13 @@ async fn multi_auth_supersession_keeps_only_rotated_requester_session_state() {
     let mut ctx = session_ctx(&cookie);
     ctx.headers
         .insert("x-api-key".to_string(), "test-api-key".to_string());
+    let key_auth_plugin: Arc<dyn Plugin> = key_auth.clone();
     let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
 
     assert!(
         run_authentication_phase(
             AuthMode::Multi,
-            &[oidc_plugin, key_auth],
+            &[oidc_plugin, key_auth_plugin],
             &mut ctx,
             &ConsumerIndex::new(&[create_test_consumer()]),
         )
@@ -234,9 +238,11 @@ async fn multi_auth_supersession_keeps_only_rotated_requester_session_state() {
             .map(|consumer| consumer.username.as_str()),
         Some("testuser")
     );
-    let mut upstream_headers = HashMap::new();
+    let mut upstream_headers = ctx.headers.clone();
     assert_continue(oidc.before_proxy(&mut ctx, &mut upstream_headers).await);
+    assert_continue(key_auth.before_proxy(&mut ctx, &mut upstream_headers).await);
     assert!(!upstream_headers.contains_key("x-oidc-email"));
+    assert!(!upstream_headers.contains_key("x-api-key"));
     let rotated = rolling_cookie(&oidc, &mut ctx)
         .await
         .expect("post-refresh reject must preserve requester-owned rotation");

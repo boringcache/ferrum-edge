@@ -1,7 +1,7 @@
 use ferrum_edge::config::types::{BackendScheme, Consumer};
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, spiffe_id_to_san};
-use ferrum_edge::plugins::mesh::spiffe_identity::SpiffeIdentity;
+use ferrum_edge::plugins::mesh::spiffe_identity::{SpiffeIdentity, SpiffeIdentityConnectionCache};
 use ferrum_edge::plugins::{
     HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, PluginResult, RequestContext,
     StreamConnectionContext, priority,
@@ -165,6 +165,127 @@ async fn test_http_request_preserves_existing_spiffe_id() {
         ctx.peer_spiffe_id.as_ref().map(SpiffeId::as_str),
         Some("spiffe://prod.example.com/ns/existing/sa/default")
     );
+}
+
+/// Build a fresh per-request context sharing one connection's cert and
+/// SPIFFE extraction cache, the way multiplexed HTTP/2 or HTTP/3 requests on
+/// a single mTLS connection do.
+fn ctx_on_connection(
+    cert_der: &Arc<Vec<u8>>,
+    cache: &Arc<SpiffeIdentityConnectionCache>,
+) -> RequestContext {
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.tls_client_cert_der = Some(Arc::clone(cert_der));
+    ctx.peer_spiffe_extraction_cache = Some(Arc::clone(cache));
+    ctx
+}
+
+#[tokio::test]
+async fn test_connection_cache_extracts_once_across_multiplexed_requests() {
+    let cert_der = Arc::new(build_cert(
+        Some("spiffe://prod.example.com/ns/api/sa/default"),
+        None,
+    ));
+    let cache = Arc::new(SpiffeIdentityConnectionCache::new());
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+
+    for _ in 0..3 {
+        let mut ctx = ctx_on_connection(&cert_der, &cache);
+        let result = plugin.on_request_received(&mut ctx).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.peer_spiffe_id.as_ref().map(SpiffeId::as_str),
+            Some("spiffe://prod.example.com/ns/api/sa/default")
+        );
+    }
+
+    assert_eq!(
+        cache.extraction_count(),
+        1,
+        "peer cert must be parsed once per connection, not once per request"
+    );
+}
+
+#[tokio::test]
+async fn test_connection_cache_rejects_duplicate_uri_sans_on_every_request() {
+    let cert_der = Arc::new(build_cert_with_uri_sans(&[
+        "spiffe://prod.example.com/ns/api/sa/default",
+        "spiffe://prod.example.com/ns/admin/sa/default",
+    ]));
+    let cache = Arc::new(SpiffeIdentityConnectionCache::new());
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+
+    for _ in 0..3 {
+        let mut ctx = ctx_on_connection(&cert_der, &cache);
+        let result = plugin.on_request_received(&mut ctx).await;
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 403);
+                assert!(body.contains("invalid SPIFFE identity"));
+            }
+            other => panic!("cached invalid-SVID outcome must reject every request, got {other:?}"),
+        }
+        assert!(ctx.peer_spiffe_id.is_none());
+    }
+
+    assert_eq!(cache.extraction_count(), 1);
+}
+
+#[tokio::test]
+async fn test_connection_cache_non_spiffe_cert_is_noop_on_every_request() {
+    let cert_der = Arc::new(build_cert(None, Some("client.example.com")));
+    let cache = Arc::new(SpiffeIdentityConnectionCache::new());
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+
+    for _ in 0..3 {
+        let mut ctx = ctx_on_connection(&cert_der, &cache);
+        let result = plugin.on_request_received(&mut ctx).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(ctx.peer_spiffe_id.is_none());
+    }
+
+    assert_eq!(cache.extraction_count(), 1);
+}
+
+#[tokio::test]
+async fn test_connection_cache_unparsable_der_is_noop_on_every_request() {
+    let cert_der = Arc::new(vec![0u8, 1, 2, 3]);
+    let cache = Arc::new(SpiffeIdentityConnectionCache::new());
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+
+    for _ in 0..3 {
+        let mut ctx = ctx_on_connection(&cert_der, &cache);
+        let result = plugin.on_request_received(&mut ctx).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(ctx.peer_spiffe_id.is_none());
+    }
+
+    assert_eq!(cache.extraction_count(), 1);
+}
+
+#[tokio::test]
+async fn test_connection_cache_not_consulted_when_peer_spiffe_id_preset() {
+    // A pre-stamped identity (e.g. node-waypoint eBPF attestation) must keep
+    // precedence over peer-cert derivation, and the cache must stay untouched.
+    let cert_der = Arc::new(build_cert(
+        Some("spiffe://prod.example.com/ns/new/sa/default"),
+        None,
+    ));
+    let cache = Arc::new(SpiffeIdentityConnectionCache::new());
+    let existing = SpiffeId::new("spiffe://prod.example.com/ns/existing/sa/default").unwrap();
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+
+    let mut ctx = ctx_on_connection(&cert_der, &cache);
+    ctx.peer_spiffe_id = Some(existing);
+    plugin.on_request_received(&mut ctx).await;
+
+    assert_eq!(
+        ctx.peer_spiffe_id.as_ref().map(SpiffeId::as_str),
+        Some("spiffe://prod.example.com/ns/existing/sa/default")
+    );
+    assert_eq!(cache.extraction_count(), 0);
 }
 
 #[tokio::test]

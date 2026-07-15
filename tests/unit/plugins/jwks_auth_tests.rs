@@ -1432,7 +1432,7 @@ async fn principal_less_jwks_attempt_is_discarded_before_later_key_auth_success(
         .expect("valid inline JWKS config"),
     );
     let key_plugin = Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
-    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![jwks_plugin.clone(), key_plugin];
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![jwks_plugin.clone(), key_plugin.clone()];
     let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
 
     for claims in [
@@ -1481,10 +1481,15 @@ async fn principal_less_jwks_attempt_is_discarded_before_later_key_auth_success(
 
         let mut headers = ctx.headers.clone();
         assert_continue(jwks_plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_continue(key_plugin.before_proxy(&mut ctx, &mut headers).await);
         assert_eq!(
             headers.get("authorization").map(String::as_str),
             Some(authorization.as_str()),
             "an unaccepted JWKS attempt must not strip its bearer token"
+        );
+        assert!(
+            !headers.contains_key("x-api-key"),
+            "the accepted key-auth credential must still be stripped"
         );
         assert!(!headers.contains_key("x-user-email"));
     }

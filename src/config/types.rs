@@ -5574,6 +5574,16 @@ impl Consumer {
                         None => {}
                     }
                 }
+                if cred_type == "keyauth" {
+                    match obj.get("key") {
+                        Some(serde_json::Value::String(key)) if !key.trim().is_empty() => {}
+                        Some(serde_json::Value::String(_)) => {
+                            errors.push(format!("{}.key must not be empty", prefix));
+                        }
+                        Some(_) => errors.push(format!("{}.key must be a string", prefix)),
+                        None => errors.push(format!("{}.key is required", prefix)),
+                    }
+                }
                 for (key, val) in *obj {
                     if let Some(s) = val.as_str() {
                         if s.len() > MAX_CREDENTIAL_VALUE_LENGTH {
