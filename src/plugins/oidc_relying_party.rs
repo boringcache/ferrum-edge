@@ -1454,6 +1454,9 @@ impl OidcRelyingParty {
         ))
     }
 
+    // Reached only through the lib target's `_test_support` shim by external
+    // unit tests; the bin target recompiles this module without that caller.
+    #[allow(dead_code)]
     pub(crate) fn sealed_session_cookie_for_tests(
         &self,
         claims: Value,
