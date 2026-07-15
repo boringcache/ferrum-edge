@@ -1918,24 +1918,31 @@ impl McpGateway {
         // URI and cannot collide across servers, but retaining their defensive
         // duplicate-key tombstones here keeps all collision-checked maps on the
         // same fail-closed lifecycle.
+        let tombstone_limit = self.validation.max_catalog_items_per_list;
         preserve_collision_tombstones(
             &old_catalog.collision_tombstones.tools,
             &mut collision_tombstones.tools,
             &mut tools,
             families.get("tools"),
+            tombstone_limit,
         );
         preserve_collision_tombstones(
             &old_catalog.collision_tombstones.prompts,
             &mut collision_tombstones.prompts,
             &mut prompts,
             families.get("prompts"),
+            tombstone_limit,
         );
         preserve_collision_tombstones(
             &old_catalog.collision_tombstones.resources,
             &mut collision_tombstones.resources,
             &mut resources,
             families.get("resources"),
+            tombstone_limit,
         );
+        prune_collision_tombstones(&mut collision_tombstones.tools, tombstone_limit);
+        prune_collision_tombstones(&mut collision_tombstones.prompts, tombstone_limit);
+        prune_collision_tombstones(&mut collision_tombstones.resources, tombstone_limit);
 
         // A fully unavailable family (every attempted list failed, no last-good
         // state anywhere in the family) must not be published as an empty
@@ -4405,21 +4412,41 @@ fn carry_stale_entries<T: Clone>(
 /// refresh is authoritative. Collision-suppressed entries are intentionally
 /// absent from the published maps, so carrying only map entries cannot retain
 /// this fail-closed state when one prior collision participant is unavailable.
+///
+/// Retention is capped by the same per-list item limit that bounds upstream
+/// catalog input. This preserves the fail-closed behavior for a bounded working
+/// set while preventing degraded refreshes from accumulating attacker-chosen
+/// tombstone keys without limit.
 fn preserve_collision_tombstones<T>(
     old_collisions: &HashSet<String>,
     collisions: &mut HashSet<String>,
     entries: &mut HashMap<String, T>,
     refresh_stats: Option<&FamilyRefreshStats>,
+    max_tombstones: usize,
 ) {
     if old_collisions.is_empty()
         || refresh_stats.is_some_and(FamilyRefreshStats::fully_authoritative)
+        || collisions.len() >= max_tombstones
     {
         return;
     }
-    for key in old_collisions {
+    let remaining = max_tombstones.saturating_sub(collisions.len());
+    let mut keys: Vec<&String> = old_collisions.iter().collect();
+    keys.sort_unstable();
+    for key in keys.into_iter().take(remaining) {
         entries.remove(key);
         collisions.insert(key.clone());
     }
+}
+
+fn prune_collision_tombstones(collisions: &mut HashSet<String>, max_tombstones: usize) {
+    if collisions.len() <= max_tombstones {
+        return;
+    }
+    let mut keys: Vec<String> = collisions.iter().cloned().collect();
+    keys.sort_unstable();
+    keys.truncate(max_tombstones);
+    *collisions = keys.into_iter().collect();
 }
 
 /// HTTP 400 for a request that requires an MCP session but carried no session
