@@ -3589,6 +3589,7 @@ impl GatewayConfig {
                     .map(|entry| {
                         entry
                             .as_object()
+                            .filter(|obj| obj.len() == 1)
                             .and_then(|obj| obj.get("secret"))
                             .and_then(|secret| secret.as_str())
                             .filter(|secret| hmac_secret_strength(secret) >= MIN_HMAC_SECRET_LENGTH)

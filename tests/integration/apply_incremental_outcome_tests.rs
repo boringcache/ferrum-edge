@@ -383,9 +383,17 @@ async fn update_config_quarantines_invalid_hmac_credentials_before_full_snapshot
         "hmac_auth".to_string(),
         serde_json::json!([{"secret": "too-short"}]),
     );
+    let mut malformed = test_consumer("c4", "dave");
+    malformed.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{
+            "secret": "strong-hmac-secret-at-least-32-characters",
+            "unexpected": true
+        }]),
+    );
 
     let outcome = state.update_config(GatewayConfig {
-        consumers: vec![first, duplicate, weak],
+        consumers: vec![first, duplicate, weak, malformed],
         loaded_at: Utc::now(),
         ..GatewayConfig::default()
     });
@@ -395,6 +403,7 @@ async fn update_config_quarantines_invalid_hmac_credentials_before_full_snapshot
     assert!(config.consumers[0].has_credential("hmac_auth"));
     assert!(!config.consumers[1].has_credential("hmac_auth"));
     assert!(!config.consumers[2].has_credential("hmac_auth"));
+    assert!(!config.consumers[3].has_credential("hmac_auth"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

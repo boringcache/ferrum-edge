@@ -1584,6 +1584,10 @@ fn test_quarantine_hmac_strips_malformed_credentials() {
         serde_json::json!([]),
         serde_json::json!({"secret": "not-an-array-secret-at-least-32-chars!"}),
         serde_json::json!([{"no_secret": true}]),
+        serde_json::json!([{
+            "secret": "strong-hmac-secret-at-least-32-characters",
+            "unexpected": true
+        }]),
         serde_json::json!([{"secret": padded}]),
     ];
     for shape in shapes {
