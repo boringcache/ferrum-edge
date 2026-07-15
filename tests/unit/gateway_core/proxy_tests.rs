@@ -662,10 +662,7 @@ async fn test_multi_auth_deadline_expiry_overrides_earlier_server_reject() {
     ctx.headers
         .insert("content-type".to_string(), "application/grpc".to_string());
     assert!(matches!(
-        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
-            &[deadline_plugin],
-            &mut ctx,
-        ),
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[deadline_plugin], &mut ctx,),
         PluginResult::Continue
     ));
 

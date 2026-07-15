@@ -1251,9 +1251,7 @@ pub(crate) enum GrpcRequestBodyCollectError {
     DeadlineExceeded,
 }
 
-fn map_request_body_wait_error(
-    error: super::RequestBodyWaitError,
-) -> GrpcRequestBodyCollectError {
+fn map_request_body_wait_error(error: super::RequestBodyWaitError) -> GrpcRequestBodyCollectError {
     match error {
         super::RequestBodyWaitError::TimedOut => GrpcRequestBodyCollectError::TimedOut,
         super::RequestBodyWaitError::DeadlineExceeded => {

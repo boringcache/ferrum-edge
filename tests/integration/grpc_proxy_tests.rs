@@ -1515,10 +1515,9 @@ async fn grpc_web_deadline_preflight_reject_is_grpc_web_shaped() {
 
     let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
     let io = TokioIo::new(stream);
-    let (mut sender, conn) =
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-            .await
-            .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -1566,19 +1565,16 @@ async fn buffered_grpc_upload_deadline_preserves_gateway_deadline_contract() {
     use http_body_util::StreamBody;
 
     let mut proxy = create_grpc_proxy("grpc-buffered-upload-deadline", "/grpc", 9);
-    let plugin_configs = attach_grpc_web_deadline_plugins(
-        &mut proxy,
-        serde_json::json!({"max_deadline_ms": 5_000}),
-    );
+    let plugin_configs =
+        attach_grpc_web_deadline_plugins(&mut proxy, serde_json::json!({"max_deadline_ms": 5_000}));
     let state = create_test_proxy_state_with_plugins(vec![proxy], plugin_configs);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
     let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
     let io = TokioIo::new(stream);
-    let (mut sender, conn) =
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-            .await
-            .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });
