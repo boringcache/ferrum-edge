@@ -3618,6 +3618,10 @@ paths:
     put:
       operationId: updateConsumer
       summary: Update a consumer
+      description: >-
+        When `basicauth` is omitted from the request, an existing Basic
+        credential type is preserved; use `DELETE
+        /consumers/{id}/credentials/basicauth` to remove it.
       tags: [Consumers]
       requestBody:
         required: true

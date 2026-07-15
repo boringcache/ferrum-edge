@@ -369,7 +369,7 @@ Credential rotation workflow:
 
 Max credentials per type is controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
 
-Ordinary Consumer responses omit the entire `basicauth` credential type; JWT, HMAC, and key credential values use their documented redaction behavior. The authenticated `/backup` endpoint is the only management response that intentionally returns unredacted Basic password hashes for faithful restoration. During active build-out, restore rejects legacy `basicauth` entries with extra fields: each entry must contain exactly one `password` or `password_hash` field.
+Ordinary Consumer responses omit the entire `basicauth` credential type; JWT, HMAC, and key credential values use their documented redaction behavior. When `basicauth` is omitted from the request, an existing Basic credential type is preserved; use `DELETE /consumers/{id}/credentials/basicauth` to remove it. The authenticated `/backup` endpoint is the only management response that intentionally returns unredacted Basic password hashes for faithful restoration. During active build-out, restore rejects legacy `basicauth` entries with extra fields: each entry must contain exactly one `password` or `password_hash` field.
 
 ## Plugin Configs
 

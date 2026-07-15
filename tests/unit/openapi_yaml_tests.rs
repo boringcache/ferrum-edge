@@ -294,6 +294,16 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
     let plugin_docs = include_str!("../../docs/plugins.md");
     assert!(plugin_docs.contains(scoped_scheme_contract));
 
+    let basic_roundtrip_contract = "When `basicauth` is omitted from the request, an existing \
+                                    Basic credential type is preserved; use `DELETE \
+                                    /consumers/{id}/credentials/basicauth` to remove it.";
+    let consumer_update = spec["paths"]["/consumers/{id}"]["put"]["description"]
+        .as_str()
+        .expect("Consumer update description");
+    assert!(consumer_update.contains(basic_roundtrip_contract));
+    let admin_docs = include_str!("../../docs/admin_api.md");
+    assert!(admin_docs.contains(basic_roundtrip_contract));
+
     let consumer_credentials =
         &spec["components"]["schemas"]["Consumer"]["properties"]["credentials"];
     let credentials_description = consumer_credentials["description"]

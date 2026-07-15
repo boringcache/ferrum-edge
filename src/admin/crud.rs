@@ -2349,6 +2349,18 @@ impl AdminResource for Consumer {
         consumer_audit_body(resource)
     }
 
+    fn prepare_for_update(&mut self, existing: &Self) {
+        // Ordinary Consumer responses omit Basic credentials entirely. Preserve
+        // them when a client round-trips that response through PUT; explicit
+        // credential replacement and deletion use the credential endpoints.
+        if !self.credentials.contains_key("basicauth")
+            && let Some(basic_credentials) = existing.credentials.get("basicauth")
+        {
+            self.credentials
+                .insert("basicauth".to_string(), basic_credentials.clone());
+        }
+    }
+
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
         super::json_response(StatusCode::CONFLICT, &json!({"error": errors.join("; ")}))
     }
