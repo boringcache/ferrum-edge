@@ -647,7 +647,8 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
     let server = wiremock::MockServer::start().await;
     let jwks_path = unique_jwks_path("oidc-jwks");
     let jwks_uri = format!("{}{}", server.uri(), jwks_path);
-    let discovery_url = format!("{}/.well-known/openid-configuration", server.uri());
+    let discovery_path = unique_jwks_path("oidc-discovery");
+    let discovery_url = format!("{}{}", server.uri(), discovery_path);
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(jwks_path))
@@ -658,9 +659,7 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
         .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
+        .and(wiremock::matchers::path(discovery_path))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "jwks_uri": jwks_uri
         })))
@@ -692,10 +691,10 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
 #[tokio::test]
 async fn oversized_discovery_document_is_rejected_before_deserialization() {
     let server = wiremock::MockServer::start().await;
+    let discovery_path = unique_jwks_path("oidc-discovery");
+    let discovery_url = format!("{}{}", server.uri(), discovery_path);
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
+        .and(wiremock::matchers::path(discovery_path))
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_bytes(vec![b' '; 128 * 1024 + 1]),
         )
@@ -704,7 +703,7 @@ async fn oversized_discovery_document_is_rejected_before_deserialization() {
     let plugin = JwksAuth::new(
         &json!({
             "providers": [{
-                "discovery_url": format!("{}/.well-known/openid-configuration", server.uri())
+                "discovery_url": discovery_url
             }]
         }),
         default_client(),
@@ -725,7 +724,7 @@ async fn equivalent_discovery_generation_reuses_last_good_store_during_outage() 
     let server = wiremock::MockServer::start().await;
     let jwks_path = unique_jwks_path("reload-jwks");
     let jwks_uri = format!("{}{}", server.uri(), jwks_path);
-    let discovery_path = "/.well-known/openid-configuration";
+    let discovery_path = unique_jwks_path("oidc-discovery");
     let discovery_url = format!("{}{discovery_path}", server.uri());
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -737,7 +736,7 @@ async fn equivalent_discovery_generation_reuses_last_good_store_during_outage() 
         .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(discovery_path))
+        .and(wiremock::matchers::path(discovery_path.clone()))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
                 .set_body_json(json!({"jwks_uri": jwks_uri.clone()})),
@@ -797,7 +796,7 @@ async fn failed_discovery_replacement_retires_unpublished_candidate_store() {
     let candidate_path = unique_jwks_path("candidate-jwks");
     let original_uri = format!("{}{}", server.uri(), original_path);
     let candidate_uri = format!("{}{}", server.uri(), candidate_path);
-    let discovery_path = "/.well-known/openid-configuration";
+    let discovery_path = unique_jwks_path("oidc-discovery");
     let discovery_url = format!("{}{discovery_path}", server.uri());
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -816,7 +815,7 @@ async fn failed_discovery_replacement_retires_unpublished_candidate_store() {
         .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(discovery_path))
+        .and(wiremock::matchers::path(discovery_path.clone()))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
                 .set_body_json(json!({"jwks_uri": original_uri.clone()})),
@@ -890,19 +889,15 @@ async fn wait_for_discovery_request(server: &wiremock::MockServer) {
 /// `jwks_uri` value, and return `(server, discovery_url)`.
 async fn start_oidc_discovery_server(jwks_uri: &str) -> (wiremock::MockServer, String) {
     let discovery_server = wiremock::MockServer::start().await;
+    let discovery_path = unique_jwks_path("oidc-discovery");
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
+        .and(wiremock::matchers::path(discovery_path.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "jwks_uri": jwks_uri
         })))
         .mount(&discovery_server)
         .await;
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        discovery_server.uri()
-    );
+    let discovery_url = format!("{}{discovery_path}", discovery_server.uri());
     (discovery_server, discovery_url)
 }
 
@@ -1048,6 +1043,7 @@ async fn test_jwks_auth_oidc_discovery_does_not_follow_jwks_redirects() {
     let redirect_target = wiremock::MockServer::start().await;
     let redirect_path = unique_jwks_path("redirect-jwks");
     let jwks_uri = format!("{}{}", discovery_server.uri(), redirect_path);
+    let discovery_path = unique_jwks_path("oidc-discovery");
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(redirect_path))
@@ -1058,9 +1054,7 @@ async fn test_jwks_auth_oidc_discovery_does_not_follow_jwks_redirects() {
         .mount(&discovery_server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
+        .and(wiremock::matchers::path(discovery_path.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "jwks_uri": jwks_uri.clone()
         })))
@@ -1072,10 +1066,7 @@ async fn test_jwks_auth_oidc_discovery_does_not_follow_jwks_redirects() {
         .mount(&redirect_target)
         .await;
 
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        discovery_server.uri()
-    );
+    let discovery_url = format!("{}{discovery_path}", discovery_server.uri());
     let plugin = JwksAuth::new(
         &json!({
             "providers": [{"discovery_url": discovery_url}],
@@ -1122,6 +1113,7 @@ async fn test_jwks_auth_oidc_discovery_accepts_same_host_jwks_uri() {
     let server = wiremock::MockServer::start().await;
     let jwks_path = unique_jwks_path("same-host-jwks");
     let jwks_uri = format!("{}{}", server.uri(), jwks_path);
+    let discovery_path = unique_jwks_path("oidc-discovery");
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(jwks_path))
@@ -1132,16 +1124,14 @@ async fn test_jwks_auth_oidc_discovery_accepts_same_host_jwks_uri() {
         .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
+        .and(wiremock::matchers::path(discovery_path.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "jwks_uri": jwks_uri.clone()
         })))
         .mount(&server)
         .await;
 
-    let discovery_url = format!("{}/.well-known/openid-configuration", server.uri());
+    let discovery_url = format!("{}{discovery_path}", server.uri());
     let plugin = JwksAuth::new(
         &json!({
             "providers": [{"discovery_url": discovery_url}],
