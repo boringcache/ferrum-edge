@@ -18,7 +18,15 @@ pub fn generate_hmac_signature(
     authority: &str,
     secret: &str,
 ) -> String {
-    generate_hmac_signature_with_query(method, path, "", date, username, authority, secret)
+    generate_hmac_signature_with_digest(
+        method,
+        path,
+        date,
+        username,
+        authority,
+        secret,
+        &empty_digest_header(),
+    )
 }
 
 /// Generate an HMAC-SHA256 signature for a request with a raw query string.
@@ -31,6 +39,51 @@ pub fn generate_hmac_signature_with_query(
     authority: &str,
     secret: &str,
 ) -> String {
+    generate_hmac_signature_with_query_and_digest(
+        method,
+        path,
+        query,
+        date,
+        username,
+        authority,
+        secret,
+        &empty_digest_header(),
+    )
+}
+
+/// Generate an HMAC-SHA256 signature for a no-query request with an explicit
+/// Digest or Content-Digest header value.
+pub fn generate_hmac_signature_with_digest(
+    method: &str,
+    path: &str,
+    date: &str,
+    username: &str,
+    authority: &str,
+    secret: &str,
+    digest_header: &str,
+) -> String {
+    generate_hmac_signature_with_query_and_digest(
+        method,
+        path,
+        "",
+        date,
+        username,
+        authority,
+        secret,
+        digest_header,
+    )
+}
+
+fn generate_hmac_signature_with_query_and_digest(
+    method: &str,
+    path: &str,
+    query: &str,
+    date: &str,
+    username: &str,
+    authority: &str,
+    secret: &str,
+    digest_header: &str,
+) -> String {
     let signing_string = format!(
         "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         username,
@@ -39,7 +92,7 @@ pub fn generate_hmac_signature_with_query(
         path,
         query,
         date,
-        empty_digest_header()
+        digest_header
     );
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("Failed to create HMAC instance");

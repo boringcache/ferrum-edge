@@ -11,13 +11,15 @@
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_auth_acl
 
 use crate::common::{
-    TestGateway, empty_digest_header, generate_hmac_signature, hmac_authority_from_url,
+    TestGateway, empty_digest_header, generate_hmac_signature,
+    generate_hmac_signature_with_digest, hmac_authority_from_url,
 };
 
 use base64::Engine;
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
@@ -193,6 +195,244 @@ impl AuthTestHarness {
     fn generate_admin_token(&self) -> Result<String, Box<dyn std::error::Error>> {
         Ok(self._gw.admin_token())
     }
+}
+
+fn content_digest_sha256(body: &[u8]) -> String {
+    format!(
+        "sha-256=:{}:",
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body))
+    )
+}
+
+fn hmac_authorization_for_digest(
+    method: &str,
+    path: &str,
+    date: &str,
+    authority: &str,
+    digest: &str,
+) -> String {
+    let signature = generate_hmac_signature_with_digest(
+        method,
+        path,
+        date,
+        "alice",
+        authority,
+        "alice-hmac-shared-secret-at-least-32-bytes",
+        digest,
+    );
+    format!(r#"hmac username="alice", algorithm="hmac-sha256", signature="{signature}""#)
+}
+
+async fn send_raw_h1_hmac_request(
+    proxy_port: u16,
+    method: &str,
+    digest: &str,
+    framing_headers: &str,
+    wire_body: &[u8],
+) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let authority = format!("127.0.0.1:{proxy_port}");
+    let date = Utc::now().to_rfc2822();
+    let authorization =
+        hmac_authorization_for_digest(method, "/hmacauth", &date, &authority, digest);
+    let request = format!(
+        "{method} /hmacauth HTTP/1.1\r\nHost: {authority}\r\nAuthorization: {authorization}\r\nDate: {date}\r\nContent-Digest: {digest}\r\n{framing_headers}Connection: close\r\n\r\n"
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect raw H1 HMAC request");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write raw H1 HMAC headers");
+    stream
+        .write_all(wire_body)
+        .await
+        .expect("write raw H1 HMAC body");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read raw H1 HMAC response");
+    let response = String::from_utf8_lossy(&response);
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .expect("raw H1 HMAC response status")
+}
+
+async fn send_h2_hmac_request(
+    proxy_port: u16,
+    method: &str,
+    digest: &str,
+    content_length: Option<&str>,
+    body_after_headers: Option<&[u8]>,
+) -> u16 {
+    let authority = format!("127.0.0.1:{proxy_port}");
+    let date = Utc::now().to_rfc2822();
+    let authorization =
+        hmac_authorization_for_digest(method, "/hmacauth", &date, &authority, digest);
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect H2 HMAC request");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, connection) = h2::client::handshake(stream)
+        .await
+        .expect("H2 HMAC handshake");
+    let connection_task = tokio::spawn(connection);
+    let mut request = hyper::Request::builder()
+        .method(method)
+        .uri(format!("http://{authority}/hmacauth"))
+        .header("authorization", authorization)
+        .header("date", date)
+        .header("content-digest", digest);
+    if let Some(content_length) = content_length {
+        request = request.header("content-length", content_length);
+    }
+    let request = request.body(()).expect("build H2 HMAC request");
+    let end_stream_on_headers = body_after_headers.is_none();
+    let (response, mut request_body) = sender
+        .send_request(request, end_stream_on_headers)
+        .expect("send H2 HMAC headers");
+    if let Some(body) = body_after_headers {
+        request_body
+            .send_data(bytes::Bytes::copy_from_slice(body), true)
+            .expect("send H2 HMAC DATA");
+    }
+    let response = response.await.expect("receive H2 HMAC response");
+    let status = response.status().as_u16();
+    let mut response_body = response.into_body();
+    while let Some(data) = response_body.data().await {
+        data.expect("read H2 HMAC response DATA");
+    }
+    drop(sender);
+    connection_task.abort();
+    status
+}
+
+async fn assert_empty_body_hmac_regressions(proxy_port: u16) {
+    let empty_digest = content_digest_sha256(&[]);
+    let incorrect_empty_digest = content_digest_sha256(b"not empty");
+
+    // In H1, absent framing proves an empty request body for every method.
+    // These methods cover the traditional bodyless set, DELETE, and a body
+    // method without framing.
+    for method in ["GET", "HEAD", "OPTIONS", "DELETE", "POST"] {
+        assert_eq!(
+            send_raw_h1_hmac_request(proxy_port, method, &empty_digest, "", &[]).await,
+            200,
+            "H1 {method} without framing should accept the empty-body digest"
+        );
+        assert_eq!(
+            send_raw_h1_hmac_request(proxy_port, method, &incorrect_empty_digest, "", &[]).await,
+            401,
+            "H1 {method} without framing must reject a signed non-empty digest"
+        );
+    }
+
+    for (framing_headers, wire_body, label) in [
+        ("Content-Length: 0\r\n", &[][..], "Content-Length: 0"),
+        (
+            "Transfer-Encoding: chunked\r\n",
+            &b"0\r\n\r\n"[..],
+            "empty chunked body",
+        ),
+    ] {
+        assert_eq!(
+            send_raw_h1_hmac_request(
+                proxy_port,
+                "POST",
+                &empty_digest,
+                framing_headers,
+                wire_body,
+            )
+            .await,
+            200,
+            "H1 POST with {label} should accept the empty-body digest"
+        );
+        assert_eq!(
+            send_raw_h1_hmac_request(
+                proxy_port,
+                "POST",
+                &incorrect_empty_digest,
+                framing_headers,
+                wire_body,
+            )
+            .await,
+            401,
+            "H1 POST with {label} must reject a signed non-empty digest"
+        );
+    }
+
+    // H2 relies on END_STREAM, not method or framing headers. An END_STREAM on
+    // the request headers proves emptiness even for body methods.
+    for method in ["GET", "HEAD", "OPTIONS", "DELETE", "POST"] {
+        assert_eq!(
+            send_h2_hmac_request(proxy_port, method, &empty_digest, None, None).await,
+            200,
+            "H2 {method} with header END_STREAM should accept the empty-body digest"
+        );
+        assert_eq!(
+            send_h2_hmac_request(proxy_port, method, &incorrect_empty_digest, None, None).await,
+            401,
+            "H2 {method} with header END_STREAM must reject a signed non-empty digest"
+        );
+    }
+
+    assert_eq!(
+        send_h2_hmac_request(proxy_port, "POST", &empty_digest, Some("0"), None).await,
+        200,
+        "H2 Content-Length: 0 should accept the empty-body digest"
+    );
+    assert_eq!(
+        send_h2_hmac_request(
+            proxy_port,
+            "POST",
+            &incorrect_empty_digest,
+            Some("0"),
+            None,
+        )
+        .await,
+        401,
+        "H2 Content-Length: 0 must reject a signed non-empty digest"
+    );
+
+    // Keep the H2 request open at header time, then finish with empty DATA.
+    // The proxy must collect through END_STREAM rather than infer emptiness
+    // from GET plus absent Content-Length.
+    assert_eq!(
+        send_h2_hmac_request(proxy_port, "GET", &empty_digest, None, Some(&[])).await,
+        200,
+        "open H2 GET ending with empty DATA should authenticate"
+    );
+    assert_eq!(
+        send_h2_hmac_request(
+            proxy_port,
+            "GET",
+            &incorrect_empty_digest,
+            None,
+            Some(&[]),
+        )
+        .await,
+        401,
+        "open H2 GET ending with empty DATA must verify the final empty digest"
+    );
+
+    let one_byte_digest = content_digest_sha256(b"x");
+    assert_eq!(
+        send_h2_hmac_request(proxy_port, "GET", &one_byte_digest, None, Some(b"x")).await,
+        200,
+        "open H2 GET must collect and verify DATA without Content-Length"
+    );
+    assert_eq!(
+        send_h2_hmac_request(proxy_port, "GET", &empty_digest, None, Some(b"x")).await,
+        401,
+        "open H2 GET must never infer empty while DATA can still arrive"
+    );
 }
 
 /// Simple echo HTTP server that returns request info.
@@ -1290,6 +1530,10 @@ async fn test_auth_acl_comprehensive() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["echo"].as_bool().unwrap_or(false));
     println!("✓ Valid HMAC signature accepted");
+
+    // Focused regression coverage for the preverified HMAC cache and the
+    // shared H1/H2 request-body classification boundary.
+    assert_empty_body_hmac_regressions(harness._gw.proxy_port).await;
 
     // Test 18: HMAC Auth — wrong secret (bad signature)
     println!("\n--- Test 18: HMAC Auth — Wrong Secret ---");

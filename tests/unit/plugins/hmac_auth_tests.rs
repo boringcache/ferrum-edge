@@ -222,6 +222,15 @@ fn sha256_digest_header(body: &[u8]) -> String {
     format!("sha-256={}", b64)
 }
 
+/// Build an RFC 9530 `Content-Digest` SHA-256 structured field.
+fn sha256_content_digest_header(body: &[u8]) -> String {
+    let digest = Sha256::digest(body);
+    format!(
+        "sha-256=:{}:",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    )
+}
+
 /// Build a `Digest:` header value of the form `sha-512=<base64>`.
 fn sha512_digest_header(body: &[u8]) -> String {
     let mut hasher = Sha512::new();
@@ -487,11 +496,9 @@ async fn test_pre_auth_body_screening_requires_a_verified_signature() {
         "authorization".to_string(),
         hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &wrong_signature),
     );
-    known_wrong
-        .headers
-        .insert("date".to_string(), date.clone());
-    let known_wrong_buffers = plugin
-        .should_buffer_request_body_before_authenticate(&known_wrong, &consumer_index);
+    known_wrong.headers.insert("date".to_string(), date.clone());
+    let known_wrong_buffers =
+        plugin.should_buffer_request_body_before_authenticate(&known_wrong, &consumer_index);
 
     let mut unknown = make_ctx("POST", "/upload");
     unknown.request_body_bytes = None;
@@ -528,10 +535,7 @@ async fn test_pre_auth_body_screening_requires_a_verified_signature() {
         r#"hmac username="hmacuser", signature="not-base64""#.to_string(),
     );
     malformed.headers.insert("date".to_string(), date);
-    assert!(!plugin.should_buffer_request_body_before_authenticate(
-        &malformed,
-        &consumer_index
-    ));
+    assert!(!plugin.should_buffer_request_body_before_authenticate(&malformed, &consumer_index));
 }
 
 #[tokio::test]
@@ -553,7 +557,9 @@ async fn test_preverified_reuse_still_rejects_final_digest_mismatch() {
         hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
     );
     tampered.headers.insert("date".to_string(), date.clone());
-    tampered.headers.insert("digest".to_string(), digest.clone());
+    tampered
+        .headers
+        .insert("digest".to_string(), digest.clone());
 
     assert!(
         plugin.should_buffer_request_body_before_authenticate(&tampered, &consumer_index),
@@ -590,6 +596,74 @@ async fn test_preverified_reuse_still_rejects_final_digest_mismatch() {
     set_request_body(&mut valid, signed_body);
     assert_continue(plugin.authenticate(&mut valid, &consumer_index).await);
     assert_eq!(valid.identified_consumer.unwrap().username, TEST_USERNAME);
+}
+
+#[tokio::test]
+async fn test_preverified_reuse_verifies_seeded_empty_body_digests() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        let path = "/empty";
+        let date = current_date();
+        let digest = sha256_content_digest_header(&[]);
+        let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
+        let mut ctx = make_ctx(method, path);
+        ctx.request_body_sha256 = None;
+        ctx.request_body_sha512 = None;
+        ctx.headers.remove("digest");
+        ctx.headers.insert(
+            "authorization".to_string(),
+            hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+        );
+        ctx.headers.insert("date".to_string(), date);
+        ctx.headers.insert("content-digest".to_string(), digest);
+
+        assert!(
+            plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
+            "{method} should stage a correctly signed empty-body request"
+        );
+        // Mirrors the shared proxy boundary after Incoming has definitively
+        // reported END_STREAM without requiring body collection.
+        set_request_body(&mut ctx, &[]);
+        assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+        assert_eq!(ctx.identified_consumer.unwrap().username, TEST_USERNAME);
+    }
+
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        let path = "/empty";
+        let date = current_date();
+        let incorrect_digest = sha256_content_digest_header(b"not empty");
+        let signature = sign_sha256_with_digest(
+            TEST_SECRET,
+            method,
+            path,
+            &date,
+            &incorrect_digest,
+        );
+        let mut ctx = make_ctx(method, path);
+        ctx.request_body_sha256 = None;
+        ctx.request_body_sha512 = None;
+        ctx.headers.remove("digest");
+        ctx.headers.insert(
+            "authorization".to_string(),
+            hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+        );
+        ctx.headers.insert("date".to_string(), date);
+        ctx.headers
+            .insert("content-digest".to_string(), incorrect_digest);
+
+        assert!(
+            plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
+            "{method} has a valid signature even though its body digest is wrong"
+        );
+        set_request_body(&mut ctx, &[]);
+        assert_reject(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            Some(401),
+        );
+        assert!(ctx.identified_consumer.is_none());
+    }
 }
 
 #[tokio::test]

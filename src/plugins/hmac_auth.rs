@@ -522,10 +522,8 @@ impl HmacAuth {
         let Some(current_fingerprint) = Self::authorization_fingerprint(ctx) else {
             return false;
         };
-        if !constant_time_eq(
-            &cached.authorization_fingerprint,
-            &current_fingerprint,
-        ) || ctx.request_authority.as_deref() != Some(cached.authority.as_str())
+        if !constant_time_eq(&cached.authorization_fingerprint, &current_fingerprint)
+            || ctx.request_authority.as_deref() != Some(cached.authority.as_str())
             || ctx.method != cached.method
             || ctx.path != cached.path
             || ctx.raw_query_string().unwrap_or_default() != cached.query
@@ -610,21 +608,18 @@ impl HmacAuth {
 
         if !self.validate_date(&cached.date) {
             return Some(Err(
-                r#"{"error":"Missing or expired Date header"}"#.to_string(),
+                r#"{"error":"Missing or expired Date header"}"#.to_string()
             ));
         }
-        let (Some(body_sha256), Some(body_sha512)) =
-            (ctx.request_body_sha256.as_ref(), ctx.request_body_sha512.as_ref())
-        else {
+        let (Some(body_sha256), Some(body_sha512)) = (
+            ctx.request_body_sha256.as_ref(),
+            ctx.request_body_sha512.as_ref(),
+        ) else {
             return Some(Err(
                 r#"{"error":"Digest header does not match request body"}"#.to_string(),
             ));
         };
-        if !Self::verify_precomputed_body_digest(
-            &cached.digest_header,
-            body_sha256,
-            body_sha512,
-        ) {
+        if !Self::verify_precomputed_body_digest(&cached.digest_header, body_sha256, body_sha512) {
             debug!("hmac_auth: digest header does not match request body");
             return Some(Err(
                 r#"{"error":"Digest header does not match request body"}"#.to_string(),

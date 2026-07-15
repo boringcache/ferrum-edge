@@ -2249,7 +2249,14 @@ async fn buffer_request_body_for_before_proxy(
     max_request_body_size_bytes: usize,
     request_body_read_timeout_ms: u64,
 ) -> Result<ClientRequestBody, RequestBodyBufferError> {
-    if !request_may_have_body(method, headers) {
+    // Keep the existing no-collection fast path only when the method/header
+    // classification and the protocol body state agree that the request is
+    // empty. In particular, an H2 GET/HEAD/OPTIONS request can omit
+    // Content-Length while keeping the stream open for DATA, so method/header
+    // heuristics alone must not infer an empty body.
+    if !request_may_have_body(method, headers)
+        && hyper::body::Body::is_end_stream(request.body())
+    {
         return Ok(ClientRequestBody::Streaming(Box::new(request)));
     }
 
@@ -14967,16 +14974,34 @@ async fn handle_proxy_request_inner(
                 .await
                 {
                     Ok(buffered) => {
-                        if let ClientRequestBody::Buffered(body) = &buffered {
-                            store_request_body_metadata(
-                                &mut ctx,
-                                body,
-                                authenticate_body_requirements.needs_text,
-                                authenticate_body_requirements.needs_bytes,
-                                authenticate_body_requirements.needs_digests,
-                            );
-                            ctx.bytes_sent_observed
-                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                        match &buffered {
+                            ClientRequestBody::Buffered(body) => {
+                                store_request_body_metadata(
+                                    &mut ctx,
+                                    body,
+                                    authenticate_body_requirements.needs_text,
+                                    authenticate_body_requirements.needs_bytes,
+                                    authenticate_body_requirements.needs_digests,
+                                );
+                                ctx.bytes_sent_observed.fetch_max(
+                                    body.len() as u64,
+                                    std::sync::atomic::Ordering::Release,
+                                );
+                            }
+                            ClientRequestBody::Streaming(_) => {
+                                // The buffering helper returns Streaming only
+                                // when Incoming already reports END_STREAM, so
+                                // seeding empty-body digests cannot race later
+                                // H2 DATA. Retain the original empty stream for
+                                // zero-copy backend forwarding.
+                                store_request_body_metadata(
+                                    &mut ctx,
+                                    &[],
+                                    false,
+                                    false,
+                                    authenticate_body_requirements.needs_digests,
+                                );
+                            }
                         }
                         buffered
                     }
