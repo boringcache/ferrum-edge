@@ -15,7 +15,6 @@ use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::str::FromStr;
 
 use crate::util::http_headers::{cache_control_has_directive, etag_value_is_strong};
 
