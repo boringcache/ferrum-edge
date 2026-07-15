@@ -11,6 +11,15 @@ pub fn extract_claim_values(claims: &Value, claim_path: &str) -> Vec<String> {
 
 /// Extract a single string from a claim path.
 pub fn extract_claim_string(claims: &Value, claim_path: &str) -> Option<String> {
+    extract_claim_string_exact(claims, claim_path).filter(|value| !value.trim().is_empty())
+}
+
+/// Extract a string byte-for-byte, including an explicitly blank value.
+///
+/// Identity-header resolution uses this to distinguish a missing configured
+/// header claim, which falls back to the principal, from a present blank claim,
+/// which the authentication transaction deliberately discards.
+pub fn extract_claim_string_exact(claims: &Value, claim_path: &str) -> Option<String> {
     resolve_claim_path(claims, claim_path)?
         .as_str()
         .map(ToOwned::to_owned)

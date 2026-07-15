@@ -580,7 +580,7 @@ async fn run_discovery_loop(
 
                     // Publish the LB-only epoch under the request-epoch write lock.
                     if let Some(epoch_store) = &request_epoch {
-                        epoch_store.update_load_balancer(
+                        let published = epoch_store.update_load_balancer(
                             |current| {
                                 Some(LoadBalancerCache::build_update_targets_inner(
                                     &current.load_balancer,
@@ -594,6 +594,15 @@ async fn run_discovery_loop(
                                 lb_cache.store_inner(Arc::clone(&published.load_balancer));
                             },
                         );
+                        if let Err(error) = published {
+                            warn!(
+                                "Service discovery [{}]: upstream {} target publication failed: {}. Keeping last-known targets.",
+                                discoverer.provider_name(),
+                                upstream_id,
+                                error,
+                            );
+                            continue;
+                        }
                     } else {
                         lb_cache.update_targets(
                             upstream_id,

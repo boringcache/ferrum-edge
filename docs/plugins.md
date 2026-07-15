@@ -121,7 +121,9 @@ Use `priority_override` to control the relative execution order of instances tha
 
 ## Multi-Authentication Mode
 
-With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one succeeds; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned. After authentication, the Access Control plugin can apply consumer or group policy.
+With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one establishes a nonblank mapped Consumer or permitted external principal; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned.
+
+In either mode, rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, rolling session cookie, or backend token-stripping state for another credential to inherit. Requester-owned cookies from rejected attempts are retained only when authentication ultimately rejects and are merged with the selected rejection's cookies by exact cookie name; a later successful credential discards them. After authentication, the Access Control plugin can apply consumer or group policy.
 
 ## Consumer Identity Headers
 
@@ -1365,8 +1367,8 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | Parameter | Type | Description |
 |---|---|---|
 | `providers` | Array | Array of identity provider configurations (required) |
-| `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint |
-| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
+| `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or `localhost`; URL userinfo is rejected |
+| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). HTTPS is required except for literal loopback or `localhost`, and URL userinfo is rejected. SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
 | `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
 | `providers[].issuer` | String (optional) | Expected JWT `iss` claim — routes tokens to this provider |
 | `providers[].audience` | String (optional) | Expected JWT `aud` claim |
@@ -1400,6 +1402,9 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
+Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. Shared stores use the minimum refresh interval requested by active consumers, and full or incremental reloads reschedule the single refresh worker without dropping cached keys. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement.
+
+Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A rejected refresh retains the last-known-good keys. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
 
 ### `oauth2_introspection`
 
@@ -1896,13 +1901,15 @@ UDP+DTLS streams via certificate-based consumer mapping.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. |
-| `disallowed_consumers` | String[] | `[]` | Consumer usernames explicitly denied. Takes precedence over every allow rule. |
-| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. |
-| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. |
-| `allow_authenticated_identity` | bool | `false` | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
+| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. |
+| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy. All checks use `HashSet<String>` for O(1) membership.
+Whitespace-only rule admission follows Rust `str::trim` Unicode `White_Space`
+semantics; accepted rule values are still stored and matched byte-for-byte.
 
 `allow_authenticated_identity: true` cannot be combined with an allow-list
 (`allowed_consumers` or `allowed_groups`): the allow-list matches mapped Consumer
@@ -1911,7 +1918,13 @@ so the combination would silently bypass the allow-list for every
 externally-authenticated-but-unmapped caller. The combination is rejected at
 config validation. The `disallowed_consumers` deny-list is still applied to the
 external identity string, so it may be combined with `allow_authenticated_identity`
-to revoke a compromised principal.
+to revoke a compromised principal. External identities longer than the 4096-character
+exact-rule bound fail closed instead of bypassing the deny-list.
+
+An authenticated external identity that is not enabled by this policy is an
+authorization denial: HTTP requests receive 403 and native gRPC requests receive
+trailers-only `PERMISSION_DENIED` (status 7). Requests with no meaningful mapped
+or external identity receive HTTP 401 / gRPC `UNAUTHENTICATED` (status 16).
 
 **Evaluation order:** deny (consumer username → group) → allow (consumer username → group).
 If both `allowed_consumers` and `allowed_groups` are set, matching _either_ grants access.
@@ -2063,13 +2076,16 @@ For HTTP and gRPC, admission runs after load balancing selects the backend targe
 
 **Behavior notes:**
 
+- **Reload continuity** is keyed by the plugin configuration's namespace and ID. Compatible cache rebuilds preserve learned limits and count permits held by streaming bodies or WebSocket sessions against the replacement plugin; requests that pinned an older compatible cache view may still admit against the shared counters, but use the replacement admission bounds and cannot train them with retired feedback. Limit-bound changes clamp the shared learned limit at publication. Strict scale-out that only adds concrete effective targets or protected proxy-group associations while preserving every old target key, scope, and route meaning is compatible when `max_tracked_keys` is not lowered, so a long-lived old-target permit does not block admission to the new target. A `key_by`, plugin-scope, effective route-override destination or execution order, effective target retirement/replacement, policy-coverage contraction/remap, lowering `max_tracked_keys`, or a transition involving an ambiguous zero-target route establishes a new tracking space, so the replacement returns `503` until older permits drain, then resets retired target state before admitting; this brief fail-closed transition also applies in `shadow_mode`. Service-discovery churn outside a policy's selected subset and route-plugin edits that cannot change its destination remain compatible. Removing and later recreating a policy starts new state, as does removing the last proxy/proxy-group association and later reattaching it.
+- **Failure recovery** is cohort-aware. Every concurrent backend failure or high-latency sample applies its own multiplicative decrease, bounded by `min_limit`, and invalidates additive-growth credit for requests admitted before that decrease. The lower limit must admit a later healthy cohort before it can grow again, so completion ordering and a large `increase_step` cannot immediately erase the backoff.
+- **Unknown configuration keys are rejected.** Misspelled limit, scope, tracking, sampling, shadow, or header fields fail startup/write/reload validation instead of falling back to defaults.
 - **Streaming responses** record their latency sample at TTFB (response-header arrival) while the in-flight slot is held for the full body. Unlike a WebSocket session this slot is still transient (it frees when the body completes), so streaming keeps the normal growth behavior rather than the handshake-style suppression above. For very long-lived streaming/SSE backends this means the limit can grow on fast TTFB while slots stay tied up for the stream duration.
 - **`target_latency_multiplier`** is relative to the *minimum* observed backend latency, which is tracked as a monotonically-decreasing baseline that does not decay back up. A single unusually-fast response (a tiny `200`, a `304`, a cache hit) permanently lowers the baseline and tightens the target, which can keep the limit pinned low. Prefer a multiplier with headroom (the `1.5` default is conservative) for backends whose latency varies widely.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `key_by` | String | `proxy_target` | Limit scope: `proxy_target` keys by proxy plus selected backend, `upstream_target` keys by upstream plus selected backend when the proxy uses an upstream, and `backend_target` shares one limit per backend endpoint across every proxy using this plugin instance. |
-| `max_tracked_keys` | u64 | `10000` | Maximum number of distinct target keys this plugin instance tracks, bounding memory under high-cardinality (e.g. wildcard upstream) traffic. The cap bounds the limiter's own memory only: a target beyond it **fails open** — admitted without adaptive limiting rather than rejected — so a new target is never black-holed and `shadow_mode` never rejects. Tracked targets continue to be admitted subject to their adaptive limit. |
+| `max_tracked_keys` | u64 | `10000` | Maximum number of distinct target keys this stable plugin policy tracks across compatible reloads, bounding memory under high-cardinality (e.g. wildcard upstream) traffic. The cap bounds the limiter's own memory only: a target beyond it **fails open** — admitted without adaptive limiting rather than rejected — until the policy is removed/recreated or the process restarts. Tracked targets continue to be admitted subject to their adaptive limit. |
 | `min_limit` | u64 | `1` | Lower bound for the adaptive in-flight request limit. Must be greater than zero. |
 | `initial_limit` | u64 | `32` | Starting in-flight request limit for a new target key. Must be between `min_limit` and `max_limit`. |
 | `max_limit` | u64 | `1024` | Upper bound for the adaptive in-flight request limit. Must be at least `min_limit`. |
@@ -2078,7 +2094,7 @@ For HTTP and gRPC, admission runs after load balancing selects the backend targe
 | `decrease_ratio` | f64 | `0.8` | Multiplicative decrease applied after a failure signal or high latency. Must be greater than `0` and less than `1`. |
 | `increase_step` | u64 | `1` | Additive increase applied when the target is saturated and latency remains within the target. |
 | `shadow_mode` | bool | `false` | Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. |
-| `expose_headers` | bool | `false` | Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on rejection responses. |
+| `expose_headers` | bool | `false` | Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Policy-generation and key-space-drain rejections omit them because those transitions have no truthful per-target limit or in-flight value. |
 
 ```yaml
 plugin_name: adaptive_concurrency
@@ -2705,6 +2721,39 @@ Body rules support the same dot-notation features as `request_transformer`: nest
 Adds secure response header defaults and strips common fingerprinting headers
 after the backend response is available. It also runs for plugin rejection
 responses so locally generated errors receive the same response hardening.
+Policy is enforced on the client-visible initial-header boundary for ordinary
+HTTP responses, buffered native gRPC, gRPC-Web binary/text, and HTTP/1.1,
+HTTP/2, and HTTP/3 WebSocket success and gateway-failure handshakes. Native
+gRPC status and application metadata remain trailers; a security policy field
+is reapplied to initial headers rather than promoting a backend trailer value.
+For a genuine Trailers-Only response whose terminal metadata is carried in the
+initial END_STREAM HEADERS, Ferrum snapshots reserved gRPC fields before hooks
+and restores that pristine backend value after policy, so `set` and `remove`
+cannot redefine the RPC outcome.
+On buffered gRPC and gRPC-Web responses, a final policy removal suppresses both
+the initial-header compatibility copy and the application-trailer copy, while
+a final set/override remains initial-header policy and preserves the backend's
+application trailer. The final replay runs after trailer-only cookie rehoming
+and preserves the transport-owned `Content-Length` produced by the last body
+transform.
+
+Post-routing gateway-generated initial HEADERS use the same precomputed policy
+slice: this includes plain HTTP method-filter responses and native-gRPC method,
+deadline, size-limit, backend-unavailable, and mesh fail-closed errors across
+H1/H2/H3 frontends. Protocol-owned gRPC status/message/content type and
+Content-Length/transfer framing remain authoritative. Pre-routing errors such
+as overload, malformed request, 0-RTT, and route-miss responses have no resolved
+plugin configuration and do not apply route policy.
+
+Configuration is fail-closed: unknown top-level keys and unknown keys inside
+the `hsts` object reject startup or reload, retaining the last-known-good
+runtime configuration on reload. Header names use the complete HTTP
+field-name token grammar, are limited to 65,535 ASCII bytes, and are
+canonicalized to lowercase. Configured values must pass the same `HeaderValue`
+validation as the downstream H1/H2/H3 response builders: C0 controls other
+than horizontal tab, DEL, and non-ASCII characters are rejected. Invalid-name
+diagnostics identify the `set` or `remove` entry and render at most 96 escaped
+bytes of the hostile name before a truncation marker.
 
 **Priority:** 4080
 
@@ -2716,8 +2765,8 @@ responses so locally generated errors receive the same response hardening.
 | `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, or an object may set `max_age`, `include_subdomains`, and `preload`. |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
-| `set` | object/null | `{}` | Additional headers to set. Values must be strings and header values must not contain CR, LF, or NUL. |
-| `remove` | string[]/null | `["server","x-powered-by"]` | Header names to remove case-insensitively; `null` disables built-in removals. |
+| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar and values must pass downstream HTTP header-value validation. |
+| `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively; `null` disables built-in removals. |
 | `override_existing` | bool | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. |
 
 ```yaml
@@ -4467,7 +4516,7 @@ config:
 
 `sessions.max_sessions` and `sessions.session_ttl_seconds` bound downstream MCP sessions; idle or oldest sessions are evicted before accepting new `initialize` calls. The cap check, in-memory eviction, and insert are serialized (so concurrent `initialize` calls cannot grow the store past `max_sessions`) in a single scan, while the evicted sessions' upstream `DELETE` cleanup is issued concurrently *after* that critical section so eviction never blocks new sessions behind upstream network round trips. In `aggregate_router` mode the gateway mints a synthetic downstream session id and never forwards it upstream: routed calls strip the downstream session header and carry only a mediated upstream session id when one exists. Server ids must be URI-safe (`[A-Za-z0-9._-]`) because they appear in public `mcp://` resource URIs, and `sessions.downstream_session_header`/`sessions.upstream_session_header` must be valid HTTP header names; both are checked at config validation. `validation.validate_tool_results` is reserved and rejected if set to `true` until result validation is implemented. `initialize_upstreams: startup` is accepted as a V1 alias for `lazy` because MCP upstream initialization requires a downstream client session. In `aggregate_router` mode, advertising a capability with no dedicated dispatch — `capabilities.advertise_completions`, `capabilities.advertise_logging`, or `capabilities.advertise_tasks` — requires `capabilities.passthrough_unknown_methods: true` so those methods (`completion/complete`, `logging/*`, `tasks/*`) are routed to the primary upstream instead of advertised without support. If `observability.log_raw_arguments` is enabled, raw MCP tool arguments are copied into request metadata and may contain secrets or PII; prefer the default argument hashing unless the logging path is explicitly protected.
 
-**Discovery, catalogs, and locking.** Discovery catalogs are cached **per downstream session**, not gateway-wide, because an upstream MCP server may expose different tools/resources/prompts per initialized session (client identity/capabilities); a shared catalog could leak or hide entries across users. Catalog refresh is serialized per session (not globally) and upstream `initialize` is serialized per `(session, server)`, so a slow upstream throttles only the affected session/server rather than blocking discovery or initialization for unrelated clients. A consequence of per-session catalogs is that each new session performs its own upstream discovery. Cached resource-template routes are refreshed against their selected resource server after `discovery.cache_ttl_seconds`; a successful refresh removes withdrawn routes, while a transient refresh failure serves the previously discovered route stale until the next per-server retry window so long-lived sessions remain available. A URI that was never discovered still fails closed. Tool-only servers are not queried for resource templates. When two upstreams produce the same public tool or prompt name after namespacing, the colliding name is skipped from discovery for **all** colliding upstreams (logged as a warning) so it can never route to the wrong upstream, while the rest of the catalog stays usable. Exact resource and resource-template public URIs include the validated-unique server id (`mcp://{server_id}/...`), so their public keys cannot collide across upstreams; defensive duplicate-key suppression for exact resources uses the same fail-closed state. Collision tombstones survive any degraded refresh for their family and are cleared only after every attempted upstream in that family lists successfully, so a temporary outage cannot choose a winner. A failing upstream likewise degrades only itself: each per-server `tools/list` / `prompts/list` / `resources/list` / `resources/templates/list` failure (transport error, non-2xx status, or JSON-RPC error) keeps that upstream's last-good entries for that family served stale and retried on the next refresh window, while every other upstream and family refreshes normally — one unavailable upstream does not fail the whole aggregate catalog. Stale carried entries pass through the same collision handling as fresh ones, and only currently enabled and exposed servers can carry entries forward, so disabled or removed servers still drop out of the catalog. Degraded upstreams are surfaced as warning logs and bounded `mcp.catalog_degraded` metadata (sorted `server:family` pairs). Availability is tracked per catalog family and separately from entry count: if every attempted upstream for the requested family fails before that family has ever listed successfully, that family returns JSON-RPC `-32006` while healthy families remain usable; a prior successful empty list is last-good state and continues to return an empty catalog during a later outage. A partially refreshed catalog retries failed families on the normal `discovery.cache_ttl_seconds` window; when every attempted family is wholly unavailable, the catalog remains stale and the next request retries.
+**Discovery, catalogs, and locking.** Discovery catalogs are cached **per downstream session**, not gateway-wide, because an upstream MCP server may expose different tools/resources/prompts per initialized session (client identity/capabilities); a shared catalog could leak or hide entries across users. Catalog refresh is serialized per session (not globally) and upstream `initialize` is serialized per `(session, server)`, so a slow upstream throttles only the affected session/server rather than blocking discovery or initialization for unrelated clients. A consequence of per-session catalogs is that each new session performs its own upstream discovery. Cached resource-template routes are refreshed against their selected resource server after `discovery.cache_ttl_seconds`; a successful refresh removes withdrawn routes, while a transient refresh failure serves the previously discovered route stale until the next per-server retry window so long-lived sessions remain available. A URI that was never discovered still fails closed. Tool-only servers are not queried for resource templates. When two upstreams produce the same public tool or prompt name after namespacing, the colliding name is skipped from discovery for **all** colliding upstreams (logged as a warning) so it can never route to the wrong upstream, while the rest of the catalog stays usable. Exact resource and resource-template public URIs include the validated-unique server id (`mcp://{server_id}/...`), so their public keys cannot collide across upstreams; defensive duplicate-key suppression for exact resources uses the same fail-closed state. Collision tombstones survive degraded refreshes and are cleared only after every attempted upstream in that family lists successfully, so a temporary outage cannot choose a winner. Per-family tombstone retention is bounded by `validation.max_catalog_items_per_list` multiplied by the number of attempted upstream lists, the aggregate number of items one refresh can contribute. If repeated degraded refreshes exceed that history bound, the gateway retains one bounded overflow marker and returns JSON-RPC `-32006` for the entire affected family until a fully authoritative refresh rebuilds its collision state; it never selects attacker-ordered tombstones or temporarily republishes a formerly ambiguous route. A failing upstream otherwise degrades only itself: each per-server `tools/list` / `prompts/list` / `resources/list` / `resources/templates/list` failure (transport error, non-2xx status, or JSON-RPC error) keeps that upstream's last-good entries for that family served stale and retried on the next refresh window, while every other upstream and family refreshes normally — one unavailable upstream does not fail the whole aggregate catalog. Stale carried entries pass through the same collision handling as fresh ones, and only currently enabled and exposed servers can carry entries forward, so disabled or removed servers still drop out of the catalog. Degraded upstreams are surfaced as warning logs and bounded `mcp.catalog_degraded` metadata (sorted `server:family` pairs). Availability is tracked per catalog family and separately from entry count: if every attempted upstream for the requested family fails before that family has ever listed successfully, that family returns JSON-RPC `-32006` while healthy families remain usable; a prior successful empty list is last-good state and continues to return an empty catalog during a later outage. A partially refreshed catalog retries failed families on the normal `discovery.cache_ttl_seconds` window; when every attempted family is wholly unavailable, the catalog remains stale and the next request retries.
 
 **Protocol version negotiation.** `endpoint.protocol_versions` is ordered: the first entry is the gateway's preferred version. In `aggregate_router` mode, `initialize` echoes a supported requested `protocolVersion` and otherwise negotiates per the MCP lifecycle — the successful initialize result carries the preferred supported version (recorded as `mcp.protocol_version_negotiated` metadata) and the session is minted on that version instead of rejecting the client. Post-initialize requests remain fail-closed: an `MCP-Protocol-Version` header naming an unsupported version is rejected with HTTP 400.
 

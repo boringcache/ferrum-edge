@@ -80,11 +80,186 @@ pub use router_cache::{RouteMatch, RouterCache};
 pub mod _test_support {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use hyper::StatusCode;
 
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
+
+    // ── adaptive_concurrency lifecycle ──────────────────────────────────────
+    pub struct AdaptiveConcurrencyDecreaseHarness {
+        limit: AtomicU64,
+        config: crate::adaptive_concurrency::AdaptiveConcurrencyConfig,
+    }
+
+    impl AdaptiveConcurrencyDecreaseHarness {
+        pub fn new(
+            initial_limit: u64,
+            min_limit: u64,
+            max_limit: u64,
+            decrease_ratio: f64,
+        ) -> Self {
+            Self {
+                limit: AtomicU64::new(initial_limit),
+                config: crate::adaptive_concurrency::AdaptiveConcurrencyConfig {
+                    key_by: crate::adaptive_concurrency::AdaptiveConcurrencyKeyBy::Proxy,
+                    max_tracked_keys: 1,
+                    min_limit,
+                    initial_limit,
+                    max_limit,
+                    min_samples: 1,
+                    target_latency_multiplier: 1.5,
+                    decrease_ratio,
+                    increase_step: 1,
+                    shadow_mode: false,
+                    expose_headers: false,
+                },
+            }
+        }
+
+        pub fn limit(&self) -> u64 {
+            self.limit.load(Ordering::Acquire)
+        }
+
+        pub fn decrease_from_observed_limit(&self, observed_limit: u64) {
+            crate::adaptive_concurrency::decrease_limit(&self.limit, &self.config, observed_limit);
+        }
+    }
+
+    pub struct AdaptiveConcurrencyTransitionHarness {
+        transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition,
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct AdaptiveConcurrencyResetToken {
+        reset: crate::adaptive_concurrency::AdaptiveConcurrencyResetEpoch,
+    }
+
+    impl AdaptiveConcurrencyTransitionHarness {
+        pub fn new() -> Self {
+            Self {
+                transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition::new(),
+            }
+        }
+
+        pub fn observe(&self) -> u64 {
+            self.transition.load()
+        }
+
+        pub fn begin_structural_reset(&self) -> AdaptiveConcurrencyResetToken {
+            AdaptiveConcurrencyResetToken {
+                reset: self.transition.begin_structural_reset(),
+            }
+        }
+
+        pub fn try_begin_structural_reset(&self) -> Option<AdaptiveConcurrencyResetToken> {
+            self.transition
+                .try_begin_structural_reset()
+                .map(|reset| AdaptiveConcurrencyResetToken { reset })
+        }
+
+        pub fn try_begin_observed_drain_reset(
+            &self,
+            observed: u64,
+        ) -> Option<AdaptiveConcurrencyResetToken> {
+            self.transition
+                .try_begin_drain_reset(observed)
+                .map(|reset| AdaptiveConcurrencyResetToken { reset })
+        }
+
+        pub fn finish_reset(&self, reset: AdaptiveConcurrencyResetToken, drain: bool) -> bool {
+            self.transition.finish_reset(reset.reset, drain)
+        }
+
+        pub fn is_active(&self) -> bool {
+            self.transition.is_active()
+        }
+    }
+
+    impl Default for AdaptiveConcurrencyTransitionHarness {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[allow(dead_code)] // owning the guard is the behavior exercised by cancellation tests
+    pub struct JwksDiscoveryCandidateForTest(
+        crate::plugins::utils::jwks_cache::DiscoveryStoreCandidate,
+    );
+
+    pub fn jwks_discovery_candidate_for_test(
+        jwks_uri: &str,
+        http_client: crate::plugins::PluginHttpClient,
+        refresh_interval: Duration,
+    ) -> JwksDiscoveryCandidateForTest {
+        JwksDiscoveryCandidateForTest(
+            crate::plugins::utils::jwks_cache::DiscoveryStoreCandidate::acquire(
+                jwks_uri,
+                &http_client,
+                refresh_interval,
+            ),
+        )
+    }
+
+    pub fn oidc_sealed_refresh_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        claims: serde_json::Value,
+        refresh_token: Option<String>,
+        refresh_due: bool,
+        rolling_due: bool,
+    ) -> Result<String, String> {
+        plugin.sealed_refresh_session_cookie_for_tests(
+            claims,
+            refresh_token,
+            refresh_due,
+            rolling_due,
+        )
+    }
+
+    pub fn oidc_open_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        cookie: &str,
+    ) -> Option<serde_json::Value> {
+        plugin.open_session_cookie_for_tests(cookie)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct OidcSessionStateForTest {
+        pub access_token: String,
+        pub refresh_token: Option<String>,
+        pub refresh_after_unix: i64,
+    }
+
+    pub fn oidc_sealed_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        claims: serde_json::Value,
+        require_rolling_update: bool,
+    ) -> Result<String, String> {
+        plugin.sealed_session_cookie_for_tests(claims, require_rolling_update)
+    }
+
+    pub fn oidc_sealed_due_refresh_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        claims: serde_json::Value,
+        refresh_token: &str,
+    ) -> Result<String, String> {
+        plugin.sealed_due_refresh_session_cookie_for_tests(claims, refresh_token)
+    }
+
+    pub fn oidc_session_state_from_set_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        set_cookie: &str,
+    ) -> Option<OidcSessionStateForTest> {
+        let (access_token, refresh_token, refresh_after_unix) =
+            plugin.session_state_from_set_cookie_for_tests(set_cookie)?;
+        Some(OidcSessionStateForTest {
+            access_token,
+            refresh_token,
+            refresh_after_unix,
+        })
+    }
 
     pub fn prepare_basic_auth_credential_for_test(
         credential: &mut serde_json::Value,

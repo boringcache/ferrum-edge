@@ -24,6 +24,7 @@ use ferrum_edge::config::types::{
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::plugins::ProxyProtocol;
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 
 /// Minimal test proxy with safe defaults.
@@ -361,6 +362,66 @@ async fn update_config_rejected_candidate_reports_rejected() {
     assert!(
         state.config.load().proxies.is_empty(),
         "rejected full candidate must not mutate runtime config"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("security-policy", true);
+    plugin.plugin_name = "security_headers".to_string();
+    plugin.config = serde_json::json!({
+        "hsts": { "max_age": 300, "include_subdomains": true },
+        "set": { "X-Policy": "last-known-good" }
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "security_headers")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "hsts": {
+            "max_age": 300,
+            "include_subdomains": true,
+            "include_subdomain": true
+        },
+        "set": { "X-Policy": "must-not-publish" }
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let outcome = state.update_config(invalid);
+    let ConfigApplyOutcome::Rejected { errors } = outcome else {
+        panic!("unknown nested security_headers key must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("security_headers.hsts") && error.contains("include_subdomain")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["set"]["X-Policy"],
+        "last-known-good"
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "security_headers"),
+        "rejected reload must retain the last-known-good plugin cache"
     );
 }
 

@@ -629,10 +629,27 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"disallowed_consumers": ["bad"], "allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
+        json!({"allowed_consumers": ["  alice  "]}),
+        // U+FEFF ZWNBSP is not in Rust's Unicode White_Space set.
+        json!({"allowed_consumers": ["\u{feff}"]}),
+        json!({"disallowed_consumers": ["\u{feff}"]}),
+        json!({"allowed_groups": ["\u{feff}"]}),
+        json!({"disallowed_groups": ["\u{feff}"]}),
+        json!({"allowed_consumers": ["é".repeat(255)]}),
+        json!({"allowed_groups": ["é".repeat(255)]}),
+        json!({"disallowed_groups": ["é".repeat(255)]}),
+        json!({
+            "disallowed_consumers": ["é".repeat(4096)],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
             "config should be valid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
         );
     }
 
@@ -642,10 +659,32 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"allowed_consumers": [], "allowed_groups": []}),
         json!({"allowed_consumers": ["alice"], "allow_authenticated_identity": true}),
         json!({"allowed_groups": ["engineering"], "allow_authenticated_identity": true}),
+        json!({"allowed_consumers": [""]}),
+        json!({"disallowed_consumers": [""]}),
+        json!({"allowed_groups": [""]}),
+        json!({"disallowed_groups": [""]}),
+        json!({"allowed_consumers": ["   "]}),
+        json!({"disallowed_consumers": ["\t"]}),
+        json!({"allowed_groups": ["\n"]}),
+        json!({"disallowed_groups": ["   "]}),
+        // U+0085 NEL is in Rust's Unicode White_Space set.
+        json!({"allowed_consumers": ["\u{0085}"]}),
+        json!({"disallowed_consumers": ["\u{0085}"]}),
+        json!({"allowed_groups": ["\u{0085}"]}),
+        json!({"disallowed_groups": ["\u{0085}"]}),
+        json!({"allowed_consumers": ["a".repeat(256)]}),
+        json!({
+            "disallowed_consumers": ["a".repeat(4097)],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_err(),
             "config should be invalid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
         );
     }
 }
@@ -864,6 +903,37 @@ fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
     assert!(guide.contains("`max_cache_entries` (default `10,000`)"));
     assert!(guide.contains("| `ldap_auth` | `max_cache_entries` | `10000` |"));
     assert!(guide.contains("| `ldap_auth` | `cache_ttl_seconds` | `0` |"));
+}
+
+#[test]
+fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/JwksAuthConfig")
+        .expect("JwksAuthConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["from_headers"]["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        schema["properties"]["jwks_refresh_interval_secs"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_JWKS_REFRESH_INTERVAL_SECS)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_jti_cache_max_entries"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES)
+    );
+
+    let guide = include_str!("../../docs/cache_management.md");
+    assert!(guide.contains("`jwks_refresh_interval_secs`, default `900` seconds"));
+    assert!(guide.contains("| `jwks_auth` | `jwks_refresh_interval_secs` | `900` |"));
+    assert!(!guide.contains("| `jwks_auth` | `cache_ttl_seconds`"));
 }
 
 #[test]
@@ -1888,6 +1958,28 @@ fn jwt_auth_schema_rejects_unknown_config_keys() {
 }
 
 #[test]
+fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AdaptiveConcurrencyConfig")
+        .expect("missing AdaptiveConcurrencyConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AdaptiveConcurrencyConfig schema compiles");
+
+    assert!(
+        validator
+            .validate(&json!({"key_by": "backend_target", "max_limit": 32}))
+            .is_ok()
+    );
+    assert!(
+        validator.validate(&json!({"max_limt": 32})).is_err(),
+        "schema must reject unknown adaptive_concurrency policy keys"
+    );
+}
+
+#[test]
 fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 
@@ -2246,5 +2338,65 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
         }),
     ] {
         assert_component_validity(&spec, "AiResponseGuardConfig", &invalid, false);
+    }
+}
+
+#[test]
+fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/SecurityHeadersConfig")
+        .expect("SecurityHeadersConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["hsts"]["oneOf"][3]["additionalProperties"],
+        false
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({
+            "hsts": { "max_age": 300 },
+            "set": { "X!#$%&'*+.^_`|~Policy": "one\ttwo" },
+            "remove": ["X!Policy"]
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "fram_options": false }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "hsts": { "include_subdomain": true } }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "set": { "X Policy": "on" } }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "set": { "X-Policy": "one\u{0001}two" } }),
+        false,
+    );
+    for non_ascii_value in [
+        json!({ "content_type_options": "caf\u{00e9}" }),
+        json!({ "frame_options": "caf\u{00e9}" }),
+        json!({ "referrer_policy": "caf\u{00e9}" }),
+        json!({ "hsts": "caf\u{00e9}" }),
+        json!({ "content_security_policy": "caf\u{00e9}" }),
+        json!({ "permissions_policy": "caf\u{00e9}" }),
+        json!({ "set": { "X-Policy": "caf\u{00e9}" } }),
+    ] {
+        assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
 }

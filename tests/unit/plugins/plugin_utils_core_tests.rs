@@ -2,7 +2,7 @@ use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::plugins::utils::auth_flow::ExtractedCredential;
 use ferrum_edge::plugins::utils::cert_hash::{sha256_base64url_no_pad, sha256_hex_lower};
 use ferrum_edge::plugins::utils::claim_resolver::{
-    extract_claim_string, extract_claim_values, parse_claim_path_value,
+    extract_claim_string, extract_claim_string_exact, extract_claim_values, parse_claim_path_value,
 };
 use ferrum_edge::plugins::utils::json_escape::escape_json_string;
 use ferrum_edge::plugins::utils::jwt_verifier::peek_unverified_issuer;
@@ -120,6 +120,30 @@ fn claim_resolver_resolves_hash_inside_path_segment() {
         extract_claim_string(&claims, "cnf.x5t#S256").as_deref(),
         Some("thumbprint")
     );
+}
+
+#[test]
+fn claim_resolver_rejects_blank_or_non_string_identity_values() {
+    for claims in [
+        json!({}),
+        json!({"sub": null}),
+        json!({"sub": 42}),
+        json!({"sub": ""}),
+        json!({"sub": "   \t"}),
+    ] {
+        assert_eq!(extract_claim_string(&claims, "sub"), None);
+    }
+}
+
+#[test]
+fn claim_resolver_exact_string_distinguishes_blank_from_missing() {
+    let claims = json!({"display_name": "   \t"});
+
+    assert_eq!(
+        extract_claim_string_exact(&claims, "display_name").as_deref(),
+        Some("   \t")
+    );
+    assert_eq!(extract_claim_string_exact(&claims, "missing"), None);
 }
 
 #[test]
