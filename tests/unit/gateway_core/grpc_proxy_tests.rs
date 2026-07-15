@@ -1047,6 +1047,43 @@ fn buffered_policy_overlay_preserves_transform_owned_content_length() {
     assert!(!absent_content_length.contains_key("content-length"));
 }
 
+#[test]
+fn buffered_policy_preserves_terminal_metadata_only_for_true_trailers_only_shape() {
+    let terminal_headers = grpc_map(&[
+        ("content-type", "application/grpc"),
+        ("grpc-status", "7"),
+        ("grpc-message", "permission denied"),
+    ]);
+
+    let mut split_initial_headers = terminal_headers.clone();
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        None,
+        &mut split_initial_headers,
+        false,
+    );
+    assert!(!split_initial_headers.contains_key("grpc-status"));
+    assert!(!split_initial_headers.contains_key("grpc-message"));
+
+    let mut trailers_only_initial_headers = terminal_headers;
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        None,
+        &mut trailers_only_initial_headers,
+        true,
+    );
+    assert_eq!(
+        trailers_only_initial_headers
+            .get("grpc-status")
+            .map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(
+        trailers_only_initial_headers
+            .get("grpc-message")
+            .map(String::as_str),
+        Some("permission denied")
+    );
+}
+
 #[tokio::test]
 async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata() {
     let backend_headers = grpc_map(&[("content-type", "application/grpc")]);

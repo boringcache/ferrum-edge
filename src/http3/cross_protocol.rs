@@ -3722,7 +3722,7 @@ where
             crate::proxy::grpc_proxy::apply_buffered_grpc_initial_response_policy(
                 buffered_initial_response_header_policy_state.as_deref(),
                 &mut response_headers,
-                response_body.is_empty(),
+                response_body.is_empty() && response_trailers.is_empty(),
             );
             // Re-home a hook-mutated trailer-only `set-cookie` onto the initial
             // HEADERS (issue #1638) so browsers / gRPC-Web clients can store it,

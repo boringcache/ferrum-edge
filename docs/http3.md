@@ -182,11 +182,13 @@ Buffered response hooks receive a compatibility view containing both initial
 headers and trailers. Before the H3 response is written, Ferrum restores the
 original provenance, reapplies the prefiltered `security_headers` policy to the
 initial header map, and keeps `grpc-status`, `grpc-message`, status details, and
-application metadata on the trailer channel for responses with DATA. A backend
-Trailers-Only response that already carries terminal status in its END_STREAM
-initial HEADERS keeps that status there; policy replay cannot remove or replace
-it. This is also the path used after gRPC-Web binary or text response framing,
-so security policy cannot disappear with the native trailer map.
+application metadata on the trailer channel whenever the backend supplied a
+real trailers frame, including split responses with an empty DATA body. A
+backend Trailers-Only response that already carries terminal status in its
+END_STREAM initial HEADERS and has no trailers frame keeps that status there;
+policy replay cannot remove or replace it. This is also the path used after
+gRPC-Web binary or text response framing, so security policy cannot disappear
+with the native trailer map.
 
 Either way, `grpc-status` reaches the H3 client intact.
 
@@ -203,9 +205,11 @@ WebSocket for the lifetime of the session.
 
 The `security_headers` initial-response policy runs on the RFC 9220 `200`
 handshake and on gateway-generated H3 WebSocket failures. Transport-managed
-fields are stripped after policy; the backend-negotiated
-`Sec-WebSocket-Protocol` is then restored on success. H3 never emits the
-HTTP/1.1-only `Upgrade`, `Connection`, or `Sec-WebSocket-Accept` fields.
+fields are stripped at the final emission boundary after response hooks; JSON
+failures default `Content-Type: application/json` there when no intentional
+content type survives. The backend-negotiated `Sec-WebSocket-Protocol` is then
+restored on success. H3 never emits the HTTP/1.1-only `Upgrade`, `Connection`,
+or `Sec-WebSocket-Accept` fields.
 
 ### Wire-level handshake
 

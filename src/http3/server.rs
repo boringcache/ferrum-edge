@@ -8739,6 +8739,14 @@ async fn send_h3_reject_flavor_aware(
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
     if !matches!(flavor, HttpFlavor::Grpc) {
+        if matches!(flavor, HttpFlavor::WebSocket) {
+            let mut finalized_headers = headers.clone();
+            crate::http3::websocket::finalize_h3_websocket_reject_headers(
+                &mut finalized_headers,
+            );
+            return send_h3_reject_response(stream, http_status, http_body, &finalized_headers)
+                .await;
+        }
         return send_h3_reject_response(stream, http_status, http_body, headers).await;
     }
 

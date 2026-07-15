@@ -422,11 +422,21 @@ async fn send_h3_reject_body<S>(
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
     ensure_h3_reject_content_type(&mut headers);
-    crate::proxy::finalize_websocket_response_headers(
+    crate::plugins::apply_initial_response_header_policies(
         initial_response_header_policy_plugins,
         &mut headers,
     );
-    write_h3_finalized_reject_body(stream, status, body, &headers).await;
+    write_h3_finalized_reject_body(stream, status, body, headers).await;
+}
+
+/// Finalize a failed RFC 9220 handshake immediately before its HEADERS frame is
+/// built. Response hooks and policy overlays run before this boundary, so none
+/// can leak H1 Upgrade or WebSocket negotiation fields onto a non-upgrade H3
+/// response. JSON rejection bodies retain an intentional surviving content
+/// type and otherwise receive the gateway default after all hooks have run.
+pub(crate) fn finalize_h3_websocket_reject_headers(headers: &mut HashMap<String, String>) {
+    crate::proxy::strip_websocket_transport_managed_response_header_map(headers);
+    ensure_h3_reject_content_type(headers);
 }
 
 fn ensure_h3_reject_content_type(headers: &mut HashMap<String, String>) {
@@ -442,12 +452,13 @@ async fn write_h3_finalized_reject_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
     body: &[u8],
-    headers: &HashMap<String, String>,
+    mut headers: HashMap<String, String>,
 ) where
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
+    finalize_h3_websocket_reject_headers(&mut headers);
     let builder =
-        crate::proxy::headers::apply_response_headers(Response::builder().status(status), headers);
+        crate::proxy::headers::apply_response_headers(Response::builder().status(status), &headers);
     let resp = match builder.body(()) {
         Ok(r) => r,
         Err(e) => {
@@ -494,7 +505,6 @@ async fn send_h3_backend_admission_rejection<S>(
         &mut headers,
     )
     .await;
-    crate::proxy::strip_websocket_transport_managed_response_header_map(&mut headers);
     let status =
         StatusCode::from_u16(rejection.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
     crate::proxy::log_rejected_request_with_path(
@@ -508,7 +518,7 @@ async fn send_h3_backend_admission_rejection<S>(
     )
     .await;
     crate::proxy::record_request(state, status.as_u16());
-    write_h3_finalized_reject_body(stream, status, &rejection.body, &headers).await;
+    write_h3_finalized_reject_body(stream, status, &rejection.body, headers).await;
 }
 
 pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(

@@ -447,7 +447,7 @@ plugin_configs:
         Connection: "policy-must-not-escape"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Protocol: "policy-must-not-escape"
-      remove: ["server", "x-powered-by"]
+      remove: ["server", "x-powered-by", "content-type"]
     scope: global
     enabled: true
   - id: "plugin-correlation-id-ws-admission"
@@ -456,6 +456,62 @@ plugin_configs:
     config:
       header_name: X-WS-Reject-Order
       echo_downstream: true
+    scope: global
+    enabled: true
+"#,
+        backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+/// Write a WebSocket config whose first failed backend dial opens the circuit
+/// breaker. The second H3 Extended CONNECT is then rejected by the pre-handler
+/// breaker branch before `handle_h3_websocket` owns the stream.
+fn write_ws_circuit_breaker_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-circuit-breaker-proxy"
+    listen_path: "/ws-echo"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+    backend_connect_timeout_ms: 200
+    circuit_breaker:
+      failure_threshold: 1
+      success_threshold: 1
+      timeout_seconds: 60
+      failure_status_codes: [500, 502, 503, 504]
+      trip_on_connection_errors: true
+
+consumers: []
+plugin_configs:
+  - id: "plugin-security-headers-ws-circuit-breaker"
+    plugin_name: "security_headers"
+    config:
+      hsts: true
+      set:
+        X-WS-Security: "gateway-enforced"
+        Upgrade: "policy-must-not-escape"
+        Connection: "policy-must-not-escape"
+        Keep-Alive: "policy-must-not-escape"
+        Proxy-Authenticate: "policy-must-not-escape"
+        Proxy-Connection: "policy-must-not-escape"
+        TE: "policy-must-not-escape"
+        Trailer: "policy-must-not-escape"
+        Transfer-Encoding: "policy-must-not-escape"
+        Content-Length: "1"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Key: "policy-must-not-escape"
+        Sec-WebSocket-Version: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
+        Sec-WebSocket-Extensions: "policy-must-not-escape"
+      remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
 "#,
@@ -947,6 +1003,30 @@ fn assert_no_h1_only_websocket_headers(headers: &http::HeaderMap) {
         assert!(
             headers.get(name).is_none(),
             "Extended CONNECT/failure response must not carry H1-only {name}"
+        );
+    }
+}
+
+fn assert_no_failed_websocket_transport_headers(headers: &http::HeaderMap) {
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "sec-websocket-accept",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-protocol",
+        "sec-websocket-extensions",
+    ] {
+        assert!(
+            headers.get(name).is_none(),
+            "failed WebSocket handshake must not carry transport-managed {name}"
         );
     }
 }
@@ -1752,6 +1832,15 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
     assert_ws_later_reject_hook_wins(&rejected.headers);
     assert_no_ws_transport_policy_values(&rejected.headers);
     assert_no_h1_only_websocket_headers(&rejected.headers);
+    assert_no_failed_websocket_transport_headers(&rejected.headers);
+    assert_eq!(
+        rejected
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "the final H3 reject writer must restore JSON content-type after hooks remove it"
+    );
     assert!(
         rejected
             .recv_body_text()
@@ -1767,6 +1856,57 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
+}
+
+/// A failed backend dial opens the breaker, then the next Extended CONNECT is
+/// rejected in `handle_h3_request` before the dedicated WebSocket handler. The
+/// final flavor-aware writer must still remove every transport-owned header
+/// injected by response policy after the circuit-breaker reject hooks run.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_open_circuit_reject_strips_transport_policy_fields() {
+    let dead_backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind non-responsive backend listener");
+    let dead_backend_port = dead_backend_listener.local_addr().unwrap().port();
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_circuit_breaker_config(&config_path, dead_backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+    let url = format!("https://localhost:{gateway_https_port}/ws-echo");
+
+    let first_client = Http3Client::insecure().expect("first H3 client");
+    let first_rejected = first_client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("initial failed backend handshake response");
+    assert_eq!(first_rejected.status, StatusCode::BAD_GATEWAY);
+
+    let second_client = Http3Client::insecure().expect("second H3 client");
+    let mut circuit_rejected = second_client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("open-circuit H3 WebSocket rejection response");
+    assert_eq!(circuit_rejected.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_ws_security_policy(&circuit_rejected.headers);
+    assert_no_ws_transport_policy_values(&circuit_rejected.headers);
+    assert_no_h1_only_websocket_headers(&circuit_rejected.headers);
+    assert_no_failed_websocket_transport_headers(&circuit_rejected.headers);
+    assert!(
+        circuit_rejected
+            .recv_body_text()
+            .await
+            .expect("open-circuit rejection body")
+            .contains("circuit breaker open")
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
 }
 
 /// Route method filtering runs before ordinary plugins, but the failed
