@@ -3666,10 +3666,7 @@ async fn partial_encoded_responses_skip_buffering_and_response_hooks() {
             HashMap::from([
                 ("content-type".to_string(), "text/plain".to_string()),
                 ("content-encoding".to_string(), "gzip".to_string()),
-                (
-                    "content-range".to_string(),
-                    "bytes 0-99/5000".to_string(),
-                ),
+                ("content-range".to_string(), "bytes 0-99/5000".to_string()),
             ]),
         ),
     ] {
@@ -3711,10 +3708,7 @@ async fn original_range_marker_skips_final_hook_after_content_range_removal() {
     let mut headers = HashMap::from([
         ("content-type".to_string(), "text/plain".to_string()),
         ("content-encoding".to_string(), "gzip".to_string()),
-        (
-            "content-range".to_string(),
-            "bytes 0-99/5000".to_string(),
-        ),
+        ("content-range".to_string(), "bytes 0-99/5000".to_string()),
     ]);
     let mut ctx = create_test_context();
     ctx.metadata
@@ -3755,10 +3749,7 @@ fn encoded_unflagged_event_stream_remains_streaming() {
     let firewall = plugin(&config);
     let ctx = create_test_context();
     let headers = HashMap::from([
-        (
-            "content-type".to_string(),
-            "text/event-stream".to_string(),
-        ),
+        ("content-type".to_string(), "text/event-stream".to_string()),
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
 
