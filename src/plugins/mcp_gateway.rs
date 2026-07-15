@@ -418,6 +418,11 @@ struct McpCatalog {
     // a healthy upstream could become the temporary winner of a prior
     // collision merely because another participant failed its list request.
     collision_tombstones: CatalogCollisionTombstones,
+    // Families whose collision history exceeded the aggregate number of items
+    // one refresh can return. A single bit replaces unbounded historical keys;
+    // the affected family stays unavailable until a fully authoritative
+    // refresh can rebuild its collision state from current upstream results.
+    collision_tombstone_overflow: BTreeSet<&'static str>,
 }
 
 impl Default for McpCatalog {
@@ -436,6 +441,7 @@ impl Default for McpCatalog {
             last_good: BTreeSet::new(),
             unavailable: BTreeSet::new(),
             collision_tombstones: CatalogCollisionTombstones::default(),
+            collision_tombstone_overflow: BTreeSet::new(),
         }
     }
 }
@@ -1918,31 +1924,68 @@ impl McpGateway {
         // URI and cannot collide across servers, but retaining their defensive
         // duplicate-key tombstones here keeps all collision-checked maps on the
         // same fail-closed lifecycle.
-        let tombstone_limit = self.validation.max_catalog_items_per_list;
-        preserve_collision_tombstones(
+        let mut collision_tombstone_overflow = BTreeSet::new();
+        let tools_tombstone_limit = family_collision_tombstone_limit(
+            families.get("tools"),
+            self.validation.max_catalog_items_per_list,
+        );
+        if reconcile_collision_tombstones(
             &old_catalog.collision_tombstones.tools,
             &mut collision_tombstones.tools,
             &mut tools,
             families.get("tools"),
-            tombstone_limit,
+            tools_tombstone_limit,
+            old_catalog.collision_tombstone_overflow.contains("tools"),
+        ) {
+            warn!(
+                family = "tools",
+                max_tombstones = tools_tombstone_limit,
+                "MCP catalog collision history exceeded bounded retention; failing family closed until an authoritative refresh"
+            );
+            collision_tombstone_overflow.insert("tools");
+        }
+        let prompts_tombstone_limit = family_collision_tombstone_limit(
+            families.get("prompts"),
+            self.validation.max_catalog_items_per_list,
         );
-        preserve_collision_tombstones(
+        if reconcile_collision_tombstones(
             &old_catalog.collision_tombstones.prompts,
             &mut collision_tombstones.prompts,
             &mut prompts,
             families.get("prompts"),
-            tombstone_limit,
+            prompts_tombstone_limit,
+            old_catalog
+                .collision_tombstone_overflow
+                .contains("prompts"),
+        ) {
+            warn!(
+                family = "prompts",
+                max_tombstones = prompts_tombstone_limit,
+                "MCP catalog collision history exceeded bounded retention; failing family closed until an authoritative refresh"
+            );
+            collision_tombstone_overflow.insert("prompts");
+        }
+        let resources_tombstone_limit = family_collision_tombstone_limit(
+            families.get("resources"),
+            self.validation.max_catalog_items_per_list,
         );
-        preserve_collision_tombstones(
+        if reconcile_collision_tombstones(
             &old_catalog.collision_tombstones.resources,
             &mut collision_tombstones.resources,
             &mut resources,
             families.get("resources"),
-            tombstone_limit,
-        );
-        prune_collision_tombstones(&mut collision_tombstones.tools, tombstone_limit);
-        prune_collision_tombstones(&mut collision_tombstones.prompts, tombstone_limit);
-        prune_collision_tombstones(&mut collision_tombstones.resources, tombstone_limit);
+            resources_tombstone_limit,
+            old_catalog
+                .collision_tombstone_overflow
+                .contains("resources"),
+        ) {
+            warn!(
+                family = "resources",
+                max_tombstones = resources_tombstone_limit,
+                "MCP catalog collision history exceeded bounded retention; failing family closed until an authoritative refresh"
+            );
+            collision_tombstone_overflow.insert("resources");
+        }
 
         // A fully unavailable family (every attempted list failed, no last-good
         // state anywhere in the family) must not be published as an empty
@@ -1998,6 +2041,7 @@ impl McpGateway {
             .retain(|family| *family == "resource_templates");
         catalog.unavailable.extend(unavailable);
         catalog.collision_tombstones = collision_tombstones;
+        catalog.collision_tombstone_overflow = collision_tombstone_overflow;
         if changed || catalog.version == 0 {
             catalog.version = catalog.version.saturating_add(1);
         }
@@ -4295,14 +4339,24 @@ fn catalog_error_response(
 }
 
 /// `-32006` when a request targets a catalog family whose most recent refresh
-/// failed on every attempted upstream with no last-good state to serve: a
-/// cached empty `200` catalog would misreport a total family outage as an
-/// empty (but healthy) catalog. Returns `None` when the family is available.
+/// failed on every attempted upstream with no last-good state to serve, or
+/// whose bounded collision history overflowed during degraded refreshes.
+/// Returns `None` when the family is available.
 fn family_unavailable_error(
     catalog: &McpCatalog,
     family: &'static str,
     id: Option<Value>,
 ) -> Option<PluginResult> {
+    if catalog.collision_tombstone_overflow.contains(family) {
+        return Some(json_rpc_error(
+            id,
+            -32006,
+            "MCP catalog unavailable",
+            Some(format!(
+                "{family} collision history exceeded bounded retention; a fully authoritative refresh is required"
+            )),
+        ));
+    }
     if !catalog.unavailable.contains(family) {
         return None;
     }
@@ -4408,45 +4462,59 @@ fn carry_stale_entries<T: Clone>(
     }
 }
 
-/// Keep previously ambiguous public keys suppressed unless the current family
-/// refresh is authoritative. Collision-suppressed entries are intentionally
-/// absent from the published maps, so carrying only map entries cannot retain
-/// this fail-closed state when one prior collision participant is unavailable.
-///
-/// Retention is capped by the same per-list item limit that bounds upstream
-/// catalog input. This preserves the fail-closed behavior for a bounded working
-/// set while preventing degraded refreshes from accumulating attacker-chosen
-/// tombstone keys without limit.
-fn preserve_collision_tombstones<T>(
+/// Bound collision history by the aggregate number of items all attempted
+/// upstream lists can return in one family refresh. A single per-list limit is
+/// insufficient because several servers can contribute distinct collisions.
+fn family_collision_tombstone_limit(
+    refresh_stats: Option<&FamilyRefreshStats>,
+    max_items_per_list: usize,
+) -> usize {
+    refresh_stats.map_or(0, |stats| {
+        stats.attempted.saturating_mul(max_items_per_list)
+    })
+}
+
+/// Keep every previously ambiguous public key suppressed unless the current
+/// family refresh is authoritative. If the union of current and historical
+/// collisions exceeds the aggregate refresh bound, retain no attacker-chosen
+/// subset: clear the family map and replace the keys with one sticky overflow
+/// bit. This prevents lexicographic/hash ordering or repeated degraded
+/// refreshes from resurrecting a suppressed route. A fully authoritative
+/// refresh discards historical uncertainty and rebuilds from current results.
+fn reconcile_collision_tombstones<T>(
     old_collisions: &HashSet<String>,
     collisions: &mut HashSet<String>,
     entries: &mut HashMap<String, T>,
     refresh_stats: Option<&FamilyRefreshStats>,
     max_tombstones: usize,
-) {
-    if old_collisions.is_empty()
-        || refresh_stats.is_some_and(FamilyRefreshStats::fully_authoritative)
-        || collisions.len() >= max_tombstones
-    {
-        return;
-    }
-    let remaining = max_tombstones.saturating_sub(collisions.len());
-    let mut keys: Vec<&String> = old_collisions.iter().collect();
-    keys.sort_unstable();
-    for key in keys.into_iter().take(remaining) {
-        entries.remove(key);
-        collisions.insert(key.clone());
-    }
-}
+    previously_overflowed: bool,
+) -> bool {
+    let fully_authoritative =
+        refresh_stats.is_some_and(FamilyRefreshStats::fully_authoritative);
+    let mut overflowed = collisions.len() > max_tombstones;
 
-fn prune_collision_tombstones(collisions: &mut HashSet<String>, max_tombstones: usize) {
-    if collisions.len() <= max_tombstones {
-        return;
+    if !fully_authoritative {
+        overflowed |= previously_overflowed;
+        if !overflowed {
+            for key in old_collisions {
+                entries.remove(key);
+                if collisions.contains(key) {
+                    continue;
+                }
+                if collisions.len() == max_tombstones {
+                    overflowed = true;
+                    break;
+                }
+                collisions.insert(key.clone());
+            }
+        }
     }
-    let mut keys: Vec<String> = collisions.iter().cloned().collect();
-    keys.sort_unstable();
-    keys.truncate(max_tombstones);
-    *collisions = keys.into_iter().collect();
+
+    if overflowed {
+        entries.clear();
+        collisions.clear();
+    }
+    overflowed
 }
 
 /// HTTP 400 for a request that requires an MCP session but carried no session
