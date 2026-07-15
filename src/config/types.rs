@@ -116,6 +116,12 @@ fn basic_auth_credential_error(
     if let Some(password) = credential.get("password") {
         return match password.as_str() {
             Some("") => Some("password must not be empty"),
+            Some(password) if password.len() > MAX_CREDENTIAL_VALUE_LENGTH => {
+                Some("password must not exceed 4096 bytes")
+            }
+            Some(password) if contains_control_chars(password) => {
+                Some("password must not contain control characters")
+            }
             Some(_) => None,
             None => Some("password must be a string"),
         };
@@ -5676,11 +5682,13 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
                 for entry in entries {
                     if let Some(obj) = entry.as_object_mut() {
                         redact_object(obj);
+                    } else {
+                        *entry = serde_json::json!("[REDACTED]");
                     }
                 }
             }
             serde_json::Value::Object(obj) => redact_object(obj),
-            _ => {}
+            _ => *cred_value = serde_json::json!("[REDACTED]"),
         }
     }
 

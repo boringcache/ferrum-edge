@@ -24,6 +24,19 @@ use super::{RequestContext, strip_auth_scheme};
 
 type HmacSha256 = Hmac<Sha256>;
 
+// A canonical stored Basic hash alone consumes this many serialized bytes,
+// before its JSON field/object/array overhead. Capping dummy work by the total
+// credential JSON limit therefore cannot omit any valid stored Basic hash, but
+// prevents a mistaken enormous FERRUM_MAX_CREDENTIALS_PER_TYPE value from
+// turning an unknown-user request into unbounded HMAC work.
+const MIN_STORED_BASIC_AUTH_HASH_BYTES: usize = "hmac_sha256:".len() + 64;
+const MAX_BASIC_AUTH_VERIFICATION_ROUNDS: usize =
+    crate::config::types::MAX_CREDENTIALS_SIZE / MIN_STORED_BASIC_AUTH_HASH_BYTES;
+
+fn bounded_verification_rounds(configured_limit: usize) -> usize {
+    configured_limit.clamp(1, MAX_BASIC_AUTH_VERIFICATION_ROUNDS)
+}
+
 pub struct BasicAuth {
     /// Pre-computed HMAC key from FERRUM_BASIC_AUTH_HMAC_SECRET.
     hmac_secret: Vec<u8>,
@@ -73,7 +86,9 @@ impl BasicAuth {
         Ok(Self {
             hmac_secret: hmac_secret.into_bytes(),
             dummy_password_hash,
-            verification_rounds: crate::config::types::max_credentials_per_type().max(1),
+            verification_rounds: bounded_verification_rounds(
+                crate::config::types::max_credentials_per_type(),
+            ),
             #[cfg(test)]
             verification_count: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -180,12 +195,18 @@ impl AuthMechanism for BasicAuth {
             #[cfg(test)]
             self.verification_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let stored_hash = credential_entries
+            let configured_hash = credential_entries
                 .get(round)
                 .and_then(|entry| entry.get("password_hash"))
-                .and_then(Value::as_str)
-                .unwrap_or(&self.dummy_password_hash);
-            password_matched |= self.verify_password(&password, stored_hash);
+                .and_then(Value::as_str);
+            let round_matched = self.verify_password(
+                &password,
+                configured_hash.unwrap_or(&self.dummy_password_hash),
+            );
+            // Always execute the padded HMAC round, but only a configured
+            // credential is allowed to establish identity. The random dummy
+            // material is timing padding, never a process-local master password.
+            password_matched |= configured_hash.is_some() & round_matched;
         }
 
         if password_matched && let Some(consumer) = consumer {
@@ -275,5 +296,35 @@ mod tests {
             assert!(matches!(outcome, VerifyOutcome::VerificationFailed(_)));
             assert_eq!(plugin.verification_count.swap(0, Ordering::Relaxed), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn dummy_verification_round_cannot_authenticate_a_consumer() {
+        let mut plugin = test_plugin();
+        plugin.dummy_password_hash = hash("dummy-password");
+        let consumers = [consumer_with_hashes(vec![hash("real-password")])];
+
+        let outcome = plugin
+            .verify(
+                ExtractedCredential::BasicAuth {
+                    username: "alice".to_string(),
+                    password: "dummy-password".to_string(),
+                },
+                &ConsumerIndex::new(&consumers),
+            )
+            .await;
+
+        assert!(matches!(outcome, VerifyOutcome::VerificationFailed(_)));
+        assert_eq!(plugin.verification_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn verification_rounds_are_bounded_by_serializable_credential_capacity() {
+        assert_eq!(bounded_verification_rounds(0), 1);
+        assert_eq!(bounded_verification_rounds(2), 2);
+        assert_eq!(
+            bounded_verification_rounds(usize::MAX),
+            MAX_BASIC_AUTH_VERIFICATION_ROUNDS
+        );
     }
 }

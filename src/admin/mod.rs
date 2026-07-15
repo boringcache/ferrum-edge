@@ -5638,6 +5638,20 @@ mod tests {
     }
 
     #[test]
+    fn basic_credential_write_rejects_oversized_plaintext_before_hashing() {
+        let mut credential = json!({
+            "password": "x".repeat(crate::config::types::MAX_CREDENTIAL_VALUE_LENGTH + 1)
+        });
+
+        let response = hash_credential_if_needed("basicauth", &mut credential)
+            .expect_err("oversized Basic password must be rejected");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(credential.get("password").is_some());
+        assert!(credential.get("password_hash").is_none());
+    }
+
+    #[test]
     fn tls_route_required_role_preserves_tls_security_boundary() {
         let operator_allowed = [
             (Method::GET, vec!["admin", "tls", "inventory"]),

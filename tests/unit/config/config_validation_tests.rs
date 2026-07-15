@@ -334,6 +334,30 @@ fn test_redact_consumer_basicauth_plaintext_and_unknown_fields_redacted() {
 }
 
 #[test]
+fn test_redact_consumer_basicauth_malformed_values_redacted() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!(["must-not-escape", 42, null]),
+    );
+    let redacted = redact_consumer_credentials(&consumer);
+    let basicauth = redacted.credentials.get("basicauth").unwrap();
+    assert_eq!(
+        basicauth,
+        &serde_json::json!(["[REDACTED]", "[REDACTED]", "[REDACTED]"])
+    );
+
+    consumer
+        .credentials
+        .insert("basicauth".into(), serde_json::json!("must-not-escape"));
+    let redacted = redact_consumer_credentials(&consumer);
+    assert_eq!(
+        redacted.credentials["basicauth"],
+        serde_json::json!("[REDACTED]")
+    );
+}
+
+#[test]
 fn test_redact_consumer_jwt_secret_redacted() {
     let mut consumer = make_consumer("c1", "alice");
     consumer.credentials.insert(

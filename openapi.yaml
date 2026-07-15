@@ -6484,6 +6484,7 @@ components:
         password:
           type: string
           minLength: 1
+          maxLength: 4096
           writeOnly: true
           description: >-
             Plaintext password (automatically hashed on write using HMAC-SHA256
@@ -6491,6 +6492,7 @@ components:
             exclusive with `password_hash`.
         password_hash:
           type: string
+          maxLength: 76
           pattern: "^hmac_sha256:[0-9a-f]{64}$"
           writeOnly: true
           description: >-
