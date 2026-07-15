@@ -377,6 +377,7 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
 
     for plugin_source in [
+        include_str!("../../../src/plugins/fault_injection.rs"),
         include_str!("../../../src/plugins/request_mirror.rs"),
         include_str!("../../../src/plugins/response_mock.rs"),
         include_str!("../../../src/plugins/serverless_function.rs"),
@@ -391,6 +392,52 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     let serverless = include_str!("../../../src/plugins/serverless_function.rs");
     assert!(
         serverless.contains("fn deferred_before_proxy_may_change_routing_headers(&self) -> bool")
+    );
+}
+
+#[test]
+fn test_backend_path_bound_retries_preflight_before_backoff() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    let grpc_retry = source
+        .find("// Resolve and validate the next gRPC retry target before")
+        .expect("direct gRPC retries must preflight the next target");
+    let grpc_after_preflight = &source[grpc_retry..];
+    let grpc_mismatch = grpc_after_preflight
+        .find("Aborting gRPC retry because the candidate would change")
+        .expect("direct gRPC retries must reject a path-changing target");
+    let grpc_intermediate_record = grpc_after_preflight
+        .find("record_grpc_backend_dispatch_outcome(")
+        .expect("direct gRPC retry accounting must remain present");
+    let grpc_backoff = grpc_after_preflight
+        .find("let delay = retry::retry_delay(retry_config, grpc_attempt);")
+        .expect("direct gRPC retry backoff must remain present");
+    assert!(
+        grpc_mismatch < grpc_intermediate_record
+            && grpc_mismatch < grpc_backoff
+            && grpc_after_preflight[grpc_mismatch..grpc_intermediate_record].contains("break;"),
+        "direct gRPC path mismatch must abort before intermediate accounting and retry backoff"
+    );
+
+    let generic_retry = source
+        .find("// Resolve and validate the next retry target before charging this")
+        .expect("generic H1/H2 retries must preflight the next target");
+    let generic_after_preflight = &source[generic_retry..];
+    let generic_mismatch = generic_after_preflight
+        .find("Aborting retry because the candidate would change")
+        .expect("generic H1/H2 retries must reject a path-changing target");
+    let generic_intermediate_record = generic_after_preflight
+        .find("permits.record_backend_outcome(BackendAdmissionOutcome {")
+        .expect("generic H1/H2 retry accounting must remain present");
+    let generic_backoff = generic_after_preflight
+        .find("let delay = retry::retry_delay(retry_config, attempt);")
+        .expect("generic H1/H2 retry backoff must remain present");
+    assert!(
+        generic_mismatch < generic_intermediate_record
+            && generic_mismatch < generic_backoff
+            && generic_after_preflight[generic_mismatch..generic_intermediate_record]
+                .contains("break;"),
+        "generic H1/H2 path mismatch must abort before intermediate accounting and retry backoff"
     );
 }
 

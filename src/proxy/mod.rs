@@ -17122,6 +17122,43 @@ async fn handle_proxy_request_inner(
                     break;
                 }
 
+                // Resolve and validate the next gRPC retry target before
+                // charging this failure as an intermediate attempt or
+                // entering backoff. A path-changing candidate will never be
+                // dispatched, so the ordinary final-outcome path must record
+                // the failed attempt exactly once without adding retry delay.
+                let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
+                    (&proxy.upstream_id, &grpc_current_target)
+                    && let Some(ref hash_key) = lb_hash_key
+                    && let Some(next) = backend_dispatch::select_next_retry_target(
+                        &state,
+                        &epoch,
+                        &proxy,
+                        prev_target,
+                        hash_key,
+                        &ctx.client_ip,
+                        proxy_headers,
+                    )
+                {
+                    if !retry_target_preserves_backend_path(
+                        backend_path_is_policy_bound,
+                        &proxy,
+                        &path,
+                        strip_len,
+                        prev_target,
+                        &next,
+                    ) {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            "Aborting gRPC retry because the candidate would change the authorized backend method path"
+                        );
+                        break;
+                    }
+                    Some(next)
+                } else {
+                    None
+                };
+
                 if let Some(permits) = backend_admission_permits.take() {
                     let error_class = match &grpc_result {
                         Err(error) => Some(retry::classify_grpc_proxy_error(error)),
@@ -17184,50 +17221,20 @@ async fn handle_proxy_request_inner(
                 let grpc_pre_rotation_target = grpc_current_target.clone();
 
                 // Try a different target on retry if load balancing is configured
-                if let (Some(_upstream_id), Some(prev_target)) =
-                    (&proxy.upstream_id, &grpc_current_target)
-                    && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = backend_dispatch::select_next_retry_target(
-                        &state,
-                        &epoch,
-                        &proxy,
-                        prev_target,
-                        hash_key,
-                        &ctx.client_ip,
-                        proxy_headers,
-                    )
-                {
-                    if !retry_target_preserves_backend_path(
-                        backend_path_is_policy_bound,
+                if let Some(next) = next_retry_target {
+                    grpc_backend_url = build_backend_url_with_target(
                         &proxy,
                         &path,
+                        effective_query_string.as_ref(),
+                        &next.host,
+                        next.port,
                         strip_len,
-                        prev_target,
-                        &next,
-                    ) {
-                        warn!(
-                            proxy_id = %proxy.id,
-                            "Aborting gRPC retry because the candidate would change the authorized backend method path"
-                        );
-                        grpc_final_cb_key = grpc_pre_rotation_cb_key;
-                        grpc_final_upstream_target = grpc_pre_rotation_target;
-                        grpc_skip_final_cb_record = true;
-                        break;
-                    } else {
-                        grpc_backend_url = build_backend_url_with_target(
-                            &proxy,
-                            &path,
-                            effective_query_string.as_ref(),
-                            &next.host,
-                            next.port,
-                            strip_len,
-                            next.path.as_deref(),
-                        );
-                        grpc_current_cb_key =
-                            Some(crate::circuit_breaker::target_key(&next.host, next.port));
-                        grpc_final_cb_key = grpc_current_cb_key.clone();
-                        grpc_current_target = Some(next);
-                    }
+                        next.path.as_deref(),
+                    );
+                    grpc_current_cb_key =
+                        Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                    grpc_final_cb_key = grpc_current_cb_key.clone();
+                    grpc_current_target = Some(next);
                 }
 
                 // Retry backoff and target rotation cross a fresh policy
@@ -19106,6 +19113,43 @@ async fn handle_proxy_request_inner(
         };
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
+            // Resolve and validate the next retry target before charging this
+            // failure as an intermediate attempt or entering backoff. A
+            // path-changing candidate will not be dispatched, so leave final
+            // accounting to the ordinary post-loop path without delaying the
+            // client first.
+            let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
+                (&proxy.upstream_id, &current_target)
+                && let Some(ref hash_key) = lb_hash_key
+                && let Some(next) = backend_dispatch::select_next_retry_target(
+                    &state,
+                    &epoch,
+                    &proxy,
+                    prev_target,
+                    hash_key,
+                    &ctx.client_ip,
+                    proxy_headers,
+                )
+            {
+                if !retry_target_preserves_backend_path(
+                    backend_path_is_policy_bound,
+                    &proxy,
+                    &path,
+                    strip_len,
+                    prev_target,
+                    &next,
+                ) {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        "Aborting retry because the candidate would change the authorized backend method path"
+                    );
+                    break;
+                }
+                Some(next)
+            } else {
+                None
+            };
+
             if let Some(permits) = backend_admission_permits.take() {
                 permits.record_backend_outcome(BackendAdmissionOutcome {
                     response_status: result.status_code,
@@ -19147,60 +19191,34 @@ async fn handle_proxy_request_inner(
             // result correctly if we break before dispatching to the new
             // target (e.g. its circuit breaker is open).
             let pre_rotation_cb_key = current_cb_target_key.clone();
-            if let (Some(_upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
-                && let Some(ref hash_key) = lb_hash_key
-                && let Some(next) = backend_dispatch::select_next_retry_target(
-                    &state,
-                    &epoch,
-                    &proxy,
-                    prev_target,
-                    hash_key,
-                    &ctx.client_ip,
-                    proxy_headers,
-                )
-            {
-                if !retry_target_preserves_backend_path(
-                    backend_path_is_policy_bound,
+            if let Some(next) = next_retry_target {
+                let target_changed = current_target.as_ref().is_some_and(|prev_target| {
+                    next.host != prev_target.host || next.port != prev_target.port
+                });
+                current_url = build_backend_url_with_target(
                     &proxy,
                     &path,
+                    effective_query_string.as_ref(),
+                    &next.host,
+                    next.port,
                     strip_len,
-                    prev_target,
-                    &next,
-                ) {
-                    warn!(
-                        proxy_id = %proxy.id,
-                        "Aborting retry because the candidate would change the authorized backend method path"
-                    );
-                    skip_final_cb_record = true;
-                    break;
-                } else {
-                    let target_changed =
-                        next.host != prev_target.host || next.port != prev_target.port;
-                    current_url = build_backend_url_with_target(
-                        &proxy,
-                        &path,
-                        effective_query_string.as_ref(),
-                        &next.host,
-                        next.port,
-                        strip_len,
-                        next.path.as_deref(),
-                    );
-                    current_cb_target_key =
-                        Some(crate::circuit_breaker::target_key(&next.host, next.port));
-                    current_target = Some(next);
-                    if target_changed {
-                        // Per-target capability lookup is O(1) (DashMap +
-                        // thread-local key buffer). Unknown / Unsupported both
-                        // gracefully fall through to reqwest, so an
-                        // un-pre-warmed target degrades to the safe path until
-                        // the periodic refresh classifies it.
-                        current_dispatch_h3 = !requires_response_stream_inspection
-                            && supports_native_http3_backend(
-                                &state,
-                                &proxy,
-                                current_target.as_deref(),
-                            );
-                    }
+                    next.path.as_deref(),
+                );
+                current_cb_target_key =
+                    Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                current_target = Some(next);
+                if target_changed {
+                    // Per-target capability lookup is O(1) (DashMap +
+                    // thread-local key buffer). Unknown / Unsupported both
+                    // gracefully fall through to reqwest, so an
+                    // un-pre-warmed target degrades to the safe path until
+                    // the periodic refresh classifies it.
+                    current_dispatch_h3 = !requires_response_stream_inspection
+                        && supports_native_http3_backend(
+                            &state,
+                            &proxy,
+                            current_target.as_deref(),
+                        );
                 }
             }
 

@@ -124,10 +124,11 @@ WebSocket retry loops.
 When backend-path policy is active, `before_proxy` hooks that can dispatch
 external work or synthesize a terminal response opt into the deferred phases.
 Ferrum runs them in their normal relative priority order only after path policy.
-`request_mirror`, pre-proxy `serverless_function`, `response_mock`, and
-`load_testing` use this boundary, so a backend-effective gRPC deny cannot be
-mirrored, invoked, mocked, or load-fanned-out before it is enforced. Proxies
-without a backend-path policy retain the ordinary single `before_proxy` pass.
+`fault_injection`, `request_mirror`, pre-proxy `serverless_function`,
+`response_mock`, and `load_testing` use this boundary, so a backend-effective
+gRPC deny cannot be delayed, faulted, mirrored, invoked, mocked, or
+load-fanned-out before it is enforced. Proxies without a backend-path policy
+retain the ordinary single `before_proxy` pass.
 Deferred hooks observe the original client path, preserving their normal
 request semantics even when mesh routing rewrote the backend path. A deferred
 hook that can inject routing headers runs after the initial access preview; if

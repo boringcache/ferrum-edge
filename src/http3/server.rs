@@ -878,14 +878,22 @@ async fn handle_h3_request(
     // flavor around lets every dispatch and rejection stay flavor-aware
     // (trailers-only gRPC status vs JSON).
     let http_flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
-    let grpc_web_response_content_type = req
-        .headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|content_type| {
-            crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
-                .then(|| crate::plugins::grpc_web::response_content_type(content_type).to_string())
-        });
+    // Extended CONNECT classification takes precedence over Content-Type.
+    // Besides selecting the WebSocket plugin chain below, suppress gRPC-Web
+    // rejection shaping so a spoofed header cannot turn a WS policy reject
+    // into a gRPC-Web response.
+    let grpc_web_response_content_type = if http_flavor == HttpFlavor::WebSocket {
+        None
+    } else {
+        req.headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|content_type| {
+                crate::plugins::grpc_web::is_grpc_web_content_type(content_type).then(|| {
+                    crate::plugins::grpc_web::response_content_type(content_type).to_string()
+                })
+            })
+    };
     let grpc_web_request = grpc_web_response_content_type.is_some();
 
     // Global request admission control (HTTP/3). Single atomic load (~1ns).
@@ -5540,8 +5548,12 @@ fn h3_plugin_protocol_for_flavor(flavor: HttpFlavor) -> ProxyProtocol {
 
 fn h3_plugin_protocol_for_request(flavor: HttpFlavor, grpc_web_request: bool) -> ProxyProtocol {
     // gRPC-Web uses HTTP semantics for transport dispatch but must load the
-    // gRPC policy chain, matching the H1/H2 frontend.
-    if grpc_web_request {
+    // gRPC policy chain, matching the H1/H2 frontend. Extended CONNECT has
+    // already been classified as WebSocket and must retain its frame-policy
+    // chain even when a hostile client also supplies a gRPC-Web content type.
+    if flavor == HttpFlavor::WebSocket {
+        ProxyProtocol::WebSocket
+    } else if grpc_web_request {
         ProxyProtocol::Grpc
     } else {
         h3_plugin_protocol_for_flavor(flavor)
@@ -10041,6 +10053,11 @@ mod h3_plugin_protocol_tests {
         assert_eq!(
             h3_plugin_protocol_for_flavor(HttpFlavor::WebSocket),
             ProxyProtocol::WebSocket
+        );
+        assert_eq!(
+            h3_plugin_protocol_for_request(HttpFlavor::WebSocket, true),
+            ProxyProtocol::WebSocket,
+            "WebSocket flavor must win over a spoofed gRPC-Web content type"
         );
     }
 

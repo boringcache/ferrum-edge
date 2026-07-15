@@ -2289,6 +2289,8 @@ config:
 
 Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; TCP/UDP stream proxies run the same decision in `on_stream_connect`. Stream rejects close the frontend connection/session, so HTTP status/body/grpc-status fields only have downstream meaning for HTTP-family protocols.
 
+When route-sensitive backend-path policy such as `grpc_method_router` is active, the HTTP-family fault decision runs only after the backend-effective method is authorized. A denied rewritten method therefore returns the policy rejection without first sleeping or receiving a synthetic fault response. Proxies without backend-path policy retain the ordinary `before_proxy` ordering.
+
 **Priority:** 2940
 
 | Parameter | Type | Default | Description |
