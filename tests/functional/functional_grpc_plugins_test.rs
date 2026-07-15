@@ -679,10 +679,7 @@ async fn test_grpc_method_router_enforces_stripped_backend_method() {
             .expect("Denied prefixed method request should complete");
     assert_eq!(status, 200);
     assert!(body.is_empty(), "gRPC rejection should be trailers-only");
-    assert_eq!(
-        headers.get("grpc-status").map(String::as_str),
-        Some("7")
-    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
 
     let (_status, allowed_headers, _body) =
         send_grpc_request(&gateway_addr, "/prefix/pkg.Svc/Allowed", b"", &[])
@@ -721,10 +718,7 @@ async fn test_grpc_method_router_enforces_mesh_rewritten_backend_method() {
             .expect("Rewritten denied method request should complete");
     assert_eq!(status, 200);
     assert!(body.is_empty(), "gRPC rejection should be trailers-only");
-    assert_eq!(
-        headers.get("grpc-status").map(String::as_str),
-        Some("7")
-    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
 
     let _ = gateway.kill();
     let _ = gateway.wait();

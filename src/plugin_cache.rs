@@ -195,8 +195,7 @@ impl Plugin for PriorityOverridePlugin {
         self.inner.before_proxy(ctx, headers).await
     }
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
-        self.inner
-            .defer_before_proxy_until_backend_path_resolved()
+        self.inner.defer_before_proxy_until_backend_path_resolved()
     }
     fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
         self.inner
@@ -210,9 +209,7 @@ impl Plugin for PriorityOverridePlugin {
         ctx: &mut RequestContext,
         backend_path: &str,
     ) -> PluginResult {
-        self.inner
-            .on_backend_path_resolved(ctx, backend_path)
-            .await
+        self.inner.on_backend_path_resolved(ctx, backend_path).await
     }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();

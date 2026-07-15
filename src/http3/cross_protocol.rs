@@ -3366,10 +3366,7 @@ where
                 client_ip,
                 proxy_headers,
             );
-            if matches!(
-                &retry_target,
-                CrossProtocolRetryTarget::BackendPathMismatch
-            ) {
+            if matches!(&retry_target, CrossProtocolRetryTarget::BackendPathMismatch) {
                 break;
             }
 
@@ -3400,11 +3397,8 @@ where
             tokio::time::sleep(delay).await;
             attempt += 1;
 
-            if let CrossProtocolRetryTarget::Selected(
-                next_target,
-                next_cb_target_key,
-                next_url,
-            ) = retry_target
+            if let CrossProtocolRetryTarget::Selected(next_target, next_cb_target_key, next_url) =
+                retry_target
             {
                 current_target = Some(next_target);
                 current_cb_target_key = Some(next_cb_target_key);

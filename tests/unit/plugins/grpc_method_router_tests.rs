@@ -560,7 +560,9 @@ fn test_empty_additive_rules_return_error() {
         json!({"method_rate_limits": {}}),
     ] {
         let result = create_plugin("grpc_method_router", &config);
-        let err = result.err().expect("empty additive rule should be rejected");
+        let err = result
+            .err()
+            .expect("empty additive rule should be rejected");
         assert!(err.contains("no rules configured"), "got: {err}");
     }
 }

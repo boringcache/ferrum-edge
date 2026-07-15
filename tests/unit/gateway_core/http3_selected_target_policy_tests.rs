@@ -275,8 +275,7 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         .find("let retry_error_class =")
         .expect("cross-protocol gRPC retry failure recording must remain present");
     assert!(
-        mismatch < failure_record
-            && after_grpc_retry[mismatch..failure_record].contains("break;"),
+        mismatch < failure_record && after_grpc_retry[mismatch..failure_record].contains("break;"),
         "cross-protocol gRPC retries must abort before recording an intermediate retry attempt"
     );
 }

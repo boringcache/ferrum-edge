@@ -883,9 +883,8 @@ async fn handle_h3_request(
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|content_type| {
-            crate::plugins::grpc_web::is_grpc_web_content_type(content_type).then(|| {
-                crate::plugins::grpc_web::response_content_type(content_type).to_string()
-            })
+            crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+                .then(|| crate::plugins::grpc_web::response_content_type(content_type).to_string())
         });
     let grpc_web_request = grpc_web_response_content_type.is_some();
 
@@ -2276,9 +2275,8 @@ async fn handle_h3_request(
     ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
 
     let has_deferred_routing_header_hooks = backend_path_is_policy_bound
-        && capabilities.has(
-            crate::plugin_cache::PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS,
-        );
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
     let mut deferred_result = PluginResult::Continue;
     let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
     let mut authorized_backend_path: Option<String> = None;
@@ -2289,7 +2287,9 @@ async fn handle_h3_request(
                 &proxy,
                 &path,
                 strip_len,
-                upstream_target.as_ref().and_then(|target| target.path.as_deref()),
+                upstream_target
+                    .as_ref()
+                    .and_then(|target| target.path.as_deref()),
             );
             if authorized_backend_path.as_deref() != Some(backend_path.as_str()) {
                 if !run_h3_backend_path_plugins_or_send_reject(
@@ -2321,8 +2321,7 @@ async fn handle_h3_request(
         let headers_before = proxy_headers.clone();
         // Deferral changes authorization order, not the client-path view that
         // before_proxy hooks received before a mesh backend rewrite.
-        let backend_ctx_path =
-            std::mem::replace(&mut ctx.path, original_request_path.clone());
+        let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
         let phase_start = std::time::Instant::now();
         deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
             &plugins,
@@ -2383,8 +2382,7 @@ async fn handle_h3_request(
         if matches!(deferred_result, PluginResult::Continue) {
             // Mirrors and other remaining deferred hooks retain the original
             // client path even though dispatch keeps the rewritten path.
-            let backend_ctx_path =
-                std::mem::replace(&mut ctx.path, original_request_path.clone());
+            let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
             let phase_start = std::time::Instant::now();
             deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
                 &plugins,
@@ -2399,8 +2397,7 @@ async fn handle_h3_request(
         }
         match deferred_result {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => {
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     record_request(&state, 500);
                     send_h3_reject_flavor_aware(
@@ -4936,17 +4933,15 @@ async fn handle_h3_request(
                 let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) =
-                        crate::proxy::backend_dispatch::select_next_retry_target(
-                            &state,
-                            &epoch,
-                            &proxy,
-                            prev_target,
-                            hash_key,
-                            &ctx.client_ip,
-                            &proxy_headers,
-                        )
-                {
+                    && let Some(next) = crate::proxy::backend_dispatch::select_next_retry_target(
+                        &state,
+                        &epoch,
+                        &proxy,
+                        prev_target,
+                        hash_key,
+                        &ctx.client_ip,
+                        &proxy_headers,
+                    ) {
                     if !crate::proxy::retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
                         &proxy,
@@ -5525,13 +5520,9 @@ async fn run_h3_backend_path_plugins_or_send_reject(
 ) -> Result<bool, anyhow::Error> {
     let phase_start = std::time::Instant::now();
     for plugin in backend_path_plugins {
-        match plugin
-            .on_backend_path_resolved(ctx, backend_path)
-            .await
-        {
+        match plugin.on_backend_path_resolved(ctx, backend_path).await {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => {
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     error!(
                         plugin = plugin.name(),
@@ -5557,8 +5548,7 @@ async fn run_h3_backend_path_plugins_or_send_reject(
                     &mut reject_status,
                     &mut headers,
                     &mut reject_body,
-                    matches!(flavor, HttpFlavor::Grpc)
-                        || grpc_web_response_content_type.is_some(),
+                    matches!(flavor, HttpFlavor::Grpc) || grpc_web_response_content_type.is_some(),
                     grpc_web_response_content_type.is_none(),
                 )
                 .await;

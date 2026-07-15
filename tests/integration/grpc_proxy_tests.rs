@@ -24,9 +24,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, BackoffStrategy, DispatchKind, GatewayConfig,
-    LoadBalancerAlgorithm, PluginConfig, PluginScope, Proxy, ResponseBodyMode, RetryConfig,
-    Upstream, UpstreamTarget,
+    AuthMode, BackendScheme, BackoffStrategy, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
+    PluginConfig, PluginScope, Proxy, ResponseBodyMode, RetryConfig, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::ProxyState;
@@ -411,11 +410,8 @@ async fn start_mock_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) 
     (addr, handle)
 }
 
-async fn start_connection_counting_backend() -> (
-    SocketAddr,
-    Arc<AtomicUsize>,
-    tokio::task::JoinHandle<()>,
-) {
+async fn start_connection_counting_backend()
+-> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let connection_count = Arc::new(AtomicUsize::new(0));
@@ -1622,11 +1618,7 @@ async fn grpc_retry_does_not_dial_path_changing_target() {
     let (path_changing_addr, path_changing_connections, _path_changing_handle) =
         start_connection_counting_backend().await;
 
-    let mut proxy = create_grpc_proxy(
-        "grpc-retry-method-policy",
-        "/grpc",
-        unavailable_addr.port(),
-    );
+    let mut proxy = create_grpc_proxy("grpc-retry-method-policy", "/grpc", unavailable_addr.port());
     proxy.upstream_id = Some("grpc-retry-method-policy-upstream".to_string());
     proxy.retry = Some(RetryConfig {
         max_retries: 1,

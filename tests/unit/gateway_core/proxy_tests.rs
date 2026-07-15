@@ -219,12 +219,8 @@ fn test_build_backend_url_target_path_with_query() {
 fn test_backend_effective_grpc_path_uses_prefix_strip() {
     let mut proxy = test_proxy();
     proxy.listen_path = Some("/prefix".into());
-    let path = build_backend_effective_path(
-        &proxy,
-        "/prefix/pkg.Service/Denied",
-        "/prefix".len(),
-        None,
-    );
+    let path =
+        build_backend_effective_path(&proxy, "/prefix/pkg.Service/Denied", "/prefix".len(), None);
     assert_eq!(path, "/pkg.Service/Denied");
 }
 
@@ -376,9 +372,7 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     assert!(path_policy < deferred);
     assert!(source.contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"));
     assert!(source.contains("backend_dispatch::upstream_selection_hash_key("));
-    assert!(source.contains(
-        "std::mem::replace(&mut ctx.path, original_request_path.clone())"
-    ));
+    assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
 
     for plugin_source in [
         include_str!("../../../src/plugins/request_mirror.rs"),
@@ -386,15 +380,16 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
         include_str!("../../../src/plugins/serverless_function.rs"),
         include_str!("../../../src/plugins/load_testing.rs"),
     ] {
-        assert!(plugin_source.contains(
-            "fn defer_before_proxy_until_backend_path_resolved(&self) -> bool"
-        ));
+        assert!(
+            plugin_source
+                .contains("fn defer_before_proxy_until_backend_path_resolved(&self) -> bool")
+        );
     }
 
     let serverless = include_str!("../../../src/plugins/serverless_function.rs");
-    assert!(serverless.contains(
-        "fn deferred_before_proxy_may_change_routing_headers(&self) -> bool"
-    ));
+    assert!(
+        serverless.contains("fn deferred_before_proxy_may_change_routing_headers(&self) -> bool")
+    );
 }
 
 #[test]

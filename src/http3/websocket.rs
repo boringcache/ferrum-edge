@@ -1005,9 +1005,7 @@ pub(crate) async fn handle_h3_websocket(
                     }
 
                     let mut retry_admitted_by_cb = true;
-                    if !retry_path_mismatch
-                        && let Some(cb_config) = &proxy.circuit_breaker
-                    {
+                    if !retry_path_mismatch && let Some(cb_config) = &proxy.circuit_breaker {
                         match state.circuit_breaker_cache.can_execute(
                             &proxy.id,
                             retry_cb_target_key.as_deref(),

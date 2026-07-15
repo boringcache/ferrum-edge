@@ -8651,9 +8651,7 @@ async fn handle_websocket_request_authenticated(
                     }
 
                     let mut retry_admitted_by_cb = true;
-                    if !retry_path_mismatch
-                        && let Some(cb_config) = &proxy.circuit_breaker
-                    {
+                    if !retry_path_mismatch && let Some(cb_config) = &proxy.circuit_breaker {
                         match state.circuit_breaker_cache.can_execute(
                             &proxy.id,
                             retry_cb_target_key.as_deref(),
@@ -9499,12 +9497,7 @@ pub fn retry_target_preserves_backend_path(
     let next_path = next.path.as_deref().or(proxy.backend_path.as_deref());
     previous_path == next_path
         || build_backend_effective_path(proxy, incoming_path, strip_len, previous.path.as_deref())
-            == build_backend_effective_path(
-                proxy,
-                incoming_path,
-                strip_len,
-                next.path.as_deref(),
-            )
+            == build_backend_effective_path(proxy, incoming_path, strip_len, next.path.as_deref())
 }
 
 fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
@@ -13846,8 +13839,7 @@ async fn run_backend_path_plugins_or_build_reject(
     for plugin in backend_path_plugins {
         match plugin.on_backend_path_resolved(ctx, backend_path).await {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => {
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     error!(
@@ -13983,13 +13975,8 @@ async fn handle_backend_admission_rejection(
     )
     .await;
     apply_grpc_reject_metadata(ctx, &reject);
-    let grpc_web_response = build_grpc_web_reject_response(
-        plugins,
-        ctx,
-        grpc_web_error_content_type,
-        &reject,
-    )
-    .await;
+    let grpc_web_response =
+        build_grpc_web_reject_response(plugins, ctx, grpc_web_error_content_type, &reject).await;
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -14057,8 +14044,8 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     pass: BackendPathBeforeProxyPass,
 ) -> PluginResult {
     for plugin in plugins {
-        let deferred = backend_path_is_policy_bound
-            && plugin.defer_before_proxy_until_backend_path_resolved();
+        let deferred =
+            backend_path_is_policy_bound && plugin.defer_before_proxy_until_backend_path_resolved();
         let should_run = match pass {
             BackendPathBeforeProxyPass::Initial => !deferred,
             BackendPathBeforeProxyPass::RoutingHeaderDeferred => {
@@ -14073,8 +14060,9 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
         }
         match plugin.before_proxy(ctx, headers).await {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => return reject,
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return reject;
+            }
         }
     }
     PluginResult::Continue
@@ -15512,8 +15500,7 @@ async fn handle_proxy_request_inner(
         .await
         {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => {
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     error!("before_proxy rejection could not be normalized");
                     record_request(&state, 500);
@@ -15527,8 +15514,7 @@ async fn handle_proxy_request_inner(
                 let reject = finalize_reject_response_with_after_proxy_hooks(
                     &plugins,
                     &mut ctx,
-                    StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &plugin_reject.body,
                     plugin_reject.headers,
                     is_grpc_request,
@@ -15566,8 +15552,7 @@ async fn handle_proxy_request_inner(
         .await
         {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => {
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     error!("before_proxy rejection could not be normalized");
                     ctx.headers = tmp_headers;
@@ -15583,8 +15568,7 @@ async fn handle_proxy_request_inner(
                 let reject = finalize_reject_response_with_after_proxy_hooks(
                     &plugins,
                     &mut ctx,
-                    StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &plugin_reject.body,
                     plugin_reject.headers,
                     is_grpc_request,
@@ -15768,7 +15752,9 @@ async fn handle_proxy_request_inner(
                 &proxy,
                 &path,
                 strip_len,
-                upstream_target.as_ref().and_then(|target| target.path.as_deref()),
+                upstream_target
+                    .as_ref()
+                    .and_then(|target| target.path.as_deref()),
             );
             if authorized_backend_path.as_deref() != Some(backend_path.as_str()) {
                 if let Some(response) = run_backend_path_plugins_or_build_reject(
@@ -15796,14 +15782,10 @@ async fn handle_proxy_request_inner(
         }
         run_deferred_routing_headers = false;
 
-        let headers_before = owned_proxy_headers
-            .as_ref()
-            .unwrap_or(&ctx.headers)
-            .clone();
+        let headers_before = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
         // These hooks moved later for authorization ordering, but their
         // documented request view remains the original client path.
-        let backend_ctx_path =
-            std::mem::replace(&mut ctx.path, original_request_path.clone());
+        let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
         let phase_start = Instant::now();
         deferred_result = match owned_proxy_headers.as_mut() {
             Some(headers) => {
@@ -15870,8 +15852,7 @@ async fn handle_proxy_request_inner(
         if matches!(deferred_result, PluginResult::Continue) {
             // Preserve the pre-existing client-path contract for mirrors,
             // mocks, load fan-out, and other remaining deferred hooks.
-            let backend_ctx_path =
-                std::mem::replace(&mut ctx.path, original_request_path.clone());
+            let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
             let phase_start = Instant::now();
             deferred_result = match owned_proxy_headers.as_mut() {
                 Some(headers) => {
@@ -15903,8 +15884,7 @@ async fn handle_proxy_request_inner(
         }
         match deferred_result {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => {
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     record_request(&state, 500);
                     return Ok(build_response(
