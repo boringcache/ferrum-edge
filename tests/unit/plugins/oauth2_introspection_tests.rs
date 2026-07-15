@@ -612,22 +612,27 @@ fn new_bounds_provider_count_and_requires_explicit_shared_trust_for_fanout() {
         "introspection_endpoint": "http://localhost/introspect",
         "client_auth": {"method": "none"}
     });
-    let explicit_authorization = json!({
-        "introspection_endpoint": "http://localhost/introspect",
-        "client_auth": {"method": "none"},
-        "from_headers": [{"name": "Authorization", "prefix": "bEaReR "}]
-    });
-    let error = Oauth2Introspection::new(
-        &json!({"providers": [implicit_authorization, explicit_authorization]}),
-        PluginHttpClient::default(),
-    )
-    .err()
-    .expect("explicit and implicit Authorization bearer sources must conflict");
-    assert!(error.contains("allow_provider_fanout"));
+    for from_headers in [
+        json!([{"name": "Authorization", "prefix": "bEaReR "}]),
+        json!([{"name": "Authorization"}]),
+    ] {
+        let explicit_authorization = json!({
+            "introspection_endpoint": "http://localhost/introspect",
+            "client_auth": {"method": "none"},
+            "from_headers": from_headers
+        });
+        let error = Oauth2Introspection::new(
+            &json!({"providers": [implicit_authorization.clone(), explicit_authorization]}),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("explicit and implicit Authorization bearer sources must conflict");
+        assert!(error.contains("allow_provider_fanout"));
+    }
 }
 
 #[tokio::test]
-async fn authorization_scheme_is_case_insensitive_but_non_bearer_is_rejected() {
+async fn authorization_scheme_is_case_insensitive_and_non_bearer_is_skipped() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/introspect"))
@@ -655,14 +660,40 @@ async fn authorization_scheme_is_case_insensitive_but_non_bearer_is_rejected() {
         "authorization".to_string(),
         "Basic not-a-bearer-token".to_string(),
     );
-    assert_bearer_reject(
+    assert_continue(
         plugin
             .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
             .await,
-        401,
-        "invalid_request",
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn prefixless_authorization_location_skips_foreign_scheme() {
+    let server = MockServer::start().await;
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": format!("{}/introspect", server.uri()),
+                "client_auth": {"method": "none"},
+                "from_headers": [{"name": "Authorization"}]
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Basic dXNlcjpwYXNz".to_string(),
+    );
+
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1108,6 +1139,51 @@ async fn accepted_token_is_stripped_from_every_duplicate_location() {
         ctx.metadata
             .contains_key("auth.strip_query_param.access_token")
     );
+}
+
+#[tokio::test]
+async fn duplicate_authorization_token_stripping_uses_shared_bearer_syntax() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"active": true, "username": "u"})),
+        )
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": format!("{}/introspect", server.uri()),
+                "client_auth": {"method": "none"},
+                "from_params": ["access_token"],
+                "forward_original_token": false
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for authorization in ["Bearer\tduplicate-token", "Bearer  duplicate-token"] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
+        ctx.headers
+            .insert("authorization".to_string(), authorization.to_string());
+        ctx.query_params
+            .insert("access_token".to_string(), "duplicate-token".to_string());
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+
+        let mut headers = ctx.headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            headers
+                .keys()
+                .all(|name| !name.eq_ignore_ascii_case("authorization"))
+        );
+    }
 }
 
 #[tokio::test]

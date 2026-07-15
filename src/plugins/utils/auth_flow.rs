@@ -121,6 +121,12 @@ macro_rules! impl_auth_plugin {
                 $protocols
             }
 
+            fn authentication_challenge(&self) -> Option<&'static str> {
+                <$ty as crate::plugins::utils::auth_flow::AuthMechanism>::authentication_challenge(
+                    self,
+                )
+            }
+
             async fn authenticate(
                 &self,
                 ctx: &mut crate::plugins::RequestContext,
@@ -139,6 +145,10 @@ pub(crate) use impl_auth_plugin;
 #[async_trait]
 pub trait AuthMechanism: Send + Sync {
     fn mechanism_name(&self) -> &'static str;
+
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        None
+    }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential;
 
@@ -178,7 +188,9 @@ async fn run_auth_impl<M: AuthMechanism>(
             debug!("{}: no credential present", mechanism.mechanism_name());
             PluginResult::Continue
         }
-        ExtractedCredential::InvalidFormat(body) => reject(401, body),
+        ExtractedCredential::InvalidFormat(body) => {
+            reject(401, body, mechanism.authentication_challenge())
+        }
         credential => match mechanism.verify(credential, consumer_index).await {
             VerifyOutcome::Success {
                 consumer,
@@ -220,18 +232,26 @@ async fn run_auth_impl<M: AuthMechanism>(
             VerifyOutcome::InvalidFormat(body)
             | VerifyOutcome::Invalid(body)
             | VerifyOutcome::ConsumerNotFound(body)
-            | VerifyOutcome::VerificationFailed(body) => reject(401, body),
-            VerifyOutcome::Forbidden(body) => reject(403, body),
-            VerifyOutcome::Internal(body) => reject(500, body),
+            | VerifyOutcome::VerificationFailed(body) => {
+                reject(401, body, mechanism.authentication_challenge())
+            }
+            VerifyOutcome::Forbidden(body) => reject(403, body, None),
+            VerifyOutcome::Internal(body) => reject(500, body, None),
         },
     }
 }
 
-fn reject(status_code: u16, body: String) -> PluginResult {
+fn reject(status_code: u16, body: String, challenge: Option<&'static str>) -> PluginResult {
+    let mut headers = HashMap::new();
+    if status_code == 401
+        && let Some(challenge) = challenge
+    {
+        headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
+    }
     PluginResult::Reject {
         status_code,
         body,
-        headers: HashMap::new(),
+        headers,
     }
 }
 

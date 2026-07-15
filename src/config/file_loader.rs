@@ -132,6 +132,27 @@ pub fn load_config_from_file(
         ))
         .run()?;
 
+    let plaintext_basic_auth_consumers: Vec<&str> = config
+        .consumers
+        .iter()
+        .filter(|consumer| {
+            consumer
+                .credentials
+                .get("basicauth")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.get("password").is_some()))
+        })
+        .map(|consumer| consumer.id.as_str())
+        .collect();
+    if !plaintext_basic_auth_consumers.is_empty() {
+        anyhow::bail!(
+            "Configuration validation failed: file-mode Basic-auth credentials must use \
+             'password_hash'; plaintext 'password' is accepted only by Admin API writes \
+             (consumer IDs: {})",
+            plaintext_basic_auth_consumers.join(", ")
+        );
+    }
+
     // Reject mesh-PROJECTED upstream fields on this operator-provided file load.
     // File config is operator-authored, so (like the admin write path) it must not
     // carry `Upstream.{port_overrides, source_locality, locality_lb_strict,
