@@ -51,9 +51,9 @@ impl AdaptiveConcurrency {
 }
 
 pub(crate) fn parse_config_value(config: &Value) -> Result<AdaptiveConcurrencyConfig, String> {
-    let object = config.as_object().ok_or_else(|| {
-        format!("adaptive_concurrency: config must be an object, got: {config}")
-    })?;
+    let object = config
+        .as_object()
+        .ok_or_else(|| format!("adaptive_concurrency: config must be an object, got: {config}"))?;
     parse_config(object)
 }
 

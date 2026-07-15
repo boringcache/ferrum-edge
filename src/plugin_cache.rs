@@ -22,7 +22,9 @@ use std::sync::Arc;
 use crate::config::types::{GatewayConfig, PluginScope};
 use tracing::{error, warn};
 
-use crate::adaptive_concurrency::{AdaptiveConcurrencyConfig, AdaptiveConcurrencyLimiter};
+use crate::adaptive_concurrency::{
+    AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
+};
 use crate::config::types::PluginConfig;
 use crate::plugins::utils::jwks_cache::retain_active_uris;
 use crate::plugins::{
@@ -572,6 +574,7 @@ impl Plugin for PriorityOverridePlugin {
 /// fail-open behavior.
 fn try_create_plugin(
     pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
     http_client: &PluginHttpClient,
     current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
     staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
@@ -579,6 +582,7 @@ fn try_create_plugin(
     let created = if pc.plugin_name == "adaptive_concurrency" {
         create_adaptive_concurrency_plugin(
             pc,
+            gateway_config,
             http_client,
             current_adaptive_states,
             staged_adaptive_states,
@@ -661,6 +665,13 @@ struct AdaptiveConcurrencyPolicyId {
     plugin_config_id: String,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AdaptiveConcurrencyRouteKey {
+    scope: String,
+    host: Option<String>,
+    port: Option<u16>,
+}
+
 #[derive(Clone)]
 struct AdaptiveConcurrencyInstance {
     limiter: Arc<AdaptiveConcurrencyLimiter>,
@@ -668,6 +679,7 @@ struct AdaptiveConcurrencyInstance {
     config_value: serde_json::Value,
     scope: PluginScope,
     proxy_id: Option<String>,
+    route_keys: Vec<AdaptiveConcurrencyRouteKey>,
     generation: u64,
     drain_older_generation: bool,
 }
@@ -685,10 +697,89 @@ fn adaptive_concurrency_policy_id(pc: &PluginConfig) -> AdaptiveConcurrencyPolic
 fn adaptive_definition_matches(
     state: &AdaptiveConcurrencyInstance,
     pc: &PluginConfig,
+    route_keys: &[AdaptiveConcurrencyRouteKey],
 ) -> bool {
     state.config_value == pc.config
         && state.scope == pc.scope
         && state.proxy_id == pc.proxy_id
+        && state.route_keys == route_keys
+}
+
+fn adaptive_concurrency_route_keys(
+    pc: &PluginConfig,
+    key_by: AdaptiveConcurrencyKeyBy,
+    config: &GatewayConfig,
+) -> Vec<AdaptiveConcurrencyRouteKey> {
+    let mut keys = Vec::new();
+    for proxy in &config.proxies {
+        let applies = match &pc.scope {
+            PluginScope::Global => true,
+            PluginScope::Proxy => {
+                pc.proxy_id.as_deref() == Some(proxy.id.as_str())
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == pc.id)
+            }
+            PluginScope::ProxyGroup => proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == pc.id),
+        };
+        if !applies {
+            continue;
+        }
+
+        let scope = match key_by {
+            AdaptiveConcurrencyKeyBy::Proxy => {
+                format!("proxy:{}:{}", proxy.namespace, proxy.id)
+            }
+            AdaptiveConcurrencyKeyBy::Upstream => proxy
+                .upstream_id
+                .as_deref()
+                .map(|upstream_id| {
+                    format!("upstream:{}:{upstream_id}", proxy.namespace)
+                })
+                .unwrap_or_else(|| format!("proxy:{}:{}", proxy.namespace, proxy.id)),
+            AdaptiveConcurrencyKeyBy::Backend => "backend".to_string(),
+        };
+
+        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            if let Some(upstream) = config
+                .upstreams
+                .iter()
+                .find(|upstream| upstream.id == upstream_id)
+            {
+                if upstream.targets.is_empty() {
+                    // Preserve the route source even when service discovery has
+                    // not materialized a target into this config snapshot.
+                    keys.push(AdaptiveConcurrencyRouteKey {
+                        scope,
+                        host: None,
+                        port: None,
+                    });
+                } else {
+                    keys.extend(upstream.targets.iter().map(|target| {
+                        AdaptiveConcurrencyRouteKey {
+                            scope: scope.clone(),
+                            host: Some(target.host.clone()),
+                            port: Some(target.port),
+                        }
+                    }));
+                }
+                continue;
+            }
+        }
+
+        keys.push(AdaptiveConcurrencyRouteKey {
+            scope,
+            host: Some(proxy.backend_host.clone()),
+            port: Some(proxy.backend_port),
+        });
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 fn retained_adaptive_concurrency_states(
@@ -704,10 +795,12 @@ fn retained_adaptive_concurrency_states(
             continue;
         }
         let identity = adaptive_concurrency_policy_id(pc);
-        if let Some(existing) = current.get(&identity)
-            && adaptive_definition_matches(existing, pc)
-        {
-            retained.insert(identity, existing.clone());
+        if let Some(existing) = current.get(&identity) {
+            let route_keys =
+                adaptive_concurrency_route_keys(pc, existing.config.key_by, config);
+            if adaptive_definition_matches(existing, pc, &route_keys) {
+                retained.insert(identity, existing.clone());
+            }
         }
     }
     retained
@@ -734,15 +827,63 @@ fn adaptive_concurrency_policy_is_active(pc: &PluginConfig, config: &GatewayConf
     }
 }
 
+fn include_adaptive_concurrency_route_rebuilds(
+    current: &AdaptiveConcurrencyInstanceMap,
+    config: &GatewayConfig,
+    proxy_ids_to_rebuild: &mut HashSet<String>,
+    rebuild_globals: &mut bool,
+) {
+    for (identity, existing) in current {
+        let Some(pc) = config.plugin_configs.iter().find(|pc| {
+            pc.enabled
+                && pc.plugin_name == "adaptive_concurrency"
+                && pc.namespace == identity.namespace
+                && pc.id == identity.plugin_config_id
+        }) else {
+            continue;
+        };
+        let route_keys = adaptive_concurrency_route_keys(pc, existing.config.key_by, config);
+        if route_keys == existing.route_keys {
+            continue;
+        }
+
+        match &pc.scope {
+            PluginScope::Global => {
+                *rebuild_globals = true;
+                proxy_ids_to_rebuild.extend(config.proxies.iter().map(|proxy| proxy.id.clone()));
+            }
+            PluginScope::Proxy => {
+                if let Some(proxy_id) = pc.proxy_id.as_ref() {
+                    proxy_ids_to_rebuild.insert(proxy_id.clone());
+                }
+            }
+            PluginScope::ProxyGroup => {
+                proxy_ids_to_rebuild.extend(config.proxies.iter().filter_map(|proxy| {
+                    proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == pc.id)
+                        .then(|| proxy.id.clone())
+                }));
+            }
+        }
+    }
+}
+
 fn create_adaptive_concurrency_plugin(
     pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
     http_client: &PluginHttpClient,
     current: &AdaptiveConcurrencyInstanceMap,
     staged: &mut AdaptiveConcurrencyInstanceMap,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     let identity = adaptive_concurrency_policy_id(pc);
+    let parsed = Arc::new(crate::plugins::adaptive_concurrency::parse_config_value(
+        &pc.config,
+    )?);
+    let route_keys = adaptive_concurrency_route_keys(pc, parsed.key_by, gateway_config);
     if let Some(existing) = staged.get(&identity) {
-        if !adaptive_definition_matches(existing, pc) {
+        if !adaptive_definition_matches(existing, pc, &route_keys) {
             return Err(format!(
                 "adaptive_concurrency: plugin config identity '{}:{}' resolves to conflicting policy definitions",
                 pc.namespace, pc.id
@@ -757,34 +898,33 @@ fn create_adaptive_concurrency_plugin(
         )));
     }
 
-    let parsed = Arc::new(
-        crate::plugins::adaptive_concurrency::parse_config_value(&pc.config)?,
-    );
-    let (limiter, generation, drain_older_generation) =
-        if let Some(existing) = current.get(&identity) {
-            let generation = existing.generation.checked_add(1).ok_or_else(|| {
-                format!(
-                    "adaptive_concurrency: plugin config '{}:{}' exhausted its reload generation counter",
-                    pc.namespace, pc.id
-                )
-            })?;
-            (
-                Arc::clone(&existing.limiter),
-                generation,
-                existing.config.key_by != parsed.key_by
-                    || parsed.max_tracked_keys < existing.config.max_tracked_keys
-                    || existing.scope != pc.scope
-                    || existing.proxy_id != pc.proxy_id,
+    let (limiter, generation, drain_older_generation) = if let Some(existing) =
+        current.get(&identity)
+    {
+        let generation = existing.generation.checked_add(1).ok_or_else(|| {
+            format!(
+                "adaptive_concurrency: plugin config '{}:{}' exhausted its reload generation counter",
+                pc.namespace, pc.id
             )
-        } else {
-            (
-                Arc::new(AdaptiveConcurrencyLimiter::new(
-                    http_client.pool_shard_amount(),
-                )),
-                1,
-                false,
-            )
-        };
+        })?;
+        (
+            Arc::clone(&existing.limiter),
+            generation,
+            existing.config.key_by != parsed.key_by
+                || parsed.max_tracked_keys < existing.config.max_tracked_keys
+                || existing.scope != pc.scope
+                || existing.proxy_id != pc.proxy_id
+                || existing.route_keys != route_keys,
+        )
+    } else {
+        (
+            Arc::new(AdaptiveConcurrencyLimiter::new(
+                http_client.pool_shard_amount(),
+            )),
+            1,
+            false,
+        )
+    };
 
     let plugin = crate::plugins::adaptive_concurrency::AdaptiveConcurrency::with_shared_limiter(
         Arc::clone(&parsed),
@@ -799,6 +939,7 @@ fn create_adaptive_concurrency_plugin(
             config_value: pc.config.clone(),
             scope: pc.scope.clone(),
             proxy_id: pc.proxy_id.clone(),
+            route_keys,
             generation,
             drain_older_generation,
         },
@@ -1487,10 +1628,16 @@ impl PluginCache {
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         let mut plugin_errors: Vec<String> = Vec::new();
-        let mut adaptive_concurrency_instances = retained_adaptive_concurrency_states(
+        let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
+        let mut rebuild_globals = rebuild_globals;
+        include_adaptive_concurrency_route_rebuilds(
             &current.adaptive_concurrency_instances,
             config,
+            &mut proxy_ids_to_rebuild,
+            &mut rebuild_globals,
         );
+        let mut adaptive_concurrency_instances =
+            retained_adaptive_concurrency_states(&current.adaptive_concurrency_instances, config);
 
         // Rebuild globals if any global plugin config changed
         let new_globals = if rebuild_globals {
@@ -1519,6 +1666,7 @@ impl PluginCache {
                 }
                 match try_create_plugin(
                     pc,
+                    config,
                     &self.http_client,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
@@ -1542,6 +1690,7 @@ impl PluginCache {
                 if pc.scope == PluginScope::Global {
                     match try_create_plugin(
                         pc,
+                        config,
                         &self.http_client,
                         &current.adaptive_concurrency_instances,
                         &mut adaptive_concurrency_instances,
@@ -1605,6 +1754,12 @@ impl PluginCache {
                     return None;
                 }
                 let pc = proxy_group_configs.get(id.as_str())?;
+                if pc.plugin_name == "adaptive_concurrency"
+                    && !adaptive_concurrency_instances
+                        .contains_key(&adaptive_concurrency_policy_id(pc))
+                {
+                    return None;
+                }
                 if same_proxy_group_plugin_config(&existing.config, pc) {
                     Some((id.clone(), existing.clone()))
                 } else {
@@ -1644,6 +1799,7 @@ impl PluginCache {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(
                             pc,
+                            config,
                             &self.http_client,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
@@ -1709,6 +1865,7 @@ impl PluginCache {
                     } else {
                         match try_create_plugin(
                             pc,
+                            config,
                             &self.http_client,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
@@ -2120,6 +2277,7 @@ impl PluginCache {
             }
             match try_create_plugin(
                 pc,
+                config,
                 http_client,
                 current_adaptive_states,
                 &mut adaptive_concurrency_instances,
@@ -2142,6 +2300,7 @@ impl PluginCache {
             if pc.scope == PluginScope::Global {
                 match try_create_plugin(
                     pc,
+                    config,
                     http_client,
                     current_adaptive_states,
                     &mut adaptive_concurrency_instances,
@@ -2199,6 +2358,7 @@ impl PluginCache {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(
                             pc,
+                            config,
                             http_client,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
@@ -2240,6 +2400,7 @@ impl PluginCache {
                         // First proxy to reference this group plugin — create the instance
                         match try_create_plugin(
                             pc,
+                            config,
                             http_client,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,

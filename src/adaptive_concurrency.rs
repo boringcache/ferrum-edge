@@ -107,6 +107,11 @@ impl AdaptiveConcurrencyState {
 struct AdaptiveConcurrencyPolicyLifecycle {
     /// Plugin-cache generation currently authorized to admit and train.
     active_generation: AtomicU64,
+    /// Oldest compatible plugin-cache generation still authorized to admit.
+    /// Requests can pin a cache view before a reload and reach backend
+    /// admission afterward, so compatible commits retain this floor. A
+    /// structural key-space change advances it to the replacement generation.
+    minimum_admission_generation: AtomicU64,
     /// Validated replacement generation staged around the cache's atomic
     /// publication. Compatible old/new plugins can both admit during this
     /// handoff because they share the same target counters.
@@ -132,6 +137,7 @@ impl AdaptiveConcurrencyPolicyLifecycle {
     fn new() -> Self {
         Self {
             active_generation: AtomicU64::new(1),
+            minimum_admission_generation: AtomicU64::new(1),
             pending_generation: AtomicU64::new(0),
             pending_requires_drain: AtomicBool::new(false),
             total_in_flight: AtomicU64::new(0),
@@ -350,7 +356,12 @@ impl AdaptiveConcurrencyLimiter {
     }
 
     fn policy_generation_current(&self, generation: u64) -> bool {
-        if self.policy.active_generation.load(Ordering::Acquire) == generation {
+        let active = self.policy.active_generation.load(Ordering::Acquire);
+        let minimum = self
+            .policy
+            .minimum_admission_generation
+            .load(Ordering::Acquire);
+        if generation >= minimum && generation <= active {
             return true;
         }
         self.policy.pending_generation.load(Ordering::Acquire) == generation
@@ -420,9 +431,16 @@ impl AdaptiveConcurrencyLimiter {
         }
 
         if drain_older_generation {
+            // Exclusively block admission before retiring the older key-space
+            // generations. In particular, an older request view must not be
+            // allowed to observe DRAINING, perform the zero-permit reset, and
+            // reactivate itself before `active_generation` advances.
             self.policy
                 .transition_state
-                .store(POLICY_DRAINING, Ordering::Release);
+                .store(POLICY_RESETTING, Ordering::Release);
+            self.policy
+                .minimum_admission_generation
+                .fetch_max(generation, Ordering::AcqRel);
         }
 
         loop {
@@ -454,6 +472,20 @@ impl AdaptiveConcurrencyLimiter {
         // changes, but the replacement bounds become authoritative at commit.
         for entry in &self.inner {
             clamp_limit(&entry.value().limit, config.min_limit, config.max_limit);
+        }
+        if drain_older_generation {
+            if self.policy.total_in_flight.load(Ordering::Acquire) == 0 {
+                self.inner.clear();
+                self.scope_cache.clear();
+                self.tracked_keys.store(0, Ordering::Release);
+                self.policy
+                    .transition_state
+                    .store(POLICY_ACTIVE, Ordering::Release);
+            } else {
+                self.policy
+                    .transition_state
+                    .store(POLICY_DRAINING, Ordering::Release);
+            }
         }
         self.policy.feedback_blocked.store(false, Ordering::Release);
     }
