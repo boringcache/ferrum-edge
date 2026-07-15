@@ -337,9 +337,16 @@ fn parse_header_name(field: &str, name: &str) -> Result<String, String> {
 }
 
 fn validate_header_value(key: &str, value: &str) -> Result<(), String> {
+    let invalid_value = || format!("security_headers: '{key}' must be a valid HTTP field value");
+    if !value
+        .bytes()
+        .all(|byte| byte == b'\t' || byte == b' ' || byte.is_ascii_graphic())
+    {
+        return Err(invalid_value());
+    }
     HeaderValue::from_str(value)
         .map(|_| ())
-        .map_err(|_| format!("security_headers: '{key}' must be a valid HTTP field value"))
+        .map_err(|_| invalid_value())
 }
 
 fn reject_unknown_keys(
