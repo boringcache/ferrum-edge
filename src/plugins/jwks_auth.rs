@@ -532,8 +532,7 @@ impl JwksAuth {
         let header_value = if effective_header_claim == effective_identity_claim {
             identity.clone()
         } else {
-            extract_claim_string_exact(claims, effective_header_claim)
-                .or_else(|| identity.clone())
+            extract_claim_string_exact(claims, effective_header_claim).or_else(|| identity.clone())
         };
 
         let consumer = if let Some(ref id) = identity {

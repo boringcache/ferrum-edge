@@ -11,8 +11,7 @@ pub fn extract_claim_values(claims: &Value, claim_path: &str) -> Vec<String> {
 
 /// Extract a single string from a claim path.
 pub fn extract_claim_string(claims: &Value, claim_path: &str) -> Option<String> {
-    extract_claim_string_exact(claims, claim_path)
-        .filter(|value| !value.trim().is_empty())
+    extract_claim_string_exact(claims, claim_path).filter(|value| !value.trim().is_empty())
 }
 
 /// Extract a string byte-for-byte, including an explicitly blank value.
