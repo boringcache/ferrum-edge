@@ -2128,13 +2128,33 @@ impl Plugin for AiSemanticFirewall {
         ctx: &RequestContext,
         content_type: Option<&str>,
         response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        response_headers: &HashMap<String, String>,
     ) -> bool {
         if !self.requires_response_body_buffering()
             || ctx.method.eq_ignore_ascii_case("HEAD")
             || is_native_grpc_request(ctx)
         {
             return false;
+        }
+
+        // The final buffered hook is the only phase that can safely classify
+        // an origin-encoded response by its decoded shape. Keep every eligible
+        // non-identity encoding on the bounded decode path even when the origin
+        // labels it as text/plain, omits Content-Type, or uses an unsupported
+        // encoding that must follow the configured `on_error` policy. This
+        // remains a narrowing-only answer: if the request-level decision
+        // already opted out, this hook must not reverse it.
+        //
+        // Compression advertises a gateway-planned encoding in `after_proxy`
+        // before the still-plaintext body is transformed. On dispatch paths
+        // that refine after that hook, the private algorithm marker prevents
+        // ordinary plaintext from being mistaken for origin-encoded bytes.
+        if (200..300).contains(&response_status)
+            && !matches!(response_status, 204 | 205)
+            && has_non_identity_content_encoding(response_headers)
+            && !gateway_response_compression_planned(ctx, response_headers)
+        {
+            return self.should_buffer_response_body(ctx);
         }
 
         let Some(content_type) = content_type else {
@@ -4919,9 +4939,12 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 }
 
 fn content_encoding_value(headers: &HashMap<String, String>) -> Option<&str> {
-    header_value(headers, "content-encoding")
+    let encoding = header_value(headers, "content-encoding")?.trim();
+    encoding
+        .split(',')
         .map(str::trim)
-        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+        .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
+        .then_some(encoding)
 }
 
 fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {

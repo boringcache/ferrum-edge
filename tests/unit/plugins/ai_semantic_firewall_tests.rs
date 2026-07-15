@@ -3445,19 +3445,34 @@ async fn encoded_origin_response_fails_closed_without_provider_call() {
     );
 }
 
-async fn assert_mislabeled_encoded_json_is_inspected(encoding: &str, body: Vec<u8>) {
+async fn assert_mislabeled_encoded_json_is_inspected(
+    content_type: Option<&str>,
+    encoding: &str,
+    body: Vec<u8>,
+) {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
         "builtins": {"response_leakage": true}
     });
     let firewall = plugin(&config);
-    let headers = HashMap::from([
-        ("content-type".to_string(), "text/plain".to_string()),
-        ("content-encoding".to_string(), encoding.to_string()),
-    ]);
+    let mut headers = HashMap::from([("content-encoding".to_string(), encoding.to_string())]);
+    if let Some(content_type) = content_type {
+        headers.insert("content-type".to_string(), content_type.to_string());
+    }
     let mut ctx = create_test_context();
 
+    // `response_body_mode: stream` first selects buffering from the plugin's
+    // request-level upper bound, then asks this header-aware refinement whether
+    // it can release the response. Encoded wire bytes must stay buffered so the
+    // final bounded decoder below is actually reached.
+    assert!(firewall.should_buffer_response_body(&ctx));
+    assert!(firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        content_type,
+        200,
+        &headers,
+    ));
     assert_continue(
         firewall
             .on_response_body(&mut ctx, 200, &headers, &body)
@@ -3480,6 +3495,7 @@ async fn assert_mislabeled_encoded_json_is_inspected(encoding: &str, body: Vec<u
 #[tokio::test]
 async fn final_response_decodes_mislabeled_gzip_json_before_scope_decision() {
     assert_mislabeled_encoded_json_is_inspected(
+        Some("text/plain"),
         "gzip",
         gzip_bytes(
             br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
@@ -3491,6 +3507,7 @@ async fn final_response_decodes_mislabeled_gzip_json_before_scope_decision() {
 #[tokio::test]
 async fn final_response_decodes_mislabeled_brotli_json_before_scope_decision() {
     assert_mislabeled_encoded_json_is_inspected(
+        None,
         "br",
         brotli_bytes(
             br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
@@ -3514,6 +3531,8 @@ async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
         ("gzip", b"not a gzip stream".to_vec()),
         ("br", truncated_brotli),
         ("zstd", b"unsupported encoded bytes".to_vec()),
+        ("gzip, br", b"unsupported encoding list".to_vec()),
+        ("identity, gzip", b"unsupported mixed encoding list".to_vec()),
     ] {
         let headers = HashMap::from([
             ("content-type".to_string(), "text/plain".to_string()),
@@ -3521,6 +3540,12 @@ async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
         ]);
         let mut ctx = create_test_context();
 
+        assert!(firewall.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/plain"),
+            200,
+            &headers,
+        ));
         assert_continue(
             firewall
                 .on_response_body(&mut ctx, 200, &headers, &body)
@@ -3545,6 +3570,12 @@ async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
     let mut empty_ctx = create_test_context();
+    assert!(firewall.should_buffer_response_body_for_content_type(
+        &empty_ctx,
+        Some("text/plain"),
+        200,
+        &headers,
+    ));
     assert_continue(
         firewall
             .on_response_body(&mut empty_ctx, 200, &headers, b"")
@@ -3583,6 +3614,12 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
     let body = gzip_bytes(&decoded);
     let mut ctx = create_test_context();
 
+    assert!(firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/plain"),
+        200,
+        &headers,
+    ));
     assert_continue(
         firewall
             .on_response_body(&mut ctx, 200, &headers, &body)
@@ -3600,6 +3637,68 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
             .map(String::as_str),
         Some("encoded_body")
     );
+}
+
+#[test]
+fn default_stream_refinement_releases_only_unencoded_non_ai_text() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let ctx = create_test_context();
+
+    assert!(firewall.should_buffer_response_body(&ctx));
+    for (content_type, headers) in [
+        (Some("text/plain"), HashMap::new()),
+        (None, HashMap::new()),
+        (
+            Some("text/plain"),
+            HashMap::from([("content-encoding".to_string(), "identity".to_string())]),
+        ),
+        (
+            Some("text/plain"),
+            HashMap::from([(
+                "content-encoding".to_string(),
+                " identity, , IDENTITY ".to_string(),
+            )]),
+        ),
+    ] {
+        assert!(!firewall.should_buffer_response_body_for_content_type(
+            &ctx,
+            content_type,
+            200,
+            &headers,
+        ));
+    }
+
+    // The compression plugin may have advertised a future gateway encoding
+    // while the body is still plaintext. That is not an origin encoding and
+    // must not pin ordinary text to the buffered path.
+    let mut planned_ctx = ctx.clone();
+    planned_ctx
+        .metadata
+        .insert("compression:algorithm".to_string(), "gzip".to_string());
+    let planned_headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    assert!(!firewall.should_buffer_response_body_for_content_type(
+        &planned_ctx,
+        Some("text/plain"),
+        200,
+        &planned_headers,
+    ));
+
+    // Response hooks intentionally ignore non-success responses, so encoding
+    // alone must not add full-body buffering where no final inspection runs.
+    assert!(!firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/plain"),
+        500,
+        &HashMap::from([("content-encoding".to_string(), "gzip".to_string())]),
+    ));
 }
 
 #[tokio::test]

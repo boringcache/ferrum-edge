@@ -1158,12 +1158,13 @@ fn simulate_later_after_proxy_headers(
 }
 
 /// Refine the pre-flight `stream_response` decision once the backend response
-/// headers — and therefore the response `Content-Type` — are known.
+/// headers — including representation metadata such as `Content-Type` and
+/// `Content-Encoding` — are known.
 ///
 /// [`should_stream_response_body`] runs before the backend request is sent, so
-/// it cannot consult the response content-type and conservatively buffers
-/// whenever any plugin *might* need the body. This downgrades buffer -> stream
-/// when no plugin actually needs to inspect the body for THIS content-type
+/// it cannot consult the response headers and conservatively buffers whenever
+/// any plugin *might* need the body. This downgrades buffer -> stream when no
+/// plugin actually needs to inspect the body for THIS representation
 /// (e.g. `waf` with `response_body_inspection` skips non-allowlisted/binary
 /// bodies), avoiding a full-body collection that would be discarded unscanned.
 ///
@@ -1282,9 +1283,10 @@ pub(crate) fn refine_stream_response_for_content_type(
         return false;
     }
     // Keep buffering only while at least one plugin still needs the body for
-    // this content-type; otherwise stream it straight through. Plugins also see
-    // the response status/headers so a plugin can release a response it will not
-    // transform (e.g. `compression` skips `206`/`Content-Range` range responses).
+    // this response representation; otherwise stream it straight through.
+    // Plugins see the response status and full header map so they can account
+    // for Content-Encoding or release a response they will not transform (e.g.
+    // `compression` skips `206`/`Content-Range` range responses).
     !plugins.iter().any(|plugin| {
         plugin.should_buffer_response_body_for_content_type(
             ctx,

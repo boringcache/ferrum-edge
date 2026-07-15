@@ -3171,9 +3171,13 @@ pub trait Plugin: Send + Sync {
     /// decision, which is why this is a separate hook.
     ///
     /// The full `response_headers` map (and `response_status`) are also passed so
-    /// a plugin can release a response it will decline to transform once headers
-    /// are known — e.g. `compression` skips `206 Partial Content` / `Content-Range`
-    /// responses, so it must not pin them onto the buffered path either.
+    /// the refinement can account for representation metadata beyond
+    /// `Content-Type`. A plugin can release a response it will decline to
+    /// transform once headers are known — e.g. `compression` skips `206 Partial
+    /// Content` / `Content-Range` responses, so it must not pin them onto the
+    /// buffered path either. Conversely, a buffered final hook that must decode
+    /// or reject a non-identity `Content-Encoding` must keep that representation
+    /// buffered; releasing opaque wire bytes would bypass the final hook.
     ///
     /// Contract: this MUST only narrow `should_buffer_response_body` — it may
     /// return `false` where the unconditional check returned `true`, but never
