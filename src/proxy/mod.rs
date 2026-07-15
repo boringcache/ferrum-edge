@@ -17,7 +17,7 @@
 //!    rewrites and final validation before backend dispatch
 //! 9. **Plugin: backend_admission** — selected-target concurrency admission
 //! 10. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
-//!    Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
+//!     Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
 //! 11. **Plugin: after_proxy** — CORS headers, response caching metadata, response transforms,
 //!     response size limiting, AI rate limiter
 //! 12. **Plugin: on_response_body** — raw backend body inspection before transforms:
