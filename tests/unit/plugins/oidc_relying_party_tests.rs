@@ -6,7 +6,10 @@ use ferrum_edge::plugins::{
 };
 use serde_json::json;
 use url::Url;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
 use super::plugin_utils::assert_reject;
 
 fn base_config() -> serde_json::Value {
@@ -43,6 +46,119 @@ fn html_ctx() -> RequestContext {
         .insert("host".to_string(), "app.example.com".to_string());
     ctx.metadata
         .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+    ctx
+}
+
+struct BrowserChallenge {
+    state: String,
+    nonce: String,
+    cookie: String,
+}
+
+async fn issue_browser_challenge(plugin: &OidcRelyingParty) -> BrowserChallenge {
+    let mut ctx = html_ctx();
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await
+    else {
+        panic!("expected browser challenge");
+    };
+    assert_eq!(status_code, 302);
+    let location = Url::parse(headers.get("location").expect("authorization URL"))
+        .expect("authorization URL parses");
+    let state = location
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .expect("state parameter");
+    let nonce = location
+        .query_pairs()
+        .find_map(|(key, value)| (key == "nonce").then(|| value.into_owned()))
+        .expect("nonce parameter");
+    let cookie = headers
+        .get("set-cookie")
+        .cloned()
+        .expect("correlation cookie");
+
+    BrowserChallenge {
+        state,
+        nonce,
+        cookie,
+    }
+}
+
+fn cookie_attribute<'a>(cookie: &'a str, expected_name: &str) -> Option<Option<&'a str>> {
+    cookie.split(';').skip(1).find_map(|attribute| {
+        let attribute = attribute.trim();
+        let (name, value) = match attribute.split_once('=') {
+            Some((name, value)) => (name.trim(), Some(value.trim())),
+            None => (attribute, None),
+        };
+        name.eq_ignore_ascii_case(expected_name).then_some(value)
+    })
+}
+
+fn cookie_pair(cookie: &str) -> &str {
+    cookie
+        .split(';')
+        .next()
+        .expect("cookie contains a name/value pair")
+}
+
+fn cookie_name(cookie: &str) -> &str {
+    cookie_pair(cookie)
+        .split_once('=')
+        .map(|(name, _)| name)
+        .expect("cookie has a name")
+}
+
+fn assert_host_only_correlation_cookie(cookie: &str, expected_max_age: &str) {
+    assert_eq!(cookie_attribute(cookie, "domain"), None, "{cookie}");
+    assert_eq!(
+        cookie_attribute(cookie, "path"),
+        Some(Some("/oauth/callback")),
+        "{cookie}"
+    );
+    assert_eq!(
+        cookie_attribute(cookie, "samesite"),
+        Some(Some("Lax")),
+        "{cookie}"
+    );
+    assert_eq!(
+        cookie_attribute(cookie, "max-age"),
+        Some(Some(expected_max_age)),
+        "{cookie}"
+    );
+    assert_eq!(cookie_attribute(cookie, "secure"), Some(None), "{cookie}");
+    assert_eq!(
+        cookie_attribute(cookie, "httponly"),
+        Some(None),
+        "{cookie}"
+    );
+}
+
+fn assert_same_correlation_scope(created: &str, cleared: &str) {
+    for attribute in ["domain", "path", "samesite", "secure", "httponly"] {
+        assert_eq!(
+            cookie_attribute(created, attribute),
+            cookie_attribute(cleared, attribute),
+            "correlation cookie {attribute} scope changed between creation and clearing"
+        );
+    }
+}
+
+fn callback_context(challenge: &BrowserChallenge) -> RequestContext {
+    let mut ctx =
+        RequestContext::new("127.0.0.1".into(), "GET".into(), "/oauth/callback".into());
+    ctx.headers.insert(
+        "cookie".to_string(),
+        cookie_pair(&challenge.cookie).to_string(),
+    );
+    ctx.query_params
+        .insert("state".to_string(), challenge.state.clone());
     ctx
 }
 
@@ -143,25 +259,87 @@ async fn correlation_cookie_ignores_configured_session_domain() {
     let mut config = base_config();
     config["session"]["domain"] = json!("example.com");
     let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
-    let mut ctx = html_ctx();
+    let challenge = issue_browser_challenge(&plugin).await;
 
-    match plugin
-        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
-        .await
-    {
-        PluginResult::Reject { headers, .. } => {
-            let cookie = headers
-                .get("set-cookie")
-                .expect("browser challenge correlation cookie");
-            assert!(!cookie.contains("Domain=example.com"));
-            assert!(!cookie.contains("Domain="));
-            assert!(cookie.contains("Path=/oauth/callback"));
-            assert!(cookie.contains("SameSite=Lax"));
-            assert!(cookie.contains("Secure"));
-            assert!(cookie.contains("HttpOnly"));
-        }
-        other => panic!("expected browser challenge, got {other:?}"),
-    }
+    assert_host_only_correlation_cookie(&challenge.cookie, "600");
+}
+
+#[tokio::test]
+async fn successful_callback_clears_host_only_correlation_cookie_and_preserves_session_domain() {
+    let server = MockServer::start().await;
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = base_config();
+    config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
+    config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
+    config["session"]["domain"] = json!("example.com");
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let challenge = issue_browser_challenge(&plugin).await;
+    let id_token = create_rs256_token(
+        &json!({
+            "iss": "https://issuer.example.com",
+            "aud": "ferrum-gateway",
+            "sub": "user-1",
+            "nonce": challenge.nonce.as_str(),
+        }),
+        private_key_pem,
+    );
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "access-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "id_token": id_token,
+        })))
+        .mount(&server)
+        .await;
+
+    let mut callback = callback_context(&challenge);
+    callback
+        .query_params
+        .insert("code".to_string(), "authorization-code".to_string());
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = plugin.on_request_received(&mut callback).await
+    else {
+        panic!("expected successful callback redirect");
+    };
+    assert_eq!(status_code, 302);
+    let cookies: Vec<&str> = headers
+        .get("set-cookie")
+        .expect("session and correlation cookies")
+        .lines()
+        .collect();
+    let session_cookie = cookies
+        .iter()
+        .copied()
+        .find(|cookie| cookie.starts_with("ferrum_session="))
+        .expect("durable session cookie");
+    let correlation_cookie_name = cookie_name(&challenge.cookie);
+    let cleared_correlation_cookie = cookies
+        .iter()
+        .copied()
+        .find(|cookie| cookie_name(cookie) == correlation_cookie_name)
+        .expect("cleared correlation cookie");
+
+    assert_eq!(
+        cookie_attribute(session_cookie, "domain"),
+        Some(Some("example.com")),
+        "durable session cookie must retain its configured domain"
+    );
+    assert_host_only_correlation_cookie(cleared_correlation_cookie, "0");
+    assert_same_correlation_scope(&challenge.cookie, cleared_correlation_cookie);
 }
 
 #[tokio::test]
@@ -275,7 +453,9 @@ async fn loopback_http_provider_endpoints_remain_available_for_development() {
 
 #[tokio::test]
 async fn callback_hook_materializes_decoded_query_before_processing() {
-    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
+    let mut config = base_config();
+    config["session"]["domain"] = json!("example.com");
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/oauth/callback".into());
     ctx.set_raw_query_string("state=encoded%2Bstate&code=example".to_string());
 
@@ -292,7 +472,7 @@ async fn callback_hook_materializes_decoded_query_before_processing() {
         } => {
             assert_eq!(status_code, 400);
             assert_eq!(body, r#"{"error":"Invalid state"}"#);
-            assert!(headers["set-cookie"].contains("Max-Age=0"));
+            assert_host_only_correlation_cookie(&headers["set-cookie"], "0");
         }
         other => panic!("expected invalid-state reject, got {other:?}"),
     }
@@ -312,39 +492,20 @@ async fn callback_hook_materializes_decoded_query_before_processing() {
 
 #[tokio::test]
 async fn browser_state_cookie_blocks_cross_browser_callback_without_consuming_flow() {
-    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
-    let mut challenge_ctx = html_ctx();
-    let (location, correlation_cookie) = match plugin
-        .authenticate(&mut challenge_ctx, &ConsumerIndex::new(&[]))
-        .await
-    {
-        PluginResult::Reject { headers, .. } => (
-            headers.get("location").cloned().expect("authorization URL"),
-            headers
-                .get("set-cookie")
-                .cloned()
-                .expect("correlation cookie"),
-        ),
-        other => panic!("expected browser challenge, got {other:?}"),
-    };
-    assert!(correlation_cookie.contains("Secure"));
-    assert!(correlation_cookie.contains("HttpOnly"));
-    assert!(correlation_cookie.contains("SameSite=Lax"));
-    let state = Url::parse(&location)
-        .expect("authorization URL parses")
-        .query_pairs()
-        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
-        .expect("state parameter");
+    let mut config = base_config();
+    config["session"]["domain"] = json!("example.com");
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let challenge = issue_browser_challenge(&plugin).await;
+    let state = challenge.state.clone();
+    let correlation_cookie = &challenge.cookie;
+    assert_host_only_correlation_cookie(correlation_cookie, "600");
 
     let mut attacker_ctx = RequestContext::new(
         "198.51.100.9".into(),
         "GET".into(),
         "/oauth/callback".into(),
     );
-    let correlation_cookie_name = correlation_cookie
-        .split_once('=')
-        .map(|(name, _)| name)
-        .expect("correlation cookie name");
+    let correlation_cookie_name = cookie_name(correlation_cookie);
     attacker_ctx.headers.insert(
         "cookie".to_string(),
         format!("{correlation_cookie_name}=wrong-browser-binding"),
@@ -352,18 +513,25 @@ async fn browser_state_cookie_blocks_cross_browser_callback_without_consuming_fl
     attacker_ctx
         .query_params
         .insert("state".to_string(), state.clone());
-    assert_reject(
-        plugin.on_request_received(&mut attacker_ctx).await,
-        Some(400),
-    );
+    match plugin.on_request_received(&mut attacker_ctx).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 400);
+            let cleared = headers
+                .get("set-cookie")
+                .expect("wrong-binding correlation cookie clear");
+            assert_host_only_correlation_cookie(cleared, "0");
+            assert_same_correlation_scope(correlation_cookie, cleared);
+        }
+        other => panic!("expected wrong-binding rejection, got {other:?}"),
+    }
 
     // The wrong browser must not consume the valid state. The initiating
     // browser reaches the next callback validation step (missing code).
-    let cookie_pair = correlation_cookie
-        .split(';')
-        .next()
-        .expect("cookie pair")
-        .to_string();
+    let cookie_pair = cookie_pair(correlation_cookie).to_string();
     let mut browser_ctx =
         RequestContext::new("127.0.0.1".into(), "GET".into(), "/oauth/callback".into());
     browser_ctx
@@ -373,7 +541,9 @@ async fn browser_state_cookie_blocks_cross_browser_callback_without_consuming_fl
     match plugin.on_request_received(&mut browser_ctx).await {
         PluginResult::Reject { body, headers, .. } => {
             assert_eq!(body, r#"{"error":"Missing code"}"#);
-            assert!(headers["set-cookie"].contains("Max-Age=0"));
+            let cleared = &headers["set-cookie"];
+            assert_host_only_correlation_cookie(cleared, "0");
+            assert_same_correlation_scope(correlation_cookie, cleared);
         }
         other => panic!("expected missing-code rejection, got {other:?}"),
     }

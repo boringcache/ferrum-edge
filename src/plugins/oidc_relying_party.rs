@@ -619,10 +619,7 @@ impl OidcRelyingParty {
             cookie_attrs,
             context_id: session_context_id,
             correlation_cookie_name_prefix,
-            // Correlation cookies bind the authorization-code state to this host.
-            // They must not inherit a parent session Domain because sibling
-            // subdomains could receive or overwrite the state-binding secret.
-            correlation_cookie_attrs: build_cookie_attrs(secure, true, "Lax", None, &callback_path),
+            correlation_cookie_attrs: build_correlation_cookie_attrs(secure, &callback_path),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
@@ -2511,6 +2508,14 @@ fn build_cookie_attrs(
         attrs.push_str("; HttpOnly");
     }
     attrs
+}
+
+/// Build the fixed scope for the short-lived browser correlation secret.
+///
+/// Unlike the durable session cookie, this cookie must remain host-only: a
+/// parent `Domain` would let sibling hosts receive or overwrite the binding.
+fn build_correlation_cookie_attrs(secure: bool, callback_path: &str) -> String {
+    build_cookie_attrs(secure, true, "Lax", None, callback_path)
 }
 
 fn encoded_session_cookie_len(plaintext_len: usize) -> usize {
