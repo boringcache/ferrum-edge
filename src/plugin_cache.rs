@@ -672,6 +672,22 @@ struct AdaptiveConcurrencyRouteKey {
     port: Option<u16>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct AdaptiveConcurrencyRouteOverride {
+    proxy_id: String,
+    namespace: String,
+    plugin_config_id: String,
+    plugin_name: String,
+    config: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AdaptiveConcurrencyRouteDefinition {
+    keys: Vec<AdaptiveConcurrencyRouteKey>,
+    overrides: Vec<AdaptiveConcurrencyRouteOverride>,
+    upstream_ids: HashSet<String>,
+}
+
 #[derive(Clone)]
 struct AdaptiveConcurrencyInstance {
     limiter: Arc<AdaptiveConcurrencyLimiter>,
@@ -679,7 +695,7 @@ struct AdaptiveConcurrencyInstance {
     config_value: serde_json::Value,
     scope: PluginScope,
     proxy_id: Option<String>,
-    route_keys: Vec<AdaptiveConcurrencyRouteKey>,
+    route_definition: AdaptiveConcurrencyRouteDefinition,
     generation: u64,
     drain_older_generation: bool,
 }
@@ -697,37 +713,102 @@ fn adaptive_concurrency_policy_id(pc: &PluginConfig) -> AdaptiveConcurrencyPolic
 fn adaptive_definition_matches(
     state: &AdaptiveConcurrencyInstance,
     pc: &PluginConfig,
-    route_keys: &[AdaptiveConcurrencyRouteKey],
+    route_definition: &AdaptiveConcurrencyRouteDefinition,
 ) -> bool {
     state.config_value == pc.config
         && state.scope == pc.scope
         && state.proxy_id == pc.proxy_id
-        && state.route_keys == route_keys
+        && state.route_definition.eq(route_definition)
 }
 
-fn adaptive_concurrency_route_keys(
+fn scoped_plugin_config_applies_to_proxy(
+    pc: &PluginConfig,
+    proxy: &crate::config::types::Proxy,
+) -> bool {
+    match &pc.scope {
+        PluginScope::Global => false,
+        PluginScope::Proxy => {
+            pc.proxy_id.as_deref() == Some(proxy.id.as_str())
+                && proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == pc.id)
+        }
+        PluginScope::ProxyGroup => proxy
+            .plugins
+            .iter()
+            .any(|association| association.plugin_config_id == pc.id),
+    }
+}
+
+fn plugin_config_effectively_applies_to_proxy(
+    pc: &PluginConfig,
+    proxy: &crate::config::types::Proxy,
+    config: &GatewayConfig,
+) -> bool {
+    if !pc.enabled {
+        return false;
+    }
+    match &pc.scope {
+        PluginScope::Global => !config.plugin_configs.iter().any(|candidate| {
+            candidate.enabled
+                && candidate.plugin_name == pc.plugin_name
+                && scoped_plugin_config_applies_to_proxy(candidate, proxy)
+        }),
+        PluginScope::Proxy | PluginScope::ProxyGroup => {
+            scoped_plugin_config_applies_to_proxy(pc, proxy)
+        }
+    }
+}
+
+fn collect_upstream_ids(value: &serde_json::Value, upstream_ids: &mut HashSet<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if key == "upstream_id"
+                    && let Some(upstream_id) = value.as_str()
+                {
+                    upstream_ids.insert(upstream_id.to_string());
+                }
+                collect_upstream_ids(value, upstream_ids);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_upstream_ids(value, upstream_ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn adaptive_concurrency_route_definition(
     pc: &PluginConfig,
     key_by: AdaptiveConcurrencyKeyBy,
     config: &GatewayConfig,
-) -> Vec<AdaptiveConcurrencyRouteKey> {
+) -> AdaptiveConcurrencyRouteDefinition {
+    const ROUTE_OVERRIDE_PLUGINS: &[&str] =
+        &["ai_stream_router", "mcp_gateway", "mesh_route_dispatch"];
     let mut keys = Vec::new();
+    let mut overrides = Vec::new();
+    let mut upstream_ids = HashSet::new();
     for proxy in &config.proxies {
-        let applies = match &pc.scope {
-            PluginScope::Global => true,
-            PluginScope::Proxy => {
-                pc.proxy_id.as_deref() == Some(proxy.id.as_str())
-                    && proxy
-                        .plugins
-                        .iter()
-                        .any(|association| association.plugin_config_id == pc.id)
-            }
-            PluginScope::ProxyGroup => proxy
-                .plugins
-                .iter()
-                .any(|association| association.plugin_config_id == pc.id),
-        };
-        if !applies {
+        if !plugin_config_effectively_applies_to_proxy(pc, proxy, config) {
             continue;
+        }
+
+        for route_pc in config.plugin_configs.iter().filter(|route_pc| {
+            ROUTE_OVERRIDE_PLUGINS.contains(&route_pc.plugin_name.as_str())
+                && plugin_config_effectively_applies_to_proxy(route_pc, proxy, config)
+        }) {
+            collect_upstream_ids(&route_pc.config, &mut upstream_ids);
+            overrides.push(AdaptiveConcurrencyRouteOverride {
+                proxy_id: proxy.id.clone(),
+                namespace: route_pc.namespace.clone(),
+                plugin_config_id: route_pc.id.clone(),
+                plugin_name: route_pc.plugin_name.clone(),
+                config: route_pc.config.clone(),
+            });
         }
 
         let scope = match key_by {
@@ -737,14 +818,13 @@ fn adaptive_concurrency_route_keys(
             AdaptiveConcurrencyKeyBy::Upstream => proxy
                 .upstream_id
                 .as_deref()
-                .map(|upstream_id| {
-                    format!("upstream:{}:{upstream_id}", proxy.namespace)
-                })
+                .map(|upstream_id| format!("upstream:{}:{upstream_id}", proxy.namespace))
                 .unwrap_or_else(|| format!("proxy:{}:{}", proxy.namespace, proxy.id)),
             AdaptiveConcurrencyKeyBy::Backend => "backend".to_string(),
         };
 
         if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            upstream_ids.insert(upstream_id.to_string());
             if let Some(upstream) = config
                 .upstreams
                 .iter()
@@ -779,7 +859,25 @@ fn adaptive_concurrency_route_keys(
     }
     keys.sort_unstable();
     keys.dedup();
-    keys
+    overrides.sort_by(|left, right| {
+        (
+            left.proxy_id.as_str(),
+            left.namespace.as_str(),
+            left.plugin_config_id.as_str(),
+            left.plugin_name.as_str(),
+        )
+            .cmp(&(
+                right.proxy_id.as_str(),
+                right.namespace.as_str(),
+                right.plugin_config_id.as_str(),
+                right.plugin_name.as_str(),
+            ))
+    });
+    AdaptiveConcurrencyRouteDefinition {
+        keys,
+        overrides,
+        upstream_ids,
+    }
 }
 
 fn retained_adaptive_concurrency_states(
@@ -796,9 +894,9 @@ fn retained_adaptive_concurrency_states(
         }
         let identity = adaptive_concurrency_policy_id(pc);
         if let Some(existing) = current.get(&identity) {
-            let route_keys =
-                adaptive_concurrency_route_keys(pc, existing.config.key_by, config);
-            if adaptive_definition_matches(existing, pc, &route_keys) {
+            let route_definition =
+                adaptive_concurrency_route_definition(pc, existing.config.key_by, config);
+            if adaptive_definition_matches(existing, pc, &route_definition) {
                 retained.insert(identity, existing.clone());
             }
         }
@@ -842,8 +940,9 @@ fn include_adaptive_concurrency_route_rebuilds(
         }) else {
             continue;
         };
-        let route_keys = adaptive_concurrency_route_keys(pc, existing.config.key_by, config);
-        if route_keys == existing.route_keys {
+        let route_definition =
+            adaptive_concurrency_route_definition(pc, existing.config.key_by, config);
+        if route_definition == existing.route_definition {
             continue;
         }
 
@@ -858,13 +957,18 @@ fn include_adaptive_concurrency_route_rebuilds(
                 }
             }
             PluginScope::ProxyGroup => {
-                proxy_ids_to_rebuild.extend(config.proxies.iter().filter_map(|proxy| {
-                    proxy
-                        .plugins
+                proxy_ids_to_rebuild.extend(
+                    config
+                        .proxies
                         .iter()
-                        .any(|association| association.plugin_config_id == pc.id)
-                        .then(|| proxy.id.clone())
-                }));
+                        .filter(|proxy| {
+                            proxy
+                                .plugins
+                                .iter()
+                                .any(|association| association.plugin_config_id == pc.id)
+                        })
+                        .map(|proxy| proxy.id.clone()),
+                );
             }
         }
     }
@@ -881,9 +985,10 @@ fn create_adaptive_concurrency_plugin(
     let parsed = Arc::new(crate::plugins::adaptive_concurrency::parse_config_value(
         &pc.config,
     )?);
-    let route_keys = adaptive_concurrency_route_keys(pc, parsed.key_by, gateway_config);
+    let route_definition =
+        adaptive_concurrency_route_definition(pc, parsed.key_by, gateway_config);
     if let Some(existing) = staged.get(&identity) {
-        if !adaptive_definition_matches(existing, pc, &route_keys) {
+        if !adaptive_definition_matches(existing, pc, &route_definition) {
             return Err(format!(
                 "adaptive_concurrency: plugin config identity '{}:{}' resolves to conflicting policy definitions",
                 pc.namespace, pc.id
@@ -914,7 +1019,7 @@ fn create_adaptive_concurrency_plugin(
                 || parsed.max_tracked_keys < existing.config.max_tracked_keys
                 || existing.scope != pc.scope
                 || existing.proxy_id != pc.proxy_id
-                || existing.route_keys != route_keys,
+                || existing.route_definition != route_definition,
         )
     } else {
         (
@@ -939,7 +1044,7 @@ fn create_adaptive_concurrency_plugin(
             config_value: pc.config.clone(),
             scope: pc.scope.clone(),
             proxy_id: pc.proxy_id.clone(),
-            route_keys,
+            route_definition,
             generation,
             drain_older_generation,
         },
@@ -1253,10 +1358,9 @@ impl PluginCacheInner {
 
     pub(crate) fn prepare_adaptive_concurrency_generations(&self) {
         for instance in self.adaptive_concurrency_instances.values() {
-            instance.limiter.prepare_policy_generation(
-                instance.generation,
-                instance.drain_older_generation,
-            );
+            instance
+                .limiter
+                .prepare_policy_generation(instance.generation, instance.drain_older_generation);
         }
     }
 
@@ -1267,6 +1371,38 @@ impl PluginCacheInner {
                 &instance.config,
                 instance.drain_older_generation,
             );
+        }
+    }
+
+    pub(crate) fn prepare_adaptive_concurrency_lb_generation(
+        &self,
+        generation: u64,
+        changed_upstream_ids: &HashSet<String>,
+    ) {
+        for instance in self.adaptive_concurrency_instances.values() {
+            let drain_older_generation = !instance
+                .route_definition
+                .upstream_ids
+                .is_disjoint(changed_upstream_ids);
+            instance
+                .limiter
+                .prepare_lb_generation(generation, drain_older_generation);
+        }
+    }
+
+    pub(crate) fn commit_adaptive_concurrency_lb_generation(
+        &self,
+        generation: u64,
+        changed_upstream_ids: &HashSet<String>,
+    ) {
+        for instance in self.adaptive_concurrency_instances.values() {
+            let drain_older_generation = !instance
+                .route_definition
+                .upstream_ids
+                .is_disjoint(changed_upstream_ids);
+            instance
+                .limiter
+                .commit_lb_generation(generation, drain_older_generation);
         }
     }
 

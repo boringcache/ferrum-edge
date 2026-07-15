@@ -4,7 +4,7 @@
 //! consumer index, and load-balancer snapshot together. Writers build staged
 //! inners before publishing, then swap the whole epoch with one ArcSwap store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -52,6 +52,44 @@ pub(crate) fn build_proxy_index_by_id(config: &GatewayConfig) -> Arc<HashMap<Str
     )
 }
 
+fn upstream_endpoint_keys(upstream: &crate::config::types::Upstream) -> Vec<(&str, u16)> {
+    let mut keys: Vec<_> = upstream
+        .targets
+        .iter()
+        .map(|target| (target.host.as_str(), target.port))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+fn changed_upstream_endpoint_ids(
+    current: &LoadBalancerCacheInner,
+    replacement: &LoadBalancerCacheInner,
+) -> HashSet<String> {
+    let mut changed = HashSet::new();
+    for (upstream_id, replacement_upstream) in replacement.upstreams() {
+        let endpoints_changed = current
+            .upstreams()
+            .get(upstream_id)
+            .is_none_or(|current_upstream| {
+                upstream_endpoint_keys(current_upstream)
+                    != upstream_endpoint_keys(replacement_upstream)
+            });
+        if endpoints_changed {
+            changed.insert(upstream_id.clone());
+        }
+    }
+    changed.extend(
+        current
+            .upstreams()
+            .keys()
+            .filter(|upstream_id| !replacement.upstreams().contains_key(*upstream_id))
+            .cloned(),
+    );
+    changed
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -60,7 +98,10 @@ mod tests {
         AuthMode, BackendScheme, DispatchKind, LoadBalancerAlgorithm, PluginAssociation,
         PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget, default_namespace,
     };
-    use crate::plugins::{PluginHttpClient, ProxyProtocol};
+    use crate::plugins::{
+        BackendAdmissionContext, BackendAdmissionDecision, PluginHttpClient, ProxyProtocol,
+        RequestContext,
+    };
     use chrono::Utc;
     use serde_json::{Map, Value, json};
     use std::cell::Cell;
@@ -621,6 +662,160 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&next, &store.load()));
     }
+
+    #[test]
+    fn lb_only_target_update_resets_adaptive_concurrency_key_space() {
+        let mut protected_proxy = proxy("p1", "/one", vec!["adaptive"]);
+        protected_proxy.upstream_id = Some("u1".to_string());
+        let adaptive = plugin_config(
+            "adaptive",
+            "adaptive_concurrency",
+            json!({
+                "max_tracked_keys": 1,
+                "min_limit": 1,
+                "initial_limit": 1,
+                "max_limit": 1
+            }),
+        );
+        let initial = config(
+            vec![protected_proxy],
+            vec![adaptive],
+            vec![upstream("u1", vec![target("a.local", 80)])],
+        );
+        let store = epoch_store(initial);
+
+        let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
+            let plugin = epoch
+                .plugin_cache
+                .get_plugins("p1")
+                .iter()
+                .find(|plugin| plugin.name() == "adaptive_concurrency")
+                .cloned()
+                .unwrap_or_else(|| panic!("adaptive plugin should be cached"));
+            let mut ctx = RequestContext::new(
+                "192.0.2.10".to_string(),
+                "GET".to_string(),
+                "/".to_string(),
+            );
+            ctx.lb_generation = epoch.lb_generation;
+            let admission = BackendAdmissionContext {
+                proxy: &epoch.config.proxies[0],
+                upstream_target: Some(target),
+                protocol: ProxyProtocol::Http,
+            };
+            plugin.try_backend_admission(&ctx, &admission)
+        };
+
+        let initial_epoch = store.load();
+        let first_target = initial_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+        let old_target_permit = match acquire(&initial_epoch, &first_target) {
+            BackendAdmissionDecision::Admit(permit) => permit,
+            _ => panic!("initial target should be admitted"),
+        };
+
+        store.update_load_balancer(
+            |current| {
+                Some(LoadBalancerCache::build_update_targets_inner(
+                    &current.load_balancer,
+                    "u1",
+                    vec![target("b.local", 81)],
+                    LoadBalancerAlgorithm::RoundRobin,
+                    None,
+                ))
+            },
+            |_| {},
+        );
+
+        let replacement_epoch = store.load();
+        let replacement_target =
+            replacement_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+        match acquire(&replacement_epoch, &replacement_target) {
+            BackendAdmissionDecision::Reject { status_code, .. } => {
+                assert_eq!(status_code, 503)
+            }
+            _ => panic!("replacement target must wait for the retired permit to drain"),
+        }
+        drop(old_target_permit);
+        match acquire(&initial_epoch, &first_target) {
+            BackendAdmissionDecision::Reject { status_code, .. } => {
+                assert_eq!(status_code, 503)
+            }
+            _ => panic!("a retired load-balancer view must not recreate the old target"),
+        }
+        let held = match acquire(&replacement_epoch, &replacement_target) {
+            BackendAdmissionDecision::Admit(permit) => permit,
+            _ => panic!("replacement target should be admitted"),
+        };
+        match acquire(&replacement_epoch, &replacement_target) {
+            BackendAdmissionDecision::Reject { status_code, .. } => {
+                assert_eq!(status_code, 503)
+            }
+            _ => panic!("replacement target should remain adaptively limited"),
+        }
+        drop(held);
+    }
+
+    #[test]
+    fn unrelated_lb_update_keeps_pinned_adaptive_request_view_compatible() {
+        let mut protected_proxy = proxy("p1", "/one", vec!["adaptive"]);
+        protected_proxy.upstream_id = Some("u1".to_string());
+        let adaptive = plugin_config(
+            "adaptive",
+            "adaptive_concurrency",
+            json!({
+                "min_limit": 1,
+                "initial_limit": 1,
+                "max_limit": 1
+            }),
+        );
+        let initial = config(
+            vec![protected_proxy],
+            vec![adaptive],
+            vec![
+                upstream("u1", vec![target("a.local", 80)]),
+                upstream("u2", vec![target("unrelated.local", 80)]),
+            ],
+        );
+        let store = epoch_store(initial);
+        let pinned_epoch = store.load();
+        let pinned_target = pinned_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+
+        store.update_load_balancer(
+            |current| {
+                Some(LoadBalancerCache::build_update_targets_inner(
+                    &current.load_balancer,
+                    "u2",
+                    vec![target("replacement-unrelated.local", 81)],
+                    LoadBalancerAlgorithm::RoundRobin,
+                    None,
+                ))
+            },
+            |_| {},
+        );
+
+        let plugin = pinned_epoch
+            .plugin_cache
+            .get_plugins("p1")
+            .iter()
+            .find(|plugin| plugin.name() == "adaptive_concurrency")
+            .cloned()
+            .unwrap_or_else(|| panic!("adaptive plugin should be cached"));
+        let mut ctx = RequestContext::new(
+            "192.0.2.10".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        );
+        ctx.lb_generation = pinned_epoch.lb_generation;
+        let admission = BackendAdmissionContext {
+            proxy: &pinned_epoch.config.proxies[0],
+            upstream_target: Some(&pinned_target),
+            protocol: ProxyProtocol::Http,
+        };
+        match plugin.try_backend_admission(&ctx, &admission) {
+            BackendAdmissionDecision::Admit(permit) => drop(permit),
+            _ => panic!("an unrelated target update must keep the pinned view compatible"),
+        }
+    }
 }
 
 pub(crate) struct StagedRequestEpoch {
@@ -708,10 +903,14 @@ impl RequestEpochStore {
         // request epoch, then retire stale feedback/bounds. Compatible old and
         // new plugin objects can both admit during this handoff because their
         // target counters are shared; structural replacements remain draining.
+        next.plugin_cache.prepare_adaptive_concurrency_generations();
+        let unchanged_upstream_ids = HashSet::new();
         next.plugin_cache
-            .prepare_adaptive_concurrency_generations();
+            .prepare_adaptive_concurrency_lb_generation(next.lb_generation, &unchanged_upstream_ids);
         self.current.store(Arc::clone(&next));
         next.plugin_cache.commit_adaptive_concurrency_generations();
+        next.plugin_cache
+            .commit_adaptive_concurrency_lb_generation(next.lb_generation, &unchanged_upstream_ids);
         // Compatibility wrapper caches are mirrored while the epoch writer lock
         // is still held so service discovery and config reloads cannot publish
         // newer epochs and then be overwritten by an older post-lock mirror.
@@ -729,6 +928,8 @@ impl RequestEpochStore {
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let current = self.current.load_full();
         let load_balancer = build(&current)?;
+        let changed_upstream_ids =
+            changed_upstream_endpoint_ids(&current.load_balancer, &load_balancer);
         let next = Arc::new(RequestEpoch {
             config: Arc::clone(&current.config),
             proxy_index_by_id: Arc::clone(&current.proxy_index_by_id),
@@ -740,7 +941,12 @@ impl RequestEpochStore {
             route_generation: current.route_generation,
             lb_generation: current.lb_generation.saturating_add(1),
         });
+        current
+            .plugin_cache
+            .prepare_adaptive_concurrency_lb_generation(next.lb_generation, &changed_upstream_ids);
         self.current.store(Arc::clone(&next));
+        next.plugin_cache
+            .commit_adaptive_concurrency_lb_generation(next.lb_generation, &changed_upstream_ids);
         // Keep LB wrapper mirroring serialized with the epoch publication.
         mirror(&next);
         Some(next)

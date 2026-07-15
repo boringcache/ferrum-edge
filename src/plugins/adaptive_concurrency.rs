@@ -84,7 +84,7 @@ impl Plugin for AdaptiveConcurrency {
 
     fn try_backend_admission(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         admission: &BackendAdmissionContext<'_>,
     ) -> BackendAdmissionDecision {
         match self.limiter.try_acquire_for_generation(
@@ -92,6 +92,7 @@ impl Plugin for AdaptiveConcurrency {
             admission.upstream_target,
             Arc::clone(&self.config),
             self.policy_generation,
+            ctx.lb_generation,
         ) {
             Ok(permit) => BackendAdmissionDecision::Admit(permit),
             Err(limit) => {

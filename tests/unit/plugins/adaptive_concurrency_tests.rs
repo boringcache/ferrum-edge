@@ -102,13 +102,17 @@ fn cache_config(scope: &str, plugin_config: serde_json::Value) -> GatewayConfig 
 }
 
 fn acquire_from_cache(cache: &PluginCache, config: &GatewayConfig) -> BackendAdmissionDecision {
-    let plugin = adaptive_plugin_from_cache(cache);
+    let plugin = adaptive_plugin_for_proxy(cache, "proxy-1");
     acquire_from_plugin(&plugin, &config.proxies[0], None)
 }
 
 fn adaptive_plugin_from_cache(cache: &PluginCache) -> Arc<dyn Plugin> {
+    adaptive_plugin_for_proxy(cache, "proxy-1")
+}
+
+fn adaptive_plugin_for_proxy(cache: &PluginCache, proxy_id: &str) -> Arc<dyn Plugin> {
     cache
-        .get_plugins("proxy-1")
+        .get_plugins(proxy_id)
         .iter()
         .find(|plugin| plugin.name() == "adaptive_concurrency")
         .cloned()
@@ -809,11 +813,7 @@ fn adaptive_concurrency_compatible_reload_keeps_pinned_old_view_admitted() {
         .rebuild(&reloaded)
         .expect("compatible bounds change should publish");
 
-    let old_view_permit = expect_admitted(acquire_from_plugin(
-        &old_view,
-        &config.proxies[0],
-        None,
-    ));
+    let old_view_permit = expect_admitted(acquire_from_plugin(&old_view, &config.proxies[0], None));
     let new_view_permit = expect_admitted(acquire_from_cache(&cache, &reloaded));
     assert_rejected(acquire_from_cache(&cache, &reloaded));
     drop(old_view_permit);
@@ -849,12 +849,7 @@ fn adaptive_concurrency_scoped_detach_and_reattach_starts_fresh_state() {
         );
 
         cache
-            .apply_delta(
-                &config,
-                &HashSet::from(["proxy-1".to_string()]),
-                &[],
-                false,
-            )
+            .apply_delta(&config, &HashSet::from(["proxy-1".to_string()]), &[], false)
             .expect("scoped policy should reattach");
         let fresh_generation = expect_admitted(acquire_from_cache(&cache, &config));
         drop(fresh_generation);
@@ -889,11 +884,7 @@ fn adaptive_concurrency_structural_config_change_drains_old_key_space() {
     assert_rejected(acquire_from_cache(&cache, &reloaded));
     drop(held);
     let new_generation = expect_admitted(acquire_from_cache(&cache, &reloaded));
-    assert_rejected(acquire_from_plugin(
-        &old_view,
-        &config.proxies[0],
-        None,
-    ));
+    assert_rejected(acquire_from_plugin(&old_view, &config.proxies[0], None));
     drop(new_generation);
 }
 
@@ -973,6 +964,169 @@ fn adaptive_concurrency_upstream_target_reload_reclaims_retired_key_capacity() {
         &replacement_plugin,
         &reloaded.proxies[0],
         Some(replacement_target),
+    ));
+    drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_global_inventory_excludes_scoped_overrides() {
+    let config: GatewayConfig = serde_json::from_value(json!({
+        "version": "1",
+        "proxies": [
+            {
+                "id": "proxy-1",
+                "namespace": "default",
+                "listen_path": "/one",
+                "backend_host": "one.local",
+                "backend_port": 8080,
+                "plugins": []
+            },
+            {
+                "id": "proxy-2",
+                "namespace": "default",
+                "listen_path": "/two",
+                "backend_host": "two.local",
+                "backend_port": 8080,
+                "plugins": []
+            }
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "adaptive-global",
+            "namespace": "default",
+            "plugin_name": "adaptive_concurrency",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "max_tracked_keys": 1,
+                "min_limit": 1,
+                "initial_limit": 1,
+                "max_limit": 1
+            }
+        }]
+    }))
+    .expect("two-proxy global config should deserialize");
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let proxy_two_plugin = adaptive_plugin_for_proxy(&cache, "proxy-2");
+    drop(expect_admitted(acquire_from_plugin(
+        &proxy_two_plugin,
+        &config.proxies[1],
+        None,
+    )));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "adaptive-proxy-two",
+            "namespace": "default",
+            "plugin_name": "adaptive_concurrency",
+            "scope": "proxy",
+            "proxy_id": "proxy-2",
+            "enabled": true,
+            "config": {
+                "max_tracked_keys": 1,
+                "min_limit": 1,
+                "initial_limit": 1,
+                "max_limit": 1
+            }
+        }))
+        .expect("scoped override should deserialize"),
+    );
+    reloaded.proxies[1].plugins.push(
+        serde_json::from_value(json!({"plugin_config_id": "adaptive-proxy-two"}))
+            .expect("scoped association should deserialize"),
+    );
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from(["proxy-2".to_string()]),
+            &[],
+            false,
+        )
+        .expect("scoped adaptive override should publish");
+
+    let proxy_one_plugin = adaptive_plugin_for_proxy(&cache, "proxy-1");
+    let held = expect_admitted(acquire_from_plugin(
+        &proxy_one_plugin,
+        &reloaded.proxies[0],
+        None,
+    ));
+    assert_rejected(acquire_from_plugin(
+        &proxy_one_plugin,
+        &reloaded.proxies[0],
+        None,
+    ));
+    drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_route_override_change_resets_target_key_space() {
+    let mut config = cache_config(
+        "proxy",
+        json!({
+            "max_tracked_keys": 1,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+    );
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "route-dispatch-1",
+            "namespace": "default",
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "proxy_group",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "destination": {
+                        "backend_host": "first-override.local",
+                        "backend_port": 8080
+                    }
+                }]
+            }
+        }))
+        .expect("route dispatch config should deserialize"),
+    );
+    config.proxies[0].plugins.push(
+        serde_json::from_value(json!({"plugin_config_id": "route-dispatch-1"}))
+            .expect("route dispatch association should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let plugin = adaptive_plugin_from_cache(&cache);
+    let mut first_effective_proxy = config.proxies[0].clone();
+    first_effective_proxy.backend_host = "first-override.local".to_string();
+    drop(expect_admitted(acquire_from_plugin(
+        &plugin,
+        &first_effective_proxy,
+        None,
+    )));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[1].config["rules"][0]["destination"]["backend_host"] =
+        json!("replacement-override.local");
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from(["proxy-1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("route override change should publish");
+
+    let replacement_plugin = adaptive_plugin_from_cache(&cache);
+    let mut replacement_effective_proxy = reloaded.proxies[0].clone();
+    replacement_effective_proxy.backend_host = "replacement-override.local".to_string();
+    let held = expect_admitted(acquire_from_plugin(
+        &replacement_plugin,
+        &replacement_effective_proxy,
+        None,
+    ));
+    assert_rejected(acquire_from_plugin(
+        &replacement_plugin,
+        &replacement_effective_proxy,
+        None,
     ));
     drop(held);
 }

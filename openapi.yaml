@@ -13348,7 +13348,7 @@ components:
           format: uint64
           default: 10000
           minimum: 1
-          description: Maximum number of distinct target keys this stable plugin policy will track, bounding limiter memory for high-cardinality wildcard upstreams. State is retained across compatible config reloads; lowering this value or changing the policy's routed backend targets drains live permits and resets tracked target state before the new key space takes effect. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503) until the policy is removed/recreated, its route key space changes, or the process restarts. Existing keys continue to be admitted subject to their adaptive limit.
+          description: Maximum number of distinct target keys this stable plugin policy will track, bounding limiter memory for high-cardinality wildcard upstreams. State is retained across compatible config reloads; lowering this value or changing the policy's configured, service-discovered, or route-override backend targets drains live permits and resets tracked target state before the new key space takes effect. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503) until the policy is removed/recreated, its route key space changes, or the process restarts. Existing keys continue to be admitted subject to their adaptive limit.
         min_limit:
           type: integer
           format: uint64

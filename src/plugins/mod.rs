@@ -426,6 +426,10 @@ pub struct RequestContext {
     /// SNI hostname from the frontend TLS/QUIC handshake for HTTP-family
     /// requests. Populated only when the downstream client supplied SNI.
     pub frontend_sni_hostname: Option<String>,
+    /// Load-balancer snapshot generation pinned by this request. Backend
+    /// admission uses it to reject a retired service-discovery target view
+    /// after a structural target-set publication.
+    pub lb_generation: u64,
     /// Raw HTTP headers from the request. Stored at init time and consumed by
     /// `materialize_headers()`. Core proxy lookups (IP resolution, host
     /// extraction) read from this directly via `raw_header_get()` to avoid
@@ -776,6 +780,7 @@ impl RequestContext {
             path,
             frontend_listen_port: None,
             frontend_sni_hostname: None,
+            lb_generation: 1,
             raw_headers: None,
             headers: HashMap::new(),
             raw_query_string: None,
@@ -863,6 +868,7 @@ impl RequestContext {
             path: self.path.clone(),
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
+            lb_generation: self.lb_generation,
             raw_headers: None,
             headers: self.headers.clone(),
             raw_query_string: None,

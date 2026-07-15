@@ -14432,6 +14432,7 @@ async fn handle_proxy_request_inner(
     };
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
     let epoch = state.request_epoch.load();
+    ctx.lb_generation = epoch.lb_generation;
 
     // Direct Pod-IP HTTP mesh egress is selected by captured original
     // destination before Host routing. The client-controlled Host header cannot
