@@ -13829,6 +13829,9 @@ fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
 ) -> (u16, Vec<u8>, HashMap<String, String>) {
     let mut headers = HashMap::new();
+    // Challenge selection follows configured priority order: mechanisms that
+    // do not advertise a challenge are skipped, and the first available
+    // challenge wins.
     let challenge = auth_plugins
         .iter()
         .find_map(|plugin| plugin.authentication_challenge())

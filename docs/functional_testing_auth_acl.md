@@ -169,7 +169,7 @@ Multi-auth mode executes auth plugins sequentially; first success stops iteratio
 
 | # | Test | Action | Expected |
 |---|------|--------|----------|
-| 36 | Credentials redacted | GET consumer | `password_hash: "[REDACTED]"` |
+| 36 | Credentials redacted | GET consumer | `basicauth` omitted |
 | 37 | List consumers | GET /consumers | Array with >= 3 consumers |
 | 38 | Delete credential | DELETE credential, then auth | 401 (key no longer valid) |
 | 39 | Re-add credential | PUT new credential, then auth | 200 OK (new key works) |

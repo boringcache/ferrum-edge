@@ -273,6 +273,31 @@ fn mtls_auth_schemas_match_runtime_contract() {
     }
 }
 
+#[test]
+fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let auth_mode = spec["components"]["schemas"]["AuthMode"]["description"]
+        .as_str()
+        .expect("AuthMode description");
+    assert!(auth_mode.contains("first applicable rejection is terminal"));
+    assert!(auth_mode.contains("run sequentially until one succeeds"));
+    assert!(auth_mode.contains("server rejection takes precedence"));
+
+    let consumer_credentials =
+        &spec["components"]["schemas"]["Consumer"]["properties"]["credentials"];
+    let credentials_description = consumer_credentials["description"]
+        .as_str()
+        .expect("Consumer credentials description");
+    assert!(credentials_description.contains("responses omit `basicauth` entirely"));
+
+    let password_hash = &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]
+        ["password_hash"];
+    assert_eq!(password_hash["pattern"], "^hmac_sha256:[0-9a-f]{64}$");
+    assert!(password_hash.get("writeOnly").is_none());
+}
+
 fn normalized_path_template(path: &str) -> String {
     static PATH_PARAMETER: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\{[^}]+\}").expect("path-template regex compiles"));

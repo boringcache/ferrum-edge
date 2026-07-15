@@ -1623,19 +1623,10 @@ async fn test_auth_acl_comprehensive() {
     assert!(resp.status().is_success());
     let consumer_json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(consumer_json["username"], "alice");
-    // Verify password_hash is redacted
-    if let Some(basicauth) = consumer_json["credentials"]["basicauth"]
-        .as_array()
-        .and_then(|entries| entries.first())
-        .and_then(|entry| entry.as_object())
-        && let Some(hash) = basicauth.get("password_hash")
-    {
-        assert_eq!(
-            hash.as_str().unwrap(),
-            "[REDACTED]",
-            "Password hash should be redacted in API response"
-        );
-    }
+    assert!(
+        consumer_json["credentials"].get("basicauth").is_none(),
+        "Basic-auth credentials should be omitted from API responses"
+    );
     println!("✓ Consumer credentials properly redacted");
 
     // Test 37: List consumers

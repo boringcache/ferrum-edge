@@ -6343,8 +6343,13 @@ components:
       enum: [single, multi]
       default: single
       description: |
-        `single` — first successful auth plugin wins.
-        `multi` — all auth plugins run; no single rejection blocks the request.
+        `single` — auth plugins run in priority order until the first success;
+        a scheme not applicable to the current mechanism is skipped, while the
+        first applicable rejection is terminal.
+        `multi` — auth plugins run sequentially until one succeeds. If none
+        succeeds, a server rejection takes precedence over the last ordinary
+        rejection; an all-missing chain returns the first available challenge
+        in plugin priority order, skipping challenge-less mechanisms.
 
     PluginAssociation:
       type: object
@@ -6400,6 +6405,8 @@ components:
             Credential values that serve as lookup keys must be unique across all
             consumers and across all entries within arrays. Max entries per type is
             controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
+            Ordinary Consumer responses omit `basicauth` entirely; authenticated
+            backup responses retain canonical unredacted values for restoration.
           properties:
             keyauth:
               type: array
@@ -6412,7 +6419,7 @@ components:
               items:
                 $ref: "#/components/schemas/BasicAuthCredential"
               minItems: 1
-              description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`.
+              description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`; omitted from ordinary Consumer responses.
             jwt:
               type: array
               items:
@@ -6494,10 +6501,11 @@ components:
           type: string
           maxLength: 76
           pattern: "^hmac_sha256:[0-9a-f]{64}$"
-          writeOnly: true
           description: >-
             Pre-hashed password in `hmac_sha256:<64 lowercase hex>` format
-            (constant-time, ~1μs). Credential values are redacted on read.
+            (constant-time, ~1μs). Ordinary Consumer responses omit the
+            entire `basicauth` credential type; authenticated backups return
+            this canonical unredacted value for restoration.
       description: >-
         Basic auth credential for the `basic_auth` plugin. Supply either
         `password` (auto-hashed) or `password_hash` (pre-hashed). Indexed by

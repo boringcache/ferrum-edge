@@ -530,7 +530,9 @@ pub(crate) fn hash_consumer_credentials(consumer: &mut Consumer) -> Result<(), S
     super::hash_consumer_secrets(consumer)
 }
 
-pub(crate) fn hash_basic_auth_credentials(cred: &mut Value) -> Result<(), String> {
+pub(crate) fn hash_basic_auth_credentials(
+    cred: &mut Value,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     super::hash_credential_passwords(cred)
 }
 

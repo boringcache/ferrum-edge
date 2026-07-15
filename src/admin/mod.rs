@@ -2735,19 +2735,31 @@ async fn load_consumer_in_namespace(
     }
 }
 
-fn hash_credential_if_needed(
+pub(crate) fn basic_auth_credential_error_status(
+    error: &crate::config::types::BasicAuthCredentialPreparationError,
+) -> StatusCode {
+    match error {
+        crate::config::types::BasicAuthCredentialPreparationError::InvalidCredential(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        crate::config::types::BasicAuthCredentialPreparationError::ServerConfiguration(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+pub(crate) fn hash_credential_if_needed(
     cred_type: &str,
     cred_value: &mut Value,
 ) -> Result<(), Box<Response<Full<Bytes>>>> {
     if cred_type == "basicauth"
         && let Err(e) = crud::hash_basic_auth_credentials(cred_value)
     {
-        let status = if e.starts_with("Basic-auth credential") {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        return Err(Box::new(json_response(status, &json!({"error": e}))));
+        let status = basic_auth_credential_error_status(&e);
+        return Err(Box::new(json_response(
+            status,
+            &json!({"error": e.to_string()}),
+        )));
     }
     Ok(())
 }
@@ -5198,7 +5210,9 @@ fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
 }
 
 /// Hash passwords in basicauth credential payloads where the credential type is known.
-fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<(), String> {
+fn hash_credential_passwords(
+    cred: &mut serde_json::Value,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     crate::config::types::hash_credential_passwords(cred)
 }
 
@@ -5635,20 +5649,6 @@ mod tests {
         assert!(normalize_credential_set(json!([])).is_err());
         assert!(normalize_credential_set(json!(["not-object"])).is_err());
         assert!(normalize_credential_set(json!("not-object")).is_err());
-    }
-
-    #[test]
-    fn basic_credential_write_rejects_oversized_plaintext_before_hashing() {
-        let mut credential = json!({
-            "password": "x".repeat(crate::config::types::MAX_CREDENTIAL_VALUE_LENGTH + 1)
-        });
-
-        let response = hash_credential_if_needed("basicauth", &mut credential)
-            .expect_err("oversized Basic password must be rejected");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(credential.get("password").is_some());
-        assert!(credential.get("password_hash").is_none());
     }
 
     #[test]

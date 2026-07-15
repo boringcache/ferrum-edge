@@ -554,6 +554,35 @@ async fn test_single_basic_auth_missing_credentials_uses_basic_challenge() {
 }
 
 #[tokio::test]
+async fn test_multi_auth_missing_credentials_uses_first_available_challenge() {
+    unsafe {
+        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
+    }
+    let jwt: Arc<dyn Plugin> = Arc::new(JwtAuth::new(&json!({})).unwrap());
+    let basic: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mixed-auth".to_string(),
+    );
+
+    let result = run_authentication_phase(
+        AuthMode::Multi,
+        &[jwt, basic],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await;
+
+    let (status, _body, headers) = result.expect("all-missing auth chain must reject");
+    assert_eq!(status, 401);
+    assert_eq!(
+        headers.get("WWW-Authenticate").map(String::as_str),
+        Some(r#"Basic realm="ferrum-edge", charset="UTF-8""#)
+    );
+}
+
+#[tokio::test]
 async fn test_single_auth_valid_basic_skips_earlier_jwt_scheme() {
     use base64::Engine;
 

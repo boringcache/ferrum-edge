@@ -86,6 +86,21 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    pub fn prepare_basic_auth_credential_for_test(
+        credential: &mut serde_json::Value,
+    ) -> Result<(), StatusCode> {
+        crate::admin::hash_credential_if_needed("basicauth", credential)
+            .map_err(|response| response.status())
+    }
+
+    pub fn basic_auth_server_configuration_status_for_test(
+        secret: Option<&str>,
+    ) -> Option<StatusCode> {
+        crate::config::types::hash_basic_auth_password_with_secret("test-password", secret)
+            .err()
+            .map(|error| crate::admin::basic_auth_credential_error_status(&error))
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)

@@ -121,7 +121,7 @@ Use `priority_override` to control the relative execution order of instances tha
 
 ## Multi-Authentication Mode
 
-With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. An `Authorization` scheme belonging to another configured mechanism is skipped, while malformed credentials for the applicable scheme are rejected. With `auth_mode: multi`, authentication plugins execute sequentially until one succeeds; earlier ordinary rejections do not block a later successful mechanism. After authentication, the Access Control plugin can apply consumer or group policy.
+With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. An `Authorization` scheme not applicable to the current mechanism is skipped, while the first applicable rejection is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one succeeds; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned. After authentication, the Access Control plugin can apply consumer or group policy.
 
 ## Consumer Identity Headers
 
@@ -1567,6 +1567,8 @@ Authenticates using HTTP Basic credentials. Every HTTP 401 response advertises `
 **Config**: The plugin object is empty. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
 
 Admin API writes may supply exactly one of `password` or `password_hash`; plaintext passwords are hashed and removed before persistence. File-mode configuration must supply only `password_hash` so plaintext credentials never enter observable runtime configuration.
+
+Ordinary Consumer API responses omit the entire `basicauth` credential type so the strict request/backup hash schema is never populated with a synthetic placeholder. The authenticated `/backup` endpoint remains intentionally unredacted for restoration.
 
 Basic authentication normalizes password-verification work to the configured credential rotation limit to reduce username and rotation-state timing signals. Apply an authentication rate-limit policy as an additional control against online guessing.
 

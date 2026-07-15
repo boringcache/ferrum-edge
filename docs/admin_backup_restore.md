@@ -17,7 +17,7 @@ Returns the entire gateway configuration as a single JSON document. The output f
 
 ### Key Behaviors
 
-- **Unredacted credentials**: Unlike `GET /consumers` (which redacts every `basicauth` credential field plus `hmac_auth.secret`, `jwt.secret`, and `keyauth.key`), the backup endpoint returns raw credential values. This is necessary for faithful restoration.
+- **Unredacted credentials**: Unlike `GET /consumers` (which omits the entire `basicauth` credential type and redacts `hmac_auth.secret`, `jwt.secret`, and `keyauth.key`), the backup endpoint returns raw credential values. This is necessary for faithful restoration.
 - **Database-first with cached fallback**: Reads from the database when available. If the database is unreachable, falls back to the in-memory cached config and sets the `X-Data-Source: cached` response header.
 - **Content-Disposition header**: Includes `attachment; filename="ferrum-backup.json"` for browser-friendly downloads.
 - **Resource filtering**: Use `?resources=proxies,consumers` to export only specific resource types. Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`. Omit the parameter to export everything.
@@ -72,6 +72,8 @@ Replaces the entire gateway configuration with the provided backup payload. This
 3. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
 4. **Imports** the provided resources in dependency order
 5. **Rolls back** to the snapshot if the delete or any import persistence step fails
+
+Build-out compatibility note: legacy backups whose `basicauth` entries contain fields other than exactly one `password` or `password_hash` no longer pass restore validation. Remove obsolete fields (for example an entry-local `username`) before restore. Ferrum intentionally does not add a legacy restore shim during active build-out.
 
 ### Recovery snapshot is authoritative and fail-safe
 
