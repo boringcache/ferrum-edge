@@ -162,6 +162,13 @@ pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_respo
 pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
     "ferrum:replaceable_rejection_response";
 
+/// One-shot handoff for requester-owned auth session state that changed before
+/// an authentication attempt rejected. The authentication phase removes this
+/// key on every exit: it attaches the cookie only to the final rejection and
+/// discards it when a later credential succeeds. The key contains "cookie" so
+/// metadata serialization still redacts the sealed value defensively.
+pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_set_cookie";
+
 /// Marker recorded in `ctx.metadata` for the duration of
 /// [`apply_synthetic_response_body_hooks`] — i.e. while the response-body hook
 /// pipeline (`on_response_body`, `transform_response_body_with_context`,
@@ -13837,6 +13844,20 @@ fn missing_authentication_reject(
     (401, MISSING_AUTHENTICATION_BODY.to_vec(), headers)
 }
 
+fn attach_auth_rejection_set_cookie(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    let Some(cookie) = ctx
+        .metadata
+        .remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY)
+    else {
+        return;
+    };
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("set-cookie"));
+    headers.insert("set-cookie".to_string(), cookie);
+}
+
 pub async fn run_authentication_phase(
     auth_mode: AuthMode,
     auth_plugins: &[Arc<dyn Plugin>],
@@ -13890,13 +13911,14 @@ pub async fn run_authentication_phase(
                 || auth_plugins.is_empty()
                 || (last_reject.is_none() && mesh_permissive_only_auth_plugin)
             {
+                ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
                 None
             } else {
-                Some(
-                    server_reject
-                        .or(last_reject)
-                        .unwrap_or_else(|| missing_authentication_reject(auth_plugins)),
-                )
+                let mut reject = server_reject
+                    .or(last_reject)
+                    .unwrap_or_else(|| missing_authentication_reject(auth_plugins));
+                attach_auth_rejection_set_cookie(ctx, &mut reject.2);
+                Some(reject)
             }
         }
         AuthMode::Single => {
@@ -13905,7 +13927,9 @@ pub async fn run_authentication_phase(
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
-                            return Some((reject.status_code, reject.body, reject.headers));
+                            let mut reject = (reject.status_code, reject.body, reject.headers);
+                            attach_auth_rejection_set_cookie(ctx, &mut reject.2);
+                            return Some(reject);
                         }
                     }
                     PluginResult::Continue => {}
@@ -13916,6 +13940,7 @@ pub async fn run_authentication_phase(
                     .metadata
                     .get("mesh_request_auth.permissive_missing_token")
                     .is_some_and(|v| v == "true");
+            ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
                 || mesh_permissive_only_auth_plugin

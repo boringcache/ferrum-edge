@@ -1153,7 +1153,7 @@ impl OidcRelyingParty {
                 plugin_name: "oidc_relying_party",
             },
         ) {
-            return self.reject_with_session_update(status, body, &payload, session_mutated);
+            return self.reject_with_session_update(ctx, status, body, &payload, session_mutated);
         }
         // Transactional commit: resolve the principal before staging claim
         // headers. A live session whose identity claim is blank/missing must
@@ -1189,6 +1189,7 @@ impl OidcRelyingParty {
 
     fn reject_with_session_update(
         &self,
+        ctx: &mut RequestContext,
         status_code: u16,
         body: String,
         payload: &SessionPayload,
@@ -1198,6 +1199,14 @@ impl OidcRelyingParty {
         if session_mutated {
             match self.seal_session_cookie(payload) {
                 Ok(cookie) => {
+                    // The local rejection owns this response cookie, while the
+                    // one-shot candidate lets multi-auth move the same sealed
+                    // state onto a later final rejection. The phase discards
+                    // the candidate if a later credential succeeds, so keep it
+                    // separate from successful-principal attempt staging.
+                    ctx.metadata
+                        .entry(crate::proxy::AUTH_REJECTION_SET_COOKIE_METADATA_KEY.to_string())
+                        .or_insert_with(|| cookie.clone());
                     headers.insert("set-cookie".to_string(), cookie);
                 }
                 Err(error) => {
