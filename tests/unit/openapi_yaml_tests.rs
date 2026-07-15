@@ -2133,4 +2133,20 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
         &json!({ "set": { "X-Policy": "one\u{0001}two" } }),
         false,
     );
+    for non_ascii_value in [
+        json!({ "content_type_options": "caf\u{00e9}" }),
+        json!({ "frame_options": "caf\u{00e9}" }),
+        json!({ "referrer_policy": "caf\u{00e9}" }),
+        json!({ "hsts": "caf\u{00e9}" }),
+        json!({ "content_security_policy": "caf\u{00e9}" }),
+        json!({ "permissions_policy": "caf\u{00e9}" }),
+        json!({ "set": { "X-Policy": "caf\u{00e9}" } }),
+    ] {
+        assert_component_validity(
+            &spec,
+            "SecurityHeadersConfig",
+            &non_ascii_value,
+            false,
+        );
+    }
 }

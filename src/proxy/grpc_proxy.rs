@@ -44,6 +44,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
+use crate::plugins::Plugin;
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
     parse_connection_listed_headers,
@@ -1604,6 +1605,73 @@ pub fn strip_grpc_terminal_metadata_from_initial(
     response_headers.remove("grpc-status");
     response_headers.remove("grpc-message");
     response_headers.remove("grpc-status-details-bin");
+}
+
+/// Replay the buffered initial-header policy while protecting gRPC terminal
+/// metadata owned by a legitimate Trailers-Only initial HEADERS block.
+///
+/// Policy-supplied terminal fields are always discarded. When
+/// `preserve_terminal_metadata` is true, only values already present before
+/// the replay are restored; otherwise terminal metadata remains exclusive to
+/// the wire trailer channel. The shared buffered replay also preserves the
+/// transform-owned `content-length`.
+pub fn replay_buffered_grpc_initial_response_policies(
+    policy_plugins: &[Arc<dyn Plugin>],
+    response_headers: &mut HashMap<String, String>,
+    preserve_terminal_metadata: bool,
+) {
+    let grpc_status = response_headers.remove_entry("grpc-status");
+    let grpc_message = response_headers.remove_entry("grpc-message");
+    let grpc_status_details = response_headers.remove_entry("grpc-status-details-bin");
+
+    crate::plugins::replay_initial_response_header_policies_after_buffering(
+        policy_plugins,
+        response_headers,
+    );
+    strip_grpc_terminal_metadata_from_initial(response_headers);
+
+    if preserve_terminal_metadata {
+        for (name, value) in [grpc_status, grpc_message, grpc_status_details]
+            .into_iter()
+            .flatten()
+        {
+            response_headers.insert(name, value);
+        }
+    }
+}
+
+/// Collapse a buffered gRPC Trailers-Only response into its initial HEADERS
+/// while keeping trailer provenance from defeating initial-header policy.
+///
+/// Trailer-only fields are removed before the first replay, so a policy using
+/// `override_existing: false` evaluates against genuine initial headers. When
+/// trailers are collapsed, policy-produced values retain precedence; a second
+/// replay applies configured removals to application trailers. Reserved gRPC
+/// terminal metadata is always restored from the authoritative trailer value.
+pub fn collapse_grpc_trailers_only_with_initial_response_policies(
+    response_headers: &mut HashMap<String, String>,
+    response_trailers: &mut HashMap<String, String>,
+    header_shadowed_trailer_keys: &HashSet<String>,
+    policy_plugins: &[Arc<dyn Plugin>],
+) {
+    strip_non_initial_grpc_trailer_fields(
+        response_headers,
+        response_trailers,
+        header_shadowed_trailer_keys,
+    );
+    replay_buffered_grpc_initial_response_policies(policy_plugins, response_headers, true);
+
+    for (name, value) in response_trailers.drain() {
+        if is_reserved_grpc_terminal_metadata(&name)
+            || header_shadowed_trailer_keys.contains(&name)
+        {
+            response_headers.insert(name, value);
+        } else {
+            response_headers.entry(name).or_insert(value);
+        }
+    }
+
+    replay_buffered_grpc_initial_response_policies(policy_plugins, response_headers, true);
 }
 
 /// Re-home a hook-mutated trailer-only `set-cookie` onto the buffered gRPC

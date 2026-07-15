@@ -372,6 +372,52 @@ plugin_configs:
         .expect("Failed to write config");
 }
 
+/// Write a WebSocket config whose backend-admission limiter holds one permit
+/// for the full upgraded session and rejects a concurrent second handshake.
+fn write_ws_backend_admission_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-admission-proxy"
+    listen_path: "/ws-echo"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+
+consumers: []
+plugin_configs:
+  - id: "plugin-ws-adaptive-concurrency"
+    plugin_name: "adaptive_concurrency"
+    config:
+      min_limit: 1
+      initial_limit: 1
+      max_limit: 1
+    scope: global
+    enabled: true
+  - id: "plugin-security-headers-ws-admission"
+    plugin_name: "security_headers"
+    config:
+      hsts: true
+      set:
+        X-WS-Security: "gateway-enforced"
+        Upgrade: "policy-must-not-escape"
+        Connection: "policy-must-not-escape"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
+      remove: ["server", "x-powered-by"]
+    scope: global
+    enabled: true
+"#,
+        backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
 /// Write a YAML config with a WebSocket proxy protected by an Origin allowlist.
 fn write_ws_origin_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
@@ -1474,6 +1520,61 @@ async fn test_websocket_global_connection_limit_rejects_second_upgrade() {
         .send(Message::Close(None))
         .await
         .expect("close first");
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// A backend-admission rejection happens after the generic reject hooks have
+/// applied security_headers. The final failed-handshake boundary must retain
+/// the security policy while stripping every transport-managed field it tried
+/// to inject.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_backend_admission_reject_strips_transport_policy_fields() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_backend_admission_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{gateway_port}/ws-echo");
+    let (mut first_ws, first_response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("first WebSocket should hold the backend-admission permit");
+    assert_ws_security_policy(first_response.headers());
+
+    let second = tokio_tungstenite::connect_async(&url).await;
+    match second {
+        Err(WsError::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_ws_security_policy(response.headers());
+            assert_no_ws_transport_policy_values(response.headers());
+            assert_no_h1_only_websocket_headers(response.headers());
+            let body = response
+                .body()
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+                .unwrap_or_default();
+            assert!(
+                body.contains("Upstream concurrency limit reached"),
+                "unexpected rejection body: {body}"
+            );
+        }
+        Ok(_) => panic!("second WebSocket should be rejected by backend admission"),
+        Err(err) => panic!("unexpected second WebSocket error: {err:?}"),
+    }
+
+    first_ws
+        .send(Message::Close(None))
+        .await
+        .expect("close first WebSocket");
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();

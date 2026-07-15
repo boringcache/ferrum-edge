@@ -824,6 +824,7 @@ async fn start_streaming_grpc_backend(
     num_frames: usize,
     frame_size: usize,
     per_frame_delay: Duration,
+    security_policy_trailer: bool,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use http_body::Frame;
     use http_body_util::StreamBody;
@@ -874,6 +875,16 @@ async fn start_streaming_grpc_backend(
                             hyper::header::HeaderName::from_static("grpc-message"),
                             hyper::header::HeaderValue::from_static("OK"),
                         );
+                        if security_policy_trailer {
+                            trailers.insert(
+                                hyper::header::HeaderName::from_static("x-security-policy"),
+                                hyper::header::HeaderValue::from_static("backend-trailer-value"),
+                            );
+                            trailers.insert(
+                                hyper::header::HeaderName::from_static("x-application-trailer"),
+                                hyper::header::HeaderValue::from_static("application-value"),
+                            );
+                        }
                         let _ = tx.send(Ok(Frame::trailers(trailers))).await;
                     });
 
@@ -902,7 +913,8 @@ async fn start_streaming_grpc_backend(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_buffered_non_empty_response_sends_status_as_trailer() {
-    let (backend_addr, _backend_handle) = start_streaming_grpc_backend(1, 32, Duration::ZERO).await;
+    let (backend_addr, _backend_handle) =
+        start_streaming_grpc_backend(1, 32, Duration::ZERO, false).await;
 
     let mut proxy = create_grpc_proxy("grpc-buffered-trailers", "/grpc", backend_addr.port());
     proxy.response_body_mode = ResponseBodyMode::Buffer;
@@ -965,7 +977,7 @@ async fn grpc_buffered_non_empty_response_sends_status_as_trailer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_buffered_trailers_only_keeps_status_and_security_policy_initial() {
     let (backend_addr, _backend_handle) =
-        start_streaming_grpc_backend(0, 0, Duration::ZERO).await;
+        start_streaming_grpc_backend(0, 0, Duration::ZERO, true).await;
     let mut proxy = create_grpc_proxy("grpc-trailers-only-policy", "/grpc", backend_addr.port());
     proxy.response_body_mode = ResponseBodyMode::Buffer;
     let state = create_test_proxy_state_with_plugins(
@@ -996,6 +1008,10 @@ async fn grpc_buffered_trailers_only_keeps_status_and_security_policy_initial() 
             .get("strict-transport-security")
             .map(String::as_str),
         Some("max-age=31536000; includeSubDomains")
+    );
+    assert_eq!(
+        headers.get("x-application-trailer").map(String::as_str),
+        Some("application-value")
     );
 }
 
@@ -1774,6 +1790,7 @@ async fn grpc_retry_enabled_does_not_stall_trailers_behind_streaming_body() {
         NUM_FRAMES,
         FRAME_SIZE,
         Duration::from_millis(PER_FRAME_DELAY_MS),
+        false,
     )
     .await;
 

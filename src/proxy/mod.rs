@@ -8096,29 +8096,37 @@ pub fn try_acquire_websocket_connection_permit(
     }
 }
 
+const WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS: [&str; 14] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "sec-websocket-accept",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-protocol",
+    "sec-websocket-extensions",
+];
+
 fn is_websocket_transport_managed_response_header(name: &str) -> bool {
     // The ordinary backend response strip predicate is lowercase-only because
     // backend maps are canonical. Plugin rejection maps can retain caller case,
     // so keep the boundary comparison case-insensitive without allocating a
     // lowercased copy on every WebSocket handshake.
-    [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "content-length",
-        "sec-websocket-accept",
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-protocol",
-        "sec-websocket-extensions",
-    ]
-    .iter()
-    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+fn strip_websocket_transport_managed_response_headers(headers: &mut hyper::HeaderMap) {
+    for name in WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS {
+        headers.remove(name);
+    }
 }
 
 /// Apply deterministic initial-response policy at the WebSocket boundary, then
@@ -8424,7 +8432,7 @@ async fn handle_websocket_request_authenticated(
                     current_cb_target_key.as_deref(),
                     ws_cb_probe_slot_available,
                 );
-                return Ok(handle_backend_admission_rejection(
+                let mut response = handle_backend_admission_rejection(
                     rejection,
                     &plugins,
                     &mut ctx,
@@ -8435,7 +8443,13 @@ async fn handle_websocket_request_authenticated(
                     false,
                     None,
                 )
-                .await);
+                .await;
+                // The generic reject finalizer already ran security_headers;
+                // strip fields owned by the failed WebSocket transport only
+                // after that last plugin opportunity so policy cannot smuggle
+                // upgrade metadata onto a non-upgrade response.
+                strip_websocket_transport_managed_response_headers(response.headers_mut());
+                return Ok(response);
             }
         };
 
@@ -17985,14 +17999,19 @@ async fn handle_proxy_request_inner(
                     &response_trailers,
                     &response_headers,
                 );
+                let initial_response_header_policy_plugins =
+                    plugin_cache_view.initial_response_header_policy_plugins();
                 if response_body.is_empty() {
                     // True Trailers-Only encoding: no DATA frame, grpc-status
                     // and friends ride in the initial HEADERS with END_STREAM.
                     // Trailer values are authoritative on collapse (pre-split
                     // merge order), including over duplicate initial headers.
-                    for (k, v) in response_trailers.drain() {
-                        response_headers.insert(k, v);
-                    }
+                    grpc_proxy::collapse_grpc_trailers_only_with_initial_response_policies(
+                        &mut response_headers,
+                        &mut response_trailers,
+                        &header_shadowed_trailer_keys,
+                        &initial_response_header_policy_plugins,
+                    );
                 } else {
                     // Non-empty gRPC responses must carry grpc-status in a
                     // terminal TRAILERS frame. Strip the view-merged trailer
@@ -18008,14 +18027,10 @@ async fn handle_proxy_request_inner(
                         &response_trailers,
                         &header_shadowed_trailer_keys,
                     );
-                    let initial_response_header_policy_plugins =
-                        plugin_cache_view.initial_response_header_policy_plugins();
-                    crate::plugins::replay_initial_response_header_policies_after_buffering(
+                    grpc_proxy::replay_buffered_grpc_initial_response_policies(
                         &initial_response_header_policy_plugins,
                         &mut response_headers,
-                    );
-                    grpc_proxy::strip_grpc_terminal_metadata_from_initial(
-                        &mut response_headers,
+                        false,
                     );
                 }
 

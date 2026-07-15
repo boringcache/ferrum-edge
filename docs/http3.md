@@ -182,9 +182,11 @@ Buffered response hooks receive a compatibility view containing both initial
 headers and trailers. Before the H3 response is written, Ferrum restores the
 original provenance, reapplies the prefiltered `security_headers` policy to the
 initial header map, and keeps `grpc-status`, `grpc-message`, status details, and
-application metadata on the trailer channel. This is also the path used after
-gRPC-Web binary or text response framing, so security policy cannot disappear
-with the native trailer map.
+application metadata on the trailer channel for responses with DATA. A backend
+Trailers-Only response that already carries terminal status in its END_STREAM
+initial HEADERS keeps that status there; policy replay cannot remove or replace
+it. This is also the path used after gRPC-Web binary or text response framing,
+so security policy cannot disappear with the native trailer map.
 
 Either way, `grpc-status` reaches the H3 client intact.
 

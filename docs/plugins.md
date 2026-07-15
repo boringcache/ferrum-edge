@@ -2710,7 +2710,7 @@ runtime configuration on reload. Header names use the complete HTTP
 field-name token grammar, are limited to 65,535 ASCII bytes, and are
 canonicalized to lowercase. Configured values must pass the same `HeaderValue`
 validation as the downstream H1/H2/H3 response builders: C0 controls other
-than horizontal tab, and DEL, are rejected.
+than horizontal tab, DEL, and non-ASCII characters are rejected.
 
 **Priority:** 4080
 

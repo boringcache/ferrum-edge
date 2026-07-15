@@ -3670,13 +3670,15 @@ where
 
             // Reconcile hook edits/removals from the merged view back into the
             // wire trailers, then assemble the initial HEADERS frame from the
-            // view. H3 always uses the split wire shape — real initial headers
-            // plus a real TRAILERS frame, never a Trailers-Only collapse — so
-            // plain gRPC-over-H3 keeps real trailers. `resp.headers` still holds
+            // view. H3 keeps the split wire shape whenever the backend supplied
+            // real trailers. A backend Trailers-Only response instead already
+            // carries terminal metadata in an END_STREAM initial HEADERS block;
+            // when the body and trailer map are empty, preserve those existing
+            // terminal fields across policy replay. `resp.headers` still holds
             // the pristine backend initial headers for the shadowed-key edit
-            // detection. Strip the merged trailer copies (and any trailer-only
-            // keys) out of the initial headers; header-shadowed keys stay real
-            // headers whose true trailing value rides the wire trailer.
+            // detection. Strip merged trailer copies (and any trailer-only keys)
+            // out of the initial headers; header-shadowed keys stay real headers
+            // whose true trailing value rides the wire trailer.
             //
             // Capture the backend's original trailer `set-cookie` (issue #1638)
             // before reconciliation overwrites it, mirroring the main gRPC path.
@@ -3700,12 +3702,10 @@ where
                 &response_trailers,
                 &header_shadowed_trailer_keys,
             );
-            crate::plugins::replay_initial_response_header_policies_after_buffering(
+            crate::proxy::grpc_proxy::replay_buffered_grpc_initial_response_policies(
                 initial_response_header_policy_plugins,
                 &mut response_headers,
-            );
-            crate::proxy::grpc_proxy::strip_grpc_terminal_metadata_from_initial(
-                &mut response_headers,
+                response_body.is_empty(),
             );
             // Re-home a hook-mutated trailer-only `set-cookie` onto the initial
             // HEADERS (issue #1638) so browsers / gRPC-Web clients can store it,

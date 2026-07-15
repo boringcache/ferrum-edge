@@ -248,6 +248,7 @@ fn validates_every_configurable_field_value_with_http_builder_rules() {
         .filter(|byte| *byte != b'\t')
         .chain(std::iter::once(127))
         .map(|byte| format!("before{}after", char::from(byte)))
+        .chain(std::iter::once("caf\u{00e9}".to_string()))
         .collect();
 
     for value in invalid_values {

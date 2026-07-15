@@ -322,6 +322,62 @@ async fn h3_buffered_grpc_security_policy_preserves_initial_and_trailer_provenan
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_trailers_only_preserves_initial_terminal_status() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let ca = TestCa::new("h3-grpc-trailers-only-be").expect("ca");
+    let (be_cert, be_key) = ca.valid().expect("backend leaf");
+    let _backend = ScriptedH2Backend::builder_tls(backend_listener, &be_cert, &be_key)
+        .expect("backend tls")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeadersEndStream(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+            ("grpc-status", "7".into()),
+            ("grpc-message", "permission denied".into()),
+        ]))
+        .spawn()
+        .expect("spawn backend");
+
+    let (_harness, https_port) = spawn_buffered_h3_grpc_gateway(backend_port).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    stream.send_message(b"ping").await.expect("send message");
+    stream.finish().await.expect("finish");
+    let (status, headers) = stream.recv_response().await.expect("recv response");
+    let (body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("recv body+trailers");
+
+    assert_eq!(status.as_u16(), 200);
+    assert!(body.is_empty());
+    assert!(trailers.is_empty());
+    assert_eq!(
+        headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("7")
+    );
+    assert_eq!(
+        headers
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
+        Some("permission denied")
+    );
+    assert_eq!(
+        headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // 2. THE KILLER TEST — bidi: the backend responds BEFORE the H3 client
 //    half-closes. The backend never drains the request body; it replies on

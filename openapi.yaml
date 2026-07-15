@@ -13682,7 +13682,7 @@ components:
           oneOf:
             - type: boolean
             - type: string
-              pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
           default: nosniff
           description: "X-Content-Type-Options. true = nosniff (default); a string sets a custom value; false/null disables."
@@ -13690,7 +13690,7 @@ components:
           oneOf:
             - type: boolean
             - type: string
-              pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
           default: SAMEORIGIN
           description: "X-Frame-Options. Default SAMEORIGIN; string overrides; false disables."
@@ -13698,7 +13698,7 @@ components:
           oneOf:
             - type: boolean
             - type: string
-              pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
           default: strict-origin-when-cross-origin
           description: "Referrer-Policy. Default strict-origin-when-cross-origin; string overrides; false disables."
@@ -13707,7 +13707,7 @@ components:
           oneOf:
             - type: boolean
             - type: string
-              pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
             - type: object
               additionalProperties: false
@@ -13724,11 +13724,11 @@ components:
                   default: false
         content_security_policy:
           type: [string, "null"]
-          pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
+          pattern: '^[\u0009\u0020-\u007E]*$'
           description: "Content-Security-Policy value (opt-in; application-specific)."
         permissions_policy:
           type: [string, "null"]
-          pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
+          pattern: '^[\u0009\u0020-\u007E]*$'
           description: "Permissions-Policy value (opt-in)."
         set:
           type: [object, "null"]
@@ -13739,8 +13739,8 @@ components:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties:
             type: string
-            pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
-          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase. Values must satisfy the HTTP HeaderValue builder rules: C0 controls other than HTAB and DEL are rejected."
+            pattern: '^[\u0009\u0020-\u007E]*$'
+          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
         remove:
           type: [array, "null"]
           items:
