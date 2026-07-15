@@ -265,8 +265,9 @@ fn test_no_match() {
 use async_trait::async_trait;
 use ferrum_edge::_test_support::{
     apply_request_body_plugins, can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
-    extract_grpc_reject_message, insert_grpc_error_metadata, map_http_reject_status_to_grpc_status,
-    normalize_reject_response, request_may_have_body,
+    extract_grpc_reject_message, finalize_plugin_rejection_for_test, insert_grpc_error_metadata,
+    map_http_reject_status_to_grpc_status, normalize_reject_response, request_may_have_body,
+    set_grpc_deadline_budget_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
@@ -367,6 +368,59 @@ impl Plugin for PendingAuth {
         _consumer_index: &ConsumerIndex,
     ) -> PluginResult {
         std::future::pending().await
+    }
+}
+
+struct DeadlineRejectDecorator;
+
+#[async_trait]
+impl Plugin for DeadlineRejectDecorator {
+    fn name(&self) -> &str {
+        "deadline_reject_decorator"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        response_headers.insert("x-deadline-decorated".to_string(), "true".to_string());
+        PluginResult::Continue
+    }
+}
+
+struct DeadlineRejectReplacer;
+
+#[async_trait]
+impl Plugin for DeadlineRejectReplacer {
+    fn name(&self) -> &str {
+        "deadline_reject_replacer"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    fn may_replace_rejection_response(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 503,
+            body: "must not replace terminal deadline".to_string(),
+            headers: HashMap::from([("x-replaced".to_string(), "true".to_string())]),
+        }
     }
 }
 
@@ -686,6 +740,53 @@ async fn test_multi_auth_deadline_expiry_overrides_earlier_server_reject() {
     assert_eq!(
         rejection.2.get("grpc-message").map(String::as_str),
         Some("Deadline exceeded at gateway")
+    );
+}
+
+#[tokio::test]
+async fn terminal_deadline_reject_runs_decorators_but_not_replacers() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(DeadlineRejectDecorator),
+        Arc::new(DeadlineRejectReplacer),
+    ];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+
+    let (status, body, headers) = finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        200,
+        Vec::new(),
+        HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("grpc-status".to_string(), "4".to_string()),
+            (
+                "grpc-message".to_string(),
+                "Deadline exceeded at gateway".to_string(),
+            ),
+        ]),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Deadline exceeded at gateway")
+    );
+    assert_eq!(
+        headers.get("x-deadline-decorated").map(String::as_str),
+        Some("true"),
+        "header-only rejection decorators must complete after deadline expiry"
+    );
+    assert!(
+        !headers.contains_key("x-replaced"),
+        "an expired fail-closed replacer must not override the terminal deadline"
     );
 }
 

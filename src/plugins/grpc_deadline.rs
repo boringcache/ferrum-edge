@@ -205,7 +205,7 @@ fn format_grpc_timeout(d: Duration) -> String {
     timeout
 }
 
-fn duration_millis_ceil_saturating(duration: Duration) -> Option<u64> {
+pub(crate) fn duration_millis_ceil_saturating(duration: Duration) -> Option<u64> {
     if duration.is_zero() {
         return None;
     }

@@ -86,6 +86,44 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
+    pub fn grpc_deadline_duration_millis_ceil_saturating_for_test(
+        duration: std::time::Duration,
+    ) -> Option<u64> {
+        crate::plugins::grpc_deadline::duration_millis_ceil_saturating(duration)
+    }
+
+    pub fn set_grpc_deadline_budget_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        budget_ms: Option<u64>,
+    ) {
+        ctx.set_grpc_deadline_budget(budget_ms);
+    }
+
+    pub async fn finalize_plugin_rejection_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: u16,
+        body: Vec<u8>,
+        headers: HashMap<String, String>,
+    ) -> (u16, Vec<u8>, HashMap<String, String>) {
+        let mut response_status = status_code;
+        let mut response_headers = headers.clone();
+        let response_body = crate::proxy::apply_plugin_rejection_response(
+            plugins,
+            ctx,
+            &mut response_status,
+            &mut response_headers,
+            crate::proxy::RejectedResponseParts {
+                status_code,
+                body,
+                headers,
+            },
+        )
+        .await;
+        (response_status, response_body, response_headers)
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)

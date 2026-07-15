@@ -891,8 +891,7 @@ impl RequestContext {
         if remaining.is_zero() {
             return Some(0);
         }
-        let millis = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
-        Some(millis.max(1))
+        grpc_deadline::duration_millis_ceil_saturating(remaining)
     }
 
     pub(crate) fn initialize_grpc_deadline_budget(&mut self, budget_ms: Option<u64>) {

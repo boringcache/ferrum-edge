@@ -8,6 +8,29 @@ use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
+#[test]
+fn remaining_duration_rounds_up_to_the_next_wire_millisecond() {
+    use ferrum_edge::_test_support::grpc_deadline_duration_millis_ceil_saturating_for_test;
+    use std::time::Duration;
+
+    assert_eq!(
+        grpc_deadline_duration_millis_ceil_saturating_for_test(Duration::ZERO),
+        None
+    );
+    assert_eq!(
+        grpc_deadline_duration_millis_ceil_saturating_for_test(Duration::from_nanos(1)),
+        Some(1)
+    );
+    assert_eq!(
+        grpc_deadline_duration_millis_ceil_saturating_for_test(Duration::from_nanos(999_999)),
+        Some(1)
+    );
+    assert_eq!(
+        grpc_deadline_duration_millis_ceil_saturating_for_test(Duration::from_nanos(1_000_001)),
+        Some(2)
+    );
+}
+
 fn create_grpc_context_with_timeout(timeout: Option<&str>) -> ferrum_edge::plugins::RequestContext {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();

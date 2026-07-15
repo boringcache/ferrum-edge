@@ -12981,6 +12981,19 @@ pub(crate) async fn log_rejected_request_with_path(
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
 }
 
+fn is_terminal_gateway_deadline_rejection(
+    status_code: u16,
+    response_headers: &HashMap<String, String>,
+) -> bool {
+    status_code == StatusCode::OK.as_u16()
+        && response_headers
+            .get("grpc-status")
+            .is_some_and(|status| status == "4")
+        && response_headers
+            .get("grpc-message")
+            .is_some_and(|message| message == "Deadline exceeded at gateway")
+}
+
 async fn run_after_proxy_hooks_on_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -13001,15 +13014,29 @@ async fn run_after_proxy_hooks_on_rejection(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
         "true".to_string(),
     );
+    let terminal_gateway_deadline =
+        is_terminal_gateway_deadline_rejection(*status_code, response_headers);
 
     for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
-        let deadline = ctx.grpc_deadline_at();
-        match crate::plugins::await_request_plugin_deadline(
-            deadline,
-            plugin.after_proxy(ctx, *status_code, response_headers),
-        )
-        .await
-        {
+        // Once an earlier phase has selected the canonical client-deadline
+        // response, non-replacing decorators and cleanup hooks must still
+        // finish. Keeping the expired RPC timer around those hooks would turn
+        // them into an ignored synthetic rejection before they can attach CORS,
+        // correlation, trace, cookie, or accounting state. A fail-closed hook
+        // that may replace the response remains under the deadline so it cannot
+        // override an already-terminal DEADLINE_EXCEEDED outcome.
+        let result = if terminal_gateway_deadline && !plugin.may_replace_rejection_response() {
+            plugin
+                .after_proxy(ctx, *status_code, response_headers)
+                .await
+        } else {
+            crate::plugins::await_request_plugin_deadline(
+                ctx.grpc_deadline_at(),
+                plugin.after_proxy(ctx, *status_code, response_headers),
+            )
+            .await
+        };
+        match result {
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     warn!(
