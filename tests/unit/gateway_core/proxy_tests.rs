@@ -872,14 +872,10 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
             "GET".to_string(),
             "/mixed-cookie-rejection".to_string(),
         );
-        let (status_code, body, headers) = run_authentication_phase(
-            AuthMode::Multi,
-            &auth_plugins,
-            &mut ctx,
-            &consumer_index,
-        )
-        .await
-        .expect("both auth attempts must reject");
+        let (status_code, body, headers) =
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+                .await
+                .expect("both auth attempts must reject");
 
         assert_eq!(status_code, 403);
         assert_eq!(body, br#"{"error":"mixed-case rejection"}"#);
@@ -887,7 +883,10 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
             headers.get("X-Rejection").map(String::as_str),
             Some("selected")
         );
-        assert_eq!(headers.get("set-cookie").map(String::as_str), Some(expected));
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some(expected)
+        );
         assert_eq!(
             headers
                 .keys()
