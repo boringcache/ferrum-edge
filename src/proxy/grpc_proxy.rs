@@ -3378,7 +3378,9 @@ mod tests {
             "the request-scoped typed deadline must be the primary source"
         );
         assert!(
-            body.contains("let client_deadline = dispatch_deadline_at"),
+            body.contains(
+                "dispatch_deadline_at.map(|deadline| (client_deadline_ms.unwrap_or(1), deadline))"
+            ),
             "one dispatch deadline must be shared by response phases"
         );
         let timeout_at = body.matches("tokio::time::timeout_at(").count();
