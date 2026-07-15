@@ -1491,7 +1491,8 @@ impl OidcRelyingParty {
         claims: Value,
         require_rolling_update: bool,
     ) -> Result<String, String> {
-        let payload = self.session_payload_for_tests(claims, require_rolling_update, None, false)?;
+        let payload =
+            self.session_payload_for_tests(claims, require_rolling_update, None, false)?;
         self.seal_session_cookie(&payload)
     }
 

@@ -191,9 +191,7 @@ async fn oidc_scope_rejection_persists_refresh_failure_backoff() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})),
-        )
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
         .expect(1)
         .mount(&server)
         .await;
