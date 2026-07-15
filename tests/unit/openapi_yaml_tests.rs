@@ -2287,3 +2287,63 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
         assert_component_validity(&spec, "AiResponseGuardConfig", &invalid, false);
     }
 }
+
+#[test]
+fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/SecurityHeadersConfig")
+        .expect("SecurityHeadersConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["hsts"]["oneOf"][3]["additionalProperties"],
+        false
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({
+            "hsts": { "max_age": 300 },
+            "set": { "X!#$%&'*+.^_`|~Policy": "one\ttwo" },
+            "remove": ["X!Policy"]
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "fram_options": false }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "hsts": { "include_subdomain": true } }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "set": { "X Policy": "on" } }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "SecurityHeadersConfig",
+        &json!({ "set": { "X-Policy": "one\u{0001}two" } }),
+        false,
+    );
+    for non_ascii_value in [
+        json!({ "content_type_options": "caf\u{00e9}" }),
+        json!({ "frame_options": "caf\u{00e9}" }),
+        json!({ "referrer_policy": "caf\u{00e9}" }),
+        json!({ "hsts": "caf\u{00e9}" }),
+        json!({ "content_security_policy": "caf\u{00e9}" }),
+        json!({ "permissions_policy": "caf\u{00e9}" }),
+        json!({ "set": { "X-Policy": "caf\u{00e9}" } }),
+    ] {
+        assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
+    }
+}
