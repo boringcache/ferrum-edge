@@ -518,8 +518,7 @@ async fn run_h3_script(
             step @ (H3Step::RespondHeaders(_) | H3Step::RespondHeadersEndStream(_)) => {
                 let end_stream = matches!(&step, H3Step::RespondHeadersEndStream(_));
                 let pairs = match step {
-                    H3Step::RespondHeaders(pairs)
-                    | H3Step::RespondHeadersEndStream(pairs) => pairs,
+                    H3Step::RespondHeaders(pairs) | H3Step::RespondHeadersEndStream(pairs) => pairs,
                     _ => unreachable!(),
                 };
                 let stream = match response_stream.as_mut() {

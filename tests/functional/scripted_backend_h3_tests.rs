@@ -3019,9 +3019,7 @@ async fn h3_native_grpc_unary_preserves_body_and_trailers() {
     );
 }
 
-async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(
-    remove_terminal: bool,
-) {
+async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(remove_terminal: bool) {
     let ca = TestCa::new("phase-h3-grpc-trailers-only").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
@@ -3066,8 +3064,15 @@ async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(
         }
     };
     let logs = harness.captured_combined().unwrap_or_default();
-    assert_eq!(resp.status.as_u16(), 200, "unexpected status; logs:\n{logs}");
-    assert!(resp.body_bytes.is_empty(), "Trailers-Only body must be empty");
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "unexpected status; logs:\n{logs}"
+    );
+    assert!(
+        resp.body_bytes.is_empty(),
+        "Trailers-Only body must be empty"
+    );
     assert_eq!(
         resp.headers
             .get("x-security-policy")
@@ -3078,11 +3083,17 @@ async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(
         resp.headers.get("grpc-status").is_none(),
         "native H3 relays terminal metadata on the trailer channel"
     );
-    assert_eq!(resp.grpc_status(), Some(7), "trailers: {:#?}", resp.trailers);
+    assert_eq!(
+        resp.grpc_status(),
+        Some(7),
+        "trailers: {:#?}",
+        resp.trailers
+    );
     assert_eq!(resp.grpc_message().as_deref(), Some("permission denied"));
     assert_eq!(
         resp.trailers
-            .get("grpc-status-details-bin")
+            .as_ref()
+            .and_then(|trailers| trailers.get("grpc-status-details-bin"))
             .and_then(|value| value.to_str().ok()),
         Some("AQID")
     );
