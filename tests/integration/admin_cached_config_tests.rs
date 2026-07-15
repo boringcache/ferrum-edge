@@ -2100,6 +2100,178 @@ async fn test_restore_rejects_invalid_plugin_config_before_delete() {
 }
 
 #[tokio::test]
+async fn plugin_delete_rejects_revealing_global_body_transformer_beside_hmac() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let seed = json!({
+        "proxies": [{
+            "id": "delete-shadow-proxy",
+            "listen_path": "/delete-shadow",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "delete-shadow-hmac"},
+                {"plugin_config_id": "delete-shadow-scoped-transformer"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "delete-shadow-global-transformer",
+                "plugin_name": "request_transformer",
+                "scope": "global",
+                "enabled": true,
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "gateway",
+                    "value": "ferrum"
+                }]}
+            },
+            {
+                "id": "delete-shadow-scoped-transformer",
+                "plugin_name": "request_transformer",
+                "scope": "proxy",
+                "proxy_id": "delete-shadow-proxy",
+                "enabled": true,
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "X-Gateway",
+                    "value": "ferrum"
+                }]}
+            },
+            {
+                "id": "delete-shadow-hmac",
+                "plugin_name": "hmac_auth",
+                "scope": "proxy",
+                "proxy_id": "delete-shadow-proxy",
+                "enabled": true,
+                "config": {"clock_skew_seconds": 300}
+            }
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "safe shadowed composition seed failed: {body:?}");
+
+    let (status, body) = admin_delete(
+        &base_url,
+        "/plugins/config/delete-shadow-scoped-transformer",
+        &token,
+    )
+    .await;
+
+    assert_eq!(status, 400, "unsafe plugin deletion was admitted: {body:?}");
+    assert!(
+        body.to_string()
+            .contains("hmac_auth cannot be combined with request-body transformer"),
+        "unexpected deletion validation response: {body:?}"
+    );
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/plugins/config/delete-shadow-scoped-transformer",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "rejected deletion must retain the shadowing plugin"
+    );
+}
+
+#[tokio::test]
+async fn restore_rejects_hmac_request_body_transformer_before_delete() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-composition-keep",
+            "listen_path": "/restore-composition-keep",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "restore preservation seed failed: {body:?}");
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-composition-new",
+            "listen_path": "/restore-composition-new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "restore-composition-hmac"},
+                {"plugin_config_id": "restore-composition-transformer"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "restore-composition-hmac",
+                "plugin_name": "hmac_auth",
+                "scope": "proxy",
+                "proxy_id": "restore-composition-new",
+                "enabled": true,
+                "config": {"clock_skew_seconds": 300}
+            },
+            {
+                "id": "restore-composition-transformer",
+                "plugin_name": "request_transformer",
+                "scope": "proxy",
+                "proxy_id": "restore-composition-new",
+                "enabled": true,
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "gateway",
+                    "value": "ferrum"
+                }]}
+            }
+        ]
+    });
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &restore_payload,
+    )
+    .await;
+
+    assert_eq!(status, 400, "unsafe restore was admitted: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|error| error.contains(
+                    "hmac_auth cannot be combined with request-body transformer"
+                )))),
+        "unexpected restore validation response: {body:?}"
+    );
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/proxies/restore-composition-keep",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "restore validation must run before destructive deletion"
+    );
+}
+
+#[tokio::test]
 async fn restore_prometheus_owner_conflicts_only_with_other_namespaces() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

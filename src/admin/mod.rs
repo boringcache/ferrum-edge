@@ -4244,6 +4244,7 @@ async fn handle_batch_create(
             namespace,
             &batch.proxies,
             &batch.plugin_configs,
+            None,
         )
         .await
         {
@@ -4866,6 +4867,34 @@ async fn handle_restore(
                     ));
                 }
             }
+        }
+        match crud::validate_hmac_request_transform_restore_candidate(
+            db.as_ref(),
+            state,
+            namespace,
+            &temp_config,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(crud::AfterValidateError::BadRequest(errors)) => {
+                validation_errors.extend(errors);
+            }
+            Err(crud::AfterValidateError::Db(error)) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Restore aborted: HMAC request-transform composition could not be validated: {}. Existing config was NOT deleted.",
+                            error
+                        )
+                    }),
+                ));
+            }
+            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
+                "HMAC request-transform candidate validation returned an unexpected response"
+                    .to_string(),
+            ),
         }
         if !validation_errors.is_empty() {
             return Ok(json_response(

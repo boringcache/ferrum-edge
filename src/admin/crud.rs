@@ -151,6 +151,7 @@ pub(crate) async fn validate_hmac_request_transform_candidates(
     namespace: &str,
     proxies: &[Proxy],
     plugins: &[PluginConfig],
+    removed_plugin_id: Option<&str>,
 ) -> Result<(), AfterValidateError> {
     let mut namespaces = db
         .list_namespaces_authoritative()
@@ -171,6 +172,12 @@ pub(crate) async fn validate_hmac_request_transform_candidates(
             .map_err(AfterValidateError::Db)?;
         candidate.proxies.extend(snapshot.proxies);
         candidate.plugin_configs.extend(snapshot.plugin_configs);
+    }
+
+    if let Some(removed_plugin_id) = removed_plugin_id {
+        candidate.plugin_configs.retain(|plugin| {
+            plugin.namespace != namespace || plugin.id != removed_plugin_id
+        });
     }
 
     for proxy in proxies {
@@ -195,6 +202,43 @@ pub(crate) async fn validate_hmac_request_transform_candidates(
             candidate.plugin_configs.push(plugin.clone());
         }
     }
+
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
+        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+}
+
+/// Validate a wholesale namespace replacement without retaining resources that
+/// the restore will delete. Global plugins span namespaces, so snapshots from
+/// every other namespace remain part of the authoritative candidate.
+pub(crate) async fn validate_hmac_request_transform_restore_candidate(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    replacement: &GatewayConfig,
+) -> Result<(), AfterValidateError> {
+    let mut namespaces = db
+        .list_namespaces_authoritative()
+        .await
+        .map_err(AfterValidateError::Db)?;
+    namespaces.sort_unstable();
+    namespaces.dedup();
+    let mut candidate = GatewayConfig::default();
+    for candidate_namespace in namespaces {
+        if candidate_namespace == namespace {
+            continue;
+        }
+        let snapshot = db
+            .load_namespace_snapshot(&candidate_namespace)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        candidate.proxies.extend(snapshot.proxies);
+        candidate.plugin_configs.extend(snapshot.plugin_configs);
+    }
+    candidate.proxies.extend(replacement.proxies.iter().cloned());
+    candidate
+        .plugin_configs
+        .extend(replacement.plugin_configs.iter().cloned());
 
     let http_client = super::plugin_validation_http_client(state);
     crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
@@ -1887,6 +1931,7 @@ impl AdminResource for PluginConfig {
             namespace,
             &[],
             std::slice::from_ref(resource),
+            None,
         )
         .await?;
 
@@ -1895,7 +1940,7 @@ impl AdminResource for PluginConfig {
 
     async fn before_delete(
         db: &dyn DatabaseBackend,
-        _state: &AdminState,
+        state: &AdminState,
         namespace: &str,
         existing: &Self,
         _ctx: &ValidationCtx<'_>,
@@ -1903,6 +1948,15 @@ impl AdminResource for PluginConfig {
         if existing.plugin_name == "mtls_auth" {
             validate_mtls_auth_candidate(db, namespace, None, None, Some(&existing.id)).await?;
         }
+        validate_hmac_request_transform_candidates(
+            db,
+            state,
+            namespace,
+            &[],
+            &[],
+            Some(&existing.id),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -2339,6 +2393,7 @@ impl AdminResource for Proxy {
             namespace,
             std::slice::from_ref(resource),
             &[],
+            None,
         )
         .await?;
 
