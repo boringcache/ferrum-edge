@@ -225,8 +225,8 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         "H3 policy rejections must be emitted before dispatch"
     );
     assert!(
-        source.contains("h3_plugin_protocol_for_request(http_flavor, grpc_web_request)"),
-        "H3 gRPC-Web requests must load the gRPC plugin policy chain"
+        source.contains("let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);"),
+        "H3 plugin-chain selection must use the effective request flavor"
     );
     assert!(
         policy_block.contains("grpc_web_response_content_type.as_deref()"),
@@ -293,28 +293,91 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
 }
 
 #[test]
-fn h3_grpc_web_initial_before_proxy_reject_uses_grpc_web_shape() {
+fn h3_grpc_web_effective_flavor_drives_policy_and_backend_dispatch() {
     let source = include_str!("../../../src/http3/server.rs");
-    let start = source
-        .find("// before_proxy hooks — only clone headers")
-        .expect("H3 initial before_proxy phase must remain present");
-    let end = source[start..]
-        .find("// Reserved consumer-identity headers are gateway-asserted")
-        .map(|offset| start + offset)
-        .expect("H3 initial before_proxy phase must have a bounded source block");
-    let before_proxy = &source[start..end];
+    let detected = source
+        .find("let detected_http_flavor =")
+        .expect("H3 must retain the original wire flavor");
+    let websocket_precedence = source
+        .find("detected_http_flavor == HttpFlavor::WebSocket")
+        .expect("H3 WebSocket classification must suppress gRPC-Web promotion");
+    let effective = source
+        .find("let http_flavor = if grpc_web_response_content_type.is_some()")
+        .expect("H3 must derive one effective gRPC flavor for gRPC-Web");
+    let post_guard = source
+        .find("if matches!(http_flavor, HttpFlavor::Grpc) && method != \"POST\"")
+        .expect("H3 POST policy must use the effective flavor");
+    let plugin_protocol = source
+        .find("let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);")
+        .expect("H3 plugin selection must use the effective flavor");
+    let bridge = source
+        .find(
+            "crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest",
+        )
+        .expect("H3 cross-protocol backend dispatch must remain present");
 
     assert!(
-        before_proxy
-            .matches("matches!(http_flavor, HttpFlavor::Grpc) || grpc_web_request")
-            .count()
-            >= 2,
-        "both H3 header-handling branches must normalize gRPC-Web plugin rejects as gRPC"
+        detected < websocket_precedence
+            && websocket_precedence < effective
+            && effective < post_guard
+            && post_guard < plugin_protocol
+            && plugin_protocol < bridge,
+        "wire classification, WebSocket precedence, effective promotion, POST policy, plugin \
+         selection, and backend dispatch must stay in that order"
     );
     assert!(
-        before_proxy.matches("send_h3_grpc_web_reject(").count() >= 2,
-        "both H3 header-handling branches must emit the gRPC-Web trailer-frame reject shape"
+        source[bridge..].contains("flavor: http_flavor,"),
+        "the backend bridge must receive the effective gRPC flavor"
     );
+
+    let cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
+    assert!(
+        cross_protocol.contains("write_grpc_error_for_request(")
+            && cross_protocol.contains("translated_error_response("),
+        "gRPC bridge failures must retain translated gRPC-Web client shaping"
+    );
+}
+
+#[test]
+fn h3_grpc_web_early_plugin_rejects_use_client_wire_shape() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let phases = [
+        (
+            "// Execute on_request_received hooks",
+            "// Materialize query params before authentication.",
+            "on_request_received",
+        ),
+        (
+            "// Authentication phase (pre-computed auth plugin list",
+            "// Authorization plugins that inspect bodies buffer only after",
+            "authentication",
+        ),
+        (
+            "// Authorization phase (pre-computed authorize plugin list",
+            "// before_proxy hooks — only clone headers",
+            "authorization",
+        ),
+    ];
+
+    for (start_marker, end_marker, phase) in phases {
+        let start = source
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("H3 {phase} phase must remain present"));
+        let end = source[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("H3 {phase} phase must remain bounded"));
+        let phase_source = &source[start..end];
+        assert!(
+            phase_source.contains("matches!(http_flavor, HttpFlavor::Grpc)"),
+            "H3 {phase} rejects must normalize with the effective gRPC flavor"
+        );
+        assert!(
+            phase_source.contains("send_h3_plugin_reject_flavor_aware(")
+                && phase_source.contains("grpc_web_response_content_type.as_deref()"),
+            "H3 {phase} rejects must retain the original gRPC-Web response encoding"
+        );
+    }
 }
 
 #[test]

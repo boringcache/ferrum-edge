@@ -45,11 +45,13 @@ Every H3 request goes through the same plugin lifecycle as H1/H2 (route match �
 | `HttpPool` | `WebSocket` | [H3 WebSocket bridge](#websocket-over-http3-rfc-9220-extended-connect) (`ws://` backend over plaintext H1.1) |
 | `TcpRaw` / `TcpTls` / `UdpRaw` / `UdpDtls` | — | Never routed here (stream proxies route on `listen_port`) |
 
-The `HttpFlavor` is computed once per request by `detect_http_flavor()` in `src/proxy/backend_dispatch.rs` — the same helper H1/H2 uses — so classification is identical on both fronts:
+The original wire `HttpFlavor` is computed once per request by `detect_http_flavor()` in `src/proxy/backend_dispatch.rs` — the same helper H1/H2 uses:
 
-- `application/grpc*` content-type → `Grpc`
+- native `application/grpc` content types (excluding gRPC-Web) → `Grpc`
 - HTTP/1.1 `Upgrade: websocket`, H2 Extended CONNECT `:protocol=websocket` (RFC 8441), or H3 Extended CONNECT `:protocol=websocket` (RFC 9220) → `WebSocket`
 - Everything else → `Plain`
+
+`application/grpc-web*` deliberately remains `Plain` in that shared wire classifier so the `grpc_web` plugin retains ownership of binary/text request-body translation. The H3 frontend immediately promotes a recognized gRPC-Web request to an effective `Grpc` flavor while retaining its original gRPC-Web response content type separately. POST validation, gRPC plugin-chain selection, request limits and retries, and native-H3 versus H2 gRPC backend transport all consume that effective flavor; early and later rejections use the retained content type to emit the browser-facing gRPC-Web trailer-frame representation. Extended CONNECT classification takes precedence, so a WebSocket request cannot be promoted by a spoofed gRPC-Web content type.
 
 ## Native H3 fast path
 
@@ -128,12 +130,12 @@ For every dispatch case that is **not** served by a native H3 path — i.e. anyt
 Flow:
 
 1. **Pre-dispatch plugin phases + LB + circuit breaker** already ran in the H3 listener; the bridge receives the resolved `backend_url`, `upstream_target`, `cb_target_key`, the already-processed `proxy_headers`, the prebuffered request body (if any plugin phase collected it), plus `&mut ctx`, the pre-resolved plugin list, and the sticky-cookie flag so the bridge can run the response-side hook pipeline.
-2. **`on_final_request_body`** — when the caller prebuffered the body, the bridge runs `apply_request_body_plugins` (transforms) then `run_final_request_body_hooks` (validators). A reject here short-circuits without ever calling the backend — Plain emits a JSON error, Grpc emits a trailers-only gRPC error.
+2. **`on_final_request_body`** — when the caller prebuffered the body, the bridge runs `apply_request_body_plugins` (transforms) then `run_final_request_body_hooks` (validators). A reject here short-circuits without ever calling the backend — Plain emits a JSON error, native Grpc emits a trailers-only gRPC error, and translated gRPC-Web emits its client-facing trailer frame.
 3. **Request dispatch** — Plain flavor opens a reqwest request with a streaming body (see [buffering policy](#buffering-policy)) and honors `backend_read_timeout_ms`; Grpc flavor calls `proxy_grpc_request_from_bytes()` with a buffered `Bytes` and streams the response when no retry / body-buffering plugin forces buffering.
 4. **`after_proxy` + sticky cookie** — once response headers arrive, the bridge runs `run_after_proxy_hooks` so response-transformer, CORS-response, compression-advertise, etc. see the cross-protocol path. A reject aborts the backend response and writes the plugin's body instead. Then `inject_sticky_cookie` adds the LB sticky-session cookie when the selection requested it.
 5. **Response normalization + body hooks** — buffered native-H3 and cross-protocol responses first run provider/protocol normalization, then `on_response_body`, ordinary response transforms, and `on_final_response_body`. This is the same order as H1/H2, so policy plugins inspect the client-visible representation (for example OpenAI-shaped SSE rather than provider-native Anthropic events). Streaming responses use the staged `ResponseStreamInspector` chain; protocol normalizers run before policy inspectors.
 6. **Response write** — response headers are mapped onto `http::Response<()>` and sent via `stream.send_response()`. The body is streamed into `stream.send_data()` with the same coalescing window the native H3 writer uses (see [Coalescing](#coalescing-and-frame-cadence)).
-7. **gRPC trailers** — forwarded via `stream.send_trailers()` so `grpc-status` / `grpc-message` survive the cross-protocol hop. See [gRPC trailers](#grpc-trailers-over-h3). Backend failures map to DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED / UNAVAILABLE / INTERNAL based on `GrpcProxyError` variant — not collapsed to UNAVAILABLE.
+7. **gRPC trailers** — forwarded via `stream.send_trailers()` for native gRPC, or embedded by the `grpc_web` plugin in the client-facing response-body trailer frame, so `grpc-status` / `grpc-message` survive the cross-protocol hop. See [gRPC trailers](#grpc-trailers-over-h3). Backend failures map to DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED / UNAVAILABLE / INTERNAL based on `GrpcProxyError` variant — not collapsed to UNAVAILABLE.
 8. **Outcome** — `record_backend_outcome()` updates the circuit breaker, passive health, and least-latency LB signals exactly as the H1/H2 path does.
 9. **Transaction summary** — the H3 listener builds the same `TransactionSummary` shape that the native H3 path emits and calls `log_with_mirror()`, so log plugins (http_logging, statsd, prometheus, …) see a consistent record regardless of dispatch kind.
 

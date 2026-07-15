@@ -376,7 +376,26 @@ where
             let mut outcome = if matches!(flavor, HttpFlavor::Grpc) {
                 let normalized = normalize_h3_grpc_reject(http_status, &rejection.body, &headers);
                 apply_h3_grpc_reject_metadata(ctx, &normalized);
-                write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await?
+                if let Some(translated) = normalized.grpc_status.and_then(|grpc_status| {
+                    crate::plugins::grpc_web::translated_error_response(
+                        ctx,
+                        grpc_status,
+                        normalized.grpc_message.as_deref().unwrap_or(""),
+                    )
+                }) {
+                    write_reject_with_headers(
+                        stream,
+                        StatusCode::OK,
+                        &translated.body,
+                        &translated.headers,
+                        backend_start,
+                        bytes_sent,
+                    )
+                    .await?
+                } else {
+                    write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent)
+                        .await?
+                }
             } else {
                 write_reject_with_headers(
                     stream,
@@ -3101,8 +3120,9 @@ where
     let hyper_method = match hyper::Method::from_bytes(method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
-            return write_grpc_error(
+            return write_grpc_error_for_request(
                 stream,
+                ctx,
                 grpc_proxy::grpc_status::UNIMPLEMENTED,
                 "Method Not Allowed",
                 backend_start,
@@ -3134,8 +3154,9 @@ where
             current_cb_target_key.as_deref(),
             cb_retry_probe_slot_available,
         );
-        return write_grpc_error(
+        return write_grpc_error_for_request(
             stream,
+            ctx,
             grpc_proxy::grpc_status::UNAVAILABLE,
             message,
             backend_start,
@@ -3169,8 +3190,9 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                return write_grpc_error(
+                return write_grpc_error_for_request(
                     stream,
+                    ctx,
                     grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Request body exceeds maximum size",
                     backend_start,
@@ -3190,8 +3212,9 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                return write_grpc_error(
+                return write_grpc_error_for_request(
                     stream,
+                    ctx,
                     grpc_proxy::grpc_status::INVALID_ARGUMENT,
                     "Request body read error",
                     backend_start,
@@ -3206,8 +3229,9 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                return write_grpc_error(
+                return write_grpc_error_for_request(
                     stream,
+                    ctx,
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Request body read timed out",
                     backend_start,
@@ -3420,8 +3444,9 @@ where
                     "cross-protocol H3→gRPC: retry rotated onto a mesh-transport-tagged target; \
                      refusing the direct dial and failing closed with gRPC UNAVAILABLE"
                 );
-                return write_grpc_error(
+                return write_grpc_error_for_request(
                     stream,
+                    ctx,
                     grpc_proxy::grpc_status::UNAVAILABLE,
                     message,
                     backend_start,
@@ -4011,8 +4036,9 @@ where
                 Some(error_class),
                 backend_admission_start.elapsed(),
             );
-            let mut outcome = write_grpc_error(
+            let mut outcome = write_grpc_error_for_request(
                 stream,
+                ctx,
                 grpc_status_code,
                 grpc_message,
                 backend_start,
@@ -4088,8 +4114,9 @@ pub(crate) async fn dispatch_grpc_streaming(
             current_cb_target_key.as_deref(),
             cb_is_half_open_probe,
         );
-        return write_grpc_error(
+        return write_grpc_error_for_request(
             &mut stream,
+            ctx,
             grpc_proxy::grpc_status::UNAVAILABLE,
             message,
             backend_start,
@@ -4101,8 +4128,9 @@ pub(crate) async fn dispatch_grpc_streaming(
     let hyper_method = match hyper::Method::from_bytes(method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
-            return write_grpc_error(
+            return write_grpc_error_for_request(
                 &mut stream,
+                ctx,
                 grpc_proxy::grpc_status::UNIMPLEMENTED,
                 "Method Not Allowed",
                 backend_start,
@@ -5246,8 +5274,9 @@ where
     let Some(mut parts) = crate::proxy::plugin_result_into_reject_parts(reject) else {
         warn!("final body reject helper received a non-reject plugin result");
         return if matches!(flavor, HttpFlavor::Grpc) {
-            write_grpc_error(
+            write_grpc_error_for_request(
                 stream,
+                ctx,
                 grpc_proxy::h3_http_reject_status_to_grpc_status(StatusCode::BAD_GATEWAY),
                 "Plugin rejection normalization failed",
                 backend_start,
@@ -5284,20 +5313,49 @@ where
     if matches!(flavor, HttpFlavor::Grpc) {
         apply_h3_grpc_reject_metadata(ctx, &normalized);
     }
+    let grpc_web_reject = if matches!(flavor, HttpFlavor::Grpc) {
+        normalized.grpc_status.and_then(|grpc_status| {
+            crate::plugins::grpc_web::translated_error_response(
+                ctx,
+                grpc_status,
+                normalized.grpc_message.as_deref().unwrap_or(""),
+            )
+        })
+    } else {
+        None
+    };
     if has_response_committed_hook {
         for plugin in plugins {
-            plugin
-                .on_response_committed(
-                    ctx,
-                    normalized.http_status.as_u16(),
-                    &normalized.headers,
-                    &normalized.body,
-                )
-                .await;
+            if let Some(translated) = grpc_web_reject.as_ref() {
+                plugin
+                    .on_response_committed(ctx, 200, &translated.headers, &translated.body)
+                    .await;
+            } else {
+                plugin
+                    .on_response_committed(
+                        ctx,
+                        normalized.http_status.as_u16(),
+                        &normalized.headers,
+                        &normalized.body,
+                    )
+                    .await;
+            }
         }
     }
     if matches!(flavor, HttpFlavor::Grpc) {
-        write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
+        if let Some(translated) = grpc_web_reject {
+            write_reject_with_headers(
+                stream,
+                StatusCode::OK,
+                &translated.body,
+                &translated.headers,
+                backend_start,
+                bytes_sent,
+            )
+            .await
+        } else {
+            write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
+        }
     } else {
         write_reject_with_headers(
             stream,
@@ -5512,6 +5570,46 @@ where
     // its spawned pump owns and halts the recv half.
     crate::http3::stream_util::halt_request_body(stream);
     Ok(outcome)
+}
+
+/// Write a pre-response gRPC failure using the original client representation.
+/// A translated gRPC-Web request keeps native gRPC framing toward the backend,
+/// but browser clients require the terminal status in a gRPC-Web trailer frame
+/// carried by the response body. Native gRPC keeps the trailers-only shape.
+async fn write_grpc_error_for_request<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    grpc_status: u32,
+    grpc_message: &str,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    if let Some(translated) =
+        crate::plugins::grpc_web::translated_error_response(ctx, grpc_status, grpc_message)
+    {
+        crate::proxy::insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, grpc_message);
+        return write_reject_with_headers(
+            stream,
+            StatusCode::OK,
+            &translated.body,
+            &translated.headers,
+            backend_start,
+            bytes_sent,
+        )
+        .await;
+    }
+
+    write_grpc_error(
+        stream,
+        grpc_status,
+        grpc_message,
+        backend_start,
+        bytes_sent,
+    )
+    .await
 }
 
 /// Send-only core of [`write_grpc_error`]: writes the trailers-only gRPC error
