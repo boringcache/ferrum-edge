@@ -13,6 +13,7 @@ pub fn extract_claim_values(claims: &Value, claim_path: &str) -> Vec<String> {
 pub fn extract_claim_string(claims: &Value, claim_path: &str) -> Option<String> {
     resolve_claim_path(claims, claim_path)?
         .as_str()
+        .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
 }
 

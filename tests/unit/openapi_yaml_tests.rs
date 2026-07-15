@@ -629,10 +629,27 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"disallowed_consumers": ["bad"], "allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
+        json!({"allowed_consumers": ["  alice  "]}),
+        // U+FEFF ZWNBSP is not in Rust's Unicode White_Space set.
+        json!({"allowed_consumers": ["\u{feff}"]}),
+        json!({"disallowed_consumers": ["\u{feff}"]}),
+        json!({"allowed_groups": ["\u{feff}"]}),
+        json!({"disallowed_groups": ["\u{feff}"]}),
+        json!({"allowed_consumers": ["é".repeat(255)]}),
+        json!({"allowed_groups": ["é".repeat(255)]}),
+        json!({"disallowed_groups": ["é".repeat(255)]}),
+        json!({
+            "disallowed_consumers": ["é".repeat(4096)],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
             "config should be valid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
         );
     }
 
@@ -642,10 +659,32 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"allowed_consumers": [], "allowed_groups": []}),
         json!({"allowed_consumers": ["alice"], "allow_authenticated_identity": true}),
         json!({"allowed_groups": ["engineering"], "allow_authenticated_identity": true}),
+        json!({"allowed_consumers": [""]}),
+        json!({"disallowed_consumers": [""]}),
+        json!({"allowed_groups": [""]}),
+        json!({"disallowed_groups": [""]}),
+        json!({"allowed_consumers": ["   "]}),
+        json!({"disallowed_consumers": ["\t"]}),
+        json!({"allowed_groups": ["\n"]}),
+        json!({"disallowed_groups": ["   "]}),
+        // U+0085 NEL is in Rust's Unicode White_Space set.
+        json!({"allowed_consumers": ["\u{0085}"]}),
+        json!({"disallowed_consumers": ["\u{0085}"]}),
+        json!({"allowed_groups": ["\u{0085}"]}),
+        json!({"disallowed_groups": ["\u{0085}"]}),
+        json!({"allowed_consumers": ["a".repeat(256)]}),
+        json!({
+            "disallowed_consumers": ["a".repeat(4097)],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_err(),
             "config should be invalid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
         );
     }
 }

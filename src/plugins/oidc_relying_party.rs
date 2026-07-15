@@ -1139,23 +1139,8 @@ impl OidcRelyingParty {
             return self.challenge(ctx, true);
         }
 
-        let mut mutated = refresh.mutated || refresh.refreshed || backfilled_claims_expiry;
-        mutated |= self.maybe_slide_session(&mut payload, now);
-        if mutated {
-            match self.seal_session_cookie(&payload) {
-                Ok(cookie) => {
-                    ctx.metadata
-                        .insert(SESSION_SET_COOKIE_METADATA_KEY.to_string(), cookie);
-                }
-                Err(error) => {
-                    warn!(
-                        plugin = "oidc_relying_party",
-                        error = %error,
-                        "failed to re-seal rolling session cookie; serving with the existing session"
-                    );
-                }
-            }
-        }
+        let mut session_mutated = refresh.mutated || refresh.refreshed || backfilled_claims_expiry;
+        session_mutated |= self.maybe_slide_session(&mut payload, now);
 
         // Authorize against the effective (possibly refreshed) claims.
         if let Err((status, body)) = scope_role_check::check(
@@ -1168,11 +1153,77 @@ impl OidcRelyingParty {
                 plugin_name: "oidc_relying_party",
             },
         ) {
-            return reject(status, body);
+            return self.reject_with_session_update(ctx, status, body, &payload, session_mutated);
         }
-        emit_claim_headers_to_metadata(ctx, &payload.claims, &self.provider.claim_headers, ",");
+        // Transactional commit: resolve the principal before staging claim
+        // headers. A live session whose identity claim is blank/missing must
+        // not leave claim-header metadata behind — in `auth_mode: multi` a
+        // later credential can authenticate this request and the staged
+        // headers would be applied under that credential's authority.
         let outcome = self.resolve_identity(&payload.claims, consumer_index);
+        if outcome.establishes_principal() {
+            // The rolling/rotated session cookie is identity-derived state too.
+            // Publish it only after this attempt's policy checks and principal
+            // resolution succeed; otherwise a later multi-auth credential could
+            // cause a rejected or blank-principal OIDC attempt's cookie to be
+            // emitted by `after_proxy`.
+            if session_mutated {
+                match self.seal_session_cookie(&payload) {
+                    Ok(cookie) => {
+                        ctx.metadata
+                            .insert(SESSION_SET_COOKIE_METADATA_KEY.to_string(), cookie);
+                    }
+                    Err(error) => {
+                        warn!(
+                            plugin = "oidc_relying_party",
+                            error = %error,
+                            "failed to re-seal rolling session cookie; serving with the existing session"
+                        );
+                    }
+                }
+            }
+            emit_claim_headers_to_metadata(ctx, &payload.claims, &self.provider.claim_headers, ",");
+        }
         apply_verify_outcome(ctx, outcome)
+    }
+
+    fn reject_with_session_update(
+        &self,
+        ctx: &mut RequestContext,
+        status_code: u16,
+        body: String,
+        payload: &SessionPayload,
+        session_mutated: bool,
+    ) -> PluginResult {
+        let mut headers = HashMap::new();
+        if session_mutated {
+            match self.seal_session_cookie(payload) {
+                Ok(cookie) => {
+                    // The local rejection owns this response cookie, while the
+                    // one-shot candidate lets multi-auth move the same sealed
+                    // state onto a later final rejection. The phase discards
+                    // the candidate if a later credential succeeds, so keep it
+                    // separate from successful-principal attempt staging.
+                    // Later rejected session attempts replace candidates with
+                    // the same exact cookie name, while independently named
+                    // session updates survive for the final rejection.
+                    crate::proxy::stage_auth_rejection_set_cookie(ctx, cookie.clone());
+                    headers.insert("set-cookie".to_string(), cookie);
+                }
+                Err(error) => {
+                    warn!(
+                        plugin = "oidc_relying_party",
+                        error = %error,
+                        "failed to re-seal rolling session cookie on authorization rejection; rejecting with the existing session"
+                    );
+                }
+            }
+        }
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        }
     }
 
     /// Advance the sliding idle window. To keep the response `Set-Cookie` (and the
@@ -1442,6 +1493,79 @@ impl OidcRelyingParty {
         ))
     }
 
+    // Reached only through the lib target's `_test_support` shim by external
+    // unit tests; the bin target recompiles this module without that caller.
+    #[allow(dead_code)]
+    pub(crate) fn sealed_session_cookie_for_tests(
+        &self,
+        claims: Value,
+        require_rolling_update: bool,
+    ) -> Result<String, String> {
+        let payload =
+            self.session_payload_for_tests(claims, require_rolling_update, None, false)?;
+        self.seal_session_cookie(&payload)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sealed_due_refresh_session_cookie_for_tests(
+        &self,
+        claims: Value,
+        refresh_token: &str,
+    ) -> Result<String, String> {
+        let payload = self.session_payload_for_tests(claims, false, Some(refresh_token), true)?;
+        self.seal_session_cookie(&payload)
+    }
+
+    fn session_payload_for_tests(
+        &self,
+        claims: Value,
+        require_rolling_update: bool,
+        refresh_token: Option<&str>,
+        refresh_due: bool,
+    ) -> Result<SessionPayload, String> {
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = claim_expiry(&claims).unwrap_or(now + 3600);
+        let sub = required_subject(&claims, "ID token")?.to_string();
+        let touch_age = if require_rolling_update {
+            (self.session.idle_ttl.as_secs() as i64 / 2).max(1)
+        } else {
+            0
+        };
+        Ok(SessionPayload {
+            version: SESSION_PAYLOAD_VERSION,
+            context_id: self.session.context_id.clone(),
+            sub,
+            id_token_b64: "test-id-token".to_string(),
+            access_token_b64: "test-access-token".to_string(),
+            refresh_token_b64: refresh_token.map(str::to_string),
+            expires_at_unix: expires_at,
+            claims_expires_at_unix: expires_at,
+            refresh_after_unix: if refresh_due { now - 1 } else { expires_at },
+            issued_at_unix: now - touch_age,
+            last_touch_unix: now - touch_age,
+            nonce: "test-nonce".to_string(),
+            claims,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn session_state_from_set_cookie_for_tests(
+        &self,
+        set_cookie: &str,
+    ) -> Option<(String, Option<String>, i64)> {
+        let prefix = format!("{}=", self.session.cookie_name);
+        let cookie = set_cookie
+            .split('\n')
+            .find(|cookie| cookie.trim_start().starts_with(&prefix))?;
+        let value = cookie.split(';').next()?.split_once('=')?.1;
+        let payload = self.open_session(value)?;
+        Some((
+            payload.access_token_b64,
+            payload.refresh_token_b64,
+            payload.refresh_after_unix,
+        ))
+    }
+
     fn open_session(&self, value: &str) -> Option<SessionPayload> {
         let bytes = self.session.codec.open(value)?;
         let payload: SessionPayload = serde_json::from_slice(&bytes).ok()?;
@@ -1626,9 +1750,11 @@ impl super::Plugin for OidcRelyingParty {
         PluginResult::Continue
     }
     fn applies_after_proxy_on_reject(&self) -> bool {
-        // A token refresh may have rotated the upstream refresh token before a
-        // later plugin rejected the request; the client must still receive the
-        // re-sealed cookie so it does not keep replaying a now-invalid token.
+        // A successful OIDC attempt may have rotated the upstream refresh token
+        // before a later plugin rejected the request; the client must still
+        // receive the staged cookie so it does not keep replaying a now-invalid
+        // token. OIDC's own scope/role rejection carries the same update in its
+        // attempt-scoped rejection headers instead.
         true
     }
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -1968,8 +2094,18 @@ fn apply_verify_outcome(ctx: &mut RequestContext, outcome: VerifyOutcome) -> Plu
             external_identity,
             external_identity_header,
         } => {
+            let external_identity =
+                external_identity.filter(|identity| !identity.trim().is_empty());
+            let external_identity_header = external_identity_header
+                .filter(|identity_header| !identity_header.trim().is_empty());
             let consumer_identified = consumer.is_some();
             let external_identity_identified = external_identity.is_some();
+            // No principal resolved: commit nothing, including a nonblank
+            // header claim, so no identity residue survives into a request a
+            // later credential authenticates.
+            if !consumer_identified && !external_identity_identified {
+                return PluginResult::Continue;
+            }
             if let Some(consumer) = consumer
                 && ctx.identified_consumer.is_none()
             {
@@ -1981,7 +2117,7 @@ fn apply_verify_outcome(ctx: &mut RequestContext, outcome: VerifyOutcome) -> Plu
             if let Some(header) = external_identity_header {
                 ctx.authenticated_identity_header = Some(header);
             }
-            if ctx.auth_method.is_none() && (consumer_identified || external_identity_identified) {
+            if ctx.auth_method.is_none() {
                 ctx.auth_method = Some("oidc_relying_party");
             }
             PluginResult::Continue
@@ -3114,6 +3250,33 @@ mod tests {
     fn build_plugin_without_workers(config: &Value) -> OidcRelyingParty {
         OidcRelyingParty::new_internal(config, PluginHttpClient::default(), false)
             .expect("OIDC test config is valid")
+    }
+
+    #[test]
+    fn oidc_identity_resolution_rejects_blank_principals() {
+        let config =
+            plugin_config_without_optional_defaults("https://app.example.com/oauth/callback");
+        let plugin = build_plugin_without_workers(&config);
+
+        for claims in [
+            json!({}),
+            json!({"sub": null}),
+            json!({"sub": 42}),
+            json!({"sub": ""}),
+            json!({"sub": "   \t"}),
+        ] {
+            let VerifyOutcome::Success {
+                consumer,
+                external_identity,
+                external_identity_header,
+            } = plugin.resolve_identity(&claims, &ConsumerIndex::new(&[]))
+            else {
+                panic!("identity resolution should remain non-rejecting");
+            };
+            assert!(consumer.is_none());
+            assert!(external_identity.is_none());
+            assert!(external_identity_header.is_none());
+        }
     }
 
     #[test]

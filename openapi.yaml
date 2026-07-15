@@ -13332,7 +13332,10 @@ components:
         keys are rejected. `allow_authenticated_identity=true` cannot be combined
         with an allow-list (`allowed_consumers`/`allowed_groups`) because the
         allow-list is not applied to unmapped external identities. Use
-        ip_restriction for IP/CIDR rules.
+        ip_restriction for IP/CIDR rules. Rule entries match principal values
+        byte-for-byte (no trimming) and must contain at least one
+        non-whitespace character. Whitespace admission follows Rust
+        `str::trim` Unicode `White_Space` semantics.
       allOf:
         - anyOf:
             - required: [allowed_consumers]
@@ -13375,6 +13378,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             Consumer usernames that are explicitly allowed. Empty list disables
@@ -13383,14 +13389,24 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 4096
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
-            Consumer usernames that are explicitly denied. Takes precedence
-            over every allow rule.
+            Consumer usernames or, when allow_authenticated_identity is true,
+            exact external principals that are explicitly denied. Takes
+            precedence over every allow rule. The 4096-character bound is
+            independent of the 255-character gateway Consumer username ceiling
+            so JWT, OIDC, and SPIFFE-style principals can be revoked; longer
+            external identities fail closed at runtime.
         allowed_groups:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             ACL group names that are explicitly allowed. The check matches if
@@ -13399,6 +13415,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             ACL group names that are explicitly denied. If any of the consumer's
@@ -13410,7 +13429,8 @@ components:
           description: >-
             Allow requests whose `ctx.authenticated_identity` is set by an
             external auth plugin (e.g. jwks_auth) even when no gateway Consumer
-            was mapped. Cannot be combined with an allow-list
+            was mapped. Empty or whitespace-only identities are unauthenticated.
+            Cannot be combined with an allow-list
             (`allowed_consumers`/`allowed_groups`); the deny-list
             `disallowed_consumers` is still applied to the external identity.
 

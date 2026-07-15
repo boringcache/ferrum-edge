@@ -759,6 +759,13 @@ pub struct RequestContext {
     pub mesh_inbound_listener_authz_port: Option<u16>,
 }
 
+/// Return an identity only when it contains a meaningful non-whitespace value.
+/// Security identities are preserved byte-for-byte; this helper rejects blank
+/// principals rather than silently canonicalizing signed claim content.
+pub(crate) fn meaningful_identity(identity: Option<&str>) -> Option<&str> {
+    identity.filter(|identity| !identity.trim().is_empty())
+}
+
 fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
     metadata
         .entry(key.to_string())
@@ -1447,7 +1454,7 @@ impl RequestContext {
         self.identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
-            .or(self.authenticated_identity.as_deref())
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
     }
 
     /// Return the identity value to forward to the backend in
@@ -1468,8 +1475,8 @@ impl RequestContext {
             .identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
-            .or(self.authenticated_identity_header.as_deref())
-            .or(self.authenticated_identity.as_deref())?;
+            .or_else(|| meaningful_identity(self.authenticated_identity_header.as_deref()))
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))?;
         if self.suppresses_backend_consumer_identity_headers() {
             return None;
         }
@@ -2454,7 +2461,7 @@ impl StreamConnectionContext {
         self.identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
-            .or(self.authenticated_identity.as_deref())
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
     }
 
     /// Insert a metadata value, lazily allocating the map on first write.

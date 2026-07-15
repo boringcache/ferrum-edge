@@ -1895,13 +1895,15 @@ UDP+DTLS streams via certificate-based consumer mapping.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. |
-| `disallowed_consumers` | String[] | `[]` | Consumer usernames explicitly denied. Takes precedence over every allow rule. |
-| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. |
-| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. |
-| `allow_authenticated_identity` | bool | `false` | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
+| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. |
+| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy. All checks use `HashSet<String>` for O(1) membership.
+Whitespace-only rule admission follows Rust `str::trim` Unicode `White_Space`
+semantics; accepted rule values are still stored and matched byte-for-byte.
 
 `allow_authenticated_identity: true` cannot be combined with an allow-list
 (`allowed_consumers` or `allowed_groups`): the allow-list matches mapped Consumer
@@ -1910,7 +1912,13 @@ so the combination would silently bypass the allow-list for every
 externally-authenticated-but-unmapped caller. The combination is rejected at
 config validation. The `disallowed_consumers` deny-list is still applied to the
 external identity string, so it may be combined with `allow_authenticated_identity`
-to revoke a compromised principal.
+to revoke a compromised principal. External identities longer than the 4096-character
+exact-rule bound fail closed instead of bypassing the deny-list.
+
+An authenticated external identity that is not enabled by this policy is an
+authorization denial: HTTP requests receive 403 and native gRPC requests receive
+trailers-only `PERMISSION_DENIED` (status 7). Requests with no meaningful mapped
+or external identity receive HTTP 401 / gRPC `UNAUTHENTICATED` (status 16).
 
 **Evaluation order:** deny (consumer username → group) → allow (consumer username → group).
 If both `allowed_consumers` and `allowed_groups` are set, matching _either_ grants access.

@@ -163,6 +163,15 @@ pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_respo
 pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
     "ferrum:replaceable_rejection_response";
 
+/// One-shot handoff for requester-owned auth session state that changed before
+/// authentication attempts rejected. Distinct cookie names are newline-joined;
+/// a later attempt replaces an earlier candidate with the same exact name. The
+/// authentication phase removes this key on every exit: it attaches the cookies
+/// only to the final rejection and discards them when a later credential
+/// succeeds. The key contains "cookie" so metadata serialization still redacts
+/// the sealed values defensively.
+pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_set_cookie";
+
 /// Marker recorded in `ctx.metadata` for the duration of
 /// [`apply_synthetic_response_body_hooks`] — i.e. while the response-body hook
 /// pipeline (`on_response_body`, `transform_response_body_with_context`,
@@ -13856,6 +13865,126 @@ fn missing_authentication_reject(
     (401, MISSING_AUTHENTICATION_BODY.to_vec(), headers)
 }
 
+/// Return the RFC 6265 cookie-name from the leading cookie-pair only.
+/// Attributes, padded names, and lines without a valid token are not names.
+fn set_cookie_name(set_cookie: &str) -> Option<&str> {
+    let cookie_pair = set_cookie
+        .split_once(';')
+        .map_or(set_cookie, |(pair, _)| pair);
+    let (name, _) = cookie_pair.split_once('=')?;
+    if name.is_empty()
+        || !name.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'a'..=b'z'
+                    | b'|'
+                    | b'~'
+            )
+        })
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
+/// earlier line when a later line owns the same exact, case-sensitive cookie
+/// name. Invalid cookie-pairs can only replace byte-identical lines.
+fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
+    for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
+        let candidate_name = set_cookie_name(candidate);
+        if let Some(index) = cookies.iter().position(|existing| {
+            existing == candidate
+                || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+        }) {
+            cookies.remove(index);
+        }
+        cookies.push(candidate.to_string());
+    }
+}
+
+fn set_cookie_conflicts(cookies: &[String], candidate: &str) -> bool {
+    let candidate_name = set_cookie_name(candidate);
+    cookies.iter().any(|existing| {
+        existing == candidate
+            || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+    })
+}
+
+/// Stage requester-owned cookies from rejecting auth attempts. This remains on
+/// the rejection path: successful authentication only removes the metadata.
+pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
+    let mut staged = Vec::new();
+    if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
+        collect_later_set_cookies(&mut staged, existing);
+    }
+    collect_later_set_cookies(&mut staged, &cookie);
+
+    if staged.is_empty() {
+        ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
+    } else {
+        ctx.metadata.insert(
+            AUTH_REJECTION_SET_COOKIE_METADATA_KEY.to_string(),
+            staged.join("\n"),
+        );
+    }
+}
+
+fn attach_auth_rejection_set_cookie(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    let Some(staged) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
+        return;
+    };
+
+    // A custom plugin can return multiple case variants because rejection
+    // headers use a String-keyed HashMap. Sort the variants by their exact key
+    // before merging so randomized HashMap iteration cannot select ownership.
+    // The canonical lowercase key sorts after uppercase variants and therefore
+    // wins same-name conflicts deterministically.
+    let mut selected_variants = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    selected_variants.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("set-cookie"));
+
+    let mut merged = Vec::new();
+    for (_, value) in selected_variants {
+        collect_later_set_cookies(&mut merged, &value);
+    }
+
+    let mut staged_cookies = Vec::new();
+    collect_later_set_cookies(&mut staged_cookies, &staged);
+    for candidate in staged_cookies {
+        // The selected final rejection owns conflicts. Preserve each selected
+        // line's full attributes and deterministic order, appending only
+        // independently named requester-owned cookies from earlier rejects.
+        if !set_cookie_conflicts(&merged, &candidate) {
+            merged.push(candidate);
+        }
+    }
+    if !merged.is_empty() {
+        headers.insert("set-cookie".to_string(), merged.join("\n"));
+    }
+}
+
 pub async fn run_authentication_phase(
     auth_mode: AuthMode,
     auth_plugins: &[Arc<dyn Plugin>],
@@ -13909,13 +14038,14 @@ pub async fn run_authentication_phase(
                 || auth_plugins.is_empty()
                 || (last_reject.is_none() && mesh_permissive_only_auth_plugin)
             {
+                ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
                 None
             } else {
-                Some(
-                    server_reject
-                        .or(last_reject)
-                        .unwrap_or_else(|| missing_authentication_reject(auth_plugins)),
-                )
+                let mut reject = server_reject
+                    .or(last_reject)
+                    .unwrap_or_else(|| missing_authentication_reject(auth_plugins));
+                attach_auth_rejection_set_cookie(ctx, &mut reject.2);
+                Some(reject)
             }
         }
         AuthMode::Single => {
@@ -13927,7 +14057,9 @@ pub async fn run_authentication_phase(
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
-                            return Some((reject.status_code, reject.body, reject.headers));
+                            let mut reject = (reject.status_code, reject.body, reject.headers);
+                            attach_auth_rejection_set_cookie(ctx, &mut reject.2);
+                            return Some(reject);
                         }
                     }
                     PluginResult::Continue => {
@@ -13942,6 +14074,7 @@ pub async fn run_authentication_phase(
                     .metadata
                     .get("mesh_request_auth.permissive_missing_token")
                     .is_some_and(|v| v == "true");
+            ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
                 || mesh_permissive_only_auth_plugin
