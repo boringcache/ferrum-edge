@@ -336,6 +336,11 @@ fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
         .expect("AuditEvent diff description");
     assert!(audit_diff_description.contains("stable `[REDACTED]` marker"));
     assert!(audit_diff_description.contains("never values, entry fields, shape, or count"));
+
+    assert_eq!(
+        spec["paths"]["/batch"]["post"]["responses"]["500"]["$ref"],
+        "#/components/responses/InternalServerError"
+    );
 }
 
 fn normalized_path_template(path: &str) -> String {

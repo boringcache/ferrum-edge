@@ -5788,14 +5788,11 @@ pub fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
     redacted
 }
 
-pub(crate) fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
+pub(crate) fn hash_consumer_secrets(
+    consumer: &mut Consumer,
+) -> Result<(), BasicAuthCredentialPreparationError> {
     if let Some(credentials) = consumer.credentials.get_mut("basicauth") {
-        hash_credential_passwords(credentials).map_err(|error| {
-            format!(
-                "Failed to prepare Basic-auth credentials for consumer {}: {}",
-                consumer.id, error
-            )
-        })?;
+        hash_credential_passwords(credentials)?;
     }
 
     Ok(())

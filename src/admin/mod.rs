@@ -2712,12 +2712,19 @@ fn prepare_batch_items<R: crud::AdminResource>(
     now: chrono::DateTime<Utc>,
     validation_ctx: &crud::ValidationCtx<'_>,
     validation_errors: &mut Vec<String>,
-) {
+) -> Result<(), String> {
     for item in items {
-        if let Err(errors) = crud::prepare_batch_resource(item, namespace, now, validation_ctx) {
-            extend_prefixed_errors(validation_errors, kind, item.id(), errors);
+        match crud::prepare_batch_resource(item, namespace, now, validation_ctx) {
+            Ok(()) => {}
+            Err(crud::BatchPreparationError::Validation(errors)) => {
+                extend_prefixed_errors(validation_errors, kind, item.id(), errors);
+            }
+            Err(crud::BatchPreparationError::Internal(error)) => {
+                return Err(format!("{} '{}': {}", kind, item.id(), error));
+            }
         }
     }
+    Ok(())
 }
 
 async fn load_consumer_in_namespace(
@@ -4082,38 +4089,58 @@ async fn handle_batch_create(
     let known_plugins = crate::plugins::available_plugins();
     let mut validation_errors: Vec<String> = Vec::new();
 
-    prepare_batch_items(
+    if let Err(error) = prepare_batch_items(
         &mut batch.consumers,
         "Consumer",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
-    prepare_batch_items(
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
+    if let Err(error) = prepare_batch_items(
         &mut batch.upstreams,
         "Upstream",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
-    prepare_batch_items(
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
+    if let Err(error) = prepare_batch_items(
         &mut batch.proxies,
         "Proxy",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
-    prepare_batch_items(
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
+    if let Err(error) = prepare_batch_items(
         &mut batch.plugin_configs,
         "PluginConfig",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
 
     for plugin_config in &batch.plugin_configs {
         if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
@@ -5229,7 +5256,9 @@ fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
     crate::config::types::redact_consumer_credentials_for_audit(consumer)
 }
 
-fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
+fn hash_consumer_secrets(
+    consumer: &mut Consumer,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     crate::config::types::hash_consumer_secrets(consumer)
 }
 

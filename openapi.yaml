@@ -3097,6 +3097,9 @@ paths:
 
         All fields within each resource follow the same schema as the
         individual create endpoints. IDs are auto-generated if omitted.
+        Plaintext Basic-auth passwords require a configured
+        `FERRUM_BASIC_AUTH_HMAC_SECRET` of at least 32 bytes; missing or weak
+        operator configuration fails the batch with 500 before persistence.
       tags: [Batch]
       requestBody:
         required: true
@@ -3131,6 +3134,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
