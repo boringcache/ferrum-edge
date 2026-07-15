@@ -265,6 +265,61 @@ async fn send_raw_h1_hmac_request(
         .expect("raw H1 HMAC response status")
 }
 
+async fn send_declared_oversized_invalid_h1_hmac_request(
+    proxy_port: u16,
+    date: &str,
+    username: &str,
+    signing_secret: &str,
+) -> (u16, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let authority = format!("127.0.0.1:{proxy_port}");
+    let digest = empty_digest_header();
+    let signature = generate_hmac_signature(
+        "POST",
+        "/hmacauth",
+        date,
+        username,
+        &authority,
+        signing_secret,
+    );
+    let authorization =
+        format!(r#"hmac username="{username}", algorithm="hmac-sha256", signature="{signature}""#);
+    let request = format!(
+        "POST /hmacauth HTTP/1.1\r\nHost: {authority}\r\nAuthorization: {authorization}\r\nDate: {date}\r\nDigest: {digest}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        10 * 1024 * 1024 + 1
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect declared-oversized HMAC request");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write declared-oversized HMAC headers");
+
+    // An invalid credential must be rejected from headers alone. Sending the
+    // advertised body would race the early response and can surface a client-
+    // side BrokenPipe even when the gateway behaves correctly.
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("timed out waiting for early HMAC rejection")
+        .expect("read early HMAC rejection");
+
+    let header_end = response
+        .windows(b"\r\n\r\n".len())
+        .position(|window| window == b"\r\n\r\n")
+        .expect("raw H1 HMAC response headers");
+    let status = String::from_utf8_lossy(&response[..header_end])
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("raw H1 HMAC response status");
+    (status, response[header_end + 4..].to_vec())
+}
+
 async fn send_h2_hmac_request(
     proxy_port: u16,
     method: &str,
@@ -1619,61 +1674,22 @@ async fn test_auth_acl_comprehensive() {
     // body reaches the HMAC plug-in's 10 MiB collection limit. Exact response
     // parity prevents the former 413-vs-401 username-enumeration oracle.
     println!("\n--- HMAC Auth — Oversized Invalid Credential Parity ---");
-    let oversized_body = bytes::Bytes::from(vec![b'x'; 10 * 1024 * 1024 + 1]);
-    let date = Utc::now().to_rfc2822();
-    let known_wrong_signature = generate_hmac_signature(
-        "POST",
-        "/hmacauth",
-        &date,
-        "alice",
-        &hmac_authority,
-        "wrong-secret-that-cannot-authenticate-alice",
-    );
-    let known_wrong_header = format!(
-        "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-        known_wrong_signature
-    );
-    let known_wrong_response = client
-        .post(format!("{}/hmacauth", proxy_url))
-        .header("Authorization", known_wrong_header)
-        .header("Date", &date)
-        .header("Digest", empty_digest_header())
-        .body(oversized_body.clone())
-        .send()
-        .await
-        .expect("Known-consumer oversized request failed");
-    let known_wrong_status = known_wrong_response.status();
-    let known_wrong_body = known_wrong_response
-        .bytes()
-        .await
-        .expect("Failed to read known-consumer rejection");
-
-    let unknown_signature = generate_hmac_signature(
-        "POST",
-        "/hmacauth",
-        &date,
+    let oversized_date = Utc::now().to_rfc2822();
+    let (known_wrong_status, known_wrong_body) =
+        send_declared_oversized_invalid_h1_hmac_request(
+            harness._gw.proxy_port,
+            &oversized_date,
+            "alice",
+            "wrong-secret-that-cannot-authenticate-alice",
+        )
+        .await;
+    let (unknown_status, unknown_body) = send_declared_oversized_invalid_h1_hmac_request(
+        harness._gw.proxy_port,
+        &oversized_date,
         "nonexistent",
-        &hmac_authority,
         "wrong-secret-that-cannot-authenticate-anyone",
-    );
-    let unknown_header = format!(
-        "hmac username=\"nonexistent\", algorithm=\"hmac-sha256\", signature=\"{}\"",
-        unknown_signature
-    );
-    let unknown_response = client
-        .post(format!("{}/hmacauth", proxy_url))
-        .header("Authorization", unknown_header)
-        .header("Date", &date)
-        .header("Digest", empty_digest_header())
-        .body(oversized_body)
-        .send()
-        .await
-        .expect("Unknown-consumer oversized request failed");
-    let unknown_status = unknown_response.status();
-    let unknown_body = unknown_response
-        .bytes()
-        .await
-        .expect("Failed to read unknown-consumer rejection");
+    )
+    .await;
 
     assert_eq!(known_wrong_status, 401);
     assert_eq!(unknown_status, known_wrong_status);
