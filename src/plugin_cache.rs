@@ -682,6 +682,8 @@ type RequestBufferingMap = HashMap<String, bool>;
 type WsFrameMap = HashMap<String, bool>;
 /// Map from proxy_group plugin_config_id to its shared plugin instance.
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
+type HmacCompositionPluginMap<'a> =
+    HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
 
 #[derive(Clone)]
 struct ProxyGroupPluginInstance {
@@ -715,8 +717,7 @@ pub(crate) fn validate_hmac_request_transform_candidate(
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     let mut global_plugins = Vec::new();
-    let mut scoped_plugins: HashMap<(&str, &str), (&PluginConfig, Arc<dyn Plugin>)> =
-        HashMap::new();
+    let mut scoped_plugins: HmacCompositionPluginMap<'_> = HashMap::new();
 
     for plugin_config in &config.plugin_configs {
         if !plugin_config.enabled

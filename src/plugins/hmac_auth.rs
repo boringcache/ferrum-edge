@@ -489,16 +489,7 @@ impl HmacAuth {
             return None;
         }
 
-        let signing_string = build_signing_string(
-            &credential.namespace,
-            &credential.username,
-            &credential.authority,
-            &credential.method,
-            &credential.path,
-            &credential.query,
-            &credential.date,
-            &credential.digest_header,
-        );
+        let signing_string = build_signing_string(credential);
         hmac_entries
             .iter()
             .any(|hmac_cred| {
@@ -859,45 +850,36 @@ fn parse_u64_field(value: Option<&Value>, field: &str, default_value: u64) -> Re
 /// attacker from replaying a captured signature against the same path with
 /// altered or added query parameters. Clients must sign the byte-for-byte raw
 /// query string the gateway receives.
-fn build_signing_string(
-    namespace: &str,
-    username: &str,
-    authority: &str,
-    method: &str,
-    path: &str,
-    query: &str,
-    date: &str,
-    digest_header: &str,
-) -> String {
+fn build_signing_string(credential: &auth_flow::HmacAuthCredential) -> String {
     let mut signing_string = String::with_capacity(
         HMAC_SIGNING_VERSION.len()
-            + namespace.len()
-            + username.len()
-            + authority.len()
-            + method.len()
-            + path.len()
-            + query.len()
-            + date.len()
-            + digest_header.len()
+            + credential.namespace.len()
+            + credential.username.len()
+            + credential.authority.len()
+            + credential.method.len()
+            + credential.path.len()
+            + credential.query.len()
+            + credential.date.len()
+            + credential.digest_header.len()
             + 8,
     );
     signing_string.push_str(HMAC_SIGNING_VERSION);
     signing_string.push('\n');
-    signing_string.push_str(namespace);
+    signing_string.push_str(&credential.namespace);
     signing_string.push('\n');
-    signing_string.push_str(username);
+    signing_string.push_str(&credential.username);
     signing_string.push('\n');
-    signing_string.push_str(authority);
+    signing_string.push_str(&credential.authority);
     signing_string.push('\n');
-    signing_string.push_str(method);
+    signing_string.push_str(&credential.method);
     signing_string.push('\n');
-    signing_string.push_str(path);
+    signing_string.push_str(&credential.path);
     signing_string.push('\n');
-    signing_string.push_str(query);
+    signing_string.push_str(&credential.query);
     signing_string.push('\n');
-    signing_string.push_str(date);
+    signing_string.push_str(&credential.date);
     signing_string.push('\n');
-    signing_string.push_str(digest_header);
+    signing_string.push_str(&credential.digest_header);
     signing_string
 }
 
