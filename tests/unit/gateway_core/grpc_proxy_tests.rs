@@ -847,6 +847,7 @@ async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata(
         ("x-policy", "backend-trailer-value"),
         ("x-application-trailer", "application-value"),
         ("x-removed-trailer", "remove-me"),
+        ("content-length", "999"),
     ]);
     let (mut plugin_view, shadowed) =
         grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
@@ -892,6 +893,7 @@ async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata(
         Some("application-value")
     );
     assert!(!plugin_view.contains_key("x-removed-trailer"));
+    assert!(!plugin_view.contains_key("content-length"));
     assert_eq!(
         plugin_view.get("grpc-status").map(String::as_str),
         Some("0")

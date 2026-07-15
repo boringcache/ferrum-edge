@@ -1648,6 +1648,8 @@ pub fn replay_buffered_grpc_initial_response_policies(
 /// trailers are collapsed, policy-produced values retain precedence; a second
 /// replay applies configured removals to application trailers. Reserved gRPC
 /// terminal metadata is always restored from the authoritative trailer value.
+/// A trailer-originated `content-length` is never promoted: framing remains
+/// owned by the final buffered representation.
 pub fn collapse_grpc_trailers_only_with_initial_response_policies(
     response_headers: &mut HashMap<String, String>,
     response_trailers: &mut HashMap<String, String>,
@@ -1662,6 +1664,9 @@ pub fn collapse_grpc_trailers_only_with_initial_response_policies(
     replay_buffered_grpc_initial_response_policies(policy_plugins, response_headers, true);
 
     for (name, value) in response_trailers.drain() {
+        if name == "content-length" {
+            continue;
+        }
         if is_reserved_grpc_terminal_metadata(&name)
             || header_shadowed_trailer_keys.contains(&name)
         {
