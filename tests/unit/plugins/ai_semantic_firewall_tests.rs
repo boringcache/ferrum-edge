@@ -118,6 +118,17 @@ fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+fn brotli_bytes(body: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut compressed = Vec::new();
+    {
+        let mut writer = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+        writer.write_all(body).unwrap();
+    }
+    compressed
+}
+
 async fn nonmatching_embedding_server() -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3434,8 +3445,7 @@ async fn encoded_origin_response_fails_closed_without_provider_call() {
     );
 }
 
-#[tokio::test]
-async fn final_response_decodes_mislabeled_gzip_json_before_scope_decision() {
+async fn assert_mislabeled_encoded_json_is_inspected(encoding: &str, body: Vec<u8>) {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
@@ -3444,11 +3454,8 @@ async fn final_response_decodes_mislabeled_gzip_json_before_scope_decision() {
     let firewall = plugin(&config);
     let headers = HashMap::from([
         ("content-type".to_string(), "text/plain".to_string()),
-        ("content-encoding".to_string(), "gzip".to_string()),
+        ("content-encoding".to_string(), encoding.to_string()),
     ]);
-    let body = gzip_bytes(
-        br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
-    );
     let mut ctx = create_test_context();
 
     assert_continue(
@@ -3467,6 +3474,131 @@ async fn final_response_decodes_mislabeled_gzip_json_before_scope_decision() {
             .get("ai_semantic_firewall.rule_ids")
             .map(String::as_str),
         Some("response_leakage")
+    );
+}
+
+#[tokio::test]
+async fn final_response_decodes_mislabeled_gzip_json_before_scope_decision() {
+    assert_mislabeled_encoded_json_is_inspected(
+        "gzip",
+        gzip_bytes(
+            br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn final_response_decodes_mislabeled_brotli_json_before_scope_decision() {
+    assert_mislabeled_encoded_json_is_inspected(
+        "br",
+        brotli_bytes(
+            br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let mut truncated_brotli = brotli_bytes(b"encoded response body");
+    truncated_brotli.truncate(truncated_brotli.len() / 2);
+
+    for (encoding, body) in [
+        ("gzip", b"not a gzip stream".to_vec()),
+        ("br", truncated_brotli),
+        ("zstd", b"unsupported encoded bytes".to_vec()),
+    ] {
+        let headers = HashMap::from([
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("content-encoding".to_string(), encoding.to_string()),
+        ]);
+        let mut ctx = create_test_context();
+
+        assert_continue(
+            firewall
+                .on_response_body(&mut ctx, 200, &headers, &body)
+                .await,
+        );
+        assert_reject(
+            firewall
+                .on_final_response_body(&mut ctx, 200, &headers, &body)
+                .await,
+            Some(502),
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.uninspectable_body")
+                .map(String::as_str),
+            Some("encoded_body")
+        );
+    }
+
+    let headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    let mut empty_ctx = create_test_context();
+    assert_continue(
+        firewall
+            .on_response_body(&mut empty_ctx, 200, &headers, b"")
+            .await,
+    );
+    assert_reject(
+        firewall
+            .on_final_response_body(&mut empty_ctx, 200, &headers, b"")
+            .await,
+        Some(502),
+    );
+    assert_eq!(
+        empty_ctx
+            .metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("empty_body")
+    );
+}
+
+#[tokio::test]
+async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let headers = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    let mut decoded = br#"{"choices":[{"message":{"content":""#.to_vec();
+    decoded.resize(10 * 1024 * 1024 + 1, b'a');
+    decoded.extend_from_slice(br#""}}]}"#);
+    let body = gzip_bytes(&decoded);
+    let mut ctx = create_test_context();
+
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+    );
+    assert_reject(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+        Some(502),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("encoded_body")
     );
 }
 
@@ -3576,32 +3708,47 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
             .await,
     );
 
-    let encoded_html_headers = HashMap::from([
-        ("content-type".to_string(), "text/html".to_string()),
-        ("content-encoding".to_string(), "gzip".to_string()),
-    ]);
-    let mut encoded_html_ctx = create_test_context();
-    let encoded_html = gzip_bytes(b"<html><body>ordinary page</body></html>");
-    assert_continue(
-        firewall
-            .on_response_body(
-                &mut encoded_html_ctx,
-                200,
-                &encoded_html_headers,
-                &encoded_html,
-            )
-            .await,
-    );
-    assert_continue(
-        firewall
-            .on_final_response_body(
-                &mut encoded_html_ctx,
-                200,
-                &encoded_html_headers,
-                &encoded_html,
-            )
-            .await,
-    );
+    for (encoding, encoded_html) in [
+        (
+            "gzip",
+            gzip_bytes(b"<html><body>ordinary page</body></html>"),
+        ),
+        (
+            "br",
+            brotli_bytes(b"<html><body>ordinary page</body></html>"),
+        ),
+    ] {
+        let encoded_html_headers = HashMap::from([
+            ("content-type".to_string(), "text/html".to_string()),
+            ("content-encoding".to_string(), encoding.to_string()),
+        ]);
+        let mut encoded_html_ctx = create_test_context();
+        assert_continue(
+            firewall
+                .on_response_body(
+                    &mut encoded_html_ctx,
+                    200,
+                    &encoded_html_headers,
+                    &encoded_html,
+                )
+                .await,
+        );
+        assert_continue(
+            firewall
+                .on_final_response_body(
+                    &mut encoded_html_ctx,
+                    200,
+                    &encoded_html_headers,
+                    &encoded_html,
+                )
+                .await,
+        );
+        assert!(
+            !encoded_html_ctx
+                .metadata
+                .contains_key("ai_semantic_firewall.uninspectable_body")
+        );
+    }
 
     let large_download = vec![b'x'; 10 * 1024 * 1024 + 1];
     let download_headers = HashMap::from([(
@@ -3615,7 +3762,7 @@ async fn unrelated_buffered_responses_remain_out_of_scope() {
             .await,
     );
 
-    for ctx in [&generic_json_ctx, &encoded_html_ctx, &download_ctx] {
+    for ctx in [&generic_json_ctx, &download_ctx] {
         assert!(
             !ctx.metadata
                 .contains_key("ai_semantic_firewall.uninspectable_body")

@@ -2263,7 +2263,9 @@ impl Plugin for AiSemanticFirewall {
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let encoded_body = has_non_identity_content_encoding(response_headers)
             && !gateway_response_compression_planned(ctx, response_headers);
-        if !response_content_type_is_inspection_candidate(content_type) && !looks_like_json(body) {
+        if !response_content_type_is_inspection_candidate(content_type)
+            && (encoded_body || !looks_like_json(body))
+        {
             return PluginResult::Continue;
         }
         if body.is_empty() {
@@ -2305,6 +2307,9 @@ impl Plugin for AiSemanticFirewall {
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let was_governed = self.response_hash(ctx).is_some();
         let type_candidate = response_content_type_is_inspection_candidate(content_type);
+        // Encoded wire bytes cannot reveal whether a mislabeled response is
+        // JSON. Decode within the hard cap before deciding that it is outside
+        // the firewall's response scope.
         if let Some(encoding) = content_encoding_value(response_headers) {
             if body.is_empty() {
                 return self.engine.handle_uninspectable_body(
