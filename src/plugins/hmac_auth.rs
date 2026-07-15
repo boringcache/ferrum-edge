@@ -47,12 +47,15 @@ use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
+use std::fmt;
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
 use super::utils::auth_flow::{
     self, AuthMechanism, ExtractedCredential, VerifyOutcome, constant_time_eq,
 };
 use super::{RequestContext, strip_auth_scheme};
+use crate::config::types::Consumer;
 use crate::consumer_index::ConsumerIndex;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -216,6 +219,61 @@ fn parse_hmac_authorization(params: &str) -> Result<ParsedHmacAuthorization, &'s
         algorithm,
         signature,
     })
+}
+
+struct CachedHmacAuthorization {
+    authorization_fingerprint: [u8; 32],
+    username: String,
+    authority: String,
+    date: String,
+    method: String,
+    path: String,
+    query: String,
+    digest_header: String,
+    preverified_consumer: Arc<Consumer>,
+}
+
+/// Request-scoped bridge between HMAC's pre-body signature check and its
+/// post-body digest check.
+///
+/// After preverification the parsed signature is dropped; this retains only a
+/// fingerprint used to detect Authorization changes, the already-owned signed
+/// request fields needed by the final digest check, and a Consumer containing
+/// secret material. Its custom `Debug` reveals only presence, and its custom
+/// `Clone` deliberately drops the value so deferred-log/simulation contexts can
+/// never inherit authentication data.
+#[derive(Default)]
+pub(crate) struct HmacPrebufferState {
+    cached: OnceLock<CachedHmacAuthorization>,
+}
+
+impl Clone for HmacPrebufferState {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl fmt::Debug for HmacPrebufferState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HmacPrebufferState")
+            .field("staged", &self.cached.get().is_some())
+            .finish()
+    }
+}
+
+impl HmacPrebufferState {
+    fn stage(&self, cached: CachedHmacAuthorization) {
+        // Multiple hmac_auth instances may screen one request. The first valid
+        // signature uses the same immutable signed fields and Consumer snapshot
+        // that authentication will see, so retaining the first verified result
+        // is sufficient and avoids replacing credential-bearing state.
+        let _ = self.cached.set(cached);
+    }
+
+    fn take(&mut self) -> Option<CachedHmacAuthorization> {
+        self.cached.take()
+    }
 }
 
 pub struct HmacAuth {
@@ -396,6 +454,94 @@ impl HmacAuth {
         strip_auth_scheme(auth_header, "hmac").is_some()
     }
 
+    fn authorization_fingerprint(ctx: &RequestContext) -> Option<[u8; 32]> {
+        ctx.headers
+            .get("authorization")
+            .map(|header| Sha256::digest(header.as_bytes()).into())
+    }
+
+    fn digest_header_ref(ctx: &RequestContext) -> Option<&str> {
+        ctx.headers
+            .get("content-digest")
+            .or_else(|| ctx.headers.get("digest"))
+            .map(String::as_str)
+    }
+
+    fn consumer_for_valid_signature(
+        &self,
+        credential: &auth_flow::HmacAuthCredential,
+        consumer_index: &ConsumerIndex,
+    ) -> Option<Arc<Consumer>> {
+        let expected_signature_len = match credential.algorithm.as_str() {
+            "hmac-sha256" => 32,
+            "hmac-sha512" => 64,
+            _ => return None,
+        };
+        let expected_signature = base64::engine::general_purpose::STANDARD
+            .decode(&credential.signature)
+            .ok()
+            .filter(|signature| signature.len() == expected_signature_len)?;
+        let consumer = consumer_index.find_by_identity(&credential.username)?;
+        let hmac_entries = consumer.credential_entries("hmac_auth");
+        if hmac_entries.is_empty() {
+            return None;
+        }
+
+        let signing_string = build_signing_string(
+            &credential.username,
+            &credential.authority,
+            &credential.method,
+            &credential.path,
+            &credential.query,
+            &credential.date,
+            &credential.digest_header,
+        );
+        hmac_entries
+            .iter()
+            .any(|hmac_cred| {
+                hmac_cred
+                    .get("secret")
+                    .and_then(|secret| secret.as_str())
+                    .is_some_and(|secret| {
+                        Self::hmac_matches(
+                            secret.as_bytes(),
+                            signing_string.as_bytes(),
+                            &credential.algorithm,
+                            &expected_signature,
+                        )
+                    })
+            })
+            .then_some(consumer)
+    }
+
+    fn cached_request_binding_matches(
+        cached: &CachedHmacAuthorization,
+        ctx: &RequestContext,
+        consumer_index: &ConsumerIndex,
+    ) -> bool {
+        let Some(current_fingerprint) = Self::authorization_fingerprint(ctx) else {
+            return false;
+        };
+        if !constant_time_eq(
+            &cached.authorization_fingerprint,
+            &current_fingerprint,
+        ) || ctx.request_authority.as_deref() != Some(cached.authority.as_str())
+            || ctx.method != cached.method
+            || ctx.path != cached.path
+            || ctx.raw_query_string().unwrap_or_default() != cached.query
+            || ctx.headers.get("date").map_or("", String::as_str) != cached.date
+            || Self::digest_header_ref(ctx) != Some(cached.digest_header.as_str())
+        {
+            return false;
+        }
+
+        consumer_index
+            .find_by_identity(&cached.username)
+            .is_some_and(|current_consumer| {
+                Arc::ptr_eq(&current_consumer, &cached.preverified_consumer)
+            })
+    }
+
     fn should_prebuffer_for_request(
         &self,
         ctx: &RequestContext,
@@ -404,25 +550,88 @@ impl HmacAuth {
         let ExtractedCredential::HmacAuth(credential) = self.extract(ctx) else {
             return false;
         };
+        let Some(authorization_fingerprint) = Self::authorization_fingerprint(ctx) else {
+            return false;
+        };
+
+        // The signing base binds only request-line/header data, so HMAC
+        // verification does not require body bytes. Only a valid secret-holder
+        // may enable collection; unknown and known-invalid identities both stay
+        // on the same pre-auth 401 path without reaching the body-size limit.
         if !self.validate_date(&credential.date)
             || !Self::digest_header_has_supported_value(&credential.digest_header)
         {
             return false;
         }
-        let expected_signature_len = match credential.algorithm.as_str() {
-            "hmac-sha256" => 32,
-            "hmac-sha512" => 64,
-            _ => return false,
-        };
-        if !base64::engine::general_purpose::STANDARD
-            .decode(&credential.signature)
-            .is_ok_and(|signature| signature.len() == expected_signature_len)
-        {
+        let Some(preverified_consumer) =
+            self.consumer_for_valid_signature(&credential, consumer_index)
+        else {
             return false;
+        };
+        let auth_flow::HmacAuthCredential {
+            username,
+            authority,
+            date,
+            method,
+            path,
+            query,
+            digest_header,
+            ..
+        } = *credential;
+        ctx.hmac_prebuffer_state.stage(CachedHmacAuthorization {
+            authorization_fingerprint,
+            username,
+            authority,
+            date,
+            method,
+            path,
+            query,
+            digest_header,
+            preverified_consumer,
+        });
+        true
+    }
+
+    fn take_prebuffered_auth(
+        &self,
+        ctx: &mut RequestContext,
+        consumer_index: &ConsumerIndex,
+    ) -> Option<Result<Arc<Consumer>, String>> {
+        let cached = ctx.hmac_prebuffer_state.take()?;
+
+        // H1/H2 and H3 call the prebuffer predicate immediately before body
+        // collection and authentication, with no plug-in hook in between. Bind
+        // the one-shot cache to the Authorization header, every signed request
+        // field, and the exact Consumer snapshot anyway; if that lifecycle ever
+        // changes, discard the cache and run ordinary extraction/verification.
+        if !Self::cached_request_binding_matches(&cached, ctx, consumer_index) {
+            return None;
         }
-        consumer_index
-            .find_by_identity(&credential.username)
-            .is_some_and(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
+
+        if !self.validate_date(&cached.date) {
+            return Some(Err(
+                r#"{"error":"Missing or expired Date header"}"#.to_string(),
+            ));
+        }
+        let (Some(body_sha256), Some(body_sha512)) =
+            (ctx.request_body_sha256.as_ref(), ctx.request_body_sha512.as_ref())
+        else {
+            return Some(Err(
+                r#"{"error":"Digest header does not match request body"}"#.to_string(),
+            ));
+        };
+        if !Self::verify_precomputed_body_digest(
+            &cached.digest_header,
+            body_sha256,
+            body_sha512,
+        ) {
+            debug!("hmac_auth: digest header does not match request body");
+            return Some(Err(
+                r#"{"error":"Digest header does not match request body"}"#.to_string(),
+            ));
+        }
+
+        Some(Ok(cached.preverified_consumer))
     }
 }
 
@@ -517,21 +726,9 @@ impl AuthMechanism for HmacAuth {
         let ExtractedCredential::HmacAuth(credential) = credential else {
             return VerifyOutcome::NotApplicable;
         };
-        let auth_flow::HmacAuthCredential {
-            username,
-            authority,
-            algorithm,
-            signature,
-            date,
-            method,
-            path,
-            query,
-            digest_header,
-            request_body_sha256,
-            request_body_sha512,
-        } = *credential;
+        let credential = *credential;
 
-        if !self.validate_date(&date) {
+        if !self.validate_date(&credential.date) {
             return VerifyOutcome::Invalid(
                 r#"{"error":"Missing or expired Date header"}"#.to_string(),
             );
@@ -541,9 +738,9 @@ impl AuthMechanism for HmacAuth {
         // Done before consumer lookup so a tampered body fails fast and the
         // error message is independent of whether the consumer exists.
         if !Self::verify_precomputed_body_digest(
-            &digest_header,
-            &request_body_sha256,
-            &request_body_sha512,
+            &credential.digest_header,
+            &credential.request_body_sha256,
+            &credential.request_body_sha512,
         ) {
             debug!("hmac_auth: digest header does not match request body");
             return VerifyOutcome::Invalid(
@@ -551,63 +748,45 @@ impl AuthMechanism for HmacAuth {
             );
         }
 
-        let consumer = match consumer_index.find_by_identity(&username) {
-            Some(consumer) => consumer,
-            None => {
-                debug!("hmac_auth: consumer '{}' not found", username);
-                return VerifyOutcome::ConsumerNotFound(
-                    r#"{"error":"Invalid credentials"}"#.to_string(),
-                );
-            }
-        };
-
-        let hmac_entries = consumer.credential_entries("hmac_auth");
-        if hmac_entries.is_empty() {
-            return VerifyOutcome::VerificationFailed(
-                r#"{"error":"Invalid credentials"}"#.to_string(),
-            );
-        }
-
         // Tampering with the digest header itself (without re-signing with
         // the secret) breaks the HMAC because the digest value is signed.
         // The query string is bound too, so altering query params invalidates
         // the signature.
-        let signing_string = build_signing_string(
-            &username,
-            &authority,
-            &method,
-            &path,
-            &query,
-            &date,
-            &digest_header,
-        );
-
-        let expected_signature = match base64::engine::general_purpose::STANDARD.decode(&signature)
-        {
-            Ok(signature) => signature,
-            Err(_) => {
-                debug!("hmac_auth: signature is not valid base64");
-                return VerifyOutcome::VerificationFailed(
-                    r#"{"error":"Invalid signature"}"#.to_string(),
-                );
-            }
-        };
-
-        for hmac_cred in &hmac_entries {
-            if let Some(secret) = hmac_cred.get("secret").and_then(|secret| secret.as_str())
-                && Self::hmac_matches(
-                    secret.as_bytes(),
-                    signing_string.as_bytes(),
-                    &algorithm,
-                    &expected_signature,
-                )
-            {
-                return VerifyOutcome::consumer(consumer);
-            }
+        if let Some(consumer) = self.consumer_for_valid_signature(&credential, consumer_index) {
+            return VerifyOutcome::consumer(consumer);
         }
 
-        debug!("hmac_auth: signature mismatch for user '{}'", username);
-        VerifyOutcome::VerificationFailed(r#"{"error":"Invalid signature"}"#.to_string())
+        debug!("hmac_auth: credential verification failed");
+        VerifyOutcome::VerificationFailed(r#"{"error":"Invalid credentials"}"#.to_string())
+    }
+}
+
+async fn run_hmac_auth(
+    mechanism: &HmacAuth,
+    ctx: &mut RequestContext,
+    consumer_index: &ConsumerIndex,
+) -> super::PluginResult {
+    match mechanism.take_prebuffered_auth(ctx, consumer_index) {
+        None => auth_flow::run_auth(mechanism, ctx, consumer_index).await,
+        Some(Err(body)) => super::PluginResult::Reject {
+            status_code: 401,
+            body,
+            headers: std::collections::HashMap::new(),
+        },
+        Some(Ok(consumer)) => {
+            if ctx.identified_consumer.is_none() {
+                debug!(
+                    "{}: identified consumer '{}'",
+                    mechanism.mechanism_name(),
+                    consumer.username
+                );
+                ctx.identified_consumer = Some(consumer);
+            }
+            if ctx.auth_method.is_none() {
+                ctx.auth_method = Some(mechanism.mechanism_name());
+            }
+            super::PluginResult::Continue
+        }
     }
 }
 
@@ -616,7 +795,7 @@ auth_flow::impl_auth_plugin!(
     "hmac_auth",
     super::priority::HMAC_AUTH,
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
-    auth_flow::run_auth;
+    run_hmac_auth;
 
     fn requires_request_body_before_authenticate(&self) -> bool {
         true

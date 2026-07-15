@@ -589,6 +589,11 @@ pub struct RequestContext {
     /// Set by the plugin in `before_proxy`; collected before building
     /// `TransactionSummary` so all logging plugins receive mirror results.
     pub mirror_result_rx: Option<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
+    /// One-shot HMAC work staged before request-body collection and consumed
+    /// at authentication. This is private rather than transaction metadata so
+    /// credential/signature/Consumer secret data cannot be forwarded or
+    /// logged. Its custom `Clone` intentionally clears the staged value.
+    hmac_prebuffer_state: hmac_auth::HmacPrebufferState,
     /// Binary-safe request body bytes, populated when a plugin requires the
     /// body before `before_proxy` (e.g., `request_mirror`). Unlike the
     /// `"request_body"` metadata key (UTF-8 only), this preserves non-UTF-8
@@ -820,6 +825,7 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
+            hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
             request_body_sha512: None,
@@ -920,6 +926,7 @@ impl RequestContext {
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
             mirror_result_rx: None,
+            hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
             request_body_sha512: None,
@@ -2828,7 +2835,7 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Return whether this request should be buffered before authentication
-    /// after cheap credential checks that do not require body bytes.
+    /// after credential checks that do not require body bytes.
     ///
     /// The default preserves the ordinary request-time buffering predicate.
     /// Body-authentication plugins can override this to reject malformed,

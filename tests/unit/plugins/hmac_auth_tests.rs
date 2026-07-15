@@ -5,7 +5,7 @@ use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::{
-    HTTP_FAMILY_PROTOCOLS, Plugin, RequestContext, hmac_auth::HmacAuth, priority,
+    HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, hmac_auth::HmacAuth, priority,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value, json};
@@ -458,7 +458,7 @@ async fn test_signature_binds_authority_and_username() {
 }
 
 #[tokio::test]
-async fn test_pre_auth_body_screening_skips_unknown_or_malformed_credentials() {
+async fn test_pre_auth_body_screening_requires_a_verified_signature() {
     let plugin = HmacAuth::new(&default_config()).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
     let date = current_date();
@@ -472,20 +472,168 @@ async fn test_pre_auth_body_screening_skips_unknown_or_malformed_credentials() {
     valid.headers.insert("date".to_string(), date.clone());
     assert!(plugin.should_buffer_request_body_before_authenticate(&valid, &consumer_index));
 
-    let mut unknown = valid.clone();
+    // A wrong-secret signature is still well-formed base64 with exactly the
+    // expected 32-byte decoded length. Knowing a real username must not be
+    // enough to opt into the 10 MiB pre-auth collection budget.
+    let wrong_signature = sign_sha256(
+        "wrong-secret-that-is-still-long-enough-for-the-test",
+        "POST",
+        "/upload",
+        &date,
+    );
+    let mut known_wrong = make_ctx("POST", "/upload");
+    known_wrong.request_body_bytes = None;
+    known_wrong.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &wrong_signature),
+    );
+    known_wrong
+        .headers
+        .insert("date".to_string(), date.clone());
+    let known_wrong_buffers = plugin
+        .should_buffer_request_body_before_authenticate(&known_wrong, &consumer_index);
+
+    let mut unknown = make_ctx("POST", "/upload");
+    unknown.request_body_bytes = None;
     unknown.headers.insert(
         "authorization".to_string(),
-        hmac_auth_header("unknown", Some("hmac-sha256"), &signature),
+        hmac_auth_header("unknown", Some("hmac-sha256"), &wrong_signature),
     );
-    assert!(!plugin.should_buffer_request_body_before_authenticate(&unknown, &consumer_index));
+    unknown.headers.insert("date".to_string(), date.clone());
+    let unknown_buffers =
+        plugin.should_buffer_request_body_before_authenticate(&unknown, &consumer_index);
 
-    let mut malformed = valid;
+    assert!(!known_wrong_buffers);
+    assert_eq!(known_wrong_buffers, unknown_buffers);
+
+    // Both non-buffered paths must also expose the same authentication result,
+    // independent of whether the username exists.
+    let known_wrong_reject = match plugin.authenticate(&mut known_wrong, &consumer_index).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => (status_code, body),
+        other => panic!("expected known wrong signature to reject, got {other:?}"),
+    };
+    let unknown_reject = match plugin.authenticate(&mut unknown, &consumer_index).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => (status_code, body),
+        other => panic!("expected unknown consumer to reject, got {other:?}"),
+    };
+    assert_eq!(known_wrong_reject, unknown_reject);
+
+    let mut malformed = make_ctx("POST", "/upload");
     malformed.headers.insert(
         "authorization".to_string(),
         r#"hmac username="hmacuser", signature="not-base64""#.to_string(),
     );
     malformed.headers.insert("date".to_string(), date);
-    assert!(!plugin.should_buffer_request_body_before_authenticate(&malformed, &consumer_index));
+    assert!(!plugin.should_buffer_request_body_before_authenticate(
+        &malformed,
+        &consumer_index
+    ));
+}
+
+#[tokio::test]
+async fn test_preverified_reuse_still_rejects_final_digest_mismatch() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let method = "POST";
+    let path = "/upload";
+    let date = current_date();
+    let signed_body = br#"{"amount":1}"#;
+    let digest = sha256_digest_header(signed_body);
+    let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
+
+    let mut tampered = make_ctx(method, path);
+    tampered.request_body_sha256 = None;
+    tampered.request_body_sha512 = None;
+    tampered.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+    );
+    tampered.headers.insert("date".to_string(), date.clone());
+    tampered.headers.insert("digest".to_string(), digest.clone());
+
+    assert!(
+        plugin.should_buffer_request_body_before_authenticate(&tampered, &consumer_index),
+        "a valid pre-body signature must enable body collection"
+    );
+    assert!(
+        format!("{tampered:?}").contains("HmacPrebufferState { staged: true }"),
+        "the request-scoped reuse path should be staged"
+    );
+    assert!(
+        format!("{:?}", tampered.clone()).contains("HmacPrebufferState { staged: false }"),
+        "request-context clones must not inherit staged HMAC credentials"
+    );
+
+    set_request_body(&mut tampered, br#"{"amount":999}"#);
+    assert_reject(
+        plugin.authenticate(&mut tampered, &consumer_index).await,
+        Some(401),
+    );
+    assert!(tampered.identified_consumer.is_none());
+
+    // Exercise the same staged path with matching bytes to prove the
+    // preverified signature remains sufficient to reach post-body auth.
+    let mut valid = make_ctx(method, path);
+    valid.request_body_sha256 = None;
+    valid.request_body_sha512 = None;
+    valid.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+    );
+    valid.headers.insert("date".to_string(), date);
+    valid.headers.insert("digest".to_string(), digest);
+    assert!(plugin.should_buffer_request_body_before_authenticate(&valid, &consumer_index));
+    set_request_body(&mut valid, signed_body);
+    assert_continue(plugin.authenticate(&mut valid, &consumer_index).await);
+    assert_eq!(valid.identified_consumer.unwrap().username, TEST_USERNAME);
+}
+
+#[tokio::test]
+async fn test_preverified_reuse_discards_changed_authorization() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let method = "POST";
+    let path = "/upload";
+    let date = current_date();
+    let body = br#"{"amount":1}"#;
+    let digest = sha256_digest_header(body);
+    let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
+
+    let mut ctx = make_ctx(method, path);
+    ctx.request_body_sha256 = None;
+    ctx.request_body_sha512 = None;
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+    );
+    ctx.headers.insert("date".to_string(), date.clone());
+    ctx.headers.insert("digest".to_string(), digest);
+    assert!(plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index));
+
+    // No plug-in hook runs between screening and authentication in H1/H2/H3,
+    // but bind the cache defensively so a future lifecycle change cannot reuse
+    // a preverified result after the credential header changes.
+    let wrong_signature = sign_sha256_with_digest(
+        "wrong-secret-that-cannot-authenticate",
+        method,
+        path,
+        &date,
+        ctx.headers.get("digest").unwrap(),
+    );
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &wrong_signature),
+    );
+    set_request_body(&mut ctx, body);
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+    assert!(ctx.identified_consumer.is_none());
 }
 
 // ── 2. Valid HMAC-SHA512 authentication (digest signing) ─────

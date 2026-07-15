@@ -1379,6 +1379,71 @@ async fn test_auth_acl_comprehensive() {
     );
     println!("✓ HMAC for unknown consumer rejected with 401");
 
+    // Regression: wrong and unknown credentials must reject before an oversized
+    // body reaches the HMAC plug-in's 10 MiB collection limit. Exact response
+    // parity prevents the former 413-vs-401 username-enumeration oracle.
+    println!("\n--- HMAC Auth — Oversized Invalid Credential Parity ---");
+    let oversized_body = bytes::Bytes::from(vec![b'x'; 10 * 1024 * 1024 + 1]);
+    let date = Utc::now().to_rfc2822();
+    let known_wrong_signature = generate_hmac_signature(
+        "POST",
+        "/hmacauth",
+        &date,
+        "alice",
+        &hmac_authority,
+        "wrong-secret-that-cannot-authenticate-alice",
+    );
+    let known_wrong_header = format!(
+        "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
+        known_wrong_signature
+    );
+    let known_wrong_response = client
+        .post(format!("{}/hmacauth", proxy_url))
+        .header("Authorization", known_wrong_header)
+        .header("Date", &date)
+        .header("Digest", empty_digest_header())
+        .body(oversized_body.clone())
+        .send()
+        .await
+        .expect("Known-consumer oversized request failed");
+    let known_wrong_status = known_wrong_response.status();
+    let known_wrong_body = known_wrong_response
+        .bytes()
+        .await
+        .expect("Failed to read known-consumer rejection");
+
+    let unknown_signature = generate_hmac_signature(
+        "POST",
+        "/hmacauth",
+        &date,
+        "nonexistent",
+        &hmac_authority,
+        "wrong-secret-that-cannot-authenticate-anyone",
+    );
+    let unknown_header = format!(
+        "hmac username=\"nonexistent\", algorithm=\"hmac-sha256\", signature=\"{}\"",
+        unknown_signature
+    );
+    let unknown_response = client
+        .post(format!("{}/hmacauth", proxy_url))
+        .header("Authorization", unknown_header)
+        .header("Date", &date)
+        .header("Digest", empty_digest_header())
+        .body(oversized_body)
+        .send()
+        .await
+        .expect("Unknown-consumer oversized request failed");
+    let unknown_status = unknown_response.status();
+    let unknown_body = unknown_response
+        .bytes()
+        .await
+        .expect("Failed to read unknown-consumer rejection");
+
+    assert_eq!(known_wrong_status, 401);
+    assert_eq!(unknown_status, known_wrong_status);
+    assert_eq!(unknown_body, known_wrong_body);
+    println!("✓ Oversized known-invalid and unknown HMAC credentials return identical 401s");
+
     // Test 21: HMAC Auth — missing Authorization header
     println!("\n--- Test 21: HMAC Auth — Missing Auth Header ---");
     let resp = client
