@@ -24,8 +24,10 @@
 //! they use sequential primary reads and only reject inconsistencies caught by
 //! the runtime load validation path. Replica-set incremental polling reads
 //! durable `config_changes` documents after the accepted sequence cursor and
-//! point-loads changed resource IDs; standalone deployments force full reloads
-//! because resource writes and change records are not transactionally coupled.
+//! point-loads changed resource IDs, except that consumer changes force a full
+//! reload to rehydrate any runtime-quarantined credentials. Standalone
+//! deployments force full reloads for every change because resource writes and
+//! change records are not transactionally coupled.
 //!
 //! **Index creation**: The `run_migrations()` method creates indexes instead of
 //! running SQL migrations. `createIndex` is idempotent **only when the full
@@ -44,7 +46,7 @@ mod inner {
         IncrementalResult, NamespaceResourceCounts, NamespacedResourceId,
         PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
     };
-    use crate::config::db_loader::proxy_route_key_hash;
+    use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
         Upstream,
@@ -93,6 +95,7 @@ mod inner {
         MONGO_MIGRATION_LEASE_DURATION.as_millis() as i64;
     const MONGO_MIGRATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
     const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+    const HMAC_SECRET_HASHES_FIELD: &str = "_ferrum_hmac_secret_hashes";
     // Dedicated migration-lease pool size. Lease upkeep only issues tiny
     // update_one/delete_one operations, so a couple of connections is ample
     // while keeping the lease client fully isolated from the migration-work
@@ -3007,11 +3010,28 @@ mod inner {
         // `custom_id` participates in the `{namespace, custom_id}` unique+
         // sparse index. Strip when absent for the same reason as Proxy above.
         strip_null_fields(&mut doc, &["custom_id"]);
+        // New writes carry a derived, deduplicated secret-hash projection for
+        // the namespace-scoped unique multikey index. Legacy documents lack
+        // this field, so adding the index does not make pre-existing duplicate
+        // credentials block startup; snapshot admission still quarantines
+        // those until an operator repairs them. Never index the raw secret.
+        let mut hmac_secret_hashes: Vec<String> = consumer
+            .credential_entries("hmac_auth")
+            .into_iter()
+            .filter_map(|entry| entry.get("secret").and_then(serde_json::Value::as_str))
+            .map(credential_value_hash)
+            .collect();
+        hmac_secret_hashes.sort();
+        hmac_secret_hashes.dedup();
+        if !hmac_secret_hashes.is_empty() {
+            doc.insert(HMAC_SECRET_HASHES_FIELD, hmac_secret_hashes);
+        }
         Ok(doc)
     }
 
     fn doc_to_consumer(mut doc: Document) -> Result<Consumer, anyhow::Error> {
         doc.remove("_id");
+        doc.remove(HMAC_SECRET_HASHES_FIELD);
         Ok(mongodb::bson::from_document(doc)?)
     }
 
@@ -3664,6 +3684,14 @@ mod inner {
                     namespace,
                     CHANGE_LOG_BATCH_LIMIT
                 );
+            }
+
+            if !consumer_ops.is_empty() {
+                return Err(anyhow::Error::new(
+                    crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                        namespace,
+                    ),
+                ));
             }
 
             let split_ops =
@@ -7083,6 +7111,27 @@ mod inner {
                             .build(),
                     )
                     .await?;
+                // Namespace-scoped unique multikey index over the derived
+                // secret-hash projection. One key is emitted per distinct
+                // rotation entry, so another consumer cannot claim it while
+                // repeated values within one document remain legal. Legacy
+                // documents without the projection stay repairable instead of
+                // making index creation fail on pre-existing duplicates.
+                self.consumers()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, HMAC_SECRET_HASHES_FIELD: 1 })
+                            .options(
+                                IndexOptions::builder()
+                                    .unique(true)
+                                    .partial_filter_expression(doc! {
+                                        HMAC_SECRET_HASHES_FIELD: { "$type": "string" }
+                                    })
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .await?;
                 self.consumers()
                     .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
                     .await?;
@@ -9901,8 +9950,11 @@ mod inner {
             assert!(
                 source.contains(r#""credentials.keyauth.key": 1"#)
                     && source.contains(r#""credentials.mtls_auth.identity": 1"#)
+                    && source.contains(
+                        r#".keys(doc! { "namespace": 1, HMAC_SECRET_HASHES_FIELD: 1 })"#
+                    )
                     && source.contains(".unique(true)"),
-                "MongoDB must enforce keyauth and mTLS credential uniqueness with indexes"
+                "MongoDB must enforce keyauth, mTLS, and HMAC credential uniqueness with indexes"
             );
             assert!(
                 !source.contains("drop_index(\"namespace_1_credentials.mtls_auth.identity_1\")"),
@@ -10018,6 +10070,35 @@ mod inner {
                 doc.get("custom_id").is_none(),
                 "`custom_id` must be absent when Consumer.custom_id is None"
             );
+        }
+
+        #[test]
+        fn consumer_to_doc_projects_deduplicated_hmac_hashes_and_round_trips() {
+            let secret = "mongo-index-hmac-secret-at-least-32-characters";
+            let mut credentials = std::collections::HashMap::new();
+            credentials.insert(
+                "hmac_auth".to_string(),
+                serde_json::json!([{"secret": secret}, {"secret": secret}]),
+            );
+            let consumer = Consumer {
+                id: "hmac-consumer".to_string(),
+                namespace: "tenant-a".to_string(),
+                username: "alice".to_string(),
+                custom_id: None,
+                credentials,
+                acl_groups: vec![],
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+
+            let doc = consumer_to_doc(&consumer).unwrap();
+            let hashes = doc.get_array(HMAC_SECRET_HASHES_FIELD).unwrap();
+            assert_eq!(hashes.len(), 1);
+            assert_eq!(hashes[0].as_str(), Some(credential_value_hash(secret).as_str()));
+            assert_ne!(hashes[0].as_str(), Some(secret));
+
+            let restored = doc_to_consumer(doc).unwrap();
+            assert_eq!(restored.credentials, consumer.credentials);
         }
 
         #[test]

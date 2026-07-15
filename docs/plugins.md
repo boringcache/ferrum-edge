@@ -1618,7 +1618,7 @@ For RFC 9530 `Content-Digest`, use structured-field byte-sequence syntax such as
 
 > **Replay protection is a freshness window, not single-use.** The signed `Date` header bounds requests to `now ± clock_skew_seconds`; there is no nonce/seen-signature store, so a captured valid request can be replayed verbatim until the window elapses. Keep `clock_skew_seconds` tight for non-idempotent routes and do not rely on `hmac_auth` alone for them.
 
-**Consumer credential** (`hmac_auth`) — array. Every secret must contain at least 32 non-whitespace characters and must not be shared by different Consumers:
+**Consumer credential** (`hmac_auth`) — array. Every secret must contain at least 32 non-whitespace characters and must not be shared by different Consumers within one namespace. Separate namespaces may reuse the same secret:
 ```yaml
 credentials:
   hmac_auth:

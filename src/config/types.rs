@@ -3518,24 +3518,28 @@ impl GatewayConfig {
         duplicates
     }
 
-    /// Cross-Consumer hmac_auth shared-secret collisions. HMAC signs the
-    /// credential identity, but a secret reused by two Consumers would still
-    /// collapse their trust boundary. Intra-consumer reuse (rotation entries
-    /// sharing one secret) is allowed; the secret value itself is never
-    /// included in the error message.
+    /// Cross-Consumer hmac_auth shared-secret collisions within each
+    /// namespace. HMAC signs the credential identity, but a secret reused by
+    /// two Consumers in one namespace would still collapse their trust
+    /// boundary. Reuse across namespaces and intra-consumer reuse (rotation
+    /// entries sharing one secret) are allowed; the secret value itself is
+    /// never included in the error message.
     fn hmac_credential_uniqueness_errors(&self) -> Vec<String> {
-        let mut seen_hmac: HashMap<&str, &str> = HashMap::new();
+        let mut seen_hmac: HashMap<(&str, &str), &str> = HashMap::new();
         let mut duplicates = Vec::new();
 
         for consumer in &self.consumers {
             for entry in consumer.credential_entries("hmac_auth") {
                 if let Some(secret) = entry.get("secret").and_then(|s| s.as_str())
-                    && let Some(existing_id) = seen_hmac.insert(secret, &consumer.id)
+                    && let Some(existing_id) = seen_hmac.insert(
+                        (consumer.namespace.as_str(), secret),
+                        consumer.id.as_str(),
+                    )
                     && existing_id != consumer.id
                 {
                     duplicates.push(format!(
-                        "Duplicate hmac_auth shared secret in consumer '{}' (conflicts with consumer '{}')",
-                        consumer.id, existing_id
+                        "Duplicate hmac_auth shared secret in consumer '{}' (conflicts with consumer '{}' in namespace '{}')",
+                        consumer.id, existing_id, consumer.namespace
                     ));
                 }
             }
@@ -3562,8 +3566,9 @@ impl GatewayConfig {
     /// entries violate the secret policy (non-array credential, empty array,
     /// malformed entry, missing/non-string secret, or fewer than
     /// [`MIN_HMAC_SECRET_LENGTH`] non-whitespace characters) or whose secret
-    /// is already claimed by an earlier-loaded consumer (first-loaded
-    /// consumer wins; the SQL and Mongo full loaders sort by id).
+    /// is already claimed by an earlier-loaded consumer in the same namespace
+    /// (first-loaded consumer wins; the SQL and Mongo full loaders sort by
+    /// id). The same secret may be reused in a different namespace.
     ///
     /// Admin write-time validation rejects NEW violations; this guard covers
     /// pre-existing and out-of-band rows, mirroring
@@ -3573,7 +3578,7 @@ impl GatewayConfig {
     /// per quarantined credential (never containing the secret); callers log
     /// these at `error!` severity.
     pub fn quarantine_invalid_hmac_credentials(&mut self) -> Vec<String> {
-        let mut claimed: HashMap<String, String> = HashMap::new();
+        let mut claimed: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut messages = Vec::new();
 
         for consumer in &mut self.consumers {
@@ -3606,21 +3611,27 @@ impl GatewayConfig {
                 ));
                 continue;
             };
-            match secrets.iter().find_map(|secret| claimed.get(secret)) {
+            let namespace_claims = claimed.entry(consumer.namespace.clone()).or_default();
+            match secrets
+                .iter()
+                .find_map(|secret| namespace_claims.get(secret))
+            {
                 Some(other_id) => {
                     let other_id = other_id.clone();
                     consumer.credentials.remove("hmac_auth");
                     messages.push(format!(
                         "Quarantined hmac_auth credential of consumer '{}': its shared \
-                         secret is also claimed by consumer '{}' — the credential is \
+                         secret is also claimed by consumer '{}' in namespace '{}' — the credential is \
                          excluded from this config load to prevent cross-Consumer \
                          signature forgery. Rotate one of the secrets to restore it.",
-                        consumer.id, other_id
+                        consumer.id, other_id, consumer.namespace
                     ));
                 }
                 None => {
                     for secret in secrets {
-                        claimed.entry(secret).or_insert_with(|| consumer.id.clone());
+                        namespace_claims
+                            .entry(secret)
+                            .or_insert_with(|| consumer.id.clone());
                     }
                 }
             }

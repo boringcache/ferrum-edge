@@ -179,8 +179,9 @@ pub(crate) async fn mtls_consumer_candidate_errors(
 /// already claimed by another consumer in the namespace. Snapshot-based like
 /// the mTLS candidate check (rather than a credential-index probe) so
 /// pre-existing rows written before hmac secrets were policed are still
-/// authoritative; races are serialized by `lock_mtls_admission`, which every
-/// credential mutation takes.
+/// authoritative. `lock_mtls_admission` serializes same-process prechecks;
+/// namespace-scoped SQL/Mongo uniqueness constraints are the cross-process
+/// persistence backstop.
 pub(crate) async fn hmac_consumer_candidate_errors(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -588,13 +589,27 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     if config_update_target_was_not_found(error) {
         return not_found_response::<Consumer>();
     }
-    let message = error.to_string();
-    let status = if super::is_unique_constraint_violation(&message) {
+    let unique_conflict = super::is_unique_constraint_violation(&error.to_string());
+    let message = consumer_persist_error_message(error);
+    let status = if unique_conflict {
         StatusCode::CONFLICT
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
     super::json_response(status, &json!({"error": message}))
+}
+
+/// Redact persistence-level uniqueness diagnostics before they reach an admin
+/// response. MongoDB duplicate-key errors can echo indexed credential-derived
+/// values; callers need the conflict disposition, never credential or index
+/// metadata.
+pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
+    if super::is_unique_constraint_violation(&error.to_string()) {
+        "Consumer identity or credential conflicts with another Consumer in the namespace"
+            .to_string()
+    } else {
+        error.to_string()
+    }
 }
 
 pub(crate) fn hash_consumer_credentials(consumer: &mut Consumer) -> Result<(), String> {

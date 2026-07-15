@@ -4,7 +4,7 @@ use ferrum_edge::_test_support::{
     db_wrap_mysql_isolation_read_error, is_config_validation_rejection, parse_auth_mode,
     parse_scheme, statement_timeout_sql,
 };
-use ferrum_edge::config::db_backend::DatabaseBackend;
+use ferrum_edge::config::db_backend::{DatabaseBackend, is_incremental_full_reload_required};
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginConfig, PluginScope, Upstream,
@@ -401,6 +401,120 @@ async fn consumer_credential_index_enforces_keyauth_uniqueness() {
             || msg.contains("UNIQUE")
             || msg.contains("constraint"),
         "unexpected duplicate-key error: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn consumer_credential_index_enforces_namespace_scoped_hmac_uniqueness() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("consumer_hmac_credential_index.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    let secret = "datastore-unique-hmac-secret-at-least-32-characters";
+
+    let mut tenant_a_owner = make_consumer("c1", "alice");
+    tenant_a_owner.namespace = "tenant-a".to_string();
+    tenant_a_owner.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": secret }, { "secret": secret }]),
+    );
+    store.create_consumer(&tenant_a_owner).await.unwrap();
+
+    let mut tenant_a_conflict = make_consumer("c2", "bob");
+    tenant_a_conflict.namespace = "tenant-a".to_string();
+    tenant_a_conflict.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": secret }]),
+    );
+    let error = store
+        .create_consumer(&tenant_a_conflict)
+        .await
+        .expect_err("a second consumer in one namespace must not claim the HMAC secret");
+    let message = error.to_string();
+    assert!(
+        message.contains("consumer_credential_index")
+            || message.contains("UNIQUE")
+            || message.contains("constraint"),
+        "unexpected duplicate-HMAC error: {message}"
+    );
+
+    let mut tenant_b_owner = make_consumer("c1", "carol");
+    tenant_b_owner.namespace = "tenant-b".to_string();
+    tenant_b_owner.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": secret }]),
+    );
+    store
+        .create_consumer(&tenant_b_owner)
+        .await
+        .expect("the HMAC index must preserve namespace isolation");
+
+    let original_secret = "transaction-preserved-hmac-secret-at-least-32-characters";
+    let mut rotating = make_consumer("c3", "dave");
+    rotating.namespace = "tenant-a".to_string();
+    rotating.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": original_secret }]),
+    );
+    store.create_consumer(&rotating).await.unwrap();
+    rotating.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": secret }]),
+    );
+    store
+        .update_consumer(&rotating)
+        .await
+        .expect_err("a conflicting HMAC update must roll back atomically");
+    let stored = store
+        .get_consumer("tenant-a", "c3")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.credentials["hmac_auth"],
+        json!([{ "secret": original_secret }])
+    );
+}
+
+#[tokio::test]
+async fn incremental_consumer_change_requires_full_reload_for_hmac_rehydration() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("consumer_incremental_full_reload.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": "first-hmac-secret-at-least-32-characters" }]),
+    );
+    store.create_consumer(&consumer).await.unwrap();
+    let accepted_sequence = store.latest_change_sequence("ferrum").await.unwrap();
+
+    consumer.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": "repaired-hmac-secret-at-least-32-characters" }]),
+    );
+    assert!(store.update_consumer(&consumer).await.unwrap());
+
+    let error = match store
+        .load_incremental_config("ferrum", accepted_sequence)
+        .await
+    {
+        Ok(_) => panic!("consumer deltas must escalate to an authoritative full reload"),
+        Err(error) => error,
+    };
+    assert!(is_incremental_full_reload_required(&error));
+
+    let reloaded = store.load_full_config("ferrum").await.unwrap();
+    assert_eq!(reloaded.consumers.len(), 1);
+    assert_eq!(
+        reloaded.consumers[0].credentials["hmac_auth"],
+        json!([{ "secret": "repaired-hmac-secret-at-least-32-characters" }])
     );
 }
 

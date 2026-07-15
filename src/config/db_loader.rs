@@ -5,7 +5,9 @@
 //!    the same transaction as SQL resource mutations.
 //! 2. Pollers read ordered change records after their accepted sequence cursor,
 //!    collapse each resource to its final operation in the batch, and point-load
-//!    only changed resource IDs.
+//!    only changed resource IDs. Consumer changes force an authoritative full
+//!    reload so credentials stripped from the published snapshot by runtime
+//!    quarantine can be rehydrated after a repair.
 //! 3. Deletes are delivered from durable delete records; normal incremental
 //!    polling does not scan every resource ID or rely on wall-clock timestamps.
 //!
@@ -141,7 +143,7 @@ struct ConsumerCredentialIndexEntry {
     credential_hash: String,
 }
 
-fn credential_value_hash(value: &str) -> String {
+pub(crate) fn credential_value_hash(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     hex::encode(hasher.finalize())
@@ -172,6 +174,22 @@ fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredent
             let indexed = ConsumerCredentialIndexEntry {
                 credential_type: "mtls_auth",
                 credential_hash: credential_value_hash(canonical_mtls_identity(identity)),
+            };
+            if seen.insert(indexed.clone()) {
+                entries.push(indexed);
+            }
+        }
+    }
+
+    // HMAC secrets are hashed before entering the index: the composite primary
+    // key is the cross-process uniqueness backstop, while the stored index
+    // never contains the credential itself. Namespace remains part of that
+    // primary key, so separate tenants may intentionally reuse a secret.
+    for entry in consumer.credential_entries("hmac_auth") {
+        if let Some(secret) = entry.get("secret").and_then(|value| value.as_str()) {
+            let indexed = ConsumerCredentialIndexEntry {
+                credential_type: "hmac_auth",
+                credential_hash: credential_value_hash(secret),
             };
             if seen.insert(indexed.clone()) {
                 entries.push(indexed);
@@ -4200,6 +4218,14 @@ impl DatabaseStore {
                     );
                 }
             }
+        }
+
+        if !consumer_ops.is_empty() {
+            return Err(anyhow::Error::new(
+                crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                    namespace,
+                ),
+            ));
         }
 
         let (proxy_upserts, mut removed_proxy_ids) = Self::split_change_ops(proxy_ops);

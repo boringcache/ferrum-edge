@@ -397,6 +397,93 @@ async fn update_config_quarantines_invalid_hmac_credentials_before_full_snapshot
     assert!(!config.consumers[2].has_credential("hmac_auth"));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn update_config_preserves_same_hmac_secret_across_namespaces() {
+    let state = empty_proxy_state();
+    let shared_secret = "namespace-reusable-hmac-secret-at-least-32-characters";
+    let mut tenant_a = test_consumer("c1", "alice");
+    tenant_a.namespace = "tenant-a".to_string();
+    tenant_a.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+    let mut tenant_b = test_consumer("c2", "bob");
+    tenant_b.namespace = "tenant-b".to_string();
+    tenant_b.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+
+    assert_eq!(
+        state.update_config(GatewayConfig {
+            consumers: vec![tenant_a, tenant_b],
+            loaded_at: Utc::now(),
+            ..GatewayConfig::default()
+        }),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .config
+            .load()
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("hmac_auth"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_snapshot_rehydrates_quarantined_hmac_after_conflict_repair() {
+    let state = empty_proxy_state();
+    let original_secret = "shared-hmac-secret-at-least-32-characters";
+    let mut first = test_consumer("c1", "alice");
+    first.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": original_secret}]),
+    );
+    let mut second = test_consumer("c2", "bob");
+    second.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": original_secret}]),
+    );
+    assert_eq!(
+        state.update_config(GatewayConfig {
+            consumers: vec![first, second],
+            loaded_at: Utc::now(),
+            ..GatewayConfig::default()
+        }),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(!state.config.load().consumers[1].has_credential("hmac_auth"));
+
+    let mut repaired_first = test_consumer("c1", "alice");
+    repaired_first.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": "rotated-hmac-secret-at-least-32-characters"}]),
+    );
+    let mut rehydrated_second = test_consumer("c2", "bob");
+    rehydrated_second.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": original_secret}]),
+    );
+    assert_eq!(
+        state.update_config(GatewayConfig {
+            consumers: vec![repaired_first, rehydrated_second],
+            loaded_at: Utc::now(),
+            ..GatewayConfig::default()
+        }),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .config
+            .load()
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("hmac_auth"))
+    );
+}
+
 /// Empty incremental result returns `Unchanged` so the polling loop can still
 /// advance `last_poll_at` (no work to retry).
 #[tokio::test(flavor = "multi_thread")]

@@ -3116,7 +3116,10 @@ async fn persist_payload_resources(
     if should_continue(&errors) && !payload.consumers.is_empty() {
         match db.batch_create_consumers(&payload.consumers).await {
             Ok(n) => counts.consumers = n,
-            Err(e) => errors.push(format!("consumers: {}", e)),
+            Err(e) => errors.push(format!(
+                "consumers: {}",
+                crud::consumer_persist_error_message(&e)
+            )),
         }
     }
     if should_continue(&errors) && !payload.upstreams.is_empty() {
@@ -5529,6 +5532,20 @@ async fn handle_node_waypoint_identities_get(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_unique_conflict_response_redacts_mongo_credential_metadata() {
+        let secret = "must-not-escape-hmac-secret-at-least-32-characters";
+        let error = anyhow::anyhow!(
+            "E11000 duplicate key error dup key: {{ namespace: ferrum, credentials.hmac_auth.secret: {} }}",
+            secret
+        );
+
+        let message = crud::consumer_persist_error_message(&error);
+        assert!(message.contains("conflicts with another Consumer"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("credentials.hmac_auth.secret"));
+    }
 
     #[test]
     fn namespace_scoped_routes_cover_tenant_resources_only() {

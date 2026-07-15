@@ -6525,7 +6525,8 @@ components:
           description: >-
             Shared secret for HMAC signature computation and verification. Must
             contain at least 32 non-whitespace characters and must not be
-            shared by different Consumers.
+            shared by different Consumers within one namespace. Separate
+            namespaces may reuse the same secret.
       description: >-
         HMAC auth credential for the `hmac_auth` plugin. Consumer is looked up
         by username in the Authorization header; all secrets are tried until one

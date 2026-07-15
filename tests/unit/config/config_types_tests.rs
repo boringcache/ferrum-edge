@@ -1507,6 +1507,33 @@ fn test_validate_unique_hmac_credentials_narrow_surface() {
 }
 
 #[test]
+fn test_hmac_secret_uniqueness_and_quarantine_are_namespace_scoped() {
+    let secret = "namespace-reusable-hmac-secret-at-least-32-characters";
+    let mut tenant_a = make_consumer("shared-id", "alice");
+    tenant_a.namespace = "tenant-a".to_string();
+    tenant_a
+        .credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    let mut tenant_b = make_consumer("shared-id", "bob");
+    tenant_b.namespace = "tenant-b".to_string();
+    tenant_b
+        .credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    let mut config = empty_config();
+    config.consumers = vec![tenant_a, tenant_b];
+
+    assert!(config.validate_unique_hmac_credentials().is_ok());
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+    assert!(config.quarantine_invalid_hmac_credentials().is_empty());
+    assert!(
+        config
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("hmac_auth"))
+    );
+}
+
+#[test]
 fn test_quarantine_hmac_strips_weak_secret_and_keeps_strong() {
     let weak = "short-secret";
     let mut c1 = make_consumer("c1", "alice");
