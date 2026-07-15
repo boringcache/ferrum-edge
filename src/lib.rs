@@ -80,11 +80,53 @@ pub use router_cache::{RouteMatch, RouterCache};
 pub mod _test_support {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use hyper::StatusCode;
 
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
+
+    #[allow(dead_code)] // owning the guard is the behavior exercised by cancellation tests
+    pub struct JwksDiscoveryCandidateForTest(
+        crate::plugins::utils::jwks_cache::DiscoveryStoreCandidate,
+    );
+
+    pub fn jwks_discovery_candidate_for_test(
+        jwks_uri: &str,
+        http_client: crate::plugins::PluginHttpClient,
+        refresh_interval: Duration,
+    ) -> JwksDiscoveryCandidateForTest {
+        JwksDiscoveryCandidateForTest(
+            crate::plugins::utils::jwks_cache::DiscoveryStoreCandidate::acquire(
+                jwks_uri,
+                &http_client,
+                refresh_interval,
+            ),
+        )
+    }
+
+    pub fn oidc_sealed_refresh_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        claims: serde_json::Value,
+        refresh_token: Option<String>,
+        refresh_due: bool,
+        rolling_due: bool,
+    ) -> Result<String, String> {
+        plugin.sealed_refresh_session_cookie_for_tests(
+            claims,
+            refresh_token,
+            refresh_due,
+            rolling_due,
+        )
+    }
+
+    pub fn oidc_open_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        cookie: &str,
+    ) -> Option<serde_json::Value> {
+        plugin.open_session_cookie_for_tests(cookie)
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     pub struct OidcSessionStateForTest {

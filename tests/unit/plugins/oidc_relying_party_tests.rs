@@ -1,5 +1,6 @@
 use ferrum_edge::_test_support::{
-    oidc_sealed_due_refresh_session_cookie_for_test, oidc_sealed_session_cookie_for_test,
+    oidc_open_session_cookie_for_test, oidc_sealed_due_refresh_session_cookie_for_test,
+    oidc_sealed_refresh_session_cookie_for_test, oidc_sealed_session_cookie_for_test,
     oidc_session_state_from_set_cookie_for_test,
 };
 use ferrum_edge::ConsumerIndex;
@@ -57,6 +58,32 @@ fn html_ctx() -> RequestContext {
     ctx
 }
 
+fn refresh_config(token_endpoint: &str) -> serde_json::Value {
+    let mut config = base_config();
+    config["providers"][0]["token_endpoint"] = json!(token_endpoint);
+    config["providers"][0]["consumer_identity_claim"] = json!("email");
+    config
+}
+
+fn session_ctx(set_cookie: &str) -> RequestContext {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.headers.insert(
+        "cookie".to_string(),
+        set_cookie
+            .split(';')
+            .next()
+            .expect("session cookie pair")
+            .to_string(),
+    );
+    ctx
+}
+
+async fn rolling_cookie(plugin: &OidcRelyingParty, ctx: &mut RequestContext) -> Option<String> {
+    let mut response_headers = HashMap::new();
+    assert_continue(plugin.after_proxy(ctx, 200, &mut response_headers).await);
+    response_headers.remove("set-cookie")
+}
+
 fn refresh_rejection_plugin(token_endpoint: &str) -> OidcRelyingParty {
     let mut config = base_config();
     config["providers"][0]["token_endpoint"] = json!(token_endpoint);
@@ -79,12 +106,214 @@ fn ctx_with_session_cookie(set_cookie: &str) -> RequestContext {
     ctx.headers.insert("cookie".to_string(), cookie_pair);
     ctx
 }
-
 #[tokio::test]
 async fn new_accepts_minimal_cookie_store_config() {
     let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
     assert_eq!(plugin.name(), "oidc_relying_party");
     assert_eq!(plugin.priority(), priority::OIDC_RELYING_PARTY);
+}
+
+#[tokio::test]
+async fn principal_less_refresh_due_session_does_not_refresh_or_slide() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "rotated-refresh-token",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+    let plugin = OidcRelyingParty::new(
+        &refresh_config(&format!("{}/token", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({"sub": "subject-only", "exp": now + 3600}),
+        Some("refresh-token".to_string()),
+        true,
+        true,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert!(ctx.authenticated_identity.is_none());
+    assert!(rolling_cookie(&plugin, &mut ctx).await.is_none());
+    assert_eq!(server.received_requests().await.expect("requests").len(), 0);
+}
+
+#[tokio::test]
+async fn earlier_single_mode_principal_prevents_later_oidc_refresh_and_slide() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let oidc = Arc::new(
+        OidcRelyingParty::new(
+            &refresh_config(&format!("{}/token", server.uri())),
+            PluginHttpClient::default(),
+        )
+        .expect("valid refresh config"),
+    );
+    let key_auth = Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &oidc,
+        json!({
+            "sub": "oidc-subject",
+            "email": "oidc@example.test",
+            "exp": now - 120
+        }),
+        Some("refresh-token".to_string()),
+        true,
+        true,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+    ctx.headers
+        .insert("x-api-key".to_string(), "test-api-key".to_string());
+    let key_auth_plugin: Arc<dyn Plugin> = key_auth.clone();
+    let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
+
+    assert!(
+        run_authentication_phase(
+            AuthMode::Single,
+            &[key_auth_plugin, oidc_plugin],
+            &mut ctx,
+            &ConsumerIndex::new(&[create_test_consumer()]),
+        )
+        .await
+        .is_none()
+    );
+    assert_eq!(ctx.auth_method, Some("key_auth"));
+    let mut upstream_headers = ctx.headers.clone();
+    assert_continue(key_auth.before_proxy(&mut ctx, &mut upstream_headers).await);
+    assert_continue(oidc.before_proxy(&mut ctx, &mut upstream_headers).await);
+    assert!(!upstream_headers.contains_key("x-api-key"));
+    assert!(rolling_cookie(&oidc, &mut ctx).await.is_none());
+    assert_eq!(server.received_requests().await.expect("requests").len(), 0);
+}
+
+#[tokio::test]
+async fn accepted_oidc_refresh_commits_rotated_token_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "rotated-refresh-token",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+    let plugin = OidcRelyingParty::new(
+        &refresh_config(&format!("{}/token", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "accepted@example.test",
+            "exp": now + 3600
+        }),
+        Some("original-refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    let rolled = rolling_cookie(&plugin, &mut ctx)
+        .await
+        .expect("accepted refresh must emit its rolling cookie");
+    let payload =
+        oidc_open_session_cookie_for_test(&plugin, &rolled).expect("rolling cookie opens");
+    assert_eq!(payload["refresh_token_b64"], json!("rotated-refresh-token"));
+    assert_eq!(payload["access_token_b64"], json!("new-access-token"));
+
+    let mut repeated = session_ctx(&rolled);
+    assert_continue(
+        plugin
+            .authenticate(&mut repeated, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_refresh_failure_commits_backoff_and_avoids_retry_storm() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "temporarily_unavailable"
+        })))
+        .mount(&server)
+        .await;
+    let plugin = OidcRelyingParty::new(
+        &refresh_config(&format!("{}/token", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "accepted@example.test",
+            "exp": now + 3600
+        }),
+        Some("refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    let backed_off = rolling_cookie(&plugin, &mut ctx)
+        .await
+        .expect("refresh failure must emit its backoff cookie");
+    let payload =
+        oidc_open_session_cookie_for_test(&plugin, &backed_off).expect("backoff cookie opens");
+    assert!(
+        payload["refresh_after_unix"]
+            .as_i64()
+            .is_some_and(|next| next > now)
+    );
+
+    let mut repeated = session_ctx(&backed_off);
+    assert_continue(
+        plugin
+            .authenticate(&mut repeated, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
 }
 
 #[tokio::test]
@@ -157,6 +386,7 @@ async fn oidc_single_auth_scope_rejection_returns_rotated_refresh_cookie() {
         &plugin,
         json!({
             "sub": "oidc-subject",
+            "email": "rejected@example.test",
             "scope": "viewer",
             "exp": now + 3600
         }),
@@ -214,6 +444,7 @@ async fn oidc_scope_rejection_persists_refresh_failure_backoff() {
         &plugin,
         json!({
             "sub": "oidc-subject",
+            "email": "rejected@example.test",
             "scope": "viewer",
             "exp": now + 3600
         }),

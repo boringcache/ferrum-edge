@@ -121,7 +121,9 @@ Use `priority_override` to control the relative execution order of instances tha
 
 ## Multi-Authentication Mode
 
-With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one succeeds; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned. After authentication, the Access Control plugin can apply consumer or group policy.
+With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one establishes a nonblank mapped Consumer or permitted external principal; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned.
+
+In either mode, rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, rolling session cookie, or backend token-stripping state for another credential to inherit. Requester-owned cookies from rejected attempts are retained only when authentication ultimately rejects and are merged with the selected rejection's cookies by exact cookie name; a later successful credential discards them. After authentication, the Access Control plugin can apply consumer or group policy.
 
 ## Consumer Identity Headers
 
@@ -1365,8 +1367,8 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | Parameter | Type | Description |
 |---|---|---|
 | `providers` | Array | Array of identity provider configurations (required) |
-| `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint |
-| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
+| `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or `localhost`; URL userinfo is rejected |
+| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). HTTPS is required except for literal loopback or `localhost`, and URL userinfo is rejected. SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
 | `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
 | `providers[].issuer` | String (optional) | Expected JWT `iss` claim — routes tokens to this provider |
 | `providers[].audience` | String (optional) | Expected JWT `aud` claim |
@@ -1400,6 +1402,9 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
+Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. Shared stores use the minimum refresh interval requested by active consumers, and full or incremental reloads reschedule the single refresh worker without dropping cached keys. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement.
+
+Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A rejected refresh retains the last-known-good keys. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
 
 ### `oauth2_introspection`
 
