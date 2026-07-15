@@ -3419,7 +3419,7 @@ async fn malformed_json_prefix_on_non_json_response_remains_out_of_scope() {
 }
 
 #[tokio::test]
-async fn encoded_origin_response_fails_closed_without_provider_call() {
+async fn malformed_labeled_encoded_origin_fails_closed_in_final_hook() {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
@@ -3431,9 +3431,14 @@ async fn encoded_origin_response_fails_closed_without_provider_call() {
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
     let mut ctx = create_test_context();
-    assert_reject(
+    assert_continue(
         firewall
             .on_response_body(&mut ctx, 200, &headers, b"opaque compressed bytes")
+            .await,
+    );
+    assert_reject(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, b"opaque compressed bytes")
             .await,
         Some(502),
     );
@@ -3445,7 +3450,7 @@ async fn encoded_origin_response_fails_closed_without_provider_call() {
     );
 }
 
-async fn assert_mislabeled_encoded_json_is_inspected(
+async fn assert_encoded_json_is_inspected(
     content_type: Option<&str>,
     encoding: &str,
     body: Vec<u8>,
@@ -3494,7 +3499,7 @@ async fn assert_mislabeled_encoded_json_is_inspected(
 
 #[tokio::test]
 async fn final_response_decodes_mislabeled_gzip_json_before_scope_decision() {
-    assert_mislabeled_encoded_json_is_inspected(
+    assert_encoded_json_is_inspected(
         Some("text/plain"),
         "gzip",
         gzip_bytes(
@@ -3506,8 +3511,32 @@ async fn final_response_decodes_mislabeled_gzip_json_before_scope_decision() {
 
 #[tokio::test]
 async fn final_response_decodes_mislabeled_brotli_json_before_scope_decision() {
-    assert_mislabeled_encoded_json_is_inspected(
+    assert_encoded_json_is_inspected(
         None,
+        "br",
+        brotli_bytes(
+            br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn final_response_decodes_labeled_gzip_json_before_inspection() {
+    assert_encoded_json_is_inspected(
+        Some("application/json"),
+        "gzip",
+        gzip_bytes(
+            br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn final_response_decodes_labeled_brotli_json_before_inspection() {
+    assert_encoded_json_is_inspected(
+        Some("application/json"),
         "br",
         brotli_bytes(
             br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,

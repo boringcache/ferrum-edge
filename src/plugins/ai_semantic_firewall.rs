@@ -2312,10 +2312,12 @@ impl Plugin for AiSemanticFirewall {
                 .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
         }
         if encoded_body {
+            // Candidate media types are governed even though this hook cannot
+            // inspect their wire bytes yet. Preserve that scope marker and let
+            // the final hook perform the bounded decode before enforcing rules
+            // or the configured fail-closed policy.
             self.set_response_hash(ctx, sha256_hex_bytes(body));
-            return self
-                .engine
-                .handle_uninspectable_body(ctx, Direction::Response, "encoded_body");
+            return PluginResult::Continue;
         }
 
         self.inspect_response_bytes(ctx, content_type, body, false)
