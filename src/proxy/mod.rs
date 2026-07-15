@@ -9007,10 +9007,15 @@ async fn handle_websocket_request_authenticated(
 
     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
-    // Assemble gateway-controlled optional fields first so response policy can
-    // intentionally remove/replace them. Transport-managed handshake fields are
-    // added only after policy and reserved-field stripping below.
+    // Apply response policy before gateway-owned affinity and transport fields.
+    // This matches ordinary HTTP/gRPC ordering: operator policy governs backend
+    // metadata, while the gateway's selected-target cookie and mandatory
+    // handshake fields are committed at the client boundary afterward.
     let mut response_headers = HashMap::new();
+    finalize_websocket_response_headers(
+        &initial_response_header_policy_plugins,
+        &mut response_headers,
+    );
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
@@ -9031,11 +9036,6 @@ async fn handle_websocket_request_authenticated(
             response_headers.insert("set-cookie".to_string(), cookie_val);
         }
     }
-
-    finalize_websocket_response_headers(
-        &initial_response_header_policy_plugins,
-        &mut response_headers,
-    );
 
     // Build the upgrade response.
     // HTTP/2 Extended CONNECT (RFC 8441): 200 OK — the H2 stream becomes the WebSocket
@@ -13524,7 +13524,12 @@ pub(crate) async fn run_after_proxy_hooks(
             .after_proxy(ctx, response_status, response_headers)
             .await
         {
-            PluginResult::Continue => {}
+            PluginResult::Continue => {
+                ctx.record_buffered_initial_response_header_plugin(
+                    plugin.as_ref(),
+                    response_headers,
+                );
+            }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let RejectedResponseParts {
                     mut status_code,
@@ -17774,19 +17779,28 @@ async fn handle_proxy_request_inner(
                         &response_headers,
                         &response_trailers,
                     );
+                ctx.begin_buffered_initial_response_header_policy(
+                    plugin_cache_view.initial_response_header_policy_names(),
+                    &response_headers,
+                    &plugin_response_headers,
+                );
 
                 // after_proxy hooks
                 let mut after_proxy_rejected = false;
+                let mut buffered_initial_response_header_policy_state;
                 {
                     let phase_start = Instant::now();
-                    if let Some(reject) = run_after_proxy_hooks(
+                    let after_proxy_reject = run_after_proxy_hooks(
                         &plugins,
                         &mut ctx,
                         response_status,
                         &mut plugin_response_headers,
                     )
-                    .await
-                    {
+                    .await;
+                    buffered_initial_response_header_policy_state =
+                        ctx.take_buffered_initial_response_header_policy();
+                    if let Some(reject) = after_proxy_reject {
+                        buffered_initial_response_header_policy_state = None;
                         let normalized = normalize_reject_response(
                             StatusCode::from_u16(reject.status_code)
                                 .unwrap_or(StatusCode::BAD_GATEWAY),
@@ -17845,6 +17859,7 @@ async fn handle_proxy_request_inner(
                                 plugin_response_headers = response_headers.clone();
                                 response_trailers.clear();
                                 response_body = normalized.body;
+                                buffered_initial_response_header_policy_state = None;
                                 break;
                             }
                         }
@@ -17947,6 +17962,7 @@ async fn handle_proxy_request_inner(
                                 }
                                 plugin_response_headers = response_headers.clone();
                                 response_trailers.clear();
+                                buffered_initial_response_header_policy_state = None;
                                 break;
                             }
                         }
@@ -17986,6 +18002,7 @@ async fn handle_proxy_request_inner(
                         &plugin_response_headers,
                         &response_headers,
                         &header_shadowed_trailer_keys,
+                        buffered_initial_response_header_policy_state.as_deref(),
                     );
                     response_headers = plugin_response_headers;
                 }
@@ -17998,8 +18015,6 @@ async fn handle_proxy_request_inner(
                     &response_trailers,
                     &response_headers,
                 );
-                let initial_response_header_policy_plugins =
-                    plugin_cache_view.initial_response_header_policy_plugins();
                 if response_body.is_empty() {
                     // True Trailers-Only encoding: no DATA frame, grpc-status
                     // and friends ride in the initial HEADERS with END_STREAM.
@@ -18009,7 +18024,7 @@ async fn handle_proxy_request_inner(
                         &mut response_headers,
                         &mut response_trailers,
                         &header_shadowed_trailer_keys,
-                        &initial_response_header_policy_plugins,
+                        buffered_initial_response_header_policy_state.as_deref(),
                     );
                 } else {
                     // Non-empty gRPC responses must carry grpc-status in a
@@ -18026,8 +18041,8 @@ async fn handle_proxy_request_inner(
                         &response_trailers,
                         &header_shadowed_trailer_keys,
                     );
-                    grpc_proxy::replay_buffered_grpc_initial_response_policies(
-                        &initial_response_header_policy_plugins,
+                    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+                        buffered_initial_response_header_policy_state.as_deref(),
                         &mut response_headers,
                         false,
                     );

@@ -110,7 +110,7 @@ use chrono::{DateTime, Utc};
 use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -206,24 +206,134 @@ pub fn apply_initial_response_header_policies(
     }
 }
 
-/// Replay initial-response policy after buffered body transforms without
-/// allowing the replay to replace the transform-owned `content-length`.
+/// Ordered outcome of deterministic initial-response policy for a buffered
+/// response whose hook-visible map also contains trailer compatibility fields.
 ///
-/// Header policy already ran in `after_proxy`, before buffered transforms.
-/// Protocol bridges replay it at the final initial-header boundary to restore
-/// fields that could otherwise be confused with backend trailers. A body
-/// transform may have corrected or removed `content-length` in between those
-/// phases, so preserve that final transport value (including absence) across
-/// the replay. `remove_entry` retains the existing key allocation.
-pub fn replay_initial_response_header_policies_after_buffering(
-    policy_plugins: &[Arc<dyn Plugin>],
-    response_headers: &mut HashMap<String, String>,
-) {
-    let content_length = response_headers.remove_entry("content-length");
-    apply_initial_response_header_policies(policy_plugins, response_headers);
-    response_headers.remove("content-length");
-    if let Some((name, value)) = content_length {
-        response_headers.insert(name, value);
+/// `desired_headers` starts from genuine backend initial HEADERS, while
+/// `observed_headers` starts from the merged header+trailer view passed to
+/// `after_proxy`. After each hook, [`Self::record_after_proxy_plugin`] advances
+/// the desired map: policy plugins apply directly to genuine initial-header
+/// state, while any mutation made by another (including custom) plugin is
+/// copied from the already-ordered real hook result. This preserves priority
+/// overrides and multiple-instance ordering without rerunning hooks or scanning
+/// the plugin chain at the client boundary.
+#[derive(Debug, Clone)]
+pub struct BufferedInitialResponseHeaderPolicyState {
+    header_names: Arc<Vec<String>>,
+    desired_headers: HashMap<String, String>,
+    observed_headers: HashMap<String, String>,
+    /// Names whose policy value had to replace a trailer-only compatibility
+    /// value in the hook map. Unless a later non-policy hook changes the name,
+    /// the backend's application trailer remains authoritative on its channel.
+    policy_only_promoted_headers: HashSet<String>,
+}
+
+impl BufferedInitialResponseHeaderPolicyState {
+    /// Build state from cache-prefiltered policy names. Returns `None` when no
+    /// initial-response policy is configured, leaving ordinary buffered paths
+    /// allocation-free.
+    pub fn new(
+        header_names: Arc<Vec<String>>,
+        initial_headers: &HashMap<String, String>,
+        merged_headers: &HashMap<String, String>,
+    ) -> Option<Self> {
+        if header_names.is_empty() {
+            return None;
+        }
+        Some(Self {
+            desired_headers: Self::select_headers(&header_names, initial_headers),
+            observed_headers: Self::select_headers(&header_names, merged_headers),
+            policy_only_promoted_headers: HashSet::new(),
+            header_names,
+        })
+    }
+
+    fn select_headers(
+        header_names: &[String],
+        source: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut selected = HashMap::with_capacity(header_names.len());
+        for name in header_names {
+            if let Some(value) = source.get(name) {
+                selected.insert(name.clone(), value.clone());
+            }
+        }
+        selected
+    }
+
+    /// Advance the genuine-initial-header outcome after one real hook has run.
+    /// Values are cloned only when a hook actually changes a policy-owned name.
+    pub fn record_after_proxy_plugin(
+        &mut self,
+        plugin: &dyn Plugin,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if plugin.is_initial_response_header_policy() {
+            plugin.apply_initial_response_header_policy(&mut self.desired_headers);
+            for name in self.header_names.iter() {
+                let hook_changed_value =
+                    self.observed_headers.get(name) != response_headers.get(name);
+                if hook_changed_value {
+                    self.policy_only_promoted_headers.remove(name);
+                } else if self.desired_headers.get(name) != response_headers.get(name) {
+                    match self.desired_headers.get(name) {
+                        Some(value) => {
+                            response_headers.insert(name.clone(), value.clone());
+                        }
+                        None => {
+                            response_headers.remove(name);
+                        }
+                    }
+                    self.policy_only_promoted_headers.insert(name.clone());
+                }
+                match response_headers.get(name) {
+                    Some(value) if self.observed_headers.get(name) != Some(value) => {
+                        self.observed_headers.insert(name.clone(), value.clone());
+                    }
+                    None => {
+                        self.observed_headers.remove(name);
+                    }
+                    Some(_) => {}
+                }
+            }
+            return;
+        }
+
+        for name in self.header_names.iter() {
+            let observed = self.observed_headers.get(name);
+            let current = response_headers.get(name);
+            if observed == current {
+                continue;
+            }
+            match current {
+                Some(value) => {
+                    self.desired_headers.insert(name.clone(), value.clone());
+                    self.observed_headers.insert(name.clone(), value.clone());
+                    self.policy_only_promoted_headers.remove(name);
+                }
+                None => {
+                    self.desired_headers.remove(name);
+                    self.observed_headers.remove(name);
+                    self.policy_only_promoted_headers.remove(name);
+                }
+            }
+        }
+    }
+
+    /// Whether a trailer-only compatibility value was replaced solely so later
+    /// header hooks could observe the genuine initial-header policy outcome.
+    pub fn preserves_backend_application_trailer(&self, name: &str) -> bool {
+        self.policy_only_promoted_headers.contains(name)
+    }
+
+    /// Apply the final ordered policy-owned fields to genuine initial HEADERS.
+    pub fn apply_to_initial_headers(&self, response_headers: &mut HashMap<String, String>) {
+        for name in self.header_names.iter() {
+            response_headers.remove(name);
+            if let Some(value) = self.desired_headers.get(name) {
+                response_headers.insert(name.clone(), value.clone());
+            }
+        }
     }
 }
 
@@ -507,6 +617,12 @@ pub struct RequestContext {
     /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
     request_headers_to_redact: Option<Arc<Vec<String>>>,
+    /// Buffered response policy provenance, present only while the ordered
+    /// `after_proxy` chain is processing a merged gRPC header+trailer view.
+    /// Shared through `Arc` so the rare hook-preflight context clone remains
+    /// cheap; the live request uses `Arc::make_mut` after the clone is dropped.
+    buffered_initial_response_header_policy_state:
+        Option<Arc<BufferedInitialResponseHeaderPolicyState>>,
     /// Semantic-cache embedding vector staged between `before_proxy` and
     /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
     /// vectors cannot enter transaction logs.
@@ -831,6 +947,7 @@ impl RequestContext {
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
             request_headers_to_redact: None,
+            buffered_initial_response_header_policy_state: None,
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
@@ -893,6 +1010,42 @@ impl RequestContext {
         self.response_stream_id
     }
 
+    /// Begin tracking initial-response policy against genuine initial headers
+    /// while hooks operate on a merged buffered gRPC compatibility view.
+    pub(crate) fn begin_buffered_initial_response_header_policy(
+        &mut self,
+        header_names: Arc<Vec<String>>,
+        initial_headers: &HashMap<String, String>,
+        merged_headers: &HashMap<String, String>,
+    ) {
+        self.buffered_initial_response_header_policy_state =
+            BufferedInitialResponseHeaderPolicyState::new(
+                header_names,
+                initial_headers,
+                merged_headers,
+            )
+            .map(Arc::new);
+    }
+
+    pub(crate) fn record_buffered_initial_response_header_plugin(
+        &mut self,
+        plugin: &dyn Plugin,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if let Some(state) = self
+            .buffered_initial_response_header_policy_state
+            .as_mut()
+        {
+            Arc::make_mut(state).record_after_proxy_plugin(plugin, response_headers);
+        }
+    }
+
+    pub(crate) fn take_buffered_initial_response_header_policy(
+        &mut self,
+    ) -> Option<Arc<BufferedInitialResponseHeaderPolicyState>> {
+        self.buffered_initial_response_header_policy_state.take()
+    }
+
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
     /// transforms. Only `metadata` is copied back to the real context by the
@@ -930,6 +1083,7 @@ impl RequestContext {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
+            buffered_initial_response_header_policy_state: None,
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
@@ -3006,6 +3160,13 @@ pub trait Plugin: Send + Sync {
         &self,
         _response_headers: &mut HashMap<String, String>,
     ) {
+    }
+
+    /// Canonical field names this initial-response policy may set or remove.
+    /// The plugin cache unions these at reload time so buffered protocol paths
+    /// track only relevant fields and never scan the plugin chain per request.
+    fn initial_response_header_policy_names(&self) -> &[String] {
+        &[]
     }
 
     /// Returns `true` when this plugin may change the response `Content-Type`

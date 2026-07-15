@@ -192,7 +192,7 @@ where
     pub xff_append_ip: &'a str,
     pub ctx: &'a mut RequestContext,
     pub plugins: &'a [Arc<dyn Plugin>],
-    pub initial_response_header_policy_plugins: &'a [Arc<dyn Plugin>],
+    pub initial_response_header_policy_names: Arc<Vec<String>>,
     pub backend_admission_plugins: &'a [Arc<dyn Plugin>],
     pub preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
     pub requires_response_body_buffering: bool,
@@ -525,7 +525,7 @@ where
         xff_append_ip,
         ctx,
         plugins,
-        initial_response_header_policy_plugins,
+        initial_response_header_policy_names,
         backend_admission_plugins,
         preacquired_backend_admission,
         requires_response_body_buffering,
@@ -660,7 +660,7 @@ where
                 backend_start,
                 ctx,
                 plugins,
-                initial_response_header_policy_plugins,
+                initial_response_header_policy_names,
                 backend_admission_plugins,
                 requires_response_body_buffering,
                 has_response_committed_hook,
@@ -3033,7 +3033,7 @@ async fn dispatch_grpc<S>(
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
-    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_names: Arc<Vec<String>>,
     backend_admission_plugins: &[Arc<dyn Plugin>],
     requires_response_body_buffering: bool,
     has_response_committed_hook: bool,
@@ -3469,15 +3469,25 @@ where
                     &resp.headers,
                     &resp.trailers,
                 );
-            if !plugins.is_empty()
-                && let Some(reject) = crate::proxy::run_after_proxy_hooks(
+            ctx.begin_buffered_initial_response_header_policy(
+                initial_response_header_policy_names,
+                &resp.headers,
+                &plugin_response_headers,
+            );
+            let after_proxy_reject = if !plugins.is_empty() {
+                crate::proxy::run_after_proxy_hooks(
                     plugins,
                     ctx,
                     resp.status,
                     &mut plugin_response_headers,
                 )
                 .await
-            {
+            } else {
+                None
+            };
+            let mut buffered_initial_response_header_policy_state =
+                ctx.take_buffered_initial_response_header_policy();
+            if let Some(reject) = after_proxy_reject {
                 let reject_status = reject.status_code;
                 let mut outcome = match write_final_body_reject(
                     stream,
@@ -3608,6 +3618,7 @@ where
                             &mut response_trailers,
                         )
                         .await;
+                        buffered_initial_response_header_policy_state = None;
                         break;
                     }
                 }
@@ -3663,6 +3674,7 @@ where
                             &mut response_trailers,
                         )
                         .await;
+                        buffered_initial_response_header_policy_state = None;
                         break;
                     }
                 }
@@ -3688,6 +3700,7 @@ where
                 &plugin_response_headers,
                 &resp.headers,
                 &header_shadowed_trailer_keys,
+                buffered_initial_response_header_policy_state.as_deref(),
             );
             // Admission retains the pristine backend status; transaction
             // metadata follows the post-hook status that the H3 client sees.
@@ -3702,8 +3715,8 @@ where
                 &response_trailers,
                 &header_shadowed_trailer_keys,
             );
-            crate::proxy::grpc_proxy::replay_buffered_grpc_initial_response_policies(
-                initial_response_header_policy_plugins,
+            crate::proxy::grpc_proxy::apply_buffered_grpc_initial_response_policy(
+                buffered_initial_response_header_policy_state.as_deref(),
                 &mut response_headers,
                 response_body.is_empty(),
             );

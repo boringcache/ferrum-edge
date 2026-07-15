@@ -1142,9 +1142,14 @@ pub(crate) async fn handle_h3_websocket(
     // are HTTP/1.1 only). The QUIC stream becomes the WebSocket
     // transport as soon as the client sees the 200.
     let mut response_headers = HashMap::new();
+    crate::proxy::finalize_websocket_response_headers(
+        &initial_response_header_policy_plugins,
+        &mut response_headers,
+    );
 
     // Sticky session cookie on the WS upgrade response, mirroring the
-    // H1/H2 path.
+    // H1/H2 path. Gateway affinity is injected after operator response
+    // policy so the selected-target cookie cannot be removed or replaced.
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
@@ -1169,10 +1174,6 @@ pub(crate) async fn handle_h3_websocket(
             response_headers.insert("set-cookie".to_string(), cookie_val);
         }
     }
-    crate::proxy::finalize_websocket_response_headers(
-        &initial_response_header_policy_plugins,
-        &mut response_headers,
-    );
     let mut response_builder = crate::proxy::headers::apply_response_headers(
         Response::builder().status(StatusCode::OK),
         &response_headers,

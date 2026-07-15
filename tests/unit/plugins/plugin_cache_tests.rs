@@ -3188,6 +3188,16 @@ fn test_initial_response_policy_plan_preserves_multiple_instance_priority_order(
     let mut headers = HashMap::new();
 
     assert_eq!(policy_plugins.len(), 2);
+    let policy_names = view.initial_response_header_policy_names();
+    assert_eq!(
+        policy_names
+            .iter()
+            .filter(|name| name.as_str() == "x-order")
+            .count(),
+        1,
+        "multiple policy instances must share one precomputed provenance name"
+    );
+    assert!(policy_names.iter().any(|name| name == "x-removed"));
     apply_initial_response_header_policies(&policy_plugins, &mut headers);
     assert_eq!(headers.get("x-order").map(String::as_str), Some("second"));
     assert!(!headers.contains_key("x-removed"));

@@ -4,7 +4,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 use ferrum_edge::plugins::security_headers::SecurityHeaders;
-use ferrum_edge::plugins::{Plugin, RequestContext};
+use ferrum_edge::plugins::{
+    BufferedInitialResponseHeaderPolicyState, Plugin, RequestContext,
+    response_transformer::ResponseTransformer,
+};
 use ferrum_edge::proxy::build_backend_url;
 use ferrum_edge::proxy::grpc_proxy;
 use serde_json::json;
@@ -621,6 +624,7 @@ fn reconcile_propagates_hook_edit_of_shadowed_key_into_trailer() {
         &view,
         &original_headers,
         &shadowed,
+        None,
     );
 
     // The sanitized value must scrub the hidden trailer copy too.
@@ -643,6 +647,7 @@ fn reconcile_keeps_backend_trailer_value_for_untouched_shadowed_key() {
         &view,
         &original_headers,
         &shadowed,
+        None,
     );
 
     // An untouched shadowed trailer must keep the backend's true trailing value,
@@ -670,6 +675,7 @@ fn reconcile_drops_hook_removed_keys() {
         &view,
         &original_headers,
         &shadowed,
+        None,
     );
 
     assert_eq!(trailers.get("grpc-status").map(String::as_str), Some("0"));
@@ -695,6 +701,7 @@ fn reconcile_propagates_trailer_only_edit_and_keeps_untouched() {
         &view,
         &original_headers,
         &shadowed,
+        None,
     );
 
     assert_eq!(trailers.get("x-edited").map(String::as_str), Some("edited"));
@@ -737,6 +744,7 @@ fn build_then_reconcile_matches_buffered_writeback_scenario() {
         &view,
         &backend_headers,
         &shadowed,
+        None,
     );
 
     // Terminal status keeps the backend's true trailing values.
@@ -764,7 +772,7 @@ fn build_then_reconcile_matches_buffered_writeback_scenario() {
 }
 
 #[tokio::test]
-async fn buffered_policy_is_reapplied_to_initial_headers_without_promoting_trailers() {
+async fn buffered_policy_is_applied_to_initial_headers_without_promoting_trailers() {
     let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
     let backend_trailers = grpc_map(&[
         ("grpc-status", "0"),
@@ -785,8 +793,15 @@ async fn buffered_policy_is_reapplied_to_initial_headers_without_promoting_trail
         }))
         .unwrap(),
     );
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
     let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
     let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
 
     let mut wire_trailers = backend_trailers.clone();
     grpc_proxy::reconcile_grpc_trailers_from_view(
@@ -794,6 +809,7 @@ async fn buffered_policy_is_reapplied_to_initial_headers_without_promoting_trail
         &plugin_view,
         &backend_headers,
         &shadowed,
+        Some(&policy_state),
     );
     let mut initial_headers = plugin_view;
     grpc_proxy::strip_non_initial_grpc_trailer_fields(
@@ -801,8 +817,8 @@ async fn buffered_policy_is_reapplied_to_initial_headers_without_promoting_trail
         &wire_trailers,
         &shadowed,
     );
-    grpc_proxy::replay_buffered_grpc_initial_response_policies(
-        &[policy],
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        Some(&policy_state),
         &mut initial_headers,
         false,
     );
@@ -837,6 +853,100 @@ async fn buffered_policy_is_reapplied_to_initial_headers_without_promoting_trail
 }
 
 #[tokio::test]
+async fn buffered_policy_state_preserves_later_header_mutator_order() {
+    let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
+    let backend_trailers = grpc_map(&[("grpc-status", "0"), ("x-policy", "backend-trailer")]);
+    let (mut plugin_view, _) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": false,
+            "set": { "X-Policy": "gateway-policy" }
+        }))
+        .unwrap(),
+    );
+    let later_mutator: Arc<dyn Plugin> = Arc::new(
+        ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Policy",
+                "value": "later-transformer"
+            }]
+        }))
+        .unwrap(),
+    );
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
+
+    let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+    let _ = later_mutator
+        .after_proxy(&mut ctx, 200, &mut plugin_view)
+        .await;
+    policy_state.record_after_proxy_plugin(later_mutator.as_ref(), &mut plugin_view);
+
+    let mut final_initial_headers = backend_headers;
+    policy_state.apply_to_initial_headers(&mut final_initial_headers);
+    assert_eq!(
+        final_initial_headers.get("x-policy").map(String::as_str),
+        Some("later-transformer"),
+        "a later response-header mutator must retain priority over policy"
+    );
+}
+
+#[test]
+fn buffered_policy_overlay_preserves_transform_owned_content_length() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {
+                "Content-Length": "1",
+                "X-Policy": "gateway-policy"
+            }
+        }))
+        .unwrap(),
+    );
+    let initial_headers = HashMap::new();
+    let mut merged_headers = HashMap::new();
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &initial_headers,
+        &merged_headers,
+    )
+    .unwrap();
+    policy.apply_initial_response_header_policy(&mut merged_headers);
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut merged_headers);
+
+    let mut transformed_headers = grpc_map(&[("content-length", "73")]);
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        Some(&policy_state),
+        &mut transformed_headers,
+        false,
+    );
+    assert_eq!(
+        transformed_headers.get("content-length").map(String::as_str),
+        Some("73")
+    );
+    assert_eq!(
+        transformed_headers.get("x-policy").map(String::as_str),
+        Some("gateway-policy")
+    );
+
+    let mut absent_content_length = HashMap::new();
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        Some(&policy_state),
+        &mut absent_content_length,
+        false,
+    );
+    assert!(!absent_content_length.contains_key("content-length"));
+}
+
+#[tokio::test]
 async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata() {
     let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
     let backend_trailers = grpc_map(&[
@@ -860,8 +970,15 @@ async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata(
         }))
         .unwrap(),
     );
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
     let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
     let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
 
     let mut wire_trailers = backend_trailers;
     grpc_proxy::reconcile_grpc_trailers_from_view(
@@ -869,12 +986,13 @@ async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata(
         &plugin_view,
         &backend_headers,
         &shadowed,
+        Some(&policy_state),
     );
     grpc_proxy::collapse_grpc_trailers_only_with_initial_response_policies(
         &mut plugin_view,
         &mut wire_trailers,
         &shadowed,
-        &[policy],
+        Some(&policy_state),
     );
 
     assert!(wire_trailers.is_empty());

@@ -43,7 +43,7 @@ use tracing::{debug, error, warn};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
-use crate::plugins::Plugin;
+use crate::plugins::{BufferedInitialResponseHeaderPolicyState, Plugin};
 use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
@@ -1552,6 +1552,7 @@ pub fn reconcile_grpc_trailers_from_view(
     plugin_response_headers: &HashMap<String, String>,
     original_response_headers: &HashMap<String, String>,
     header_shadowed_trailer_keys: &HashSet<String>,
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
 ) {
     response_trailers.retain(|k, v| match plugin_response_headers.get(k) {
         Some(plugin_value) => {
@@ -1559,6 +1560,14 @@ pub fn reconcile_grpc_trailers_from_view(
                 if original_response_headers.get(k) != Some(plugin_value) {
                     *v = plugin_value.clone();
                 }
+            } else if policy_state.is_some_and(|state| {
+                state.preserves_backend_application_trailer(k)
+            }) {
+                // A trailer-only value suppressed an override_existing=false
+                // initial-header policy in the merged compatibility view. The
+                // policy state promoted its genuine initial value so later
+                // hooks saw correct ordering; keep the untouched application
+                // trailer on its original channel.
             } else if plugin_value != v {
                 *v = plugin_value.clone();
             }
@@ -1569,13 +1578,13 @@ pub fn reconcile_grpc_trailers_from_view(
 }
 
 /// Remove compatibility-view trailer copies from buffered gRPC initial headers
-/// before deterministic response policy is reapplied to the initial map.
+/// before the ordered response-policy outcome is applied to the initial map.
 ///
 /// Buffered response hooks historically receive one merged header+trailer map.
 /// After trailer reconciliation, ordinary trailer-only fields must return to the
-/// trailer channel. Callers then reapply the plugin-cache-prefiltered initial
-/// response policy chain so policy values land in initial HEADERS without ever
-/// promoting an application trailer value.
+/// trailer channel. Callers then apply the policy provenance state so policy
+/// values land in initial HEADERS without ever promoting an application
+/// trailer value.
 ///
 /// Header-shadowed trailers already have a genuine initial-header copy and are
 /// left alone. Reserved gRPC terminal metadata is never considered shadowed by
@@ -1605,27 +1614,31 @@ pub fn strip_grpc_terminal_metadata_from_initial(response_headers: &mut HashMap<
     response_headers.remove("grpc-status-details-bin");
 }
 
-/// Replay the buffered initial-header policy while protecting gRPC terminal
+/// Apply the buffered initial-header policy outcome while protecting gRPC terminal
 /// metadata owned by a legitimate Trailers-Only initial HEADERS block.
 ///
 /// Policy-supplied terminal fields are always discarded. When
 /// `preserve_terminal_metadata` is true, only values already present before
-/// the replay are restored; otherwise terminal metadata remains exclusive to
-/// the wire trailer channel. The shared buffered replay also preserves the
-/// transform-owned `content-length`.
-pub fn replay_buffered_grpc_initial_response_policies(
-    policy_plugins: &[Arc<dyn Plugin>],
+/// policy application are restored; otherwise terminal metadata remains
+/// exclusive to the wire trailer channel. The transform-owned
+/// `content-length` is preserved across the policy overlay.
+pub fn apply_buffered_grpc_initial_response_policy(
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
     response_headers: &mut HashMap<String, String>,
     preserve_terminal_metadata: bool,
 ) {
+    let content_length = response_headers.remove_entry("content-length");
     let grpc_status = response_headers.remove_entry("grpc-status");
     let grpc_message = response_headers.remove_entry("grpc-message");
     let grpc_status_details = response_headers.remove_entry("grpc-status-details-bin");
 
-    crate::plugins::replay_initial_response_header_policies_after_buffering(
-        policy_plugins,
-        response_headers,
-    );
+    if let Some(policy_state) = policy_state {
+        policy_state.apply_to_initial_headers(response_headers);
+    }
+    response_headers.remove("content-length");
+    if let Some((name, value)) = content_length {
+        response_headers.insert(name, value);
+    }
     strip_grpc_terminal_metadata_from_initial(response_headers);
 
     if preserve_terminal_metadata {
@@ -1652,14 +1665,14 @@ pub fn collapse_grpc_trailers_only_with_initial_response_policies(
     response_headers: &mut HashMap<String, String>,
     response_trailers: &mut HashMap<String, String>,
     header_shadowed_trailer_keys: &HashSet<String>,
-    policy_plugins: &[Arc<dyn Plugin>],
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
 ) {
     strip_non_initial_grpc_trailer_fields(
         response_headers,
         response_trailers,
         header_shadowed_trailer_keys,
     );
-    replay_buffered_grpc_initial_response_policies(policy_plugins, response_headers, true);
+    apply_buffered_grpc_initial_response_policy(policy_state, response_headers, true);
 
     for (name, value) in response_trailers.drain() {
         if name == "content-length" {
@@ -1673,7 +1686,7 @@ pub fn collapse_grpc_trailers_only_with_initial_response_policies(
         }
     }
 
-    replay_buffered_grpc_initial_response_policies(policy_plugins, response_headers, true);
+    apply_buffered_grpc_initial_response_policy(policy_state, response_headers, true);
 }
 
 /// Re-home a hook-mutated trailer-only `set-cookie` onto the buffered gRPC

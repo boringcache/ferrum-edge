@@ -26,6 +26,9 @@ pub struct SecurityHeaders {
     set: Vec<(String, String)>,
     /// Header names (lowercase) to strip from the response.
     remove: Vec<String>,
+    /// Unique canonical names touched by `set` or `remove`, precomputed for
+    /// buffered initial-header provenance tracking.
+    policy_header_names: Vec<String>,
     /// When false, only add a header if the backend did not already set it.
     override_existing: bool,
 }
@@ -97,9 +100,17 @@ impl SecurityHeaders {
             );
         }
 
+        let mut policy_header_names = Vec::with_capacity(set.len() + remove.len());
+        for name in remove.iter().chain(set.iter().map(|(name, _)| name)) {
+            if !policy_header_names.contains(name) {
+                policy_header_names.push(name.clone());
+            }
+        }
+
         Ok(Self {
             set,
             remove,
+            policy_header_names,
             override_existing,
         })
     }
@@ -149,6 +160,10 @@ impl Plugin for SecurityHeaders {
 
     fn apply_initial_response_header_policy(&self, response_headers: &mut HashMap<String, String>) {
         self.apply(response_headers);
+    }
+
+    fn initial_response_header_policy_names(&self) -> &[String] {
+        &self.policy_header_names
     }
 
     fn may_add_response_cache_control_no_transform(
