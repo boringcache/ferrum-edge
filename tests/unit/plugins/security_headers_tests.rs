@@ -176,7 +176,10 @@ async fn accepts_complete_http_field_name_grammar_and_canonicalizes_case() {
     plugin.after_proxy(&mut ctx, 200, &mut headers).await;
 
     let canonical = name.to_ascii_lowercase();
-    assert_eq!(headers.get(&canonical).map(String::as_str), Some("accepted"));
+    assert_eq!(
+        headers.get(&canonical).map(String::as_str),
+        Some("accepted")
+    );
     assert_eq!(headers.keys().filter(|key| *key == &canonical).count(), 1);
 }
 
@@ -203,23 +206,7 @@ fn rejects_names_outside_http_field_name_grammar_without_trimming() {
     ];
     invalid.extend(
         [
-            '(',
-            ')',
-            '<',
-            '>',
-            '@',
-            ',',
-            ';',
-            ':',
-            '\\',
-            '"',
-            '/',
-            '[',
-            ']',
-            '?',
-            '=',
-            '{',
-            '}',
+            '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}',
         ]
         .into_iter()
         .map(|separator| format!("x{separator}name")),
@@ -316,9 +303,7 @@ fn rejects_unknown_top_level_and_nested_hsts_keys_with_paths() {
         }
     }))
     .unwrap_err();
-    assert!(err.contains(
-        "under 'security_headers.hsts': include_subdomain, unknown"
-    ));
+    assert!(err.contains("under 'security_headers.hsts': include_subdomain, unknown"));
 }
 
 #[test]
@@ -356,8 +341,7 @@ fn buffered_policy_replay_preserves_transport_owned_content_length() {
         }))
         .unwrap(),
     );
-    let mut transformed_headers =
-        HashMap::from([("content-length".to_string(), "73".to_string())]);
+    let mut transformed_headers = HashMap::from([("content-length".to_string(), "73".to_string())]);
 
     replay_initial_response_header_policies_after_buffering(
         std::slice::from_ref(&policy),
@@ -365,7 +349,9 @@ fn buffered_policy_replay_preserves_transport_owned_content_length() {
     );
 
     assert_eq!(
-        transformed_headers.get("content-length").map(String::as_str),
+        transformed_headers
+            .get("content-length")
+            .map(String::as_str),
         Some("73")
     );
     assert_eq!(

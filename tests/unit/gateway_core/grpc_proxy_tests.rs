@@ -786,9 +786,7 @@ async fn buffered_policy_is_reapplied_to_initial_headers_without_promoting_trail
         .unwrap(),
     );
     let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
-    let _ = policy
-        .after_proxy(&mut ctx, 200, &mut plugin_view)
-        .await;
+    let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
 
     let mut wire_trailers = backend_trailers.clone();
     grpc_proxy::reconcile_grpc_trailers_from_view(
@@ -863,9 +861,7 @@ async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata(
         .unwrap(),
     );
     let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
-    let _ = policy
-        .after_proxy(&mut ctx, 200, &mut plugin_view)
-        .await;
+    let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
 
     let mut wire_trailers = backend_trailers;
     grpc_proxy::reconcile_grpc_trailers_from_view(
@@ -887,9 +883,7 @@ async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata(
         Some("gateway-enforced")
     );
     assert_eq!(
-        plugin_view
-            .get("x-application-trailer")
-            .map(String::as_str),
+        plugin_view.get("x-application-trailer").map(String::as_str),
         Some("application-value")
     );
     assert!(!plugin_view.contains_key("x-removed-trailer"));

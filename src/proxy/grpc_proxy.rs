@@ -43,8 +43,8 @@ use tracing::{debug, error, warn};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
-use crate::pool::{GenericPool, PoolManager};
 use crate::plugins::Plugin;
+use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
     parse_connection_listed_headers,
@@ -1599,9 +1599,7 @@ pub fn strip_non_initial_grpc_trailer_fields(
 /// An operator may deliberately name a gRPC metadata field in a generic header
 /// policy, but the protocol boundary must still keep terminal status on the
 /// trailer channel.
-pub fn strip_grpc_terminal_metadata_from_initial(
-    response_headers: &mut HashMap<String, String>,
-) {
+pub fn strip_grpc_terminal_metadata_from_initial(response_headers: &mut HashMap<String, String>) {
     response_headers.remove("grpc-status");
     response_headers.remove("grpc-message");
     response_headers.remove("grpc-status-details-bin");
@@ -1667,8 +1665,7 @@ pub fn collapse_grpc_trailers_only_with_initial_response_policies(
         if name == "content-length" {
             continue;
         }
-        if is_reserved_grpc_terminal_metadata(&name)
-            || header_shadowed_trailer_keys.contains(&name)
+        if is_reserved_grpc_terminal_metadata(&name) || header_shadowed_trailer_keys.contains(&name)
         {
             response_headers.insert(name, value);
         } else {

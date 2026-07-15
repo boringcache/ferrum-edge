@@ -3067,8 +3067,7 @@ async fn handle_h3_request(
                 xff_append_ip: socket_ip,
                 ctx: &mut ctx,
                 plugins: &plugins,
-                initial_response_header_policy_plugins:
-                    &initial_response_header_policy_plugins,
+                initial_response_header_policy_plugins: &initial_response_header_policy_plugins,
                 backend_admission_plugins: backend_admission_plugins.as_ref(),
                 preacquired_backend_admission,
                 requires_response_body_buffering: maybe_requires_response_body_buffering,

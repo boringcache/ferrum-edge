@@ -795,9 +795,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         authorize_plugins: Arc::new(authorize),
         backend_admission_plugins: Arc::new(backend_admission),
         request_headers_to_redact: Arc::new(request_headers_to_redact),
-        initial_response_header_policy_plugins: Arc::new(
-            initial_response_header_policy_plugins,
-        ),
+        initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
         capabilities: PluginCapabilities(caps),
     }
 }

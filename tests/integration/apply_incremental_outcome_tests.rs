@@ -380,7 +380,10 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
         loaded_at: Utc::now(),
         ..GatewayConfig::default()
     };
-    assert_eq!(state.update_config(valid.clone()), ConfigApplyOutcome::Applied);
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
     assert!(
         state
             .plugin_cache

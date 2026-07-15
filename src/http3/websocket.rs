@@ -431,10 +431,8 @@ async fn send_h3_reject_body<S>(
         initial_response_header_policy_plugins,
         &mut headers,
     );
-    let builder = crate::proxy::headers::apply_response_headers(
-        Response::builder().status(status),
-        &headers,
-    );
+    let builder =
+        crate::proxy::headers::apply_response_headers(Response::builder().status(status), &headers);
     let resp = match builder.body(()) {
         Ok(r) => r,
         Err(e) => {

@@ -986,14 +986,10 @@ async fn grpc_buffered_trailers_only_keeps_status_and_security_policy_initial() 
     );
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
-    let (status, headers, body) = send_grpc_request(
-        gateway_addr,
-        "/grpc/my.Service/Unary",
-        b"",
-        &[],
-    )
-    .await
-    .expect("trailers-only gRPC response");
+    let (status, headers, body) =
+        send_grpc_request(gateway_addr, "/grpc/my.Service/Unary", b"", &[])
+            .await
+            .expect("trailers-only gRPC response");
 
     assert_eq!(status, 200);
     assert!(body.is_empty());
@@ -1004,9 +1000,7 @@ async fn grpc_buffered_trailers_only_keeps_status_and_security_policy_initial() 
         Some("gateway-enforced")
     );
     assert_eq!(
-        headers
-            .get("strict-transport-security")
-            .map(String::as_str),
+        headers.get("strict-transport-security").map(String::as_str),
         Some("max-age=31536000; includeSubDomains")
     );
     assert_eq!(
@@ -1352,7 +1346,10 @@ async fn grpc_buffered_security_policy_stays_initial_without_relocating_trailers
         .header("te", "trailers")
         .body(Full::new(Bytes::new()))
         .unwrap();
-    let response = sender.send_request(request).await.expect("request send failed");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("request send failed");
 
     assert_eq!(
         response
@@ -1533,10 +1530,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     );
     assert_eq!(status, 200);
     assert_eq!(security_policy.as_deref(), Some("gateway-enforced"));
-    assert_eq!(
-        hsts.as_deref(),
-        Some("max-age=31536000; includeSubDomains")
-    );
+    assert_eq!(hsts.as_deref(), Some("max-age=31536000; includeSubDomains"));
     assert_eq!(
         content_type.as_deref(),
         Some("application/grpc-web+proto"),

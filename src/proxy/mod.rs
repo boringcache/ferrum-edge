@@ -8143,8 +8143,7 @@ pub(crate) fn finalize_websocket_response_headers(
         initial_response_header_policy_plugins,
         response_headers,
     );
-    response_headers
-        .retain(|name, _| !is_websocket_transport_managed_response_header(name));
+    response_headers.retain(|name, _| !is_websocket_transport_managed_response_header(name));
 }
 
 fn build_websocket_error_response(

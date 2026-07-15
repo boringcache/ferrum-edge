@@ -7,8 +7,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, ProxyProtocol, RequestContext,
-    apply_initial_response_header_policies,
+    Plugin, PluginResult, ProxyProtocol, RequestContext, apply_initial_response_header_policies,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use ferrum_edge::{PluginCache, PluginCapabilities};

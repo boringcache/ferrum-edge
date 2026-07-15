@@ -2142,11 +2142,6 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
         json!({ "permissions_policy": "caf\u{00e9}" }),
         json!({ "set": { "X-Policy": "caf\u{00e9}" } }),
     ] {
-        assert_component_validity(
-            &spec,
-            "SecurityHeadersConfig",
-            &non_ascii_value,
-            false,
-        );
+        assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
 }

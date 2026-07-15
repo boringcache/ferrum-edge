@@ -318,11 +318,9 @@ fn parse_remove(object: &serde_json::Map<String, Value>) -> Result<Vec<String>, 
         Some(Value::Array(values)) => {
             let mut out = Vec::with_capacity(values.len());
             for value in values {
-                let name = value
-                    .as_str()
-                    .ok_or_else(|| {
-                        "security_headers: 'remove' entries must be strings".to_string()
-                    })?;
+                let name = value.as_str().ok_or_else(|| {
+                    "security_headers: 'remove' entries must be strings".to_string()
+                })?;
                 out.push(parse_header_name("remove", name)?);
             }
             Ok(out)
