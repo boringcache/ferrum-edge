@@ -7,7 +7,7 @@ fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
     let after_selection = &source[selection..];
 
     let cap = after_selection
-        .find("let selected_base_proxy =")
+        .find("let mut selected_base_proxy =")
         .expect("H3 frontend must cap retry policy by selected target");
     let effective = after_selection
         .find("let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(")
@@ -189,13 +189,20 @@ fn h3_grpc_streaming_bridge_keeps_unresolved_base_proxy_for_selected_target() {
 #[test]
 fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     let source = include_str!("../../../src/http3/server.rs");
+    let backend_path_plugins = source
+        .find("let backend_path_plugins = plugin_cache_view.backend_path_plugins();")
+        .expect("H3 must load the prefiltered backend-path policy list");
     let selection = source
         .find("let mut selection = crate::proxy::backend_dispatch::select_upstream_target(")
         .expect("H3 selected-target lookup must remain present");
+    assert!(
+        backend_path_plugins < selection,
+        "H3 must load the cached backend-path plugin view before target selection"
+    );
     let after_selection = &source[selection..];
     let path_policy = after_selection
-        .find("let backend_path_plugins = plugin_cache_view.backend_path_plugins();")
-        .expect("H3 must load the prefiltered backend-path policy list");
+        .find("if backend_path_is_policy_bound {")
+        .expect("H3 must enforce backend-path policy after selecting a target");
     let circuit_breaker = after_selection
         .find("check_circuit_breaker(")
         .expect("H3 circuit-breaker check must remain present");
