@@ -791,6 +791,32 @@ async fn terminal_deadline_reject_runs_decorators_but_not_replacers() {
 }
 
 #[test]
+fn generic_retry_backoff_uses_request_aware_grpc_deadline_response() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let retry_loop = source
+        .find("while retry::should_retry(retry_config, &method, &result, attempt) {")
+        .expect("generic HTTP retry loop must remain present");
+    let retry_loop = &source[retry_loop..];
+    let backoff_end = retry_loop
+        .find("attempt += 1;")
+        .expect("generic HTTP retry backoff must remain present");
+    let backoff = &retry_loop[..backoff_end];
+
+    assert!(
+        backoff.contains("client_grpc_deadline_exceeded_response_for_request("),
+        "gRPC-Web retry-backoff expiry must use the request-aware deadline shaper"
+    );
+    assert!(
+        !backoff.contains(
+            "client_grpc_deadline_exceeded_response(result.backend_resolved_ip.clone())"
+        ),
+        "the generic retry backoff must not regress to native-only gRPC framing"
+    );
+    assert!(backoff.contains("&ctx,"));
+    assert!(backoff.contains("proxy_headers,"));
+}
+
+#[test]
 fn test_request_context_effective_identity_prefers_consumer_then_external_identity() {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),

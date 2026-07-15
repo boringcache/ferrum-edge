@@ -622,6 +622,93 @@ pub mod _test_support {
         pub grpc_message: Option<String>,
     }
 
+    pub struct DeadlineBackendResponse {
+        pub status_code: u16,
+        pub headers: HashMap<String, String>,
+        pub body: Vec<u8>,
+        pub connection_error: bool,
+        pub error_class: Option<crate::retry::ErrorClass>,
+    }
+
+    pub struct PreacquiredBackendAdmissionForTest {
+        inner: crate::proxy::PreacquiredBackendAdmission,
+    }
+
+    impl PreacquiredBackendAdmissionForTest {
+        pub fn acquired(permits: Option<crate::plugins::BackendAdmissionPermitSet>) -> Self {
+            Self {
+                inner: crate::proxy::PreacquiredBackendAdmission::acquired(permits),
+            }
+        }
+
+        pub fn take_if_acquired(
+            &mut self,
+        ) -> Option<Option<crate::plugins::BackendAdmissionPermitSet>> {
+            self.inner.take_if_acquired()
+        }
+    }
+
+    pub fn h3_buffered_grpc_deadline_replacement_for_test(
+        grpc_web_response_content_type: Option<&str>,
+    ) -> NormalizedRejectResponse {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Service/Call".to_string(),
+        );
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("x-backend".to_string(), "discard-me".to_string()),
+        ]);
+        let mut body = b"backend response".to_vec();
+        let http_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
+            &mut ctx,
+            grpc_web_response_content_type,
+            &mut headers,
+            &mut body,
+        );
+        NormalizedRejectResponse {
+            http_status,
+            headers,
+            body,
+            grpc_status: ctx
+                .metadata
+                .get("grpc_status")
+                .and_then(|value| value.parse().ok()),
+            grpc_message: ctx.metadata.get("grpc_message").cloned(),
+        }
+    }
+
+    pub fn client_grpc_deadline_response_for_request_for_test(
+        content_type: &str,
+    ) -> DeadlineBackendResponse {
+        let ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Service/Call".to_string(),
+        );
+        let request_headers =
+            HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        let response = crate::proxy::client_grpc_deadline_exceeded_response_for_request(
+            &ctx,
+            &request_headers,
+            None,
+        );
+        let body = match response.body {
+            crate::retry::ResponseBody::Buffered(body) => body,
+            crate::retry::ResponseBody::Streaming { .. }
+            | crate::retry::ResponseBody::StreamingH2(_)
+            | crate::retry::ResponseBody::StreamingH3(_) => Vec::new(),
+        };
+        DeadlineBackendResponse {
+            status_code: response.status_code,
+            headers: response.headers,
+            body,
+            connection_error: response.connection_error,
+            error_class: response.error_class,
+        }
+    }
+
     pub fn can_use_direct_http2_pool(
         enable_http2: bool,
         retain_request_body: bool,

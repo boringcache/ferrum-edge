@@ -683,6 +683,7 @@ where
                 ctx,
                 plugins,
                 backend_admission_plugins,
+                preacquired_backend_admission,
                 requires_response_body_buffering,
                 has_response_committed_hook,
                 sticky_cookie_needed,
@@ -3055,6 +3056,7 @@ async fn dispatch_grpc<S>(
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
+    mut preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
     requires_response_body_buffering: bool,
     has_response_committed_hook: bool,
     sticky_cookie_needed: bool,
@@ -3245,27 +3247,32 @@ where
         (hmap, body_bytes, None, None)
     };
     let mut backend_admission_start = Instant::now();
-    let mut backend_admission_permits = match run_cross_protocol_backend_admission_or_reject(
-        backend_admission_plugins,
-        plugins,
-        ctx,
-        proxy,
-        current_target.as_deref(),
-        HttpFlavor::Grpc,
-        stream,
-        backend_start,
-        bytes_sent,
-        state,
-        current_cb_target_key.as_deref(),
-        cb_retry_probe_slot_available,
-        None,
-    )
-    .await?
-    {
-        Ok(permits) => permits,
-        // Probe release happens inside the helper, before the reject write.
-        Err(outcome) => return Ok(outcome),
-    };
+    let mut backend_admission_permits =
+        if let Some(permits) = preacquired_backend_admission.take_if_acquired() {
+            permits
+        } else {
+            match run_cross_protocol_backend_admission_or_reject(
+                backend_admission_plugins,
+                plugins,
+                ctx,
+                proxy,
+                current_target.as_deref(),
+                HttpFlavor::Grpc,
+                stream,
+                backend_start,
+                bytes_sent,
+                state,
+                current_cb_target_key.as_deref(),
+                cb_retry_probe_slot_available,
+                None,
+            )
+            .await?
+            {
+                Ok(permits) => permits,
+                // Probe release happens inside the helper, before the reject write.
+                Err(outcome) => return Ok(outcome),
+            }
+        };
     record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
     // `hmap` already contains the complete backend-bound header set
     // (plugin-transformed end-to-end headers + canonical forwarding
@@ -4559,11 +4566,19 @@ fn replace_buffered_grpc_response_with_deadline(
     response_body: &mut Vec<u8>,
     response_trailers: &mut HashMap<String, String>,
 ) {
-    let normalized = normalized_h3_grpc_deadline();
-    apply_h3_grpc_reject_metadata(ctx, &normalized);
-    *response_status = normalized.http_status.as_u16();
-    *response_headers = normalized.headers;
-    *response_body = normalized.body;
+    let grpc_web_response_content_type = response_headers
+        .get("content-type")
+        .filter(|content_type| {
+            crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+        })
+        .map(|content_type| crate::plugins::grpc_web::response_content_type(content_type));
+    *response_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
+        ctx,
+        grpc_web_response_content_type,
+        response_headers,
+        response_body,
+    )
+    .as_u16();
     response_trailers.clear();
 }
 

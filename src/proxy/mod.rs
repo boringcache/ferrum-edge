@@ -19056,8 +19056,11 @@ async fn handle_proxy_request_inner(
                     .await
                     .is_err()
                 {
-                    result =
-                        client_grpc_deadline_exceeded_response(result.backend_resolved_ip.clone());
+                    result = client_grpc_deadline_exceeded_response_for_request(
+                        &ctx,
+                        proxy_headers,
+                        result.backend_resolved_ip.clone(),
+                    );
                     break;
                 }
             } else {
@@ -24401,7 +24404,7 @@ fn client_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry:
     response
 }
 
-fn client_grpc_deadline_exceeded_response_for_request(
+pub(crate) fn client_grpc_deadline_exceeded_response_for_request(
     request_ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
     resolved_ip: Option<String>,

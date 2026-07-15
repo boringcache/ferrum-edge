@@ -68,6 +68,132 @@ async fn streaming_grpc_web_deadline_emits_encoded_status_before_backend_data() 
 }
 
 #[test]
+fn buffered_h3_committed_deadline_preserves_binary_text_and_native_framing() {
+    use base64::Engine as _;
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, h3_buffered_grpc_deadline_replacement_for_test, parse_grpc_frames,
+    };
+
+    for content_type in [
+        "application/grpc-web+proto",
+        "application/grpc-web-text+proto",
+    ] {
+        let response =
+            h3_buffered_grpc_deadline_replacement_for_test(Some(content_type));
+        assert_eq!(response.http_status, http::StatusCode::OK);
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some(content_type)
+        );
+        assert_eq!(
+            response.headers.get("x-grpc-web").map(String::as_str),
+            Some("1")
+        );
+        assert!(response.headers.contains_key("access-control-expose-headers"));
+        assert!(!response.headers.contains_key("grpc-status"));
+        assert!(!response.headers.contains_key("grpc-message"));
+
+        let decoded = if content_type.contains("-text") {
+            base64::engine::general_purpose::STANDARD
+                .decode(&response.body)
+                .expect("text gRPC-Web deadline body must be valid base64")
+        } else {
+            response.body.clone()
+        };
+        let frames = parse_grpc_frames(&decoded);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
+        assert!(
+            frames[0]
+                .1
+                .windows(b"grpc-status: 4".len())
+                .any(|window| window == b"grpc-status: 4")
+        );
+        assert!(
+            frames[0]
+                .1
+                .windows(b"grpc-message: Deadline exceeded at gateway".len())
+                .any(|window| window == b"grpc-message: Deadline exceeded at gateway")
+        );
+        assert_eq!(response.grpc_status, Some(4));
+        assert_eq!(
+            response.grpc_message.as_deref(),
+            Some("Deadline exceeded at gateway")
+        );
+    }
+
+    let native = h3_buffered_grpc_deadline_replacement_for_test(None);
+    assert_eq!(native.http_status, http::StatusCode::OK);
+    assert_eq!(
+        native.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(
+        native.headers.get("grpc-status").map(String::as_str),
+        Some("4")
+    );
+    assert_eq!(
+        native.headers.get("grpc-message").map(String::as_str),
+        Some("Deadline exceeded at gateway")
+    );
+    assert!(native.body.is_empty());
+}
+
+#[test]
+fn retry_backoff_deadline_response_is_request_aware_for_grpc_web() {
+    use base64::Engine as _;
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, client_grpc_deadline_response_for_request_for_test,
+        parse_grpc_frames,
+    };
+    use ferrum_edge::retry::ErrorClass;
+
+    for content_type in [
+        "application/grpc-web+proto",
+        "application/grpc-web-text+proto",
+    ] {
+        let response = client_grpc_deadline_response_for_request_for_test(content_type);
+        assert_eq!(response.status_code, 200);
+        assert!(!response.connection_error);
+        assert_eq!(response.error_class, Some(ErrorClass::ClientDisconnect));
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some(content_type)
+        );
+        assert!(!response.headers.contains_key("grpc-status"));
+
+        let decoded = if content_type.contains("-text") {
+            base64::engine::general_purpose::STANDARD
+                .decode(&response.body)
+                .expect("text gRPC-Web retry deadline body must be valid base64")
+        } else {
+            response.body
+        };
+        let frames = parse_grpc_frames(&decoded);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
+        assert!(
+            frames[0]
+                .1
+                .windows(b"grpc-status: 4".len())
+                .any(|window| window == b"grpc-status: 4")
+        );
+    }
+
+    let native = client_grpc_deadline_response_for_request_for_test("application/grpc");
+    assert_eq!(
+        native.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(
+        native.headers.get("grpc-status").map(String::as_str),
+        Some("4")
+    );
+    assert!(native.body.is_empty());
+    assert_eq!(native.error_class, Some(ErrorClass::ClientDisconnect));
+}
+
+#[test]
 fn remaining_duration_rounds_up_to_the_next_wire_millisecond() {
     use ferrum_edge::_test_support::grpc_deadline_duration_millis_ceil_saturating_for_test;
     use std::time::Duration;

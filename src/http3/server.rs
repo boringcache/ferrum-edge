@@ -68,6 +68,13 @@ impl H3ResponseFlavor {
     fn is_grpc(self) -> bool {
         matches!(self, Self::Grpc | Self::GrpcWeb(_))
     }
+
+    fn grpc_web_content_type(self) -> Option<&'static str> {
+        match self {
+            Self::GrpcWeb(content_type) => Some(content_type),
+            Self::Plain | Self::WebSocket | Self::Grpc => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -5360,8 +5367,9 @@ async fn handle_h3_request(
                 .await
                 .is_err()
                 {
-                    response_status = replace_h3_response_with_grpc_deadline(
+                    response_status = replace_buffered_h3_response_with_grpc_deadline(
                         &mut ctx,
+                        response_flavor.grpc_web_content_type(),
                         &mut response_headers,
                         &mut response_body,
                     )
@@ -9097,6 +9105,35 @@ fn replace_h3_response_with_grpc_deadline(
         "Deadline exceeded at gateway".to_string(),
     );
     body.clear();
+    crate::proxy::insert_grpc_error_metadata(
+        &mut ctx.metadata,
+        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+        "Deadline exceeded at gateway",
+    );
+    StatusCode::OK
+}
+
+/// Replace a buffered H3 response that will be written directly as HEADERS +
+/// DATA. Unlike the rejection paths, this response does not pass through the
+/// flavor-aware sender, so gRPC-Web must be encoded here before the caller
+/// writes it to the QUIC stream.
+pub(crate) fn replace_buffered_h3_response_with_grpc_deadline(
+    ctx: &mut RequestContext,
+    grpc_web_response_content_type: Option<&str>,
+    headers: &mut HashMap<String, String>,
+    body: &mut Vec<u8>,
+) -> StatusCode {
+    let Some(content_type) = grpc_web_response_content_type else {
+        return replace_h3_response_with_grpc_deadline(ctx, headers, body);
+    };
+
+    let response = crate::plugins::grpc_web::error_response_for_content_type(
+        content_type,
+        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+        "Deadline exceeded at gateway",
+    );
+    *headers = response.headers;
+    *body = response.body;
     crate::proxy::insert_grpc_error_metadata(
         &mut ctx.metadata,
         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
