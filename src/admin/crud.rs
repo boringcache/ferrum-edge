@@ -175,9 +175,9 @@ pub(crate) async fn validate_hmac_request_transform_candidates(
     }
 
     if let Some(removed_plugin_id) = removed_plugin_id {
-        candidate.plugin_configs.retain(|plugin| {
-            plugin.namespace != namespace || plugin.id != removed_plugin_id
-        });
+        candidate
+            .plugin_configs
+            .retain(|plugin| plugin.namespace != namespace || plugin.id != removed_plugin_id);
     }
 
     for proxy in proxies {
@@ -235,7 +235,9 @@ pub(crate) async fn validate_hmac_request_transform_restore_candidate(
         candidate.proxies.extend(snapshot.proxies);
         candidate.plugin_configs.extend(snapshot.plugin_configs);
     }
-    candidate.proxies.extend(replacement.proxies.iter().cloned());
+    candidate
+        .proxies
+        .extend(replacement.proxies.iter().cloned());
     candidate
         .plugin_configs
         .extend(replacement.plugin_configs.iter().cloned());

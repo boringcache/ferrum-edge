@@ -1651,7 +1651,10 @@ async fn non_hmac_credential_update_revalidates_retained_hmac_credentials() {
     )
     .await;
 
-    assert_eq!(status, 409, "retained HMAC collision was not rejected: {body:?}");
+    assert_eq!(
+        status, 409,
+        "retained HMAC collision was not rejected: {body:?}"
+    );
     assert!(
         body.to_string()
             .contains("Duplicate hmac_auth shared secret"),
@@ -1661,12 +1664,8 @@ async fn non_hmac_credential_update_revalidates_retained_hmac_credentials() {
         !body.to_string().contains(shared_secret),
         "collision response must not disclose the HMAC secret"
     );
-    let (status, consumer, _) = admin_get(
-        &base_url,
-        "/consumers/retained-hmac-stale",
-        &token,
-    )
-    .await;
+    let (status, consumer, _) =
+        admin_get(&base_url, "/consumers/retained-hmac-stale", &token).await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert!(
         consumer["credentials"].get("keyauth").is_none(),
@@ -2226,7 +2225,10 @@ async fn plugin_delete_rejects_revealing_global_body_transformer_beside_hmac() {
         ]
     });
     let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
-    assert_eq!(status, 201, "safe shadowed composition seed failed: {body:?}");
+    assert_eq!(
+        status, 201,
+        "safe shadowed composition seed failed: {body:?}"
+    );
 
     let (status, body) = admin_delete(
         &base_url,
@@ -2310,31 +2312,20 @@ async fn restore_rejects_hmac_request_body_transformer_before_delete() {
             }
         ]
     });
-    let (status, body) = admin_post(
-        &base_url,
-        "/restore?confirm=true",
-        &token,
-        &restore_payload,
-    )
-    .await;
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
 
     assert_eq!(status, 400, "unsafe restore was admitted: {body:?}");
     assert!(
         body["validation_errors"]
             .as_array()
-            .is_some_and(|errors| errors.iter().any(|error| error
-                .as_str()
-                .is_some_and(|error| error.contains(
-                    "hmac_auth cannot be combined with request-body transformer"
-                )))),
+            .is_some_and(|errors| errors
+                .iter()
+                .any(|error| error.as_str().is_some_and(|error| error
+                    .contains("hmac_auth cannot be combined with request-body transformer")))),
         "unexpected restore validation response: {body:?}"
     );
-    let (status, _, _) = admin_get(
-        &base_url,
-        "/proxies/restore-composition-keep",
-        &token,
-    )
-    .await;
+    let (status, _, _) = admin_get(&base_url, "/proxies/restore-composition-keep", &token).await;
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
