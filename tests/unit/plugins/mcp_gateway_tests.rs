@@ -3755,7 +3755,7 @@ async fn aggregate_tools_family_outage_keeps_prompts_healthy_and_recovers_on_ttl
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 105).await;
     assert_eq!(sorted_tool_names(&body), vec!["github.recovered_tool"]);
-    assert!(ctx.metadata.get("mcp.catalog_degraded").is_none());
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
     assert_eq!(tool_requests.load(Ordering::SeqCst), 2);
 }
 
@@ -3991,7 +3991,7 @@ async fn aggregate_resource_templates_distinguish_never_loaded_from_last_good_em
         body["result"]["resourceTemplates"].as_array().map(Vec::len),
         Some(1)
     );
-    assert!(ctx.metadata.get("mcp.catalog_degraded").is_none());
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
     assert_eq!(template_requests.load(Ordering::SeqCst), 4);
 }
 
@@ -4177,7 +4177,7 @@ async fn aggregate_failed_upstream_serves_last_good_entries_stale_and_recovers()
         sorted_tool_names(&body),
         vec!["flaky.flaky_tool", "github.steady_tool"]
     );
-    assert!(ctx.metadata.get("mcp.catalog_degraded").is_none());
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
 
     // Outage: the failed upstream's last-good tool is served stale alongside
     // the healthy upstream's fresh entries and the degraded state is emitted.
@@ -4200,7 +4200,7 @@ async fn aggregate_failed_upstream_serves_last_good_entries_stale_and_recovers()
         sorted_tool_names(&body),
         vec!["flaky.replacement_tool", "github.steady_tool"]
     );
-    assert!(ctx.metadata.get("mcp.catalog_degraded").is_none());
+    assert!(!ctx.metadata.contains_key("mcp.catalog_degraded"));
     assert_eq!(list_requests.load(Ordering::SeqCst), 3);
 }
 
@@ -4380,10 +4380,6 @@ async fn aggregate_initialize_echoes_requested_supported_version() {
     assert_eq!(status, 200);
     // A supported requested version is echoed, not replaced by the preferred one.
     assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
-    assert!(
-        ctx.metadata
-            .get("mcp.protocol_version_negotiated")
-            .is_none()
-    );
+    assert!(!ctx.metadata.contains_key("mcp.protocol_version_negotiated"));
     assert!(response_headers.contains_key("mcp-session-id"));
 }
