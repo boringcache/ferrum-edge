@@ -286,17 +286,14 @@ impl CapturedMeshEgressLifecycle {
 impl Drop for CapturedMeshEgressLifecycle {
     fn drop(&mut self) {
         if !self.completion_recorded
-            && let Some(outcome) = self
-                .udp_outcome_signal
-                .as_ref()
-                .and_then(|signal| {
-                    let outcome = signal.resolve_egress_completion(true);
-                    matches!(
-                        outcome,
-                        CapturedUdpOutcome::IdleTimeout | CapturedUdpOutcome::ProducerShutdown
-                    )
-                    .then_some(outcome)
-                })
+            && let Some(outcome) = self.udp_outcome_signal.as_ref().and_then(|signal| {
+                let outcome = signal.resolve_egress_completion(true);
+                matches!(
+                    outcome,
+                    CapturedUdpOutcome::IdleTimeout | CapturedUdpOutcome::ProducerShutdown
+                )
+                .then_some(outcome)
+            })
         {
             let (bytes_sent, bytes_received) = self
                 .udp_byte_counters
