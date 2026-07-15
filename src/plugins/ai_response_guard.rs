@@ -1924,7 +1924,10 @@ fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
 
 /// Locate exact byte spans of string/number values held by structural keys in
 /// the root JSON object. Scanning the original serialization preserves
-/// duplicate members and contextual whitespace for the residual raw pass.
+/// contextual whitespace for the residual raw pass. For duplicate object
+/// members, only the last scalar for each structural key is maskable, matching
+/// the `serde_json::Value` that redaction actually inspected and preventing
+/// overwritten duplicate values from being hidden from residual detection.
 fn top_level_structural_scalar_spans(
     raw: &str,
     json: &Value,
@@ -1940,6 +1943,7 @@ fn top_level_structural_scalar_spans(
     }
     index += 1;
     let mut spans = Vec::new();
+    let mut structural_keys = Vec::<String>::new();
 
     loop {
         index = skip_json_whitespace(bytes, index);
@@ -1968,6 +1972,12 @@ fn top_level_structural_scalar_spans(
             let raw_value = raw.get(value_start..value_end)?;
             let value = serde_json::from_str::<Value>(raw_value).ok()?;
             if value.is_string() || value.is_number() {
+                if let Some(existing) = structural_keys.iter().position(|seen| seen == key.as_ref())
+                {
+                    structural_keys.remove(existing);
+                    spans.remove(existing);
+                }
+                structural_keys.push(key.into_owned());
                 spans.push(value_start..value_end);
             }
         }

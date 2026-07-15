@@ -1944,6 +1944,10 @@ async fn test_sse_scan_all_unredactable_raw_bytes_fail_closed() {
             "email",
             "data: {\"secret\":\"duplicate@example.com\",\"secret\":\"clean\"}\n\n",
         ),
+        (
+            "email",
+            "data: {\"id\":\"victim@example.com\",\"id\":\"chunk_1\",\"choices\":[{\"delta\":{\"content\":\"clean\"}}]}\n\n",
+        ),
         ("email", "data: {\"user@example.com\":\"clean\"}\n\n"),
         ("ssn", "data: {\"count\":123456789}\n\n"),
         (
