@@ -6471,6 +6471,7 @@ components:
         key:
           type: string
           minLength: 1
+          pattern: "\\S"
           description: >-
             API key value. Must be non-empty after trimming and globally unique
             across all consumers.
@@ -11690,9 +11691,10 @@ components:
           type: boolean
           default: true
           description: >-
-            Remove a successfully authenticated API key from the header or
-            query string before forwarding the request upstream. Disable only
-            when a legacy backend explicitly requires the reusable credential.
+            Remove the configured API-key header or query parameter before
+            forwarding an authenticated request upstream, including when
+            another mechanism wins a multi-auth chain. Disable only when a
+            legacy backend explicitly requires the reusable credential.
 
     BasicAuthConfig:
       type: object

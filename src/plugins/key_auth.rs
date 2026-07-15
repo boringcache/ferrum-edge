@@ -3,8 +3,10 @@
 //! Extracts an API key from a configurable location (header or query parameter)
 //! and looks up the corresponding consumer via the `ConsumerIndex` for O(1)
 //! credential matching. Provides transport-level authentication only — the key
-//! reaches the gateway in plaintext, so TLS is required in production. Accepted
-//! credentials are removed before backend forwarding by default.
+//! reaches the gateway in plaintext, so TLS is required in production.
+//! Configured credential locations are removed before backend forwarding by
+//! default after the request authenticates, including when another mechanism
+//! wins a multi-auth chain.
 //!
 //! Default key location: `header:X-API-Key`. Configurable via `key_location`
 //! in the plugin config (e.g., `"query:api_key"` for query parameter extraction).
@@ -19,8 +21,6 @@ use super::RequestContext;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX;
 
-const STRIP_HEADER_METADATA_PREFIX: &str = "key_auth.strip_header.";
-
 pub struct KeyAuth {
     /// Pre-lowercased header name for header-based key extraction.
     /// Avoids a per-request `to_lowercase()` allocation.
@@ -29,11 +29,11 @@ pub struct KeyAuth {
     header_name_original: Option<String>,
     /// Query parameter name for query-based key extraction.
     query_param_name: Option<String>,
-    /// Precomputed metadata key used to strip a successfully verified header.
-    strip_header_metadata_key: Option<String>,
+    /// Precomputed metadata key used to strip the configured query parameter.
+    strip_query_metadata_key: Option<String>,
     /// Configured request headers that logging plugins must always redact.
     request_headers_to_redact: Vec<String>,
-    /// Remove accepted credentials before the request reaches the backend.
+    /// Remove the configured credential location before the backend request.
     hide_credentials: bool,
 }
 
@@ -76,7 +76,7 @@ impl KeyAuth {
             header_name_lower,
             header_name_original,
             query_param_name,
-            strip_header_metadata_key,
+            strip_query_metadata_key,
             request_headers_to_redact,
         ) = if let Some(name) = key_location.strip_prefix("header:") {
             let name = name.trim();
@@ -88,15 +88,11 @@ impl KeyAuth {
                 "key_auth: 'key_location' header name is not a valid HTTP header name".to_string()
             })?;
             let canonical_name = header_name.as_str().to_string();
-            let mut strip_key =
-                String::with_capacity(STRIP_HEADER_METADATA_PREFIX.len() + canonical_name.len());
-            strip_key.push_str(STRIP_HEADER_METADATA_PREFIX);
-            strip_key.push_str(&canonical_name);
             (
                 Some(canonical_name.clone()),
                 Some(name.to_string()),
                 None,
-                Some(strip_key),
+                None,
                 vec![canonical_name],
             )
         } else if let Some(name) = key_location.strip_prefix("query:") {
@@ -104,7 +100,17 @@ impl KeyAuth {
             if name.is_empty() {
                 return Err("key_auth: 'key_location' query name must not be empty".to_string());
             }
-            (None, None, Some(name.to_string()), None, Vec::new())
+            let mut strip_key =
+                String::with_capacity(STRIP_QUERY_PARAM_METADATA_PREFIX.len() + name.len());
+            strip_key.push_str(STRIP_QUERY_PARAM_METADATA_PREFIX);
+            strip_key.push_str(name);
+            (
+                None,
+                None,
+                Some(name.to_string()),
+                Some(strip_key),
+                Vec::new(),
+            )
         } else {
             return Err(
                 "key_auth: 'key_location' must use 'header:<name>' or 'query:<name>'".to_string(),
@@ -115,7 +121,7 @@ impl KeyAuth {
             header_name_lower,
             header_name_original,
             query_param_name,
-            strip_header_metadata_key,
+            strip_query_metadata_key,
             request_headers_to_redact,
             hide_credentials,
         })
@@ -155,24 +161,6 @@ impl AuthMechanism for KeyAuth {
         }
     }
 
-    fn on_success(&self, ctx: &mut RequestContext) {
-        if !self.hide_credentials {
-            return;
-        }
-
-        if let Some(key) = &self.strip_header_metadata_key {
-            ctx.metadata.insert(key.clone(), "true".to_string());
-        }
-        if let Some(name) = self.query_param_name.as_deref() {
-            let mut key =
-                String::with_capacity(STRIP_QUERY_PARAM_METADATA_PREFIX.len() + name.len());
-            key.push_str(STRIP_QUERY_PARAM_METADATA_PREFIX);
-            key.push_str(name);
-            ctx.metadata.insert(key, "true".to_string());
-            ctx.query_params.remove(name);
-        }
-    }
-
     async fn verify(
         &self,
         credential: ExtractedCredential,
@@ -209,6 +197,12 @@ auth_flow::impl_auth_plugin!(
             && ctx.query_params.contains_key(name)
         {
             crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
+            if self.hide_credentials
+                && let Some(metadata_key) = &self.strip_query_metadata_key
+            {
+                ctx.metadata
+                    .insert(metadata_key.clone(), "true".to_string());
+            }
         }
     }
 
@@ -225,11 +219,24 @@ auth_flow::impl_auth_plugin!(
         ctx: &mut crate::plugins::RequestContext,
         headers: &mut std::collections::HashMap<String, String>,
     ) -> crate::plugins::PluginResult {
-        if let Some(metadata_key) = &self.strip_header_metadata_key
-            && ctx.metadata.remove(metadata_key).is_some()
-            && let Some(header_name) = self.header_name_lower.as_deref()
+        if !self.hide_credentials {
+            return crate::plugins::PluginResult::Continue;
+        }
+
+        if let Some(header_name) = self.header_name_lower.as_deref() {
+            headers.remove(header_name);
+            if let Some(original) = self.header_name_original.as_deref()
+                && original != header_name
+            {
+                headers.remove(original);
+            }
+        }
+        if let Some(name) = self.query_param_name.as_deref()
+            && ctx.query_params.remove(name).is_some()
+            && let Some(metadata_key) = &self.strip_query_metadata_key
         {
-            headers.retain(|name, _| !name.eq_ignore_ascii_case(header_name));
+            ctx.metadata
+                .insert(metadata_key.clone(), "true".to_string());
         }
         crate::plugins::PluginResult::Continue
     }

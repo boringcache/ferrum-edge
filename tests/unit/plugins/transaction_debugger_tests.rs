@@ -6,6 +6,9 @@ use ferrum_edge::plugins::{
 };
 use serde_json::json;
 use std::collections::HashMap;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::MakeWriter;
 
 use super::plugin_utils::create_test_transaction_summary;
 
@@ -196,6 +199,94 @@ fn make_ctx_with_sensitive_headers() -> RequestContext {
     ctx.headers
         .insert("x-request-id".to_string(), "req-456".to_string());
     ctx
+}
+
+#[derive(Clone, Default)]
+struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_transaction_debugger_redacts_provider_api_key_headers_in_both_directions() {
+    let writer = SharedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("API-Key".to_string(), "azure-request-secret".to_string());
+    ctx.headers.insert(
+        "x-goog-api-key".to_string(),
+        "google-request-secret".to_string(),
+    );
+    ctx.headers.insert(
+        "x-safe-header".to_string(),
+        "safe-request-value".to_string(),
+    );
+
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+
+    let mut response_headers = HashMap::from([
+        ("api-key".to_string(), "azure-response-secret".to_string()),
+        (
+            "X-Goog-Api-Key".to_string(),
+            "google-response-secret".to_string(),
+        ),
+        (
+            "x-safe-response".to_string(),
+            "safe-response-value".to_string(),
+        ),
+    ]);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+
+    let logs = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+    for secret in [
+        "azure-request-secret",
+        "google-request-secret",
+        "azure-response-secret",
+        "google-response-secret",
+    ] {
+        assert!(!logs.contains(secret), "debugger leaked {secret}: {logs}");
+    }
+    assert!(logs.contains("***REDACTED***"), "missing redaction: {logs}");
+    assert!(
+        logs.contains("safe-request-value"),
+        "safe header omitted: {logs}"
+    );
+    assert!(
+        logs.contains("safe-response-value"),
+        "safe response header omitted: {logs}"
+    );
 }
 
 #[tokio::test]

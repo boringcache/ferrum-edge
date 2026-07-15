@@ -240,6 +240,12 @@ async fn test_key_auth_plugin_query_parameter() {
             .map(String::as_str),
         Some("true")
     );
+    let mut backend_headers = valid_ctx.headers.clone();
+    assert_continue(
+        plugin
+            .before_proxy(&mut valid_ctx, &mut backend_headers)
+            .await,
+    );
     assert!(!valid_ctx.query_params.contains_key("api_key"));
     assert_eq!(
         valid_ctx
@@ -263,6 +269,8 @@ async fn test_key_auth_can_explicitly_preserve_successful_query_credential() {
         .insert("api_key".to_string(), "test-api-key".to_string());
 
     assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
 
     assert_eq!(
         ctx.query_params.get("api_key").map(String::as_str),

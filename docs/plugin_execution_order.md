@@ -304,7 +304,7 @@ Given all built-in plugins enabled, the execution order is:
 | 16 | `oauth2_introspection` | 1050 | authenticate, before_proxy |
 | 17 | `oidc_relying_party` | 1075 | authenticate, before_proxy |
 | 18 | `jwt_auth` | 1100 | authenticate |
-| 19 | `key_auth` | 1200 | authenticate |
+| 19 | `key_auth` | 1200 | authenticate, before_proxy |
 | 20 | `ldap_auth` | 1250 | authenticate |
 | 21 | `basic_auth` | 1300 | authenticate |
 | 22 | `hmac_auth` | 1400 | authenticate |
@@ -584,7 +584,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `oauth2_introspection` | ✓ | ✓ | ✓ | | | Requires HTTP bearer token headers or query params |
 | `oidc_relying_party` | ✓ | ✓ | ✓ | | | Browser-oriented HTTP authentication flow |
 | `jwt_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
-| `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
+| `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers or query parameters |
 | `ldap_auth` | ✓ | ✓ | ✓ | | | Requires HTTP Basic auth header; authenticates against LDAP directory |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |

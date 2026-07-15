@@ -1549,7 +1549,7 @@ Authenticates requests using an API key matched against consumer credentials.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `key_location` | String | `header:X-API-Key` | Where to find the key (`header:<name>` or `query:<name>`) |
-| `hide_credentials` | Boolean | `true` | Remove a successfully authenticated key before proxying. Set to `false` only for a legacy backend that explicitly requires the reusable credential. |
+| `hide_credentials` | Boolean | `true` | Remove the configured key location before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable credential. |
 
 Header locations must use a valid HTTP header name. Query names and values use
 the same percent-decoded representation on HTTP/1.1, HTTP/2, and HTTP/3.

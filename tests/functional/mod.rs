@@ -36,6 +36,7 @@ mod functional_header_limits_test;
 mod functional_header_read_timeout_test;
 mod functional_header_size_limits_test;
 mod functional_host_only_routing_test;
+mod functional_key_auth_query_test;
 mod functional_load_balancer_test;
 mod functional_load_stress_test;
 mod functional_logging_plugins_test;
