@@ -256,9 +256,10 @@ pub(crate) async fn validate_hmac_request_transform_api_spec_replacement_candida
     // where the insert is rejected by the plugin-config primary key.
     if let Some(plugin) = plugins.iter().find(|plugin| {
         !replaced_plugin_ids.contains(&plugin.id)
-            && candidate.plugin_configs.iter().any(|existing| {
-                existing.namespace == namespace && existing.id == plugin.id
-            })
+            && candidate
+                .plugin_configs
+                .iter()
+                .any(|existing| existing.namespace == namespace && existing.id == plugin.id)
     }) {
         return Err(AfterValidateError::BadRequest(vec![format!(
             "plugin_config id '{}' already exists in namespace '{}' outside api_spec '{}'; replacement cannot take ownership of it",
@@ -270,9 +271,9 @@ pub(crate) async fn validate_hmac_request_transform_api_spec_replacement_candida
         .plugin_configs
         .retain(|plugin| !replaced_plugin_ids.contains(&plugin.id));
     for candidate_proxy in &mut candidate.proxies {
-        candidate_proxy.plugins.retain(|association| {
-            !replaced_plugin_ids.contains(&association.plugin_config_id)
-        });
+        candidate_proxy
+            .plugins
+            .retain(|association| !replaced_plugin_ids.contains(&association.plugin_config_id));
     }
 
     let previous_declared_assoc_ids =

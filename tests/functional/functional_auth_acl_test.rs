@@ -1675,14 +1675,13 @@ async fn test_auth_acl_comprehensive() {
     // parity prevents the former 413-vs-401 username-enumeration oracle.
     println!("\n--- HMAC Auth — Oversized Invalid Credential Parity ---");
     let oversized_date = Utc::now().to_rfc2822();
-    let (known_wrong_status, known_wrong_body) =
-        send_declared_oversized_invalid_h1_hmac_request(
-            harness._gw.proxy_port,
-            &oversized_date,
-            "alice",
-            "wrong-secret-that-cannot-authenticate-alice",
-        )
-        .await;
+    let (known_wrong_status, known_wrong_body) = send_declared_oversized_invalid_h1_hmac_request(
+        harness._gw.proxy_port,
+        &oversized_date,
+        "alice",
+        "wrong-secret-that-cannot-authenticate-alice",
+    )
+    .await;
     let (unknown_status, unknown_body) = send_declared_oversized_invalid_h1_hmac_request(
         harness._gw.proxy_port,
         &oversized_date,

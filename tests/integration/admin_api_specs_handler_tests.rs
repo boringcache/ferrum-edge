@@ -423,7 +423,10 @@ async fn convert_spec_owned_plugin_to_global(
         .plugins
         .retain(|association| association.plugin_config_id != plugin_id);
     assert!(
-        store.update_proxy(&proxy).await.expect("remove association"),
+        store
+            .update_proxy(&proxy)
+            .await
+            .expect("remove association"),
         "spec proxy must exist while removing the global association"
     );
 
@@ -447,11 +450,7 @@ async fn convert_spec_owned_plugin_to_global(
     );
 }
 
-async fn attach_manual_proxy_plugin(
-    store: &DatabaseStore,
-    proxy_id: &str,
-    plugin: &PluginConfig,
-) {
+async fn attach_manual_proxy_plugin(store: &DatabaseStore, proxy_id: &str, plugin: &PluginConfig) {
     store
         .create_plugin_config(plugin)
         .await
@@ -1719,8 +1718,8 @@ async fn disabled_basic_auth_spec_can_be_staged_before_plugin_construction() {
     );
     assert!(body["failures"].as_array().is_some_and(|failures| {
         failures
-             .iter()
-             .any(|failure| failure["resource_type"] == "plugin")
+            .iter()
+            .any(|failure| failure["resource_type"] == "plugin")
     }));
 }
 
