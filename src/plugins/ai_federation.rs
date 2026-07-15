@@ -1819,7 +1819,10 @@ fn request_wants_streaming(openai_body: &Value) -> bool {
     openai_body["stream"].as_bool() == Some(true)
 }
 
-fn validate_openai_request(openai_body: &Value) -> Result<(), String> {
+fn validate_openai_request(
+    openai_body: &Value,
+    allow_dropped_non_text_parts: bool,
+) -> Result<(), String> {
     let object = openai_body
         .as_object()
         .ok_or("ai_federation: request body must be a JSON object")?;
@@ -1856,7 +1859,7 @@ fn validate_openai_request(openai_body: &Value) -> Result<(), String> {
         match message_object.get("content") {
             Some(Value::String(_)) => {}
             Some(content @ Value::Array(_)) => {
-                validate_openai_content_parts(content, index)?;
+                validate_openai_content_parts(content, index, allow_dropped_non_text_parts)?;
             }
             Some(Value::Null) if role == "assistant" && has_tool_calls => {}
             _ => {
@@ -1903,7 +1906,11 @@ fn validate_openai_request(openai_body: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_openai_content_parts(content: &Value, message_index: usize) -> Result<(), String> {
+fn validate_openai_content_parts(
+    content: &Value,
+    message_index: usize,
+    allow_dropped_non_text_parts: bool,
+) -> Result<(), String> {
     let parts = content.as_array().ok_or_else(|| {
         format!("ai_federation: messages[{message_index}] content must be an array")
     })?;
@@ -1927,6 +1934,9 @@ fn validate_openai_content_parts(content: &Value, message_index: usize) -> Resul
                     "ai_federation: messages[{message_index}].content[{part_index}] missing non-empty type"
                 )
             })?;
+        if allow_dropped_non_text_parts && part_type != "text" {
+            continue;
+        }
         match part_type {
             "text" => {
                 if part.get("text").and_then(Value::as_str).is_none() {
@@ -1949,11 +1959,27 @@ fn validate_openai_content_parts(content: &Value, message_index: usize) -> Resul
                     ));
                 }
             }
-            // Provider-specific policy decides whether an otherwise
-            // well-formed non-text part can be translated, passed through, or
-            // intentionally dropped by `text_only_with_warning`. Rejecting the
-            // type here would make that explicit drop policy inert.
-            _ => {}
+            "input_audio" => {
+                let audio = part.get("input_audio").and_then(Value::as_object);
+                let has_data = audio
+                    .and_then(|audio| audio.get("data"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty());
+                let has_format = audio
+                    .and_then(|audio| audio.get("format"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty());
+                if !has_data || !has_format {
+                    return Err(format!(
+                        "ai_federation: messages[{message_index}].content[{part_index}] input_audio part requires non-empty input_audio.data and input_audio.format"
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "ai_federation: messages[{message_index}].content[{part_index}] has an unsupported content-part type"
+                ));
+            }
         }
     }
     Ok(())
@@ -3140,10 +3166,8 @@ fn translate_to_anthropic(
             continue;
         }
 
-        let translated_content = openai_content_to_anthropic(
-            &message["content"],
-            provider.multimodal_mode,
-        )?;
+        let translated_content =
+            openai_content_to_anthropic(&message["content"], provider.multimodal_mode)?;
         let tool_calls = if role == "assistant" {
             parse_openai_tool_calls(message, message_index)?
         } else {
@@ -4907,15 +4931,33 @@ impl Plugin for AiFederation {
             );
         }
 
-        if let Err(message) = validate_openai_request(&openai_body) {
-            return self.openai_error_response(
-                400,
-                &message,
-                "invalid_request_error",
-                None,
-                Some("invalid_request"),
-            );
-        }
+        let deferred_non_text_validation_error =
+            match validate_openai_request(&openai_body, false) {
+                Ok(()) => None,
+                Err(strict_message) => {
+                    if let Err(message) = validate_openai_request(&openai_body, true) {
+                        return self.openai_error_response(
+                            400,
+                            &message,
+                            "invalid_request_error",
+                            None,
+                            Some("invalid_request"),
+                        );
+                    }
+                    if !matching_providers.iter().any(|provider| {
+                        provider.multimodal_mode == MultimodalMode::TextOnlyWithWarning
+                    }) {
+                        return self.openai_error_response(
+                            400,
+                            &strict_message,
+                            "invalid_request_error",
+                            None,
+                            Some("invalid_request"),
+                        );
+                    }
+                    Some(strict_message)
+                }
+            };
 
         let _request_permit = match self.request_slots.try_acquire() {
             Ok(permit) => permit,
@@ -4983,6 +5025,18 @@ impl Plugin for AiFederation {
                     );
                 }
                 continue;
+            }
+            if provider.multimodal_mode != MultimodalMode::TextOnlyWithWarning
+                && let Some(message) = &deferred_non_text_validation_error
+            {
+                if let Some(circuit) = &provider.circuit {
+                    circuit.release_probe(admission);
+                }
+                last_client_rejection = Some(message.clone());
+                if self.fallback_enabled && has_later_provider {
+                    continue;
+                }
+                break;
             }
             if provider.circuit.is_some() {
                 ctx.metadata.insert(
