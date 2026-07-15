@@ -29629,7 +29629,7 @@ mod tests {
         let reject = plugin_result_into_reject_parts(reject).expect("expected reject response");
         finalize_reject_response_with_after_proxy_hooks(
             plugins,
-            response_decision_ctx,
+            ctx,
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::OK),
             &reject.body,
             reject.headers,
