@@ -2249,6 +2249,33 @@ async fn handle_h3_request(
     // proxy on H3 only.
     ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
 
+    let backend_path_plugins = plugin_cache_view.backend_path_plugins();
+    let backend_path_is_policy_bound = !backend_path_plugins.is_empty();
+    if backend_path_is_policy_bound {
+        let backend_path = crate::proxy::build_backend_effective_path(
+            &proxy,
+            &path,
+            strip_len,
+            upstream_target.as_ref().and_then(|target| target.path.as_deref()),
+        );
+        if !run_h3_backend_path_plugins_or_send_reject(
+            backend_path_plugins,
+            &plugins,
+            &mut ctx,
+            &backend_path,
+            &original_request_path,
+            http_flavor,
+            &mut stream,
+            &state,
+            start_time,
+            &mut plugin_execution_ns,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
     let mut preacquired_backend_admission = crate::proxy::PreacquiredBackendAdmission::default();
@@ -3051,6 +3078,8 @@ async fn handle_h3_request(
                 path: &path,
                 query_string: effective_query_string.as_ref(),
                 backend_url: &backend_url,
+                strip_len,
+                backend_path_is_policy_bound,
                 lb_hash_key: lb_hash_key.as_deref(),
                 upstream_target: upstream_target.as_deref(),
                 upstream_balancer: upstream_balancer.as_ref(),
@@ -4735,18 +4764,29 @@ async fn handle_h3_request(
                         &proxy_headers,
                     )
                 {
-                    current_url = crate::proxy::build_backend_url_with_target(
-                        &proxy,
-                        &path,
-                        effective_query_string.as_ref(),
-                        &next.host,
-                        next.port,
-                        strip_len,
-                        next.path.as_deref(),
-                    );
-                    current_cb_target_key =
-                        Some(crate::circuit_breaker::target_key(&next.host, next.port));
-                    current_target = Some(next);
+                    if !crate::proxy::retry_target_preserves_backend_path(
+                        backend_path_is_policy_bound,
+                        prev_target,
+                        &next,
+                    ) {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            "Keeping the current H3 retry target because the candidate would change the authorized backend method path"
+                        );
+                    } else {
+                        current_url = crate::proxy::build_backend_url_with_target(
+                            &proxy,
+                            &path,
+                            effective_query_string.as_ref(),
+                            &next.host,
+                            next.port,
+                            strip_len,
+                            next.path.as_deref(),
+                        );
+                        current_cb_target_key =
+                            Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                        current_target = Some(next);
+                    }
                 }
 
                 // Re-screen the rotated retry target BEFORE admission/dispatch:
@@ -5236,6 +5276,94 @@ fn h3_plugin_protocol_for_flavor(flavor: HttpFlavor) -> ProxyProtocol {
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
         HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_h3_backend_path_plugins_or_send_reject(
+    backend_path_plugins: &[Arc<dyn Plugin>],
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    backend_path: &str,
+    original_request_path: &str,
+    flavor: HttpFlavor,
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &ProxyState,
+    start_time: std::time::Instant,
+    plugin_execution_ns: &mut u64,
+) -> Result<bool, anyhow::Error> {
+    let phase_start = std::time::Instant::now();
+    for plugin in backend_path_plugins {
+        match plugin
+            .on_backend_path_resolved(ctx, backend_path)
+            .await
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. }
+            | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                    error!(
+                        plugin = plugin.name(),
+                        "H3 backend-path plugin rejection could not be normalized"
+                    );
+                    record_request(state, 500);
+                    send_h3_reject_flavor_aware(
+                        stream,
+                        flavor,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await?;
+                    return Ok(false);
+                };
+                let mut headers = reject.headers;
+                let mut reject_status = reject.status_code;
+                let mut reject_body = reject.body;
+                apply_reject_after_proxy_and_synthetic_body_hooks(
+                    plugins,
+                    ctx,
+                    &mut reject_status,
+                    &mut headers,
+                    &mut reject_body,
+                    matches!(flavor, HttpFlavor::Grpc),
+                    true,
+                )
+                .await;
+                *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                let http_status = StatusCode::from_u16(reject_status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    ctx,
+                    flavor,
+                    http_status,
+                    &reject_body,
+                    &headers,
+                );
+                record_request(state, log_status_code);
+                log_rejected_request_with_path(
+                    plugins,
+                    ctx,
+                    log_status_code,
+                    start_time,
+                    "on_backend_path_resolved",
+                    *plugin_execution_ns,
+                    Some(original_request_path),
+                )
+                .await;
+                send_h3_reject_flavor_aware(
+                    stream,
+                    flavor,
+                    http_status,
+                    &reject_body,
+                    &headers,
+                )
+                .await?;
+                return Ok(false);
+            }
+        }
+    }
+    *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]

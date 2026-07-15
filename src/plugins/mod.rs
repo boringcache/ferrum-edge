@@ -2,9 +2,10 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → `transform_request_body` → `on_final_request_body` →
-//! `backend_admission` → `after_proxy` → `normalize_response_body` →
-//! `on_response_body` → `transform_response_body` → `on_final_response_body` →
+//! `before_proxy` → `on_backend_path_resolved` → `transform_request_body` →
+//! `on_final_request_body` → `backend_admission` → `after_proxy` →
+//! `normalize_response_body` → `on_response_body` →
+//! `transform_response_body` → `on_final_response_body` →
 //! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
@@ -2904,6 +2905,26 @@ pub trait Plugin: Send + Sync {
         &self,
         _ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin must inspect the backend-effective path
+    /// after route overrides and load balancing have selected the first target.
+    ///
+    /// The plugin cache precomputes this opt-in list, so requests without a
+    /// participating plugin do not scan the full chain at this boundary.
+    fn requires_backend_path_resolution(&self) -> bool {
+        false
+    }
+
+    /// Called after the backend-effective path has been assembled from the
+    /// final route override, listen-path stripping, proxy/backend path, and
+    /// selected upstream target path, but before any backend is dialed.
+    async fn on_backend_path_resolved(
+        &self,
+        _ctx: &mut RequestContext,
+        _backend_path: &str,
     ) -> PluginResult {
         PluginResult::Continue
     }

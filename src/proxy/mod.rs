@@ -11,19 +11,22 @@
 //! 5. **Plugin: before_proxy** — request/response policy before backend dispatch:
 //!    request size limiting, GraphQL guardrails, AI plugins, request transformation,
 //!    response caching preparation, gRPC deadline injection
-//! 6. **Plugin: transform_request_body / on_final_request_body** — buffered request-body
+//! 6. **Plugin: on_backend_path_resolved** — opt-in policy over the path assembled
+//!    after routing and initial target selection
+//! 7. **Plugin: transform_request_body / on_final_request_body** — buffered request-body
 //!    rewrites and final validation before backend dispatch
-//! 7. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
+//! 8. **Plugin: backend_admission** — selected-target concurrency admission
+//! 9. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
 //!    Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
-//! 8. **Plugin: after_proxy** — CORS headers, response caching metadata, response transforms,
+//! 10. **Plugin: after_proxy** — CORS headers, response caching metadata, response transforms,
 //!    response size limiting, AI rate limiter
-//! 9. **Plugin: on_response_body** — raw backend body inspection before transforms:
+//! 11. **Plugin: on_response_body** — raw backend body inspection before transforms:
 //!    AI token metrics, AI rate limiter
-//! 10. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
-//! 11. **Plugin: on_final_response_body** — buffered body validation/storage:
+//! 12. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
+//! 13. **Plugin: on_final_response_body** — buffered body validation/storage:
 //!     body validation, response size limiting, response caching
-//! 12. **Plugin: on_response_committed** — observe-only final buffered status/body export
-//! 13. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
+//! 14. **Plugin: on_response_committed** — observe-only final buffered status/body export
+//! 15. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
 //!
 //! Key design principles:
 //! - **Lock-free reads**: All config access uses `ArcSwap::load()` — no mutexes on the hot path
@@ -9403,6 +9406,68 @@ fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str)
     url.push_str(remaining_path);
 }
 
+fn with_backend_path_parts<R>(
+    proxy: &Proxy,
+    incoming_path: &str,
+    strip_len: usize,
+    target_path: Option<&str>,
+    use_parts: impl FnOnce(&str, &str) -> R,
+) -> R {
+    // `strip_len` is measured by the router after encoded-slash
+    // normalization, so stripping must use the same coordinate system.
+    let normalized_path = if proxy.strip_listen_path {
+        Some(crate::router_cache::normalize_encoded_slashes(
+            incoming_path,
+        ))
+    } else {
+        None
+    };
+    let remaining_path = match &normalized_path {
+        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
+        None => incoming_path,
+    };
+    let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
+    use_parts(backend_path, remaining_path)
+}
+
+/// Assemble the exact path that URL construction will forward to the selected
+/// backend target. This intentionally shares path segmentation with
+/// [`build_backend_url_with_target`] so post-routing policy cannot authorize a
+/// path that differs from the one placed on the wire.
+pub fn build_backend_effective_path(
+    proxy: &Proxy,
+    incoming_path: &str,
+    strip_len: usize,
+    target_path: Option<&str>,
+) -> String {
+    with_backend_path_parts(
+        proxy,
+        incoming_path,
+        strip_len,
+        target_path,
+        |backend_path, remaining_path| {
+            let layout = backend_path_layout(backend_path, remaining_path);
+            let mut path = String::with_capacity(layout.len);
+            push_backend_path(&mut path, backend_path, remaining_path);
+            path
+        },
+    )
+}
+
+/// Once a route-sensitive plugin has authorized the first target's assembled
+/// path, retries may rotate hosts and ports but must not select a different
+/// target-level path without rerunning policy and charging another method.
+/// Keeping the authorized path immutable avoids turning transport retry into a
+/// second routing decision.
+#[doc(hidden)]
+pub fn retry_target_preserves_backend_path(
+    backend_path_is_policy_bound: bool,
+    previous: &UpstreamTarget,
+    next: &UpstreamTarget,
+) -> bool {
+    !backend_path_is_policy_bound || previous.path == next.path
+}
+
 fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
     if host.contains(':') && !host.starts_with('[') {
         std::borrow::Cow::Owned(format!("[{host}]"))
@@ -15498,6 +15563,71 @@ async fn handle_proxy_request_inner(
         request_host.as_deref(),
     );
 
+    // Route-sensitive policy runs only after the exact backend path is known:
+    // all before_proxy rewrites have completed, the effective proxy has been
+    // materialized, and load balancing has selected the target whose optional
+    // path overrides proxy.backend_path. The list is precomputed by
+    // PluginCache, so ordinary requests do not scan the full plugin chain.
+    let backend_path_plugins = plugin_cache_view.backend_path_plugins();
+    let backend_path_is_policy_bound = !backend_path_plugins.is_empty();
+    if backend_path_is_policy_bound {
+        let backend_path = build_backend_effective_path(
+            &proxy,
+            &path,
+            strip_len,
+            upstream_target.as_ref().and_then(|target| target.path.as_deref()),
+        );
+        let phase_start = Instant::now();
+        for plugin in backend_path_plugins.iter() {
+            match plugin
+                .on_backend_path_resolved(&mut ctx, &backend_path)
+                .await
+            {
+                PluginResult::Continue => {}
+                reject @ PluginResult::Reject { .. }
+                | reject @ PluginResult::RejectBinary { .. } => {
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                    let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                        error!(
+                            plugin = plugin.name(),
+                            "Backend-path plugin rejection could not be normalized"
+                        );
+                        record_request(&state, 500);
+                        return Ok(build_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"error":"Internal error"}"#,
+                        ));
+                    };
+                    let status = StatusCode::from_u16(plugin_reject.status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                        &plugins,
+                        &mut ctx,
+                        status,
+                        &plugin_reject.body,
+                        plugin_reject.headers,
+                        is_grpc_request,
+                    )
+                    .await;
+                    apply_grpc_reject_metadata(&mut ctx, &reject);
+                    log_rejected_request_with_path(
+                        &plugins,
+                        &ctx,
+                        reject.http_status.as_u16(),
+                        start_time,
+                        "on_backend_path_resolved",
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                    )
+                    .await;
+                    record_request(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
+                }
+            }
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
     // The effective PeerAuthentication app port is not authoritative until
     // routing plugins have applied their overrides and load balancing has
     // selected a concrete upstream target. Re-check every inbound request
@@ -16705,19 +16835,30 @@ async fn handle_proxy_request_inner(
                         proxy_headers,
                     )
                 {
-                    grpc_backend_url = build_backend_url_with_target(
-                        &proxy,
-                        &path,
-                        effective_query_string.as_ref(),
-                        &next.host,
-                        next.port,
-                        strip_len,
-                        next.path.as_deref(),
-                    );
-                    grpc_current_cb_key =
-                        Some(crate::circuit_breaker::target_key(&next.host, next.port));
-                    grpc_final_cb_key = grpc_current_cb_key.clone();
-                    grpc_current_target = Some(next);
+                    if !retry_target_preserves_backend_path(
+                        backend_path_is_policy_bound,
+                        prev_target,
+                        &next,
+                    ) {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            "Keeping the current gRPC retry target because the candidate would change the authorized backend method path"
+                        );
+                    } else {
+                        grpc_backend_url = build_backend_url_with_target(
+                            &proxy,
+                            &path,
+                            effective_query_string.as_ref(),
+                            &next.host,
+                            next.port,
+                            strip_len,
+                            next.path.as_deref(),
+                        );
+                        grpc_current_cb_key =
+                            Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                        grpc_final_cb_key = grpc_current_cb_key.clone();
+                        grpc_current_target = Some(next);
+                    }
                 }
 
                 // Retry backoff and target rotation cross a fresh policy
@@ -18649,27 +18790,43 @@ async fn handle_proxy_request_inner(
                     proxy_headers,
                 )
             {
-                let target_changed = next.host != prev_target.host || next.port != prev_target.port;
-                current_url = build_backend_url_with_target(
-                    &proxy,
-                    &path,
-                    effective_query_string.as_ref(),
-                    &next.host,
-                    next.port,
-                    strip_len,
-                    next.path.as_deref(),
-                );
-                current_cb_target_key =
-                    Some(crate::circuit_breaker::target_key(&next.host, next.port));
-                current_target = Some(next);
-                if target_changed {
-                    // Per-target capability lookup is O(1) (DashMap +
-                    // thread-local key buffer). Unknown / Unsupported both
-                    // gracefully fall through to reqwest, so an
-                    // un-pre-warmed target degrades to the safe path until
-                    // the periodic refresh classifies it.
-                    current_dispatch_h3 = !requires_response_stream_inspection
-                        && supports_native_http3_backend(&state, &proxy, current_target.as_deref());
+                if !retry_target_preserves_backend_path(
+                    backend_path_is_policy_bound,
+                    prev_target,
+                    &next,
+                ) {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        "Keeping the current retry target because the candidate would change the authorized backend method path"
+                    );
+                } else {
+                    let target_changed =
+                        next.host != prev_target.host || next.port != prev_target.port;
+                    current_url = build_backend_url_with_target(
+                        &proxy,
+                        &path,
+                        effective_query_string.as_ref(),
+                        &next.host,
+                        next.port,
+                        strip_len,
+                        next.path.as_deref(),
+                    );
+                    current_cb_target_key =
+                        Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                    current_target = Some(next);
+                    if target_changed {
+                        // Per-target capability lookup is O(1) (DashMap +
+                        // thread-local key buffer). Unknown / Unsupported both
+                        // gracefully fall through to reqwest, so an
+                        // un-pre-warmed target degrades to the safe path until
+                        // the periodic refresh classifies it.
+                        current_dispatch_h3 = !requires_response_stream_inspection
+                            && supports_native_http3_backend(
+                                &state,
+                                &proxy,
+                                current_target.as_deref(),
+                            );
+                    }
                 }
             }
 
@@ -20151,58 +20308,38 @@ pub fn build_backend_url_with_target(
         DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
     };
 
-    // `strip_len` (RouteMatch::matched_prefix_len) is a byte offset into the
-    // path AFTER encoded-slash normalization: the router matches against
-    // `normalize_encoded_slashes(path)`, which collapses %2f/%252f to '/'.
-    // Slicing that offset out of the RAW `incoming_path` is a coordinate
-    // mismatch — the offset is too small whenever the request contained
-    // encoded slashes (each %2f shrinks 2 bytes, %252f 4), which both forwards
-    // a corrupted tail to the backend (routing-vs-forwarding desync) and can
-    // index into the middle of a multi-byte UTF-8 codepoint, panicking the
-    // request task. Strip from the SAME normalized path the offset was
-    // computed against so the slice is coordinate-correct and on a char
-    // boundary. Normalization is an allocation-free borrow when the path has
-    // no encoded slashes (the common case) and only runs when stripping.
-    let normalized_path = if proxy.strip_listen_path {
-        Some(crate::router_cache::normalize_encoded_slashes(
-            incoming_path,
-        ))
-    } else {
-        None
-    };
-    let remaining_path = match &normalized_path {
-        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
-        None => incoming_path,
-    };
+    with_backend_path_parts(
+        proxy,
+        incoming_path,
+        strip_len,
+        target_path,
+        |backend_path, remaining_path| {
+            let path_layout = backend_path_layout(backend_path, remaining_path);
+            let rendered_host = url_render_host(host);
 
-    let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
+            // Build URL in a single buffer, writing the path segments directly
+            // to avoid an intermediate `full_path` allocation.
+            let capacity = scheme.len()
+                + 3
+                + rendered_host.len()
+                + 6
+                + path_layout.len
+                + if query_string.is_empty() {
+                    0
+                } else {
+                    1 + query_string.len()
+                };
+            let mut url = String::with_capacity(capacity);
+            let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
+            push_backend_path(&mut url, backend_path, remaining_path);
 
-    let path_layout = backend_path_layout(backend_path, remaining_path);
-    let rendered_host = url_render_host(host);
-
-    // Build URL in a single buffer, writing the path segments directly to avoid
-    // an intermediate `full_path` String allocation from format!().
-    let capacity = scheme.len()
-        + 3
-        + rendered_host.len()
-        + 6
-        + path_layout.len
-        + if query_string.is_empty() {
-            0
-        } else {
-            1 + query_string.len()
-        };
-    let mut url = String::with_capacity(capacity);
-    let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
-
-    push_backend_path(&mut url, backend_path, remaining_path);
-
-    if !query_string.is_empty() {
-        url.push('?');
-        url.push_str(query_string);
-    }
-
-    url
+            if !query_string.is_empty() {
+                url.push('?');
+                url.push_str(query_string);
+            }
+            url
+        },
+    )
 }
 
 /// Resolve the effective `Proxy` for one backend dispatch, honoring an

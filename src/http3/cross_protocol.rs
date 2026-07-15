@@ -174,6 +174,8 @@ where
     pub path: &'a str,
     pub query_string: &'a str,
     pub backend_url: &'a str,
+    pub strip_len: usize,
+    pub backend_path_is_policy_bound: bool,
     pub lb_hash_key: Option<&'a str>,
     pub upstream_target: Option<&'a UpstreamTarget>,
     pub upstream_balancer: Option<&'a Arc<LoadBalancer>>,
@@ -422,6 +424,8 @@ fn select_next_cross_protocol_retry_target(
     proxy: &Proxy,
     lb_hash_key: Option<&str>,
     current_target: Option<&Arc<UpstreamTarget>>,
+    strip_len: usize,
+    backend_path_is_policy_bound: bool,
     path: &str,
     query_string: &str,
     client_ip: &str,
@@ -442,7 +446,18 @@ fn select_next_cross_protocol_retry_target(
         proxy_headers,
     )?;
 
-    let strip_len = proxy.listen_path.as_deref().map(str::len).unwrap_or(0);
+    if !crate::proxy::retry_target_preserves_backend_path(
+        backend_path_is_policy_bound,
+        prev_target,
+        &next,
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            "Keeping the current cross-protocol retry target because the candidate would change the authorized backend method path"
+        );
+        return None;
+    }
+
     let next_url = crate::proxy::build_backend_url_with_target(
         proxy,
         path,
@@ -511,6 +526,8 @@ where
         path,
         query_string,
         backend_url,
+        strip_len,
+        backend_path_is_policy_bound,
         lb_hash_key,
         upstream_target,
         upstream_balancer,
@@ -614,6 +631,8 @@ where
                 path,
                 query_string,
                 backend_url,
+                strip_len,
+                backend_path_is_policy_bound,
                 lb_hash_key,
                 upstream_target,
                 upstream_balancer,
@@ -646,6 +665,8 @@ where
                 path,
                 query_string,
                 backend_url,
+                strip_len,
+                backend_path_is_policy_bound,
                 lb_hash_key,
                 upstream_target,
                 upstream_balancer,
@@ -1189,6 +1210,8 @@ async fn dispatch_plain<S>(
     path: &str,
     query_string: &str,
     backend_url: &str,
+    strip_len: usize,
+    backend_path_is_policy_bound: bool,
     lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
     upstream_balancer: Option<&Arc<LoadBalancer>>,
@@ -1434,6 +1457,8 @@ where
                                         proxy,
                                         lb_hash_key,
                                         current_target.as_ref(),
+                                        strip_len,
+                                        backend_path_is_policy_bound,
                                         path,
                                         query_string,
                                         client_ip,
@@ -1502,6 +1527,8 @@ where
                                         proxy,
                                         lb_hash_key,
                                         current_target.as_ref(),
+                                        strip_len,
+                                        backend_path_is_policy_bound,
                                         path,
                                         query_string,
                                         client_ip,
@@ -3018,6 +3045,8 @@ async fn dispatch_grpc<S>(
     path: &str,
     query_string: &str,
     backend_url: &str,
+    strip_len: usize,
+    backend_path_is_policy_bound: bool,
     lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
     upstream_balancer: Option<&Arc<LoadBalancer>>,
@@ -3327,6 +3356,8 @@ where
                     proxy,
                     lb_hash_key,
                     current_target.as_ref(),
+                    strip_len,
+                    backend_path_is_policy_bound,
                     path,
                     query_string,
                     client_ip,

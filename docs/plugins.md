@@ -10,15 +10,16 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 2. **`authenticate`** — Identifies the consumer (mTLS, JWKS, JWT, API Key, LDAP, Basic Auth, HMAC)
 3. **`authorize`** — Checks consumer permissions and policy decisions (Access Control, OPA, consumer-mode rate limiting)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
-5. **`backend_admission`** — Decides whether the selected backend target can accept one more in-flight request after load balancing
-6. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
-7. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
-8. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
-9. **`on_final_response_body`** — Validates or stores the transformed buffered body and may still replace it (Body Validator, Response Size Limiting, Response Caching)
-10. **`on_response_committed`** — Observe-only exporter hook for the final client-visible buffered status, headers, and body after validators and rejection replacement
-11. **`on_response_stream_terminated`** — Releases state and writes aggregate metadata for streamed, non-buffered responses after terminal success, error, or client disconnect
-12. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
-13. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
+5. **`on_backend_path_resolved`** — Applies opt-in policy to the finalized backend path after routing and initial target selection
+6. **`backend_admission`** — Decides whether the selected backend target can accept one more in-flight request after load balancing
+7. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
+8. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
+9. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
+10. **`on_final_response_body`** — Validates or stores the transformed buffered body and may still replace it (Body Validator, Response Size Limiting, Response Caching)
+11. **`on_response_committed`** — Observe-only exporter hook for the final client-visible buffered status, headers, and body after validators and rejection replacement
+12. **`on_response_stream_terminated`** — Releases state and writes aggregate metadata for streamed, non-buffered responses after terminal success, error, or client disconnect
+13. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
+14. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
 
 ## Custom Plugins
 
@@ -3181,7 +3182,7 @@ Supports both encoding modes:
 - **Binary** (`application/grpc-web`, `application/grpc-web+proto`): same length-prefixed framing as native gRPC — request body passes through unchanged.
 - **Text** (`application/grpc-web-text`, `application/grpc-web-text+proto`): base64-encoded binary frames — decoded on request and re-encoded on response.
 
-On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. On the response path, it embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` back to the original gRPC-Web variant.
+On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. On the response path, `grpc_web` embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` back to the original gRPC-Web variant.
 
 **Priority:** 260 (runs before `grpc_method_router` at 275)
 **Protocols:** HTTP, gRPC
@@ -3200,7 +3201,7 @@ config:
 
 ### `grpc_method_router`
 
-Parses the gRPC path (`/package.Service/Method`) and enables per-method access control and rate limiting. Populates `grpc_service`, `grpc_method`, and `grpc_full_method` metadata for downstream plugins.
+Enables per-method access control and rate limiting for canonical gRPC paths (`/package.Service/Method`). The security decision uses the backend-effective path after URI rewrites, listen-path stripping, proxy/target backend-path composition, and initial load-balancer target selection. It then refreshes `grpc_service`, `grpc_method`, and `grpc_full_method` metadata with the method actually authorized for backend dispatch.
 
 **Priority:** 275
 **Protocol:** gRPC only
@@ -3221,11 +3222,15 @@ Parses the gRPC path (`/package.Service/Method`) and enables per-method access c
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit.
+Each configured method accepts one optional leading slash and must use protobuf identifier grammar: `package.Service/Method`, with dot-separated service segments. Leading/trailing whitespace is normalized. Byte-identical duplicates are rejected by OpenAPI `uniqueItems`; duplicates that become equal only after trimming or slash normalization are rejected at runtime because JSON Schema cannot express canonical equality for array entries or object keys.
 
-The plugin requires at least one rule (`allow_methods`, `deny_methods`, or `method_rate_limits`) — an empty config is rejected. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+Each rate limit entry is `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit. In Redis mode, `redis_url` and `redis_key_prefix` must be non-empty, the URL must use `redis://` or `rediss://` with an authority, and pool/connect/health numeric settings must be positive.
 
-Populates `ctx.metadata` with `grpc_service`, `grpc_method`, and `grpc_full_method` in the `on_request_received` phase.
+The plugin requires at least one effective rule (`allow_methods`, a non-empty `deny_methods`, or a non-empty `method_rate_limits`) — an empty config is rejected. An explicitly empty `allow_methods` is valid block-all policy. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+
+`on_request_received` may populate provisional client-path metadata for early consumers. After all `before_proxy` routing plugins have run and the first backend target is selected, `on_backend_path_resolved` clears those three fields and replaces them from the backend-effective method before enforcing allow/deny/rate policy. An invalid backend-effective gRPC path fails closed for every policy shape, including deny-only and rate-only configurations. Retries may rotate hosts or ports but do not rotate to a target-specific path that would change the already authorized method.
+
+The backend-path boundary is shared by the HTTP/1.1 + HTTP/2 handler (including gRPC-Web requests classified as gRPC) and the HTTP/3 frontend, including its H3-to-H2 gRPC bridge.
 
 **Counter storage** (`sync_mode`): gRPC method rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter and falls back to local counters while Redis is unavailable.
 

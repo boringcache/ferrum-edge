@@ -171,3 +171,48 @@ fn h3_grpc_streaming_bridge_keeps_unresolved_base_proxy_for_selected_target() {
         "H3 streaming gRPC bridge must not inherit the first target's effective proxy"
     );
 }
+
+#[test]
+fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let selection = source
+        .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .expect("H3 selected-target lookup must remain present");
+    let after_selection = &source[selection..];
+    let path_policy = after_selection
+        .find("let backend_path_plugins = plugin_cache_view.backend_path_plugins();")
+        .expect("H3 must load the prefiltered backend-path policy list");
+    let circuit_breaker = after_selection
+        .find("check_circuit_breaker(")
+        .expect("H3 circuit-breaker check must remain present");
+    assert!(
+        path_policy < circuit_breaker,
+        "backend-effective path policy must run before circuit breaking or backend dispatch"
+    );
+
+    let policy_block = &after_selection[path_policy..circuit_breaker];
+    assert!(
+        policy_block.contains("crate::proxy::build_backend_effective_path("),
+        "H3 policy must use the shared backend URL path assembler"
+    );
+    assert!(
+        policy_block.contains("target.path.as_deref()"),
+        "H3 policy must include the initially selected target path"
+    );
+    assert!(
+        policy_block.contains("run_h3_backend_path_plugins_or_send_reject("),
+        "H3 policy rejections must be emitted before dispatch"
+    );
+
+    let cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
+    let retry_policy = cross_protocol
+        .find("retry_target_preserves_backend_path(")
+        .expect("cross-protocol H3 retry must retain the authorized target path");
+    let retry_url = cross_protocol
+        .find("let next_url = crate::proxy::build_backend_url_with_target(")
+        .expect("cross-protocol retry URL reconstruction must remain present");
+    assert!(
+        retry_policy < retry_url,
+        "retry target path policy must run before rebuilding the backend URL"
+    );
+}

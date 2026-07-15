@@ -31,7 +31,12 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 5. backend_admission    │  Target-aware backend admission after load balancing
+│ 5. backend path policy  │  Backend-effective path after routing/target selection
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 6. backend_admission    │  Target-aware backend admission after load balancing
 └────────────┬────────────┘
              │
              ▼
@@ -41,44 +46,56 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 6. after_proxy          │  Response headers, fast-path rejection, CORS
+│ 7. after_proxy          │  Response headers, fast-path rejection, CORS
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 7. normalize_response_body │ Provider/protocol normalization
+│ 8. normalize_response_body │ Provider/protocol normalization
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 8. on_response_body     │  Normalized buffered body inspection
+│ 9. on_response_body     │  Normalized buffered body inspection
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 9. transform_response_body │ Buffered presentation rewrites
+│ 10. transform_response_body │ Buffered presentation rewrites
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 10. on_final_response_body │ Buffered body validation/storage
+│ 11. on_final_response_body │ Buffered body validation/storage
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 11. on_response_committed │ Observe final buffered response
+│ 12. on_response_committed │ Observe final buffered response
 └────────────┬────────────┘
              │
-             │  Streamed non-buffered bodies skip phases 7-11 and call
+             │  Streamed non-buffered bodies skip phases 8-12 and call
              │  on_response_stream_terminated here when the body terminates.
              │
              ▼
 ┌─────────────────────────┐
-│ 12. log                 │  Logging & observability (fire-and-forget)
+│ 13. log                 │  Logging & observability (fire-and-forget)
 └─────────────────────────┘
 ```
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
+
+`on_backend_path_resolved` is an opt-in, route-sensitive boundary after all
+`before_proxy` overrides and initial load balancing, but before circuit-breaker
+or backend dispatch. The gateway assembles the same path segments used by the
+backend URL builder, including regex/exact/prefix match length, encoded-slash
+normalization, `strip_listen_path`, `backend_path`, and the selected target's
+path. `grpc_method_router` uses this phase so allow/deny/rate policy and
+`grpc_*` metadata describe the method placed on the backend wire. Its
+pre-filtered plugin list is built on reload; proxies without an opt-in plugin do
+not scan the chain or allocate an effective-path string. Once policy binds the
+first target's path, retries may rotate host/port but retain that target-path
+component so retry cannot silently change the authorized method.
 
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
 
@@ -297,7 +314,7 @@ Given all built-in plugins enabled, the execution order is:
 | 9 | `spec_expose` | 210 | on_request_received |
 | 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body |
 | 11 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, on_final_request_body, after_proxy, transform_response_body |
-| 12 | `grpc_method_router` | 275 | on_request_received, before_proxy |
+| 12 | `grpc_method_router` | 275 | on_request_received, on_backend_path_resolved |
 | 13 | `spiffe_identity` | 940 | on_request_received, on_stream_connect |
 | 14 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 15 | `jwks_auth` | 1000 | authenticate |

@@ -2858,6 +2858,43 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
+#[test]
+fn test_grpc_backend_path_plugins_are_precomputed_with_priority_override() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["router"])],
+        vec![make_plugin_config_with_priority(
+            "router",
+            "grpc_method_router",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(300),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    assert!(
+        grpc_view
+            .capabilities()
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+    );
+    assert_eq!(grpc_view.backend_path_plugins().len(), 1);
+    assert_eq!(
+        grpc_view.backend_path_plugins()[0].name(),
+        "grpc_method_router"
+    );
+    assert_eq!(grpc_view.backend_path_plugins()[0].priority(), 300);
+
+    let http_view = cache.request_view("p1", ProxyProtocol::Http);
+    assert!(
+        !http_view
+            .capabilities()
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+    );
+    assert!(http_view.backend_path_plugins().is_empty());
+}
+
 #[tokio::test]
 async fn test_priority_override_delegates_response_stream_termination_hook() {
     let config = make_config(

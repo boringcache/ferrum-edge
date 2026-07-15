@@ -194,6 +194,18 @@ impl Plugin for PriorityOverridePlugin {
     ) -> PluginResult {
         self.inner.before_proxy(ctx, headers).await
     }
+    fn requires_backend_path_resolution(&self) -> bool {
+        self.inner.requires_backend_path_resolution()
+    }
+    async fn on_backend_path_resolved(
+        &self,
+        ctx: &mut RequestContext,
+        backend_path: &str,
+    ) -> PluginResult {
+        self.inner
+            .on_backend_path_resolved(ctx, backend_path)
+            .await
+    }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();
     }
@@ -693,6 +705,7 @@ impl PluginCapabilities {
     pub const HAS_RESPONSE_COMMITTED_HOOK: u16 = 1 << 8;
     pub const HAS_RESPONSE_STREAM_HOOKS: u16 = 1 << 9;
     pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
+    pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -710,6 +723,8 @@ pub struct PluginPhaseData {
     pub authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Backend-admission plugins only (pre-filtered from the protocol plugin list).
     pub backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Plugins that inspect the backend-effective path after route resolution.
+    pub backend_path_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Credential-bearing request header names used by safe downstream views.
     pub request_headers_to_redact: Arc<Vec<String>>,
     /// Capability bitset for fast boolean checks.
@@ -722,6 +737,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut auth = Vec::new();
     let mut authorize = Vec::new();
     let mut backend_admission = Vec::new();
+    let mut backend_path = Vec::new();
     let mut request_headers_to_redact = Vec::new();
     for p in plugins {
         if p.is_auth_plugin() {
@@ -733,6 +749,10 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.is_backend_admission_plugin() {
             backend_admission.push(Arc::clone(p));
+        }
+        if p.requires_backend_path_resolution() {
+            caps |= PluginCapabilities::HAS_BACKEND_PATH_PLUGINS;
+            backend_path.push(Arc::clone(p));
         }
         for header in p.request_headers_to_redact() {
             if !request_headers_to_redact
@@ -777,6 +797,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         auth_plugins: Arc::new(auth),
         authorize_plugins: Arc::new(authorize),
         backend_admission_plugins: Arc::new(backend_admission),
+        backend_path_plugins: Arc::new(backend_path),
         request_headers_to_redact: Arc::new(request_headers_to_redact),
         capabilities: PluginCapabilities(caps),
     }
@@ -1010,6 +1031,16 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_backend_path_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.backend_path_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_request_headers_to_redact(
         &self,
         proxy_id: &str,
@@ -1056,13 +1087,18 @@ impl PluginCacheInner {
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> PluginCacheRequestView {
+        let capabilities = self.get_capabilities(proxy_id, protocol);
+        let backend_path_plugins = capabilities
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+            .then(|| self.get_backend_path_plugins(proxy_id, protocol));
         PluginCacheRequestView {
             plugins: self.get_plugins_for_protocol(proxy_id, protocol),
             auth_plugins: self.get_auth_plugins(proxy_id, protocol),
             authorize_plugins: self.get_authorize_plugins(proxy_id, protocol),
             backend_admission_plugins: self.get_backend_admission_plugins(proxy_id, protocol),
+            backend_path_plugins,
             request_headers_to_redact: self.get_request_headers_to_redact(proxy_id, protocol),
-            capabilities: self.get_capabilities(proxy_id, protocol),
+            capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
             requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_id),
@@ -1081,6 +1117,7 @@ pub struct PluginCacheRequestView {
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    backend_path_plugins: Option<Arc<Vec<Arc<dyn Plugin>>>>,
     request_headers_to_redact: Arc<Vec<String>>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
@@ -1107,6 +1144,14 @@ impl PluginCacheRequestView {
     /// Get pre-computed backend admission plugins from this request view.
     pub fn backend_admission_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.backend_admission_plugins)
+    }
+
+    /// Get plugins that inspect the finalized backend path.
+    pub fn backend_path_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.backend_path_plugins
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Get credential-bearing request headers precomputed for safe downstream views.

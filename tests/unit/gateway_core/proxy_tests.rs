@@ -1,7 +1,13 @@
 use chrono::Utc;
-use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
-use ferrum_edge::proxy::{build_backend_url, build_backend_url_with_target};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, UpstreamTarget,
+};
+use ferrum_edge::proxy::{
+    build_backend_effective_path, build_backend_url, build_backend_url_with_target,
+    retry_target_preserves_backend_path,
+};
 use ferrum_edge::router_cache::RouterCache;
+use std::collections::HashMap;
 
 fn test_proxy() -> Proxy {
     Proxy {
@@ -210,6 +216,102 @@ fn test_build_backend_url_target_path_with_query() {
 }
 
 #[test]
+fn test_backend_effective_grpc_path_uses_prefix_strip() {
+    let mut proxy = test_proxy();
+    proxy.listen_path = Some("/prefix".into());
+    let path = build_backend_effective_path(
+        &proxy,
+        "/prefix/pkg.Service/Denied",
+        "/prefix".len(),
+        None,
+    );
+    assert_eq!(path, "/pkg.Service/Denied");
+}
+
+#[test]
+fn test_backend_effective_grpc_path_uses_exact_route_backend_path() {
+    let mut proxy = test_proxy();
+    proxy.listen_path = Some("=/public.Service/Allowed".into());
+    proxy.backend_path = Some("/admin.Service/Delete".into());
+    let incoming = "/public.Service/Allowed";
+    let path = build_backend_effective_path(&proxy, incoming, incoming.len(), None);
+    assert_eq!(path, "/admin.Service/Delete");
+}
+
+#[test]
+fn test_backend_effective_grpc_path_uses_regex_match_length() {
+    let mut proxy = test_proxy();
+    proxy.listen_path = Some("~^/public\\.Service/Allowed$".into());
+    proxy.backend_path = Some("/admin.Service/Delete".into());
+    let incoming = "/public.Service/Allowed";
+    let path = build_backend_effective_path(&proxy, incoming, incoming.len(), None);
+    assert_eq!(path, "/admin.Service/Delete");
+}
+
+#[test]
+fn test_backend_effective_grpc_path_uses_selected_target_path() {
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("/ignored.Service/Method".into());
+    let incoming = "/api/v1";
+    let path = build_backend_effective_path(
+        &proxy,
+        incoming,
+        incoming.len(),
+        Some("/selected.Service/Method"),
+    );
+    assert_eq!(path, "/selected.Service/Method");
+}
+
+#[test]
+fn test_backend_effective_path_matches_backend_url_path_assembly() {
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("/backend.Service".into());
+    let incoming = "/api/v1/Method";
+    let strip_len = "/api/v1".len();
+    let path = build_backend_effective_path(&proxy, incoming, strip_len, None);
+    let url = build_backend_url_with_target(
+        &proxy,
+        incoming,
+        "",
+        "target.example.com",
+        9090,
+        strip_len,
+        None,
+    );
+    assert_eq!(path, "/backend.Service/Method");
+    assert_eq!(url, format!("http://target.example.com:9090{path}"));
+}
+
+fn retry_target(host: &str, path: Option<&str>) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.to_string(),
+        port: 9090,
+        service_port_policy_key: None,
+        weight: 100,
+        tags: HashMap::new(),
+        locality: None,
+        path: path.map(str::to_string),
+    }
+}
+
+#[test]
+fn test_backend_path_policy_pins_target_path_across_retries() {
+    let initial = retry_target("first.example.com", Some("/pkg.Service/Allowed"));
+    let same_method = retry_target("second.example.com", Some("/pkg.Service/Allowed"));
+    let different_method = retry_target("third.example.com", Some("/admin.Service/Delete"));
+
+    assert!(retry_target_preserves_backend_path(
+        true, &initial, &same_method
+    ));
+    assert!(!retry_target_preserves_backend_path(
+        true, &initial, &different_method
+    ));
+    assert!(retry_target_preserves_backend_path(
+        false, &initial, &different_method
+    ));
+}
+
+#[test]
 fn test_longest_prefix_match() {
     let config = GatewayConfig {
         version: "1".to_string(),
@@ -275,7 +377,6 @@ use ferrum_edge::proxy::grpc_proxy::grpc_status;
 use ferrum_edge::proxy::run_authentication_phase;
 use hyper::StatusCode;
 use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 struct ExternalIdentityAuth;
