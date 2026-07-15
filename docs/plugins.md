@@ -121,7 +121,9 @@ Use `priority_override` to control the relative execution order of instances tha
 
 ## Multi-Authentication Mode
 
-When a proxy has `auth_mode: multi`, attached authentication plugins execute in priority order and stop after the first attempt establishes a nonblank mapped Consumer or permitted external principal. In `auth_mode: single`, all attached authentication plugins execute, but the first accepted attempt still owns the request's identity-derived state; later accepted credentials may add their own cleanup without overwriting it. In either mode, rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, rolling session cookie, or backend token-stripping state for another credential to inherit. If one or more authentication plugins are attached and none succeeds, the request is rejected before authorization.
+With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one establishes a nonblank mapped Consumer or permitted external principal; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned.
+
+In either mode, rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, rolling session cookie, or backend token-stripping state for another credential to inherit. Requester-owned cookies from rejected attempts are retained only when authentication ultimately rejects and are merged with the selected rejection's cookies by exact cookie name; a later successful credential discards them. After authentication, the Access Control plugin can apply consumer or group policy.
 
 ## Consumer Identity Headers
 
@@ -1569,18 +1571,24 @@ credentials:
 
 ### `basic_auth`
 
-Authenticates using HTTP Basic credentials. Supports `hmac_sha256:<hex>` password hashes derived from `FERRUM_BASIC_AUTH_HMAC_SECRET`. A default secret is provided but **must be changed in production**.
+Authenticates using HTTP Basic credentials. Every HTTP 401 response advertises `Basic realm="ferrum-edge", charset="UTF-8"`. Password hashes use the exact `hmac_sha256:<64 lowercase hex>` form derived from `FERRUM_BASIC_AUTH_HMAC_SECRET`.
 
 **Priority:** 1300
 
-**Config**: None required.
+**Config**: The plugin object is empty. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+
+Admin API writes may supply exactly one of `password` or `password_hash`; plaintext passwords are hashed and removed before persistence. File-mode configuration must supply only `password_hash` so plaintext credentials never enter observable runtime configuration.
+
+Ordinary Consumer API responses omit the entire `basicauth` credential type so the strict request/backup hash schema is never populated with a synthetic placeholder. The authenticated `/backup` endpoint remains intentionally unredacted for restoration.
+
+Basic authentication normalizes password-verification work to the configured credential rotation limit to reduce username and rotation-state timing signals. Apply an authentication rate-limit policy as an additional control against online guessing.
 
 **Consumer credential** (`basicauth`) — array:
 ```yaml
 credentials:
   basicauth:
-    - password_hash: "hmac_sha256:ab3f..."
-    - password_hash: "hmac_sha256:new..."
+    - password_hash: "hmac_sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    - password_hash: "hmac_sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ```
 
 ### `hmac_auth`
@@ -1634,11 +1642,11 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `bind_dn_template` | string | (none) | Direct bind DN template with `{username}` placeholder (e.g., `uid={username},ou=users,dc=example,dc=com`) |
 | `search_base_dn` | string | (none) | Base DN for search-then-bind user search |
 | `search_filter` | string | (none) | LDAP search filter with `{username}` placeholder (e.g., `(&(objectClass=user)(sAMAccountName={username}))`) |
-| `canonical_identity_attribute` | string | (none) | Required for search-then-bind. The uniquely selected entry must return exactly one value for this attribute; that value becomes the Ferrum identity and Consumer mapping key |
+| `canonical_identity_attribute` | string | (none) | Required for search-then-bind. The uniquely selected entry must return exactly one value for this attribute; that value becomes the Ferrum identity, Consumer mapping key, custom group-filter `{username}`, and default `memberUid` value |
 | `service_account_dn` | string | (none) | DN for the service account used in search-then-bind |
 | `service_account_password` | string | (none) | Password for the service account |
 | `group_base_dn` | string | (none) | Base DN for group membership search (required when `required_groups` is set) |
-| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` remains the presented login value even when the canonical identity differs. Default checks `member`, `uniqueMember`, and `memberUid`; custom-filter matches are rechecked against the returned group entry using those attributes before authorization |
+| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` is the authenticated canonical identity (the presented username for direct bind, or `canonical_identity_attribute` for search-then-bind). Default checks `member`, `uniqueMember`, and canonical-identity `memberUid`; custom-filter matches are rechecked against the returned group entry using those attributes before authorization |
 | `required_groups` | string[] | `[]` | List of LDAP/AD group names the user must belong to (OR logic — at least one must match) |
 | `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups`; LDAP attribute-name matching is case-insensitive |
 | `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
@@ -1653,7 +1661,7 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 **Authentication modes** (must configure one):
 
 1. **Direct bind** — set `bind_dn_template` with `{username}` placeholder. Fastest option, no service account needed.
-2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `canonical_identity_attribute`, `service_account_dn`, and `service_account_password`. The service account performs a size-limited search, which must return exactly one entry, then the plugin binds as that user. The configured canonical attribute—not the client-supplied username—is exported and used for Consumer mapping.
+2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `canonical_identity_attribute`, `service_account_dn`, and `service_account_password`. The service account performs a size-limited search, which must return exactly one entry, then the plugin binds as that user. The configured canonical attribute—not the client-supplied username—is exported and used for Consumer mapping and username-based group authorization.
 
 **Example — Direct bind:**
 ```yaml
@@ -1697,7 +1705,9 @@ A directory outage or a misconfigured service account therefore returns `500` (`
 
 **Group search and service accounts:** When `required_groups` is set, the group-membership search binds with the service account if one is configured. With direct bind and **no** service account, the search runs over an **anonymous** bind — many directories deny anonymous reads of group objects / `member` attributes, in which case the search returns no entries and an entitled user is wrongly denied (`403`). The plugin logs a startup warning for this configuration and a per-request warning when an anonymous group search returns zero entries. **Configure a service account whenever you use `required_groups`** unless the directory is known to permit anonymous group searches.
 
-For custom `group_filter` values, a required group returned by the initial search is not sufficient proof of membership. The plugin performs a base-scope search against that exact group DN and authorizes it only when the directory confirms the bound user's DN or presented username through `member`, `uniqueMember`, or `memberUid`. This prevents a static filter branch from returning an allowed group for every successfully bound user without downloading large group membership attributes.
+For custom `group_filter` values, a required group returned by the initial search is not sufficient proof of membership. The plugin performs a base-scope search against that exact group DN and authorizes it only when the directory confirms the bound user's DN or authenticated canonical identity through `member`, `uniqueMember`, or `memberUid`. This prevents a static filter branch from returning an allowed group for every successfully bound user without downloading large group membership attributes.
+
+In search-then-bind deployments that use POSIX `memberUid` or `{username}` in a custom group filter, configure `canonical_identity_attribute` to the authoritative directory attribute whose value those groups store. If groups store a different identifier than the desired Ferrum/Consumer identity, use DN-based `member`/`uniqueMember` membership or a `{user_dn}` custom filter. A mismatch fails closed as non-membership; the plugin never falls back to the client-presented login. Direct bind is unchanged because its authenticated canonical identity is the presented login.
 
 **TLS and revocation:** `ldaps://` and STARTTLS connections use rustls with the gateway's CA settings (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`). When a CRL is configured (`FERRUM_TLS_CRL_FILE_PATH`) and verification is not disabled, revoked LDAP server certificates are rejected — the same revocation guarantee as the proxy backend, DTLS, frontend mTLS, and rustls logging-sink surfaces.
 
@@ -1890,13 +1900,15 @@ UDP+DTLS streams via certificate-based consumer mapping.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. |
-| `disallowed_consumers` | String[] | `[]` | Consumer usernames explicitly denied. Takes precedence over every allow rule. |
-| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. |
-| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. |
-| `allow_authenticated_identity` | bool | `false` | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
+| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. |
+| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy. All checks use `HashSet<String>` for O(1) membership.
+Whitespace-only rule admission follows Rust `str::trim` Unicode `White_Space`
+semantics; accepted rule values are still stored and matched byte-for-byte.
 
 `allow_authenticated_identity: true` cannot be combined with an allow-list
 (`allowed_consumers` or `allowed_groups`): the allow-list matches mapped Consumer
@@ -1905,7 +1917,13 @@ so the combination would silently bypass the allow-list for every
 externally-authenticated-but-unmapped caller. The combination is rejected at
 config validation. The `disallowed_consumers` deny-list is still applied to the
 external identity string, so it may be combined with `allow_authenticated_identity`
-to revoke a compromised principal.
+to revoke a compromised principal. External identities longer than the 4096-character
+exact-rule bound fail closed instead of bypassing the deny-list.
+
+An authenticated external identity that is not enabled by this policy is an
+authorization denial: HTTP requests receive 403 and native gRPC requests receive
+trailers-only `PERMISSION_DENIED` (status 7). Requests with no meaningful mapped
+or external identity receive HTTP 401 / gRPC `UNAUTHENTICATED` (status 16).
 
 **Evaluation order:** deny (consumer username → group) → allow (consumer username → group).
 If both `allowed_consumers` and `allowed_groups` are set, matching _either_ grants access.

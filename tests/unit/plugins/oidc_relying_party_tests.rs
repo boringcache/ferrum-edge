@@ -1,5 +1,7 @@
 use ferrum_edge::_test_support::{
     oidc_open_session_cookie_for_test, oidc_sealed_refresh_session_cookie_for_test,
+    oidc_sealed_due_refresh_session_cookie_for_test, oidc_sealed_session_cookie_for_test,
+    oidc_session_state_from_set_cookie_for_test,
 };
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::AuthMode;
@@ -12,9 +14,10 @@ use ferrum_edge::proxy::run_authentication_phase;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use url::Url;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
 
@@ -81,6 +84,28 @@ async fn rolling_cookie(plugin: &OidcRelyingParty, ctx: &mut RequestContext) -> 
     response_headers.remove("set-cookie")
 }
 
+fn refresh_rejection_plugin(token_endpoint: &str) -> OidcRelyingParty {
+    let mut config = base_config();
+    config["providers"][0]["token_endpoint"] = json!(token_endpoint);
+    config["providers"][0]["required_scopes"] = json!(["admin"]);
+    config["providers"][0]["consumer_identity_claim"] = json!("email");
+    config["providers"][0]["claim_headers"] = json!({"role": "X-Untrusted-Role"});
+    OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap()
+}
+
+fn ctx_with_session_cookie(set_cookie: &str) -> RequestContext {
+    let cookie_pair = set_cookie
+        .split('\n')
+        .find(|cookie| cookie.trim_start().starts_with("ferrum_session="))
+        .expect("OIDC session cookie")
+        .split(';')
+        .next()
+        .expect("OIDC session cookie pair")
+        .to_string();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.headers.insert("cookie".to_string(), cookie_pair);
+    ctx
+}
 #[tokio::test]
 async fn new_accepts_minimal_cookie_store_config() {
     let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
@@ -179,77 +204,6 @@ async fn earlier_single_mode_principal_prevents_later_oidc_refresh_and_slide() {
     assert!(!upstream_headers.contains_key("x-api-key"));
     assert!(rolling_cookie(&oidc, &mut ctx).await.is_none());
     assert_eq!(server.received_requests().await.expect("requests").len(), 0);
-}
-
-#[tokio::test]
-async fn multi_auth_supersession_keeps_only_rotated_requester_session_state() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "new-access-token",
-            "refresh_token": "rotated-refresh-token",
-            "token_type": "Bearer",
-            "expires_in": 3600
-        })))
-        .mount(&server)
-        .await;
-    let mut config = refresh_config(&format!("{}/token", server.uri()));
-    config["providers"][0]["required_scopes"] = json!(["admin"]);
-    config["providers"][0]["claim_headers"] = json!({"email": "X-OIDC-Email"});
-    let oidc = Arc::new(
-        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config"),
-    );
-    let key_auth = Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
-    let now = chrono::Utc::now().timestamp();
-    let cookie = oidc_sealed_refresh_session_cookie_for_test(
-        &oidc,
-        json!({
-            "sub": "oidc-subject",
-            "email": "rejected@example.test",
-            "scope": "read",
-            "exp": now + 3600
-        }),
-        Some("refresh-token".to_string()),
-        true,
-        true,
-    )
-    .expect("session seals");
-    let mut ctx = session_ctx(&cookie);
-    ctx.headers
-        .insert("x-api-key".to_string(), "test-api-key".to_string());
-    let key_auth_plugin: Arc<dyn Plugin> = key_auth.clone();
-    let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
-
-    assert!(
-        run_authentication_phase(
-            AuthMode::Multi,
-            &[oidc_plugin, key_auth_plugin],
-            &mut ctx,
-            &ConsumerIndex::new(&[create_test_consumer()]),
-        )
-        .await
-        .is_none()
-    );
-    assert_eq!(ctx.auth_method, Some("key_auth"));
-    assert_eq!(
-        ctx.identified_consumer
-            .as_ref()
-            .map(|consumer| consumer.username.as_str()),
-        Some("testuser")
-    );
-    let mut upstream_headers = ctx.headers.clone();
-    assert_continue(oidc.before_proxy(&mut ctx, &mut upstream_headers).await);
-    assert_continue(key_auth.before_proxy(&mut ctx, &mut upstream_headers).await);
-    assert!(!upstream_headers.contains_key("x-oidc-email"));
-    assert!(!upstream_headers.contains_key("x-api-key"));
-    let rotated = rolling_cookie(&oidc, &mut ctx)
-        .await
-        .expect("post-refresh reject must preserve requester-owned rotation");
-    let payload = oidc_open_session_cookie_for_test(&oidc, &rotated)
-        .expect("rotated requester session opens");
-    assert_eq!(payload["refresh_token_b64"], json!("rotated-refresh-token"));
-    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
 }
 
 #[tokio::test]
@@ -360,6 +314,932 @@ async fn accepted_refresh_failure_commits_backoff_and_avoids_retry_storm() {
             .await,
     );
     assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+#[tokio::test]
+async fn oidc_success_commits_claim_headers_and_rolling_cookie_together() {
+    let mut config = base_config();
+    config["providers"][0]["consumer_identity_claim"] = json!("email");
+    config["providers"][0]["claim_headers"] = json!({"role": "X-Trusted-Role"});
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let set_cookie = oidc_sealed_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "external@example.test",
+            "role": "operator",
+            "exp": now + 3600
+        }),
+        true,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.headers.insert(
+        "cookie".to_string(),
+        set_cookie.split(';').next().unwrap().to_string(),
+    );
+
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("external@example.test")
+    );
+    assert_eq!(ctx.auth_method, Some("oidc_relying_party"));
+
+    let mut request_headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut request_headers).await);
+    assert_eq!(
+        request_headers.get("x-trusted-role").map(String::as_str),
+        Some("operator")
+    );
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+    assert!(response_headers.contains_key("set-cookie"));
+}
+
+#[tokio::test]
+async fn oidc_single_auth_scope_rejection_returns_rotated_refresh_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = Arc::new(refresh_rejection_plugin(&format!("{}/token", server.uri())));
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "scope": "viewer",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .unwrap();
+    let mut ctx = ctx_with_session_cookie(&cookie);
+
+    let plugin_for_phase: Arc<dyn Plugin> = plugin.clone();
+    let (status_code, _, headers) = run_authentication_phase(
+        AuthMode::Single,
+        &[plugin_for_phase],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("scope-rejected OIDC session must reject");
+    assert_eq!(status_code, 403);
+    assert!(
+        ctx.metadata
+            .keys()
+            .all(|key| !key.contains("rejection_set_cookie"))
+    );
+    let mut set_cookies = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"));
+    let set_cookie = set_cookies
+        .next()
+        .map(|(_, value)| value)
+        .expect("rotated session must be returned on terminal rejection");
+    assert!(set_cookies.next().is_none());
+    assert!(!set_cookie.contains('\n'));
+    let state = oidc_session_state_from_set_cookie_for_test(&plugin, set_cookie)
+        .expect("rotated session cookie must open");
+    assert_eq!(state.access_token, "new-access-token");
+    assert_eq!(
+        state.refresh_token.as_deref(),
+        Some("rotated-refresh-token")
+    );
+    assert!(state.refresh_after_unix > now);
+}
+
+#[tokio::test]
+async fn oidc_scope_rejection_persists_refresh_failure_backoff() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = refresh_rejection_plugin(&format!("{}/token", server.uri()));
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "scope": "viewer",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .unwrap();
+    let mut first_ctx = ctx_with_session_cookie(&cookie);
+
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = plugin
+        .authenticate(&mut first_ctx, &ConsumerIndex::new(&[]))
+        .await
+    else {
+        panic!("scope-rejected OIDC session must reject");
+    };
+    assert_eq!(status_code, 403);
+    let set_cookie = headers
+        .get("set-cookie")
+        .expect("refresh backoff must be returned on terminal rejection");
+    let state = oidc_session_state_from_set_cookie_for_test(&plugin, set_cookie)
+        .expect("backoff session cookie must open");
+    assert_eq!(state.access_token, "test-access-token");
+    assert_eq!(
+        state.refresh_token.as_deref(),
+        Some("original-refresh-token")
+    );
+    assert!(state.refresh_after_unix >= now + 20);
+
+    let mut second_ctx = ctx_with_session_cookie(set_cookie);
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = plugin
+        .authenticate(&mut second_ctx, &ConsumerIndex::new(&[]))
+        .await
+    else {
+        panic!("scope-rejected OIDC session must reject");
+    };
+    assert_eq!(status_code, 403);
+    assert!(
+        !headers.contains_key("set-cookie"),
+        "a backed-off session must not be re-sealed again immediately"
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the persisted backoff must suppress an immediate second refresh"
+    );
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_preserves_rotated_cookie_when_later_credential_rejects() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut config = base_config();
+    config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
+    config["providers"][0]["required_roles"] = json!(["admin"]);
+    config["providers"][0]["consumer_identity_claim"] = json!("email");
+    config["providers"][0]["claim_headers"] = json!({"roles": "X-Untrusted-Roles"});
+    let oidc = Arc::new(OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap());
+    let key_auth: Arc<dyn Plugin> =
+        Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
+    let consumers = [create_test_consumer()];
+    let consumer_index = ConsumerIndex::new(&consumers);
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &oidc,
+        json!({
+            "sub": "oidc-subject",
+            "email": "rejected@example.test",
+            "roles": ["viewer"],
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .unwrap();
+    let mut ctx = ctx_with_session_cookie(&cookie);
+    ctx.headers
+        .insert("x-api-key".to_string(), "invalid-api-key".to_string());
+    let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
+
+    let (status_code, body, mut response_headers) = run_authentication_phase(
+        AuthMode::Multi,
+        &[oidc_plugin, key_auth],
+        &mut ctx,
+        &consumer_index,
+    )
+    .await
+    .expect("later invalid API key must keep the request rejected");
+    assert_eq!(
+        status_code, 401,
+        "the later client rejection must still win"
+    );
+    assert_eq!(body.as_slice(), br#"{"error":"Invalid API key"}"#);
+    assert!(ctx.identified_consumer.is_none());
+    assert!(ctx.authenticated_identity.is_none());
+    assert!(ctx.authenticated_identity_header.is_none());
+    assert!(ctx.auth_method.is_none());
+    assert!(
+        ctx.metadata
+            .keys()
+            .all(|key| !key.contains("rejection_set_cookie"))
+    );
+
+    let mut request_headers = HashMap::new();
+    assert_continue(oidc.before_proxy(&mut ctx, &mut request_headers).await);
+    assert!(
+        !request_headers.contains_key("x-untrusted-roles"),
+        "the rejected OIDC attempt must not publish claim headers"
+    );
+
+    let set_cookie = response_headers
+        .iter()
+        .find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("set-cookie")
+                .then_some(value.clone())
+        })
+        .expect("the earlier rotated session must survive the later rejection");
+    assert!(!set_cookie.contains('\n'));
+    let state = oidc_session_state_from_set_cookie_for_test(&oidc, &set_cookie)
+        .expect("rotated session cookie must open");
+    assert_eq!(state.access_token, "new-access-token");
+    assert_eq!(
+        state.refresh_token.as_deref(),
+        Some("rotated-refresh-token")
+    );
+
+    assert_continue(
+        oidc.after_proxy(&mut ctx, status_code, &mut response_headers)
+            .await,
+    );
+    assert_eq!(
+        response_headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("set-cookie"))
+            .count(),
+        1,
+        "reject finalization must emit exactly one session cookie"
+    );
+    assert_eq!(
+        response_headers
+            .iter()
+            .find_map(|(name, value)| { name.eq_ignore_ascii_case("set-cookie").then_some(value) }),
+        Some(&set_cookie)
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_preserves_distinct_rejected_session_cookies() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/first-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "first-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "first-rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/second-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "second-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "second-rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let rejection_plugin = |cookie_name: &str, token_path: &str| {
+        let mut config = base_config();
+        config["providers"][0]["token_endpoint"] = json!(format!("{}{token_path}", server.uri()));
+        config["providers"][0]["required_scopes"] = json!(["admin"]);
+        config["providers"][0]["consumer_identity_claim"] = json!("email");
+        config["session"]["cookie_name"] = json!(cookie_name);
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap()
+    };
+    let first = Arc::new(rejection_plugin("first_session", "/first-token"));
+    let second = Arc::new(rejection_plugin("second_session", "/second-token"));
+    let now = chrono::Utc::now().timestamp();
+    let claims = json!({
+        "sub": "oidc-subject",
+        "email": "rejected@example.test",
+        "scope": "viewer",
+        "exp": now + 3600
+    });
+    let first_cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &first,
+        claims.clone(),
+        "first-original-refresh-token",
+    )
+    .unwrap();
+    let second_cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &second,
+        claims,
+        "second-original-refresh-token",
+    )
+    .unwrap();
+    let first_pair = first_cookie.split(';').next().expect("first cookie pair");
+    let second_pair = second_cookie.split(';').next().expect("second cookie pair");
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.headers
+        .insert("cookie".to_string(), format!("{first_pair}; {second_pair}"));
+    let first_plugin: Arc<dyn Plugin> = first.clone();
+    let second_plugin: Arc<dyn Plugin> = second.clone();
+
+    let (status_code, _, headers) = run_authentication_phase(
+        AuthMode::Multi,
+        &[first_plugin, second_plugin],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("both scope-rejected sessions must reject");
+    assert_eq!(status_code, 403);
+    let mut set_cookies = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"));
+    let set_cookie = set_cookies
+        .next()
+        .map(|(_, value)| value)
+        .expect("both rejected session cookies must reach the client");
+    assert!(set_cookies.next().is_none());
+    let cookies: Vec<&str> = set_cookie.split('\n').collect();
+    assert_eq!(cookies.len(), 2);
+    assert!(cookies[0].starts_with("second_session="));
+    assert!(cookies[1].starts_with("first_session="));
+    assert_eq!(
+        cookies
+            .iter()
+            .filter(|cookie| cookie.starts_with("first_session="))
+            .count(),
+        1
+    );
+    assert_eq!(
+        cookies
+            .iter()
+            .filter(|cookie| cookie.starts_with("second_session="))
+            .count(),
+        1
+    );
+    let first_state = oidc_session_state_from_set_cookie_for_test(&first, set_cookie)
+        .expect("first rejected session cookie must open with its owner");
+    assert_eq!(first_state.access_token, "first-access-token");
+    assert_eq!(
+        first_state.refresh_token.as_deref(),
+        Some("first-rotated-refresh-token")
+    );
+    let second_state = oidc_session_state_from_set_cookie_for_test(&second, set_cookie)
+        .expect("second rejected session cookie must open with its owner");
+    assert_eq!(second_state.access_token, "second-access-token");
+    assert_eq!(
+        second_state.refresh_token.as_deref(),
+        Some("second-rotated-refresh-token")
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_uses_later_same_name_rejected_session_cookie() {
+    let server = MockServer::start().await;
+    let response_number = Arc::new(AtomicUsize::new(0));
+    let response_number_for_mock = Arc::clone(&response_number);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(move |_: &Request| {
+            let response_number = response_number_for_mock.fetch_add(1, Ordering::SeqCst);
+            let (access_token, refresh_token) = if response_number == 0 {
+                ("first-access-token", "first-rotated-refresh-token")
+            } else {
+                ("second-access-token", "second-rotated-refresh-token")
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "refresh_token": refresh_token,
+                "expires_in": 3600
+            }))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let mut config = base_config();
+    config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
+    config["providers"][0]["required_scopes"] = json!(["admin"]);
+    config["providers"][0]["consumer_identity_claim"] = json!("email");
+    config["session"]["cookie_name"] = json!("shared_session");
+    let first = Arc::new(
+        OidcRelyingParty::new(&config, PluginHttpClient::default())
+            .expect("first OIDC config must be valid"),
+    );
+    let second = Arc::new(
+        OidcRelyingParty::new(&config, PluginHttpClient::default())
+            .expect("second OIDC config must be valid"),
+    );
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &first,
+        json!({
+            "sub": "oidc-subject",
+            "email": "rejected@example.test",
+            "scope": "viewer",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .unwrap();
+    let cookie_pair = cookie.split(';').next().expect("session cookie pair");
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.headers
+        .insert("cookie".to_string(), cookie_pair.to_string());
+    let first_plugin: Arc<dyn Plugin> = first;
+    let second_plugin: Arc<dyn Plugin> = second.clone();
+
+    let (status_code, _, headers) = run_authentication_phase(
+        AuthMode::Multi,
+        &[first_plugin, second_plugin],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("both scope-rejected sessions must reject");
+    assert_eq!(status_code, 403);
+    let mut set_cookies = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"));
+    let set_cookie = set_cookies
+        .next()
+        .map(|(_, value)| value)
+        .expect("the later rejected session cookie must reach the client");
+    assert!(set_cookies.next().is_none());
+    assert!(!set_cookie.contains('\n'));
+    assert!(set_cookie.starts_with("shared_session="));
+    let state = oidc_session_state_from_set_cookie_for_test(&second, set_cookie)
+        .expect("the later rejected session cookie must remain readable");
+    assert_eq!(state.access_token, "second-access-token");
+    assert_eq!(
+        state.refresh_token.as_deref(),
+        Some("second-rotated-refresh-token")
+    );
+    assert_eq!(response_number.load(Ordering::SeqCst), 2);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_preserves_selected_rejection_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut first_config = base_config();
+    first_config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
+    first_config["providers"][0]["required_scopes"] = json!(["admin"]);
+    first_config["providers"][0]["consumer_identity_claim"] = json!("email");
+    // The selected correlation cookie starts with `ferrum_`; the shorter
+    // requester cookie name proves conflict checks use the complete name.
+    first_config["session"]["cookie_name"] = json!("ferrum");
+    let first =
+        Arc::new(OidcRelyingParty::new(&first_config, PluginHttpClient::default()).unwrap());
+    let mut second_config = base_config();
+    second_config["session"]["cookie_name"] = json!("second_session");
+    let second =
+        Arc::new(OidcRelyingParty::new(&second_config, PluginHttpClient::default()).unwrap());
+    let now = chrono::Utc::now().timestamp();
+    let first_cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &first,
+        json!({
+            "sub": "oidc-subject",
+            "email": "rejected@example.test",
+            "scope": "viewer",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .unwrap();
+    let first_pair = first_cookie.split(';').next().expect("session cookie pair");
+    let mut ctx = html_ctx();
+    ctx.headers
+        .insert("cookie".to_string(), first_pair.to_string());
+    let first_plugin: Arc<dyn Plugin> = first.clone();
+    let second_plugin: Arc<dyn Plugin> = second.clone();
+
+    let (status_code, _, mut headers) = run_authentication_phase(
+        AuthMode::Multi,
+        &[first_plugin, second_plugin],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("the later browser challenge must reject");
+    assert_eq!(status_code, 302);
+    assert!(
+        headers
+            .get("location")
+            .is_some_and(|location| location.starts_with("https://issuer.example.com/authorize"))
+    );
+    let set_cookie = headers
+        .iter()
+        .find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("set-cookie")
+                .then_some(value.clone())
+        })
+        .expect("both response-owned cookies must reach the client");
+    let cookies: Vec<&str> = set_cookie.split('\n').collect();
+    assert_eq!(cookies.len(), 2);
+    assert!(cookies[0].contains("Path=/oauth/callback"));
+    assert!(cookies[1].starts_with("ferrum="));
+    assert_eq!(
+        cookies
+            .iter()
+            .filter(|cookie| cookie.starts_with("ferrum="))
+            .count(),
+        1
+    );
+    let state = oidc_session_state_from_set_cookie_for_test(&first, &set_cookie)
+        .expect("rotated requester session cookie must remain readable");
+    assert_eq!(state.access_token, "new-access-token");
+    assert_eq!(
+        state.refresh_token.as_deref(),
+        Some("rotated-refresh-token")
+    );
+    assert!(
+        ctx.metadata
+            .keys()
+            .all(|key| !key.contains("rejection_set_cookie"))
+    );
+
+    assert_continue(first.after_proxy(&mut ctx, status_code, &mut headers).await);
+    assert_continue(
+        second
+            .after_proxy(&mut ctx, status_code, &mut headers)
+            .await,
+    );
+    assert_eq!(
+        headers
+            .iter()
+            .find_map(|(name, value)| { name.eq_ignore_ascii_case("set-cookie").then_some(value) })
+            .map(|value| value.split('\n').count()),
+        Some(2),
+        "reject finalization must not duplicate either cookie"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_keeps_later_clear_for_shared_session_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut first_config = base_config();
+    first_config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
+    first_config["providers"][0]["required_scopes"] = json!(["admin"]);
+    first_config["providers"][0]["consumer_identity_claim"] = json!("email");
+    first_config["session"]["cookie_name"] = json!("ferrum");
+    let first =
+        Arc::new(OidcRelyingParty::new(&first_config, PluginHttpClient::default()).unwrap());
+    let mut second_config = base_config();
+    second_config["session"]["cookie_name"] = json!("ferrum");
+    let second =
+        Arc::new(OidcRelyingParty::new(&second_config, PluginHttpClient::default()).unwrap());
+    let now = chrono::Utc::now().timestamp();
+    let first_cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &first,
+        json!({
+            "sub": "oidc-subject",
+            "email": "rejected@example.test",
+            "scope": "viewer",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .unwrap();
+    let first_pair = first_cookie.split(';').next().expect("session cookie pair");
+    let mut ctx = html_ctx();
+    ctx.headers
+        .insert("cookie".to_string(), first_pair.to_string());
+    let first_plugin: Arc<dyn Plugin> = first.clone();
+    let second_plugin: Arc<dyn Plugin> = second;
+
+    let (status_code, _, headers) = run_authentication_phase(
+        AuthMode::Multi,
+        &[first_plugin, second_plugin],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("the later browser challenge must reject");
+    assert_eq!(status_code, 302);
+    assert!(
+        headers
+            .get("location")
+            .is_some_and(|location| location.starts_with("https://issuer.example.com/authorize"))
+    );
+    let set_cookie = headers
+        .iter()
+        .find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("set-cookie")
+                .then_some(value.as_str())
+        })
+        .expect("the selected challenge cookies must reach the client");
+    let cookies: Vec<&str> = set_cookie.split('\n').collect();
+    assert_eq!(cookies.len(), 2);
+    assert!(cookies[0].starts_with("ferrum_oidc_state_"));
+    assert!(cookies[0].contains("Path=/oauth/callback"));
+    assert_eq!(
+        cookies[1],
+        "ferrum=; Max-Age=0; Path=/; SameSite=lax; Secure; HttpOnly"
+    );
+    assert!(oidc_session_state_from_set_cookie_for_test(&first, set_cookie).is_none());
+    assert!(
+        ctx.metadata
+            .keys()
+            .all(|key| !key.contains("rejection_set_cookie"))
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_preserves_refresh_backoff_when_later_credential_rejects() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let oidc = Arc::new(refresh_rejection_plugin(&format!("{}/token", server.uri())));
+    let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
+    let key_auth: Arc<dyn Plugin> =
+        Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
+    let auth_plugins = [oidc_plugin, key_auth];
+    let consumers = [create_test_consumer()];
+    let consumer_index = ConsumerIndex::new(&consumers);
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &oidc,
+        json!({
+            "sub": "oidc-subject",
+            "email": "rejected@example.test",
+            "role": "viewer",
+            "scope": "viewer",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .unwrap();
+    let mut first_ctx = ctx_with_session_cookie(&cookie);
+    first_ctx
+        .headers
+        .insert("x-api-key".to_string(), "invalid-api-key".to_string());
+
+    let (status_code, _, headers) = run_authentication_phase(
+        AuthMode::Multi,
+        &auth_plugins,
+        &mut first_ctx,
+        &consumer_index,
+    )
+    .await
+    .expect("later invalid API key must keep the request rejected");
+    assert_eq!(status_code, 401);
+    let set_cookie = headers
+        .iter()
+        .find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("set-cookie")
+                .then_some(value.as_str())
+        })
+        .expect("refresh backoff must survive the later rejection");
+    let state = oidc_session_state_from_set_cookie_for_test(&oidc, set_cookie)
+        .expect("backoff session cookie must open");
+    assert_eq!(state.access_token, "test-access-token");
+    assert_eq!(
+        state.refresh_token.as_deref(),
+        Some("original-refresh-token")
+    );
+    assert!(state.refresh_after_unix >= now + 20);
+
+    let mut second_ctx = ctx_with_session_cookie(set_cookie);
+    second_ctx
+        .headers
+        .insert("x-api-key".to_string(), "invalid-api-key".to_string());
+    let (status_code, _, headers) = run_authentication_phase(
+        AuthMode::Multi,
+        &auth_plugins,
+        &mut second_ctx,
+        &consumer_index,
+    )
+    .await
+    .expect("backed-off session and invalid API key must reject");
+    assert_eq!(status_code, 401);
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("set-cookie")),
+        "a no-refresh attempt must not fabricate a response cookie"
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the persisted backoff must suppress an immediate second refresh"
+    );
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_discards_scope_rejection_refresh_cookie_on_later_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let oidc = Arc::new(refresh_rejection_plugin(&format!("{}/token", server.uri())));
+    let key_auth: Arc<dyn Plugin> =
+        Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
+    let consumers = [create_test_consumer()];
+    let consumer_index = ConsumerIndex::new(&consumers);
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &oidc,
+        json!({
+            "sub": "oidc-subject",
+            "email": "rejected@example.test",
+            "role": "attacker",
+            "scope": "viewer",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .unwrap();
+    let mut ctx = ctx_with_session_cookie(&cookie);
+    ctx.headers
+        .insert("x-api-key".to_string(), "test-api-key".to_string());
+    let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
+
+    let rejection = run_authentication_phase(
+        AuthMode::Multi,
+        &[oidc_plugin, key_auth],
+        &mut ctx,
+        &consumer_index,
+    )
+    .await;
+    assert!(rejection.is_none(), "later key_auth must authenticate");
+    assert_eq!(ctx.auth_method, Some("key_auth"));
+    assert_eq!(
+        ctx.identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str()),
+        Some("testuser")
+    );
+    assert!(ctx.authenticated_identity.is_none());
+    assert!(ctx.authenticated_identity_header.is_none());
+    assert!(
+        ctx.metadata
+            .keys()
+            .all(|key| !key.contains("rejection_set_cookie"))
+    );
+
+    let mut request_headers = HashMap::new();
+    assert_continue(oidc.before_proxy(&mut ctx, &mut request_headers).await);
+    assert!(
+        !request_headers.contains_key("x-untrusted-role"),
+        "the rejected OIDC attempt must not publish claim headers"
+    );
+    let mut response_headers = HashMap::new();
+    assert_continue(oidc.after_proxy(&mut ctx, 200, &mut response_headers).await);
+    assert!(
+        !response_headers.contains_key("set-cookie"),
+        "a successful later credential must discard the rejected OIDC cookie"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_discards_uncommitted_attempt_metadata() {
+    let mut config = base_config();
+    config["providers"][0]["consumer_identity_claim"] = json!("email");
+    config["providers"][0]["claim_headers"] = json!({"role": "X-Untrusted-Role"});
+    config["providers"][0]["required_scopes"] = json!(["admin"]);
+    let oidc = Arc::new(OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap());
+    let key_auth: Arc<dyn Plugin> =
+        Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
+    let consumers = [create_test_consumer()];
+    let consumer_index = ConsumerIndex::new(&consumers);
+    let now = chrono::Utc::now().timestamp();
+    let attempted_cookies = [
+        oidc_sealed_session_cookie_for_test(
+            &oidc,
+            json!({
+                "sub": "oidc-subject",
+                "email": "   ",
+                "role": "attacker",
+                "scope": "admin",
+                "exp": now + 3600
+            }),
+            true,
+        )
+        .unwrap(),
+        oidc_sealed_session_cookie_for_test(
+            &oidc,
+            json!({
+                "sub": "oidc-subject",
+                "role": "attacker",
+                "scope": "admin",
+                "exp": now + 3600
+            }),
+            true,
+        )
+        .unwrap(),
+        oidc_sealed_session_cookie_for_test(
+            &oidc,
+            json!({
+                "sub": "oidc-subject",
+                "email": "rejected@example.test",
+                "role": "attacker",
+                "scope": "viewer",
+                "exp": now + 3600
+            }),
+            true,
+        )
+        .unwrap(),
+        "ferrum_session=invalid-session".to_string(),
+    ];
+
+    for attempted_cookie in attempted_cookies {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+        ctx.headers.insert(
+            "cookie".to_string(),
+            attempted_cookie.split(';').next().unwrap().to_string(),
+        );
+        ctx.headers
+            .insert("x-api-key".to_string(), "test-api-key".to_string());
+        let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
+
+        let rejection = run_authentication_phase(
+            AuthMode::Multi,
+            &[oidc_plugin, Arc::clone(&key_auth)],
+            &mut ctx,
+            &consumer_index,
+        )
+        .await;
+        assert!(rejection.is_none(), "later key_auth must authenticate");
+        assert_eq!(ctx.auth_method, Some("key_auth"));
+
+        let mut request_headers = HashMap::new();
+        assert_continue(oidc.before_proxy(&mut ctx, &mut request_headers).await);
+        assert!(!request_headers.contains_key("x-untrusted-role"));
+        let mut response_headers = HashMap::new();
+        assert_continue(oidc.after_proxy(&mut ctx, 200, &mut response_headers).await);
+        assert!(
+            !response_headers.contains_key("set-cookie"),
+            "an uncommitted OIDC attempt must not publish rolling session state"
+        );
+    }
 }
 
 #[test]

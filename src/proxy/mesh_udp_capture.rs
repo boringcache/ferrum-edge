@@ -41,6 +41,71 @@ use std::net::SocketAddr as StdSocketAddr;
 
 use tokio::sync::watch;
 
+/// Terminal classification for a captured UDP session.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturedUdpOutcome {
+    ReturnPathEnded,
+    EgressPathEnded,
+    IdleTimeout,
+    ProducerShutdown,
+}
+
+/// Race-safe reason shared by the capture-session map and its relay task.
+///
+/// The idle sweep records `IdleTimeout` before it drops the map-owned sender,
+/// allowing the relay task to distinguish normal expiry from an unexpected
+/// sender disappearance. Producer shutdown has precedence over a concurrent
+/// sweep so cancellation remains graceful, while real tunnel/return failures
+/// bypass this signal and keep their error outcomes.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct CapturedUdpOutcomeSignal {
+    reason: std::sync::atomic::AtomicU8,
+}
+
+impl CapturedUdpOutcomeSignal {
+    const ACTIVE: u8 = 0;
+    const IDLE_TIMEOUT: u8 = 1;
+    const PRODUCER_SHUTDOWN: u8 = 2;
+
+    pub fn new() -> Self {
+        Self {
+            reason: std::sync::atomic::AtomicU8::new(Self::ACTIVE),
+        }
+    }
+
+    pub fn mark_idle_timeout(&self) {
+        let _ = self.reason.compare_exchange(
+            Self::ACTIVE,
+            Self::IDLE_TIMEOUT,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    pub fn mark_producer_shutdown(&self) {
+        self.reason.store(
+            Self::PRODUCER_SHUTDOWN,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Resolve completion of the client-to-egress relay. A real tunnel write
+    /// failure remains `EgressPathEnded`; only closure of the map-owned sender
+    /// consumes the shared cleanup/shutdown reason.
+    pub fn resolve_egress_completion(&self, sender_closed: bool) -> CapturedUdpOutcome {
+        if !sender_closed {
+            return CapturedUdpOutcome::EgressPathEnded;
+        }
+        match self.reason.load(std::sync::atomic::Ordering::Acquire) {
+            Self::IDLE_TIMEOUT => CapturedUdpOutcome::IdleTimeout,
+            Self::PRODUCER_SHUTDOWN => CapturedUdpOutcome::ProducerShutdown,
+            _ => CapturedUdpOutcome::EgressPathEnded,
+        }
+    }
+}
+
 /// Process-local admission counter for captured UDP sessions.
 ///
 /// Sidecar has one current-netns UDP producer, so its limiter is listener-local.
@@ -562,6 +627,12 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
             }
         }
     }
+    // Record producer shutdown before signalling/aborting tasks. `JoinSet::shutdown`
+    // may drop a task before it polls the watch receiver, so the lifecycle's
+    // Drop fallback must already be able to classify that cancellation.
+    for session in sessions.iter() {
+        session.outcome_signal.mark_producer_shutdown();
+    }
     let _ = session_stop_tx.send(true);
     // The producer handle does not finish until every tunnel opened with its
     // fixed source evidence is gone. This makes manager-side replacement wait
@@ -658,6 +729,9 @@ struct CaptureSession {
     /// ([`EGRESS_CHANNEL_MAX_QUEUED_BYTES`]) can be enforced on the hot path
     /// without walking the channel. The `Arc` is shared with the egress task.
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Cleanup/shutdown reason stored before the map drops `tx`, shared with
+    /// the relay task so sender closure is classified without a timing race.
+    outcome_signal: std::sync::Arc<CapturedUdpOutcomeSignal>,
     /// Per-session idle window in milliseconds, derived from the relay proxy's
     /// `udp_idle_timeout_seconds` at admit (`0` = idle disabled). The cleanup
     /// sweep reaps a session only after THIS window of inactivity (codex r7):
@@ -756,6 +830,7 @@ fn handle_captured_datagram(
             session_id,
             last_activity,
             queued_bytes,
+            outcome_signal,
         } => {
             // Spawn the per-session egress task (tunnel dial + return path); the
             // session's `tx` (already inserted by the bookkeeping above) feeds it.
@@ -779,6 +854,7 @@ fn handle_captured_datagram(
                 rx,
                 last_activity,
                 queued_bytes,
+                outcome_signal,
                 epoch,
                 source_identity.cloned(),
                 reply_factory.clone(),
@@ -810,6 +886,7 @@ enum SessionAdmission {
         session_id: u64,
         last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
         queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        outcome_signal: std::sync::Arc<CapturedUdpOutcomeSignal>,
     },
     /// The datagram was dropped (not routable, or the session cap was reached).
     Dropped,
@@ -888,6 +965,7 @@ where
             // sweep, the recv loop, and the task all read/write the same state.
             let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now));
             let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let outcome_signal = std::sync::Arc::new(CapturedUdpOutcomeSignal::new());
             // The first datagram fits trivially (empty channel, depth >= 1, byte
             // cap >> one datagram), so account it and enqueue; `rx` is alive
             // (returned below) so the send cannot fail.
@@ -907,6 +985,7 @@ where
                 session_id,
                 tx: Some(tx),
                 queued_bytes: queued_bytes.clone(),
+                outcome_signal: outcome_signal.clone(),
                 idle_timeout_ms,
             });
             SessionAdmission::Admitted {
@@ -915,6 +994,7 @@ where
                 session_id,
                 last_activity,
                 queued_bytes,
+                outcome_signal,
             }
         }
     }
@@ -988,6 +1068,7 @@ fn spawn_udp_egress_session(
     rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    outcome_signal: std::sync::Arc<CapturedUdpOutcomeSignal>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
     source_identity: Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
     reply_factory: std::sync::Arc<dyn ReplySocketFactory>,
@@ -1002,6 +1083,7 @@ fn spawn_udp_egress_session(
             rx,
             last_activity,
             queued_bytes,
+            outcome_signal,
             epoch,
             source_identity.as_deref(),
             &reply_factory,
@@ -1075,6 +1157,7 @@ async fn run_udp_egress_session(
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    outcome_signal: std::sync::Arc<CapturedUdpOutcomeSignal>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
     source_identity: Option<&crate::modes::mesh::hbone::UdpSourceIdentity>,
     reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
@@ -1091,6 +1174,19 @@ async fn run_udp_egress_session(
     // right after selection (below) rather than pinning the generation for the
     // session's lifetime.
     let proxy = entry.relay_proxy.as_ref();
+    let mut observability = super::mesh_egress_observability::CapturedMeshEgressLifecycle::start(
+        &epoch,
+        proxy,
+        crate::plugins::ProxyProtocol::Udp,
+        key.client.ip(),
+        &entry.service_fqdn,
+        key.orig_dst.port(),
+        source_identity.map(|identity| &identity.principal),
+    )
+    .await;
+    if let Some(observability) = observability.as_mut() {
+        observability.set_udp_outcome_signal(outcome_signal.clone());
+    }
 
     // ── Fail-closed egress gates (mirrors handle_mesh_tcp_egress) ──────────
     // Engage the per-port LB lane (algorithm / locality) when all upstream
@@ -1194,6 +1290,9 @@ async fn run_udp_egress_session(
     drop(epoch);
     let _lb_guard =
         LoadBalancerConnectionGuard::new(Some(std::sync::Arc::clone(&target)), balancer);
+    if let Some(observability) = observability.as_mut() {
+        observability.set_target(&target);
+    }
 
     if state.gateway_svid_bundle.load().is_none() {
         warn!(
@@ -1473,6 +1572,17 @@ async fn run_udp_egress_session(
     let return_client = key.client;
     let return_socket = reply_socket.clone();
     let return_activity = last_activity.clone();
+    let bytes_received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    if let Some(observability) = observability.as_mut() {
+        observability.set_udp_byte_counters(bytes_sent.clone(), bytes_received.clone());
+    }
+    let return_bytes_received = std::sync::Arc::clone(&bytes_received);
+    enum ReturnPathCompletion {
+        TunnelEnded,
+        ClientReplySendFailed,
+    }
+
     let return_path = async move {
         let mut buf = bytes::BytesMut::with_capacity(super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
         loop {
@@ -1482,6 +1592,10 @@ async fn run_udp_egress_session(
                         crate::socket_opts::monotonic_now_ms(),
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    // Count bytes read from the backend even when the client
+                    // delivery below fails, matching the generic UDP lifecycle.
+                    return_bytes_received
+                        .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     // Best-effort reply; a send error (client gone) ends the
                     // return path, which tears the session down.
                     if let Err(e) = return_socket.send_to(&payload, return_client).await {
@@ -1490,11 +1604,11 @@ async fn run_udp_egress_session(
                             error = %e,
                             "Mesh UDP egress: reply send to client failed; ending return path"
                         );
-                        break;
+                        break ReturnPathCompletion::ClientReplySendFailed;
                     }
                 }
-                Ok(None) => break, // tunnel half-closed
-                Err(_) => break,   // tunnel read error
+                Ok(None) => break ReturnPathCompletion::TunnelEnded, // tunnel half-closed
+                Err(_) => break ReturnPathCompletion::TunnelEnded,   // tunnel read error
             }
         }
     };
@@ -1505,14 +1619,23 @@ async fn run_udp_egress_session(
     // by `write_deadline` so a stalled HBONE peer tears the session down instead
     // of leaking this task (codex r2 P2).
     let egress_activity = last_activity.clone();
+    let egress_bytes_sent = std::sync::Arc::clone(&bytes_sent);
     // Moved into the egress loop: it is the sole drainer, so it owns releasing
     // the byte reservations. (The recv loop only ever ADDS to this counter.)
     let egress_queued_bytes = queued_bytes;
+    enum EgressCompletion {
+        SenderClosed,
+        TunnelEnded,
+    }
+
     let egress_loop = async move {
         use tokio::io::AsyncWriteExt;
         let mut frame =
             bytes::BytesMut::with_capacity(2 + super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
-        while let Some(payload) = rx.recv().await {
+        let completion = loop {
+            let Some(payload) = rx.recv().await else {
+                break EgressCompletion::SenderClosed;
+            };
             // This datagram has left the queue: release its byte reservation so
             // the per-session queued-byte cap tracks the live queue depth (codex
             // r3). Released for EVERY dequeued datagram regardless of the
@@ -1529,10 +1652,13 @@ async fn run_udp_egress_session(
                 continue;
             }
             match tokio::time::timeout(write_deadline, tunnel_write.write_all(&frame)).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    egress_bytes_sent
+                        .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 Ok(Err(e)) => {
                     debug!(error = %e, "Mesh UDP egress: tunnel write failed; ending session");
-                    break;
+                    break EgressCompletion::TunnelEnded;
                 }
                 Err(_) => {
                     // The HBONE peer stopped reading / flow-control is exhausted;
@@ -1542,12 +1668,14 @@ async fn run_udp_egress_session(
                         write_deadline_ms = write_deadline.as_millis() as u64,
                         "Mesh UDP egress: tunnel write stalled past deadline; ending session"
                     );
-                    break;
+                    break EgressCompletion::TunnelEnded;
                 }
             }
-        }
-        // Half-close the tunnel write side (h2 end-stream) on the way out.
-        let _ = tunnel_write.shutdown().await;
+        };
+        // Return the write half to the selected branch. Half-closing it inside
+        // this future could wake `return_path` first and misclassify a cleanup-
+        // driven sender close as a return-path failure.
+        (completion, tunnel_write)
     };
 
     // Idle watchdog: ends the session when neither direction has been active for
@@ -1572,20 +1700,60 @@ async fn run_udp_egress_session(
         }
     };
 
+    let producer_outcome_signal = outcome_signal.clone();
     let producer_cancelled = async move {
         if *session_shutdown.borrow() {
+            producer_outcome_signal.mark_producer_shutdown();
             return;
         }
         let _ = session_shutdown.changed().await;
+        producer_outcome_signal.mark_producer_shutdown();
     };
 
     // Any arm completing ends the session (and, on return, the caller's
     // `remove_session_if_owned` frees the slot + decrements `active_sessions`).
-    tokio::select! {
-        _ = return_path => {}
-        _ = egress_loop => {}
-        _ = watchdog => {}
-        _ = producer_cancelled => {}
+    enum SessionCompletion {
+        Relay(CapturedUdpOutcome),
+        ClientReplySendFailed,
+    }
+
+    let completion = tokio::select! {
+        biased;
+        return_completion = return_path => match return_completion {
+            ReturnPathCompletion::TunnelEnded => {
+                SessionCompletion::Relay(CapturedUdpOutcome::ReturnPathEnded)
+            }
+            ReturnPathCompletion::ClientReplySendFailed => {
+                SessionCompletion::ClientReplySendFailed
+            }
+        },
+        (completion, mut tunnel_write) = egress_loop => {
+            // The egress completion has won before its local half-close can
+            // wake the return reader. Preserve h2 end-stream semantics, then
+            // resolve sender closure through the sweep/shutdown signal.
+            use tokio::io::AsyncWriteExt as _;
+            let _ = tunnel_write.shutdown().await;
+            SessionCompletion::Relay(outcome_signal.resolve_egress_completion(matches!(
+                completion,
+                EgressCompletion::SenderClosed,
+            )))
+        },
+        _ = watchdog => SessionCompletion::Relay(CapturedUdpOutcome::IdleTimeout),
+        _ = producer_cancelled => {
+            SessionCompletion::Relay(CapturedUdpOutcome::ProducerShutdown)
+        },
+    };
+    if let Some(observability) = observability.as_mut() {
+        let bytes_sent = bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
+        let bytes_received = bytes_received.load(std::sync::atomic::Ordering::Relaxed);
+        match completion {
+            SessionCompletion::Relay(outcome) => {
+                observability.complete_udp(bytes_sent, bytes_received, outcome);
+            }
+            SessionCompletion::ClientReplySendFailed => {
+                observability.complete_udp_client_reply_failure(bytes_sent, bytes_received);
+            }
+        }
     }
 }
 
@@ -1676,6 +1844,10 @@ fn spawn_capture_session_cleanup(
                         let keep = session.idle_timeout_ms == 0
                             || now.saturating_sub(last) <= session.idle_timeout_ms;
                         if !keep {
+                            // Publish the normal outcome before `retain` drops
+                            // the sender. The receiver can then distinguish this
+                            // cleanup race from a real egress-path failure.
+                            session.outcome_signal.mark_idle_timeout();
                             reaped += 1;
                         }
                         keep

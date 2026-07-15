@@ -128,6 +128,93 @@ pub mod _test_support {
         plugin.open_session_cookie_for_tests(cookie)
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct OidcSessionStateForTest {
+        pub access_token: String,
+        pub refresh_token: Option<String>,
+        pub refresh_after_unix: i64,
+    }
+
+    pub fn oidc_sealed_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        claims: serde_json::Value,
+        require_rolling_update: bool,
+    ) -> Result<String, String> {
+        plugin.sealed_session_cookie_for_tests(claims, require_rolling_update)
+    }
+
+    pub fn oidc_sealed_due_refresh_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        claims: serde_json::Value,
+        refresh_token: &str,
+    ) -> Result<String, String> {
+        plugin.sealed_due_refresh_session_cookie_for_tests(claims, refresh_token)
+    }
+
+    pub fn oidc_session_state_from_set_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        set_cookie: &str,
+    ) -> Option<OidcSessionStateForTest> {
+        let (access_token, refresh_token, refresh_after_unix) =
+            plugin.session_state_from_set_cookie_for_tests(set_cookie)?;
+        Some(OidcSessionStateForTest {
+            access_token,
+            refresh_token,
+            refresh_after_unix,
+        })
+    }
+
+    pub fn prepare_basic_auth_credential_for_test(
+        credential: &mut serde_json::Value,
+    ) -> Result<(), StatusCode> {
+        crate::admin::hash_credential_if_needed("basicauth", credential)
+            .map_err(|response| response.status())
+    }
+
+    pub fn basic_auth_server_configuration_status_for_test(
+        secret: Option<&str>,
+    ) -> Option<StatusCode> {
+        crate::config::types::hash_basic_auth_password_with_secret("test-password", secret)
+            .err()
+            .map(|error| crate::admin::basic_auth_credential_error_status(&error))
+    }
+
+    pub fn basic_auth_verify_with_test_material_for_test(
+        dummy_password_hash: String,
+        verification_rounds: usize,
+        username: &str,
+        password: &str,
+        consumer_index: &crate::ConsumerIndex,
+    ) -> (crate::plugins::utils::auth_flow::VerifyOutcome, usize) {
+        crate::plugins::basic_auth::BasicAuth::verify_with_test_material(
+            dummy_password_hash,
+            verification_rounds,
+            username,
+            password,
+            consumer_index,
+        )
+    }
+
+    pub fn basic_auth_bounded_verification_rounds_for_test(configured_limit: usize) -> usize {
+        crate::plugins::basic_auth::bounded_verification_rounds(configured_limit)
+    }
+
+    pub fn basic_auth_construction_with_secret_for_test(
+        config: &serde_json::Value,
+        secret: Option<&str>,
+    ) -> Result<(), String> {
+        crate::plugins::basic_auth::BasicAuth::new_with_hmac_secret(config, secret).map(|_| ())
+    }
+
+    pub fn validate_admin_plugin_config_for_test(
+        plugin_config: &crate::config::types::PluginConfig,
+    ) -> Result<(), String> {
+        crate::admin::validate_plugin_config_definition(
+            plugin_config,
+            crate::plugins::PluginHttpClient::default(),
+        )
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)

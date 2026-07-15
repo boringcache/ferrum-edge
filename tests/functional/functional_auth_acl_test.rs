@@ -18,7 +18,7 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::time::Duration;
 
-fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
+pub(super) fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("test-key-1".to_string());
     encode(
@@ -29,7 +29,7 @@ fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> Str
     .expect("Failed to encode RS256 token")
 }
 
-fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
+pub(super) fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     let pem_str = std::str::from_utf8(public_key_pem).expect("Invalid public key PEM");
@@ -176,7 +176,7 @@ impl AuthTestHarness {
         let gw = TestGateway::builder()
             .jwt_secret("test-admin-jwt-secret-key-1234567890")
             .jwt_issuer("ferrum-edge-auth-test")
-            .basic_auth_hmac_secret("test-hmac-server-secret")
+            .basic_auth_hmac_secret("test-hmac-server-secret-0123456789abcdef")
             .log_level("info")
             .spawn()
             .await?;
@@ -566,8 +566,8 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
         .expect("Denied external identity request failed");
     assert_eq!(
         denied.status().as_u16(),
-        401,
-        "without allow_authenticated_identity, external identity should still be rejected by ACL"
+        403,
+        "an authenticated external identity outside the Consumer allow-list is forbidden"
     );
 }
 
@@ -1623,19 +1623,10 @@ async fn test_auth_acl_comprehensive() {
     assert!(resp.status().is_success());
     let consumer_json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(consumer_json["username"], "alice");
-    // Verify password_hash is redacted
-    if let Some(basicauth) = consumer_json["credentials"]["basicauth"]
-        .as_array()
-        .and_then(|entries| entries.first())
-        .and_then(|entry| entry.as_object())
-        && let Some(hash) = basicauth.get("password_hash")
-    {
-        assert_eq!(
-            hash.as_str().unwrap(),
-            "[REDACTED]",
-            "Password hash should be redacted in API response"
-        );
-    }
+    assert!(
+        consumer_json["credentials"].get("basicauth").is_none(),
+        "Basic-auth credentials should be omitted from API responses"
+    );
     println!("✓ Consumer credentials properly redacted");
 
     // Test 37: List consumers

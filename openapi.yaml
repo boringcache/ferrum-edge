@@ -3024,7 +3024,9 @@ paths:
         Returns successful admin API mutation events for the selected namespace.
         Requires an admin-role JWT. Each event includes actor, action, resource
         identity, timestamp, and a JSON diff. Consumer credential data is
-        redacted before it is written to the audit log.
+        redacted before it is written to the audit log. Basic credential
+        mutations remain visible by type and action, but values, entry fields,
+        shape, and count are replaced by one stable `[REDACTED]` marker.
       tags: [Audit]
       parameters:
         - name: actor
@@ -3095,6 +3097,9 @@ paths:
 
         All fields within each resource follow the same schema as the
         individual create endpoints. IDs are auto-generated if omitted.
+        Plaintext Basic-auth passwords require a configured
+        `FERRUM_BASIC_AUTH_HMAC_SECRET` of at least 32 bytes; missing or weak
+        operator configuration fails the batch with 500 before persistence.
       tags: [Batch]
       requestBody:
         required: true
@@ -3129,6 +3134,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3580,6 +3587,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3614,6 +3623,10 @@ paths:
     put:
       operationId: updateConsumer
       summary: Update a consumer
+      description: >-
+        When `basicauth` is omitted from the request, an existing Basic
+        credential type is preserved; use `DELETE
+        /consumers/{id}/credentials/basicauth` to remove it.
       tags: [Consumers]
       requestBody:
         required: true
@@ -3636,6 +3649,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3715,6 +3730,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3752,6 +3769,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -5809,7 +5828,10 @@ components:
         diff:
           type: object
           additionalProperties: true
-          description: Redacted JSON before/after diff for the successful mutation
+          description: >-
+            Redacted JSON diff for the successful mutation. Basic credential
+            changes expose only the credential type, action, and a stable
+            `[REDACTED]` marker, never values, entry fields, shape, or count.
 
     AuditEventListResponse:
       type: object
@@ -6343,8 +6365,15 @@ components:
       enum: [single, multi]
       default: single
       description: |
-        `single` — first successful auth plugin wins.
-        `multi` — all auth plugins run; no single rejection blocks the request.
+        `single` — auth plugins run in priority order until the first success.
+        For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`,
+        and `oauth2_introspection`, a foreign `Authorization` scheme is skipped;
+        other mechanisms are not covered by this guarantee. Any rejection
+        returned by a plugin is terminal.
+        `multi` — auth plugins run sequentially until one succeeds. If none
+        succeeds, a server rejection takes precedence over the last ordinary
+        rejection; an all-missing chain returns the first available challenge
+        in plugin priority order, skipping challenge-less mechanisms.
 
     PluginAssociation:
       type: object
@@ -6400,6 +6429,8 @@ components:
             Credential values that serve as lookup keys must be unique across all
             consumers and across all entries within arrays. Max entries per type is
             controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
+            Ordinary Consumer responses omit `basicauth` entirely; authenticated
+            backup responses retain canonical unredacted values for restoration.
           properties:
             keyauth:
               type: array
@@ -6412,7 +6443,7 @@ components:
               items:
                 $ref: "#/components/schemas/BasicAuthCredential"
               minItems: 1
-              description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`.
+              description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`; omitted from ordinary Consumer responses.
             jwt:
               type: array
               items:
@@ -6479,19 +6510,31 @@ components:
 
     BasicAuthCredential:
       type: object
+      additionalProperties: false
+      oneOf:
+        - required: [password]
+        - required: [password_hash]
       properties:
         password:
           type: string
+          minLength: 1
+          maxLength: 4096
+          pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           writeOnly: true
           description: >-
             Plaintext password (automatically hashed on write using HMAC-SHA256
             with the server secret `FERRUM_BASIC_AUTH_HMAC_SECRET`). Mutually
-            exclusive with `password_hash`.
+            exclusive with `password_hash`. Must not contain ASCII control bytes
+            other than horizontal tab, line feed, and carriage return.
         password_hash:
           type: string
+          maxLength: 76
+          pattern: "^hmac_sha256:[0-9a-f]{64}$"
           description: >-
-            Pre-hashed password in `hmac_sha256:<hex>` format (constant-time,
-            ~1μs). On read, this field is always returned instead of `password`.
+            Pre-hashed password in `hmac_sha256:<64 lowercase hex>` format
+            (constant-time, ~1μs). Ordinary Consumer responses omit the
+            entire `basicauth` credential type; authenticated backups return
+            this canonical unredacted value for restoration.
       description: >-
         Basic auth credential for the `basic_auth` plugin. Supply either
         `password` (auto-hashed) or `password_hash` (pre-hashed). Indexed by
@@ -6587,15 +6630,18 @@ components:
           type: object
           default: {}
           description: >-
-            Plugin-specific JSON configuration. Validated on create/update and
-            again when the plugin is instantiated at config reload time.
-            Enabled plugin configs are validation-fatal when the plugin cache is
-            built: unknown plugin names or invalid plugin-specific config block
-            gateway startup in file mode, and on DB/CP polling the new config
-            snapshot is rejected as a whole (the gateway keeps serving the
-            prior good config). Disabled plugin configs are not instantiated.
-            See
-            `PluginConfigs` section for per-plugin schema definitions.
+            Plugin-specific JSON configuration. Resource-level size and depth
+            constraints are always validated. Plugin-specific construction is
+            performed on create/update and config reload only when `enabled` is
+            true. Enabled plugin configs are validation-fatal when the plugin
+            cache is built: unknown plugin names or invalid plugin-specific
+            config block gateway startup in file mode, and on DB/CP polling the
+            new config snapshot is rejected as a whole (the gateway keeps
+            serving the prior good config). Disabled plugin configs are stored
+            without construction, allowing secret-dependent plugins such as
+            `basic_auth` to be staged before their runtime secret is provisioned.
+            Enabling performs full validation. See `PluginConfigs` section for
+            per-plugin schema definitions.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
@@ -6610,6 +6656,9 @@ components:
         enabled:
           type: boolean
           default: true
+          description: >-
+            Whether the plugin is active. Disabled configs are stored but not
+            constructed; enabling them performs full plugin-specific validation.
         priority_override:
           type: [integer, "null"]
           minimum: 0
@@ -11808,7 +11857,7 @@ components:
         canonical_identity_attribute:
           type: string
           minLength: 1
-          description: "Required for search-then-bind. Exactly one value from the uniquely selected entry becomes the authenticated identity and Consumer mapping key (for example uid or sAMAccountName). Attribute-name matching is LDAP case-insensitive."
+          description: "Required for search-then-bind. Exactly one value from the uniquely selected entry becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive."
         service_account_dn:
           type: string
           minLength: 1
@@ -11826,7 +11875,7 @@ components:
         group_filter:
           type: string
           minLength: 1
-          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the presented login value; canonical_identity_attribute controls the exported Ferrum identity. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
+          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity: the presented username for direct bind, or canonical_identity_attribute for search-then-bind. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
         required_groups:
           type: array
           items:
@@ -12644,6 +12693,11 @@ components:
         Auto-injected by mesh mode on every applicable topology; reserved
         plugin id `__mesh_workload_metrics`. Standalone use is supported on
         non-mesh gateways that want Istio-style workload labels in logs.
+
+        Runtime admission permits at most 32 distinct custom tag names across
+        `custom_tags` and `custom_header_tags` combined. The individual
+        `maxProperties: 32` bounds remain for generated clients, but the
+        cross-property combined total cannot be expressed mechanically.
       properties:
         node_id:
           type: string
@@ -12687,14 +12741,27 @@ components:
           description: Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD).
         custom_tags:
           type: object
+          maxProperties: 32
           additionalProperties:
             type: string
-          description: Custom tags injected into every transaction's metadata.
+            maxLength: 1024
+          description: |
+            Custom tags injected into transaction metadata and exported spans.
+            Names are limited to 128 ASCII letters, digits, `.`, `_`, or `-`
+            and cannot collide with reserved, sensitive, `mesh.*`, trace, or
+            authorization keys. This map and `custom_header_tags` may contain
+            at most 32 distinct tag names combined.
         custom_header_tags:
           type: object
+          maxProperties: 32
           additionalProperties:
             type: string
-          description: Custom tags populated from request headers (`tag_name -> header_name`).
+          description: |
+            Custom tags populated from request headers (`tag_name ->
+            header_name`). Credential-bearing source headers and reserved or
+            sensitive destination names are rejected; runtime values over 1024
+            bytes are omitted. This map and `custom_tags` may contain at most
+            32 distinct tag names combined.
         metrics:
           type: object
           description: |
@@ -12707,9 +12774,20 @@ components:
                 type: object
                 required: [name, operation]
                 properties:
+                  metric:
+                    type: string
+                    description: |
+                      Metric family targeted by this override. Supported values
+                      are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum
+                      metric names, and `ALL_METRICS`; omitted means all metrics.
+                      Recognized Istio standard families Ferrum does not emit
+                      are accepted and ignored with a bounded construction-time
+                      warning; unknown families remain configuration errors.
                   name:
                     type: string
-                    description: Tag name to override.
+                    description: |
+                      Tag name to override. Accepts Istio names such as
+                      `source_workload` and Ferrum `mesh.*` label names.
                   operation:
                     type: object
                     required: [type]
@@ -12726,13 +12804,24 @@ components:
                         description: Replacement tag name when `type` is `rename`.
                       value:
                         type: string
-                        description: Replacement tag value when `type` is `set`.
+                        maxLength: 256
+                        description: |
+                          Replacement tag value when `type` is `set`. OpenAPI
+                          `maxLength` counts Unicode characters; runtime
+                          admission separately enforces at most 256 UTF-8 bytes,
+                          so multibyte values may be rejected below 256
+                          characters.
               description: Per-metric tag overrides translated from the Istio Telemetry CRD.
             disabled_metrics:
               type: array
               items:
                 type: string
-              description: Names of metrics suppressed by this workload (Istio Telemetry CRD).
+              description: |
+                Names of metrics suppressed by this workload. Supported values
+                are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum metric
+                names, and `ALL_METRICS`. Recognized Istio standard families
+                Ferrum does not emit are accepted and ignored with a bounded
+                construction-time warning; unknown families remain errors.
         tracing_providers:
           type: array
           items:
@@ -13247,7 +13336,10 @@ components:
         keys are rejected. `allow_authenticated_identity=true` cannot be combined
         with an allow-list (`allowed_consumers`/`allowed_groups`) because the
         allow-list is not applied to unmapped external identities. Use
-        ip_restriction for IP/CIDR rules.
+        ip_restriction for IP/CIDR rules. Rule entries match principal values
+        byte-for-byte (no trimming) and must contain at least one
+        non-whitespace character. Whitespace admission follows Rust
+        `str::trim` Unicode `White_Space` semantics.
       allOf:
         - anyOf:
             - required: [allowed_consumers]
@@ -13290,6 +13382,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             Consumer usernames that are explicitly allowed. Empty list disables
@@ -13298,14 +13393,24 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 4096
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
-            Consumer usernames that are explicitly denied. Takes precedence
-            over every allow rule.
+            Consumer usernames or, when allow_authenticated_identity is true,
+            exact external principals that are explicitly denied. Takes
+            precedence over every allow rule. The 4096-character bound is
+            independent of the 255-character gateway Consumer username ceiling
+            so JWT, OIDC, and SPIFFE-style principals can be revoked; longer
+            external identities fail closed at runtime.
         allowed_groups:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             ACL group names that are explicitly allowed. The check matches if
@@ -13314,6 +13419,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             ACL group names that are explicitly denied. If any of the consumer's
@@ -13325,7 +13433,8 @@ components:
           description: >-
             Allow requests whose `ctx.authenticated_identity` is set by an
             external auth plugin (e.g. jwks_auth) even when no gateway Consumer
-            was mapped. Cannot be combined with an allow-list
+            was mapped. Empty or whitespace-only identities are unauthenticated.
+            Cannot be combined with an allow-list
             (`allowed_consumers`/`allowed_groups`); the deny-list
             `disallowed_consumers` is still applied to the external identity.
 

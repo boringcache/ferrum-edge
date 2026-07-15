@@ -84,6 +84,9 @@ impl VerifyOutcome {
         external_identity: Option<String>,
         external_identity_header: Option<String>,
     ) -> Self {
+        let external_identity = external_identity.filter(|identity| !identity.trim().is_empty());
+        let external_identity_header =
+            external_identity_header.filter(|identity_header| !identity_header.trim().is_empty());
         Self::Success {
             consumer,
             external_identity,
@@ -93,6 +96,26 @@ impl VerifyOutcome {
 
     pub fn consumer(consumer: Arc<Consumer>) -> Self {
         Self::success(Some(consumer), None, None)
+    }
+
+    /// True when this outcome established a principal: a mapped Consumer or a
+    /// nonblank external identity. Auth attempts must treat this as the commit
+    /// gate for every identity-derived side effect (claim-header fanout,
+    /// token-stripping metadata, identity header staging): an attempt that
+    /// verifies a credential but resolves no principal is not an
+    /// authentication, and in `auth_mode: multi` a later credential can still
+    /// authenticate the request — any state staged by the failed attempt would
+    /// then be applied under that other credential's authority.
+    pub fn establishes_principal(&self) -> bool {
+        matches!(
+            self,
+            Self::Success {
+                consumer,
+                external_identity,
+                ..
+            } if consumer.is_some()
+                || crate::plugins::meaningful_identity(external_identity.as_deref()).is_some()
+        )
     }
 }
 
@@ -123,6 +146,12 @@ macro_rules! impl_auth_plugin {
                 $protocols
             }
 
+            fn authentication_challenge(&self) -> Option<&'static str> {
+                <$ty as crate::plugins::utils::auth_flow::AuthMechanism>::authentication_challenge(
+                    self,
+                )
+            }
+
             async fn authenticate(
                 &self,
                 ctx: &mut crate::plugins::RequestContext,
@@ -141,6 +170,10 @@ pub(crate) use impl_auth_plugin;
 #[async_trait]
 pub trait AuthMechanism: Send + Sync {
     fn mechanism_name(&self) -> &'static str;
+
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        None
+    }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential;
 
@@ -180,7 +213,9 @@ async fn run_auth_impl<M: AuthMechanism>(
             debug!("{}: no credential present", mechanism.mechanism_name());
             PluginResult::Continue
         }
-        ExtractedCredential::InvalidFormat(body) => reject(401, body),
+        ExtractedCredential::InvalidFormat(body) => {
+            reject(401, body, mechanism.authentication_challenge())
+        }
         credential => match commit_authentication_attempt(
             ctx,
             AuthenticationAttempt::new(),
@@ -192,9 +227,11 @@ async fn run_auth_impl<M: AuthMechanism>(
             Err(VerifyOutcome::InvalidFormat(body))
             | Err(VerifyOutcome::Invalid(body))
             | Err(VerifyOutcome::ConsumerNotFound(body))
-            | Err(VerifyOutcome::VerificationFailed(body)) => reject(401, body),
-            Err(VerifyOutcome::Forbidden(body)) => reject(403, body),
-            Err(VerifyOutcome::Internal(body)) => reject(500, body),
+            | Err(VerifyOutcome::VerificationFailed(body)) => {
+                reject(401, body, mechanism.authentication_challenge())
+            }
+            Err(VerifyOutcome::Forbidden(body)) => reject(403, body, None),
+            Err(VerifyOutcome::Internal(body)) => reject(500, body, None),
             Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
                 PluginResult::Continue
             }
@@ -247,9 +284,10 @@ pub fn commit_authentication_attempt(
 
     let principal_already_committed = request_principal_is_committed(ctx);
 
-    // Cleanup is additive for every accepted credential, including later
-    // instances in single-auth mode. Failed and principal-less attempts never
-    // reach this boundary.
+    // Cleanup is additive for every accepted credential that reaches this
+    // boundary. The dispatcher normally stops after its first success; direct
+    // or custom callers still cannot erase cleanup already requested. Failed
+    // and principal-less attempts never reach this boundary.
     attempt.commit_credential_cleanup(ctx);
 
     if !principal_already_committed {
@@ -316,11 +354,17 @@ pub fn nonblank_identity(identity: Option<String>) -> Option<String> {
     identity.filter(|value| !value.trim().is_empty())
 }
 
-fn reject(status_code: u16, body: String) -> PluginResult {
+fn reject(status_code: u16, body: String, challenge: Option<&'static str>) -> PluginResult {
+    let mut headers = HashMap::new();
+    if status_code == 401
+        && let Some(challenge) = challenge
+    {
+        headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
+    }
     PluginResult::Reject {
         status_code,
         body,
-        headers: HashMap::new(),
+        headers,
     }
 }
 
@@ -588,6 +632,28 @@ mod tests {
 
         run_auth_external_identity(&mechanism, &mut ctx, &index).await;
 
+        assert!(ctx.effective_identity().is_none());
+        assert!(ctx.auth_method.is_none());
+    }
+
+    #[tokio::test]
+    async fn blank_external_identity_does_not_authenticate() {
+        let mechanism = FakeMechanism {
+            extracted: ExtractedCredential::BearerToken("token".to_string()),
+            outcome: VerifyOutcome::Success {
+                consumer: None,
+                external_identity: Some("   \t".to_string()),
+                external_identity_header: Some(" \n".to_string()),
+            },
+        };
+        let mut ctx = test_ctx();
+        let index = ConsumerIndex::new(&[]);
+
+        let result = run_auth_external_identity(&mechanism, &mut ctx, &index).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(ctx.authenticated_identity.is_none());
+        assert!(ctx.authenticated_identity_header.is_none());
         assert!(ctx.effective_identity().is_none());
         assert!(ctx.auth_method.is_none());
     }

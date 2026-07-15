@@ -37,6 +37,9 @@ use crate::config::types::{
     PluginConfig, Proxy, RetryConfig, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
 };
+use crate::plugins::mesh::workload_metrics::{
+    is_recognized_unsupported_istio_metric_family, validate_istio_telemetry_config,
+};
 
 const URI_LESS_MATCH_LISTEN_PATH: &str = "~.*";
 
@@ -4424,7 +4427,11 @@ fn telemetry(
                                     .and_then(Value::as_str)
                                 {
                                     custom_header_tags.insert(key.clone(), header_name.to_string());
-                                    return None;
+                                    return val
+                                        .get("header")
+                                        .and_then(|header| header.get("defaultValue"))
+                                        .and_then(Value::as_str)
+                                        .map(|value| (key.clone(), value.to_string()));
                                 }
 
                                 let value = val
@@ -4496,38 +4503,66 @@ fn telemetry(
             let mut disabled_metrics = Vec::new();
             if let Some(overrides) = m.get("overrides").and_then(Value::as_array) {
                 for ovr in overrides {
-                    if ovr.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
-                        let metric_name = ovr
-                            .get("match")
-                            .and_then(|m| m.get("metric"))
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| {
-                                invalid_resource(
+                    let matched_metric =
+                        match ovr.get("match").and_then(|matcher| matcher.get("metric")) {
+                            Some(Value::String(metric)) => metric.as_str(),
+                            Some(_) => {
+                                return Err(invalid_resource(
                                     object,
-                                    "Telemetry metrics.overrides[].match.metric is required when disabled=true",
-                                )
-                            })?;
-                        disabled_metrics.push(metric_name.to_string());
+                                    "Telemetry metrics.overrides[].match.metric must be a string",
+                                ));
+                            }
+                            None => "ALL_METRICS",
+                        };
+                    let ignored_metric_family =
+                        is_recognized_unsupported_istio_metric_family(matched_metric);
+                    if ovr
+                        .get("disabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        disabled_metrics.push(matched_metric.to_string());
                     }
                     if let Some(tags) = ovr.get("tagOverrides").and_then(Value::as_object) {
                         for (tag_name, tag_spec) in tags {
-                            let op = tag_spec
-                                .get("operation")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            let operation = match op {
-                                "REMOVE" => TagOverrideOperation::Remove,
-                                "UPSERT" => {
-                                    let value = tag_spec
-                                        .get("value")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_string();
-                                    TagOverrideOperation::Set { value }
+                            let operation = if ignored_metric_family {
+                                // Preserve one no-op entry so workload_metrics emits its
+                                // bounded ignored-family diagnostic, but do not validate
+                                // policy for a metric family Ferrum never records.
+                                TagOverrideOperation::Remove
+                            } else {
+                                let op = tag_spec
+                                    .get("operation")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                match op {
+                                    "REMOVE" => TagOverrideOperation::Remove,
+                                    "UPSERT" => {
+                                        let value = telemetry_metric_upsert_literal(
+                                            object, tag_name, tag_spec,
+                                        )?;
+                                        TagOverrideOperation::Set { value }
+                                    }
+                                    "" => {
+                                        return Err(invalid_resource(
+                                            object,
+                                            format!(
+                                                "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation is required"
+                                            ),
+                                        ));
+                                    }
+                                    _ => {
+                                        return Err(invalid_resource(
+                                            object,
+                                            format!(
+                                                "Telemetry metrics.overrides[].tagOverrides.{tag_name}.operation '{op}' is unsupported"
+                                            ),
+                                        ));
+                                    }
                                 }
-                                _ => continue,
                             };
                             tag_overrides.push(MetricTagOverride {
+                                metric: Some(matched_metric.to_string()),
                                 name: tag_name.clone(),
                                 operation,
                             });
@@ -4541,6 +4576,16 @@ fn telemetry(
             })
         })
         .transpose()?;
+
+    validate_istio_telemetry_config(tracing.as_ref(), metrics.as_ref()).map_err(|message| {
+        let detail = message
+            .strip_prefix("workload_metrics: ")
+            .unwrap_or(&message);
+        invalid_resource(
+            object,
+            format!("Telemetry workload_metrics configuration is invalid: {detail}"),
+        )
+    })?;
 
     let access_logging = object
         .spec
@@ -4573,6 +4618,34 @@ fn telemetry(
             metrics,
             access_logging,
         },
+    })
+}
+
+fn telemetry_metric_upsert_literal(
+    object: &K8sObject,
+    tag_name: &str,
+    tag_spec: &Value,
+) -> Result<String, K8sTranslateError> {
+    let expression = tag_spec
+        .get("value")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            invalid_resource(
+                object,
+                format!(
+                    "Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT value is required"
+                ),
+            )
+        })?;
+    serde_json::from_str::<String>(expression).map_err(|_| {
+        invalid_resource(
+            object,
+            format!(
+                "Telemetry metrics.overrides[].tagOverrides.{tag_name}.UPSERT value must be a double-quoted string literal; CEL expressions are unsupported"
+            ),
+        )
     })
 }
 
@@ -6907,6 +6980,53 @@ mod tests {
             Some("us-east")
         );
         assert!(!tracing.custom_tags.contains_key("tenant"));
+    }
+
+    #[test]
+    fn telemetry_metric_tag_overrides_preserve_match_scope() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "metrics": [{
+                        "overrides": [
+                            {
+                                "match": {"metric": "REQUEST_COUNT"},
+                                "tagOverrides": {
+                                    "source_workload": {"operation": "REMOVE"}
+                                }
+                            },
+                            {
+                                "match": {"metric": "REQUEST_DURATION"},
+                                "tagOverrides": {
+                                    "response_flags": {
+                                        "operation": "UPSERT",
+                                        "value": "\"duration-only\""
+                                    }
+                                }
+                            }
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let metrics = result.config.mesh.expect("mesh config").telemetry_resources[0]
+            .config
+            .metrics
+            .clone()
+            .expect("metrics config");
+        assert_eq!(metrics.tag_overrides.len(), 2);
+        assert_eq!(
+            metrics.tag_overrides[0].metric.as_deref(),
+            Some("REQUEST_COUNT")
+        );
+        assert_eq!(
+            metrics.tag_overrides[1].metric.as_deref(),
+            Some("REQUEST_DURATION")
+        );
     }
 
     #[test]

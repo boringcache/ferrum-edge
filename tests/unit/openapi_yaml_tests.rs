@@ -273,6 +273,76 @@ fn mtls_auth_schemas_match_runtime_contract() {
     }
 }
 
+#[test]
+fn auth_mode_and_basic_credential_response_contracts_are_truthful() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let auth_mode = spec["components"]["schemas"]["AuthMode"]["description"]
+        .as_str()
+        .expect("AuthMode description");
+    let scoped_scheme_contract = "For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, \
+                                  `jwks_auth`, and `oauth2_introspection`, a foreign \
+                                  `Authorization` scheme is skipped; other mechanisms are not \
+                                  covered by this guarantee.";
+    let normalized_auth_mode = auth_mode.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(normalized_auth_mode.contains(scoped_scheme_contract));
+    assert!(normalized_auth_mode.contains("Any rejection returned by a plugin is terminal"));
+    assert!(normalized_auth_mode.contains("run sequentially until one succeeds"));
+    assert!(normalized_auth_mode.contains("server rejection takes precedence"));
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    assert!(plugin_docs.contains(scoped_scheme_contract));
+
+    let basic_roundtrip_contract = "When `basicauth` is omitted from the request, an existing \
+                                    Basic credential type is preserved; use `DELETE \
+                                    /consumers/{id}/credentials/basicauth` to remove it.";
+    let consumer_update = spec["paths"]["/consumers/{id}"]["put"]["description"]
+        .as_str()
+        .expect("Consumer update description");
+    assert!(consumer_update.contains(basic_roundtrip_contract));
+    let admin_docs = include_str!("../../docs/admin_api.md");
+    assert!(admin_docs.contains(basic_roundtrip_contract));
+
+    let consumer_credentials =
+        &spec["components"]["schemas"]["Consumer"]["properties"]["credentials"];
+    let credentials_description = consumer_credentials["description"]
+        .as_str()
+        .expect("Consumer credentials description");
+    assert!(credentials_description.contains("responses omit `basicauth` entirely"));
+
+    let password_hash =
+        &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]["password_hash"];
+    assert_eq!(password_hash["pattern"], "^hmac_sha256:[0-9a-f]{64}$");
+    assert!(password_hash.get("writeOnly").is_none());
+
+    let password = &spec["components"]["schemas"]["BasicAuthCredential"]["properties"]["password"];
+    let password_pattern = password["pattern"].as_str().expect("password pattern");
+    assert_eq!(password_pattern, r"^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$");
+    let password_pattern = Regex::new(password_pattern).expect("password pattern compiles");
+    assert!(!password_pattern.is_match("embedded\0null"));
+    assert!(password_pattern.is_match("tabs\tand\nnewlines\rremain valid"));
+
+    let plugin_config = &spec["components"]["schemas"]["PluginConfig"];
+    let config_description = plugin_config["properties"]["config"]["description"]
+        .as_str()
+        .expect("PluginConfig config description");
+    assert!(config_description.contains("Disabled plugin configs are stored without construction"));
+    assert!(config_description.contains("Enabling performs full validation"));
+
+    let audit_diff_description = spec["components"]["schemas"]["AuditEvent"]["properties"]["diff"]
+        ["description"]
+        .as_str()
+        .expect("AuditEvent diff description");
+    assert!(audit_diff_description.contains("stable `[REDACTED]` marker"));
+    assert!(audit_diff_description.contains("never values, entry fields, shape, or count"));
+
+    assert_eq!(
+        spec["paths"]["/batch"]["post"]["responses"]["500"]["$ref"],
+        "#/components/responses/InternalServerError"
+    );
+}
+
 fn normalized_path_template(path: &str) -> String {
     static PATH_PARAMETER: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\{[^}]+\}").expect("path-template regex compiles"));
@@ -559,10 +629,27 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"disallowed_consumers": ["bad"], "allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
+        json!({"allowed_consumers": ["  alice  "]}),
+        // U+FEFF ZWNBSP is not in Rust's Unicode White_Space set.
+        json!({"allowed_consumers": ["\u{feff}"]}),
+        json!({"disallowed_consumers": ["\u{feff}"]}),
+        json!({"allowed_groups": ["\u{feff}"]}),
+        json!({"disallowed_groups": ["\u{feff}"]}),
+        json!({"allowed_consumers": ["é".repeat(255)]}),
+        json!({"allowed_groups": ["é".repeat(255)]}),
+        json!({"disallowed_groups": ["é".repeat(255)]}),
+        json!({
+            "disallowed_consumers": ["é".repeat(4096)],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
             "config should be valid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
         );
     }
 
@@ -572,10 +659,32 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"allowed_consumers": [], "allowed_groups": []}),
         json!({"allowed_consumers": ["alice"], "allow_authenticated_identity": true}),
         json!({"allowed_groups": ["engineering"], "allow_authenticated_identity": true}),
+        json!({"allowed_consumers": [""]}),
+        json!({"disallowed_consumers": [""]}),
+        json!({"allowed_groups": [""]}),
+        json!({"disallowed_groups": [""]}),
+        json!({"allowed_consumers": ["   "]}),
+        json!({"disallowed_consumers": ["\t"]}),
+        json!({"allowed_groups": ["\n"]}),
+        json!({"disallowed_groups": ["   "]}),
+        // U+0085 NEL is in Rust's Unicode White_Space set.
+        json!({"allowed_consumers": ["\u{0085}"]}),
+        json!({"disallowed_consumers": ["\u{0085}"]}),
+        json!({"allowed_groups": ["\u{0085}"]}),
+        json!({"disallowed_groups": ["\u{0085}"]}),
+        json!({"allowed_consumers": ["a".repeat(256)]}),
+        json!({
+            "disallowed_consumers": ["a".repeat(4097)],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_err(),
             "config should be invalid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
         );
     }
 }
@@ -1339,6 +1448,99 @@ fn assert_component_validity(
         actual_valid, expected_valid,
         "unexpected {component} validation result for {instance}"
     );
+}
+
+#[test]
+fn workload_metrics_schema_documents_runtime_tag_limits() {
+    use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let properties = spec
+        .pointer("/components/schemas/WorkloadMetricsConfig/properties")
+        .expect("WorkloadMetricsConfig properties exist");
+
+    for field in ["custom_tags", "custom_header_tags"] {
+        assert_eq!(properties[field]["maxProperties"], json!(32));
+        let description = properties[field]["description"]
+            .as_str()
+            .expect("custom tag description");
+        assert!(
+            description.contains("32 distinct tag names combined"),
+            "{field} must document the combined runtime cap"
+        );
+    }
+
+    let operation_value = properties
+        .pointer("/metrics/properties/tag_overrides/items/properties/operation/properties/value")
+        .expect("metric set operation value schema exists");
+    assert_eq!(operation_value["maxLength"], json!(256));
+    let value_description = operation_value["description"]
+        .as_str()
+        .expect("metric value description");
+    assert!(value_description.contains("256 UTF-8 bytes"));
+    assert!(value_description.contains("counts Unicode characters"));
+
+    let ascii_256 = "x".repeat(256);
+    let ascii_257 = "x".repeat(257);
+    let metric_config = |value: &str| {
+        json!({
+            "metrics": {
+                "tag_overrides": [{
+                    "name": "source_workload",
+                    "operation": {"type": "set", "value": value}
+                }]
+            }
+        })
+    };
+    assert_component_validity(
+        &spec,
+        "WorkloadMetricsConfig",
+        &metric_config(&ascii_256),
+        true,
+    );
+    assert!(WorkloadMetrics::new(&metric_config(&ascii_256)).is_ok());
+    assert_component_validity(
+        &spec,
+        "WorkloadMetricsConfig",
+        &metric_config(&ascii_257),
+        false,
+    );
+    assert!(WorkloadMetrics::new(&metric_config(&ascii_257)).is_err());
+
+    // JSON Schema maxLength counts characters, whereas runtime admission is
+    // deliberately stricter for multibyte input and counts encoded bytes.
+    let multibyte_over_256_bytes = "é".repeat(129);
+    assert_component_validity(
+        &spec,
+        "WorkloadMetricsConfig",
+        &metric_config(&multibyte_over_256_bytes),
+        true,
+    );
+    assert!(WorkloadMetrics::new(&metric_config(&multibyte_over_256_bytes)).is_err());
+
+    let custom_tags: serde_json::Map<String, serde_json::Value> = (0..16)
+        .map(|index| (format!("literal_{index}"), json!("value")))
+        .collect();
+    let custom_header_tags: serde_json::Map<String, serde_json::Value> = (0..16)
+        .map(|index| (format!("header_{index}"), json!("x-tag")))
+        .collect();
+    let combined_32 = json!({
+        "custom_tags": custom_tags,
+        "custom_header_tags": custom_header_tags,
+    });
+    assert_component_validity(&spec, "WorkloadMetricsConfig", &combined_32, true);
+    assert!(WorkloadMetrics::new(&combined_32).is_ok());
+
+    let mut combined_33 = combined_32;
+    combined_33["custom_header_tags"]
+        .as_object_mut()
+        .expect("custom_header_tags object")
+        .insert("header_16".to_string(), json!("x-tag"));
+    // The per-map OpenAPI bounds cannot express a sum across two objects; the
+    // property descriptions carry that contract and runtime rejects the union.
+    assert_component_validity(&spec, "WorkloadMetricsConfig", &combined_33, true);
+    assert!(WorkloadMetrics::new(&combined_33).is_err());
 }
 
 #[test]
