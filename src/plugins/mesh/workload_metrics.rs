@@ -422,7 +422,7 @@ impl WorkloadMetrics {
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
-    ) {
+    ) -> bool {
         // `on_request_received` imports inbound context early so authorization
         // rejects remain observable. For accepted requests, request_transformer
         // runs before this hook and its final header policy is authoritative.
@@ -435,18 +435,12 @@ impl WorkloadMetrics {
         let captured_b3 = ctx.metadata.remove(CAPTURED_B3_METADATA).is_some();
         let captured_tracestate = ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA).is_some();
         let final_traceparent = has_valid_traceparent(headers);
-        let final_b3 = !final_traceparent && has_b3_trace_context(headers);
+        let final_b3_context = !final_traceparent && has_b3_trace_context(headers);
+        let final_b3_sampling = !final_traceparent && b3_sampling_decision(headers).is_some();
+        let final_trace_signal = final_traceparent || final_b3_context || final_b3_sampling;
 
-        if final_traceparent || final_b3 {
-            for key in [
-                "trace_id",
-                "span_id",
-                "parent_span_id",
-                "trace_sampled",
-                TRACEPARENT_HEADER,
-            ] {
-                ctx.metadata.remove(key);
-            }
+        if final_trace_signal {
+            clear_http_trace_metadata(&mut ctx.metadata);
         }
 
         if captured_traceparent && !final_traceparent {
@@ -462,7 +456,7 @@ impl WorkloadMetrics {
             });
         }
 
-        if captured_b3 && !final_traceparent && !final_b3 {
+        if captured_b3 && !final_traceparent && !final_b3_context && !final_b3_sampling {
             ctx.metadata.remove(TRACEPARENT_HEADER);
             headers.retain(|name, _| {
                 !B3_TRACE_HEADERS
@@ -474,6 +468,12 @@ impl WorkloadMetrics {
         if captured_tracestate && header_value(headers, TRACESTATE_HEADER).is_none() {
             ctx.metadata.remove(TRACESTATE_HEADER);
         }
+
+        let suppress_local_trace = (captured_traceparent || captured_b3) && !final_trace_signal;
+        if suppress_local_trace {
+            clear_http_trace_metadata(&mut ctx.metadata);
+        }
+        suppress_local_trace
     }
 
     fn resolve_peer_source_identity(
@@ -809,7 +809,8 @@ impl Plugin for WorkloadMetrics {
         // after route selection for accepted requests.
         let headers = std::mem::take(&mut ctx.headers);
         let captured_traceparent = has_valid_traceparent(&headers);
-        let captured_b3 = has_b3_trace_context(&headers);
+        let captured_b3 =
+            has_b3_trace_context(&headers) || b3_sampling_decision(&headers).is_some();
         let captured_tracestate = header_value(&headers, TRACESTATE_HEADER).is_some();
         self.annotate_http_context(ctx, &headers);
         if captured_traceparent && ctx.metadata.contains_key(TRACEPARENT_HEADER) {
@@ -822,7 +823,7 @@ impl Plugin for WorkloadMetrics {
             ctx.metadata
                 .insert(CAPTURED_TRACESTATE_METADATA.to_string(), "true".to_string());
         }
-        if captured_b3 && ctx.metadata.contains_key(TRACEPARENT_HEADER) {
+        if captured_b3 {
             ctx.metadata
                 .insert(CAPTURED_B3_METADATA.to_string(), "true".to_string());
         }
@@ -835,8 +836,11 @@ impl Plugin for WorkloadMetrics {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        self.reconcile_captured_trace_headers(ctx, headers);
+        let suppress_local_trace = self.reconcile_captured_trace_headers(ctx, headers);
         self.annotate_http_context(ctx, headers);
+        if suppress_local_trace {
+            clear_http_trace_metadata(&mut ctx.metadata);
+        }
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
             set_header_case_insensitive(headers, TRACEPARENT_HEADER, traceparent);
         }
@@ -1096,6 +1100,13 @@ fn metric_selector(name: &str) -> Option<MetricSelector> {
         )),
         _ => None,
     }
+}
+
+pub(crate) fn is_recognized_unsupported_istio_metric_family(name: &str) -> bool {
+    matches!(
+        metric_selector(name),
+        Some(MetricSelector::RecognizedUnsupported(_))
+    )
 }
 
 enum ParsedTagOperation<'a> {
@@ -1484,6 +1495,19 @@ fn existing_sampling_decision(
             header_value(headers, TRACEPARENT_HEADER).and_then(traceparent_sampling_decision)
         })
         .or_else(|| b3_sampling_decision(headers))
+}
+
+fn clear_http_trace_metadata(metadata: &mut HashMap<String, String>) {
+    for key in [
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "trace_sampled",
+        TRACEPARENT_HEADER,
+        TRACESTATE_HEADER,
+    ] {
+        metadata.remove(key);
+    }
 }
 
 fn metadata_has_sampling_decision(metadata: &HashMap<String, String>) -> bool {

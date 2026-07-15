@@ -374,6 +374,8 @@ fn k8s_telemetry_match_mode_server_plus_client_union_becomes_client_and_server()
 
 #[tokio::test]
 async fn translated_unsupported_standard_metric_families_do_not_omit_plugin() {
+    let oversized_ignored_literal =
+        serde_json::to_string(&"x".repeat(257)).expect("serialize ignored metric literal");
     let translation = translate_k8s_objects(
         &[telemetry(json!({
             "metrics": [{
@@ -382,12 +384,21 @@ async fn translated_unsupported_standard_metric_families_do_not_omit_plugin() {
                         "match": {"metric": "REQUEST_SIZE"},
                         "disabled": true,
                         "tagOverrides": {
-                            "request_bytes": {"operation": "REMOVE"}
+                            "request_bytes": {
+                                "operation": "UPSERT",
+                                "value": "request.host"
+                            }
                         }
                     },
                     {
                         "match": {"metric": "RESPONSE_SIZE"},
-                        "disabled": true
+                        "disabled": true,
+                        "tagOverrides": {
+                            "response_bytes": {
+                                "operation": "UPSERT",
+                                "value": oversized_ignored_literal
+                            }
+                        }
                     },
                     {
                         "match": {"metric": "REQUEST_DURATION"},
