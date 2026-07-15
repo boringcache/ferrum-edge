@@ -731,7 +731,6 @@ fn openai_compatible_tool_arguments_are_canonicalized_before_dispatch() {
             {"role": "user", "content": "Weather?"},
             {
                 "role": "assistant",
-                "content": null,
                 "tool_calls": [{
                     "id": "call_weather",
                     "type": "function",
@@ -907,7 +906,6 @@ fn tool_round_trip_request(stop: Value) -> Value {
             {"role": "user", "content": "Weather?"},
             {
                 "role": "assistant",
-                "content": null,
                 "tool_calls": [{
                     "id": "call_weather",
                     "type": "function",
@@ -1015,6 +1013,23 @@ fn native_adapters_preserve_tool_call_state_and_scalar_stop() {
     assert_eq!(cohere["messages"][1]["tool_calls"][0]["id"], "call_weather");
     assert_eq!(cohere["stop_sequences"], json!(["DONE"]));
     assert!(cohere.get("stop").is_none());
+}
+
+#[test]
+fn bedrock_tool_choice_none_omits_native_tool_config() {
+    let mut request = tool_round_trip_request(json!(["DONE"]));
+    request["tool_choice"] = json!("none");
+
+    let (_, _, body_bytes) = test_helpers::translate_request_test(
+        "aws_bedrock",
+        &request,
+        "anthropic.claude-3",
+        &json!({"aws_region": "us-east-1"}),
+    )
+    .unwrap();
+    let translated: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    assert!(translated.get("toolConfig").is_none());
 }
 
 #[test]
@@ -1732,6 +1747,15 @@ fn openai_filtered_content_and_generated_tool_arguments_are_preserved() {
                     }]
                 },
                 "finish_reason": "tool_calls"
+            },
+            {
+                "index": 3,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "refusal": "I cannot help with that request."
+                },
+                "finish_reason": "stop"
             }
         ]
     });
@@ -1746,6 +1770,10 @@ fn openai_filtered_content_and_generated_tool_arguments_are_preserved() {
     assert_eq!(
         normalized["choices"][2]["message"]["tool_calls"][0]["function"]["arguments"],
         "{\"partial\":"
+    );
+    assert_eq!(
+        normalized["choices"][3]["message"]["refusal"],
+        "I cannot help with that request."
     );
 }
 
@@ -1857,6 +1885,23 @@ fn test_normalize_gemini_safety_filter() {
         test_helpers::normalize_response_test("google_gemini", 200, &body, "gemini-2.0-flash")
             .unwrap();
     assert_eq!(normalized["choices"][0]["finish_reason"], "content_filter");
+
+    let candidate_blocked = json!({
+        "candidates": [
+            {
+                "content": {"role": "model", "parts": []},
+                "finishReason": "SAFETY"
+            },
+            {"finishReason": "IMAGE_SAFETY"}
+        ],
+        "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 0, "totalTokenCount": 5}
+    });
+    let body = serde_json::to_vec(&candidate_blocked).unwrap();
+    let (normalized, _, _, _) =
+        test_helpers::normalize_response_test("google_vertex", 200, &body, "gemini-2.0-flash")
+            .unwrap();
+    assert_eq!(normalized["choices"][0]["finish_reason"], "content_filter");
+    assert_eq!(normalized["choices"][1]["finish_reason"], "content_filter");
 
     let prompt_blocked = json!({
         "promptFeedback": {"blockReason": "SAFETY"},
@@ -2083,6 +2128,19 @@ fn malformed_provider_success_shapes_are_rejected() {
     for (provider, body) in [
         ("openai", json!({})),
         ("openai", json!({"choices": []})),
+        (
+            "openai",
+            json!({
+                "id": "chatcmpl-invalid-refusal",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": null, "refusal": {}},
+                    "finish_reason": "stop"
+                }]
+            }),
+        ),
         (
             "anthropic",
             json!({"type": "message", "role": "assistant", "content": []}),

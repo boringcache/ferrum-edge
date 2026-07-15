@@ -1861,7 +1861,7 @@ fn validate_openai_request(
             Some(content @ Value::Array(_)) => {
                 validate_openai_content_parts(content, index, allow_dropped_non_text_parts)?;
             }
-            Some(Value::Null) if role == "assistant" && has_tool_calls => {}
+            Some(Value::Null) | None if role == "assistant" && has_tool_calls => {}
             _ => {
                 return Err(format!(
                     "ai_federation: messages[{index}] content must be a string or content-parts array"
@@ -3643,32 +3643,38 @@ fn translate_to_bedrock(
         body["inferenceConfig"] = Value::Object(inference_config);
     }
 
-    if let Some(tools) = parse_openai_tools(openai_body)? {
-        let native_tools = tools
-            .into_iter()
-            .map(|tool| {
-                let mut spec = serde_json::Map::new();
-                spec.insert("name".to_string(), tool["name"].clone());
-                if let Some(description) = tool["description"].as_str() {
+    let tool_choice = bedrock_tool_choice(openai_body)?;
+    match (parse_openai_tools(openai_body)?, tool_choice) {
+        (_, BedrockToolChoice::Disabled) => {}
+        (Some(tools), BedrockToolChoice::Enabled(choice)) => {
+            let native_tools = tools
+                .into_iter()
+                .map(|tool| {
+                    let mut spec = serde_json::Map::new();
+                    spec.insert("name".to_string(), tool["name"].clone());
+                    if let Some(description) = tool["description"].as_str() {
+                        spec.insert(
+                            "description".to_string(),
+                            Value::String(description.to_string()),
+                        );
+                    }
                     spec.insert(
-                        "description".to_string(),
-                        Value::String(description.to_string()),
+                        "inputSchema".to_string(),
+                        json!({ "json": tool["parameters"].clone() }),
                     );
-                }
-                spec.insert(
-                    "inputSchema".to_string(),
-                    json!({ "json": tool["parameters"].clone() }),
-                );
-                json!({ "toolSpec": Value::Object(spec) })
-            })
-            .collect::<Vec<_>>();
-        let mut tool_config = json!({ "tools": native_tools });
-        if let Some(choice) = bedrock_tool_choice(openai_body)? {
-            tool_config["toolChoice"] = choice;
+                    json!({ "toolSpec": Value::Object(spec) })
+                })
+                .collect::<Vec<_>>();
+            let mut tool_config = json!({ "tools": native_tools });
+            if let Some(choice) = choice {
+                tool_config["toolChoice"] = choice;
+            }
+            body["toolConfig"] = tool_config;
         }
-        body["toolConfig"] = tool_config;
-    } else if openai_body.get("tool_choice").is_some() {
-        return Err("ai_federation: Bedrock tool_choice requires tools".to_string());
+        (None, BedrockToolChoice::Enabled(Some(_))) => {
+            return Err("ai_federation: Bedrock tool_choice requires tools".to_string());
+        }
+        (None, BedrockToolChoice::Enabled(None)) => {}
     }
 
     let url = build_provider_url(provider, resolved_model);
@@ -3678,17 +3684,19 @@ fn translate_to_bedrock(
     Ok((url, headers, body_bytes))
 }
 
-fn bedrock_tool_choice(openai_body: &Value) -> Result<Option<Value>, String> {
+enum BedrockToolChoice {
+    Disabled,
+    Enabled(Option<Value>),
+}
+
+fn bedrock_tool_choice(openai_body: &Value) -> Result<BedrockToolChoice, String> {
     let Some(choice) = openai_body.get("tool_choice") else {
-        return Ok(None);
+        return Ok(BedrockToolChoice::Enabled(None));
     };
     let translated = match choice {
-        Value::String(value) if value == "none" => {
-            return Err(
-                "ai_federation: AWS Bedrock Converse cannot represent tool_choice='none'"
-                    .to_string(),
-            );
-        }
+        // Bedrock Converse has no native disabled choice. Omitting the entire
+        // toolConfig is the lossless representation: no tools are available.
+        Value::String(value) if value == "none" => return Ok(BedrockToolChoice::Disabled),
         Value::String(value) if value == "auto" => json!({ "auto": {} }),
         Value::String(value) if value == "required" => json!({ "any": {} }),
         Value::Object(object) => json!({
@@ -3696,7 +3704,7 @@ fn bedrock_tool_choice(openai_body: &Value) -> Result<Option<Value>, String> {
         }),
         _ => return Err("ai_federation: unsupported Bedrock tool_choice".to_string()),
     };
-    Ok(Some(translated))
+    Ok(BedrockToolChoice::Enabled(Some(translated)))
 }
 
 fn translate_to_cohere(
@@ -3887,18 +3895,36 @@ fn normalize_from_openai_compatible(resp: &Value) -> Result<(Value, TokenCounts)
             ));
         }
         let tool_calls = parse_provider_tool_calls(message, index, "OpenAI-compatible")?;
-        let has_non_empty_content = message
-            .get("content")
-            .and_then(Value::as_str)
-            .is_some_and(|content| !content.is_empty());
+        let has_refusal = match message.get("refusal") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(refusal)) => !refusal.is_empty(),
+            Some(_) => {
+                return Err(format!(
+                    "ai_federation: OpenAI-compatible choices[{index}] refusal must be a string or null"
+                ));
+            }
+        };
+        let has_non_empty_content = match message.get("content") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(content)) => !content.is_empty(),
+            Some(_) => {
+                return Err(format!(
+                    "ai_federation: OpenAI-compatible choices[{index}] content must be a string or null"
+                ));
+            }
+        };
         let has_filtered_content_shape = finish_reason == "content_filter"
             && matches!(
                 message.get("content"),
                 None | Some(Value::Null) | Some(Value::String(_))
             );
-        if !has_non_empty_content && tool_calls.is_empty() && !has_filtered_content_shape {
+        if !has_non_empty_content
+            && tool_calls.is_empty()
+            && !has_filtered_content_shape
+            && !has_refusal
+        {
             return Err(format!(
-                "ai_federation: OpenAI-compatible choices[{index}] has neither text content nor tool calls"
+                "ai_federation: OpenAI-compatible choices[{index}] has neither text content, tool calls, nor refusal"
             ));
         }
         if (finish_reason == "tool_calls") != !tool_calls.is_empty() {
@@ -4198,9 +4224,15 @@ fn gemini_prompt_is_blocked(resp: &Value) -> Result<bool, String> {
     };
     match reason.as_str() {
         Some(
-            "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "IMAGE_SAFETY" | "JAILBREAK" | "OTHER",
+            "SAFETY"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "MODEL_ARMOR"
+            | "IMAGE_SAFETY"
+            | "JAILBREAK"
+            | "OTHER",
         ) => Ok(true),
-        Some("BLOCK_REASON_UNSPECIFIED") => Ok(false),
+        Some("BLOCK_REASON_UNSPECIFIED" | "BLOCKED_REASON_UNSPECIFIED") => Ok(false),
         _ => Err("ai_federation: Gemini promptFeedback has an unsupported blockReason".to_string()),
     }
 }
@@ -4241,19 +4273,66 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
     }
 
     for (candidate_index, candidate) in candidates.iter().enumerate() {
-        if candidate["content"]["role"].as_str() != Some("model") {
-            return Err(format!(
-                "ai_federation: Gemini candidates[{candidate_index}] content role must be model"
-            ));
-        }
-        let parts = candidate["content"]["parts"]
-            .as_array()
-            .filter(|parts| !parts.is_empty())
+        let candidate = candidate.as_object().ok_or_else(|| {
+            format!("ai_federation: Gemini candidates[{candidate_index}] must be an object")
+        })?;
+        let native_finish = candidate
+            .get("finishReason")
+            .and_then(Value::as_str)
             .ok_or_else(|| {
-                format!(
-                    "ai_federation: Gemini candidates[{candidate_index}] missing non-empty content.parts"
-                )
+                format!("ai_federation: Gemini candidates[{candidate_index}] missing finishReason")
             })?;
+        let base_finish_reason = match native_finish {
+            "STOP" | "OTHER" => "stop",
+            "MAX_TOKENS" => "length",
+            "SAFETY"
+            | "RECITATION"
+            | "LANGUAGE"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "SPII"
+            | "MODEL_ARMOR"
+            | "MALFORMED_FUNCTION_CALL"
+            | "IMAGE_SAFETY"
+            | "IMAGE_PROHIBITED_CONTENT"
+            | "IMAGE_OTHER"
+            | "NO_IMAGE"
+            | "IMAGE_RECITATION"
+            | "UNEXPECTED_TOOL_CALL" => "content_filter",
+            _ => {
+                return Err(
+                    "ai_federation: Gemini candidate has an unsupported finishReason".to_string(),
+                );
+            }
+        };
+        let parts: &[Value] = match candidate.get("content") {
+            Some(Value::Object(content)) => {
+                match content.get("role") {
+                    Some(Value::String(role)) if role == "model" => {}
+                    None if base_finish_reason == "content_filter" => {}
+                    _ => {
+                        return Err(format!(
+                            "ai_federation: Gemini candidates[{candidate_index}] content role must be model"
+                        ));
+                    }
+                }
+                match content.get("parts") {
+                    Some(Value::Array(parts)) if !parts.is_empty() => parts,
+                    Some(Value::Array(_)) | None if base_finish_reason == "content_filter" => &[],
+                    _ => {
+                        return Err(format!(
+                            "ai_federation: Gemini candidates[{candidate_index}] missing non-empty content.parts"
+                        ));
+                    }
+                }
+            }
+            None | Some(Value::Null) if base_finish_reason == "content_filter" => &[],
+            _ => {
+                return Err(format!(
+                    "ai_federation: Gemini candidates[{candidate_index}] missing content object"
+                ));
+            }
+        };
         let mut text = String::new();
         let mut tool_calls = Vec::new();
         for (part_index, part) in parts.iter().enumerate() {
@@ -4289,9 +4368,6 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
                 }
             }
         }
-        let native_finish = candidate["finishReason"].as_str().ok_or_else(|| {
-            format!("ai_federation: Gemini candidates[{candidate_index}] missing finishReason")
-        })?;
         let finish_reason = if !tool_calls.is_empty() {
             if native_finish != "STOP" {
                 return Err(format!(
@@ -4300,24 +4376,7 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
             }
             "tool_calls"
         } else {
-            match native_finish {
-                "STOP" | "OTHER" => "stop",
-                "MAX_TOKENS" => "length",
-                "SAFETY"
-                | "RECITATION"
-                | "BLOCKLIST"
-                | "PROHIBITED_CONTENT"
-                | "SPII"
-                | "MODEL_ARMOR"
-                | "MALFORMED_FUNCTION_CALL"
-                | "UNEXPECTED_TOOL_CALL" => "content_filter",
-                _ => {
-                    return Err(
-                        "ai_federation: Gemini candidate has an unsupported finishReason"
-                            .to_string(),
-                    );
-                }
-            }
+            base_finish_reason
         };
         if text.is_empty() && tool_calls.is_empty() && finish_reason != "content_filter" {
             return Err(format!(
