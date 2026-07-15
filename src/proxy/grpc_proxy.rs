@@ -2138,8 +2138,7 @@ async fn proxy_grpc_streaming_dispatch(
             .map_err(|_| {
                 warn!("gRPC deadline exceeded waiting for streaming RPC response headers");
                 GrpcProxyError::ClientDeadlineExceeded(
-                    "gRPC deadline exceeded waiting for streaming RPC response headers"
-                        .to_string(),
+                    "gRPC deadline exceeded waiting for streaming RPC response headers".to_string(),
                 )
             })?
             .map_err(|e| {
@@ -2383,13 +2382,12 @@ pub(crate) async fn proxy_grpc_request_core(
             tokio::time::Instant::now().checked_add(Duration::from_millis(grpc_ms))
         })
     });
-    let per_phase_read_ms = if client_grpc_deadline_at.is_none()
-        && proxy.backend_read_timeout_ms > 0
-    {
-        Some(proxy.backend_read_timeout_ms)
-    } else {
-        None
-    };
+    let per_phase_read_ms =
+        if client_grpc_deadline_at.is_none() && proxy.backend_read_timeout_ms > 0 {
+            Some(proxy.backend_read_timeout_ms)
+        } else {
+            None
+        };
 
     // Effective per-frame idle read timeout for the STREAMING response body,
     // computed before `headers` is moved into the backend request below. Same
@@ -2427,9 +2425,8 @@ pub(crate) async fn proxy_grpc_request_core(
     // operator read timeout over response processing only, after connection
     // acquisition, and keep the earlier source typed for accounting.
     let backend_read_deadline_at = if proxy.backend_read_timeout_ms > 0 {
-        tokio::time::Instant::now().checked_add(Duration::from_millis(
-            proxy.backend_read_timeout_ms,
-        ))
+        tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
     } else {
         None
     };
@@ -2465,8 +2462,8 @@ pub(crate) async fn proxy_grpc_request_core(
     // collection below. The operator fallback (`per_phase_read_ms`) instead
     // arms a fresh per-phase timer in each phase when no client deadline exists,
     // preserving the prior per-read stall-guard semantics.
-    let shared_response_deadline = response_deadline_at
-        .map(|deadline| (response_deadline_ms.unwrap_or(1), deadline));
+    let shared_response_deadline =
+        response_deadline_at.map(|deadline| (response_deadline_ms.unwrap_or(1), deadline));
     let response = if let Some((timeout_ms, deadline)) = shared_response_deadline {
         tokio::time::timeout_at(deadline, send_fut)
             .await
