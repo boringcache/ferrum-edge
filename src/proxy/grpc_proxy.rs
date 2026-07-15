@@ -1241,12 +1241,25 @@ pub enum GrpcProxyError {
 
 /// Failure while collecting a buffered client gRPC request before dispatch.
 ///
-/// `TimedOut` is kept separate from [`GrpcProxyError`] because it is a client
-/// upload deadline, not a backend exchange failure. Callers return
-/// DEADLINE_EXCEEDED and let their pre-dispatch probe guard settle neutrally.
+/// Upload failures are kept separate from [`GrpcProxyError`] because they occur
+/// before backend dispatch. The typed timeout source preserves the distinct
+/// operator stall-timeout and client RPC-deadline wire messages while both let
+/// their pre-dispatch probe guard settle neutrally.
 pub(crate) enum GrpcRequestBodyCollectError {
     Proxy(GrpcProxyError),
     TimedOut,
+    DeadlineExceeded,
+}
+
+fn map_request_body_wait_error(
+    error: super::RequestBodyWaitError,
+) -> GrpcRequestBodyCollectError {
+    match error {
+        super::RequestBodyWaitError::TimedOut => GrpcRequestBodyCollectError::TimedOut,
+        super::RequestBodyWaitError::DeadlineExceeded => {
+            GrpcRequestBodyCollectError::DeadlineExceeded
+        }
+    }
 }
 
 impl GrpcProxyError {
@@ -2269,7 +2282,7 @@ pub(crate) async fn collect_grpc_request_body(
             request_body_read_timeout_ms,
         )
         .await
-        .map_err(|_| GrpcRequestBodyCollectError::TimedOut)?;
+        .map_err(map_request_body_wait_error)?;
         match collected {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
@@ -2293,7 +2306,7 @@ pub(crate) async fn collect_grpc_request_body(
             request_body_read_timeout_ms,
         )
         .await
-        .map_err(|_| GrpcRequestBodyCollectError::TimedOut)?
+        .map_err(map_request_body_wait_error)?
         .map_err(|e| {
             GrpcRequestBodyCollectError::Proxy(GrpcProxyError::Internal(format!(
                 "Failed to read request body: {}",

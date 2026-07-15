@@ -252,6 +252,49 @@ fn create_test_proxy_state_with_plugins(
     state
 }
 
+fn attach_grpc_web_deadline_plugins(
+    proxy: &mut Proxy,
+    deadline_config: serde_json::Value,
+) -> Vec<PluginConfig> {
+    let proxy_id = proxy.id.clone();
+    proxy.plugins = vec![
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-bridge".to_string(),
+        },
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-deadline".to_string(),
+        },
+    ];
+    vec![
+        PluginConfig {
+            id: "grpc-web-bridge".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "grpc_web".to_string(),
+            enabled: true,
+            config: serde_json::json!({}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some(proxy_id.clone()),
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+        PluginConfig {
+            id: "grpc-deadline".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "grpc_deadline".to_string(),
+            enabled: true,
+            config: deadline_config,
+            scope: PluginScope::Proxy,
+            proxy_id: Some(proxy_id),
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    ]
+}
+
 /// Like [`create_test_proxy_state`] but with a caller-supplied `EnvConfig` so a
 /// test can override runtime limits (e.g. `max_grpc_recv_size_bytes`).
 fn create_test_proxy_state_with_env(
@@ -1457,6 +1500,120 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
             .windows(b"grpc-status: 14".len())
             .any(|w| w == b"grpc-status: 14"),
         "gRPC-Web error body must embed the gateway's grpc-status: 14 (UNAVAILABLE)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_deadline_preflight_reject_is_grpc_web_shaped() {
+    let mut proxy = create_grpc_proxy("grpc-web-deadline-preflight", "/grpc", 9);
+    let plugin_configs = attach_grpc_web_deadline_plugins(
+        &mut proxy,
+        serde_json::json!({"reject_no_deadline": true}),
+    );
+    let state = create_test_proxy_state_with_plugins(vec![proxy], plugin_configs);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/grpc/my.Service/Unary")
+        .header("content-type", "application/grpc-web+proto")
+        .body(Full::new(Bytes::from_static(&[0, 0, 0, 0, 0])))
+        .unwrap();
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("deadline preflight response");
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/grpc-web+proto")
+    );
+    assert!(
+        response.headers().get("grpc-status").is_none(),
+        "gRPC-Web terminal status must ride in the body trailer frame"
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect preflight response")
+        .to_bytes();
+    assert_eq!(body.first(), Some(&0x80));
+    assert!(
+        body.windows(b"grpc-status: 3".len())
+            .any(|window| window == b"grpc-status: 3"),
+        "missing-timeout preflight rejection must embed INVALID_ARGUMENT in a gRPC-Web trailer frame"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn buffered_grpc_upload_deadline_preserves_gateway_deadline_contract() {
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let mut proxy = create_grpc_proxy("grpc-buffered-upload-deadline", "/grpc", 9);
+    let plugin_configs = attach_grpc_web_deadline_plugins(
+        &mut proxy,
+        serde_json::json!({"max_deadline_ms": 5_000}),
+    );
+    let state = create_test_proxy_state_with_plugins(vec![proxy], plugin_configs);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let (_body_tx, body_rx) =
+        tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::convert::Infallible>>(1);
+    let request_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(body_rx));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/grpc/my.Service/ClientStreaming")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .header("grpc-timeout", "50m")
+        .body(request_body)
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(2), sender.send_request(request))
+        .await
+        .expect("gateway must enforce the client RPC deadline")
+        .expect("buffered upload deadline response");
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("4")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
+        Some("Deadline exceeded at gateway"),
+        "client deadline expiry must not collapse into the operator upload-timeout message"
     );
 }
 

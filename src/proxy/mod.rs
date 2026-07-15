@@ -14029,12 +14029,26 @@ pub async fn run_authentication_phase(
             let mut server_reject: Option<(u16, Vec<u8>, HashMap<String, String>)> = None;
             for auth_plugin in auth_plugins {
                 let deadline = ctx.grpc_deadline_at();
-                match crate::plugins::await_request_plugin_deadline(
+                let auth_result = match crate::plugins::await_grpc_deadline(
                     deadline,
                     auth_plugin.authenticate(ctx, consumer_index),
                 )
                 .await
                 {
+                    Ok(result) => result,
+                    Err(()) => {
+                        let reject = crate::plugins::grpc_deadline_exceeded_plugin_result();
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            return Some((
+                                500,
+                                br#"{"error":"Internal error"}"#.to_vec(),
+                                HashMap::new(),
+                            ));
+                        };
+                        return Some((reject.status_code, reject.body, reject.headers));
+                    }
+                };
+                match auth_result {
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
@@ -15048,6 +15062,21 @@ async fn handle_proxy_request_inner(
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
+            let grpc_web_response = if let (Some(content_type), Some(grpc_status)) =
+                (grpc_web_response_content_type, reject.grpc_status)
+            {
+                let message = reject
+                    .grpc_message
+                    .as_deref()
+                    .unwrap_or_else(|| grpc_status_reason(grpc_status));
+                Some(build_grpc_web_error_response(
+                    content_type,
+                    grpc_status,
+                    message,
+                ))
+            } else {
+                None
+            };
             log_rejected_request(
                 &plugins,
                 &ctx,
@@ -15058,6 +15087,9 @@ async fn handle_proxy_request_inner(
             )
             .await;
             record_request(&state, reject.http_status.as_u16());
+            if let Some(response) = grpc_web_response {
+                return Ok(response);
+            }
             return Ok(build_response_from_normalized_reject(reject));
         }
     }
@@ -16463,6 +16495,13 @@ async fn handle_proxy_request_inner(
                             grpc_web_response_content_type,
                         ));
                     }
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {
+                        record_request(&state, StatusCode::OK.as_u16());
+                        return Ok(build_request_deadline_exceeded_response(
+                            true,
+                            grpc_web_response_content_type,
+                        ));
+                    }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(e)) => {
                         record_request(&state, 500);
                         return Ok(grpc_proxy::build_grpc_error_response(
@@ -16847,6 +16886,13 @@ async fn handle_proxy_request_inner(
                         // sole neutral probe release on this early return.
                         record_request(&state, StatusCode::OK.as_u16());
                         return Ok(build_request_body_timeout_response(
+                            true,
+                            grpc_web_response_content_type,
+                        ));
+                    }
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {
+                        record_request(&state, StatusCode::OK.as_u16());
+                        return Ok(build_request_deadline_exceeded_response(
                             true,
                             grpc_web_response_content_type,
                         ));
@@ -18442,7 +18488,9 @@ async fn handle_proxy_request_inner(
                 );
                 if !matches!(
                     &e,
-                    GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
+                    GrpcProxyError::ClientDeadlineExceeded(_)
+                        | GrpcProxyError::ResourceExhausted(_)
+                        | GrpcProxyError::Internal(_)
                 ) && let Some(permits) = backend_admission_permits.take()
                 {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
@@ -18455,7 +18503,9 @@ async fn handle_proxy_request_inner(
                 if !grpc_skip_final_cb_record
                     && !matches!(
                         &e,
-                        GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
+                        GrpcProxyError::ClientDeadlineExceeded(_)
+                            | GrpcProxyError::ResourceExhausted(_)
+                            | GrpcProxyError::Internal(_)
                     )
                 {
                     record_grpc_backend_dispatch_outcome(
@@ -21170,27 +21220,31 @@ pub(crate) async fn proxy_to_backend_retry(
     // "disabled" for both — skip the override so reqwest's default (no timeout)
     // applies. The per-request `connect_timeout` API is provided by a vendored
     // copy of reqwest patched with seanmonstar/reqwest#3017.
-    if proxy.backend_connect_timeout_ms > 0 {
-        req_builder = req_builder.connect_timeout(std::time::Duration::from_millis(
-            proxy.backend_connect_timeout_ms,
-        ));
-    }
-    if proxy.backend_read_timeout_ms > 0 {
-        req_builder = req_builder.timeout(std::time::Duration::from_millis(
-            proxy.backend_read_timeout_ms,
-        ));
-    }
-    if let Some(deadline) = request_ctx.grpc_deadline_at() {
+    // Keep the timeout source typed: the outer `await_grpc_deadline` owns the
+    // client RPC deadline, while reqwest owns only operator timeouts that
+    // expire strictly earlier. Installing the same budget in both
+    // places creates a race where reqwest can misclassify client expiry as a
+    // backend failure and train health/adaptive accounting.
+    let client_deadline_remaining = if let Some(deadline) = request_ctx.grpc_deadline_at() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return client_grpc_deadline_exceeded_response(resolved_ip);
         }
-        let request_timeout = if proxy.backend_read_timeout_ms > 0 {
-            remaining.min(Duration::from_millis(proxy.backend_read_timeout_ms))
-        } else {
-            remaining
-        };
-        req_builder = req_builder.timeout(request_timeout);
+        Some(remaining)
+    } else {
+        None
+    };
+    if proxy.backend_connect_timeout_ms > 0 {
+        let operator_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
+            req_builder = req_builder.connect_timeout(operator_timeout);
+        }
+    }
+    if proxy.backend_read_timeout_ms > 0 {
+        let operator_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
+            req_builder = req_builder.timeout(operator_timeout);
+        }
     }
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
@@ -21321,7 +21375,7 @@ pub(crate) async fn proxy_to_backend_retry(
     .await
     {
         Ok(result) => result,
-        Err(()) => return mesh_grpc_deadline_exceeded_response(resolved_ip),
+        Err(()) => return client_grpc_deadline_exceeded_response(resolved_ip),
     };
     // Release this retry attempt's in-flight slot the instant `send()` resolves
     // (response headers / dial failure) — BEFORE any response-body collection —
@@ -22467,17 +22521,8 @@ async fn proxy_to_backend(
     // "disabled" for both — skip the override so reqwest's default (no timeout)
     // applies. The per-request `connect_timeout` API is provided by a vendored
     // copy of reqwest patched with seanmonstar/reqwest#3017.
-    if proxy.backend_connect_timeout_ms > 0 {
-        req_builder = req_builder.connect_timeout(std::time::Duration::from_millis(
-            proxy.backend_connect_timeout_ms,
-        ));
-    }
-    if proxy.backend_read_timeout_ms > 0 {
-        req_builder = req_builder.timeout(std::time::Duration::from_millis(
-            proxy.backend_read_timeout_ms,
-        ));
-    }
-    if let Some(deadline) = request_ctx.grpc_deadline_at() {
+    // Keep the timeout source typed; see the retry-path companion above.
+    let client_deadline_remaining = if let Some(deadline) = request_ctx.grpc_deadline_at() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return backend_dispatch_response(
@@ -22486,12 +22531,21 @@ async fn proxy_to_backend(
                 None,
             );
         }
-        let request_timeout = if proxy.backend_read_timeout_ms > 0 {
-            remaining.min(Duration::from_millis(proxy.backend_read_timeout_ms))
-        } else {
-            remaining
-        };
-        req_builder = req_builder.timeout(request_timeout);
+        Some(remaining)
+    } else {
+        None
+    };
+    if proxy.backend_connect_timeout_ms > 0 {
+        let operator_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
+            req_builder = req_builder.connect_timeout(operator_timeout);
+        }
+    }
+    if proxy.backend_read_timeout_ms > 0 {
+        let operator_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
+            req_builder = req_builder.timeout(operator_timeout);
+        }
     }
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
@@ -22914,7 +22968,7 @@ async fn proxy_to_backend(
         Ok(result) => result,
         Err(()) => {
             return backend_dispatch_response(
-                mesh_grpc_deadline_exceeded_response(resolved_ip),
+                client_grpc_deadline_exceeded_response(resolved_ip),
                 retained_body,
                 backend_admission_permits,
             );
@@ -24128,10 +24182,10 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
     }
 }
 
-/// Client RPC deadline expiry before the current attempt could reach an
-/// upstream. It has the same client-visible Trailers-Only status as a backend
-/// read timeout, but remains neutral to backend health, circuit breaking, and
-/// adaptive concurrency because there is no backend signal to attribute.
+/// Client RPC deadline expiry while gateway work is still pending. It has the
+/// same client-visible Trailers-Only status as a backend read timeout, but
+/// remains neutral to backend health, circuit breaking, and adaptive
+/// concurrency because the client-chosen deadline is not a backend signal.
 fn client_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::BackendResponse {
     let mut response = mesh_grpc_deadline_exceeded_response(resolved_ip);
     response.headers.insert(

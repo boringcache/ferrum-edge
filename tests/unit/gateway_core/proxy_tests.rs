@@ -324,6 +324,52 @@ impl Plugin for RejectingAuth {
     }
 }
 
+struct ServerRejectingAuth;
+
+#[async_trait]
+impl Plugin for ServerRejectingAuth {
+    fn name(&self) -> &str {
+        "server_rejecting_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 503,
+            body: r#"{"error":"Identity provider unavailable"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+struct PendingAuth;
+
+#[async_trait]
+impl Plugin for PendingAuth {
+    fn name(&self) -> &str {
+        "pending_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        std::future::pending().await
+    }
+}
+
 struct PermissiveMissingMeshAuth;
 
 #[async_trait]
@@ -600,6 +646,50 @@ async fn test_multi_auth_preserves_specific_reject_when_surrounded_by_missing() 
     assert_eq!(body, br#"{"error":"Specific auth failure"}"#);
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
+}
+
+#[tokio::test]
+async fn test_multi_auth_deadline_expiry_overrides_earlier_server_reject() {
+    let deadline_plugin =
+        ferrum_edge::plugins::create_plugin("grpc_deadline", &json!({"default_deadline_ms": 10}))
+            .unwrap()
+            .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(matches!(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
+            &[deadline_plugin],
+            &mut ctx,
+        ),
+        PluginResult::Continue
+    ));
+
+    let auth_plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(ServerRejectingAuth), Arc::new(PendingAuth)];
+    let rejection = run_authentication_phase(
+        AuthMode::Multi,
+        &auth_plugins,
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("expired authentication phase must reject");
+
+    assert_eq!(rejection.0, 200);
+    assert!(rejection.1.is_empty());
+    assert_eq!(
+        rejection.2.get("grpc-status").map(String::as_str),
+        Some("4")
+    );
+    assert_eq!(
+        rejection.2.get("grpc-message").map(String::as_str),
+        Some("Deadline exceeded at gateway")
+    );
 }
 
 #[test]
