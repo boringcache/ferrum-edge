@@ -1194,7 +1194,7 @@ async fn workload_metrics_response_code_override_changes_selected_metric_family(
 }
 
 #[tokio::test]
-async fn mesh_histogram_renders_valid_labels_when_all_base_labels_are_removed() {
+async fn mesh_metrics_render_valid_labels_when_all_base_labels_are_removed() {
     let removed_labels = [
         "source_workload",
         "source_namespace",
@@ -1215,7 +1215,6 @@ async fn mesh_histogram_renders_valid_labels_when_all_base_labels_are_removed() 
         .into_iter()
         .map(|name| {
             json!({
-                "metric": "REQUEST_DURATION",
                 "name": name,
                 "operation": {"type": "remove"}
             })
@@ -1239,6 +1238,7 @@ async fn mesh_histogram_renders_valid_labels_when_all_base_labels_are_removed() 
     registry.record(&summary);
 
     let output = registry.render_uncached();
+    assert!(output.contains("ferrum_mesh_requests_total{} 1"));
     let buckets = output
         .lines()
         .filter(|line| line.starts_with("ferrum_mesh_request_duration_ms_bucket{"))
@@ -1268,6 +1268,9 @@ async fn mesh_histogram_renders_valid_labels_when_all_base_labels_are_removed() 
     let namespaced_output = registry.render_uncached();
     assert!(!namespaced_output.contains("{,"), "{namespaced_output}");
     assert!(namespaced_output.contains(
+        "ferrum_mesh_requests_total{gateway_namespace=\"mesh-system\"} 1"
+    ));
+    assert!(namespaced_output.contains(
         "ferrum_mesh_request_duration_ms_bucket{le=\"+Inf\",gateway_namespace=\"mesh-system\"} 1"
     ));
     assert!(namespaced_output.contains(
@@ -1281,6 +1284,9 @@ async fn mesh_histogram_renders_valid_labels_when_all_base_labels_are_removed() 
     labeled_summary
         .metadata
         .remove("mesh.metrics.request_duration.tag_overrides");
+    labeled_summary
+        .metadata
+        .remove("mesh.metrics.request_count.tag_overrides");
     let labeled_registry = MetricsRegistry::new();
     labeled_registry.record(&labeled_summary);
     let labeled_output = labeled_registry.render_uncached();

@@ -1433,9 +1433,16 @@ impl MetricsRegistry {
             for entry in self.mesh_request_counter.iter() {
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let labels = prometheus_helpers::mesh_label_fragment(entry.key(), None);
+                let counter_gateway_ns_label = if labels.is_empty() {
+                    gateway_ns_label
+                        .strip_prefix(',')
+                        .unwrap_or(gateway_ns_label.as_str())
+                } else {
+                    gateway_ns_label.as_str()
+                };
                 output.push_str(&format!(
                     "ferrum_mesh_requests_total{{{}{}}} {}\n",
-                    labels, gateway_ns_label, count
+                    labels, counter_gateway_ns_label, count
                 ));
             }
         }
