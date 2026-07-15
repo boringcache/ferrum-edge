@@ -14,8 +14,7 @@ use super::plugin_utils::assert_reject;
 
 const AUTHORITY_MISMATCH_ERROR: &str =
     r#"{"error":"OIDC callback host does not match request host"}"#;
-const INVALID_AUTHORITY_ERROR: &str =
-    r#"{"error":"OIDC missing or malformed request authority"}"#;
+const INVALID_AUTHORITY_ERROR: &str = r#"{"error":"OIDC missing or malformed request authority"}"#;
 
 fn base_config() -> serde_json::Value {
     json!({
