@@ -560,14 +560,21 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
         json!({"allowed_consumers": ["  alice  "]}),
+        json!({"allowed_consumers": ["é".repeat(255)]}),
+        json!({"allowed_groups": ["é".repeat(255)]}),
+        json!({"disallowed_groups": ["é".repeat(255)]}),
         json!({
-            "disallowed_consumers": ["a".repeat(256)],
+            "disallowed_consumers": ["é".repeat(4096)],
             "allow_authenticated_identity": true
         }),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
             "config should be valid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
         );
     }
 
@@ -594,6 +601,10 @@ fn access_control_schema_matches_runtime_validation() {
         assert!(
             validator.validate(&config).is_err(),
             "config should be invalid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("access_control", &config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
         );
     }
 }

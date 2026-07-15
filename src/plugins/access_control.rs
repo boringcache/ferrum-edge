@@ -71,25 +71,18 @@ impl AccessControl {
             object,
             "allowed_consumers",
             crate::config::types::MAX_USERNAME_LENGTH,
-            false,
         )?;
-        let disallowed = parse_string_set(
-            object,
-            "disallowed_consumers",
-            MAX_EXTERNAL_IDENTITY_LENGTH,
-            true,
-        )?;
+        let disallowed =
+            parse_string_set(object, "disallowed_consumers", MAX_EXTERNAL_IDENTITY_LENGTH)?;
         let allowed_groups = parse_string_set(
             object,
             "allowed_groups",
             crate::config::types::MAX_ACL_GROUP_LENGTH,
-            false,
         )?;
         let disallowed_groups = parse_string_set(
             object,
             "disallowed_groups",
             crate::config::types::MAX_ACL_GROUP_LENGTH,
-            false,
         )?;
         let allow_authenticated_identity =
             parse_bool(object, "allow_authenticated_identity")?.unwrap_or(false);
@@ -287,7 +280,6 @@ fn parse_string_set(
     object: &serde_json::Map<String, Value>,
     field: &str,
     max_length: usize,
-    count_unicode_characters: bool,
 ) -> Result<HashSet<String>, String> {
     let Some(value) = object.get(field) else {
         return Ok(HashSet::new());
@@ -313,11 +305,7 @@ fn parse_string_set(
                 "access_control: '{field}' entries must contain non-whitespace characters"
             ));
         }
-        let raw_length = if count_unicode_characters {
-            raw.chars().count()
-        } else {
-            raw.len()
-        };
+        let raw_length = raw.chars().count();
         if raw_length > max_length {
             return Err(format!(
                 "access_control: '{field}' entries must not exceed {max_length} characters"
