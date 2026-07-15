@@ -46,24 +46,39 @@ fn write_frontend_certs(scratch: &std::path::Path) -> (String, String) {
 
 /// File-mode YAML for one HTTPS proxy (gRPC is a runtime flavor of `https`)
 /// pointing at `(127.0.0.1, backend_port)`.
-fn file_mode_yaml(backend_port: u16) -> String {
+fn file_mode_yaml_with_response_buffering(backend_port: u16, buffer_response: bool) -> String {
+    let mut proxy = json!({
+        "id": "h3-grpc-stream",
+        "listen_path": "/api",
+        "backend_scheme": "https",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port,
+        "strip_listen_path": true,
+        "backend_connect_timeout_ms": 2000,
+        "backend_read_timeout_ms": 5000,
+        "backend_write_timeout_ms": 5000,
+        "backend_tls_verify_server_cert": false,
+    });
+    if buffer_response {
+        proxy["response_body_mode"] = json!("buffer");
+    }
     let config = json!({
         "version": "1",
-        "proxies": [{
-            "id": "h3-grpc-stream",
-            "listen_path": "/api",
-            "backend_scheme": "https",
-            "backend_host": "127.0.0.1",
-            "backend_port": backend_port,
-            "strip_listen_path": true,
-            "backend_connect_timeout_ms": 2000,
-            "backend_read_timeout_ms": 5000,
-            "backend_write_timeout_ms": 5000,
-            "backend_tls_verify_server_cert": false,
-        }],
+        "proxies": [proxy],
         "consumers": [],
         "upstreams": [],
-        "plugin_configs": [],
+        "plugin_configs": [{
+            "id": "h3-grpc-security-headers",
+            "plugin_name": "security_headers",
+            "config": {
+                "override_existing": false,
+                "hsts": true,
+                "set": { "X-Security-Policy": "gateway-enforced" },
+                "remove": [],
+            },
+            "scope": "global",
+            "enabled": true,
+        }],
     });
     serde_yaml::to_string(&config).expect("yaml serialize")
 }
@@ -74,6 +89,18 @@ fn file_mode_yaml(backend_port: u16) -> String {
 async fn spawn_h3_grpc_gateway(
     backend_port: u16,
     extra_env: &[(&str, String)],
+) -> (GatewayHarness, u16) {
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, extra_env, false).await
+}
+
+async fn spawn_buffered_h3_grpc_gateway(backend_port: u16) -> (GatewayHarness, u16) {
+    spawn_h3_grpc_gateway_with_response_buffering(backend_port, &[], true).await
+}
+
+async fn spawn_h3_grpc_gateway_with_response_buffering(
+    backend_port: u16,
+    extra_env: &[(&str, String)],
+    buffer_response: bool,
 ) -> (GatewayHarness, u16) {
     // Outer retry (codex P3): `FERRUM_PROXY_HTTPS_PORT` is a fixed port we
     // reserve-then-drop before the subprocess binds it, so a parallel test can
@@ -90,7 +117,10 @@ async fn spawn_h3_grpc_gateway(
         let (cert_path, key_path) = write_frontend_certs(scratch.path());
 
         let mut builder = GatewayHarness::builder()
-            .file_config(file_mode_yaml(backend_port))
+            .file_config(file_mode_yaml_with_response_buffering(
+                backend_port,
+                buffer_response,
+            ))
             .log_level("info")
             .capture_output()
             .env("FERRUM_ENABLE_HTTP3", "true")
@@ -177,13 +207,25 @@ async fn h3_grpc_streaming_unary_roundtrip() {
     let mut stream = open_grpc_stream_with_retry(&client, &url).await;
     stream.send_message(b"ping").await.expect("send message");
     stream.finish().await.expect("finish");
-    let (status, _headers) = stream.recv_response().await.expect("recv response");
+    let (status, headers) = stream.recv_response().await.expect("recv response");
     let (body, trailers) = stream
         .recv_body_and_trailers()
         .await
         .expect("recv body+trailers");
 
     assert_eq!(status.as_u16(), 200, "gRPC rides on HTTP 200");
+    assert_eq!(
+        headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+    assert_eq!(
+        headers
+            .get("strict-transport-security")
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=31536000; includeSubDomains")
+    );
     assert_eq!(
         body.as_ref(),
         grpc_frame(b"pong").as_slice(),
@@ -193,6 +235,90 @@ async fn h3_grpc_streaming_unary_roundtrip() {
         trailers.get("grpc-status").map(|v| v.to_str().unwrap()),
         Some("0"),
         "grpc-status trailer must be preserved through the streaming bridge"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_grpc_security_policy_preserves_initial_and_trailer_provenance() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let ca = TestCa::new("h3-grpc-buffered-policy-be").expect("ca");
+    let (be_cert, be_key) = ca.valid().expect("backend leaf");
+    let _backend = ScriptedH2Backend::builder_tls(backend_listener, &be_cert, &be_key)
+        .expect("backend tls")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from(grpc_frame(b"buffered-reply")),
+            end_stream: false,
+        })
+        .step(H2Step::RespondTrailers(vec![
+            ("grpc-status", "0".into()),
+            ("grpc-message", "OK".into()),
+            ("x-security-policy", "backend-trailer-value".into()),
+            ("x-application-trailer", "application-value".into()),
+        ]))
+        .spawn()
+        .expect("spawn backend");
+
+    let (_harness, https_port) = spawn_buffered_h3_grpc_gateway(backend_port).await;
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/echo.Echo/Unary");
+    let mut stream = open_grpc_stream_with_retry(&client, &url).await;
+    stream.send_message(b"ping").await.expect("send message");
+    stream.finish().await.expect("finish");
+    let (status, headers) = stream.recv_response().await.expect("recv response");
+    let (body, trailers) = stream
+        .recv_body_and_trailers()
+        .await
+        .expect("recv body+trailers");
+
+    assert_eq!(status.as_u16(), 200);
+    assert_eq!(body.as_ref(), grpc_frame(b"buffered-reply").as_slice());
+    assert_eq!(
+        headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+    assert_eq!(
+        headers
+            .get("strict-transport-security")
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=31536000; includeSubDomains")
+    );
+    assert!(headers.get("grpc-status").is_none());
+    assert!(headers.get("grpc-message").is_none());
+    assert!(headers.get("x-application-trailer").is_none());
+    assert_eq!(
+        trailers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("backend-trailer-value")
+    );
+    assert_eq!(
+        trailers
+            .get("x-application-trailer")
+            .and_then(|value| value.to_str().ok()),
+        Some("application-value")
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("0")
+    );
+    assert_eq!(
+        trailers
+            .get("grpc-message")
+            .and_then(|value| value.to_str().ok()),
+        Some("OK")
     );
 }
 

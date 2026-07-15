@@ -1,9 +1,13 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::Utc;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
+use ferrum_edge::plugins::security_headers::SecurityHeaders;
+use ferrum_edge::plugins::{Plugin, RequestContext, apply_initial_response_header_policies};
 use ferrum_edge::proxy::build_backend_url;
 use ferrum_edge::proxy::grpc_proxy;
+use serde_json::json;
 
 fn test_proxy() -> Proxy {
     Proxy {
@@ -757,6 +761,78 @@ fn build_then_reconcile_matches_buffered_writeback_scenario() {
     // Hook removals suppress both a trailer-only key and a shadowed trailer.
     assert!(!wire_trailers.contains_key("x-removed-trailer"));
     assert!(!wire_trailers.contains_key("x-shadowed-removed"));
+}
+
+#[tokio::test]
+async fn buffered_policy_is_reapplied_to_initial_headers_without_promoting_trailers() {
+    let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
+    let backend_trailers = grpc_map(&[
+        ("grpc-status", "0"),
+        ("grpc-message", "OK"),
+        ("x-policy", "backend-trailer-value"),
+        ("x-application-trailer", "application-value"),
+    ]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": false,
+            "set": {
+                "X-Policy": "gateway-enforced",
+                "Grpc-Status": "13"
+            },
+            "remove": []
+        }))
+        .unwrap(),
+    );
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
+    let _ = policy
+        .after_proxy(&mut ctx, 200, &mut plugin_view)
+        .await;
+
+    let mut wire_trailers = backend_trailers.clone();
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+    );
+    let mut initial_headers = plugin_view;
+    grpc_proxy::strip_non_initial_grpc_trailer_fields(
+        &mut initial_headers,
+        &wire_trailers,
+        &shadowed,
+    );
+    apply_initial_response_header_policies(&[policy], &mut initial_headers);
+    grpc_proxy::strip_grpc_terminal_metadata_from_initial(&mut initial_headers);
+
+    assert_eq!(
+        initial_headers.get("x-policy").map(String::as_str),
+        Some("gateway-enforced"),
+        "override_existing=false must evaluate against genuine initial headers"
+    );
+    assert!(!initial_headers.contains_key("x-application-trailer"));
+    assert!(!initial_headers.contains_key("grpc-status"));
+    assert!(!initial_headers.contains_key("grpc-message"));
+    assert_eq!(
+        wire_trailers.get("x-policy").map(String::as_str),
+        Some("backend-trailer-value"),
+        "policy enforcement must not promote or relocate the backend trailer value"
+    );
+    assert_eq!(
+        wire_trailers
+            .get("x-application-trailer")
+            .map(String::as_str),
+        Some("application-value")
+    );
+    assert_eq!(
+        wire_trailers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        wire_trailers.get("grpc-message").map(String::as_str),
+        Some("OK")
+    );
 }
 
 // ── GrpcBody::Channel (H3 cross-protocol streaming request body) ──────────────

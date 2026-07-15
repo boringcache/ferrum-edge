@@ -178,6 +178,14 @@ The coalesce loop is identical across the two paths — source of bytes differs 
 - **Buffered gRPC response** — the gRPC pool extracts trailers into a `HashMap<String, String>` before returning; the bridge converts them to a `HeaderMap` and sends via `send_trailers()` after the data frames.
 - **Streaming gRPC response** — the bridge polls hyper `Incoming::frame()`; when a `Frame::trailers()` variant is seen, the `HeaderMap` is stashed, the data loop exits cleanly, and the stashed trailers are forwarded via `send_trailers()`.
 
+Buffered response hooks receive a compatibility view containing both initial
+headers and trailers. Before the H3 response is written, Ferrum restores the
+original provenance, reapplies the prefiltered `security_headers` policy to the
+initial header map, and keeps `grpc-status`, `grpc-message`, status details, and
+application metadata on the trailer channel. This is also the path used after
+gRPC-Web binary or text response framing, so security policy cannot disappear
+with the native trailer map.
+
 Either way, `grpc-status` reaches the H3 client intact.
 
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
@@ -190,6 +198,12 @@ gateway authenticates, authorizes, runs the `before_proxy` plugin chain,
 opens a backend WebSocket connection, replies `:status = 200`, and then
 bridges WebSocket frames between the QUIC stream and the backend
 WebSocket for the lifetime of the session.
+
+The `security_headers` initial-response policy runs on the RFC 9220 `200`
+handshake and on gateway-generated H3 WebSocket failures. Transport-managed
+fields are stripped after policy; the backend-negotiated
+`Sec-WebSocket-Protocol` is then restored on success. H3 never emits the
+HTTP/1.1-only `Upgrade`, `Connection`, or `Sec-WebSocket-Accept` fields.
 
 ### Wire-level handshake
 

@@ -1567,6 +1567,45 @@ pub fn reconcile_grpc_trailers_from_view(
     });
 }
 
+/// Remove compatibility-view trailer copies from buffered gRPC initial headers
+/// before deterministic response policy is reapplied to the initial map.
+///
+/// Buffered response hooks historically receive one merged header+trailer map.
+/// After trailer reconciliation, ordinary trailer-only fields must return to the
+/// trailer channel. Callers then reapply the plugin-cache-prefiltered initial
+/// response policy chain so policy values land in initial HEADERS without ever
+/// promoting an application trailer value.
+///
+/// Header-shadowed trailers already have a genuine initial-header copy and are
+/// left alone. Reserved gRPC terminal metadata is never considered shadowed by
+/// the collector and therefore remains trailer-authoritative for non-empty
+/// responses.
+pub fn strip_non_initial_grpc_trailer_fields(
+    response_headers: &mut HashMap<String, String>,
+    response_trailers: &HashMap<String, String>,
+    header_shadowed_trailer_keys: &HashSet<String>,
+) {
+    for name in response_trailers.keys() {
+        if !header_shadowed_trailer_keys.contains(name) {
+            response_headers.remove(name);
+        }
+    }
+}
+
+/// Keep gRPC terminal metadata out of initial HEADERS on non-empty responses.
+///
+/// Initial-response policy is reapplied after trailer provenance is restored.
+/// An operator may deliberately name a gRPC metadata field in a generic header
+/// policy, but the protocol boundary must still keep terminal status on the
+/// trailer channel.
+pub fn strip_grpc_terminal_metadata_from_initial(
+    response_headers: &mut HashMap<String, String>,
+) {
+    response_headers.remove("grpc-status");
+    response_headers.remove("grpc-message");
+    response_headers.remove("grpc-status-details-bin");
+}
+
 /// Re-home a hook-mutated trailer-only `set-cookie` onto the buffered gRPC
 /// initial HEADERS (issue #1638).
 ///

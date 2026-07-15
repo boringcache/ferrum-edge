@@ -192,6 +192,7 @@ where
     pub xff_append_ip: &'a str,
     pub ctx: &'a mut RequestContext,
     pub plugins: &'a [Arc<dyn Plugin>],
+    pub initial_response_header_policy_plugins: &'a [Arc<dyn Plugin>],
     pub backend_admission_plugins: &'a [Arc<dyn Plugin>],
     pub preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
     pub requires_response_body_buffering: bool,
@@ -524,6 +525,7 @@ where
         xff_append_ip,
         ctx,
         plugins,
+        initial_response_header_policy_plugins,
         backend_admission_plugins,
         preacquired_backend_admission,
         requires_response_body_buffering,
@@ -3691,11 +3693,18 @@ where
                 &plugin_response_headers,
             );
             let mut response_headers = plugin_response_headers;
-            for k in response_trailers.keys() {
-                if !header_shadowed_trailer_keys.contains(k) {
-                    response_headers.remove(k);
-                }
-            }
+            crate::proxy::grpc_proxy::strip_non_initial_grpc_trailer_fields(
+                &mut response_headers,
+                &response_trailers,
+                &header_shadowed_trailer_keys,
+            );
+            crate::plugins::apply_initial_response_header_policies(
+                initial_response_header_policy_plugins,
+                &mut response_headers,
+            );
+            crate::proxy::grpc_proxy::strip_grpc_terminal_metadata_from_initial(
+                &mut response_headers,
+            );
             // Re-home a hook-mutated trailer-only `set-cookie` onto the initial
             // HEADERS (issue #1638) so browsers / gRPC-Web clients can store it,
             // identically to the main gRPC path. Runs after the strip loop and
@@ -5003,35 +5012,10 @@ where
     S: SendStream<Bytes>,
 {
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut resp_builder = Response::builder().status(status_code);
-    for (k, v) in headers {
-        if k == "set-cookie" {
-            // Multiple Set-Cookie values are stored newline-separated by
-            // `collect_reqwest_response_headers` to avoid RFC-violating
-            // comma folding. Newlines are invalid inside a single
-            // HeaderValue, so split and emit each cookie as its own header
-            // line — mirrors the H1/H2 path in `src/proxy/mod.rs`. Fast
-            // path: most responses have a single Set-Cookie, so skip the
-            // split when there's no embedded newline.
-            if !v.contains('\n') {
-                if let Ok(val) = HeaderValue::from_str(v) {
-                    // Pre-interned constant — zero parse, zero alloc.
-                    resp_builder = resp_builder.header(hyper::header::SET_COOKIE, val);
-                }
-            } else {
-                for cookie_val in v.split('\n') {
-                    if let Ok(val) = HeaderValue::from_str(cookie_val) {
-                        resp_builder = resp_builder.header(hyper::header::SET_COOKIE, val);
-                    }
-                }
-            }
-        } else if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            resp_builder = resp_builder.header(name, val);
-        }
-    }
+    let resp_builder = crate::proxy::headers::apply_response_headers(
+        Response::builder().status(status_code),
+        headers,
+    );
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 response: {}", e))?;

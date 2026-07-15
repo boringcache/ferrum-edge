@@ -12,8 +12,10 @@
 //! app). Operators can add or remove arbitrary headers via `set` / `remove`.
 
 use async_trait::async_trait;
+use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use crate::util::http_headers::{cache_control_has_directive, etag_value_is_strong};
 
@@ -34,6 +36,21 @@ impl SecurityHeaders {
         let object = config
             .as_object()
             .ok_or_else(|| "security_headers: config must be an object".to_string())?;
+        reject_unknown_keys(
+            object,
+            "security_headers",
+            &[
+                "content_type_options",
+                "frame_options",
+                "referrer_policy",
+                "hsts",
+                "content_security_policy",
+                "permissions_policy",
+                "set",
+                "remove",
+                "override_existing",
+            ],
+        )?;
 
         let override_existing = parse_bool(object, "override_existing", true)?;
 
@@ -125,6 +142,14 @@ impl Plugin for SecurityHeaders {
     ) -> PluginResult {
         self.apply(response_headers);
         PluginResult::Continue
+    }
+
+    fn is_initial_response_header_policy(&self) -> bool {
+        true
+    }
+
+    fn apply_initial_response_header_policy(&self, response_headers: &mut HashMap<String, String>) {
+        self.apply(response_headers);
     }
 
     fn may_add_response_cache_control_no_transform(
@@ -236,6 +261,11 @@ fn parse_hsts(object: &serde_json::Map<String, Value>) -> Result<Option<String>,
             Ok(Some(value.clone()))
         }
         Some(Value::Object(map)) => {
+            reject_unknown_keys(
+                map,
+                "security_headers.hsts",
+                &["max_age", "include_subdomains", "preload"],
+            )?;
             let max_age = match map.get("max_age") {
                 None | Some(Value::Null) => 31_536_000u64,
                 Some(Value::Number(n)) => n.as_u64().ok_or_else(|| {
@@ -266,18 +296,12 @@ fn parse_set_map(object: &serde_json::Map<String, Value>) -> Result<Vec<(String,
         Some(Value::Object(map)) => {
             let mut out = Vec::with_capacity(map.len());
             for (name, value) in map {
-                let name = name.trim();
-                if name.is_empty() {
-                    return Err(
-                        "security_headers: 'set' header names must be non-empty".to_string()
-                    );
-                }
-                validate_header_name(name)?;
+                let name = parse_header_name("set", name)?;
                 let value = value.as_str().ok_or_else(|| {
                     format!("security_headers: 'set.{name}' value must be a string")
                 })?;
-                validate_header_value(name, value)?;
-                out.push((name.to_ascii_lowercase(), value.to_string()));
+                validate_header_value(&format!("set.{name}"), value)?;
+                out.push((name, value.to_string()));
             }
             Ok(out)
         }
@@ -298,13 +322,8 @@ fn parse_remove(object: &serde_json::Map<String, Value>) -> Result<Vec<String>, 
                     .as_str()
                     .ok_or_else(|| {
                         "security_headers: 'remove' entries must be strings".to_string()
-                    })?
-                    .trim();
-                if name.is_empty() {
-                    return Err("security_headers: 'remove' entries must be non-empty".to_string());
-                }
-                validate_header_name(name)?;
-                out.push(name.to_ascii_lowercase());
+                    })?;
+                out.push(parse_header_name("remove", name)?);
             }
             Ok(out)
         }
@@ -314,26 +333,36 @@ fn parse_remove(object: &serde_json::Map<String, Value>) -> Result<Vec<String>, 
     }
 }
 
-fn validate_header_name(name: &str) -> Result<(), String> {
-    if name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "security_headers: invalid header name '{name}' (allowed: letters, digits, '-', '_')"
-        ))
-    }
+fn parse_header_name(field: &str, name: &str) -> Result<String, String> {
+    HeaderName::from_bytes(name.as_bytes())
+        .map(|name| name.as_str().to_string())
+        .map_err(|_| format!("security_headers: '{field}' contains an invalid HTTP field name"))
 }
 
 fn validate_header_value(key: &str, value: &str) -> Result<(), String> {
-    if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
-        return Err(format!(
-            "security_headers: '{key}' value must not contain CR, LF, or NUL"
-        ));
+    HeaderValue::from_str(value)
+        .map(|_| ())
+        .map_err(|_| format!("security_headers: '{key}' must be a valid HTTP field value"))
+}
+
+fn reject_unknown_keys(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    unknown.sort_unstable();
+    Err(format!(
+        "security_headers: unknown configuration key(s) under '{path}': {}",
+        unknown.join(", ")
+    ))
 }
 
 fn parse_bool(
@@ -457,7 +486,7 @@ mod tests {
     fn header_value_with_crlf_is_rejected() {
         let err =
             SecurityHeaders::new(&json!({ "set": { "X-Bad": "a\r\nInjected: 1" } })).unwrap_err();
-        assert!(err.contains("CR, LF"));
+        assert!(err.contains("valid HTTP field value"));
     }
 
     #[test]

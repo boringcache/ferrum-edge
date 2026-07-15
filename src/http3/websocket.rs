@@ -394,55 +394,47 @@ fn push_h3_forwardable_header_override(
 }
 
 /// Write a small JSON error body on the H3 stream and finish.
-async fn send_h3_error_body<S>(
+pub(crate) async fn send_h3_error_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
     body: &'static str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) where
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
-    let resp = match Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(())
-    {
-        Ok(r) => r,
-        Err(e) => {
-            error!("H3 WS: failed to build error response: {}", e);
-            return;
-        }
-    };
-    if let Err(e) = stream.send_response(resp).await {
-        debug!("H3 WS: failed to send error response: {}", e);
-        return;
-    }
-    if let Err(e) = stream.send_data(Bytes::from_static(body.as_bytes())).await {
-        debug!("H3 WS: failed to send error body: {}", e);
-    }
-    if let Err(e) = stream.finish().await {
-        debug!("H3 WS: failed to finish stream after error: {}", e);
-    }
-    crate::http3::stream_util::halt_request_body(stream);
+    send_h3_reject_body(
+        stream,
+        status,
+        body.as_bytes(),
+        HashMap::new(),
+        initial_response_header_policy_plugins,
+    )
+    .await;
 }
 
 async fn send_h3_reject_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
     body: &[u8],
-    headers: &HashMap<String, String>,
+    mut headers: HashMap<String, String>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) where
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
-    let mut builder = Response::builder().status(status);
     if !headers
         .keys()
         .any(|key| key.eq_ignore_ascii_case("content-type"))
     {
-        builder = builder.header("content-type", "application/json");
+        headers.insert("content-type".to_string(), "application/json".to_string());
     }
-    for (name, value) in headers {
-        builder = builder.header(name.as_str(), value.as_str());
-    }
+    crate::proxy::finalize_websocket_response_headers(
+        initial_response_header_policy_plugins,
+        &mut headers,
+    );
+    let builder = crate::proxy::headers::apply_response_headers(
+        Response::builder().status(status),
+        &headers,
+    );
     let resp = match builder.body(()) {
         Ok(r) => r,
         Err(e) => {
@@ -470,6 +462,7 @@ async fn send_h3_backend_admission_rejection<S>(
     stream: &mut RequestStream<S, Bytes>,
     rejection: crate::proxy::backend_dispatch::BackendAdmissionRejection,
     plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     state: &ProxyState,
     start_time: Instant,
@@ -501,7 +494,14 @@ async fn send_h3_backend_admission_rejection<S>(
     )
     .await;
     crate::proxy::record_request(state, status.as_u16());
-    send_h3_reject_body(stream, status, &rejection.body, &headers).await;
+    send_h3_reject_body(
+        stream,
+        status,
+        &rejection.body,
+        headers,
+        initial_response_header_policy_plugins,
+    )
+    .await;
 }
 
 pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
@@ -542,6 +542,7 @@ pub(crate) async fn handle_h3_websocket(
     proxy: Arc<Proxy>,
     ctx: RequestContext,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
     upstream_target: Option<Arc<UpstreamTarget>>,
@@ -574,6 +575,7 @@ pub(crate) async fn handle_h3_websocket(
             &mut stream,
             StatusCode::NOT_IMPLEMENTED,
             r#"{"error":"WebSocket over HTTP/3 is disabled on this gateway"}"#,
+            &initial_response_header_policy_plugins,
         )
         .await;
         crate::proxy::record_request(&state, 501);
@@ -628,6 +630,7 @@ pub(crate) async fn handle_h3_websocket(
                 &mut stream,
                 StatusCode::SERVICE_UNAVAILABLE,
                 r#"{"error":"WebSocket connection limit exceeded"}"#,
+                &initial_response_header_policy_plugins,
             )
             .await;
             // Gateway-side reject after the caller's CB check — release a
@@ -771,7 +774,8 @@ pub(crate) async fn handle_h3_websocket(
                 &mut stream,
                 StatusCode::BAD_GATEWAY,
                 br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
-                &reason_headers,
+                reason_headers,
+                &initial_response_header_policy_plugins,
             )
             .await;
             drop(ws_connection_permit);
@@ -827,6 +831,7 @@ pub(crate) async fn handle_h3_websocket(
                     &mut stream,
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"Backend connection limit exceeded"}"#,
+                    &initial_response_header_policy_plugins,
                 )
                 .await;
                 // Gateway-side reject after the CB check — release a claimed
@@ -864,6 +869,7 @@ pub(crate) async fn handle_h3_websocket(
                         &mut stream,
                         rejection,
                         &plugins,
+                        &initial_response_header_policy_plugins,
                         &mut ctx,
                         &state,
                         start_time,
@@ -1086,7 +1092,13 @@ pub(crate) async fn handle_h3_websocket(
                 } else {
                     r#"{"error":"Backend WebSocket connection failed"}"#
                 };
-                send_h3_error_body(&mut stream, StatusCode::BAD_GATEWAY, ws_body).await;
+                send_h3_error_body(
+                    &mut stream,
+                    StatusCode::BAD_GATEWAY,
+                    ws_body,
+                    &initial_response_header_policy_plugins,
+                )
+                .await;
                 drop(ws_connection_permit);
                 return Ok(());
             }
@@ -1131,15 +1143,7 @@ pub(crate) async fn handle_h3_websocket(
     // No Upgrade / Connection / Sec-WebSocket-Accept headers (those
     // are HTTP/1.1 only). The QUIC stream becomes the WebSocket
     // transport as soon as the client sees the 200.
-    let mut response_builder = Response::builder().status(StatusCode::OK);
-
-    // Forward the backend's negotiated subprotocol (RFC 6455 §11.3.4,
-    // applicable to RFC 9220 Extended CONNECT via RFC 8441 §5.2).
-    // Clients that offered a subprotocol expect the server's selected
-    // value; dropping it breaks subprotocol-based application dispatch.
-    if let Some(proto) = backend_handshake.negotiated_subprotocol.clone() {
-        response_builder = response_builder.header("sec-websocket-protocol", proto);
-    }
+    let mut response_headers = HashMap::new();
 
     // Sticky session cookie on the WS upgrade response, mirroring the
     // H1/H2 path.
@@ -1164,8 +1168,24 @@ pub(crate) async fn handle_h3_websocket(
                 .unwrap_or(&default_cc);
             let cookie_val =
                 crate::proxy::build_sticky_cookie_header(cookie_name, target, cookie_config);
-            response_builder = response_builder.header("set-cookie", cookie_val);
+            response_headers.insert("set-cookie".to_string(), cookie_val);
         }
+    }
+    crate::proxy::finalize_websocket_response_headers(
+        &initial_response_header_policy_plugins,
+        &mut response_headers,
+    );
+    let mut response_builder = crate::proxy::headers::apply_response_headers(
+        Response::builder().status(StatusCode::OK),
+        &response_headers,
+    );
+
+    // Forward the backend's negotiated subprotocol (RFC 6455 §11.3.4,
+    // applicable to RFC 9220 Extended CONNECT via RFC 8441 §5.2). Add this
+    // transport-owned field after policy enforcement so policy cannot invent
+    // or remove the backend-negotiated value.
+    if let Some(proto) = backend_handshake.negotiated_subprotocol.clone() {
+        response_builder = response_builder.header("sec-websocket-protocol", proto);
     }
     let response = match response_builder.body(()) {
         Ok(r) => r,

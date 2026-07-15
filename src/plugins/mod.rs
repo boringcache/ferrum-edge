@@ -189,6 +189,23 @@ pub const TCP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp];
 /// UDP-only (datagram-level plugins that do not apply to TCP or HTTP).
 pub const UDP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Udp];
 
+/// Apply the pre-filtered initial-response header policy chain in configured
+/// priority order.
+///
+/// The plugin cache builds this list once per proxy/protocol generation. Callers
+/// at protocol-specific client boundaries (notably WebSocket handshakes) can
+/// therefore enforce deterministic response policy without filtering or
+/// allocating on the request path. Ordinary HTTP responses continue to use the
+/// full `after_proxy` lifecycle.
+pub fn apply_initial_response_header_policies(
+    policy_plugins: &[Arc<dyn Plugin>],
+    response_headers: &mut HashMap<String, String>,
+) {
+    for plugin in policy_plugins {
+        plugin.apply_initial_response_header_policy(response_headers);
+    }
+}
+
 /// How plugin construction or validation failures affect cache publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginFailurePolicy {
@@ -2948,6 +2965,26 @@ pub trait Plugin: Send + Sync {
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin defines deterministic response-header
+    /// policy that must be enforced on protocol-specific initial response
+    /// boundaries as well as the ordinary `after_proxy` path.
+    ///
+    /// The plugin cache uses this marker to pre-filter a priority-ordered list;
+    /// request paths must not rediscover these plugins with name checks or scans.
+    fn is_initial_response_header_policy(&self) -> bool {
+        false
+    }
+
+    /// Apply this plugin's deterministic policy to an initial response header
+    /// map. Called only for plugins that opt in through
+    /// [`Self::is_initial_response_header_policy`]. Implementations must not
+    /// consume request-local state or perform I/O.
+    fn apply_initial_response_header_policy(
+        &self,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
     }
 
     /// Returns `true` when this plugin may change the response `Content-Type`

@@ -349,7 +349,20 @@ proxies:
     strip_listen_path: true
 
 consumers: []
-plugin_configs: []
+plugin_configs:
+  - id: "plugin-security-headers-ws"
+    plugin_name: "security_headers"
+    config:
+      hsts: true
+      set:
+        X-WS-Security: "gateway-enforced"
+        Upgrade: "policy-must-not-escape"
+        Connection: "policy-must-not-escape"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
+      remove: ["server", "x-powered-by"]
+    scope: global
+    enabled: true
 "#,
         backend_port
     );
@@ -375,7 +388,20 @@ proxies:
       - "https://app.example.com"
 
 consumers: []
-plugin_configs: []
+plugin_configs:
+  - id: "plugin-security-headers-ws-origin"
+    plugin_name: "security_headers"
+    config:
+      hsts: true
+      set:
+        X-WS-Security: "gateway-enforced"
+        Upgrade: "policy-must-not-escape"
+        Connection: "policy-must-not-escape"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
+      remove: ["server", "x-powered-by"]
+    scope: global
+    enabled: true
 "#,
         backend_port
     );
@@ -769,6 +795,45 @@ fn assert_websocket_limit_closed(reply: Option<Result<Message, WsError>>, contex
     }
 }
 
+fn assert_ws_security_policy(headers: &http::HeaderMap) {
+    assert_eq!(
+        headers
+            .get("x-ws-security")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+    assert_eq!(
+        headers
+            .get("strict-transport-security")
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=31536000; includeSubDomains")
+    );
+}
+
+fn assert_no_ws_transport_policy_values(headers: &http::HeaderMap) {
+    for name in [
+        "upgrade",
+        "connection",
+        "sec-websocket-accept",
+        "sec-websocket-protocol",
+    ] {
+        assert_ne!(
+            headers.get(name).and_then(|value| value.to_str().ok()),
+            Some("policy-must-not-escape"),
+            "security policy must not control transport-managed {name}"
+        );
+    }
+}
+
+fn assert_no_h1_only_websocket_headers(headers: &http::HeaderMap) {
+    for name in ["upgrade", "connection", "sec-websocket-accept"] {
+        assert!(
+            headers.get(name).is_none(),
+            "Extended CONNECT/failure response must not carry H1-only {name}"
+        );
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -795,9 +860,27 @@ async fn test_websocket_plaintext_echo() {
 
     // Connect WebSocket client through the gateway
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
-    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+    let (mut ws, response) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("Failed to connect WebSocket");
+    assert_ws_security_policy(response.headers());
+    assert_no_ws_transport_policy_values(response.headers());
+    assert_eq!(
+        response
+            .headers()
+            .get("upgrade")
+            .and_then(|value| value.to_str().ok()),
+        Some("websocket")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("connection")
+            .and_then(|value| value.to_str().ok()),
+        Some("upgrade")
+    );
+    assert!(response.headers().get("sec-websocket-accept").is_some());
+    assert!(response.headers().get("sec-websocket-protocol").is_none());
 
     // Test text echo
     ws.send(Message::Text("hello world".into()))
@@ -857,7 +940,12 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
         Err(err) => err,
     };
     match missing_origin {
-        WsError::Http(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+        WsError::Http(response) => {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_ws_security_policy(response.headers());
+            assert_no_ws_transport_policy_values(response.headers());
+            assert_no_h1_only_websocket_headers(response.headers());
+        }
         other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
     }
 
@@ -873,7 +961,12 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
         Err(err) => err,
     };
     match blocked_origin {
-        WsError::Http(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+        WsError::Http(response) => {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_ws_security_policy(response.headers());
+            assert_no_ws_transport_policy_values(response.headers());
+            assert_no_h1_only_websocket_headers(response.headers());
+        }
         other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
     }
 
@@ -888,6 +981,8 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
         .await
         .expect("WebSocket handshake from allowed Origin should succeed");
     assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_ws_security_policy(response.headers());
+    assert_no_ws_transport_policy_values(response.headers());
 
     ws.send(Message::Text("origin ok".into()))
         .await
@@ -1255,6 +1350,9 @@ async fn test_h2_websocket_extended_connect_echo() {
         .expect("send H2 WebSocket CONNECT");
     assert_eq!(response.status(), http::StatusCode::OK);
     assert_eq!(response.version(), Version::HTTP_2);
+    assert_ws_security_policy(response.headers());
+    assert_no_ws_transport_policy_values(response.headers());
+    assert_no_h1_only_websocket_headers(response.headers());
     assert!(
         response.headers().get("upgrade").is_none(),
         "RFC 8441 H2 WebSocket responses must not use H1 Upgrade headers"
@@ -1342,6 +1440,9 @@ async fn test_websocket_global_connection_limit_rejects_second_upgrade() {
     match second {
         Err(WsError::Http(response)) => {
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_ws_security_policy(response.headers());
+            assert_no_ws_transport_policy_values(response.headers());
+            assert_no_h1_only_websocket_headers(response.headers());
             let body = response
                 .body()
                 .as_ref()
@@ -1406,6 +1507,9 @@ async fn test_h3_websocket_rfc9220_echo_and_masked_frame() {
         .await
         .expect("H3 WebSocket connect");
     assert_eq!(ws.status, StatusCode::OK);
+    assert_ws_security_policy(&ws.headers);
+    assert_no_ws_transport_policy_values(&ws.headers);
+    assert_no_h1_only_websocket_headers(&ws.headers);
     assert!(
         ws.headers.get("sec-websocket-protocol").is_none(),
         "backend negotiated no subprotocol, so H3 200 must not invent one"
@@ -1612,6 +1716,9 @@ async fn test_h3_websocket_subprotocol_forwarding_and_none() {
         .await
         .expect("H3 WebSocket connect with subprotocols");
     assert_eq!(with_subprotocol.status, StatusCode::OK);
+    assert_ws_security_policy(&with_subprotocol.headers);
+    assert_no_ws_transport_policy_values(&with_subprotocol.headers);
+    assert_no_h1_only_websocket_headers(&with_subprotocol.headers);
     assert_eq!(
         with_subprotocol
             .headers
@@ -1634,6 +1741,9 @@ async fn test_h3_websocket_subprotocol_forwarding_and_none() {
         .await
         .expect("H3 WebSocket connect without subprotocol");
     assert_eq!(without_subprotocol.status, StatusCode::OK);
+    assert_ws_security_policy(&without_subprotocol.headers);
+    assert_no_ws_transport_policy_values(&without_subprotocol.headers);
+    assert_no_h1_only_websocket_headers(&without_subprotocol.headers);
     assert!(
         without_subprotocol
             .headers
@@ -1684,6 +1794,9 @@ async fn test_h3_websocket_origin_allowlist_enforced_before_backend_connect() {
         .await
         .expect("H3 WebSocket missing-origin response");
     assert_eq!(missing_origin.status, StatusCode::FORBIDDEN);
+    assert_ws_security_policy(&missing_origin.headers);
+    assert_no_ws_transport_policy_values(&missing_origin.headers);
+    assert_no_h1_only_websocket_headers(&missing_origin.headers);
     assert!(
         missing_origin
             .recv_body_text()
@@ -1703,6 +1816,9 @@ async fn test_h3_websocket_origin_allowlist_enforced_before_backend_connect() {
         .await
         .expect("H3 WebSocket disallowed-origin response");
     assert_eq!(blocked_origin.status, StatusCode::FORBIDDEN);
+    assert_ws_security_policy(&blocked_origin.headers);
+    assert_no_ws_transport_policy_values(&blocked_origin.headers);
+    assert_no_h1_only_websocket_headers(&blocked_origin.headers);
     assert!(
         blocked_origin
             .recv_body_text()
@@ -1722,6 +1838,9 @@ async fn test_h3_websocket_origin_allowlist_enforced_before_backend_connect() {
         .await
         .expect("H3 WebSocket allowed-origin connect");
     assert_eq!(allowed_origin.status, StatusCode::OK);
+    assert_ws_security_policy(&allowed_origin.headers);
+    assert_no_ws_transport_policy_values(&allowed_origin.headers);
+    assert_no_h1_only_websocket_headers(&allowed_origin.headers);
     allowed_origin
         .send_text("origin h3")
         .await
@@ -1801,6 +1920,9 @@ async fn test_h3_websocket_failed_backend_upgrade_returns_502() {
         .await
         .expect("H3 WebSocket failed-upgrade response");
     assert_eq!(ws.status, StatusCode::BAD_GATEWAY);
+    assert_ws_security_policy(&ws.headers);
+    assert_no_ws_transport_policy_values(&ws.headers);
+    assert_no_h1_only_websocket_headers(&ws.headers);
     assert!(
         ws.recv_body_text()
             .await

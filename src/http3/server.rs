@@ -2766,6 +2766,8 @@ async fn handle_h3_request(
     // from reaching this branch, but the dedicated handler also emits
     // a 501 itself as defense in depth.
     if http_flavor == HttpFlavor::WebSocket {
+        let initial_response_header_policy_plugins =
+            plugin_cache_view.initial_response_header_policy_plugins();
         // CSWSH protection (RFC 6455 §10.2): reject WS upgrades from
         // origins not on the allow-list BEFORE dispatching into the
         // bridge. Mirrors the H1/H2 check in
@@ -2792,15 +2794,13 @@ async fn handle_h3_request(
                     cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
-                send_h3_error_flavor_aware(
+                crate::http3::websocket::send_h3_error_body(
                     &mut stream,
-                    http_flavor,
                     StatusCode::FORBIDDEN,
                     r#"{"error":"WebSocket Origin not allowed"}"#,
-                    crate::proxy::grpc_proxy::grpc_status::PERMISSION_DENIED,
-                    "WebSocket Origin not allowed",
+                    &initial_response_header_policy_plugins,
                 )
-                .await?;
+                .await;
                 return Ok(());
             }
         }
@@ -2823,6 +2823,7 @@ async fn handle_h3_request(
             Arc::clone(&selected_base_proxy),
             ctx,
             plugins,
+            initial_response_header_policy_plugins,
             backend_admission_plugins,
             plugin_execution_ns,
             upstream_target,
@@ -3034,6 +3035,8 @@ async fn handle_h3_request(
             // non-H3 backends silently skip the response-transform /
             // body-validator / sticky-session phases.
             let client_ip_owned = ctx.client_ip.clone();
+            let initial_response_header_policy_plugins =
+                plugin_cache_view.initial_response_header_policy_plugins();
             crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest {
                 state: &state,
                 epoch: &epoch,
@@ -3064,6 +3067,8 @@ async fn handle_h3_request(
                 xff_append_ip: socket_ip,
                 ctx: &mut ctx,
                 plugins: &plugins,
+                initial_response_header_policy_plugins:
+                    &initial_response_header_policy_plugins,
                 backend_admission_plugins: backend_admission_plugins.as_ref(),
                 preacquired_backend_admission,
                 requires_response_body_buffering: maybe_requires_response_body_buffering,

@@ -348,7 +348,7 @@ Given all built-in plugins enabled, the execution order is:
 | 60 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body |
 | 61 | `ai_federation` | 4060 | before_proxy |
 | 62 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
-| 63 | `security_headers` | 4080 | after_proxy |
+| 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
 | 66 | `stdout_logging` | 9000 | log, on_stream_disconnect |

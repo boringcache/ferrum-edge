@@ -2696,6 +2696,19 @@ Body rules support the same dot-notation features as `request_transformer`: nest
 Adds secure response header defaults and strips common fingerprinting headers
 after the backend response is available. It also runs for plugin rejection
 responses so locally generated errors receive the same response hardening.
+Policy is enforced on the client-visible initial-header boundary for ordinary
+HTTP responses, buffered native gRPC, gRPC-Web binary/text, and HTTP/1.1,
+HTTP/2, and HTTP/3 WebSocket success and gateway-failure handshakes. Native
+gRPC status and application metadata remain trailers; a security policy field
+is reapplied to initial headers rather than promoting a backend trailer value.
+
+Configuration is fail-closed: unknown top-level keys and unknown keys inside
+the `hsts` object reject startup or reload, retaining the last-known-good
+runtime configuration on reload. Header names use the complete HTTP
+field-name token grammar, are limited to 65,535 ASCII bytes, and are
+canonicalized to lowercase. Configured values must pass the same `HeaderValue`
+validation as the downstream H1/H2/H3 response builders: C0 controls other
+than horizontal tab, and DEL, are rejected.
 
 **Priority:** 4080
 
@@ -2707,8 +2720,8 @@ responses so locally generated errors receive the same response hardening.
 | `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, or an object may set `max_age`, `include_subdomains`, and `preload`. |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
-| `set` | object/null | `{}` | Additional headers to set. Values must be strings and header values must not contain CR, LF, or NUL. |
-| `remove` | string[]/null | `["server","x-powered-by"]` | Header names to remove case-insensitively; `null` disables built-in removals. |
+| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar and values must pass downstream HTTP header-value validation. |
+| `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively; `null` disables built-in removals. |
 | `override_existing` | bool | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. |
 
 ```yaml

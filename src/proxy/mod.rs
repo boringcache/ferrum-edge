@@ -8096,6 +8096,69 @@ pub fn try_acquire_websocket_connection_permit(
     }
 }
 
+fn is_websocket_transport_managed_response_header(name: &str) -> bool {
+    // The ordinary backend response strip predicate is lowercase-only because
+    // backend maps are canonical. Plugin rejection maps can retain caller case,
+    // so keep the boundary comparison case-insensitive without allocating a
+    // lowercased copy on every WebSocket handshake.
+    [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "sec-websocket-accept",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-protocol",
+        "sec-websocket-extensions",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+/// Apply deterministic initial-response policy at the WebSocket boundary, then
+/// remove transport-managed fields. Successful handshake builders add their
+/// protocol-required Upgrade / Extended CONNECT metadata after this returns, so
+/// a configured remove or hostile replacement cannot corrupt H1, H2, or H3
+/// handshake semantics. Negotiated subprotocol metadata is likewise added only
+/// from the verified backend handshake.
+pub(crate) fn finalize_websocket_response_headers(
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    response_headers: &mut HashMap<String, String>,
+) {
+    crate::plugins::apply_initial_response_header_policies(
+        initial_response_header_policy_plugins,
+        response_headers,
+    );
+    response_headers
+        .retain(|name, _| !is_websocket_transport_managed_response_header(name));
+}
+
+fn build_websocket_error_response(
+    status: StatusCode,
+    body: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Response<ProxyBody> {
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    finalize_websocket_response_headers(
+        initial_response_header_policy_plugins,
+        &mut response_headers,
+    );
+    headers_mod::apply_response_headers(Response::builder().status(status), &response_headers)
+        .body(ProxyBody::from_string(body))
+        .unwrap_or_else(|_| {
+            Response::new(ProxyBody::from_string(
+                r#"{"error":"Internal server error"}"#,
+            ))
+        })
+}
+
 /// Handle WebSocket requests AFTER authentication and authorization plugins have run.
 ///
 /// Supports both HTTP/1.1 Upgrade (101 Switching Protocols) and HTTP/2 Extended CONNECT
@@ -8110,6 +8173,7 @@ async fn handle_websocket_request_authenticated(
     ctx: RequestContext,
     proxy_headers: HashMap<String, String>,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
     epoch: Arc<RequestEpoch>,
@@ -8174,9 +8238,10 @@ async fn handle_websocket_request_authenticated(
                 current_cb_target_key.as_deref(),
                 cb_is_half_open_probe,
             );
-            return Ok(build_response(
+            return Ok(build_websocket_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"error":"Internal server error during WebSocket upgrade"}"#,
+                &initial_response_header_policy_plugins,
             ));
         }
     };
@@ -8215,9 +8280,10 @@ async fn handle_websocket_request_authenticated(
                     current_cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
-                return Ok(build_response(
+                return Ok(build_websocket_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"WebSocket connection limit exceeded"}"#,
+                    &initial_response_header_policy_plugins,
                 ));
             }
         };
@@ -8333,9 +8399,10 @@ async fn handle_websocket_request_authenticated(
                     current_cb_target_key.as_deref(),
                     ws_cb_probe_slot_available,
                 );
-                return Ok(build_response(
+                return Ok(build_websocket_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"Backend connection limit exceeded"}"#,
+                    &initial_response_header_policy_plugins,
                 ));
             }
         };
@@ -8535,7 +8602,11 @@ async fn handle_websocket_request_authenticated(
                         Some(rc) => rc,
                         None => {
                             let ws_body = r#"{"error":"Backend WebSocket connection failed"}"#;
-                            return Ok(build_response(StatusCode::BAD_GATEWAY, ws_body));
+                            return Ok(build_websocket_error_response(
+                                StatusCode::BAD_GATEWAY,
+                                ws_body,
+                                &initial_response_header_policy_plugins,
+                            ));
                         }
                     };
 
@@ -8770,7 +8841,11 @@ async fn handle_websocket_request_authenticated(
                 }
 
                 let ws_body = r#"{"error":"Backend WebSocket connection failed"}"#;
-                return Ok(build_response(StatusCode::BAD_GATEWAY, ws_body));
+                return Ok(build_websocket_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    ws_body,
+                    &initial_response_header_policy_plugins,
+                ));
             }
         }
     };
@@ -8919,38 +8994,10 @@ async fn handle_websocket_request_authenticated(
 
     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
-    // Build the upgrade response.
-    // HTTP/2 Extended CONNECT (RFC 8441): 200 OK — the H2 stream becomes the WebSocket
-    // transport. No Upgrade/Connection/Sec-WebSocket-Accept headers (those are HTTP/1.1).
-    // HTTP/1.1: 101 Switching Protocols with standard WebSocket handshake headers.
-    let mut ws_resp_builder = if is_h2_websocket {
-        Response::builder().status(StatusCode::OK)
-    } else {
-        Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
-            .header("upgrade", "websocket")
-            .header("connection", "upgrade")
-            .header(
-                "sec-websocket-accept",
-                ws_accept_from_key(
-                    parts
-                        .headers
-                        .get("sec-websocket-key")
-                        .and_then(|k| k.to_str().ok())
-                        .unwrap_or(""),
-                ),
-            )
-    };
-
-    // Forward the backend's negotiated subprotocol (RFC 6455 §11.3.4, RFC
-    // 8441 §5.2). Clients that send `Sec-WebSocket-Protocol` expect the
-    // server to confirm the selected value; dropping it breaks
-    // subprotocol-based dispatch in application code.
-    if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
-        ws_resp_builder = ws_resp_builder.header("sec-websocket-protocol", proto);
-    }
-
-    // Inject sticky session cookie on WebSocket upgrade responses
+    // Assemble gateway-controlled optional fields first so response policy can
+    // intentionally remove/replace them. Transport-managed handshake fields are
+    // added only after policy and reserved-field stripping below.
+    let mut response_headers = HashMap::new();
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
@@ -8968,13 +9015,58 @@ async fn handle_websocket_request_authenticated(
                 .and_then(|u| u.hash_on_cookie_config.as_ref())
                 .unwrap_or(&default_cc);
             let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
-            ws_resp_builder = ws_resp_builder.header("set-cookie", cookie_val);
+            response_headers.insert("set-cookie".to_string(), cookie_val);
         }
+    }
+
+    finalize_websocket_response_headers(
+        &initial_response_header_policy_plugins,
+        &mut response_headers,
+    );
+
+    // Build the upgrade response.
+    // HTTP/2 Extended CONNECT (RFC 8441): 200 OK — the H2 stream becomes the WebSocket
+    // transport. No Upgrade/Connection/Sec-WebSocket-Accept headers (those are HTTP/1.1).
+    // HTTP/1.1: 101 Switching Protocols with standard WebSocket handshake headers.
+    let response_status = if is_h2_websocket {
+        StatusCode::OK
+    } else {
+        StatusCode::SWITCHING_PROTOCOLS
+    };
+    let mut ws_resp_builder = headers_mod::apply_response_headers(
+        Response::builder().status(response_status),
+        &response_headers,
+    );
+    if !is_h2_websocket {
+        ws_resp_builder = ws_resp_builder
+            .header("upgrade", "websocket")
+            .header("connection", "upgrade")
+            .header(
+                "sec-websocket-accept",
+                ws_accept_from_key(
+                    parts
+                        .headers
+                        .get("sec-websocket-key")
+                        .and_then(|k| k.to_str().ok())
+                        .unwrap_or(""),
+                ),
+            );
+    }
+
+    // Forward the backend's negotiated subprotocol (RFC 6455 §11.3.4, RFC
+    // 8441 §5.2). It is appended after response policy so configuration cannot
+    // remove it or fabricate a value the backend did not negotiate.
+    if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
+        ws_resp_builder = ws_resp_builder.header("sec-websocket-protocol", proto);
     }
 
     let upgrade_response = ws_resp_builder
         .body(ProxyBody::empty())
-        .unwrap_or_else(|_| Response::new(ProxyBody::empty()));
+        .unwrap_or_else(|_| {
+            let mut response = Response::new(ProxyBody::empty());
+            *response.status_mut() = response_status;
+            response
+        });
 
     // Collect plugins that opted into per-frame WebSocket hooks. `plugins`
     // was resolved from the request's plugin-cache snapshot, so the upgrade
@@ -15796,6 +15888,8 @@ async fn handle_proxy_request_inner(
     // backend wire protocol is `ws://` or `wss://` depending on scheme.
     // Stream proxies never reach here (the handler only runs for HTTP).
     if request_protocol == ProxyProtocol::WebSocket && proxy.dispatch_kind.is_http_family() {
+        let initial_response_header_policy_plugins =
+            plugin_cache_view.initial_response_header_policy_plugins();
         // Cross-Site WebSocket Hijacking (CSWSH) protection per RFC 6455 §10.2.
         // When allowed_ws_origins is non-empty, reject upgrades from unlisted origins.
         if !proxy.allowed_ws_origins.is_empty() {
@@ -15819,9 +15913,10 @@ async fn handle_proxy_request_inner(
                     cb_is_half_open_probe,
                 );
                 record_request(&state, 403);
-                return Ok(build_response(
+                return Ok(build_websocket_error_response(
                     StatusCode::FORBIDDEN,
                     r#"{"error":"WebSocket Origin not allowed"}"#,
+                    &initial_response_header_policy_plugins,
                 ));
             }
         }
@@ -15833,9 +15928,10 @@ async fn handle_proxy_request_inner(
                     "websocket requests should never be pre-buffered for before_proxy"
                 );
                 record_request(&state, 500);
-                return Ok(build_response(
+                return Ok(build_websocket_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     r#"{"error":"WebSocket request buffering invariant violated"}"#,
+                    &initial_response_header_policy_plugins,
                 ));
             }
         };
@@ -15849,6 +15945,7 @@ async fn handle_proxy_request_inner(
             ctx,
             websocket_proxy_headers,
             plugins,
+            initial_response_header_policy_plugins,
             backend_admission_plugins,
             plugin_execution_ns,
             Arc::clone(&epoch),
@@ -17906,11 +18003,20 @@ async fn handle_proxy_request_inner(
                     // keys are never shadowed, so a malformed duplicate
                     // grpc-status initial header is always stripped here:
                     // status must only appear in the trailers.
-                    for k in response_trailers.keys() {
-                        if !header_shadowed_trailer_keys.contains(k) {
-                            response_headers.remove(k);
-                        }
-                    }
+                    grpc_proxy::strip_non_initial_grpc_trailer_fields(
+                        &mut response_headers,
+                        &response_trailers,
+                        &header_shadowed_trailer_keys,
+                    );
+                    let initial_response_header_policy_plugins =
+                        plugin_cache_view.initial_response_header_policy_plugins();
+                    crate::plugins::apply_initial_response_header_policies(
+                        &initial_response_header_policy_plugins,
+                        &mut response_headers,
+                    );
+                    grpc_proxy::strip_grpc_terminal_metadata_from_initial(
+                        &mut response_headers,
+                    );
                 }
 
                 // Re-home a hook-mutated trailer-only `set-cookie` onto the
