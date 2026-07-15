@@ -1034,10 +1034,7 @@ impl RequestContext {
         plugin: &dyn Plugin,
         response_headers: &mut HashMap<String, String>,
     ) {
-        if let Some(state) = self
-            .buffered_initial_response_header_policy_state
-            .as_mut()
-        {
+        if let Some(state) = self.buffered_initial_response_header_policy_state.as_mut() {
             Arc::make_mut(state).record_after_proxy_plugin(plugin, response_headers);
         }
     }

@@ -1,8 +1,7 @@
 use ferrum_edge::plugins::security_headers::SecurityHeaders;
 use ferrum_edge::plugins::{
     BufferedInitialResponseHeaderPolicyState, Plugin, PluginFailurePolicy, PluginResult,
-    RequestContext,
-    apply_initial_response_header_policies, plugin_failure_policy,
+    RequestContext, apply_initial_response_header_policies, plugin_failure_policy,
 };
 use ferrum_edge::proxy::headers::{append_set_cookie_header, apply_response_headers};
 use http::{Response, Version};

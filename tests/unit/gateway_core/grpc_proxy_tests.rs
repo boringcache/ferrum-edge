@@ -993,7 +993,9 @@ fn buffered_policy_overlay_preserves_transform_owned_content_length() {
         false,
     );
     assert_eq!(
-        transformed_headers.get("content-length").map(String::as_str),
+        transformed_headers
+            .get("content-length")
+            .map(String::as_str),
         Some("73")
     );
     assert_eq!(

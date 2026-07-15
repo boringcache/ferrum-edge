@@ -1649,7 +1649,10 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
             .contains("Upstream concurrency limit reached")
     );
 
-    first_ws.send_close().await.expect("close first H3 WebSocket");
+    first_ws
+        .send_close()
+        .await
+        .expect("close first H3 WebSocket");
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
