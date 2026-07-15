@@ -1307,7 +1307,10 @@ pub(crate) fn validate_istio_telemetry_config(
     metrics: Option<&MeshMetricsConfig>,
 ) -> Result<(), String> {
     if let Some(tracing) = tracing {
-        validate_custom_tags(tracing.custom_tags.clone(), tracing.custom_header_tags.clone())?;
+        validate_custom_tags(
+            tracing.custom_tags.clone(),
+            tracing.custom_header_tags.clone(),
+        )?;
         validate_trace_provider_endpoints(&tracing.providers).map_err(|error| {
             format!("workload_metrics: invalid tracing exporter config: {error}")
         })?;

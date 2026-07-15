@@ -4578,7 +4578,9 @@ fn telemetry(
         .transpose()?;
 
     validate_istio_telemetry_config(tracing.as_ref(), metrics.as_ref()).map_err(|message| {
-        let detail = message.strip_prefix("workload_metrics: ").unwrap_or(&message);
+        let detail = message
+            .strip_prefix("workload_metrics: ")
+            .unwrap_or(&message);
         invalid_resource(
             object,
             format!("Telemetry workload_metrics configuration is invalid: {detail}"),

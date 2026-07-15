@@ -5789,7 +5789,10 @@ async fn workload_metrics_sampling_only_b3_uses_final_transformed_headers() {
     let result = metrics.on_request_received(&mut removed_ctx).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(
-        removed_ctx.metadata.get("trace_sampled").map(String::as_str),
+        removed_ctx
+            .metadata
+            .get("trace_sampled")
+            .map(String::as_str),
         Some("true")
     );
     let remover = trace_header_remover("b3");
@@ -5822,7 +5825,10 @@ async fn workload_metrics_sampling_only_b3_uses_final_transformed_headers() {
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(
-        flipped_ctx.metadata.get("trace_sampled").map(String::as_str),
+        flipped_ctx
+            .metadata
+            .get("trace_sampled")
+            .map(String::as_str),
         Some("false")
     );
     assert!(!flipped_ctx.metadata.contains_key("trace_id"));
@@ -5837,9 +5843,7 @@ async fn workload_metrics_sampling_only_b3_uses_final_transformed_headers() {
     );
     let adder = trace_header_adder("x-b3-sampled", "0");
     let mut added_headers = added_ctx.headers.clone();
-    let result = adder
-        .before_proxy(&mut added_ctx, &mut added_headers)
-        .await;
+    let result = adder.before_proxy(&mut added_ctx, &mut added_headers).await;
     assert!(matches!(result, PluginResult::Continue));
     let result = metrics
         .before_proxy(&mut added_ctx, &mut added_headers)

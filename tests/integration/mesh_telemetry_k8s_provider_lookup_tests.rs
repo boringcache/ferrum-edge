@@ -589,10 +589,7 @@ async fn k8s_telemetry_header_default_is_fallback_and_present_header_wins() {
         Some("unknown")
     );
     assert_eq!(
-        tracing
-            .custom_header_tags
-            .get("tenant")
-            .map(String::as_str),
+        tracing.custom_header_tags.get("tenant").map(String::as_str),
         Some("x-tenant")
     );
 
@@ -606,7 +603,9 @@ async fn k8s_telemetry_header_default_is_fallback_and_present_header_wins() {
         RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
     let mut absent_headers = HashMap::new();
     assert!(matches!(
-        plugin.before_proxy(&mut absent_ctx, &mut absent_headers).await,
+        plugin
+            .before_proxy(&mut absent_ctx, &mut absent_headers)
+            .await,
         PluginResult::Continue
     ));
     assert_eq!(
@@ -618,7 +617,9 @@ async fn k8s_telemetry_header_default_is_fallback_and_present_header_wins() {
         RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
     let mut present_headers = HashMap::from([("x-tenant".to_string(), "acme".to_string())]);
     assert!(matches!(
-        plugin.before_proxy(&mut present_ctx, &mut present_headers).await,
+        plugin
+            .before_proxy(&mut present_ctx, &mut present_headers)
+            .await,
         PluginResult::Continue
     ));
     assert_eq!(
@@ -639,12 +640,9 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
             (format!("tag_{index}"), tag)
         })
         .collect::<serde_json::Map<String, Value>>();
-    let too_long_custom_tag_name = [(
-        "x".repeat(129),
-        json!({"literal": {"value": "v"}}),
-    )]
-    .into_iter()
-    .collect::<serde_json::Map<String, Value>>();
+    let too_long_custom_tag_name = [("x".repeat(129), json!({"literal": {"value": "v"}}))]
+        .into_iter()
+        .collect::<serde_json::Map<String, Value>>();
     let oversized_custom_tag_value = "x".repeat(1025);
     let oversized_metric_literal =
         serde_json::to_string(&"x".repeat(257)).expect("serialize metric literal");
