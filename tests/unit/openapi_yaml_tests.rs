@@ -1381,6 +1381,99 @@ fn assert_component_validity(
 }
 
 #[test]
+fn workload_metrics_schema_documents_runtime_tag_limits() {
+    use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let properties = spec
+        .pointer("/components/schemas/WorkloadMetricsConfig/properties")
+        .expect("WorkloadMetricsConfig properties exist");
+
+    for field in ["custom_tags", "custom_header_tags"] {
+        assert_eq!(properties[field]["maxProperties"], json!(32));
+        let description = properties[field]["description"]
+            .as_str()
+            .expect("custom tag description");
+        assert!(
+            description.contains("32 distinct tag names combined"),
+            "{field} must document the combined runtime cap"
+        );
+    }
+
+    let operation_value = properties
+        .pointer("/metrics/properties/tag_overrides/items/properties/operation/properties/value")
+        .expect("metric set operation value schema exists");
+    assert_eq!(operation_value["maxLength"], json!(256));
+    let value_description = operation_value["description"]
+        .as_str()
+        .expect("metric value description");
+    assert!(value_description.contains("256 UTF-8 bytes"));
+    assert!(value_description.contains("counts Unicode characters"));
+
+    let ascii_256 = "x".repeat(256);
+    let ascii_257 = "x".repeat(257);
+    let metric_config = |value: &str| {
+        json!({
+            "metrics": {
+                "tag_overrides": [{
+                    "name": "source_workload",
+                    "operation": {"type": "set", "value": value}
+                }]
+            }
+        })
+    };
+    assert_component_validity(
+        &spec,
+        "WorkloadMetricsConfig",
+        &metric_config(&ascii_256),
+        true,
+    );
+    assert!(WorkloadMetrics::new(&metric_config(&ascii_256)).is_ok());
+    assert_component_validity(
+        &spec,
+        "WorkloadMetricsConfig",
+        &metric_config(&ascii_257),
+        false,
+    );
+    assert!(WorkloadMetrics::new(&metric_config(&ascii_257)).is_err());
+
+    // JSON Schema maxLength counts characters, whereas runtime admission is
+    // deliberately stricter for multibyte input and counts encoded bytes.
+    let multibyte_over_256_bytes = "é".repeat(129);
+    assert_component_validity(
+        &spec,
+        "WorkloadMetricsConfig",
+        &metric_config(&multibyte_over_256_bytes),
+        true,
+    );
+    assert!(WorkloadMetrics::new(&metric_config(&multibyte_over_256_bytes)).is_err());
+
+    let custom_tags: serde_json::Map<String, serde_json::Value> = (0..16)
+        .map(|index| (format!("literal_{index}"), json!("value")))
+        .collect();
+    let custom_header_tags: serde_json::Map<String, serde_json::Value> = (0..16)
+        .map(|index| (format!("header_{index}"), json!("x-tag")))
+        .collect();
+    let combined_32 = json!({
+        "custom_tags": custom_tags,
+        "custom_header_tags": custom_header_tags,
+    });
+    assert_component_validity(&spec, "WorkloadMetricsConfig", &combined_32, true);
+    assert!(WorkloadMetrics::new(&combined_32).is_ok());
+
+    let mut combined_33 = combined_32;
+    combined_33["custom_header_tags"]
+        .as_object_mut()
+        .expect("custom_header_tags object")
+        .insert("header_16".to_string(), json!("x-tag"));
+    // The per-map OpenAPI bounds cannot express a sum across two objects; the
+    // property descriptions carry that contract and runtime rejects the union.
+    assert_component_validity(&spec, "WorkloadMetricsConfig", &combined_33, true);
+    assert!(WorkloadMetrics::new(&combined_33).is_err());
+}
+
+#[test]
 fn opa_schema_matches_runtime_validation_contract() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

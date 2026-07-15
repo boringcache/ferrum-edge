@@ -12689,6 +12689,11 @@ components:
         Auto-injected by mesh mode on every applicable topology; reserved
         plugin id `__mesh_workload_metrics`. Standalone use is supported on
         non-mesh gateways that want Istio-style workload labels in logs.
+
+        Runtime admission permits at most 32 distinct custom tag names across
+        `custom_tags` and `custom_header_tags` combined. The individual
+        `maxProperties: 32` bounds remain for generated clients, but the
+        cross-property combined total cannot be expressed mechanically.
       properties:
         node_id:
           type: string
@@ -12732,14 +12737,27 @@ components:
           description: Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD).
         custom_tags:
           type: object
+          maxProperties: 32
           additionalProperties:
             type: string
-          description: Custom tags injected into every transaction's metadata.
+            maxLength: 1024
+          description: |
+            Custom tags injected into transaction metadata and exported spans.
+            Names are limited to 128 ASCII letters, digits, `.`, `_`, or `-`
+            and cannot collide with reserved, sensitive, `mesh.*`, trace, or
+            authorization keys. This map and `custom_header_tags` may contain
+            at most 32 distinct tag names combined.
         custom_header_tags:
           type: object
+          maxProperties: 32
           additionalProperties:
             type: string
-          description: Custom tags populated from request headers (`tag_name -> header_name`).
+          description: |
+            Custom tags populated from request headers (`tag_name ->
+            header_name`). Credential-bearing source headers and reserved or
+            sensitive destination names are rejected; runtime values over 1024
+            bytes are omitted. This map and `custom_tags` may contain at most
+            32 distinct tag names combined.
         metrics:
           type: object
           description: |
@@ -12752,9 +12770,20 @@ components:
                 type: object
                 required: [name, operation]
                 properties:
+                  metric:
+                    type: string
+                    description: |
+                      Metric family targeted by this override. Supported values
+                      are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum
+                      metric names, and `ALL_METRICS`; omitted means all metrics.
+                      Recognized Istio standard families Ferrum does not emit
+                      are accepted and ignored with a bounded construction-time
+                      warning; unknown families remain configuration errors.
                   name:
                     type: string
-                    description: Tag name to override.
+                    description: |
+                      Tag name to override. Accepts Istio names such as
+                      `source_workload` and Ferrum `mesh.*` label names.
                   operation:
                     type: object
                     required: [type]
@@ -12771,13 +12800,24 @@ components:
                         description: Replacement tag name when `type` is `rename`.
                       value:
                         type: string
-                        description: Replacement tag value when `type` is `set`.
+                        maxLength: 256
+                        description: |
+                          Replacement tag value when `type` is `set`. OpenAPI
+                          `maxLength` counts Unicode characters; runtime
+                          admission separately enforces at most 256 UTF-8 bytes,
+                          so multibyte values may be rejected below 256
+                          characters.
               description: Per-metric tag overrides translated from the Istio Telemetry CRD.
             disabled_metrics:
               type: array
               items:
                 type: string
-              description: Names of metrics suppressed by this workload (Istio Telemetry CRD).
+              description: |
+                Names of metrics suppressed by this workload. Supported values
+                are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum metric
+                names, and `ALL_METRICS`. Recognized Istio standard families
+                Ferrum does not emit are accepted and ignored with a bounded
+                construction-time warning; unknown families remain errors.
         tracing_providers:
           type: array
           items:

@@ -876,7 +876,9 @@ pub struct MeshTracingConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub disable_span_reporting: Option<bool>,
-    /// Literal/environment custom tags injected into every span / transaction metadata.
+    /// Literal custom tags and environment-tag `defaultValue`s injected into
+    /// every span / transaction metadata. Process environment values are never
+    /// resolved from this configuration.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_tags: HashMap<String, String>,
     /// Custom tags resolved from request headers at runtime.
@@ -999,6 +1001,10 @@ pub struct MeshMetricsConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricTagOverride {
+    /// Metric family this override targets. `None` applies to every supported
+    /// mesh metric for direct/native configurations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
     pub name: String,
     pub operation: TagOverrideOperation,
 }
