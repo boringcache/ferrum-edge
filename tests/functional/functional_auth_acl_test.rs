@@ -305,9 +305,15 @@ async fn send_h2_hmac_request(
     }
     let response = response.await.expect("receive H2 HMAC response");
     let status = response.status().as_u16();
-    let mut response_body = response.into_body();
-    while let Some(data) = response_body.data().await {
-        data.expect("read H2 HMAC response DATA");
+    // HEAD may legally advertise the corresponding GET payload length while
+    // sending no DATA. The low-level h2 client does not apply Hyper's
+    // method-aware response-body semantics, so driving its generic body
+    // validator can turn that valid response into a local PROTOCOL_ERROR.
+    if method != "HEAD" {
+        let mut response_body = response.into_body();
+        while let Some(data) = response_body.data().await {
+            data.expect("read H2 HMAC response DATA");
+        }
     }
     drop(sender);
     connection_task.abort();
