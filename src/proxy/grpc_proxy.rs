@@ -3412,7 +3412,8 @@ mod tests {
             "backend_read_timeout_ms must start after connection acquisition"
         );
         assert!(
-            body.contains("let shared_response_deadline = response_deadline_at"),
+            body.contains("let shared_response_deadline =")
+                && body.contains("response_deadline_at.map(|deadline|"),
             "one effective response deadline must be shared by response phases"
         );
         let timeout_at = body.matches("tokio::time::timeout_at(").count();
