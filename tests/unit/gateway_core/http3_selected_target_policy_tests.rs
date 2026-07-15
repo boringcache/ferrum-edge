@@ -1,4 +1,26 @@
 #[test]
+fn h3_terminal_final_body_dispatch_precedes_backend_selection_and_breaker() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let terminal_gate = source
+        .find("if final_body_before_backend_dispatch {")
+        .expect("H3 terminal final-body dispatch gate must remain present");
+    let selection = source[terminal_gate..]
+        .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .map(|offset| terminal_gate + offset)
+        .expect("H3 backend selection must remain present");
+    let breaker = source[selection..]
+        .find("check_circuit_breaker(")
+        .map(|offset| selection + offset)
+        .expect("H3 backend circuit-breaker gate must remain present");
+    let terminal_path = &source[terminal_gate..selection];
+
+    assert!(terminal_path.contains("run_final_request_body_hooks("));
+    assert!(terminal_path.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
+    assert!(terminal_gate < selection);
+    assert!(selection < breaker);
+}
+
+#[test]
 fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
     let source = include_str!("../../../src/http3/server.rs");
     let selection = source

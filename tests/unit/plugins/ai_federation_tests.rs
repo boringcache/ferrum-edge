@@ -724,6 +724,41 @@ fn test_translate_openai_compatible() {
 }
 
 #[test]
+fn openai_compatible_tool_arguments_are_canonicalized_before_dispatch() {
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "Weather?"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_weather",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": "{\"city\":\"Paris\",\"city\":\"London\"}"
+                    }
+                }]
+            }
+        ]
+    });
+
+    let (_, _, body_bytes) =
+        test_helpers::translate_request_test("openai", &body, "gpt-4o", &json!({})).unwrap();
+    let translated: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let arguments = translated["messages"][1]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+
+    assert_eq!(arguments, r#"{"city":"London"}"#);
+    assert_eq!(
+        serde_json::from_str::<Value>(arguments).unwrap(),
+        json!({"city": "London"})
+    );
+}
+
+#[test]
 fn test_translate_azure_openai() {
     let body = sample_openai_request();
     let provider_config = json!({

@@ -2279,6 +2279,7 @@ fn translate_openai_compatible(
     } else {
         openai_body.clone()
     };
+    canonicalize_openai_tool_arguments(&mut body)?;
     body["model"] = Value::String(resolved_model.to_string());
 
     // For Azure, strip the model field — the deployment is in the URL
@@ -2293,6 +2294,55 @@ fn translate_openai_compatible(
     let body_bytes = serialize_translated_request(&body, "OpenAI-compatible")?;
 
     Ok((url, headers, body_bytes))
+}
+
+/// Replace assistant tool-call argument strings with the JSON object Ferrum
+/// actually validated. This prevents duplicate object keys (or other alternate
+/// JSON spellings) from being interpreted one way by gateway policy and another
+/// way by an OpenAI-compatible provider.
+fn canonicalize_openai_tool_arguments(body: &mut Value) -> Result<(), String> {
+    let messages = body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .ok_or("ai_federation: request missing 'messages' array")?;
+
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant")
+            || message.get("tool_calls").is_none()
+        {
+            continue;
+        }
+
+        let parsed_calls = parse_openai_tool_calls(message, message_index)?;
+        let tool_calls = message
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                format!(
+                    "ai_federation: messages[{message_index}].tool_calls must be an array"
+                )
+            })?;
+        for (tool_index, (tool_call, parsed)) in
+            tool_calls.iter_mut().zip(parsed_calls).enumerate()
+        {
+            let function = tool_call
+                .get_mut("function")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    format!(
+                        "ai_federation: messages[{message_index}].tool_calls[{tool_index}] missing function"
+                    )
+                })?;
+            let arguments = serde_json::to_string(&parsed.arguments).map_err(|error| {
+                format!(
+                    "ai_federation: messages[{message_index}].tool_calls[{tool_index}] arguments could not be canonicalized: {error}"
+                )
+            })?;
+            function.insert("arguments".to_string(), Value::String(arguments));
+        }
+    }
+
+    Ok(())
 }
 
 /// OpenAI chat-completions messages accept `content` as either a plain

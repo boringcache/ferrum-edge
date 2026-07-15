@@ -2194,8 +2194,165 @@ async fn handle_h3_request(
     let reevaluate_response_policy_after_request_body = matches!(http_flavor, HttpFlavor::Plain)
         && plugin_needs_request_buffering
         && (maybe_requires_response_body_buffering || stream_hooks_enabled);
+    // Provider-dispatch plugins synthesize the complete response from the
+    // finalized request body. As on H1/H2, their hook owns dispatch and must
+    // run before the placeholder backend's target selection, breaker,
+    // admission, egress, pool, and TLS work. The capability is precomputed at
+    // reload, so ordinary H3 requests pay only this bit check.
+    let final_body_before_backend_dispatch = plugin_needs_request_buffering
+        && capabilities.has(
+            crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH,
+        );
     let mut request_body_prepared = false;
     let mut prepared_raw_request_body_bytes: Option<u64> = None;
+
+    if final_body_before_backend_dispatch {
+        let body_was_prebuffered = prebuffered_body_data.is_some();
+        let mut body_data = prebuffered_body_data.take().unwrap_or_default();
+        if !body_was_prebuffered {
+            let collect = async {
+                while let Some(chunk) = stream.recv_data().await? {
+                    let bytes = chunk.chunk();
+                    if content_length_limit > 0
+                        && body_data.len().saturating_add(bytes.len()) > content_length_limit
+                    {
+                        return Ok::<_, h3::error::StreamError>(false);
+                    }
+                    body_data.extend_from_slice(bytes);
+                }
+                Ok(true)
+            };
+            match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    let metric_status = h3_reject_log_status_and_metadata(
+                        &mut ctx,
+                        http_flavor,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        br#"{"error":"Request body exceeds maximum size"}"#,
+                        &HashMap::new(),
+                    );
+                    record_request(&state, metric_status);
+                    send_h3_error_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                        crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                        "Request body exceeds maximum size",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
+                Err(H3RequestBodyReadError::TimedOut) => {
+                    record_request(
+                        &state,
+                        if matches!(http_flavor, HttpFlavor::Grpc) {
+                            StatusCode::OK.as_u16()
+                        } else {
+                            StatusCode::REQUEST_TIMEOUT.as_u16()
+                        },
+                    );
+                    send_h3_error_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::REQUEST_TIMEOUT,
+                        r#"{"error":"Request body read timed out"}"#,
+                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                        "Request body read timed out",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let raw_request_body_bytes = body_data.len() as u64;
+        prepared_raw_request_body_bytes = Some(raw_request_body_bytes);
+        ctx.bytes_sent_observed
+            .fetch_max(raw_request_body_bytes, std::sync::atomic::Ordering::Release);
+
+        let mut hook_headers = proxy_headers.clone();
+        hook_headers
+            .entry(":method".to_string())
+            .or_insert_with(|| method.clone());
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            &plugins,
+            Some(&mut ctx),
+            &hook_headers,
+            body_data,
+        )
+        .await;
+        match crate::proxy::run_final_request_body_hooks(
+            &plugins,
+            Some(&mut ctx),
+            &hook_headers,
+            &transformed,
+        )
+        .await
+        {
+            PluginResult::Continue => {
+                prebuffered_body_data = Some(transformed);
+                request_body_prepared = true;
+            }
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
+                    record_request(&state, 500);
+                    send_h3_reject_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let mut headers = reject.headers;
+                crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut reject.status_code,
+                    &mut headers,
+                    &mut reject.body,
+                    matches!(http_flavor, HttpFlavor::Grpc),
+                    true,
+                )
+                .await;
+                let http_status =
+                    StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_REQUEST);
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    http_status,
+                    &reject.body,
+                    &headers,
+                );
+                record_request(&state, log_status_code);
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    "on_final_request_body",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                send_h3_reject_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    http_status,
+                    &reject.body,
+                    &headers,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
 
     // --- Upstream target selection and circuit breaker ---
     // DestinationRule-derived HTTP connectionPool/TLS knobs are projected below
@@ -2330,9 +2487,11 @@ async fn handle_h3_request(
             }
         };
 
-    // Preserve fail-fast breaker behavior: only drain/transform an H3 request
-    // body after the selected target's breaker admits it. Every local failure
-    // below releases a HALF_OPEN probe before writing the client response.
+    // Preserve fail-fast breaker behavior for ordinary request-body plugins:
+    // only drain/transform their H3 body after the selected target's breaker
+    // admits it. Terminal provider dispatch above intentionally precedes that
+    // backend-only gate. Every local failure below releases a HALF_OPEN probe
+    // before writing the client response.
     let preparation_backend_host = upstream_target
         .as_deref()
         .map(|target| target.host.as_str())
@@ -2356,7 +2515,10 @@ async fn handle_h3_request(
             upstream_target.as_deref(),
         )
         .is_some();
-    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
+    if reevaluate_response_policy_after_request_body
+        && !request_body_prepared
+        && !preparation_blocked_by_dispatch_policy
+    {
         if !backend_admission_plugins.is_empty() {
             let permits = match run_h3_backend_admission_or_send_reject(
                 backend_admission_plugins.as_ref(),

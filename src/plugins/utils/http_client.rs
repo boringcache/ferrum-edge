@@ -744,7 +744,16 @@ impl PluginHttpClient {
                 let error_class = classify_reqwest_error(&error);
                 PluginHttpFailure {
                     error_class,
-                    request_reached_wire: crate::retry::request_reached_wire(error_class),
+                    // `DispatchPolicyRejected` is intentionally treated as a
+                    // post-wire class by the backend retry machinery so a
+                    // terminal route policy rejection is never amplified.
+                    // Here the caller needs the literal provider-I/O boundary:
+                    // a DnsCacheResolver egress denial happens before any dial,
+                    // so a non-idempotent provider request remains safe to send
+                    // to a configured fallback.
+                    request_reached_wire: error_class
+                        != crate::retry::ErrorClass::DispatchPolicyRejected
+                        && crate::retry::request_reached_wire(error_class),
                 }
             })
     }
