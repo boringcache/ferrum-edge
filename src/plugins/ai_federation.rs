@@ -4724,8 +4724,7 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: final body is empty or non-UTF-8, passing through by explicit opt-in"
                 );
-                ctx.metadata
-                    .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+                ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
         };
@@ -4746,8 +4745,7 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: request body is not valid JSON, passing through by explicit opt-in: {e}"
                 );
-                ctx.metadata
-                    .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+                ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
         };
@@ -4769,8 +4767,7 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: request has non-string 'model' field, passing through by explicit opt-in"
                 );
-                ctx.metadata
-                    .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+                ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
             None => {
@@ -4787,8 +4784,7 @@ impl Plugin for AiFederation {
                 debug!(
                     "ai_federation: request missing 'model' field, passing through by explicit opt-in"
                 );
-                ctx.metadata
-                    .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+                ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                 return PluginResult::Continue;
             }
         };
@@ -4823,8 +4819,7 @@ impl Plugin for AiFederation {
                 model = %model,
                 "ai_federation: no provider matches model, passing through by explicit opt-in"
             );
-            ctx.metadata
-                .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+            ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
             return PluginResult::Continue;
         }
 
@@ -5073,8 +5068,7 @@ impl Plugin for AiFederation {
                     // internal marker only after the final client-visible
                     // response is committed and publishes a non-replayable
                     // tombstone for an idempotency-key retry.
-                    ctx.metadata
-                        .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+                    ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                     ctx.metadata.insert(
                         EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
                         "true".to_string(),
@@ -5088,8 +5082,7 @@ impl Plugin for AiFederation {
                         // Both must suppress an independent client retry under
                         // the same idempotency key even when provider fallback
                         // itself is disabled.
-                        ctx.metadata
-                            .remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
+                        ctx.metadata.remove(RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY);
                         ctx.metadata.insert(
                             EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
                             "true".to_string(),
@@ -5176,10 +5169,8 @@ impl Plugin for AiFederation {
             // `ai_rate_limiter` must treat a usage-less provider 2xx followed by
             // a synthetic 502 as an unmetered provider success, not as a free
             // gateway rejection that releases the pre-reservation.
-            ctx.metadata.insert(
-                "ai_federation_provider".to_string(),
-                provider.name.clone(),
-            );
+            ctx.metadata
+                .insert("ai_federation_provider".to_string(), provider.name.clone());
             ctx.metadata
                 .insert("ai_federation_status".to_string(), status.to_string());
             if self.fallback_status_codes.contains(&status) {
