@@ -36,9 +36,7 @@ fn h3_final_body_rejects_use_complete_synthetic_response_pipeline() {
         .expect("H3 terminal final-body dispatch gate must remain present");
     let applicability = &src[request_scoped_gate..early_dispatch];
     assert!(applicability.contains("plugin.should_buffer_request_body(&ctx)"));
-    assert!(
-        applicability.contains("plugin.requires_final_request_body_before_backend_dispatch()")
-    );
+    assert!(applicability.contains("plugin.requires_final_request_body_before_backend_dispatch()"));
 
     let early_start = src
         .find("let raw_request_body_bytes = body_data.len() as u64;")

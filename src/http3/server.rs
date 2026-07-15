@@ -1813,8 +1813,8 @@ async fn handle_h3_request(
         allows_request_body_buffering && maybe_needs_request_buffering;
     let has_terminal_body_dispatch = capabilities
         .has(crate::plugin_cache::PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH);
-    let has_contextual_final_body_hook = capabilities
-        .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
+    let has_contextual_final_body_hook =
+        capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
     let (
         plugin_needs_request_buffering,
         final_body_before_backend_dispatch,
@@ -1828,8 +1828,7 @@ async fn handle_h3_request(
         for plugin in plugins.iter() {
             if plugin.should_buffer_request_body(&ctx) {
                 needs_buffering = true;
-                terminal_dispatch |=
-                    plugin.requires_final_request_body_before_backend_dispatch();
+                terminal_dispatch |= plugin.requires_final_request_body_before_backend_dispatch();
                 needs_final_context |= plugin.needs_final_request_body_context();
             }
         }

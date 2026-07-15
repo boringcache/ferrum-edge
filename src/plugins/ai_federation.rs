@@ -2100,16 +2100,12 @@ fn parse_provider_tool_calls<'a>(
 
     let mut parsed = Vec::with_capacity(tool_calls.len());
     for (tool_index, call) in tool_calls.iter().enumerate() {
-        let scope = format!(
-            "{provider} choices[{choice_index}].message.tool_calls[{tool_index}]"
-        );
+        let scope = format!("{provider} choices[{choice_index}].message.tool_calls[{tool_index}]");
         let call = call
             .as_object()
             .ok_or_else(|| format!("ai_federation: {scope} must be an object"))?;
         if call.get("type").and_then(Value::as_str) != Some("function") {
-            return Err(format!(
-                "ai_federation: {scope} must have type 'function'"
-            ));
+            return Err(format!("ai_federation: {scope} must have type 'function'"));
         }
         let id = call
             .get("id")
@@ -4202,17 +4198,10 @@ fn gemini_prompt_is_blocked(resp: &Value) -> Result<bool, String> {
     };
     match reason.as_str() {
         Some(
-            "SAFETY"
-            | "BLOCKLIST"
-            | "PROHIBITED_CONTENT"
-            | "IMAGE_SAFETY"
-            | "JAILBREAK"
-            | "OTHER",
+            "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "IMAGE_SAFETY" | "JAILBREAK" | "OTHER",
         ) => Ok(true),
         Some("BLOCK_REASON_UNSPECIFIED") => Ok(false),
-        _ => Err(
-            "ai_federation: Gemini promptFeedback has an unsupported blockReason".to_string(),
-        ),
+        _ => Err("ai_federation: Gemini promptFeedback has an unsupported blockReason".to_string()),
     }
 }
 
