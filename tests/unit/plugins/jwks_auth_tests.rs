@@ -1604,7 +1604,10 @@ async fn first_accepted_jwks_instance_owns_identity_and_claim_headers() {
         Some("first@example.com")
     );
     assert!(!headers.contains_key("x-jwt-a"));
-    assert!(!headers.contains_key("x-jwt-b"));
+    assert!(
+        headers.contains_key("x-jwt-b"),
+        "single auth must stop before the later plugin stages credential cleanup"
+    );
 }
 
 #[test]

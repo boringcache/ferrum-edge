@@ -386,6 +386,7 @@ async fn oidc_single_auth_scope_rejection_returns_rotated_refresh_cookie() {
         &plugin,
         json!({
             "sub": "oidc-subject",
+            "email": "rejected@example.test",
             "scope": "viewer",
             "exp": now + 3600
         }),
@@ -443,6 +444,7 @@ async fn oidc_scope_rejection_persists_refresh_failure_backoff() {
         &plugin,
         json!({
             "sub": "oidc-subject",
+            "email": "rejected@example.test",
             "scope": "viewer",
             "exp": now + 3600
         }),

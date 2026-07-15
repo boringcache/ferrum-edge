@@ -23,7 +23,9 @@ use super::utils::claim_header_fanout::{
     ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
     parse_claim_headers, parse_separator,
 };
-use super::utils::claim_resolver::{extract_claim_string, parse_claim_path_value};
+use super::utils::claim_resolver::{
+    extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
+};
 use super::utils::dpop::{self, DpopJtiCache, DpopVerifyInput};
 use super::utils::jwks_cache::{
     DiscoveryStoreCandidate, get_or_create_jwks_store, last_discovered_jwks_uri,
@@ -530,7 +532,8 @@ impl JwksAuth {
         let header_value = if effective_header_claim == effective_identity_claim {
             identity.clone()
         } else {
-            extract_claim_string(claims, effective_header_claim).or_else(|| identity.clone())
+            extract_claim_string_exact(claims, effective_header_claim)
+                .or_else(|| identity.clone())
         };
 
         let consumer = if let Some(ref id) = identity {

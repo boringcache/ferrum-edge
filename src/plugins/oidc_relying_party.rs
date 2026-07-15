@@ -29,7 +29,7 @@ use super::utils::claim_header_fanout::{
     ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
     parse_claim_headers,
 };
-use super::utils::claim_resolver::extract_claim_string;
+use super::utils::claim_resolver::{extract_claim_string, extract_claim_string_exact};
 use super::utils::jwks_cache::get_or_create_jwks_store;
 use super::utils::jwks_store::JwksKeyStore;
 use super::utils::jwt_verifier::{JwtVerifyParams, verify_jwt_with_jwks};
@@ -1395,7 +1395,7 @@ impl OidcRelyingParty {
         {
             identity.clone()
         } else {
-            extract_claim_string(claims, &self.provider.consumer_header_claim)
+            extract_claim_string_exact(claims, &self.provider.consumer_header_claim)
                 .or_else(|| identity.clone())
         };
         let consumer = identity

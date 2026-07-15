@@ -27,7 +27,9 @@ use super::utils::claim_header_fanout::{
     ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
     parse_claim_headers,
 };
-use super::utils::claim_resolver::{extract_claim_string, parse_claim_path_value};
+use super::utils::claim_resolver::{
+    extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
+};
 use super::utils::introspection_cache::{CacheLookup, IntrospectionCache, TokenKey};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
@@ -765,7 +767,7 @@ impl Oauth2Introspection {
         let header_value = if header_claim == identity_claim {
             identity.clone()
         } else {
-            extract_claim_string(claims, header_claim).or_else(|| identity.clone())
+            extract_claim_string_exact(claims, header_claim).or_else(|| identity.clone())
         };
         let consumer = identity
             .as_deref()
