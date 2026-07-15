@@ -670,23 +670,28 @@ struct AdaptiveConcurrencyRouteKey {
     scope: String,
     host: Option<String>,
     port: Option<u16>,
-    subset: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct AdaptiveConcurrencyRouteOverride {
     proxy_id: String,
-    namespace: String,
-    plugin_config_id: String,
     plugin_name: String,
-    config: serde_json::Value,
+    effective_priority: u16,
+    destination_fingerprint: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AdaptiveConcurrencyUpstreamRoute {
+    scope: String,
+    upstream_id: String,
+    subset: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct AdaptiveConcurrencyRouteDefinition {
     keys: Vec<AdaptiveConcurrencyRouteKey>,
     overrides: Vec<AdaptiveConcurrencyRouteOverride>,
-    upstream_ids: HashSet<String>,
+    upstream_routes: Vec<AdaptiveConcurrencyUpstreamRoute>,
 }
 
 #[derive(Clone)]
@@ -762,21 +767,484 @@ fn plugin_config_effectively_applies_to_proxy(
     }
 }
 
-fn collect_upstream_ids(value: &serde_json::Value, upstream_ids: &mut HashSet<String>) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, value) in object {
-                if key == "upstream_id"
-                    && let Some(upstream_id) = value.as_str()
+fn adaptive_concurrency_scope(
+    key_by: AdaptiveConcurrencyKeyBy,
+    proxy: &crate::config::types::Proxy,
+    upstream_id: Option<&str>,
+) -> String {
+    match key_by {
+        AdaptiveConcurrencyKeyBy::Proxy => format!("proxy:{}:{}", proxy.namespace, proxy.id),
+        AdaptiveConcurrencyKeyBy::Upstream => upstream_id
+            .map(|upstream_id| format!("upstream:{}:{upstream_id}", proxy.namespace))
+            .unwrap_or_else(|| format!("proxy:{}:{}", proxy.namespace, proxy.id)),
+        AdaptiveConcurrencyKeyBy::Backend => "backend".to_string(),
+    }
+}
+
+fn target_matches_subset(
+    upstream: &crate::config::types::Upstream,
+    target: &crate::config::types::UpstreamTarget,
+    subset_name: Option<&str>,
+) -> bool {
+    let Some(subset_name) = subset_name else {
+        return true;
+    };
+    upstream
+        .subsets
+        .as_ref()
+        .and_then(|subsets| subsets.iter().find(|subset| subset.name == subset_name))
+        .is_some_and(|subset| {
+            subset
+                .labels
+                .iter()
+                .all(|(key, value)| target.tags.get(key) == Some(value))
+        })
+}
+
+fn push_upstream_route(
+    keys: &mut Vec<AdaptiveConcurrencyRouteKey>,
+    upstream_routes: &mut Vec<AdaptiveConcurrencyUpstreamRoute>,
+    scope: String,
+    upstream_id: &str,
+    subset: Option<&str>,
+    upstream: Option<&crate::config::types::Upstream>,
+) {
+    upstream_routes.push(AdaptiveConcurrencyUpstreamRoute {
+        scope: scope.clone(),
+        upstream_id: upstream_id.to_string(),
+        subset: subset.map(ToOwned::to_owned),
+    });
+    let key_count = keys.len();
+    if let Some(upstream) = upstream {
+        keys.extend(
+            upstream
+                .targets
+                .iter()
+                .filter(|target| target_matches_subset(upstream, target, subset))
+                .map(|target| AdaptiveConcurrencyRouteKey {
+                    scope: scope.clone(),
+                    host: Some(target.host.clone()),
+                    port: Some(target.port),
+                }),
+        );
+    }
+    if keys.len() == key_count {
+        // Preserve the route source while service discovery has no effective
+        // target for this upstream/subset.
+        keys.push(AdaptiveConcurrencyRouteKey {
+            scope,
+            host: None,
+            port: None,
+        });
+    }
+}
+
+fn push_direct_route_key(
+    keys: &mut Vec<AdaptiveConcurrencyRouteKey>,
+    key_by: AdaptiveConcurrencyKeyBy,
+    proxy: &crate::config::types::Proxy,
+    host: &str,
+    port: u16,
+) {
+    keys.push(AdaptiveConcurrencyRouteKey {
+        scope: adaptive_concurrency_scope(key_by, proxy, None),
+        host: Some(host.trim().to_ascii_lowercase()),
+        port: Some(port),
+    });
+}
+
+fn route_override_priority(pc: &PluginConfig) -> u16 {
+    pc.priority_override.unwrap_or(match pc.plugin_name.as_str() {
+        "ai_stream_router" => crate::plugins::priority::AI_STREAM_ROUTER,
+        "mcp_gateway" => crate::plugins::priority::MCP_GATEWAY,
+        "mesh_route_dispatch" => crate::plugins::priority::MESH_ROUTE_DISPATCH,
+        _ => crate::plugins::priority::DEFAULT,
+    })
+}
+
+fn effective_route_override_configs_for_proxy<'a>(
+    proxy: &crate::config::types::Proxy,
+    config: &'a GatewayConfig,
+) -> Vec<&'a PluginConfig> {
+    const ROUTE_OVERRIDE_PLUGINS: &[&str] =
+        &["ai_stream_router", "mcp_gateway", "mesh_route_dispatch"];
+    let mut route_configs = Vec::new();
+
+    // Match PluginCache construction order before its stable priority sort:
+    // globals, proxy-scoped configs in config order, then proxy-group configs
+    // in association order.
+    route_configs.extend(config.plugin_configs.iter().filter(|pc| {
+        pc.scope == PluginScope::Global
+            && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+            && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
+    }));
+    route_configs.extend(config.plugin_configs.iter().filter(|pc| {
+        pc.scope == PluginScope::Proxy
+            && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+            && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
+    }));
+    for association in &proxy.plugins {
+        if let Some(pc) = config.plugin_configs.iter().find(|pc| {
+            pc.id == association.plugin_config_id
+                && pc.scope == PluginScope::ProxyGroup
+                && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+                && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
+        }) {
+            route_configs.push(pc);
+        }
+    }
+    route_configs.sort_by_key(|pc| route_override_priority(pc));
+    route_configs
+}
+
+fn url_destination_fingerprint(url: &str) -> serde_json::Value {
+    let parse_source = url.replace("{model}", "__FERRUM_MODEL__");
+    if let Ok(parsed) = url::Url::parse(&parse_source)
+        && let (Some(host), Some(port)) = (parsed.host_str(), parsed.port_or_known_default())
+    {
+        return serde_json::json!({
+            "host": host.to_ascii_lowercase(),
+            "port": port
+        });
+    }
+    // Invalid route configs fail their own constructor validation. Retaining
+    // the raw value here keeps staged fingerprinting deterministic until that
+    // validation rejects the generation.
+    serde_json::Value::String(url.to_string())
+}
+
+fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Value {
+    match pc.plugin_name.as_str() {
+        "mesh_route_dispatch" => {
+            let rules = pc
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .map(|rules| {
+                    rules
+                        .iter()
+                        .map(|rule| {
+                            let redirects = rule
+                                .get("redirect")
+                                .is_some_and(|redirect| !redirect.is_null());
+                            let destination = if redirects {
+                                None
+                            } else {
+                                rule.get("destination")
+                                    .and_then(serde_json::Value::as_object)
+                            };
+                            let upstream_id = destination
+                                .and_then(|value| value.get("upstream_id"))
+                                .cloned();
+                            let backend_host = destination
+                                .and_then(|value| value.get("backend_host"))
+                                .cloned();
+                            let backend_port = destination
+                                .and_then(|value| value.get("backend_port"))
+                                .cloned();
+                            let requires_node_waypoint_authz = destination
+                                .and_then(|value| value.get("requires_node_waypoint_authz"))
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
+                            serde_json::json!({
+                                "match": rule
+                                    .get("match")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({})),
+                                "destination": {
+                                    "upstream_id": upstream_id,
+                                    "backend_host": backend_host,
+                                    "backend_port": backend_port,
+                                    "requires_node_waypoint_authz": requires_node_waypoint_authz
+                                },
+                                // Redirect presence suppresses backend dispatch; its
+                                // response-only fields do not affect limiter keys.
+                                "redirects": redirects
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "reject_unmatched": pc
+                    .config
+                    .get("reject_unmatched")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                "rules": rules
+            })
+        }
+        "ai_stream_router" => {
+            let enabled = pc
+                .config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if !enabled {
+                return serde_json::json!({"enabled": false});
+            }
+            let mut providers = pc
+                .config
+                .get("providers")
+                .and_then(serde_json::Value::as_array)
+                .map(|providers| {
+                    providers
+                        .iter()
+                        .enumerate()
+                        .map(|(index, provider)| {
+                            let priority = provider
+                                .get("priority")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or((index as u64).saturating_add(1));
+                            serde_json::json!({
+                                "priority": priority,
+                                "model_patterns": provider
+                                    .get("model_patterns")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!([])),
+                                "destination": provider
+                                    .get("endpoint")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(url_destination_fingerprint)
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            providers.sort_by_key(|provider| {
+                provider
+                    .get("priority")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(u64::MAX)
+            });
+            serde_json::json!({
+                "enabled": true,
+                "fail_on_missing_model": pc
+                    .config
+                    .get("fail_on_missing_model")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                "fail_on_no_matching_provider": pc
+                    .config
+                    .get("fail_on_no_matching_provider")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                "providers": providers
+            })
+        }
+        "mcp_gateway" => {
+            let enabled = pc
+                .config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if !enabled {
+                return serde_json::json!({"enabled": false});
+            }
+            let mut servers = pc
+                .config
+                .get("servers")
+                .and_then(serde_json::Value::as_object)
+                .map(|servers| {
+                    servers
+                        .iter()
+                        .map(|(server_id, server)| {
+                            let enabled = server
+                                .get("enabled")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(true);
+                            if !enabled {
+                                return serde_json::json!({
+                                    "server_id": server_id,
+                                    "enabled": false
+                                });
+                            }
+                            serde_json::json!({
+                                "server_id": server_id,
+                                "namespace": server.get("namespace").cloned(),
+                                "enabled": true,
+                                "expose_tools": server
+                                    .get("expose_tools")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(true),
+                                "expose_resources": server
+                                    .get("expose_resources")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false),
+                                "expose_prompts": server
+                                    .get("expose_prompts")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false),
+                                "destination": server
+                                    .get("upstream_url")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(url_destination_fingerprint)
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            servers.sort_by(|left, right| {
+                left.get("server_id")
+                    .and_then(serde_json::Value::as_str)
+                    .cmp(&right.get("server_id").and_then(serde_json::Value::as_str))
+            });
+            serde_json::json!({
+                "enabled": true,
+                "mode": pc.config.get("mode").cloned(),
+                "endpoint_path": pc
+                    .config
+                    .get("endpoint")
+                    .and_then(|value| value.get("path"))
+                    .cloned(),
+                "namespace_separator": pc
+                    .config
+                    .get("discovery")
+                    .and_then(|value| value.get("namespace_separator"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("."),
+                "passthrough_unknown_methods": pc
+                    .config
+                    .get("capabilities")
+                    .and_then(|value| value.get("passthrough_unknown_methods"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                "servers": servers
+            })
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn collect_route_override_destinations(
+    route_pc: &PluginConfig,
+    proxy: &crate::config::types::Proxy,
+    key_by: AdaptiveConcurrencyKeyBy,
+    config: &GatewayConfig,
+    keys: &mut Vec<AdaptiveConcurrencyRouteKey>,
+    upstream_routes: &mut Vec<AdaptiveConcurrencyUpstreamRoute>,
+) {
+    match route_pc.plugin_name.as_str() {
+        "mesh_route_dispatch" => {
+            let Some(rules) = route_pc
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return;
+            };
+            for destination in rules
+                .iter()
+                .filter(|rule| {
+                    !rule
+                        .get("redirect")
+                        .is_some_and(|redirect| !redirect.is_null())
+                })
+                .filter_map(|rule| {
+                    rule.get("destination")
+                        .and_then(serde_json::Value::as_object)
+                })
+            {
+                if let Some(upstream_id) = destination
+                    .get("upstream_id")
+                    .and_then(serde_json::Value::as_str)
                 {
-                    upstream_ids.insert(upstream_id.to_string());
+                    let subset = if proxy.upstream_id.as_deref() == Some(upstream_id) {
+                        proxy.upstream_subset.as_deref()
+                    } else {
+                        None
+                    };
+                    let upstream = config
+                        .upstreams
+                        .iter()
+                        .find(|upstream| upstream.id == upstream_id);
+                    push_upstream_route(
+                        keys,
+                        upstream_routes,
+                        adaptive_concurrency_scope(key_by, proxy, Some(upstream_id)),
+                        upstream_id,
+                        subset,
+                        upstream,
+                    );
+                } else if let (Some(host), Some(port)) = (
+                    destination
+                        .get("backend_host")
+                        .and_then(serde_json::Value::as_str),
+                    destination
+                        .get("backend_port")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|port| u16::try_from(port).ok()),
+                ) {
+                    push_direct_route_key(keys, key_by, proxy, host, port);
                 }
-                collect_upstream_ids(value, upstream_ids);
             }
         }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_upstream_ids(value, upstream_ids);
+        "ai_stream_router" => {
+            if route_pc
+                .config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                return;
+            }
+            if let Some(providers) = route_pc
+                .config
+                .get("providers")
+                .and_then(serde_json::Value::as_array)
+            {
+                for endpoint in providers.iter().filter_map(|provider| {
+                    provider
+                        .get("endpoint")
+                        .and_then(serde_json::Value::as_str)
+                }) {
+                    let parse_source = endpoint.replace("{model}", "__FERRUM_MODEL__");
+                    if let Ok(parsed) = url::Url::parse(&parse_source)
+                        && let (Some(host), Some(port)) =
+                            (parsed.host_str(), parsed.port_or_known_default())
+                    {
+                        push_direct_route_key(keys, key_by, proxy, host, port);
+                    }
+                }
+            }
+        }
+        "mcp_gateway" => {
+            if route_pc
+                .config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                return;
+            }
+            if let Some(servers) = route_pc
+                .config
+                .get("servers")
+                .and_then(serde_json::Value::as_object)
+            {
+                for upstream_url in servers
+                    .values()
+                    .filter(|server| {
+                        server
+                            .get("enabled")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(true)
+                    })
+                    .filter_map(|server| {
+                        server
+                            .get("upstream_url")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                {
+                    if let Ok(parsed) = url::Url::parse(upstream_url)
+                        && let (Some(host), Some(port)) =
+                            (parsed.host_str(), parsed.port_or_known_default())
+                    {
+                        push_direct_route_key(keys, key_by, proxy, host, port);
+                    }
+                }
             }
         }
         _ => {}
@@ -788,100 +1256,111 @@ fn adaptive_concurrency_route_definition(
     key_by: AdaptiveConcurrencyKeyBy,
     config: &GatewayConfig,
 ) -> AdaptiveConcurrencyRouteDefinition {
-    const ROUTE_OVERRIDE_PLUGINS: &[&str] =
-        &["ai_stream_router", "mcp_gateway", "mesh_route_dispatch"];
     let mut keys = Vec::new();
     let mut overrides = Vec::new();
-    let mut upstream_ids = HashSet::new();
+    let mut upstream_routes = Vec::new();
     for proxy in &config.proxies {
         if !plugin_config_effectively_applies_to_proxy(pc, proxy, config) {
             continue;
         }
 
-        for route_pc in config.plugin_configs.iter().filter(|route_pc| {
-            ROUTE_OVERRIDE_PLUGINS.contains(&route_pc.plugin_name.as_str())
-                && plugin_config_effectively_applies_to_proxy(route_pc, proxy, config)
-        }) {
-            collect_upstream_ids(&route_pc.config, &mut upstream_ids);
+        for route_pc in effective_route_override_configs_for_proxy(proxy, config) {
+            collect_route_override_destinations(
+                route_pc,
+                proxy,
+                key_by,
+                config,
+                &mut keys,
+                &mut upstream_routes,
+            );
             overrides.push(AdaptiveConcurrencyRouteOverride {
                 proxy_id: proxy.id.clone(),
-                namespace: route_pc.namespace.clone(),
-                plugin_config_id: route_pc.id.clone(),
                 plugin_name: route_pc.plugin_name.clone(),
-                config: route_pc.config.clone(),
+                effective_priority: route_override_priority(route_pc),
+                destination_fingerprint: route_override_destination_fingerprint(route_pc),
             });
         }
 
-        let scope = match key_by {
-            AdaptiveConcurrencyKeyBy::Proxy => {
-                format!("proxy:{}:{}", proxy.namespace, proxy.id)
-            }
-            AdaptiveConcurrencyKeyBy::Upstream => proxy
-                .upstream_id
-                .as_deref()
-                .map(|upstream_id| format!("upstream:{}:{upstream_id}", proxy.namespace))
-                .unwrap_or_else(|| format!("proxy:{}:{}", proxy.namespace, proxy.id)),
-            AdaptiveConcurrencyKeyBy::Backend => "backend".to_string(),
-        };
-
         if let Some(upstream_id) = proxy.upstream_id.as_deref() {
-            upstream_ids.insert(upstream_id.to_string());
-            if let Some(upstream) = config
+            let upstream = config
                 .upstreams
                 .iter()
-                .find(|upstream| upstream.id == upstream_id)
-            {
-                if upstream.targets.is_empty() {
-                    // Preserve the route source even when service discovery has
-                    // not materialized a target into this config snapshot.
-                    keys.push(AdaptiveConcurrencyRouteKey {
-                        scope,
-                        host: None,
-                        port: None,
-                        subset: proxy.upstream_subset.clone(),
-                    });
-                } else {
-                    keys.extend(upstream.targets.iter().map(|target| {
-                        AdaptiveConcurrencyRouteKey {
-                            scope: scope.clone(),
-                            host: Some(target.host.clone()),
-                            port: Some(target.port),
-                            subset: proxy.upstream_subset.clone(),
-                        }
-                    }));
-                }
-                continue;
-            }
+                .find(|upstream| upstream.id == upstream_id);
+            push_upstream_route(
+                &mut keys,
+                &mut upstream_routes,
+                adaptive_concurrency_scope(key_by, proxy, Some(upstream_id)),
+                upstream_id,
+                proxy.upstream_subset.as_deref(),
+                upstream,
+            );
+        } else {
+            push_direct_route_key(
+                &mut keys,
+                key_by,
+                proxy,
+                &proxy.backend_host,
+                proxy.backend_port,
+            );
         }
-
-        keys.push(AdaptiveConcurrencyRouteKey {
-            scope,
-            host: Some(proxy.backend_host.clone()),
-            port: Some(proxy.backend_port),
-            subset: proxy.upstream_subset.clone(),
-        });
     }
     keys.sort_unstable();
     keys.dedup();
-    overrides.sort_by(|left, right| {
-        (
-            left.proxy_id.as_str(),
-            left.namespace.as_str(),
-            left.plugin_config_id.as_str(),
-            left.plugin_name.as_str(),
-        )
-            .cmp(&(
-                right.proxy_id.as_str(),
-                right.namespace.as_str(),
-                right.plugin_config_id.as_str(),
-                right.plugin_name.as_str(),
-            ))
-    });
+    // Proxy ordering in GatewayConfig is not execution ordering. Stable-sort
+    // only by proxy ID so the effective route-plugin order within each proxy
+    // remains visible to compatibility checks.
+    overrides.sort_by(|left, right| left.proxy_id.cmp(&right.proxy_id));
+    upstream_routes.sort_unstable();
+    upstream_routes.dedup();
     AdaptiveConcurrencyRouteDefinition {
         keys,
         overrides,
-        upstream_ids,
+        upstream_routes,
     }
+}
+
+fn adaptive_concurrency_effective_lb_keys(
+    route_definition: &AdaptiveConcurrencyRouteDefinition,
+    load_balancer: &crate::load_balancer::LoadBalancerCacheInner,
+) -> Vec<AdaptiveConcurrencyRouteKey> {
+    let mut keys = Vec::new();
+    for route in &route_definition.upstream_routes {
+        let key_count = keys.len();
+        if let Some(upstream) = load_balancer.upstreams().get(&route.upstream_id) {
+            keys.extend(
+                upstream
+                    .targets
+                    .iter()
+                    .filter(|target| {
+                        target_matches_subset(upstream, target, route.subset.as_deref())
+                    })
+                    .map(|target| AdaptiveConcurrencyRouteKey {
+                        scope: route.scope.clone(),
+                        host: Some(target.host.clone()),
+                        port: Some(target.port),
+                    }),
+            );
+        }
+        if keys.len() == key_count {
+            keys.push(AdaptiveConcurrencyRouteKey {
+                scope: route.scope.clone(),
+                host: None,
+                port: None,
+            });
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+fn adaptive_concurrency_lb_key_space_changed(
+    instance: &AdaptiveConcurrencyInstance,
+    current: &crate::load_balancer::LoadBalancerCacheInner,
+    replacement: &crate::load_balancer::LoadBalancerCacheInner,
+) -> bool {
+    adaptive_concurrency_effective_lb_keys(&instance.route_definition, current)
+        != adaptive_concurrency_effective_lb_keys(&instance.route_definition, replacement)
 }
 
 fn retained_adaptive_concurrency_states(
@@ -1380,13 +1859,12 @@ impl PluginCacheInner {
     pub(crate) fn prepare_adaptive_concurrency_lb_generation(
         &self,
         generation: u64,
-        changed_upstream_ids: &HashSet<String>,
+        current: &crate::load_balancer::LoadBalancerCacheInner,
+        replacement: &crate::load_balancer::LoadBalancerCacheInner,
     ) {
         for instance in self.adaptive_concurrency_instances.values() {
-            let drain_older_generation = !instance
-                .route_definition
-                .upstream_ids
-                .is_disjoint(changed_upstream_ids);
+            let drain_older_generation =
+                adaptive_concurrency_lb_key_space_changed(instance, current, replacement);
             instance
                 .limiter
                 .prepare_lb_generation(generation, drain_older_generation);
@@ -1396,13 +1874,12 @@ impl PluginCacheInner {
     pub(crate) fn commit_adaptive_concurrency_lb_generation(
         &self,
         generation: u64,
-        changed_upstream_ids: &HashSet<String>,
+        current: &crate::load_balancer::LoadBalancerCacheInner,
+        replacement: &crate::load_balancer::LoadBalancerCacheInner,
     ) {
         for instance in self.adaptive_concurrency_instances.values() {
-            let drain_older_generation = !instance
-                .route_definition
-                .upstream_ids
-                .is_disjoint(changed_upstream_ids);
+            let drain_older_generation =
+                adaptive_concurrency_lb_key_space_changed(instance, current, replacement);
             instance
                 .limiter
                 .commit_lb_generation(generation, drain_older_generation);

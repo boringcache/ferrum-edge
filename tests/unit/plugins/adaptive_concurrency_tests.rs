@@ -1110,6 +1110,7 @@ fn adaptive_concurrency_route_override_change_resets_target_key_space() {
             "enabled": true,
             "config": {
                 "rules": [{
+                    "match": {"methods": ["GET"]},
                     "destination": {
                         "backend_host": "first-override.local",
                         "backend_port": 8080
@@ -1159,6 +1160,392 @@ fn adaptive_concurrency_route_override_change_resets_target_key_space() {
         None,
     ));
     drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_unchanged_upstream_subset_stays_compatible() {
+    let mut config = cache_config(
+        "proxy",
+        json!({
+            "min_limit": 1,
+            "initial_limit": 2,
+            "max_limit": 2
+        }),
+    );
+    config.proxies[0].upstream_id = Some("shared-upstream".to_string());
+    config.proxies[0].upstream_subset = Some("blue".to_string());
+    config.upstreams.push(
+        serde_json::from_value(json!({
+            "id": "shared-upstream",
+            "namespace": "default",
+            "targets": [
+                {
+                    "host": "blue.local",
+                    "port": 8080,
+                    "tags": {"version": "blue"}
+                },
+                {
+                    "host": "green.local",
+                    "port": 8080,
+                    "tags": {"version": "green"}
+                }
+            ],
+            "subsets": [
+                {"name": "blue", "labels": {"version": "blue"}},
+                {"name": "green", "labels": {"version": "green"}}
+            ]
+        }))
+        .expect("shared upstream should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let blue_target = config.upstreams[0].targets[0].clone();
+    let held = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &config.proxies[0],
+        Some(&blue_target),
+    ));
+
+    let mut reloaded = config.clone();
+    reloaded.upstreams[0].targets[1].host = "replacement-green.local".to_string();
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from(["proxy-1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("unchanged subset reload should publish");
+
+    let second = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &reloaded.proxies[0],
+        Some(&blue_target),
+    ));
+    drop(second);
+    drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_route_non_destination_change_stays_compatible() {
+    let mut config = cache_config(
+        "proxy",
+        json!({
+            "min_limit": 1,
+            "initial_limit": 2,
+            "max_limit": 2
+        }),
+    );
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "route-dispatch-1",
+            "namespace": "default",
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "proxy_group",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "override.local",
+                        "backend_port": 8080
+                    }
+                }]
+            }
+        }))
+        .expect("route dispatch config should deserialize"),
+    );
+    config.proxies[0].plugins.push(
+        serde_json::from_value(json!({"plugin_config_id": "route-dispatch-1"}))
+            .expect("route dispatch association should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let mut effective_proxy = config.proxies[0].clone();
+    effective_proxy.backend_host = "override.local".to_string();
+    let held = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_proxy,
+        None,
+    ));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[1].config["rules"][0]["rewrite"] =
+        json!({"uri": "/rewritten"});
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from(["proxy-1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("non-destination route edit should publish");
+
+    let second = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_proxy,
+        None,
+    ));
+    drop(second);
+    drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_ai_and_mcp_non_destination_changes_stay_compatible() {
+    for (plugin_name, route_config, host, port) in [
+        (
+            "ai_stream_router",
+            json!({
+                "providers": [{
+                    "name": "test",
+                    "provider_type": "openai",
+                    "endpoint": "https://ai.example/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"]
+                }]
+            }),
+            "ai.example",
+            443,
+        ),
+        (
+            "mcp_gateway",
+            json!({
+                "mode": "transparent_proxy",
+                "endpoint": {"path": "/mcp"},
+                "servers": {
+                    "tools": {
+                        "upstream_url": "http://mcp.example:8081/mcp",
+                        "namespace": "tools"
+                    }
+                }
+            }),
+            "mcp.example",
+            8081,
+        ),
+    ] {
+        let mut config = cache_config(
+            "proxy",
+            json!({
+                "min_limit": 1,
+                "initial_limit": 2,
+                "max_limit": 2
+            }),
+        );
+        config.plugin_configs.push(
+            serde_json::from_value(json!({
+                "id": "route-override-1",
+                "namespace": "default",
+                "plugin_name": plugin_name,
+                "scope": "proxy_group",
+                "enabled": true,
+                "config": route_config
+            }))
+            .expect("route override config should deserialize"),
+        );
+        config.proxies[0].plugins.push(
+            serde_json::from_value(json!({"plugin_config_id": "route-override-1"}))
+                .expect("route override association should deserialize"),
+        );
+        let cache = PluginCache::new(&config).expect("initial cache should build");
+        let mut effective_proxy = config.proxies[0].clone();
+        effective_proxy.backend_host = host.to_string();
+        effective_proxy.backend_port = port;
+        let held = expect_admitted(acquire_from_plugin(
+            &adaptive_plugin_from_cache(&cache),
+            &effective_proxy,
+            None,
+        ));
+
+        let mut reloaded = config.clone();
+        match plugin_name {
+            "ai_stream_router" => {
+                reloaded.plugin_configs[1].config["inject_usage_options"] = json!(false);
+            }
+            "mcp_gateway" => {
+                reloaded.plugin_configs[1].config["observability"] =
+                    json!({"emit_metadata": false});
+            }
+            _ => unreachable!("test cases cover only route-override plugins"),
+        }
+        cache
+            .apply_delta(
+                &reloaded,
+                &HashSet::from(["proxy-1".to_string()]),
+                &[],
+                false,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{plugin_name} non-destination edit should publish: {error}")
+            });
+
+        let second = expect_admitted(acquire_from_plugin(
+            &adaptive_plugin_from_cache(&cache),
+            &effective_proxy,
+            None,
+        ));
+        drop(second);
+        drop(held);
+    }
+}
+
+#[test]
+fn adaptive_concurrency_route_priority_change_resets_winning_destination() {
+    let mut config = cache_config(
+        "proxy",
+        json!({
+            "max_tracked_keys": 1,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+    );
+    for (id, host, priority) in [
+        ("route-dispatch-1", "first.local", 2994),
+        ("route-dispatch-2", "second.local", 2996),
+    ] {
+        config.plugin_configs.push(
+            serde_json::from_value(json!({
+                "id": id,
+                "namespace": "default",
+                "plugin_name": "mesh_route_dispatch",
+                "scope": "proxy_group",
+                "enabled": true,
+                "priority_override": priority,
+                "config": {
+                    "rules": [{
+                        "match": {"methods": ["GET"]},
+                        "destination": {
+                            "backend_host": host,
+                            "backend_port": 8080
+                        }
+                    }]
+                }
+            }))
+            .expect("route dispatch config should deserialize"),
+        );
+        config.proxies[0].plugins.push(
+            serde_json::from_value(json!({"plugin_config_id": id}))
+                .expect("route dispatch association should deserialize"),
+        );
+    }
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let mut second_effective_proxy = config.proxies[0].clone();
+    second_effective_proxy.backend_host = "second.local".to_string();
+    let held = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &second_effective_proxy,
+        None,
+    ));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[1].priority_override = Some(2996);
+    reloaded.plugin_configs[2].priority_override = Some(2994);
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from(["proxy-1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("route priority change should publish");
+
+    let mut first_effective_proxy = reloaded.proxies[0].clone();
+    first_effective_proxy.backend_host = "first.local".to_string();
+    assert_rejected(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &first_effective_proxy,
+        None,
+    ));
+    drop(held);
+    let replacement = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &first_effective_proxy,
+        None,
+    ));
+    assert_rejected(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &first_effective_proxy,
+        None,
+    ));
+    drop(replacement);
+}
+
+#[test]
+fn adaptive_concurrency_route_association_order_resets_winning_destination() {
+    let mut config = cache_config(
+        "proxy",
+        json!({
+            "max_tracked_keys": 1,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+    );
+    for (id, host) in [
+        ("route-dispatch-1", "first.local"),
+        ("route-dispatch-2", "second.local"),
+    ] {
+        config.plugin_configs.push(
+            serde_json::from_value(json!({
+                "id": id,
+                "namespace": "default",
+                "plugin_name": "mesh_route_dispatch",
+                "scope": "proxy_group",
+                "enabled": true,
+                "config": {
+                    "rules": [{
+                        "match": {"methods": ["GET"]},
+                        "destination": {
+                            "backend_host": host,
+                            "backend_port": 8080
+                        }
+                    }]
+                }
+            }))
+            .expect("route dispatch config should deserialize"),
+        );
+        config.proxies[0].plugins.push(
+            serde_json::from_value(json!({"plugin_config_id": id}))
+                .expect("route dispatch association should deserialize"),
+        );
+    }
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let mut second_effective_proxy = config.proxies[0].clone();
+    second_effective_proxy.backend_host = "second.local".to_string();
+    let held = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &second_effective_proxy,
+        None,
+    ));
+
+    let mut reloaded = config.clone();
+    reloaded.proxies[0].plugins.swap(1, 2);
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from(["proxy-1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("route association reorder should publish");
+
+    let mut first_effective_proxy = reloaded.proxies[0].clone();
+    first_effective_proxy.backend_host = "first.local".to_string();
+    assert_rejected(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &first_effective_proxy,
+        None,
+    ));
+    drop(held);
+    let replacement = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &first_effective_proxy,
+        None,
+    ));
+    assert_rejected(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &first_effective_proxy,
+        None,
+    ));
+    drop(replacement);
 }
 
 #[test]

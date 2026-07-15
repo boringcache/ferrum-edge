@@ -4,7 +4,7 @@
 //! consumer index, and load-balancer snapshot together. Writers build staged
 //! inners before publishing, then swap the whole epoch with one ArcSwap store.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -50,58 +50,6 @@ pub(crate) fn build_proxy_index_by_id(config: &GatewayConfig) -> Arc<HashMap<Str
             .map(|(idx, proxy)| (proxy.id.clone(), idx))
             .collect(),
     )
-}
-
-type UpstreamEndpointKey<'a> = (&'a str, u16, Vec<(&'a str, &'a str)>);
-
-fn upstream_endpoint_keys(
-    upstream: &crate::config::types::Upstream,
-) -> Vec<UpstreamEndpointKey<'_>> {
-    let mut keys: Vec<_> = upstream
-        .targets
-        .iter()
-        .map(|target| {
-            let mut tags: Vec<_> = target
-                .tags
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str()))
-                .collect();
-            tags.sort_unstable();
-            (target.host.as_str(), target.port, tags)
-        })
-        .collect();
-    keys.sort_unstable();
-    keys.dedup();
-    keys
-}
-
-fn changed_upstream_endpoint_ids(
-    current: &LoadBalancerCacheInner,
-    replacement: &LoadBalancerCacheInner,
-) -> HashSet<String> {
-    let mut changed = HashSet::new();
-    for (upstream_id, replacement_upstream) in replacement.upstreams() {
-        let endpoints_changed =
-            current
-                .upstreams()
-                .get(upstream_id)
-                .is_none_or(|current_upstream| {
-                    upstream_endpoint_keys(current_upstream)
-                        != upstream_endpoint_keys(replacement_upstream)
-                        || current_upstream.subsets != replacement_upstream.subsets
-                });
-        if endpoints_changed {
-            changed.insert(upstream_id.clone());
-        }
-    }
-    changed.extend(
-        current
-            .upstreams()
-            .keys()
-            .filter(|upstream_id| !replacement.upstreams().contains_key(*upstream_id))
-            .cloned(),
-    );
-    changed
 }
 
 #[cfg(test)]
@@ -678,23 +626,93 @@ mod tests {
     }
 
     #[test]
-    fn changed_upstream_endpoints_include_subset_tag_changes() {
-        let mut blue = target("a.local", 80);
+    fn lb_only_update_keeps_unchanged_adaptive_subset_compatible() {
+        let mut protected_proxy = proxy("p1", "/one", vec!["adaptive"]);
+        protected_proxy.upstream_id = Some("u1".to_string());
+        protected_proxy.upstream_subset = Some("blue".to_string());
+        let adaptive = plugin_config(
+            "adaptive",
+            "adaptive_concurrency",
+            json!({
+                "min_limit": 1,
+                "initial_limit": 2,
+                "max_limit": 2
+            }),
+        );
+        let mut blue = target("blue.local", 80);
         blue.tags.insert("version".to_string(), "blue".to_string());
-        let current_config = config(vec![], vec![], vec![upstream("u1", vec![blue])]);
-        let current = LoadBalancerCache::build_inner(&current_config);
-
-        let mut green = target("a.local", 80);
+        let mut green = target("green.local", 80);
         green
             .tags
             .insert("version".to_string(), "green".to_string());
-        let replacement_config = config(vec![], vec![], vec![upstream("u1", vec![green])]);
-        let replacement = LoadBalancerCache::build_inner(&replacement_config);
+        let mut shared_upstream = upstream("u1", vec![blue.clone(), green]);
+        shared_upstream.subsets = Some(vec![
+            serde_json::from_value(json!({
+                "name": "blue",
+                "labels": {"version": "blue"}
+            }))
+            .unwrap_or_else(|error| panic!("blue subset should deserialize: {error}")),
+            serde_json::from_value(json!({
+                "name": "green",
+                "labels": {"version": "green"}
+            }))
+            .unwrap_or_else(|error| panic!("green subset should deserialize: {error}")),
+        ]);
+        let store = epoch_store(config(
+            vec![protected_proxy],
+            vec![adaptive],
+            vec![shared_upstream],
+        ));
 
-        assert_eq!(
-            changed_upstream_endpoint_ids(&current, &replacement),
-            HashSet::from(["u1".to_string()])
+        let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
+            let plugin = epoch
+                .plugin_cache
+                .get_plugins("p1")
+                .iter()
+                .find(|plugin| plugin.name() == "adaptive_concurrency")
+                .cloned()
+                .unwrap_or_else(|| panic!("adaptive plugin should be cached"));
+            let mut ctx =
+                RequestContext::new("192.0.2.10".to_string(), "GET".to_string(), "/".to_string());
+            ctx.lb_generation = epoch.lb_generation;
+            let admission = BackendAdmissionContext {
+                proxy: &epoch.config.proxies[0],
+                upstream_target: Some(target),
+                protocol: ProxyProtocol::Http,
+            };
+            plugin.try_backend_admission(&ctx, &admission)
+        };
+
+        let initial_epoch = store.load();
+        let held = match acquire(&initial_epoch, &blue) {
+            BackendAdmissionDecision::Admit(permit) => permit,
+            _ => panic!("initial blue request should be admitted"),
+        };
+
+        let mut replacement_green = target("replacement-green.local", 81);
+        replacement_green
+            .tags
+            .insert("version".to_string(), "green".to_string());
+        store.update_load_balancer(
+            |current| {
+                Some(LoadBalancerCache::build_update_targets_inner(
+                    &current.load_balancer,
+                    "u1",
+                    vec![blue.clone(), replacement_green],
+                    LoadBalancerAlgorithm::RoundRobin,
+                    None,
+                ))
+            },
+            |_| {},
         );
+
+        let replacement_epoch = store.load();
+        let second = match acquire(&replacement_epoch, &blue) {
+            BackendAdmissionDecision::Admit(permit) => permit,
+            _ => panic!("an unchanged blue subset must remain compatible"),
+        };
+        drop(second);
+        drop(held);
     }
 
     #[test]
@@ -997,8 +1015,6 @@ impl RequestEpochStore {
             return Ok(None);
         };
 
-        let changed_upstream_ids =
-            changed_upstream_endpoint_ids(&current.load_balancer, &staged.load_balancer);
         let proxy_index_by_id = build_proxy_index_by_id(&staged.config);
         let next = Arc::new(RequestEpoch {
             config: staged.config,
@@ -1025,12 +1041,18 @@ impl RequestEpochStore {
         // new plugin objects can both admit during this handoff because their
         // target counters are shared; structural replacements remain draining.
         next.plugin_cache.prepare_adaptive_concurrency_generations();
-        next.plugin_cache
-            .prepare_adaptive_concurrency_lb_generation(next.lb_generation, &changed_upstream_ids);
+        next.plugin_cache.prepare_adaptive_concurrency_lb_generation(
+            next.lb_generation,
+            &current.load_balancer,
+            &next.load_balancer,
+        );
         self.current.store(Arc::clone(&next));
         next.plugin_cache.commit_adaptive_concurrency_generations();
-        next.plugin_cache
-            .commit_adaptive_concurrency_lb_generation(next.lb_generation, &changed_upstream_ids);
+        next.plugin_cache.commit_adaptive_concurrency_lb_generation(
+            next.lb_generation,
+            &current.load_balancer,
+            &next.load_balancer,
+        );
         // Compatibility wrapper caches are mirrored while the epoch writer lock
         // is still held so service discovery and config reloads cannot publish
         // newer epochs and then be overwritten by an older post-lock mirror.
@@ -1048,8 +1070,6 @@ impl RequestEpochStore {
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let current = self.current.load_full();
         let load_balancer = build(&current)?;
-        let changed_upstream_ids =
-            changed_upstream_endpoint_ids(&current.load_balancer, &load_balancer);
         let next = Arc::new(RequestEpoch {
             config: Arc::clone(&current.config),
             proxy_index_by_id: Arc::clone(&current.proxy_index_by_id),
@@ -1061,12 +1081,17 @@ impl RequestEpochStore {
             route_generation: current.route_generation,
             lb_generation: current.lb_generation.saturating_add(1),
         });
-        current
-            .plugin_cache
-            .prepare_adaptive_concurrency_lb_generation(next.lb_generation, &changed_upstream_ids);
+        current.plugin_cache.prepare_adaptive_concurrency_lb_generation(
+            next.lb_generation,
+            &current.load_balancer,
+            &next.load_balancer,
+        );
         self.current.store(Arc::clone(&next));
-        next.plugin_cache
-            .commit_adaptive_concurrency_lb_generation(next.lb_generation, &changed_upstream_ids);
+        next.plugin_cache.commit_adaptive_concurrency_lb_generation(
+            next.lb_generation,
+            &current.load_balancer,
+            &next.load_balancer,
+        );
         // Keep LB wrapper mirroring serialized with the epoch publication.
         mirror(&next);
         Some(next)

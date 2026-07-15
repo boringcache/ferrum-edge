@@ -216,6 +216,10 @@ impl AdaptiveConcurrencyLimiter {
         self.inner.len()
     }
 
+    // Public convenience entrypoint used by the library's external tests and
+    // custom integrations. The binary crate uses the generation-aware path
+    // through `AdaptiveConcurrency::try_backend_admission` instead.
+    #[allow(dead_code)]
     pub fn try_acquire(
         &self,
         proxy: &Proxy,
