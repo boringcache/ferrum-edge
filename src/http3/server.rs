@@ -1352,6 +1352,13 @@ async fn handle_h3_request(
 
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
+    // Map runtime HTTP flavor to the plugin-cache protocol key and stamp the
+    // client-visible transport boundary before route-level rejects.
+    // Method-filtered Extended CONNECT requests still require WebSocket-scoped
+    // initial response policy and transport-managed header stripping.
+    let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);
+    ctx.set_websocket_response_boundary(matches!(http_flavor, HttpFlavor::WebSocket));
+
     // Per-proxy HTTP method filtering (checked before plugins to save work)
     if let Some(ref allowed) = proxy.allowed_methods
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
@@ -1359,6 +1366,15 @@ async fn handle_h3_request(
         record_request(&state, 405);
         let mut headers = HashMap::new();
         headers.insert("allow".to_string(), allowed.join(", "));
+        if request_protocol == ProxyProtocol::WebSocket {
+            let policy_plugins = epoch
+                .plugin_cache
+                .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
+            crate::proxy::finalize_websocket_response_headers(
+                policy_plugins.as_ref(),
+                &mut headers,
+            );
+        }
         send_h3_reject_flavor_aware(
             &mut stream,
             http_flavor,
@@ -1370,10 +1386,6 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Map runtime HTTP flavor to the plugin-cache protocol key so H3 requests
-    // load the same plugin/auth/capability set as the H1/H2 dispatch path.
-    let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);
-    ctx.set_websocket_response_boundary(matches!(http_flavor, HttpFlavor::WebSocket));
     if request_protocol == ProxyProtocol::Grpc {
         ctx.metadata
             .entry("request_protocol".to_string())

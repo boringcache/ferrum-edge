@@ -372,6 +372,46 @@ plugin_configs:
         .expect("Failed to write config");
 }
 
+/// Write a WebSocket config whose route-level method filter rejects both the
+/// H1 Upgrade GET and H2/H3 Extended CONNECT before the ordinary plugin chain.
+fn write_ws_method_reject_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-method-reject-proxy"
+    listen_path: "/ws-echo"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+    allowed_methods:
+      - POST
+
+consumers: []
+plugin_configs:
+  - id: "plugin-security-headers-ws-method-reject"
+    plugin_name: "security_headers"
+    config:
+      hsts: true
+      set:
+        X-WS-Security: "gateway-enforced"
+        Upgrade: "policy-must-not-escape"
+        Connection: "policy-must-not-escape"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
+      remove: ["server", "x-powered-by"]
+    scope: global
+    enabled: true
+"#,
+        backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
 /// Write a WebSocket config whose backend-admission limiter holds one permit
 /// for the full upgraded session and rejects a concurrent second handshake.
 fn write_ws_backend_admission_config(config_path: &std::path::Path, backend_port: u16) {
@@ -410,15 +450,12 @@ plugin_configs:
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
-  - id: "plugin-response-transformer-ws-admission"
-    plugin_name: "response_transformer"
+  - id: "plugin-correlation-id-ws-admission"
+    plugin_name: "correlation_id"
     priority_override: 4090
     config:
-      rules:
-        - operation: update
-          target: header
-          key: X-WS-Reject-Order
-          value: later-response-hook
+      header_name: X-WS-Reject-Order
+      echo_downstream: true
     scope: global
     enabled: true
 "#,
@@ -1629,7 +1666,15 @@ async fn test_websocket_backend_admission_reject_strips_transport_policy_fields(
         .expect("first WebSocket should hold the backend-admission permit");
     assert_ws_security_policy(first_response.headers());
 
-    let second = tokio_tungstenite::connect_async(&url).await;
+    let mut second_request = url
+        .as_str()
+        .into_client_request()
+        .expect("valid second WebSocket request");
+    second_request.headers_mut().insert(
+        "x-ws-reject-order",
+        "later-response-hook".parse().unwrap(),
+    );
+    let second = tokio_tungstenite::connect_async(second_request).await;
     match second {
         Err(WsError::Http(response)) => {
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1691,7 +1736,16 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
 
     let second_client = Http3Client::insecure().expect("second H3 client");
     let mut rejected = second_client
-        .websocket(&url, WebSocketOptions::default())
+        .websocket(
+            &url,
+            WebSocketOptions {
+                headers: vec![(
+                    "x-ws-reject-order".to_string(),
+                    "later-response-hook".to_string(),
+                )],
+                ..WebSocketOptions::default()
+            },
+        )
         .await
         .expect("second H3 WebSocket rejection response");
     assert_eq!(rejected.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1714,6 +1768,112 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
+}
+
+/// Route method filtering runs before ordinary plugins, but the failed
+/// WebSocket handshake is already a client-visible response boundary. Both
+/// frontend implementations must apply the cached security policy while
+/// keeping handshake-owned fields under transport control.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h3() {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::Empty;
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let backend_port = free_port().await;
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_method_reject_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let h1_url = format!("ws://127.0.0.1:{gateway_http_port}/ws-echo");
+    let h1_rejected = match tokio_tungstenite::connect_async(&h1_url).await {
+        Err(WsError::Http(response)) => response,
+        Ok(_) => panic!("H1 WebSocket method-filtered handshake should be rejected"),
+        Err(error) => panic!("unexpected H1 WebSocket rejection: {error:?}"),
+    };
+    assert_eq!(h1_rejected.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        h1_rejected
+            .headers()
+            .get("allow")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    );
+    assert_ws_security_policy(h1_rejected.headers());
+    assert_no_ws_transport_policy_values(h1_rejected.headers());
+    assert_no_h1_only_websocket_headers(h1_rejected.headers());
+
+    let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
+        .await
+        .expect("connect to gateway H2 port");
+    let h2_io = TokioIo::new(h2_stream);
+    let (mut h2_sender, h2_connection) = http2::handshake(TokioExecutor::new(), h2_io)
+        .await
+        .expect("H2 handshake");
+    let h2_connection_task = tokio::spawn(async move {
+        let _ = h2_connection.await;
+    });
+    let h2_request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{gateway_http_port}/ws-echo"))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build method-filtered H2 WebSocket request");
+    let h2_rejected = h2_sender
+        .send_request(h2_request)
+        .await
+        .expect("H2 WebSocket method-filter rejection response");
+    assert_eq!(h2_rejected.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        h2_rejected
+            .headers()
+            .get("allow")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    );
+    assert_ws_security_policy(h2_rejected.headers());
+    assert_no_ws_transport_policy_values(h2_rejected.headers());
+    assert_no_h1_only_websocket_headers(h2_rejected.headers());
+    h2_connection_task.abort();
+
+    let h3_url = format!("https://localhost:{gateway_https_port}/ws-echo");
+    let h3_client = Http3Client::insecure().expect("H3 client");
+    let mut h3_rejected = h3_client
+        .websocket(&h3_url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket method-filter rejection response");
+    assert_eq!(h3_rejected.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        h3_rejected
+            .headers
+            .get("allow")
+            .and_then(|value| value.to_str().ok()),
+        Some("POST")
+    );
+    assert_ws_security_policy(&h3_rejected.headers);
+    assert_no_ws_transport_policy_values(&h3_rejected.headers);
+    assert_no_h1_only_websocket_headers(&h3_rejected.headers);
+    assert!(
+        h3_rejected
+            .recv_body_text()
+            .await
+            .expect("H3 method-filter rejection body")
+            .contains("Method Not Allowed")
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
 }
 
 /// Test HTTP/3 WebSocket (RFC 9220 Extended CONNECT) proxying through the

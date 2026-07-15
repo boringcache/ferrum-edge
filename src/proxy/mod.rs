@@ -13774,33 +13774,116 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
     })
 }
 
+/// Build a gateway-generated error for a request the grpc_web plugin already
+/// translated, enforcing the precomputed initial-header policy chain because
+/// no backend response exists and the ordinary after_proxy lifecycle cannot
+/// run. Policy is applied after the gRPC-Web representation headers are built
+/// so content framing remains authoritative.
 fn build_translated_grpc_web_error_response(
     ctx: &RequestContext,
     status: u32,
     message: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Option<Response<ProxyBody>> {
-    let translated = crate::plugins::grpc_web::translated_error_response(ctx, status, message)?;
-    let builder =
-        headers_mod::apply_response_headers(Response::builder().status(200), &translated.headers);
-
-    Some(
-        builder
-            .body(ProxyBody::full(Bytes::from(translated.body)))
-            .unwrap_or_else(|_| grpc_proxy::build_grpc_error_response(status, message)),
-    )
+    let mut translated =
+        crate::plugins::grpc_web::translated_error_response(ctx, status, message)?;
+    finalize_grpc_web_error_response_headers(
+        &mut translated,
+        initial_response_header_policy_plugins,
+        None,
+    );
+    Some(build_grpc_web_error_response_from_parts(translated, status, message))
 }
 
+/// Build a gateway-generated gRPC-Web error at the client-visible boundary.
+/// These early/backend-exchange failure paths bypass normal response hooks, so
+/// enforce the precomputed initial-header policy chain directly without a
+/// plugin scan or moving terminal gRPC metadata out of the body trailer frame.
 fn build_grpc_web_error_response(
     response_content_type: &str,
     status: u32,
     message: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Response<ProxyBody> {
-    let response = crate::plugins::grpc_web::error_response_for_content_type(
+    let mut response = crate::plugins::grpc_web::error_response_for_content_type(
         response_content_type,
         status,
         message,
     );
+    finalize_grpc_web_error_response_headers(
+        &mut response,
+        initial_response_header_policy_plugins,
+        None,
+    );
     build_grpc_web_error_response_from_parts(response, status, message)
+}
+
+/// Finalize the initial HEADERS for a gateway-generated gRPC-Web error.
+///
+/// `error_response_for_content_type` temporarily keeps terminal gRPC metadata
+/// in its header map while constructing the body trailer frame. At the wire
+/// boundary those fields must remain body-only. The generated representation
+/// fields are also authoritative: neither a security policy nor headers from
+/// an already-finalized reject-hook chain may replace them or supply a stale
+/// content length.
+fn finalize_grpc_web_error_response_headers(
+    response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    finalized_reject_headers: Option<&HashMap<String, String>>,
+) {
+    let content_type = response.headers.get("content-type").cloned();
+    let grpc_web = response.headers.get("x-grpc-web").cloned();
+    let expose_headers = response
+        .headers
+        .get("access-control-expose-headers")
+        .cloned();
+
+    if let Some(finalized_headers) = finalized_reject_headers {
+        response.headers.extend(
+            finalized_headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+    } else {
+        crate::plugins::apply_initial_response_header_policies(
+            initial_response_header_policy_plugins,
+            &mut response.headers,
+        );
+    }
+
+    response.headers.retain(|name, _| {
+        ![
+            "content-type",
+            "content-length",
+            "content-encoding",
+            "x-grpc-web",
+            "access-control-expose-headers",
+            "grpc-status",
+            "grpc-message",
+            "grpc-status-details-bin",
+            "trailer",
+        ]
+        .iter()
+        .any(|managed| name.eq_ignore_ascii_case(managed))
+    });
+    if let Some(content_type) = content_type {
+        response
+            .headers
+            .insert("content-type".to_string(), content_type);
+    }
+    if let Some(grpc_web) = grpc_web {
+        response.headers.insert("x-grpc-web".to_string(), grpc_web);
+    }
+    if let Some(expose_headers) = expose_headers {
+        response.headers.insert(
+            "access-control-expose-headers".to_string(),
+            expose_headers,
+        );
+    }
+    response.headers.insert(
+        "content-length".to_string(),
+        response.body.len().to_string(),
+    );
 }
 
 fn build_grpc_web_error_response_from_parts(
@@ -13904,11 +13987,12 @@ async fn handle_backend_admission_rejection(
             .grpc_message
             .as_deref()
             .unwrap_or_else(|| grpc_status_reason(grpc_status));
-        let translated = crate::plugins::grpc_web::error_response_for_content_type(
+        let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
             grpc_status,
             message,
         );
+        finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));
         if plugins
             .iter()
             .any(|plugin| plugin.requires_response_committed_hook())
@@ -14873,6 +14957,16 @@ async fn handle_proxy_request_inner(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     debug!(proxy_id = %proxy.id, method = %method, path = %path, client_ip = %ctx.client_ip, "Request routed to proxy");
 
+    // Detect request flavor purely from the incoming traffic. WebSocket and
+    // gRPC are no longer pinned by the proxy's scheme — a single `Https`
+    // backend serves all three flavors depending on the request. Classify the
+    // client-visible boundary before route-level rejects so a failed WebSocket
+    // handshake still receives WebSocket-scoped policy without exposing
+    // policy-controlled upgrade fields.
+    let is_h2_ws = is_h2_websocket_connect(&req);
+    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    ctx.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
+
     // Per-proxy HTTP method filtering (checked before plugins to save work)
     if let Some(ref allowed) = proxy.allowed_methods
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
@@ -14881,6 +14975,15 @@ async fn handle_proxy_request_inner(
         let allow_header = allowed.join(", ");
         let mut reject_headers = HashMap::new();
         reject_headers.insert("allow".to_string(), allow_header);
+        if matches!(flavor, HttpFlavor::WebSocket) {
+            let policy_plugins = epoch
+                .plugin_cache
+                .get_initial_response_header_policy_plugins(&proxy.id, ProxyProtocol::WebSocket);
+            finalize_websocket_response_headers(
+                policy_plugins.as_ref(),
+                &mut reject_headers,
+            );
+        }
         let reject = normalize_reject_response(
             StatusCode::METHOD_NOT_ALLOWED,
             br#"{"error":"Method Not Allowed"}"#,
@@ -14891,15 +14994,8 @@ async fn handle_proxy_request_inner(
         return Ok(build_response_from_normalized_reject(reject));
     }
 
-    // Detect request flavor purely from the incoming traffic. WebSocket and
-    // gRPC are no longer pinned by the proxy's scheme — a single `Https`
-    // backend serves all three flavors depending on the request. This is
-    // the decoupling that lets an H3 client hit an H1/H2 backend through
-    // the same proxy config. The `detect_http_flavor` helper is shared with
-    // the H3 frontend so both paths classify requests identically.
-    let is_h2_ws = is_h2_websocket_connect(&req);
-    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
-    ctx.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
+    // gRPC-Web dispatch remains keyed by its original content type: it uses
+    // the plain HTTP backend flavor while loading the gRPC plugin policy set.
     let grpc_web_response_content_type = req
         .headers()
         .get(hyper::header::CONTENT_TYPE)
@@ -15108,6 +15204,9 @@ async fn handle_proxy_request_inner(
                         let response = build_request_body_timeout_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         );
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
@@ -15225,6 +15324,9 @@ async fn handle_proxy_request_inner(
                         let response = build_request_body_timeout_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         );
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
@@ -15379,6 +15481,9 @@ async fn handle_proxy_request_inner(
                         let response = build_request_body_timeout_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         );
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
@@ -15826,6 +15931,9 @@ async fn handle_proxy_request_inner(
                         let response = build_request_body_timeout_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         );
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
@@ -16129,7 +16237,14 @@ async fn handle_proxy_request_inner(
                 );
                 record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
                 if let Some(content_type) = grpc_web_response_content_type {
-                    return Ok(build_grpc_web_error_response(content_type, 14, message));
+                    return Ok(build_grpc_web_error_response(
+                        content_type,
+                        14,
+                        message,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    ));
                 }
                 return Ok(grpc_proxy::build_grpc_error_response(
                     14, // UNAVAILABLE
@@ -16322,6 +16437,9 @@ async fn handle_proxy_request_inner(
                         return Ok(build_request_body_timeout_response(
                             true,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         ));
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(e)) => {
@@ -16702,6 +16820,9 @@ async fn handle_proxy_request_inner(
                         return Ok(build_request_body_timeout_response(
                             true,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         ));
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(error)) => {
@@ -16912,6 +17033,9 @@ async fn handle_proxy_request_inner(
                             content_type,
                             14,
                             "gRPC retry target requires a mesh transport that does not support retries",
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         ));
                     }
                     if grpc_request_is_web_translated
@@ -16919,6 +17043,9 @@ async fn handle_proxy_request_inner(
                             &ctx,
                             14,
                             "gRPC retry target requires a mesh transport that does not support retries",
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         )
                     {
                         return Ok(response);
@@ -17970,12 +18097,17 @@ async fn handle_proxy_request_inner(
                                         .grpc_message
                                         .as_deref()
                                         .unwrap_or_else(|| grpc_status_reason(grpc_status));
-                                    let translated =
+                                    let mut translated =
                                         crate::plugins::grpc_web::error_response_for_content_type(
                                             grpc_web_ct,
                                             grpc_status,
                                             message,
                                         );
+                                    finalize_grpc_web_error_response_headers(
+                                        &mut translated,
+                                        &[],
+                                        Some(&normalized.headers),
+                                    );
                                     response_status = 200;
                                     response_headers = translated.headers;
                                     response_body = translated.body;
@@ -18390,11 +18522,24 @@ async fn handle_proxy_request_inner(
                 // intermittent `200 + application/grpc` a gRPC-Web caller saw when
                 // a backend read/connect blipped under load (issue #2041).
                 if let Some(content_type) = grpc_web_response_content_type {
-                    return Ok(build_grpc_web_error_response(content_type, grpc_code, msg));
+                    return Ok(build_grpc_web_error_response(
+                        content_type,
+                        grpc_code,
+                        msg,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    ));
                 }
                 if grpc_request_is_web_translated
-                    && let Some(response) =
-                        build_translated_grpc_web_error_response(&ctx, grpc_code, msg)
+                    && let Some(response) = build_translated_grpc_web_error_response(
+                        &ctx,
+                        grpc_code,
+                        msg,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    )
                 {
                     return Ok(response);
                 }
@@ -18543,7 +18688,14 @@ async fn handle_proxy_request_inner(
             let message =
                 format!("HBONE dispatch required for this backend target: {block_reason}");
             if let Some(content_type) = grpc_web_response_content_type {
-                return Ok(build_grpc_web_error_response(content_type, 14, &message));
+                return Ok(build_grpc_web_error_response(
+                    content_type,
+                    14,
+                    &message,
+                    plugin_cache_view
+                        .initial_response_header_policy_plugins()
+                        .as_ref(),
+                ));
             }
             return Ok(grpc_proxy::build_grpc_error_response(
                 14, // UNAVAILABLE
@@ -18613,10 +18765,24 @@ async fn handle_proxy_request_inner(
                 "sidecar mesh mTLS dispatch required for this backend target: {block_reason}"
             );
             if let Some(content_type) = grpc_web_response_content_type {
-                return Ok(build_grpc_web_error_response(content_type, 14, &message));
+                return Ok(build_grpc_web_error_response(
+                    content_type,
+                    14,
+                    &message,
+                    plugin_cache_view
+                        .initial_response_header_policy_plugins()
+                        .as_ref(),
+                ));
             }
             if grpc_request_is_web_translated
-                && let Some(response) = build_translated_grpc_web_error_response(&ctx, 14, &message)
+                && let Some(response) = build_translated_grpc_web_error_response(
+                    &ctx,
+                    14,
+                    &message,
+                    plugin_cache_view
+                        .initial_response_header_policy_plugins()
+                        .as_ref(),
+                )
             {
                 return Ok(response);
             }
@@ -23449,6 +23615,7 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
 fn build_request_body_timeout_response(
     is_grpc_request: bool,
     grpc_web_response_content_type: Option<&str>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Response<ProxyBody> {
     const MESSAGE: &str = "Request body read timed out";
     if let Some(content_type) = grpc_web_response_content_type {
@@ -23456,6 +23623,7 @@ fn build_request_body_timeout_response(
             content_type,
             grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
             MESSAGE,
+            initial_response_header_policy_plugins,
         );
     }
     if is_grpc_request {
@@ -27447,7 +27615,7 @@ mod tests {
 
     #[test]
     fn request_body_timeout_uses_grpc_deadline_response() {
-        let response = super::build_request_body_timeout_response(true, None);
+        let response = super::build_request_body_timeout_response(true, None, &[]);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response

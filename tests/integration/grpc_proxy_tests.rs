@@ -1702,7 +1702,13 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let state = create_test_proxy_state_with_plugins(
+        vec![proxy],
+        vec![
+            plugin,
+            security_headers_plugin("grpc-web-backend-error-security"),
+        ],
+    );
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
     let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
@@ -1737,6 +1743,27 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         "a gateway gRPC error for a gRPC-Web request must use the gRPC-Web content-type, \
          not raw application/grpc"
     );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced"),
+        "gateway-generated gRPC-Web errors must retain initial-header policy"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("strict-transport-security")
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=31536000; includeSubDomains")
+    );
+    for name in ["grpc-status", "grpc-message", "grpc-status-details-bin"] {
+        assert!(
+            response.headers().get(name).is_none(),
+            "terminal {name} metadata must remain in the gRPC-Web body trailer frame"
+        );
+    }
 
     let body_bytes = response
         .into_body()
