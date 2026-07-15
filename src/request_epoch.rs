@@ -52,9 +52,11 @@ pub(crate) fn build_proxy_index_by_id(config: &GatewayConfig) -> Arc<HashMap<Str
     )
 }
 
+type UpstreamEndpointKey<'a> = (&'a str, u16, Vec<(&'a str, &'a str)>);
+
 fn upstream_endpoint_keys(
     upstream: &crate::config::types::Upstream,
-) -> Vec<(&str, u16, Vec<(&str, &str)>)> {
+) -> Vec<UpstreamEndpointKey<'_>> {
     let mut keys: Vec<_> = upstream
         .targets
         .iter()
