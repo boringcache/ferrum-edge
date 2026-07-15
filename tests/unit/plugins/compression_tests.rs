@@ -36,9 +36,7 @@ async fn plan_response_algorithm(
         PluginResult::Continue
     ));
     assert_eq!(
-        response_headers
-            .get("content-encoding")
-            .map(String::as_str),
+        response_headers.get("content-encoding").map(String::as_str),
         Some(encoding)
     );
 }
@@ -1168,8 +1166,7 @@ async fn test_brotli_response_compression_roundtrip() {
 
     let original = b"Hello, this is a test body that should be compressed with brotli encoding!";
 
-    let mut resp_headers =
-        HashMap::from([("content-type".to_string(), "text/html".to_string())]);
+    let mut resp_headers = HashMap::from([("content-type".to_string(), "text/html".to_string())]);
     plan_response_algorithm(&plugin, &mut ctx, &mut resp_headers, "br").await;
 
     let compressed = plugin

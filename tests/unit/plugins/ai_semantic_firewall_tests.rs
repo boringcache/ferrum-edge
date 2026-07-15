@@ -3942,8 +3942,7 @@ async fn planned_gateway_compression_inspects_plaintext_before_encoding() {
         "min_content_length": 0
     }))
     .unwrap();
-    let mut headers =
-        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let mut ctx = create_test_context();
     ctx.headers
         .insert("accept-encoding".to_string(), "gzip".to_string());
@@ -4018,12 +4017,7 @@ async fn gateway_compressed_oversized_non_candidate_skips_final_decode() {
     );
 
     let encoded = compression
-        .transform_response_body_with_context(
-            &mut ctx,
-            &plaintext,
-            Some("text/plain"),
-            &headers,
-        )
+        .transform_response_body_with_context(&mut ctx, &plaintext, Some("text/plain"), &headers)
         .await
         .expect("planned gateway compression should transform the body");
     assert!(encoded.len() < plaintext.len());

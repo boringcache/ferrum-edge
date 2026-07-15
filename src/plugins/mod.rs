@@ -915,8 +915,7 @@ impl RequestContext {
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
-            gateway_response_compression_algorithm: self
-                .gateway_response_compression_algorithm,
+            gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,

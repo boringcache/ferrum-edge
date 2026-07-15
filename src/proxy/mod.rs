@@ -308,15 +308,12 @@ pub(crate) fn stamp_original_response_metadata(
         );
     }
     ctx.metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
-    if let Some(encoding) = response_headers
-        .get("content-encoding")
-        .filter(|encoding| {
-            encoding
-                .split(',')
-                .map(str::trim)
-                .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
-        })
-    {
+    if let Some(encoding) = response_headers.get("content-encoding").filter(|encoding| {
+        encoding
+            .split(',')
+            .map(str::trim)
+            .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
+    }) {
         ctx.metadata.insert(
             ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
             encoding.clone(),
