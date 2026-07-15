@@ -1591,7 +1591,13 @@ async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
             .and_then(|value| value.to_str().ok()),
         Some("application/grpc-web+proto")
     );
-    assert!(response.headers().get("grpc-status").is_none());
+    assert_eq!(
+        response
+            .headers()
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("7")
+    );
     let body = response
         .into_body()
         .collect()
