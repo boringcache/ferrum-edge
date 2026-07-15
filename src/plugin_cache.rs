@@ -866,9 +866,7 @@ fn push_upstream_route(
     }
 }
 
-fn adaptive_concurrency_port_override_keys(
-    upstream: &crate::config::types::Upstream,
-) -> Vec<u16> {
+fn adaptive_concurrency_port_override_keys(upstream: &crate::config::types::Upstream) -> Vec<u16> {
     let mut keys = upstream.port_overrides.keys().copied().collect::<Vec<_>>();
     keys.sort_unstable();
     keys
