@@ -24,6 +24,7 @@ use tracing::{error, warn};
 
 use crate::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
+    adaptive_concurrency_scope,
 };
 use crate::config::types::PluginConfig;
 use crate::plugins::utils::jwks_cache::retain_active_uris;
@@ -695,6 +696,7 @@ struct AdaptiveConcurrencyUpstreamRoute {
 
 #[derive(Clone, Debug, PartialEq)]
 struct AdaptiveConcurrencyRouteDefinition {
+    protected_proxy_ids: Vec<String>,
     keys: Vec<AdaptiveConcurrencyRouteKey>,
     overrides: Vec<AdaptiveConcurrencyRouteOverride>,
     upstream_routes: Vec<AdaptiveConcurrencyUpstreamRoute>,
@@ -770,20 +772,6 @@ fn plugin_config_effectively_applies_to_proxy(
         PluginScope::Proxy | PluginScope::ProxyGroup => {
             scoped_plugin_config_applies_to_proxy(pc, proxy)
         }
-    }
-}
-
-fn adaptive_concurrency_scope(
-    key_by: AdaptiveConcurrencyKeyBy,
-    proxy: &crate::config::types::Proxy,
-    upstream_id: Option<&str>,
-) -> String {
-    match key_by {
-        AdaptiveConcurrencyKeyBy::Proxy => format!("proxy:{}:{}", proxy.namespace, proxy.id),
-        AdaptiveConcurrencyKeyBy::Upstream => upstream_id
-            .map(|upstream_id| format!("upstream:{}:{upstream_id}", proxy.namespace))
-            .unwrap_or_else(|| format!("proxy:{}:{}", proxy.namespace, proxy.id)),
-        AdaptiveConcurrencyKeyBy::Backend => "backend".to_string(),
     }
 }
 
@@ -937,6 +925,9 @@ fn push_direct_route_key(
 }
 
 fn normalize_adaptive_concurrency_direct_host(host: &str) -> String {
+    // GatewayConfig::normalize_fields delegates configured destinations to
+    // Proxy::normalize_fields and Upstream::normalize_fields. Route overrides
+    // bypass those host fields, so mirror their lowercase contract here.
     host.trim().to_ascii_lowercase()
 }
 
@@ -1361,6 +1352,7 @@ fn adaptive_concurrency_route_definition(
     key_by: AdaptiveConcurrencyKeyBy,
     config: &GatewayConfig,
 ) -> AdaptiveConcurrencyRouteDefinition {
+    let mut protected_proxy_ids = Vec::new();
     let mut keys = Vec::new();
     let mut overrides = Vec::new();
     let mut upstream_routes = Vec::new();
@@ -1368,6 +1360,7 @@ fn adaptive_concurrency_route_definition(
         if !plugin_config_effectively_applies_to_proxy(pc, proxy, config) {
             continue;
         }
+        protected_proxy_ids.push(proxy.id.clone());
 
         for route_pc in effective_route_override_configs_for_proxy(proxy, config) {
             collect_route_override_destinations(
@@ -1416,9 +1409,12 @@ fn adaptive_concurrency_route_definition(
     // only by proxy ID so the effective route-plugin order within each proxy
     // remains visible to compatibility checks.
     overrides.sort_by(|left, right| left.proxy_id.cmp(&right.proxy_id));
+    protected_proxy_ids.sort_unstable();
+    protected_proxy_ids.dedup();
     upstream_routes.sort_unstable();
     upstream_routes.dedup();
     AdaptiveConcurrencyRouteDefinition {
+        protected_proxy_ids,
         keys,
         overrides,
         upstream_routes,
@@ -1469,13 +1465,77 @@ fn adaptive_concurrency_effective_lb_keys(
     keys
 }
 
+fn adaptive_concurrency_has_zero_target_sentinel(keys: &[AdaptiveConcurrencyRouteKey]) -> bool {
+    keys.iter()
+        .any(|key| key.host.is_none() && key.port.is_none())
+}
+
+/// Existing target keys keep their counters during strict scale-out. Any
+/// retirement/replacement still drains, as do expansions involving the
+/// zero-target sentinel because it identifies a route source rather than a
+/// concrete limiter key and can collide across sources sharing one scope.
+fn adaptive_concurrency_key_space_requires_drain(
+    current: &[AdaptiveConcurrencyRouteKey],
+    replacement: &[AdaptiveConcurrencyRouteKey],
+) -> bool {
+    if current == replacement {
+        return false;
+    }
+    if adaptive_concurrency_has_zero_target_sentinel(current)
+        || adaptive_concurrency_has_zero_target_sentinel(replacement)
+    {
+        return true;
+    }
+    !current
+        .iter()
+        .all(|key| replacement.binary_search(key).is_ok())
+}
+
+fn adaptive_concurrency_route_definition_requires_drain(
+    current: &AdaptiveConcurrencyRouteDefinition,
+    replacement: &AdaptiveConcurrencyRouteDefinition,
+) -> bool {
+    if current == replacement {
+        return false;
+    }
+    let existing_proxy_scopes_preserved = current
+        .protected_proxy_ids
+        .iter()
+        .all(|proxy_id| replacement.protected_proxy_ids.binary_search(proxy_id).is_ok());
+    let existing_override_semantics_preserved = current.protected_proxy_ids.iter().all(|proxy_id| {
+        current
+            .overrides
+            .iter()
+            .filter(|route| route.proxy_id.as_str() == proxy_id.as_str())
+            .eq(replacement
+                .overrides
+                .iter()
+                .filter(|route| route.proxy_id.as_str() == proxy_id.as_str()))
+    });
+    if !existing_proxy_scopes_preserved
+        || !existing_override_semantics_preserved
+        || adaptive_concurrency_has_zero_target_sentinel(&current.keys)
+        || adaptive_concurrency_has_zero_target_sentinel(&replacement.keys)
+        || !current
+            .upstream_routes
+            .iter()
+            .all(|route| replacement.upstream_routes.binary_search(route).is_ok())
+    {
+        return true;
+    }
+    adaptive_concurrency_key_space_requires_drain(&current.keys, &replacement.keys)
+}
+
 fn adaptive_concurrency_lb_key_space_changed(
     instance: &AdaptiveConcurrencyInstance,
     current: &crate::load_balancer::LoadBalancerCacheInner,
     replacement: &crate::load_balancer::LoadBalancerCacheInner,
 ) -> bool {
-    adaptive_concurrency_effective_lb_keys(&instance.route_definition, current)
-        != adaptive_concurrency_effective_lb_keys(&instance.route_definition, replacement)
+    let current_keys =
+        adaptive_concurrency_effective_lb_keys(&instance.route_definition, current);
+    let replacement_keys =
+        adaptive_concurrency_effective_lb_keys(&instance.route_definition, replacement);
+    adaptive_concurrency_key_space_requires_drain(&current_keys, &replacement_keys)
 }
 
 fn retained_adaptive_concurrency_states(
@@ -1616,7 +1676,10 @@ fn create_adaptive_concurrency_plugin(
                 || parsed.max_tracked_keys < existing.config.max_tracked_keys
                 || existing.scope != pc.scope
                 || existing.proxy_id != pc.proxy_id
-                || existing.route_definition != route_definition,
+                || adaptive_concurrency_route_definition_requires_drain(
+                    &existing.route_definition,
+                    &route_definition,
+                ),
         )
     } else {
         (

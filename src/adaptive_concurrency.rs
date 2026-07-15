@@ -614,7 +614,9 @@ impl AdaptiveConcurrencyLimiter {
         AdaptiveConcurrencyLimitExceeded {
             current_in_flight: self.policy.total_in_flight.load(Ordering::Acquire),
             limit: config.min_limit,
-            expose_headers: config.expose_headers,
+            // A structural transition is policy-wide: neither the aggregate
+            // count nor any configured bound is a truthful per-target value.
+            expose_headers: false,
         }
     }
 
@@ -887,12 +889,20 @@ impl AdaptiveConcurrencyLimiter {
     fn resolve_scope(&self, proxy: &Proxy, key_by: AdaptiveConcurrencyKeyBy) -> Arc<str> {
         match key_by {
             AdaptiveConcurrencyKeyBy::Backend => Arc::clone(&self.backend_scope),
-            AdaptiveConcurrencyKeyBy::Upstream => Arc::from(compute_scope_string(proxy, key_by)),
+            AdaptiveConcurrencyKeyBy::Upstream => Arc::from(adaptive_concurrency_scope(
+                key_by,
+                proxy,
+                proxy.upstream_id.as_deref(),
+            )),
             AdaptiveConcurrencyKeyBy::Proxy => {
                 if let Some(cached) = self.scope_cache.get(proxy.id.as_str()) {
                     return Arc::clone(cached.value());
                 }
-                let scope: Arc<str> = Arc::from(compute_scope_string(proxy, key_by));
+                let scope: Arc<str> = Arc::from(adaptive_concurrency_scope(
+                    key_by,
+                    proxy,
+                    proxy.upstream_id.as_deref(),
+                ));
                 self.scope_cache
                     .insert(proxy.id.as_str().into(), Arc::clone(&scope));
                 scope
@@ -931,9 +941,10 @@ impl AdaptiveConcurrencySnapshot {
 pub struct AdaptiveConcurrencyLimitExceeded {
     pub current_in_flight: u64,
     pub limit: u64,
-    /// Header policy from the same active configuration that made the
-    /// admission decision. A request pinned to an older compatible plugin
-    /// view must not render a rejection with that view's retired policy.
+    /// Whether a genuine per-target limit rejection should expose its target
+    /// values. Policy-wide generation/drain transitions always set this false;
+    /// a request pinned to an older compatible plugin view otherwise uses the
+    /// active configuration's header policy.
     pub expose_headers: bool,
 }
 
@@ -1112,12 +1123,17 @@ fn build_key(
     }
 }
 
-fn compute_scope_string(proxy: &Proxy, key_by: AdaptiveConcurrencyKeyBy) -> String {
+/// Canonical scope formatter shared by request admission and cold route-key
+/// inventory. `upstream_id` may be an effective route override; `None` uses the
+/// direct-backend proxy fallback required by `upstream_target` scoping.
+pub(crate) fn adaptive_concurrency_scope(
+    key_by: AdaptiveConcurrencyKeyBy,
+    proxy: &Proxy,
+    upstream_id: Option<&str>,
+) -> String {
     match key_by {
         AdaptiveConcurrencyKeyBy::Proxy => scoped_proxy(proxy),
-        AdaptiveConcurrencyKeyBy::Upstream => proxy
-            .upstream_id
-            .as_deref()
+        AdaptiveConcurrencyKeyBy::Upstream => upstream_id
             .map(|upstream_id| {
                 let mut scope = String::with_capacity(
                     "upstream::".len() + proxy.namespace.len() + upstream_id.len(),

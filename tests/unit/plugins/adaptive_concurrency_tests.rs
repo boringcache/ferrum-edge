@@ -1166,6 +1166,71 @@ fn adaptive_concurrency_structural_config_change_drains_old_key_space() {
 }
 
 #[test]
+fn adaptive_concurrency_transition_rejection_omits_per_target_headers() {
+    let config = cache_config(
+        "proxy",
+        json!({
+            "key_by": "proxy_target",
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 100,
+            "expose_headers": true
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let held = expect_admitted(acquire_from_cache(&cache, &config));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[0].config["key_by"] = json!("backend_target");
+    cache
+        .rebuild(&reloaded)
+        .expect("structural key-space change should publish");
+
+    match acquire_from_cache(&cache, &reloaded) {
+        BackendAdmissionDecision::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert!(
+                !headers.contains_key("x-adaptive-concurrency-limit"),
+                "a policy-wide drain has no truthful per-target limit"
+            );
+            assert!(
+                !headers.contains_key("x-adaptive-concurrency-inflight"),
+                "a policy-wide drain has no truthful per-target in-flight count"
+            );
+        }
+        _ => panic!("replacement policy should reject during the structural drain"),
+    }
+
+    drop(held);
+    let replacement_permit = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    match acquire_from_cache(&cache, &reloaded) {
+        BackendAdmissionDecision::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert_eq!(
+                headers.get("x-adaptive-concurrency-limit").map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                headers
+                    .get("x-adaptive-concurrency-inflight")
+                    .map(String::as_str),
+                Some("1")
+            );
+        }
+        _ => panic!("a genuine per-target limit rejection should expose target headers"),
+    }
+    drop(replacement_permit);
+}
+
+#[test]
 fn adaptive_concurrency_overlapping_structural_reloads_keep_newest_reset_authoritative() {
     let config = cache_config(
         "proxy",
@@ -1286,6 +1351,121 @@ fn adaptive_concurrency_upstream_target_reload_reclaims_retired_key_capacity() {
         Some(replacement_target),
     ));
     drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_configured_upstream_scale_out_keeps_old_permit_active() {
+    let mut config = cache_config(
+        "proxy",
+        json!({
+            "max_tracked_keys": 2,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+    );
+    config.proxies[0].upstream_id = Some("upstream-1".to_string());
+    config.upstreams.push(
+        serde_json::from_value(json!({
+            "id": "upstream-1",
+            "namespace": "default",
+            "targets": [{"host": "first.local", "port": 8080}]
+        }))
+        .expect("upstream should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let first_target = config.upstreams[0].targets[0].clone();
+    let held_old_target = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &config.proxies[0],
+        Some(&first_target),
+    ));
+
+    let mut reloaded = config.clone();
+    reloaded.upstreams[0]
+        .targets
+        .push(target("second.local", 8080));
+    cache
+        .apply_delta(&reloaded, &HashSet::new(), &[], false)
+        .expect("configured upstream scale-out should publish");
+
+    let added_target = &reloaded.upstreams[0].targets[1];
+    let added_target_permit = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &reloaded.proxies[0],
+        Some(added_target),
+    ));
+    drop(added_target_permit);
+    drop(held_old_target);
+}
+
+#[test]
+fn adaptive_concurrency_proxy_group_association_growth_keeps_old_permit_active() {
+    let config: GatewayConfig = serde_json::from_value(json!({
+        "version": "1",
+        "proxies": [
+            {
+                "id": "proxy-1",
+                "namespace": "default",
+                "listen_path": "/one",
+                "backend_host": "first.local",
+                "backend_port": 8080,
+                "plugins": [{"plugin_config_id": "adaptive-1"}]
+            },
+            {
+                "id": "proxy-2",
+                "namespace": "default",
+                "listen_path": "/two",
+                "backend_host": "second.local",
+                "backend_port": 8080,
+                "plugins": []
+            }
+        ],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "adaptive-1",
+            "namespace": "default",
+            "plugin_name": "adaptive_concurrency",
+            "scope": "proxy_group",
+            "enabled": true,
+            "config": {
+                "max_tracked_keys": 2,
+                "min_limit": 1,
+                "initial_limit": 1,
+                "max_limit": 1
+            }
+        }]
+    }))
+    .expect("proxy-group scale-out config should deserialize");
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let held_old_target = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_for_proxy(&cache, "proxy-1"),
+        &config.proxies[0],
+        None,
+    ));
+
+    let mut reloaded = config.clone();
+    reloaded.proxies[1].plugins.push(
+        serde_json::from_value(json!({"plugin_config_id": "adaptive-1"}))
+            .expect("proxy-group association should deserialize"),
+    );
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from(["proxy-2".to_string()]),
+            &[],
+            false,
+        )
+        .expect("proxy-group association scale-out should publish");
+
+    let added_target_permit = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_for_proxy(&cache, "proxy-2"),
+        &reloaded.proxies[1],
+        None,
+    ));
+    drop(added_target_permit);
+    drop(held_old_target);
 }
 
 #[test]
