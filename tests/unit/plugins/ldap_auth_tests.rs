@@ -1,9 +1,8 @@
 //! Tests for ldap_auth plugin — config validation and credential extraction.
 //!
-//! Note: These tests validate plugin construction (config validation) and
-//! credential parsing from the Authorization header. Actual LDAP server
-//! interaction is not tested here since it requires a real LDAP server;
-//! those scenarios are covered by integration/functional tests.
+//! The protocol-mock tests below also exercise bind, search-then-bind, and
+//! group-authorization behavior through the public plugin interface. Live
+//! directory behavior is covered by the LDAP service-integration suite.
 
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::{
@@ -952,7 +951,7 @@ fn search_result_done(message_id: u8, result_code: u8) -> Vec<u8> {
     )
 }
 
-async fn read_ldap_message(stream: &mut tokio::net::TcpStream) {
+async fn read_ldap_message_bytes(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
 
     let mut header = [0u8; 2];
@@ -979,6 +978,17 @@ async fn read_ldap_message(stream: &mut tokio::net::TcpStream) {
         .read_exact(&mut body)
         .await
         .expect("read LDAP message body");
+    body
+}
+
+async fn read_ldap_message(stream: &mut tokio::net::TcpStream) {
+    let _ = read_ldap_message_bytes(stream).await;
+}
+
+fn ldap_message_contains(message: &[u8], value: &str) -> bool {
+    message
+        .windows(value.len())
+        .any(|window| window == value.as_bytes())
 }
 
 async fn spawn_search_bind_server(
@@ -1119,6 +1129,160 @@ async fn test_search_bind_rejects_ambiguous_results() {
     assert_reject(result, Some(401));
     assert!(ctx.authenticated_identity.is_none());
     task.abort();
+}
+
+async fn assert_search_bind_group_checks_use_canonical_identity(
+    custom_group_filter: Option<&str>,
+) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    const PRESENTED_ALIAS: &str = "alice@example.com";
+    const CANONICAL_IDENTITY: &str = "immutable-alice-id";
+    const USER_DN: &str = "uid=alice,ou=users,dc=example,dc=com";
+    const GROUP_DN: &str = "cn=gateway-admins,ou=groups,dc=example,dc=com";
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind canonical group-check LDAP server");
+    let port = listener
+        .local_addr()
+        .expect("canonical group-check LDAP local addr")
+        .port();
+    let expects_exact_group_proof = custom_group_filter.is_some();
+    let task = tokio::spawn(async move {
+        let (mut service_stream, _) = listener.accept().await.expect("accept service bind");
+        read_ldap_message(&mut service_stream).await;
+        service_stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write service bind success");
+
+        let user_search = read_ldap_message_bytes(&mut service_stream).await;
+        assert!(
+            ldap_message_contains(&user_search, PRESENTED_ALIAS),
+            "the presented login must remain the user-search input"
+        );
+        service_stream
+            .write_all(&search_result_entry(
+                2,
+                USER_DN,
+                &[("entryUUID", &[CANONICAL_IDENTITY])],
+            ))
+            .await
+            .expect("write canonical user search entry");
+        service_stream
+            .write_all(&search_result_done(2, 0))
+            .await
+            .expect("write canonical user search done");
+        drop(service_stream);
+
+        let (mut user_stream, _) = listener.accept().await.expect("accept selected user bind");
+        read_ldap_message(&mut user_stream).await;
+        user_stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write selected user bind success");
+        drop(user_stream);
+
+        let (mut group_stream, _) = listener.accept().await.expect("accept group service bind");
+        read_ldap_message(&mut group_stream).await;
+        group_stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write group service bind success");
+
+        let group_search = read_ldap_message_bytes(&mut group_stream).await;
+        assert!(
+            ldap_message_contains(&group_search, CANONICAL_IDENTITY),
+            "group search did not use the authenticated canonical identity"
+        );
+        assert!(
+            ldap_message_contains(&group_search, "memberUid"),
+            "group search did not carry the username-based membership predicate"
+        );
+        assert!(
+            !ldap_message_contains(&group_search, PRESENTED_ALIAS),
+            "group search reused the client-presented alias"
+        );
+        group_stream
+            .write_all(&search_result_entry(
+                2,
+                GROUP_DN,
+                &[("cn", &["gateway-admins"])],
+            ))
+            .await
+            .expect("write required group search entry");
+        group_stream
+            .write_all(&search_result_done(2, 0))
+            .await
+            .expect("write required group search done");
+
+        if expects_exact_group_proof {
+            let exact_group_proof = read_ldap_message_bytes(&mut group_stream).await;
+            assert!(
+                ldap_message_contains(&exact_group_proof, CANONICAL_IDENTITY),
+                "exact returned-group proof did not use the canonical identity"
+            );
+            assert!(
+                ldap_message_contains(&exact_group_proof, "memberUid"),
+                "exact returned-group proof did not carry the memberUid predicate"
+            );
+            assert!(
+                !ldap_message_contains(&exact_group_proof, PRESENTED_ALIAS),
+                "exact returned-group proof reused the client-presented alias"
+            );
+            group_stream
+                .write_all(&search_result_entry(3, GROUP_DN, &[]))
+                .await
+                .expect("write exact returned-group proof");
+            group_stream
+                .write_all(&search_result_done(3, 0))
+                .await
+                .expect("write exact returned-group proof done");
+        }
+    });
+
+    let mut config = json!({
+        "ldap_url": format!("ldap://127.0.0.1:{port}"),
+        "search_base_dn": "ou=users,dc=example,dc=com",
+        "search_filter": "(mail={username})",
+        "canonical_identity_attribute": "entryUUID",
+        "service_account_dn": "cn=admin,dc=example,dc=com",
+        "service_account_password": "service-secret",
+        "group_base_dn": "ou=groups,dc=example,dc=com",
+        "required_groups": ["gateway-admins"],
+        "consumer_mapping": false
+    });
+    if let Some(group_filter) = custom_group_filter {
+        config["group_filter"] = json!(group_filter);
+    }
+    let plugin = LdapAuth::new(&config, http_client()).expect("valid canonical group-check config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header(PRESENTED_ALIAS, "user-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some(CANONICAL_IDENTITY)
+    );
+    task.await.expect("canonical group-check LDAP server");
+}
+
+#[tokio::test]
+async fn test_search_bind_default_member_uid_uses_canonical_identity() {
+    assert_search_bind_group_checks_use_canonical_identity(None).await;
+}
+
+#[tokio::test]
+async fn test_search_bind_custom_username_and_exact_proof_use_canonical_identity() {
+    assert_search_bind_group_checks_use_canonical_identity(Some("(memberUid={username})")).await;
 }
 
 async fn assert_group_search_result(

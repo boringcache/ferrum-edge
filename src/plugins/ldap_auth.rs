@@ -139,7 +139,8 @@ pub struct LdapAuth {
     search_base_dn: Option<String>,
     /// Search filter with {username} placeholder, e.g. "(&(objectClass=person)(sAMAccountName={username}))"
     search_filter: Option<String>,
-    /// Attribute returned by search-then-bind and used as the Ferrum identity.
+    /// Attribute returned by search-then-bind and used as the Ferrum identity
+    /// and username-based group-authorization value.
     canonical_identity_attribute: Option<String>,
     /// Service account for search-then-bind
     service_account_dn: Option<String>,

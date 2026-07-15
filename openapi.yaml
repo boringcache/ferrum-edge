@@ -11618,7 +11618,7 @@ components:
         canonical_identity_attribute:
           type: string
           minLength: 1
-          description: "Required for search-then-bind. Exactly one value from the uniquely selected entry becomes the authenticated identity and Consumer mapping key (for example uid or sAMAccountName). Attribute-name matching is LDAP case-insensitive."
+          description: "Required for search-then-bind. Exactly one value from the uniquely selected entry becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive."
         service_account_dn:
           type: string
           minLength: 1
