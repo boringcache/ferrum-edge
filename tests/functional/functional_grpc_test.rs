@@ -1347,7 +1347,7 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
     assert_eq!(status, 200, "gRPC route miss should return HTTP 200");
     assert!(body.is_empty(), "gRPC route miss should be trailers-only");
     assert!(
-        headers.get("x-synthetic-policy").is_none(),
+        !headers.contains_key("x-synthetic-policy"),
         "pre-routing route misses have no resolved policy configuration"
     );
     assert_eq!(
@@ -1393,7 +1393,7 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
         headers2.get("content-length").map(String::as_str),
         Some("999")
     );
-    assert!(headers2.get("transfer-encoding").is_none());
+    assert!(!headers2.contains_key("transfer-encoding"));
 
     let _ = gateway.kill();
     let _ = gateway.wait();
