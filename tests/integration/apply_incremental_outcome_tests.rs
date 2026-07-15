@@ -399,6 +399,7 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
         },
         "set": { "X-Policy": "must-not-publish" }
     });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
     let outcome = state.update_config(invalid);
     let ConfigApplyOutcome::Rejected { errors } = outcome else {
         panic!("unknown nested security_headers key must reject reload");
