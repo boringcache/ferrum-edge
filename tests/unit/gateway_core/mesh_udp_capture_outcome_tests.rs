@@ -1,12 +1,13 @@
 use ferrum_edge::proxy::mesh_udp_capture::{CapturedUdpOutcome, CapturedUdpOutcomeSignal};
 
 #[tokio::test]
-async fn captured_udp_idle_sweep_before_watchdog_keeps_idle_outcome() {
+async fn captured_udp_idle_sweep_before_relay_cleanup_keeps_idle_outcome() {
     let signal = CapturedUdpOutcomeSignal::new();
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<()>(1);
 
     // This is the production ordering: publish the reason before `retain`
-    // drops the map-owned sender and wakes the egress receiver.
+    // drops the map-owned sender. The lifecycle Drop fallback uses this same
+    // resolution if producer shutdown aborts the relay before it wakes.
     signal.mark_idle_timeout();
     drop(sender);
 

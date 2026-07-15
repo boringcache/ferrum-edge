@@ -6152,6 +6152,66 @@ async fn workload_metrics_keeps_early_trace_context_for_reject_observability() {
 }
 
 #[tokio::test]
+async fn workload_metrics_rebuilds_source_identity_after_baggage_transform() {
+    let metrics = WorkloadMetrics::new(&json!({
+        "namespace": "payments",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
+        "labels": {"app": "checkout"},
+        "trusted_hbone_assertors": ["spiffe://cluster.local/assertor"]
+    }))
+    .expect("workload metrics config");
+    let transformer = trace_header_remover("baggage");
+    let mut ctx = request_context(Some("spiffe://cluster.local/assertor"));
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    ctx.headers.insert(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/storefront/sa/frontend".to_string(),
+    );
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.namespace")
+            .map(String::as_str),
+        Some("storefront")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.service_account")
+            .map(String::as_str),
+        Some("frontend")
+    );
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/assertor")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.trust_domain")
+            .map(String::as_str),
+        Some("cluster.local")
+    );
+    assert!(!ctx.metadata.contains_key("mesh.source.namespace"));
+    assert!(!ctx.metadata.contains_key("mesh.source.service_account"));
+    assert_eq!(
+        ctx.metadata.get("mesh.source.workload").map(String::as_str),
+        Some("unknown")
+    );
+}
+
+#[tokio::test]
 async fn workload_metrics_node_waypoint_http_outbound_uses_asserted_pod_before_baggage() {
     let plugin = WorkloadMetrics::new(&json!({
         "topology": "node_waypoint",

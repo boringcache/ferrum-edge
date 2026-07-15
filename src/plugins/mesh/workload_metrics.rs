@@ -339,6 +339,11 @@ impl WorkloadMetrics {
         }
         let hbone_identity = hbone_identity_from_headers(ctx, headers);
         let peer_source_identity = self.resolve_peer_source_identity(ctx, hbone_identity.as_ref());
+        // This method runs before authorization and again after request-header
+        // transforms. Rebuild the SPIFFE-derived source identity as one atomic
+        // view so a final peer with fewer path segments cannot retain namespace
+        // or service-account labels from early trusted baggage.
+        clear_source_spiffe_labels(&mut ctx.metadata);
         ctx.metadata.insert(
             "mesh.connection_security_policy".to_string(),
             if ctx.peer_spiffe_id.is_some() || ctx.tls_client_cert_der.is_some() {
@@ -868,10 +873,7 @@ impl Plugin for WorkloadMetrics {
             && ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str)
                 != ctx.peer_spiffe_id.as_ref().map(SpiffeId::as_str)
         {
-            ctx.metadata.remove(MESH_SOURCE_PRINCIPAL);
-            ctx.metadata.remove(MESH_SOURCE_TRUST_DOMAIN);
-            ctx.metadata.remove(MESH_SOURCE_NAMESPACE);
-            ctx.metadata.remove(MESH_SOURCE_SERVICE_ACCOUNT);
+            clear_source_spiffe_labels(&mut ctx.metadata);
             let headers = std::mem::take(&mut ctx.headers);
             self.annotate_http_context(ctx, &headers);
             ctx.headers = headers;
@@ -1737,6 +1739,17 @@ fn has_valid_traceparent(headers: &HashMap<String, String>) -> bool {
     header_value(headers, TRACEPARENT_HEADER)
         .and_then(OtelTracing::parse_traceparent)
         .is_some()
+}
+
+fn clear_source_spiffe_labels(metadata: &mut HashMap<String, String>) {
+    for key in [
+        MESH_SOURCE_PRINCIPAL,
+        MESH_SOURCE_TRUST_DOMAIN,
+        MESH_SOURCE_NAMESPACE,
+        MESH_SOURCE_SERVICE_ACCOUNT,
+    ] {
+        metadata.remove(key);
+    }
 }
 
 fn insert_source_spiffe_labels(metadata: &mut HashMap<String, String>, identity: &SpiffeId) {

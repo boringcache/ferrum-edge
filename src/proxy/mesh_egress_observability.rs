@@ -232,6 +232,21 @@ impl CapturedMeshEgressLifecycle {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn complete_udp_client_reply_failure(
+        &mut self,
+        bytes_sent: u64,
+        bytes_received: u64,
+    ) {
+        self.completion_recorded = true;
+        self.bytes_sent = bytes_sent;
+        self.bytes_received = bytes_received;
+        self.connection_error = Some("captured mesh UDP reply send to client failed".to_string());
+        self.error_class = Some(ErrorClass::ClientDisconnect);
+        self.disconnect_direction = Some(Direction::BackendToClient);
+        self.disconnect_cause = Some(DisconnectCause::RecvError);
+    }
+
     fn complete_gracefully(&mut self) {
         self.completion_recorded = true;
         self.connection_error = None;
@@ -274,7 +289,14 @@ impl Drop for CapturedMeshEgressLifecycle {
             && let Some(outcome) = self
                 .udp_outcome_signal
                 .as_ref()
-                .and_then(|signal| signal.producer_shutdown_outcome())
+                .and_then(|signal| {
+                    let outcome = signal.resolve_egress_completion(true);
+                    matches!(
+                        outcome,
+                        CapturedUdpOutcome::IdleTimeout | CapturedUdpOutcome::ProducerShutdown
+                    )
+                    .then_some(outcome)
+                })
         {
             let (bytes_sent, bytes_received) = self
                 .udp_byte_counters

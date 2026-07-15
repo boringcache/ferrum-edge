@@ -104,11 +104,6 @@ impl CapturedUdpOutcomeSignal {
             _ => CapturedUdpOutcome::EgressPathEnded,
         }
     }
-
-    pub(crate) fn producer_shutdown_outcome(&self) -> Option<CapturedUdpOutcome> {
-        (self.reason.load(std::sync::atomic::Ordering::Acquire) == Self::PRODUCER_SHUTDOWN)
-            .then_some(CapturedUdpOutcome::ProducerShutdown)
-    }
 }
 
 /// Process-local admission counter for captured UDP sessions.
@@ -1583,6 +1578,11 @@ async fn run_udp_egress_session(
         observability.set_udp_byte_counters(bytes_sent.clone(), bytes_received.clone());
     }
     let return_bytes_received = std::sync::Arc::clone(&bytes_received);
+    enum ReturnPathCompletion {
+        TunnelEnded,
+        ClientReplySendFailed,
+    }
+
     let return_path = async move {
         let mut buf = bytes::BytesMut::with_capacity(super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
         loop {
@@ -1592,6 +1592,10 @@ async fn run_udp_egress_session(
                         crate::socket_opts::monotonic_now_ms(),
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    // Count bytes read from the backend even when the client
+                    // delivery below fails, matching the generic UDP lifecycle.
+                    return_bytes_received
+                        .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     // Best-effort reply; a send error (client gone) ends the
                     // return path, which tears the session down.
                     if let Err(e) = return_socket.send_to(&payload, return_client).await {
@@ -1600,13 +1604,11 @@ async fn run_udp_egress_session(
                             error = %e,
                             "Mesh UDP egress: reply send to client failed; ending return path"
                         );
-                        break;
+                        break ReturnPathCompletion::ClientReplySendFailed;
                     }
-                    return_bytes_received
-                        .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
-                Ok(None) => break, // tunnel half-closed
-                Err(_) => break,   // tunnel read error
+                Ok(None) => break ReturnPathCompletion::TunnelEnded, // tunnel half-closed
+                Err(_) => break ReturnPathCompletion::TunnelEnded,   // tunnel read error
             }
         }
     };
@@ -1710,29 +1712,48 @@ async fn run_udp_egress_session(
 
     // Any arm completing ends the session (and, on return, the caller's
     // `remove_session_if_owned` frees the slot + decrements `active_sessions`).
-    let outcome = tokio::select! {
+    enum SessionCompletion {
+        Relay(CapturedUdpOutcome),
+        ClientReplySendFailed,
+    }
+
+    let completion = tokio::select! {
         biased;
-        _ = return_path => CapturedUdpOutcome::ReturnPathEnded,
+        return_completion = return_path => match return_completion {
+            ReturnPathCompletion::TunnelEnded => {
+                SessionCompletion::Relay(CapturedUdpOutcome::ReturnPathEnded)
+            }
+            ReturnPathCompletion::ClientReplySendFailed => {
+                SessionCompletion::ClientReplySendFailed
+            }
+        },
         (completion, mut tunnel_write) = egress_loop => {
             // The egress completion has won before its local half-close can
             // wake the return reader. Preserve h2 end-stream semantics, then
             // resolve sender closure through the sweep/shutdown signal.
             use tokio::io::AsyncWriteExt as _;
             let _ = tunnel_write.shutdown().await;
-            outcome_signal.resolve_egress_completion(matches!(
+            SessionCompletion::Relay(outcome_signal.resolve_egress_completion(matches!(
                 completion,
                 EgressCompletion::SenderClosed,
-            ))
+            )))
         },
-        _ = watchdog => CapturedUdpOutcome::IdleTimeout,
-        _ = producer_cancelled => CapturedUdpOutcome::ProducerShutdown,
+        _ = watchdog => SessionCompletion::Relay(CapturedUdpOutcome::IdleTimeout),
+        _ = producer_cancelled => {
+            SessionCompletion::Relay(CapturedUdpOutcome::ProducerShutdown)
+        },
     };
     if let Some(observability) = observability.as_mut() {
-        observability.complete_udp(
-            bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
-            bytes_received.load(std::sync::atomic::Ordering::Relaxed),
-            outcome,
-        );
+        let bytes_sent = bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
+        let bytes_received = bytes_received.load(std::sync::atomic::Ordering::Relaxed);
+        match completion {
+            SessionCompletion::Relay(outcome) => {
+                observability.complete_udp(bytes_sent, bytes_received, outcome);
+            }
+            SessionCompletion::ClientReplySendFailed => {
+                observability.complete_udp_client_reply_failure(bytes_sent, bytes_received);
+            }
+        }
     }
 }
 
