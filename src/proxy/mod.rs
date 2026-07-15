@@ -13022,10 +13022,14 @@ async fn run_after_proxy_hooks_on_rejection(
         // response, non-replacing decorators and cleanup hooks must still
         // finish. Keeping the expired RPC timer around those hooks would turn
         // them into an ignored synthetic rejection before they can attach CORS,
-        // correlation, trace, cookie, or accounting state. A fail-closed hook
-        // that may replace the response remains under the deadline so it cannot
-        // override an already-terminal DEADLINE_EXCEEDED outcome.
-        let result = if terminal_gateway_deadline && !plugin.may_replace_rejection_response() {
+        // correlation, trace, cookie, or accounting state. Response-replacing
+        // hooks are skipped after the terminal deadline is selected: an
+        // already-ready replacer can win `timeout_at`'s boundary race even when
+        // the deadline has expired and must never overwrite DEADLINE_EXCEEDED.
+        if terminal_gateway_deadline && plugin.may_replace_rejection_response() {
+            continue;
+        }
+        let result = if terminal_gateway_deadline {
             plugin
                 .after_proxy(ctx, *status_code, response_headers)
                 .await

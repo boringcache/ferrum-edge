@@ -17,7 +17,7 @@ fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
         "H3 effective proxy resolution must use the retry-capped selected base proxy"
     );
     let has_retry = after_selection
-        .find("let has_retry = match http_flavor")
+        .find("let has_retry = match backend_http_flavor")
         .expect("retry-dependent buffering decision must remain present");
     let native_h3_decision = after_selection
         .find("let backend_supports_native_h3 =")
