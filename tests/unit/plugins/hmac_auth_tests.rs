@@ -634,13 +634,8 @@ async fn test_preverified_reuse_verifies_seeded_empty_body_digests() {
         let path = "/empty";
         let date = current_date();
         let incorrect_digest = sha256_content_digest_header(b"not empty");
-        let signature = sign_sha256_with_digest(
-            TEST_SECRET,
-            method,
-            path,
-            &date,
-            &incorrect_digest,
-        );
+        let signature =
+            sign_sha256_with_digest(TEST_SECRET, method, path, &date, &incorrect_digest);
         let mut ctx = make_ctx(method, path);
         ctx.request_body_sha256 = None;
         ctx.request_body_sha512 = None;

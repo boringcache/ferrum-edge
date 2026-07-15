@@ -9950,9 +9950,8 @@ mod inner {
             assert!(
                 source.contains(r#""credentials.keyauth.key": 1"#)
                     && source.contains(r#""credentials.mtls_auth.identity": 1"#)
-                    && source.contains(
-                        r#".keys(doc! { "namespace": 1, HMAC_SECRET_HASHES_FIELD: 1 })"#
-                    )
+                    && source
+                        .contains(r#".keys(doc! { "namespace": 1, HMAC_SECRET_HASHES_FIELD: 1 })"#)
                     && source.contains(".unique(true)"),
                 "MongoDB must enforce keyauth, mTLS, and HMAC credential uniqueness with indexes"
             );
@@ -10094,7 +10093,10 @@ mod inner {
             let doc = consumer_to_doc(&consumer).unwrap();
             let hashes = doc.get_array(HMAC_SECRET_HASHES_FIELD).unwrap();
             assert_eq!(hashes.len(), 1);
-            assert_eq!(hashes[0].as_str(), Some(credential_value_hash(secret).as_str()));
+            assert_eq!(
+                hashes[0].as_str(),
+                Some(credential_value_hash(secret).as_str())
+            );
             assert_ne!(hashes[0].as_str(), Some(secret));
 
             let restored = doc_to_consumer(doc).unwrap();

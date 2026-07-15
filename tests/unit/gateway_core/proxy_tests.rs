@@ -765,8 +765,7 @@ fn test_request_may_have_body_uses_method_and_body_headers() {
         assert!(request_may_have_body(method, &no_headers));
     }
 
-    let content_length_zero =
-        HashMap::from([("content-length".to_string(), "0".to_string())]);
+    let content_length_zero = HashMap::from([("content-length".to_string(), "0".to_string())]);
     let chunked = HashMap::from([("transfer-encoding".to_string(), "chunked".to_string())]);
     for method in ["GET", "HEAD", "OPTIONS"] {
         assert!(request_may_have_body(method, &content_length_zero));

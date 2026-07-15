@@ -424,10 +424,9 @@ async fn consumer_credential_index_enforces_namespace_scoped_hmac_uniqueness() {
 
     let mut tenant_a_conflict = make_consumer("c2", "bob");
     tenant_a_conflict.namespace = "tenant-a".to_string();
-    tenant_a_conflict.credentials.insert(
-        "hmac_auth".to_string(),
-        json!([{ "secret": secret }]),
-    );
+    tenant_a_conflict
+        .credentials
+        .insert("hmac_auth".to_string(), json!([{ "secret": secret }]));
     let error = store
         .create_consumer(&tenant_a_conflict)
         .await
@@ -442,10 +441,9 @@ async fn consumer_credential_index_enforces_namespace_scoped_hmac_uniqueness() {
 
     let mut tenant_b_owner = make_consumer("c1", "carol");
     tenant_b_owner.namespace = "tenant-b".to_string();
-    tenant_b_owner.credentials.insert(
-        "hmac_auth".to_string(),
-        json!([{ "secret": secret }]),
-    );
+    tenant_b_owner
+        .credentials
+        .insert("hmac_auth".to_string(), json!([{ "secret": secret }]));
     store
         .create_consumer(&tenant_b_owner)
         .await
@@ -459,19 +457,14 @@ async fn consumer_credential_index_enforces_namespace_scoped_hmac_uniqueness() {
         json!([{ "secret": original_secret }]),
     );
     store.create_consumer(&rotating).await.unwrap();
-    rotating.credentials.insert(
-        "hmac_auth".to_string(),
-        json!([{ "secret": secret }]),
-    );
+    rotating
+        .credentials
+        .insert("hmac_auth".to_string(), json!([{ "secret": secret }]));
     store
         .update_consumer(&rotating)
         .await
         .expect_err("a conflicting HMAC update must roll back atomically");
-    let stored = store
-        .get_consumer("tenant-a", "c3")
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = store.get_consumer("tenant-a", "c3").await.unwrap().unwrap();
     assert_eq!(
         stored.credentials["hmac_auth"],
         json!([{ "secret": original_secret }])

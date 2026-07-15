@@ -86,13 +86,7 @@ fn generate_hmac_signature_with_query_and_digest(
 ) -> String {
     let signing_string = format!(
         "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        username,
-        authority,
-        method,
-        path,
-        query,
-        date,
-        digest_header
+        username, authority, method, path, query, date, digest_header
     );
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("Failed to create HMAC instance");

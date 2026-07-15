@@ -3531,10 +3531,8 @@ impl GatewayConfig {
         for consumer in &self.consumers {
             for entry in consumer.credential_entries("hmac_auth") {
                 if let Some(secret) = entry.get("secret").and_then(|s| s.as_str())
-                    && let Some(existing_id) = seen_hmac.insert(
-                        (consumer.namespace.as_str(), secret),
-                        consumer.id.as_str(),
-                    )
+                    && let Some(existing_id) = seen_hmac
+                        .insert((consumer.namespace.as_str(), secret), consumer.id.as_str())
                     && existing_id != consumer.id
                 {
                     duplicates.push(format!(

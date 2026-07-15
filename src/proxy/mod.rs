@@ -2254,9 +2254,7 @@ async fn buffer_request_body_for_before_proxy(
     // empty. In particular, an H2 GET/HEAD/OPTIONS request can omit
     // Content-Length while keeping the stream open for DATA, so method/header
     // heuristics alone must not infer an empty body.
-    if !request_may_have_body(method, headers)
-        && hyper::body::Body::is_end_stream(request.body())
-    {
+    if !request_may_have_body(method, headers) && hyper::body::Body::is_end_stream(request.body()) {
         return Ok(ClientRequestBody::Streaming(Box::new(request)));
     }
 

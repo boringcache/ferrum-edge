@@ -11,8 +11,8 @@
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_auth_acl
 
 use crate::common::{
-    TestGateway, empty_digest_header, generate_hmac_signature,
-    generate_hmac_signature_with_digest, hmac_authority_from_url,
+    TestGateway, empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_digest,
+    hmac_authority_from_url,
 };
 
 use base64::Engine;
@@ -389,14 +389,7 @@ async fn assert_empty_body_hmac_regressions(proxy_port: u16) {
         "H2 Content-Length: 0 should accept the empty-body digest"
     );
     assert_eq!(
-        send_h2_hmac_request(
-            proxy_port,
-            "POST",
-            &incorrect_empty_digest,
-            Some("0"),
-            None,
-        )
-        .await,
+        send_h2_hmac_request(proxy_port, "POST", &incorrect_empty_digest, Some("0"), None,).await,
         401,
         "H2 Content-Length: 0 must reject a signed non-empty digest"
     );
@@ -410,14 +403,7 @@ async fn assert_empty_body_hmac_regressions(proxy_port: u16) {
         "open H2 GET ending with empty DATA should authenticate"
     );
     assert_eq!(
-        send_h2_hmac_request(
-            proxy_port,
-            "GET",
-            &incorrect_empty_digest,
-            None,
-            Some(&[]),
-        )
-        .await,
+        send_h2_hmac_request(proxy_port, "GET", &incorrect_empty_digest, None, Some(&[]),).await,
         401,
         "open H2 GET ending with empty DATA must verify the final empty digest"
     );
