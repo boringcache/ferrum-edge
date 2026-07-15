@@ -428,10 +428,12 @@ impl WorkloadMetrics {
         // runs before this hook and its final header policy is authoritative.
         // A valid final W3C or B3 value replaces every early-derived trace
         // field, including locally generated context when the transformer adds
-        // traceparent. Removed or malformed captured context stays suppressed
-        // while the early IDs remain available for the local span/reject record.
+        // traceparent. When an inbound W3C parent was captured, only a valid
+        // final W3C parent may retain tracestate; a final B3 context can rebuild
+        // its own trace identity but must not inherit orphan W3C state.
         let captured_traceparent = ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA).is_some();
         let captured_b3 = ctx.metadata.remove(CAPTURED_B3_METADATA).is_some();
+        let captured_tracestate = ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA).is_some();
         let final_traceparent = has_valid_traceparent(headers);
         let final_b3 = !final_traceparent && has_b3_trace_context(headers);
 
@@ -445,26 +447,31 @@ impl WorkloadMetrics {
             ] {
                 ctx.metadata.remove(key);
             }
-        } else {
-            if captured_traceparent {
-                ctx.metadata.remove(TRACEPARENT_HEADER);
-                // A transformer may replace a valid inbound value with malformed
-                // hostile input. Drop that value rather than forwarding it or
-                // replacing it with the early cached context.
-                headers.retain(|name, _| !name.eq_ignore_ascii_case(TRACEPARENT_HEADER));
-            }
-            if captured_b3 {
-                ctx.metadata.remove(TRACEPARENT_HEADER);
-                headers.retain(|name, _| {
-                    !B3_TRACE_HEADERS
-                        .iter()
-                        .any(|header| name.eq_ignore_ascii_case(header))
-                });
-            }
         }
-        if ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA).is_some()
-            && header_value(headers, TRACESTATE_HEADER).is_none()
-        {
+
+        if captured_traceparent && !final_traceparent {
+            ctx.metadata.remove(TRACEPARENT_HEADER);
+            ctx.metadata.remove(TRACESTATE_HEADER);
+            // A transformer may remove the captured parent, replace it with
+            // malformed hostile input, or leave/add tracestate independently.
+            // Remove every casing of both W3C headers so neither the cached
+            // parent nor an orphan tracestate can cross the proxy boundary.
+            headers.retain(|name, _| {
+                !name.eq_ignore_ascii_case(TRACEPARENT_HEADER)
+                    && !name.eq_ignore_ascii_case(TRACESTATE_HEADER)
+            });
+        }
+
+        if captured_b3 && !final_traceparent && !final_b3 {
+            ctx.metadata.remove(TRACEPARENT_HEADER);
+            headers.retain(|name, _| {
+                !B3_TRACE_HEADERS
+                    .iter()
+                    .any(|header| name.eq_ignore_ascii_case(header))
+            });
+        }
+
+        if captured_tracestate && header_value(headers, TRACESTATE_HEADER).is_none() {
             ctx.metadata.remove(TRACESTATE_HEADER);
         }
     }

@@ -5549,10 +5549,10 @@ async fn workload_metrics_propagates_valid_traceparent_replacement_as_authoritat
         .remove("traceparent")
         .expect("transformer replaced traceparent");
     headers.insert("TraceParent".to_string(), transformed_traceparent);
-    let transformed_tracestate = headers
+    headers
         .remove("tracestate")
         .expect("inbound tracestate retained");
-    headers.insert("TraceState".to_string(), transformed_tracestate);
+    headers.insert("TraceState".to_string(), "replacement=value".to_string());
 
     let result = metrics.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
@@ -5572,7 +5572,7 @@ async fn workload_metrics_propagates_valid_traceparent_replacement_as_authoritat
     );
     assert_eq!(
         headers.get("tracestate").map(String::as_str),
-        Some("vendor=value")
+        Some("replacement=value")
     );
     assert!(!headers.contains_key("TraceState"));
     assert_eq!(
@@ -5850,11 +5850,21 @@ async fn workload_metrics_does_not_restore_traceparent_removed_by_transformer() 
     let result = transformer.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!headers.contains_key("traceparent"));
+    let tracestate = headers
+        .remove("tracestate")
+        .expect("transformer leaves inbound tracestate");
+    headers.insert("TraceState".to_string(), tracestate);
 
     let result = metrics.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(!headers.contains_key("traceparent"));
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("traceparent")
+                && !name.eq_ignore_ascii_case("tracestate"))
+    );
     assert!(!ctx.metadata.contains_key("traceparent"));
+    assert!(!ctx.metadata.contains_key("tracestate"));
     assert!(ctx.metadata.contains_key("trace_id"));
 
     let mut response_headers = HashMap::new();
@@ -5863,6 +5873,127 @@ async fn workload_metrics_does_not_restore_traceparent_removed_by_transformer() 
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!response_headers.contains_key("traceparent"));
+}
+
+#[tokio::test]
+async fn workload_metrics_drops_added_tracestate_with_malformed_final_parent() {
+    let metrics = workload_metrics_tracing_plugin();
+    let transformer = RequestTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "update",
+                "target": "header",
+                "key": "TraceParent",
+                "value": "malformed"
+            },
+            {
+                "operation": "add",
+                "target": "header",
+                "key": "TraceState",
+                "value": "added=value"
+            }
+        ]
+    }))
+    .expect("malformed W3C replacement config");
+    let mut ctx = request_context(None);
+    ctx.headers.insert(
+        "TraceParent".to_string(),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+    );
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let early_trace_id = ctx
+        .metadata
+        .get("trace_id")
+        .cloned()
+        .expect("captured trace identity");
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let malformed = headers
+        .remove("traceparent")
+        .expect("transformer replaced traceparent");
+    headers.insert("TraceParent".to_string(), malformed);
+    let added_tracestate = headers
+        .remove("tracestate")
+        .expect("transformer added tracestate");
+    headers.insert("TraceState".to_string(), added_tracestate);
+
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("traceparent")
+                && !name.eq_ignore_ascii_case("tracestate"))
+    );
+    assert!(!ctx.metadata.contains_key("traceparent"));
+    assert!(!ctx.metadata.contains_key("tracestate"));
+    assert_eq!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some(early_trace_id.as_str()),
+        "captured identity remains local-only"
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_final_b3_context_does_not_retain_captured_tracestate() {
+    let metrics = workload_metrics_tracing_plugin();
+    let b3_trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let b3_parent_span_id = "ffffffffffffffff";
+    let transformer = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "header", "key": "TraceParent"},
+            {
+                "operation": "add",
+                "target": "header",
+                "key": "X-B3-TraceId",
+                "value": b3_trace_id
+            },
+            {
+                "operation": "add",
+                "target": "header",
+                "key": "X-B3-SpanId",
+                "value": b3_parent_span_id
+            },
+            {
+                "operation": "add",
+                "target": "header",
+                "key": "X-B3-Sampled",
+                "value": "1"
+            }
+        ]
+    }))
+    .expect("final B3 context config");
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("tracestate"))
+    );
+    assert!(!ctx.metadata.contains_key("tracestate"));
+    assert!(
+        headers
+            .get("traceparent")
+            .expect("final B3 context propagates as W3C")
+            .starts_with(&format!("00-{b3_trace_id}-"))
+    );
+    assert_eq!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some(b3_trace_id)
+    );
 }
 
 #[tokio::test]
