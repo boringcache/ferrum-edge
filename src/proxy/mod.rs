@@ -17138,8 +17138,7 @@ async fn handle_proxy_request_inner(
                         hash_key,
                         &ctx.client_ip,
                         proxy_headers,
-                    )
-                {
+                    ) {
                     if !retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
                         &proxy,
@@ -19129,8 +19128,7 @@ async fn handle_proxy_request_inner(
                     hash_key,
                     &ctx.client_ip,
                     proxy_headers,
-                )
-            {
+                ) {
                 if !retry_target_preserves_backend_path(
                     backend_path_is_policy_bound,
                     &proxy,
@@ -19214,11 +19212,7 @@ async fn handle_proxy_request_inner(
                     // un-pre-warmed target degrades to the safe path until
                     // the periodic refresh classifies it.
                     current_dispatch_h3 = !requires_response_stream_inspection
-                        && supports_native_http3_backend(
-                            &state,
-                            &proxy,
-                            current_target.as_deref(),
-                        );
+                        && supports_native_http3_backend(&state, &proxy, current_target.as_deref());
                 }
             }
 
