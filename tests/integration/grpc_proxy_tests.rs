@@ -1845,12 +1845,22 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
+    let mut gateway_error_security =
+        security_headers_plugin("grpc-web-backend-error-security");
+    gateway_error_security.config["set"] = serde_json::json!({
+        "X-Security-Policy": "gateway-enforced",
+        "Connection": "close",
+        "Keep-Alive": "timeout=5",
+        "Proxy-Authenticate": "Basic realm=hostile",
+        "Proxy-Connection": "close",
+        "TE": "trailers",
+        "Trailer": "x-hostile",
+        "Transfer-Encoding": "chunked",
+        "Upgrade": "h2c"
+    });
     let state = create_test_proxy_state_with_plugins(
         vec![proxy],
-        vec![
-            plugin,
-            security_headers_plugin("grpc-web-backend-error-security"),
-        ],
+        vec![plugin, gateway_error_security],
     );
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
@@ -1905,6 +1915,21 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         assert!(
             response.headers().get(name).is_none(),
             "terminal {name} metadata must remain in the gRPC-Web body trailer frame"
+        );
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        assert!(
+            response.headers().get(name).is_none(),
+            "hop-by-hop {name} header leaked from gateway policy"
         );
     }
 

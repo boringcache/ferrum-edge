@@ -8641,6 +8641,11 @@ fn finalize_h3_gateway_error_headers(
     headers: &mut HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
+    if !matches!(flavor, HttpFlavor::Grpc) {
+        headers
+            .entry("content-type".to_string())
+            .or_insert_with(|| "application/json".to_string());
+    }
     if matches!(flavor, HttpFlavor::Grpc) {
         let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
         crate::proxy::grpc_proxy::finalize_grpc_error_response_headers(

@@ -488,8 +488,10 @@ fn build_config_with_h3_gateway_policy(echo_port: u16) -> String {
          \x20   scope: global\n\
          \x20   enabled: true\n\
          \x20   config:\n\
+         \x20     override_existing: false\n\
          \x20     set:\n\
          \x20       X-H3-Gateway-Policy: enforced\n\
+         \x20       Content-Type: text/plain\n\
          \x20       Content-Length: \"999\"\n\
          \x20       Transfer-Encoding: chunked\n",
     )
@@ -1956,16 +1958,49 @@ async fn functional_protocol_validation_h3_request_body_limit_rejects_from_env()
         "unexpected body: {}",
         resp.body_text()
     );
+
+    // A declared oversized body is rejected from the native H3 server before
+    // dispatch. This is the gateway-error path where initial response-header
+    // policies must be applied and framing headers must remain authoritative.
+    let options = GetOptions::default()
+        .method(Method::POST)
+        .header("content-length", "16");
+    let policy_resp = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        loop {
+            match client.get_with_options(&url, options.clone()).await {
+                Ok(resp) => break resp,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    last_err = Some(err.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 request with oversized declared body did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
+            }
+        }
+    };
+
     assert_eq!(
-        resp.headers
+        policy_resp.status.as_u16(),
+        413,
+        "body={}",
+        policy_resp.body_text()
+    );
+    assert_eq!(
+        policy_resp
+            .headers
             .get("x-h3-gateway-policy")
             .and_then(|value| value.to_str().ok()),
         Some("enforced")
     );
-    assert!(!resp.headers.contains_key("content-length"));
-    assert!(!resp.headers.contains_key("transfer-encoding"));
+    assert!(!policy_resp.headers.contains_key("content-length"));
+    assert!(!policy_resp.headers.contains_key("transfer-encoding"));
     assert_eq!(
-        resp.headers
+        policy_resp
+            .headers
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
         Some("application/json")

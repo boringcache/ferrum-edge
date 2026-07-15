@@ -13918,7 +13918,14 @@ fn finalize_grpc_web_error_response_headers(
             "grpc-status",
             "grpc-message",
             "grpc-status-details-bin",
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-connection",
+            "te",
             "trailer",
+            "transfer-encoding",
+            "upgrade",
         ]
         .iter()
         .any(|managed| name.eq_ignore_ascii_case(managed))
@@ -17409,6 +17416,9 @@ async fn handle_proxy_request_inner(
                 // (#1649 R8 finding 1): the body-terminal observer must then be
                 // suppressed so the ended body's `Drop` can't deliver a second
                 // (ClientDisconnect) terminal that neutralizes the deferred success.
+                let pristine_streaming_trailers_only_terminal_metadata = grpc_body_ended.then(|| {
+                    grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers)
+                });
                 let mut grpc_recorder_owns_ended_response = false;
                 let grpc_cb_recorded_eagerly = if grpc_skip_final_cb_record {
                     // A rotated retry already recorded (and released) the prior
@@ -17552,9 +17562,21 @@ async fn handle_proxy_request_inner(
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
-                // Hooks may rewrite/remove a Trailers-Only grpc-status in the
-                // initial header block. Seed deferred metadata from the final
-                // client-visible headers; a later real trailer overrides it.
+                if let Some(pristine_terminal_metadata) =
+                    pristine_streaming_trailers_only_terminal_metadata.as_ref()
+                {
+                    // An already-ended Incoming is a true Trailers-Only response.
+                    // Discard policy attempts to rewrite its terminal fields and
+                    // restore the backend's pristine status before emission.
+                    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+                        None,
+                        &mut response_headers,
+                        Some(pristine_terminal_metadata),
+                    );
+                }
+                // Seed deferred metadata from the final client-visible headers.
+                // The snapshot restore above protects a true Trailers-Only status;
+                // a later real trailer on an open stream remains authoritative.
                 grpc_proxy::refresh_grpc_status_metadata(
                     &mut ctx.metadata,
                     &EMPTY_HEADERS,
@@ -17994,7 +18016,7 @@ async fn handle_proxy_request_inner(
                     );
                 let initial_response_header_policy_names =
                     plugin_cache_view.initial_response_header_policy_names();
-                let pristine_trailers_only_terminal_metadata = (response_body.is_empty()
+                let mut authoritative_trailers_only_terminal_metadata = (response_body.is_empty()
                     && response_trailers.is_empty())
                 .then(|| grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers));
                 ctx.begin_buffered_initial_response_header_policy(
@@ -18027,6 +18049,11 @@ async fn handle_proxy_request_inner(
                             true,
                         );
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        authoritative_trailers_only_terminal_metadata = Some(
+                            grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                &normalized.headers,
+                            ),
+                        );
                         response_status = normalized.http_status.as_u16();
                         response_headers = normalized.headers;
                         plugin_response_headers = response_headers.clone();
@@ -18072,6 +18099,11 @@ async fn handle_proxy_request_inner(
                                         &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
+                                authoritative_trailers_only_terminal_metadata = Some(
+                                    grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                        &normalized.headers,
+                                    ),
+                                );
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
                                 plugin_response_headers = response_headers.clone();
@@ -18163,6 +18195,11 @@ async fn handle_proxy_request_inner(
                                         &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
+                                authoritative_trailers_only_terminal_metadata = Some(
+                                    grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                        &normalized.headers,
+                                    ),
+                                );
                                 if let (Some(grpc_web_ct), Some(grpc_status)) =
                                     (grpc_web_response_content_type, normalized.grpc_status)
                                 {
@@ -18254,7 +18291,7 @@ async fn handle_proxy_request_inner(
                         &mut response_trailers,
                         &header_shadowed_trailer_keys,
                         buffered_initial_response_header_policy_state.as_deref(),
-                        pristine_trailers_only_terminal_metadata.as_ref(),
+                        authoritative_trailers_only_terminal_metadata.as_ref(),
                     );
                 } else {
                     // Non-empty gRPC responses must carry grpc-status in a
