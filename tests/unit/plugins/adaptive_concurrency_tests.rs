@@ -1215,7 +1215,9 @@ fn adaptive_concurrency_transition_rejection_omits_per_target_headers() {
         } => {
             assert_eq!(status_code, 503);
             assert_eq!(
-                headers.get("x-adaptive-concurrency-limit").map(String::as_str),
+                headers
+                    .get("x-adaptive-concurrency-limit")
+                    .map(String::as_str),
                 Some("1")
             );
             assert_eq!(

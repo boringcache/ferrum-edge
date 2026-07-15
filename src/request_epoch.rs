@@ -709,7 +709,10 @@ mod tests {
         let after = store.load();
         assert!(Arc::ptr_eq(&before, &after));
         assert_eq!(after.lb_generation, u64::MAX);
-        assert_eq!(after.load_balancer.upstreams()["u1"].targets[0].host, "a.local");
+        assert_eq!(
+            after.load_balancer.upstreams()["u1"].targets[0].host,
+            "a.local"
+        );
     }
 
     #[test]
@@ -821,9 +824,7 @@ mod tests {
             }),
         );
         let mut first = target("blue-a.local", 80);
-        first
-            .tags
-            .insert("version".to_string(), "blue".to_string());
+        first.tags.insert("version".to_string(), "blue".to_string());
         let mut shared_upstream = upstream("u1", vec![first.clone()]);
         shared_upstream.service_discovery = Some(
             serde_json::from_value(json!({
@@ -872,9 +873,7 @@ mod tests {
             _ => panic!("initial selected-subset target should be admitted"),
         };
         let mut added = target("blue-b.local", 80);
-        added
-            .tags
-            .insert("version".to_string(), "blue".to_string());
+        added.tags.insert("version".to_string(), "blue".to_string());
         store
             .update_load_balancer(
                 |current| {

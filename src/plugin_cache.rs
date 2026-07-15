@@ -1498,20 +1498,23 @@ fn adaptive_concurrency_route_definition_requires_drain(
     if current == replacement {
         return false;
     }
-    let existing_proxy_scopes_preserved = current
-        .protected_proxy_ids
-        .iter()
-        .all(|proxy_id| replacement.protected_proxy_ids.binary_search(proxy_id).is_ok());
-    let existing_override_semantics_preserved = current.protected_proxy_ids.iter().all(|proxy_id| {
-        current
-            .overrides
-            .iter()
-            .filter(|route| route.proxy_id.as_str() == proxy_id.as_str())
-            .eq(replacement
+    let existing_proxy_scopes_preserved = current.protected_proxy_ids.iter().all(|proxy_id| {
+        replacement
+            .protected_proxy_ids
+            .binary_search(proxy_id)
+            .is_ok()
+    });
+    let existing_override_semantics_preserved =
+        current.protected_proxy_ids.iter().all(|proxy_id| {
+            current
                 .overrides
                 .iter()
-                .filter(|route| route.proxy_id.as_str() == proxy_id.as_str()))
-    });
+                .filter(|route| route.proxy_id.as_str() == proxy_id.as_str())
+                .eq(replacement
+                    .overrides
+                    .iter()
+                    .filter(|route| route.proxy_id.as_str() == proxy_id.as_str()))
+        });
     if !existing_proxy_scopes_preserved
         || !existing_override_semantics_preserved
         || adaptive_concurrency_has_zero_target_sentinel(&current.keys)
@@ -1531,8 +1534,7 @@ fn adaptive_concurrency_lb_key_space_changed(
     current: &crate::load_balancer::LoadBalancerCacheInner,
     replacement: &crate::load_balancer::LoadBalancerCacheInner,
 ) -> bool {
-    let current_keys =
-        adaptive_concurrency_effective_lb_keys(&instance.route_definition, current);
+    let current_keys = adaptive_concurrency_effective_lb_keys(&instance.route_definition, current);
     let replacement_keys =
         adaptive_concurrency_effective_lb_keys(&instance.route_definition, replacement);
     adaptive_concurrency_key_space_requires_drain(&current_keys, &replacement_keys)
