@@ -371,6 +371,8 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
         .expect("deferred before_proxy pass must remain present");
     assert!(path_policy < deferred);
     assert!(source.contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"));
+    assert!(source.contains("BackendPathPolicyPhase::Preview"));
+    assert!(source.contains("BackendPathPolicyPhase::Enforce"));
     assert!(source.contains("backend_dispatch::upstream_selection_hash_key("));
     assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
 

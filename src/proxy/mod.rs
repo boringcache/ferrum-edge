@@ -106,9 +106,9 @@ use crate::modes::mesh::node_waypoint::{
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
-    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
-    RequestContext, TransactionSummary, WebSocketFrameDirection, is_builtin_plugin_name,
-    mesh_route_dispatch::MeshRouteDispatchConfig,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
+    PluginResult, ProxyProtocol, RequestContext, TransactionSummary, WebSocketFrameDirection,
+    is_builtin_plugin_name, mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
 use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
@@ -13834,10 +13834,11 @@ async fn run_backend_path_plugins_or_build_reject(
     original_request_path: &str,
     is_grpc_request: bool,
     grpc_web_response_content_type: Option<&str>,
+    phase: BackendPathPolicyPhase,
 ) -> Option<Response<ProxyBody>> {
     let phase_start = Instant::now();
     for plugin in backend_path_plugins {
-        match plugin.on_backend_path_resolved(ctx, backend_path).await {
+        match plugin.on_backend_path_resolved(ctx, backend_path, phase).await {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -15741,12 +15742,11 @@ async fn handle_proxy_request_inner(
         && capabilities.has(PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
     let mut deferred_result = PluginResult::Continue;
     let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
-    let mut authorized_backend_path: Option<String> = None;
 
     loop {
-        // Route-sensitive policy runs only after route/header-shaping hooks and
-        // target selection. If a deferred function changes the selection hash,
-        // this loop reauthorizes the newly selected effective path.
+        // Preview access rules before a deferred routing function performs
+        // external work, then enforce stateful policy exactly once after its
+        // header mutations and any target reselection have settled.
         if backend_path_is_policy_bound {
             let backend_path = build_backend_effective_path(
                 &proxy,
@@ -15756,24 +15756,27 @@ async fn handle_proxy_request_inner(
                     .as_ref()
                     .and_then(|target| target.path.as_deref()),
             );
-            if authorized_backend_path.as_deref() != Some(backend_path.as_str()) {
-                if let Some(response) = run_backend_path_plugins_or_build_reject(
-                    backend_path_plugins,
-                    &plugins,
-                    &mut ctx,
-                    &backend_path,
-                    &state,
-                    start_time,
-                    &mut plugin_execution_ns,
-                    &original_request_path,
-                    is_grpc_request,
-                    grpc_web_response_content_type,
-                )
-                .await
-                {
-                    return Ok(response);
-                }
-                authorized_backend_path = Some(backend_path);
+            let phase = if run_deferred_routing_headers {
+                BackendPathPolicyPhase::Preview
+            } else {
+                BackendPathPolicyPhase::Enforce
+            };
+            if let Some(response) = run_backend_path_plugins_or_build_reject(
+                backend_path_plugins,
+                &plugins,
+                &mut ctx,
+                &backend_path,
+                &state,
+                start_time,
+                &mut plugin_execution_ns,
+                &original_request_path,
+                is_grpc_request,
+                grpc_web_response_content_type,
+                phase,
+            )
+            .await
+            {
+                return Ok(response);
             }
         }
 
@@ -15840,9 +15843,9 @@ async fn handle_proxy_request_inner(
                 selection.target,
                 request_host.as_deref(),
             );
-            continue;
         }
-        break;
+        // Always make one more pass after the routing-header hook so final
+        // enforcement charges only the settled backend-effective method.
     }
 
     // Hooks that can dispatch external work or synthesize a terminal response

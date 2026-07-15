@@ -28,8 +28,8 @@ use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{
-    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
-    RequestContext, ResponseStreamAction, TransactionSummary,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
+    PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction, TransactionSummary,
     normalize_response_body_for_inspection,
 };
 use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
@@ -1964,20 +1964,31 @@ async fn handle_h3_request(
                         &mut reject_status,
                         &mut headers,
                         &mut reject_body,
-                        matches!(http_flavor, HttpFlavor::Grpc),
-                        true,
+                        matches!(http_flavor, HttpFlavor::Grpc) || grpc_web_request,
+                        !grpc_web_request,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                     let http_status = StatusCode::from_u16(reject_status)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let log_status_code = h3_reject_log_status_and_metadata(
-                        &mut ctx,
-                        http_flavor,
-                        http_status,
-                        &reject_body,
-                        &headers,
-                    );
+                    let log_status_code = if grpc_web_request {
+                        let (grpc_status, grpc_message) =
+                            h3_grpc_reject_signal(http_status, &reject_body, &headers);
+                        crate::proxy::insert_grpc_error_metadata(
+                            &mut ctx.metadata,
+                            grpc_status,
+                            grpc_message.as_ref(),
+                        );
+                        StatusCode::OK.as_u16()
+                    } else {
+                        h3_reject_log_status_and_metadata(
+                            &mut ctx,
+                            http_flavor,
+                            http_status,
+                            &reject_body,
+                            &headers,
+                        )
+                    };
                     // Record the normalized wire status (gRPC rejects go out as
                     // HTTP 200 + grpc-status); keeps runtime metrics consistent
                     // with the logged/served status across every H3 reject phase.
@@ -1991,14 +2002,27 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                     )
                     .await;
-                    send_h3_reject_flavor_aware(
-                        &mut stream,
-                        http_flavor,
-                        http_status,
-                        &reject_body,
-                        &headers,
-                    )
-                    .await?;
+                    if let Some(content_type) = grpc_web_response_content_type.as_deref() {
+                        send_h3_grpc_web_reject(
+                            &mut stream,
+                            &plugins,
+                            &mut ctx,
+                            content_type,
+                            http_status,
+                            &reject_body,
+                            &headers,
+                        )
+                        .await?;
+                    } else {
+                        send_h3_reject_flavor_aware(
+                            &mut stream,
+                            http_flavor,
+                            http_status,
+                            &reject_body,
+                            &headers,
+                        )
+                        .await?;
+                    }
                     return Ok(());
                 }
             }
@@ -2049,20 +2073,31 @@ async fn handle_h3_request(
                         &mut reject_status,
                         &mut headers,
                         &mut reject_body,
-                        matches!(http_flavor, HttpFlavor::Grpc),
-                        true,
+                        matches!(http_flavor, HttpFlavor::Grpc) || grpc_web_request,
+                        !grpc_web_request,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                     let http_status = StatusCode::from_u16(reject_status)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    let log_status_code = h3_reject_log_status_and_metadata(
-                        &mut ctx,
-                        http_flavor,
-                        http_status,
-                        &reject_body,
-                        &headers,
-                    );
+                    let log_status_code = if grpc_web_request {
+                        let (grpc_status, grpc_message) =
+                            h3_grpc_reject_signal(http_status, &reject_body, &headers);
+                        crate::proxy::insert_grpc_error_metadata(
+                            &mut ctx.metadata,
+                            grpc_status,
+                            grpc_message.as_ref(),
+                        );
+                        StatusCode::OK.as_u16()
+                    } else {
+                        h3_reject_log_status_and_metadata(
+                            &mut ctx,
+                            http_flavor,
+                            http_status,
+                            &reject_body,
+                            &headers,
+                        )
+                    };
                     // Record the normalized wire status (gRPC rejects go out as
                     // HTTP 200 + grpc-status); keeps runtime metrics consistent
                     // with the logged/served status across every H3 reject phase.
@@ -2076,14 +2111,27 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                     )
                     .await;
-                    send_h3_reject_flavor_aware(
-                        &mut stream,
-                        http_flavor,
-                        http_status,
-                        &reject_body,
-                        &headers,
-                    )
-                    .await?;
+                    if let Some(content_type) = grpc_web_response_content_type.as_deref() {
+                        send_h3_grpc_web_reject(
+                            &mut stream,
+                            &plugins,
+                            &mut ctx,
+                            content_type,
+                            http_status,
+                            &reject_body,
+                            &headers,
+                        )
+                        .await?;
+                    } else {
+                        send_h3_reject_flavor_aware(
+                            &mut stream,
+                            http_flavor,
+                            http_status,
+                            &reject_body,
+                            &headers,
+                        )
+                        .await?;
+                    }
                     return Ok(());
                 }
             }
@@ -2279,7 +2327,6 @@ async fn handle_h3_request(
             .has(crate::plugin_cache::PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
     let mut deferred_result = PluginResult::Continue;
     let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
-    let mut authorized_backend_path: Option<String> = None;
 
     loop {
         if backend_path_is_policy_bound {
@@ -2291,25 +2338,28 @@ async fn handle_h3_request(
                     .as_ref()
                     .and_then(|target| target.path.as_deref()),
             );
-            if authorized_backend_path.as_deref() != Some(backend_path.as_str()) {
-                if !run_h3_backend_path_plugins_or_send_reject(
-                    backend_path_plugins,
-                    &plugins,
-                    &mut ctx,
-                    &backend_path,
-                    &original_request_path,
-                    http_flavor,
-                    &mut stream,
-                    &state,
-                    start_time,
-                    &mut plugin_execution_ns,
-                    grpc_web_response_content_type.as_deref(),
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-                authorized_backend_path = Some(backend_path);
+            let phase = if run_deferred_routing_headers {
+                BackendPathPolicyPhase::Preview
+            } else {
+                BackendPathPolicyPhase::Enforce
+            };
+            if !run_h3_backend_path_plugins_or_send_reject(
+                backend_path_plugins,
+                &plugins,
+                &mut ctx,
+                &backend_path,
+                &original_request_path,
+                http_flavor,
+                &mut stream,
+                &state,
+                start_time,
+                &mut plugin_execution_ns,
+                grpc_web_response_content_type.as_deref(),
+                phase,
+            )
+            .await?
+            {
+                return Ok(());
             }
         }
 
@@ -2373,9 +2423,9 @@ async fn handle_h3_request(
                 std::borrow::Cow::Owned(owned) => Arc::new(owned),
             };
             ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
-            continue;
         }
-        break;
+        // Always make one more pass after the routing-header hook so final
+        // enforcement charges only the settled backend-effective method.
     }
 
     if backend_path_is_policy_bound {
@@ -5517,10 +5567,11 @@ async fn run_h3_backend_path_plugins_or_send_reject(
     start_time: std::time::Instant,
     plugin_execution_ns: &mut u64,
     grpc_web_response_content_type: Option<&str>,
+    phase: BackendPathPolicyPhase,
 ) -> Result<bool, anyhow::Error> {
     let phase_start = std::time::Instant::now();
     for plugin in backend_path_plugins {
-        match plugin.on_backend_path_resolved(ctx, backend_path).await {
+        match plugin.on_backend_path_resolved(ctx, backend_path, phase).await {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {

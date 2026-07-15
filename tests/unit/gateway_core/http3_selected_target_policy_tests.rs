@@ -230,6 +230,11 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         "H3 must re-evaluate header-hash routing after deferred header mutations"
     );
     assert!(
+        policy_block.contains("BackendPathPolicyPhase::Preview")
+            && policy_block.contains("BackendPathPolicyPhase::Enforce"),
+        "H3 must preview access before deferred routing and charge final policy only after it settles"
+    );
+    assert!(
         source.contains("BackendPathBeforeProxyPass::RemainingDeferred"),
         "H3 must keep remaining side-effect hooks behind any required reauthorization"
     );
@@ -277,5 +282,30 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     assert!(
         mismatch < failure_record && after_grpc_retry[mismatch..failure_record].contains("break;"),
         "cross-protocol gRPC retries must abort before recording an intermediate retry attempt"
+    );
+}
+
+#[test]
+fn h3_grpc_web_initial_before_proxy_reject_uses_grpc_web_shape() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let start = source
+        .find("// before_proxy hooks — only clone headers")
+        .expect("H3 initial before_proxy phase must remain present");
+    let end = source[start..]
+        .find("// Reserved consumer-identity headers are gateway-asserted")
+        .map(|offset| start + offset)
+        .expect("H3 initial before_proxy phase must have a bounded source block");
+    let before_proxy = &source[start..end];
+
+    assert!(
+        before_proxy
+            .matches("matches!(http_flavor, HttpFlavor::Grpc) || grpc_web_request")
+            .count()
+            >= 2,
+        "both H3 header-handling branches must normalize gRPC-Web plugin rejects as gRPC"
+    );
+    assert!(
+        before_proxy.matches("send_h3_grpc_web_reject(").count() >= 2,
+        "both H3 header-handling branches must emit the gRPC-Web trailer-frame reject shape"
     );
 }

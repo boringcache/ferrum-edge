@@ -31,12 +31,22 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 5. backend path policy  │  Backend-effective path after routing/target selection
+│ 5a. path policy preview │  Stateless access check for initial selected path
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 5b. deferred before_proxy │  External/synthetic work after path authorization
+│ 5b. routing-header hook │  Deferred routing input, then target reselection
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 5c. final path policy   │  Enforce settled method; charge state once
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 5d. deferred before_proxy │  Remaining external/synthetic work after policy
 └────────────┬────────────┘
              │
              ▼
@@ -91,13 +101,17 @@ Request In
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
 `on_backend_path_resolved` is an opt-in, route-sensitive boundary after
-route/header-shaping `before_proxy` hooks and initial load balancing, but before
+route/header-shaping `before_proxy` hooks and load balancing, but before
 circuit-breaker or backend dispatch. The gateway assembles the same path
 segments used by the backend URL builder, including regex/exact/prefix match
 length, encoded-slash normalization, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
-backend wire. Its
+backend wire. When a deferred hook can inject headers used by load balancing,
+the policy hook first receives a non-state-consuming preview phase for the
+initial path. After the header hook and any reselection, the settled path is
+enforced once; per-method rate limits are charged only in this final phase, so
+one request cannot consume both the provisional and final method buckets. Its
 pre-filtered plugin list is built on reload; proxies without an opt-in plugin do
 not scan the chain or allocate an effective-path string. Once policy binds the
 first target's path, retries may rotate host/port only when the candidate keeps
@@ -108,16 +122,17 @@ the authorized method. This applies to HTTP, native and bridged gRPC/H3, and
 WebSocket retry loops.
 
 When backend-path policy is active, `before_proxy` hooks that can dispatch
-external work or synthesize a terminal response opt into phase 5b. Ferrum runs
-them in their normal relative priority order only after path authorization.
+external work or synthesize a terminal response opt into the deferred phases.
+Ferrum runs them in their normal relative priority order only after path policy.
 `request_mirror`, pre-proxy `serverless_function`, `response_mock`, and
 `load_testing` use this boundary, so a backend-effective gRPC deny cannot be
 mirrored, invoked, mocked, or load-fanned-out before it is enforced. Proxies
 without a backend-path policy retain the ordinary single `before_proxy` pass.
 Deferred hooks observe the original client path, preserving their normal
 request semantics even when mesh routing rewrote the backend path. A deferred
-hook that can inject routing headers runs first; if it changes the load-balancer
-hash key, Ferrum reselects the target and authorizes any changed effective path
+hook that can inject routing headers runs after the initial access preview; if
+it changes the load-balancer hash key, Ferrum reselects the target and performs
+the single state-consuming enforcement against the settled effective path
 before any remaining external or synthetic hook.
 
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
