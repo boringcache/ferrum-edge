@@ -224,6 +224,22 @@ pub(crate) async fn validate_hmac_request_transform_api_spec_replacement_candida
         .map(|plugin| plugin.id)
         .collect();
 
+    // Only plugin configs owned by this spec are replaceable. Treating an
+    // incoming same-ID plugin as an overlay on a manual or differently owned
+    // config would make the in-memory candidate diverge from persistence,
+    // where the insert is rejected by the plugin-config primary key.
+    if let Some(plugin) = plugins.iter().find(|plugin| {
+        !replaced_plugin_ids.contains(&plugin.id)
+            && candidate.plugin_configs.iter().any(|existing| {
+                existing.namespace == namespace && existing.id == plugin.id
+            })
+    }) {
+        return Err(AfterValidateError::BadRequest(vec![format!(
+            "plugin_config id '{}' already exists in namespace '{}' outside api_spec '{}'; replacement cannot take ownership of it",
+            plugin.id, namespace, existing_spec.id
+        )]));
+    }
+
     candidate
         .plugin_configs
         .retain(|plugin| !replaced_plugin_ids.contains(&plugin.id));

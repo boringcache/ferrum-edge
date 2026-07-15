@@ -1568,6 +1568,110 @@ async fn put_rejects_hmac_beside_preserved_manual_body_transformer_association()
     .await;
 }
 
+#[tokio::test]
+async fn put_rejects_same_id_overlay_of_manual_hmac_plugin_without_mutation() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("same-id-manual-proxy");
+    let manual_plugin_id = uid("same-id-manual-hmac");
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "initial API spec failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+    let manual_plugin = manual_proxy_plugin(
+        &manual_plugin_id,
+        &proxy_id,
+        "hmac_auth",
+        hmac_plugin_config(),
+    );
+    attach_manual_proxy_plugin(&store, &proxy_id, &manual_plugin).await;
+
+    let spec_before = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read API spec before rejected PUT")
+        .expect("API spec must exist before rejected PUT");
+    let proxy_before = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("read proxy before rejected PUT")
+        .expect("proxy must exist before rejected PUT");
+    let replacement_spec = json_spec_with_plugin(
+        &proxy_id,
+        "replacement-backend.internal",
+        &manual_plugin_id,
+        "request_transformer",
+        request_body_transformer_config(),
+    );
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &replacement_spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "same-ID manual plugin overlay was not rejected during validation: {put_body}"
+    );
+    assert!(
+        put_body
+            .to_string()
+            .contains("replacement cannot take ownership"),
+        "same-ID rejection must identify the ownership conflict: {put_body}"
+    );
+
+    let spec_after = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read API spec after rejected PUT")
+        .expect("API spec must survive rejected PUT");
+    assert_eq!(spec_after.content_hash, spec_before.content_hash);
+    assert_eq!(spec_after.resource_hash, spec_before.resource_hash);
+    assert_eq!(spec_after.updated_at, spec_before.updated_at);
+    let proxy_after = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("read proxy after rejected PUT")
+        .expect("proxy must survive rejected PUT");
+    assert_eq!(proxy_after.backend_host, proxy_before.backend_host);
+    assert_eq!(proxy_after.updated_at, proxy_before.updated_at);
+    assert!(
+        proxy_after
+            .plugins
+            .iter()
+            .any(|association| association.plugin_config_id == manual_plugin_id),
+        "rejected PUT must retain the manual plugin association"
+    );
+    let manual_after = store
+        .get_plugin_config("ferrum", &manual_plugin_id)
+        .await
+        .expect("read manual plugin after rejected PUT")
+        .expect("manual plugin must survive rejected PUT");
+    assert_eq!(manual_after.plugin_name, "hmac_auth");
+    assert_eq!(manual_after.config, manual_plugin.config);
+    assert!(manual_after.api_spec_id.is_none());
+
+    let runtime_config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("rejected replacement must leave the prior runtime config loadable");
+    assert!(
+        runtime_config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.id == manual_plugin_id && plugin.plugin_name == "hmac_auth"),
+        "prior runtime config lost or replaced the manual HMAC plugin"
+    );
+}
+
 // ============================================================================
 // Gap #3: Multiple validation failures aggregated in one 422
 // ============================================================================
