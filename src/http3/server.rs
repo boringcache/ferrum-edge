@@ -1373,6 +1373,7 @@ async fn handle_h3_request(
     // Map runtime HTTP flavor to the plugin-cache protocol key so H3 requests
     // load the same plugin/auth/capability set as the H1/H2 dispatch path.
     let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);
+    ctx.set_websocket_response_boundary(matches!(http_flavor, HttpFlavor::WebSocket));
     if request_protocol == ProxyProtocol::Grpc {
         ctx.metadata
             .entry("request_protocol".to_string())

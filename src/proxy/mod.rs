@@ -13434,6 +13434,17 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // see the divergence note above.
     apply_replaceable_after_proxy_hooks_to_rejection(plugins, ctx, status, body, headers).await;
 
+    // A failed WebSocket handshake is still an ordinary HTTP response, but its
+    // transport-owned fields must come only from a successful H1 Upgrade or
+    // Extended CONNECT builder. Run this boundary after every ordered reject
+    // hook (including security_headers) so an early auth/authz/before_proxy
+    // rejection cannot expose configured Upgrade/Connection/Sec-WebSocket-*
+    // values. The request-flavor bit is stamped once by both frontends, avoiding
+    // a second hot-path classification or plugin scan here.
+    if ctx.has_websocket_response_boundary() {
+        strip_websocket_transport_managed_response_header_map(headers);
+    }
+
     // Observe every client-visible rejection that flows through this finalizer —
     // synthetic short-circuits, gRPC rejects, non-2xx rejects, empty-body rejects
     // — only after final-body validators, rejection replacement, and the
@@ -14888,6 +14899,7 @@ async fn handle_proxy_request_inner(
     // the H3 frontend so both paths classify requests identically.
     let is_h2_ws = is_h2_websocket_connect(&req);
     let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    ctx.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
     let grpc_web_response_content_type = req
         .headers()
         .get(hyper::header::CONTENT_TYPE)

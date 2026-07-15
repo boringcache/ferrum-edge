@@ -636,6 +636,11 @@ pub struct RequestContext {
     /// cheap; the live request uses `Arc::make_mut` after the clone is dropped.
     buffered_initial_response_header_policy_state:
         Option<Arc<BufferedInitialResponseHeaderPolicyState>>,
+    /// Whether client-visible rejection responses for this request cross a
+    /// WebSocket handshake boundary. Set once after request-flavor detection so
+    /// the shared reject finalizer can remove transport-owned handshake fields
+    /// after every ordered response hook without reclassifying or allocating.
+    websocket_response_boundary: bool,
     /// Semantic-cache embedding vector staged between `before_proxy` and
     /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
     /// vectors cannot enter transaction logs.
@@ -961,6 +966,7 @@ impl RequestContext {
             metadata: HashMap::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
+            websocket_response_boundary: false,
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
@@ -1094,6 +1100,7 @@ impl RequestContext {
                 .collect(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             buffered_initial_response_header_policy_state: None,
+            websocket_response_boundary: self.websocket_response_boundary,
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
@@ -1161,6 +1168,14 @@ impl RequestContext {
         if !headers.is_empty() {
             self.request_headers_to_redact = Some(headers);
         }
+    }
+
+    pub(crate) fn set_websocket_response_boundary(&mut self, enabled: bool) {
+        self.websocket_response_boundary = enabled;
+    }
+
+    pub(crate) fn has_websocket_response_boundary(&self) -> bool {
+        self.websocket_response_boundary
     }
 
     pub(crate) fn request_header_requires_redaction(&self, header_name: &str) -> bool {

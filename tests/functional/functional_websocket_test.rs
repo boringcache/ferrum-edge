@@ -500,6 +500,19 @@ plugin_configs:
     scope: proxy
     proxy_id: "ws-secured-proxy"
     enabled: true
+  - id: "plugin-security-headers-ws-auth"
+    plugin_name: "security_headers"
+    config:
+      hsts: true
+      set:
+        X-WS-Security: "gateway-enforced"
+        Upgrade: "policy-must-not-escape"
+        Connection: "policy-must-not-escape"
+        Sec-WebSocket-Accept: "policy-must-not-escape"
+        Sec-WebSocket-Protocol: "policy-must-not-escape"
+      remove: ["server", "x-powered-by"]
+    scope: global
+    enabled: true
 "#,
         backend_port
     );
@@ -1179,6 +1192,9 @@ async fn test_websocket_key_auth_rejects_missing_key() {
     match err {
         WsError::Http(response) => {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_ws_security_policy(response.headers());
+            assert_no_ws_transport_policy_values(response.headers());
+            assert_no_h1_only_websocket_headers(response.headers());
             assert_eq!(
                 response
                     .headers()
@@ -1194,6 +1210,48 @@ async fn test_websocket_key_auth_rejects_missing_key() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_websocket_key_auth_rejects_missing_key PASSED");
+}
+
+/// H3 authentication rejects traverse the same ordered response-hook pipeline
+/// as H1, then strip fields owned by the failed Extended CONNECT handshake.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_key_auth_reject_strips_transport_policy_fields() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_auth_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+    let url = format!("https://localhost:{gateway_https_port}/ws-secure");
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let rejected = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket authentication rejection response");
+    assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
+    assert_ws_security_policy(&rejected.headers);
+    assert_no_ws_transport_policy_values(&rejected.headers);
+    assert_no_h1_only_websocket_headers(&rejected.headers);
+    assert_eq!(
+        rejected
+            .headers
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok()),
+        Some("ferrum-edge")
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
 }
 
 /// End-to-end test: WebSocket handshakes with a valid API key reach the backend.
