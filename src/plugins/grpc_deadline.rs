@@ -219,6 +219,14 @@ impl Plugin for GrpcDeadline {
         true
     }
 
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        // grpc_method_router historically ran before this hook. Preserve that
+        // terminal-policy ordering when method authorization moves to the
+        // backend-effective path boundary; without such a policy, the gateway
+        // still runs this hook in the ordinary initial pass.
+        true
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
