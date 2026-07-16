@@ -171,7 +171,7 @@ pub struct ServerlessFunction {
     /// For Azure/GCP: the user-supplied URL. For AWS: the computed Lambda Invoke API URL.
     function_url: String,
     /// Parsed destination used to prevent signed path/query credentials from
-    /// returning to clients through a function-controlled redirect.
+    /// returning to clients through function-controlled URL-valued headers.
     function_destination: FunctionDestination,
     /// Credential-safe structural form used in every diagnostic and client error path.
     function_display_url: String,
@@ -667,10 +667,14 @@ impl ServerlessFunction {
         let status = response.status().as_u16();
         let lambda_function_error = self.provider == Provider::AwsLambda
             && response.headers().contains_key("x-amz-function-error");
-        let response_headers = sanitize_function_response_headers(
-            response.headers(),
-            &self.function_destination,
-        );
+        // Only terminate mode can return function response headers. Avoid the
+        // filtering and destination-inspection work for pre_proxy responses,
+        // whose JSON body alone supplies request-header candidates/metadata.
+        let response_headers = if self.mode == InvocationMode::Terminate {
+            sanitize_function_response_headers(response.headers(), &self.function_destination)
+        } else {
+            HashMap::new()
+        };
 
         // Stream the response body with a hard cap. Calling `.bytes().await`
         // would buffer the whole payload before any size check fires — a
@@ -1002,33 +1006,34 @@ impl FunctionDestination {
         self.sensitive_path.is_some() || !self.sensitive_query_pairs.is_empty()
     }
 
-    fn location_exposes_destination(&self, location: &str) -> bool {
+    fn uri_reference_exposes_destination(&self, reference: &str) -> bool {
         if !self.has_sensitive_components() {
             return false;
         }
         // If the accepted destination itself exceeds the bounded decoding
-        // budget, no function-controlled redirect can be proven credential
-        // free. Keep accepting the provider URL, but strip Location fail closed.
+        // budget, no function-controlled URL-valued header can be proven
+        // credential free. Keep accepting the provider URL, but strip such
+        // response headers fail closed.
         if self.has_unresolved_encoding {
             return true;
         }
-        self.location_exposes_destination_inner(location, 0)
+        self.uri_reference_exposes_destination_inner(reference, 0)
     }
 
-    fn location_exposes_destination_inner(&self, location: &str, depth: usize) -> bool {
-        // A signed destination makes an unparseable Location unsafe: Ferrum
-        // cannot prove that an encoded credential is absent, so fail closed by
-        // removing the field. Valid benign relative/absolute redirects remain
-        // eligible below.
-        let decoded_location = decode_percent_layers(location);
-        if !decoded_location.fully_decoded {
+    fn uri_reference_exposes_destination_inner(&self, reference: &str, depth: usize) -> bool {
+        // A signed destination makes an unparseable URI reference unsafe:
+        // Ferrum cannot prove that an encoded credential is absent, so fail
+        // closed by removing the field. Valid benign relative/absolute
+        // references remain eligible below.
+        let decoded_reference = decode_percent_layers(reference);
+        if !decoded_reference.fully_decoded {
             return true;
         }
         let Some(candidate) = self
             .url
-            .join(location)
+            .join(reference)
             .ok()
-            .or_else(|| self.url.join(&decoded_location.value).ok())
+            .or_else(|| self.url.join(&decoded_reference.value).ok())
         else {
             return true;
         };
@@ -1058,11 +1063,19 @@ impl FunctionDestination {
         let exposes_signed_path = self
             .sensitive_path
             .as_deref()
-            .is_some_and(|path| candidate_path == path);
+            .is_some_and(|path| {
+                candidate_path == path
+                    || candidate_path
+                        .strip_prefix(path)
+                        .is_some_and(|suffix| path.ends_with('/') || suffix.starts_with('/'))
+            });
         // A signed path is credential material even if the function copies it
         // onto another authority. Restricting this comparison to same-origin
-        // redirects would disclose path-embedded tokens through an attacker
-        // controlled host.
+        // references would disclose path-embedded tokens through an attacker
+        // controlled host. Match slash-delimited descendants as well: adding
+        // another path segment does not stop the configured signed path from
+        // being echoed, while lookalikes such as `/signed/triggered` remain
+        // distinct and avoid arbitrary substring matching.
         if exposes_signed_path {
             return true;
         }
@@ -1078,41 +1091,140 @@ impl FunctionDestination {
             return true;
         }
 
-        // Redirectors commonly embed their next destination as an encoded
-        // query value or fragment. Inspect those URI references recursively,
-        // but only when they are syntactically URI-like: treating every scalar
-        // as a relative path would remove benign redirects such as
-        // `https://example.test/next?label=signed/trigger`. Cap depth so hostile
-        // nested values have fixed work per response.
-        if depth < 2 {
-            for (key, value) in &candidate_pairs {
-                if nested_uri_reference(key).is_some_and(|reference| {
-                    self.location_exposes_destination_inner(reference, depth + 1)
-                }) || nested_uri_reference(value).is_some_and(|reference| {
-                    self.location_exposes_destination_inner(reference, depth + 1)
-                }) {
-                    return true;
-                }
-            }
-            if let Some(reference) = nested_uri_reference(&candidate_path)
-                && self.location_exposes_destination_inner(reference, depth + 1)
+        // URL-bearing fields commonly embed their next destination as an
+        // encoded query value or fragment. Inspect those URI references
+        // recursively, but only when they are syntactically URI-like: treating
+        // every scalar as a relative path would remove benign values such as
+        // `https://example.test/next?label=signed/trigger`. When a structural
+        // reference remains at the depth boundary, fail closed rather than
+        // silently treating uninspected nesting as safe.
+        for (key, value) in &candidate_pairs {
+            if self.nested_reference_exposes_destination(nested_uri_reference(key), depth)
+                || self.nested_reference_exposes_destination(
+                    nested_uri_reference(value),
+                    depth,
+                )
             {
                 return true;
             }
-            if let Some(fragment) = candidate.fragment() {
-                let decoded_fragment = decode_percent_layers(fragment);
-                if !decoded_fragment.fully_decoded {
-                    return true;
-                }
-                if let Some(reference) = nested_uri_reference(&decoded_fragment.value)
-                    && self.location_exposes_destination_inner(reference, depth + 1)
-                {
-                    return true;
-                }
+        }
+        if self.nested_reference_exposes_destination(
+            nested_path_uri_reference(&candidate_path),
+            depth,
+        ) {
+            return true;
+        }
+        if let Some(fragment) = candidate.fragment() {
+            let decoded_fragment = decode_percent_layers(fragment);
+            if !decoded_fragment.fully_decoded {
+                return true;
+            }
+            if self.nested_reference_exposes_destination(
+                nested_uri_reference(&decoded_fragment.value),
+                depth,
+            ) {
+                return true;
             }
         }
 
         false
+    }
+
+    fn nested_reference_exposes_destination(
+        &self,
+        reference: Option<&str>,
+        depth: usize,
+    ) -> bool {
+        let Some(reference) = reference else {
+            return false;
+        };
+        depth >= MAX_NESTED_DESTINATION_DEPTH
+            || self.uri_reference_exposes_destination_inner(reference, depth + 1)
+    }
+
+    fn response_header_exposes_destination(
+        &self,
+        kind: UrlValuedResponseHeader,
+        value: &str,
+    ) -> bool {
+        if !self.has_sensitive_components() {
+            return false;
+        }
+        if value.len() > MAX_URL_VALUED_RESPONSE_HEADER_BYTES {
+            return true;
+        }
+        match kind {
+            UrlValuedResponseHeader::Location | UrlValuedResponseHeader::ContentLocation => {
+                self.uri_reference_exposes_destination(value)
+            }
+            UrlValuedResponseHeader::Refresh => match refresh_uri_reference(value) {
+                Ok(Some(reference)) => self.uri_reference_exposes_destination(reference),
+                Ok(None) => false,
+                Err(()) => true,
+            },
+            UrlValuedResponseHeader::Link => self.link_header_exposes_destination(value),
+        }
+    }
+
+    fn link_header_exposes_destination(&self, value: &str) -> bool {
+        let bytes = value.as_bytes();
+        let mut cursor = 0;
+        let mut targets = 0;
+
+        loop {
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if cursor == bytes.len() {
+                return true;
+            }
+            if bytes[cursor] != b'<' {
+                return true;
+            }
+            let target_start = cursor + 1;
+            let Some(relative_end) = value[target_start..].find('>') else {
+                return true;
+            };
+            let target_end = target_start + relative_end;
+            targets += 1;
+            if targets > MAX_LINK_HEADER_TARGETS
+                || self.uri_reference_exposes_destination(&value[target_start..target_end])
+            {
+                return true;
+            }
+
+            cursor = target_end + 1;
+            let mut quoted = false;
+            let mut escaped = false;
+            let mut has_next_target = false;
+            while cursor < bytes.len() {
+                let byte = bytes[cursor];
+                if quoted {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        quoted = false;
+                    }
+                } else if byte == b'"' {
+                    quoted = true;
+                } else if byte == b',' {
+                    cursor += 1;
+                    has_next_target = true;
+                    break;
+                } else if byte == b'<' {
+                    return true;
+                }
+                cursor += 1;
+            }
+            if quoted || escaped {
+                return true;
+            }
+            if cursor == bytes.len() {
+                return has_next_target;
+            }
+        }
     }
 }
 
@@ -1143,6 +1255,14 @@ fn nested_uri_reference(value: &str) -> Option<&str> {
     .then_some(trimmed)
 }
 
+fn nested_path_uri_reference(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    let without_slash = trimmed.strip_prefix('/')?;
+    (has_ascii_case_insensitive_prefix(without_slash, "http://")
+        || has_ascii_case_insensitive_prefix(without_slash, "https://"))
+    .then_some(without_slash)
+}
+
 fn has_ascii_case_insensitive_prefix(value: &str, prefix: &str) -> bool {
     value
         .as_bytes()
@@ -1151,6 +1271,76 @@ fn has_ascii_case_insensitive_prefix(value: &str, prefix: &str) -> bool {
 }
 
 const MAX_REDIRECT_PERCENT_DECODE_LAYERS: usize = 8;
+const MAX_NESTED_DESTINATION_DEPTH: usize = 2;
+const MAX_URL_VALUED_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+const MAX_LINK_HEADER_TARGETS: usize = 32;
+
+#[derive(Clone, Copy)]
+enum UrlValuedResponseHeader {
+    Location,
+    ContentLocation,
+    Refresh,
+    Link,
+}
+
+impl UrlValuedResponseHeader {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "location" => Some(Self::Location),
+            "content-location" => Some(Self::ContentLocation),
+            "refresh" => Some(Self::Refresh),
+            "link" => Some(Self::Link),
+            _ => None,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Location => 0,
+            Self::ContentLocation => 1,
+            Self::Refresh => 2,
+            Self::Link => 3,
+        }
+    }
+}
+
+fn refresh_uri_reference(value: &str) -> Result<Option<&str>, ()> {
+    let Some((_, directive)) = value.split_once(';') else {
+        return Ok(None);
+    };
+    let directive = directive.trim();
+    if !has_ascii_case_insensitive_prefix(directive, "url") {
+        return Ok(None);
+    }
+    let after_name = &directive["url".len()..];
+    if after_name
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+    {
+        return Ok(None);
+    }
+    let Some(target) = after_name.trim_start().strip_prefix('=') else {
+        return Err(());
+    };
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(());
+    }
+    if matches!(target.as_bytes()[0], b'\'' | b'"') {
+        let quote = target.as_bytes()[0];
+        if target.len() < 2 || target.as_bytes()[target.len() - 1] != quote {
+            return Err(());
+        }
+        let unquoted = &target[1..target.len() - 1];
+        if unquoted.is_empty() || unquoted.as_bytes().contains(&quote) {
+            return Err(());
+        }
+        Ok(Some(unquoted))
+    } else {
+        Ok(Some(target))
+    }
+}
 
 struct DecodedPercentLayers {
     value: String,
@@ -1189,7 +1379,7 @@ fn sanitize_function_response_headers(
             .into_iter()
             .collect();
     let mut safe = HashMap::new();
-    let mut location_blocked = false;
+    let mut destination_header_blocked = [false; 4];
     for (name, value) in headers {
         let lower = name.as_str();
         if connection_listed.contains(name)
@@ -1201,12 +1391,13 @@ fn sanitize_function_response_headers(
         let Ok(value) = value.to_str() else {
             continue;
         };
-        if lower == "location" {
-            if location_blocked
-                || function_destination.location_exposes_destination(value)
+        if let Some(kind) = UrlValuedResponseHeader::from_name(lower) {
+            let index = kind.index();
+            if destination_header_blocked[index]
+                || function_destination.response_header_exposes_destination(kind, value)
             {
-                safe.remove("location");
-                location_blocked = true;
+                safe.remove(lower);
+                destination_header_blocked[index] = true;
                 continue;
             }
         }

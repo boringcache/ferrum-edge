@@ -1264,7 +1264,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "scheme-relative",
         "decoded-path",
         "copied-path-other-host",
+        "descendant-path-other-host",
         "nested-double-encoded",
+        "nested-depth-budget",
         "nested-over-decode-budget",
         "destination-over-decode-budget",
         "nested-path-encoded",
@@ -1275,6 +1277,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-same-origin",
         "benign-external",
         "benign-external-label",
+        "benign-path-lookalike",
     ] {
         let server = MockServer::start().await;
         let function_url = if case == "destination-over-decode-budget" {
@@ -1302,12 +1305,20 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "copied-path-other-host" => {
                 "https://redirect.example/signed/trigger?unrelated=1".to_string()
             }
+            "descendant-path-other-host" => {
+                "https://redirect.example/signed/trigger/continue?unrelated=1".to_string()
+            }
             "nested-double-encoded" => {
                 let encoded: String =
                     url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
                 let double_encoded: String =
                     url::form_urlencoded::byte_serialize(encoded.as_bytes()).collect();
                 format!("https://redirect.example/continue?next={double_encoded}")
+            }
+            "nested-depth-budget" => {
+                let deepest = format!("https://third.example/three?next={function_url}");
+                let middle = format!("https://second.example/two?next={deepest}");
+                format!("https://redirect.example/one?next={middle}")
             }
             "nested-over-decode-budget" => {
                 let mut encoded = function_url.clone();
@@ -1332,6 +1343,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "benign-external" => "https://redirect.example/next?code=other".to_string(),
             "benign-external-label" => {
                 "https://redirect.example/next?label=signed/trigger".to_string()
+            }
+            "benign-path-lookalike" => {
+                "https://redirect.example/signed/triggered?code=other".to_string()
             }
             _ => unreachable!(),
         };
@@ -1372,6 +1386,160 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
                 }
             }
             other => panic!("expected terminal redirect for case {case}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in [
+        "content-location-absolute",
+        "content-location-relative",
+        "content-location-encoded",
+        "refresh-absolute",
+        "refresh-relative",
+        "refresh-encoded",
+        "refresh-malformed-target",
+        "link-absolute",
+        "link-relative",
+        "link-multiple-targets",
+        "link-target-budget",
+        "link-malformed",
+        "benign-content-location",
+        "benign-refresh",
+        "benign-refresh-delay-only",
+        "benign-refresh-non-url-directive",
+        "benign-link-multiple-targets",
+        "benign-link-label",
+        "benign-link-path-lookalike",
+    ] {
+        let server = MockServer::start().await;
+        let function_url = format!(
+            "{}/signed%2Ftrigger?code=secret%2Fvalue",
+            server.uri()
+        );
+        let encoded_function_url: String =
+            url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
+        let (header, value, should_strip) = match case {
+            "content-location-absolute" => {
+                ("content-location", function_url.clone(), true)
+            }
+            "content-location-relative" => (
+                "content-location",
+                "/signed%2Ftrigger?code=secret%2Fvalue".to_string(),
+                true,
+            ),
+            "content-location-encoded" => {
+                ("content-location", encoded_function_url.clone(), true)
+            }
+            "refresh-absolute" => {
+                ("refresh", format!("0; URL=\"{function_url}\""), true)
+            }
+            "refresh-relative" => (
+                "refresh",
+                "0;url=/signed%2Ftrigger?code=secret%2Fvalue".to_string(),
+                true,
+            ),
+            "refresh-encoded" => {
+                ("refresh", format!("0; url={encoded_function_url}"), true)
+            }
+            "refresh-malformed-target" => {
+                ("refresh", format!("0; url=\"{function_url}"), true)
+            }
+            "link-absolute" => {
+                ("link", format!("<{function_url}>; rel=\"next\""), true)
+            }
+            "link-relative" => (
+                "link",
+                "</signed%2Ftrigger?code=secret%2Fvalue>; rel=\"next\"".to_string(),
+                true,
+            ),
+            "link-multiple-targets" => (
+                "link",
+                format!("</safe>; rel=\"prev\", <{function_url}>; rel=\"next\""),
+                true,
+            ),
+            "link-target-budget" => (
+                "link",
+                (0..33)
+                    .map(|index| format!("</safe/{index}>; rel=\"item\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                true,
+            ),
+            "link-malformed" => (
+                "link",
+                format!("</safe>; title=\"unterminated, <{function_url}>; rel=next"),
+                true,
+            ),
+            "benign-content-location" => {
+                ("content-location", "/safe?code=other".to_string(), false)
+            }
+            "benign-refresh" => {
+                ("refresh", "5; URL = '/safe?code=other'".to_string(), false)
+            }
+            "benign-refresh-delay-only" => ("refresh", "5".to_string(), false),
+            "benign-refresh-non-url-directive" => {
+                ("refresh", "not-a-delay; token=value".to_string(), false)
+            }
+            "benign-link-multiple-targets" => (
+                "link",
+                "</safe>; rel=\"prev\", <https://redirect.example/next?code=other>; rel=\"next\"; title=\"a,b\""
+                    .to_string(),
+                false,
+            ),
+            "benign-link-label" => (
+                "link",
+                format!("</safe>; title=\"{function_url}\""),
+                false,
+            ),
+            "benign-link-path-lookalike" => (
+                "link",
+                "<https://redirect.example/signed/triggered?code=other>; rel=\"next\""
+                    .to_string(),
+                false,
+            ),
+            _ => unreachable!(),
+        };
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("function-response")
+                    .insert_header(header, value.as_str()),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": function_url,
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::RejectBinary { headers, .. } => {
+                if should_strip {
+                    assert!(
+                        !headers.contains_key(header),
+                        "credential-bearing {header} survived case {case}: {headers:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        headers.get(header).map(String::as_str),
+                        Some(value.as_str()),
+                        "benign {header} changed in case {case}"
+                    );
+                }
+            }
+            other => panic!("expected terminal response for case {case}, got {other:?}"),
         }
     }
 }

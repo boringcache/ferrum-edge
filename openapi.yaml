@@ -15162,11 +15162,17 @@ components:
         back to well-known environment variables. Terminate mode forwards
         applicable end-to-end response headers, preserving repeated Set-Cookie,
         while stripping hop-by-hop, Connection-listed, transport-managed,
-        provider-control, and credential-bearing fields. Redirect Location is
-        removed when a relative, absolute, encoded, or nested target exposes
-        the configured signed function path/query; residual encoding beyond
-        the bounded inspection budget also fails closed, while unrelated
-        redirects remain.
+        provider-control, and credential-bearing fields. URL-valued Location,
+        Content-Location, Refresh (url= form), and every Link target are removed
+        when a relative, absolute, encoded, or nested target exposes the
+        configured signed function path/query. Signed paths match exact and
+        slash-delimited descendant paths, not arbitrary substrings. Inspection
+        is bounded to 16 KiB per field, 32 Link targets, eight percent-decoding
+        transforms, and two nested URI-reference hops. Residual encoding,
+        malformed target syntax, budget overflow, or another structural URI
+        reference at the nesting boundary fails closed, while unrelated URL
+        targets, non-URL Refresh directives, quoted Link parameters, and scalar
+        labels remain observable.
         Later body rewrites invalidate ranges, validators, integrity metadata,
         and content-bound signatures while unmodified responses retain them;
         206 Partial Content responses skip rewriting to preserve range semantics.
