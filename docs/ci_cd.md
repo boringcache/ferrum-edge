@@ -34,9 +34,10 @@ adding, removing, or materially changing a workflow.
 | Workflow file | Display name | Triggers | Role |
 |---|---|---|---|
 | `ci.yml` | CI | PRs, push to `main`, manual | Required validation gate plus `latest` prerelease and Docker image publishing from `main`. |
-| `coverage.yml` | Coverage | PRs, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement mirrored by CI. |
+| `coverage.yml` | Coverage | PRs, push to `main`, weekly schedule, manual | Coverage planning/reporting and coverage floor enforcement; `Merge Coverage` is directly required on PRs. |
 | `release.yml` | Release | `v*` tag push | Versioned binary, GitHub Release, and Docker publishing after CI/Coverage validation. |
-| `gateway-api-conformance.yml` | Gateway API Conformance | PRs, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab. |
+| `gateway-api-conformance.yml` | Gateway API Conformance | PRs, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs. |
+| `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | Path-filtered PRs, manual | Live multicluster federation datapath validation. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
@@ -55,16 +56,19 @@ adding, removing, or materially changing a workflow.
 
 ```
 Pull Request
-    └─► CI plan
+    ├─► CI plan
             ├─► Docs/license/agent-only: lightweight Tests aggregate
             └─► Full CI
                     ├─► Format + integration-shard coverage (in CI plan)
                     ├─► Unit+inline-lib / integration-shard / functional-shard tests
                     ├─► Lint, dependency audit, vendored regressions
-                    ├─► Coverage workflow mirror
                     ├─► eBPF/netns live checks when planner marks relevant
-                    ├─► Gateway / planner-gated mesh / Helm / performance gates
+                    ├─► Planner-gated mesh / Helm / performance gates
                     └─► Five target release builds
+    └─► Dedicated required checks (internally skip unrelated changes)
+            ├─► Merge Coverage
+            ├─► Gateway API Conformance
+            └─► Mesh E2E Sidecar Live
 
 Push to main
     ├─► Full required validation gate
@@ -116,12 +120,21 @@ Rust formatting and the integration-shard coverage contract also run as named
 steps in `CI Plan`, avoiding two additional runner allocations.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
-shards, lint, dependency audit, vendored patch regressions, the Coverage
-workflow mirror, Gateway/mesh/Helm gates, eBPF/netns gates, performance, and the
+shards, lint, dependency audit, vendored patch regressions,
+planner-gated mesh/Helm gates, eBPF/netns gates, performance, and the
 cross-platform build matrix. In light mode it requires the planner to succeed
 and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
+
+Branch protection must require four independent PR checks: the unchanged `Tests`
+aggregate from `ci.yml`, plus `Merge Coverage` from `coverage.yml`, `Gateway API
+Conformance` from `gateway-api-conformance.yml`, and `Mesh E2E Sidecar Live`
+from `mesh-e2e-sidecar-live.yml`. Each dedicated workflow triggers on every
+pull request, performs its path filtering internally, and terminates in an
+`if: always()` job that passes a legitimate internal skip and fails on planning
+or validation failures. They are required directly rather than mirrored by
+runner-holding polling jobs in `ci.yml`.
 
 CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation. If the cancellation left publishing incomplete, re-run the newest workflow attempt (the one for the latest `main` SHA) — re-running the older, canceled run would re-publish stale binaries and images as `latest`.
 
@@ -321,7 +334,7 @@ image such as `macos-14` if the host architecture must be guaranteed.
 
 **Runs**: `ubuntu-latest`
 
-On pushes to `main`, the `latest-release` job and the per-architecture Linux Docker publishing job both depend on the completed build matrix and the `Tests` aggregate, which includes a mirror of the separate Coverage workflow for the same SHA. They can run in parallel after validation passes; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease, but neither publish path can start until required validation passes. Version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
+On pushes to `main`, the `latest-release` job and the per-architecture Linux Docker publishing job both depend on the completed build matrix and the `Tests` aggregate. The dedicated Coverage, Gateway API Conformance, and Mesh E2E Sidecar Live Datapath workflows run independently and are not polled by `ci.yml`. The publish jobs can run in parallel after their CI dependencies pass; the `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease, but neither publish path can start until its CI dependencies pass. Version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
 
 ## Release Pipeline (release.yml)
 
