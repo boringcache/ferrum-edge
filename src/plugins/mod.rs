@@ -1185,10 +1185,13 @@ impl RequestContext {
 
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
-    /// transforms. Only `metadata` is copied back to the real context by the
-    /// proxy caller, so this deliberately skips raw headers, raw query strings,
-    /// parsed query maps, prebuffered body bytes, and mirror receivers.
-    pub(crate) fn clone_for_final_request_body_hooks(&self) -> Self {
+    /// transforms. The compressor's private staged representation is moved
+    /// into this context so the authoritative wire transform can consume it
+    /// without recomputing or retaining a prompt-sized copy on the real
+    /// context. Only `metadata` and selected policy state are copied back by
+    /// the proxy caller, so this deliberately skips raw headers, raw query
+    /// strings, parsed query maps, prebuffered body bytes, and mirror receivers.
+    pub(crate) fn clone_for_final_request_body_hooks(&mut self) -> Self {
         Self {
             client_ip: self.client_ip.clone(),
             direct_client_ip: self.direct_client_ip.clone(),
@@ -1236,10 +1239,13 @@ impl RequestContext {
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
-            // Final hooks consume the body argument and copied public metadata,
-            // never the compressor's potentially body-sized private stage.
-            ai_prompt_compressor_staged: HashMap::new(),
-            ai_prompt_compressor_wire_stats_started: false,
+            // Transfer rather than clone the potentially body-sized compressor
+            // stage. The final wire hook consumes it from this compatibility
+            // context, while the live context no longer retains a second copy.
+            ai_prompt_compressor_staged: std::mem::take(&mut self.ai_prompt_compressor_staged),
+            ai_prompt_compressor_wire_stats_started: std::mem::take(
+                &mut self.ai_prompt_compressor_wire_stats_started,
+            ),
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
