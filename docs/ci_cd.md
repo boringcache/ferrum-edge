@@ -261,7 +261,12 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 
 Runs on full-mode PRs, pushes to `main`, and manual dispatches. PRs first apply a
 performance-sensitive path filter; unrelated PRs skip the expensive benchmark
-and report success. Relevant PRs and all `main` pushes build the gateway in the
+and report success. The PR gate covers proxy and connection hot paths, the
+file-mode startup path used by this benchmark, performance fixtures, and
+dependency/build-graph inputs. Plugin-internal, admin, secrets, and unrelated
+operating-mode changes are excluded because this plain HTTP/1.1 file-mode route
+cannot observe them. If the PR diff cannot be computed, the benchmark runs to
+fail closed. Relevant PRs and all `main` pushes build the gateway in the
 `ci-release` profile, build `tests/performance/backend_server`, start both
 services, and run:
 
