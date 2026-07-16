@@ -14697,12 +14697,7 @@ fn collect_later_set_cookies(
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
         if let Some(index) = cookies.iter().position(|existing| {
             existing == candidate
-                || set_cookie_same_storage_key(
-                    existing,
-                    candidate,
-                    default_domain,
-                    default_path,
-                )
+                || set_cookie_same_storage_key(existing, candidate, default_domain, default_path)
         }) {
             cookies.remove(index);
         }
@@ -14780,12 +14775,7 @@ fn attach_auth_rejection_set_cookie(
     }
 
     let mut staged_cookies = Vec::new();
-    collect_later_set_cookies(
-        &mut staged_cookies,
-        &staged,
-        default_domain,
-        default_path,
-    );
+    collect_later_set_cookies(&mut staged_cookies, &staged, default_domain, default_path);
     for candidate in staged_cookies {
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
