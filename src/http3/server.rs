@@ -29,7 +29,8 @@ use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
-    RequestContext, ResponseStreamAction, TransactionSummary,
+    RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, ResponseStreamAction,
+    TransactionSummary,
     normalize_response_body_for_inspection,
 };
 use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
@@ -66,6 +67,68 @@ where
         .await
         .map_err(|_| H3RequestBodyReadError::TimedOut)?
         .map_err(H3RequestBodyReadError::Read)
+}
+
+struct FinalizedH3TerminalBodyRejection {
+    http_status: StatusCode,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+/// Commit an H3 terminal request-body failure before provider/backend I/O.
+/// The shared committed-response hook then releases any exact local/Redis
+/// request ownership once, even when the client reset prevents writing the
+/// already-decided rejection back to the stream.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_h3_terminal_body_read_rejection(
+    state: &ProxyState,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    http_flavor: HttpFlavor,
+    status: StatusCode,
+    body: &[u8],
+    start_time: std::time::Instant,
+    plugin_execution_ns: &mut u64,
+    request_path: &str,
+) -> FinalizedH3TerminalBodyRejection {
+    ctx.metadata.insert(
+        RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut response_status = status.as_u16();
+    let mut headers = HashMap::new();
+    let mut body = body.to_vec();
+    let rejection_hook_start = std::time::Instant::now();
+    apply_reject_after_proxy_and_synthetic_body_hooks(
+        plugins,
+        ctx,
+        &mut response_status,
+        &mut headers,
+        &mut body,
+        matches!(http_flavor, HttpFlavor::Grpc),
+        true,
+    )
+    .await;
+    *plugin_execution_ns += rejection_hook_start.elapsed().as_nanos() as u64;
+    let http_status = StatusCode::from_u16(response_status).unwrap_or(status);
+    let log_status =
+        h3_reject_log_status_and_metadata(ctx, http_flavor, http_status, &body, &headers);
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        log_status,
+        start_time,
+        "on_final_request_body",
+        *plugin_execution_ns,
+        Some(request_path),
+    )
+    .await;
+    record_request(state, log_status);
+    FinalizedH3TerminalBodyRejection {
+        http_status,
+        headers,
+        body,
+    }
 }
 
 /// Optional HTTP/3 listener settings that don't affect the core bind contract.

@@ -51,13 +51,13 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
-use super::request_deduplication::{
-    EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY,
-};
 use super::utils::aws_sigv4;
 use super::utils::body_transform::is_json_content_type;
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
-use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::{
+    EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, Plugin, PluginHttpClient, PluginResult,
+    RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
+};
 
 const DEFAULT_MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -1850,6 +1850,7 @@ fn validate_openai_request(
             .and_then(Value::as_str)
             .ok_or_else(|| format!("ai_federation: messages[{index}] missing string role"))?;
         if !matches!(role, "system" | "developer" | "user" | "assistant" | "tool") {
+            let role = bounded_error_value(role);
             return Err(format!(
                 "ai_federation: messages[{index}] has unsupported role '{role}'"
             ));

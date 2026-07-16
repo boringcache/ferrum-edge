@@ -121,6 +121,19 @@ use crate::config::types::{
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
 
+/// Internal provenance marker set after a request-phase plugin has issued an
+/// external operation whose result must not be replayed from an ambiguous
+/// synthetic-response pipeline.
+pub(crate) const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str =
+    "ferrum:external_operation_completed";
+
+/// Internal marker set when a request is committed to a synthetic rejection
+/// before any external operation or backend dispatch could have started.
+/// Ownership plugins consume it from `on_response_committed` to release this
+/// request's exact local/distributed in-flight token safely.
+pub(crate) const RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY: &str =
+    "ferrum:release_dedup_inflight_on_commit";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JwtAuthAttributeValue {
     Scalar(String),

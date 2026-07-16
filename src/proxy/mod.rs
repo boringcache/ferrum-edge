@@ -104,7 +104,8 @@ use crate::modes::mesh::node_waypoint::{
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
-    RequestContext, TransactionSummary, WebSocketFrameDirection, is_builtin_plugin_name,
+    RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, TransactionSummary,
+    WebSocketFrameDirection, is_builtin_plugin_name,
     mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
@@ -13748,6 +13749,50 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     normalize_reject_response(status, &response_body, &headers, is_grpc_request)
 }
 
+/// Finalize a terminal request-body read failure before any external operation
+/// or backend dispatch could start. The committed-response hook owns cleanup of
+/// exact local/distributed in-flight tokens, so every failure shape must pass
+/// through the same rejection pipeline exactly once.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_terminal_request_body_read_rejection(
+    state: &ProxyState,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: &[u8],
+    is_grpc_request: bool,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    request_path: &str,
+) -> Response<ProxyBody> {
+    ctx.metadata.insert(
+        RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let normalized = finalize_reject_response_with_after_proxy_hooks(
+        plugins,
+        ctx,
+        status,
+        body,
+        HashMap::new(),
+        is_grpc_request,
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &normalized);
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        normalized.http_status.as_u16(),
+        start_time,
+        "on_final_request_body",
+        plugin_execution_ns,
+        Some(request_path),
+    )
+    .await;
+    record_request(state, normalized.http_status.as_u16());
+    build_response_from_normalized_reject(normalized)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_backend_admission_rejection(
     rejection: backend_dispatch::BackendAdmissionRejection,
@@ -15583,11 +15628,18 @@ async fn handle_proxy_request_inner(
                 {
                     Ok(body) => body,
                     Err(RequestBodyBufferError::TooLarge) => {
-                        record_request(&state, 413);
-                        return Ok(build_response(
+                        return Ok(finalize_terminal_request_body_read_rejection(
+                            &state,
+                            &plugins,
+                            &mut ctx,
                             StatusCode::PAYLOAD_TOO_LARGE,
-                            r#"{"error":"Request body exceeds maximum size"}"#,
-                        ));
+                            br#"{"error":"Request body exceeds maximum size"}"#,
+                            is_grpc_request,
+                            start_time,
+                            plugin_execution_ns,
+                            &original_request_path,
+                        )
+                        .await);
                     }
                     Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
                         error!(
@@ -15597,19 +15649,32 @@ async fn handle_proxy_request_inner(
                             error = %error_message,
                             "Client disconnected while finalizing terminal request body before backend dispatch"
                         );
-                        record_request(&state, 499);
-                        return Ok(build_response(
+                        return Ok(finalize_terminal_request_body_read_rejection(
+                            &state,
+                            &plugins,
+                            &mut ctx,
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            r#"{"error":"Client disconnected"}"#,
-                        ));
+                            br#"{"error":"Client disconnected"}"#,
+                            is_grpc_request,
+                            start_time,
+                            plugin_execution_ns,
+                            &original_request_path,
+                        )
+                        .await);
                     }
                     Err(RequestBodyBufferError::TimedOut) => {
-                        let response = build_request_body_timeout_response(
+                        return Ok(finalize_terminal_request_body_read_rejection(
+                            &state,
+                            &plugins,
+                            &mut ctx,
+                            StatusCode::REQUEST_TIMEOUT,
+                            br#"{"error":"Request body read timed out"}"#,
                             is_grpc_request,
-                            grpc_web_response_content_type,
-                        );
-                        record_request(&state, response.status().as_u16());
-                        return Ok(response);
+                            start_time,
+                            plugin_execution_ns,
+                            &original_request_path,
+                        )
+                        .await);
                     }
                 }
             }
@@ -15622,6 +15687,7 @@ async fn handle_proxy_request_inner(
                     .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
                 let mut body_hook_ctx = needs_final_request_body_context
                     .then(|| ctx.clone_for_final_request_body_hooks());
+                let terminal_hook_start = Instant::now();
                 let transformed = apply_request_body_plugins_with_context(
                     &plugins,
                     body_hook_ctx.as_mut(),
@@ -15636,6 +15702,7 @@ async fn handle_proxy_request_inner(
                     &transformed,
                 )
                 .await;
+                plugin_execution_ns += terminal_hook_start.elapsed().as_nanos() as u64;
                 if let Some(body_hook_ctx) = body_hook_ctx {
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;

@@ -57,18 +57,6 @@ const DEDUP_KEY_METADATA: &str = "_dedup_key";
 const DEDUP_FINGERPRINT_METADATA: &str = "_dedup_fingerprint";
 const DEDUP_LOCAL_INFLIGHT_TOKEN_METADATA: &str = "_dedup_local_inflight_token";
 const DEDUP_REDIS_LOCK_TOKEN_METADATA: &str = "_dedup_redis_lock_token";
-/// Internal provenance marker set by a later plugin after it has issued an
-/// external operation whose result must not be replayed from an ambiguous
-/// synthetic-response pipeline. `ai_federation` sets this as soon as a
-/// provider request has a potentially committed outcome.
-pub(crate) const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str =
-    "ferrum:external_operation_completed";
-/// Internal marker set by a later request-phase plugin when it is returning a
-/// synthetic response before any external operation could have started. The
-/// committed-response hook consumes it to release this request's in-flight
-/// ownership instead of retaining a false "already in progress" conflict.
-pub(crate) const RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY: &str =
-    "ferrum:release_dedup_inflight_on_commit";
 const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v2";
 const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
 const REDIS_INFLIGHT_KEY_COMPONENT: &str = "inflight";
@@ -134,7 +122,10 @@ fn decrement_atomic(value: &AtomicUsize) -> usize {
 use super::utils::body_transform::is_event_stream_content_type;
 use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
-use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::{
+    EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, Plugin, PluginHttpClient, PluginResult,
+    RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
+};
 
 /// A cached response stored for deduplication replay.
 #[derive(Debug, Clone)]
