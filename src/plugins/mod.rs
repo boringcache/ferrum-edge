@@ -2213,35 +2213,6 @@ where
     }
 }
 
-/// Await a rejection-path hook under the RPC deadline without cancelling the
-/// hook's cleanup future when the deadline wins. The response finalizer still
-/// receives typed deadline provenance immediately after the same hook
-/// invocation completes, so it can select the terminal status-4 response and
-/// run later cleanup/decorator hooks without reusing the expired timer.
-pub(crate) async fn await_rejection_plugin_deadline_with_provenance<F>(
-    deadline: Option<tokio::time::Instant>,
-    future: F,
-) -> RequestPluginDeadlineResult
-where
-    F: std::future::Future<Output = PluginResult>,
-{
-    let Some(deadline) = deadline else {
-        return RequestPluginDeadlineResult::Completed(future.await);
-    };
-
-    tokio::pin!(future);
-    let deadline_sleep = tokio::time::sleep_until(deadline);
-    tokio::pin!(deadline_sleep);
-    tokio::select! {
-        biased;
-        result = &mut future => RequestPluginDeadlineResult::Completed(result),
-        () = &mut deadline_sleep => {
-            let _ = future.await;
-            RequestPluginDeadlineResult::DeadlineExceeded
-        }
-    }
-}
-
 /// Await one request-phase plugin hook under the RPC's absolute deadline.
 /// Returning a normal plugin rejection keeps callers that do not need write
 /// provenance on their existing protocol-specific reject finalizer paths.

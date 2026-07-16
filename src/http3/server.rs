@@ -8630,7 +8630,26 @@ async fn dispatch_grpc_native_h3(
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                     client_deadline_expired = true;
                     coalesce_buf.clear();
-                    crate::http3::stream_util::abort_response_stream(stream);
+                    if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                        bytes_streamed,
+                    ) {
+                        if send_h3_grpc_terminal_trailers(
+                            stream,
+                            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                            GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+                            grpc_deadline_at,
+                        )
+                        .await
+                        {
+                            grpc_trailer_status =
+                                Some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
+                            body_completed = true;
+                        } else {
+                            crate::http3::stream_util::abort_response_stream(stream);
+                        }
+                    } else {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                    }
                     crate::proxy::insert_grpc_error_metadata(
                         &mut ctx.metadata,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -8657,6 +8676,70 @@ async fn dispatch_grpc_native_h3(
             just_received_backend_frame = false;
         }
         tokio::select! {
+            biased;
+            // Absolute deadline: unlike `read_deadline` this is NOT gated on an
+            // empty coalesce buffer — once the client's RPC deadline passes we stop
+            // regardless of buffered/in-flight frames. It comes first in this
+            // biased select so simultaneous backend DATA cannot cross the deadline.
+            // Headers (HTTP 200 + content-type) are already on the wire.
+            //
+            // If NO body bytes have been flushed yet, complete the RPC with a clean
+            // terminal `grpc-status: 4` trailer (an empty-body deadline) so the
+            // client surfaces gRPC DEADLINE_EXCEEDED instead of a transport failure
+            // — clearing any buffered-but-unflushed tail is safe because the client
+            // never saw a partial message. But once ANY body bytes are on the wire,
+            // a length-prefixed gRPC message may be mid-frame (H3 DATA chunk
+            // boundaries are independent of gRPC message boundaries), so dropping
+            // the buffered remainder and synthesizing clean trailers would hand the
+            // client a TRUNCATED message it surfaces as a protocol/internal error.
+            // In that case RESET instead: the client sees a transport abort and its
+            // own (equal) RPC deadline fires. Either way this client-owned expiry is
+            // health-neutral (`ClientDisconnect`) and the gRPC status lands in the
+            // metadata.
+            _ = &mut grpc_deadline_sleep, if grpc_deadline_active && !stream_done => {
+                client_deadline_expired = true;
+                coalesce_buf.clear();
+                if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                    bytes_streamed,
+                ) {
+                    warn!(
+                        "gRPC deadline (grpc-timeout) exceeded before any response body; \
+                         completing with grpc-status DEADLINE_EXCEEDED"
+                    );
+                    if send_h3_grpc_terminal_trailers(
+                        stream,
+                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                        GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+                        grpc_deadline_at,
+                    )
+                    .await
+                    {
+                        grpc_trailer_status =
+                            Some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
+                        body_completed = true;
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    } else {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        client_disconnected = true;
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    }
+                } else {
+                    warn!(
+                        "gRPC deadline (grpc-timeout) exceeded mid-body; resetting the stream \
+                         (a partial gRPC message would be truncated by synthesized trailers)"
+                    );
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                }
+                // Record the gRPC status in metadata so observability reflects the
+                // deadline on both the clean-trailer and reset paths.
+                crate::proxy::insert_grpc_error_metadata(
+                    &mut ctx.metadata,
+                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                );
+                break 'outer;
+            }
             chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                 match chunk_result {
                     Ok(Some(mut chunk)) => {
@@ -8755,66 +8838,6 @@ async fn dispatch_grpc_native_h3(
                 body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
                 break 'outer;
             }
-            // Absolute deadline: unlike `read_deadline` this is NOT gated on an
-            // empty coalesce buffer — once the client's RPC deadline passes we stop
-            // regardless of buffered/in-flight frames. Headers (HTTP 200 +
-            // content-type) are already on the wire.
-            //
-            // If NO body bytes have been flushed yet, complete the RPC with a clean
-            // terminal `grpc-status: 4` trailer (an empty-body deadline) so the
-            // client surfaces gRPC DEADLINE_EXCEEDED instead of a transport failure
-            // — clearing any buffered-but-unflushed tail is safe because the client
-            // never saw a partial message. But once ANY body bytes are on the wire,
-            // a length-prefixed gRPC message may be mid-frame (H3 DATA chunk
-            // boundaries are independent of gRPC message boundaries), so dropping
-            // the buffered remainder and synthesizing clean trailers would hand the
-            // client a TRUNCATED message it surfaces as a protocol/internal error.
-            // In that case RESET instead: the client sees a transport abort and its
-            // own (equal) RPC deadline fires. Either way this client-owned expiry is
-            // health-neutral (`ClientDisconnect`) and the gRPC status lands in the
-            // metadata.
-            _ = &mut grpc_deadline_sleep, if grpc_deadline_active && !stream_done => {
-                client_deadline_expired = true;
-                coalesce_buf.clear();
-                if bytes_streamed == 0 {
-                    warn!(
-                        "gRPC deadline (grpc-timeout) exceeded before any response body; \
-                         completing with grpc-status DEADLINE_EXCEEDED"
-                    );
-                    if send_h3_grpc_terminal_trailers(
-                        stream,
-                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                        GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
-                        grpc_deadline_at,
-                    )
-                    .await
-                    {
-                        grpc_trailer_status =
-                            Some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
-                        body_completed = true;
-                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                    } else {
-                        crate::http3::stream_util::abort_response_stream(stream);
-                        client_disconnected = true;
-                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                    }
-                } else {
-                    warn!(
-                        "gRPC deadline (grpc-timeout) exceeded mid-body; resetting the stream \
-                         (a partial gRPC message would be truncated by synthesized trailers)"
-                    );
-                    crate::http3::stream_util::abort_response_stream(stream);
-                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                }
-                // Record the gRPC status in metadata so observability reflects the
-                // deadline on both the clean-trailer and reset paths.
-                crate::proxy::insert_grpc_error_metadata(
-                    &mut ctx.metadata,
-                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
-                );
-                break 'outer;
-            }
         }
         if stream_done {
             if !coalesce_buf.is_empty() {
@@ -8867,7 +8890,9 @@ async fn dispatch_grpc_native_h3(
                             // possibly-truncated message isn't capped with a clean
                             // status the client surfaces as a protocol error. Same
                             // rule as the mid-body deadline arm.
-                            if bytes_streamed == 0 {
+                            if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                                bytes_streamed,
+                            ) {
                                 warn!(
                                     "gRPC deadline (grpc-timeout) exceeded while awaiting trailers \
                                      (empty body); completing with grpc-status DEADLINE_EXCEEDED"
@@ -10087,30 +10112,29 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
         if !plugin.requires_response_committed_hook() {
             continue;
         }
-        if ctx.gateway_deadline_response_selected() {
-            plugin
-                .on_response_committed(
-                    ctx,
-                    committed_status.as_u16(),
-                    &committed_headers,
-                    &committed_body,
-                )
-                .await;
-            continue;
-        }
-        if crate::plugins::await_grpc_deadline(
-            ctx.grpc_deadline_at(),
-            plugin.on_response_committed(
-                ctx,
-                committed_status.as_u16(),
-                &committed_headers,
-                &committed_body,
-            ),
+        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+        let Some(pending_hook) = crate::proxy::run_response_committed_hook_until_deadline(
+            Arc::clone(plugin),
+            ctx,
+            committed_status.as_u16(),
+            &committed_headers,
+            &committed_body,
+            terminal_gateway_deadline,
         )
         .await
-        .is_ok()
-        {
+        else {
             continue;
+        };
+
+        if terminal_gateway_deadline {
+            crate::proxy::spawn_detached_response_committed_hooks(
+                pending_hook,
+                plugins[index + 1..].to_vec(),
+                committed_status.as_u16(),
+                Arc::new(committed_headers.clone()),
+                Arc::new(committed_body.clone()),
+            );
+            return false;
         }
 
         let mut deadline_headers = headers.clone();
@@ -10137,29 +10161,24 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
                 );
                 (normalized.http_status, normalized.headers, normalized.body)
             };
-        for remaining in plugins[index + 1..]
-            .iter()
-            .filter(|plugin| plugin.requires_response_committed_hook())
-        {
-            remaining
-                .on_response_committed(
-                    ctx,
-                    deadline_status.as_u16(),
-                    &deadline_headers,
-                    &deadline_body,
-                )
-                .await;
-        }
+        crate::proxy::spawn_detached_response_committed_hooks(
+            pending_hook,
+            plugins[index + 1..].to_vec(),
+            deadline_status.as_u16(),
+            Arc::new(deadline_headers),
+            Arc::new(deadline_body),
+        );
         return true;
     }
     false
 }
 
 /// Finalize and emit a client RPC deadline discovered while buffering an H3
-/// upload. The body wait is over, but the rejection lifecycle is not: response
-/// decorators, committed observers, and rejection logging must all run before
-/// the stream is closed. This is also the point where gRPC-Web CORS headers are
-/// folded into the translated body-trailer response.
+/// upload. The body wait is over, but the rejection lifecycle is not:
+/// immediately-ready decorators and committed observers run before rejection
+/// logging and the stream write, while pending cleanup transfers to bounded
+/// owned state. This is also the point where synchronous gRPC-Web CORS headers
+/// are folded into the translated body-trailer response.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_h3_upload_deadline_rejection(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,

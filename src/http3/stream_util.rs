@@ -23,6 +23,15 @@ pub(crate) enum H3ResponseWriteError<E> {
     DeadlineExceeded,
 }
 
+/// A deadline can still be reported with a clean terminal gRPC status while
+/// the downstream client has not observed any response DATA. Once any DATA is
+/// visible, resetting is the only safe choice because the deadline may have
+/// interrupted a length-prefixed gRPC message.
+#[inline]
+pub(crate) fn grpc_deadline_can_send_terminal_status(bytes_streamed: u64) -> bool {
+    bytes_streamed == 0
+}
+
 /// Race one potentially flow-control-blocked downstream H3 write against the
 /// same absolute deadline that bounds the rest of the RPC.
 ///

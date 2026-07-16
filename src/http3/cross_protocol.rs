@@ -392,76 +392,14 @@ where
                 &headers,
                 matches!(flavor, HttpFlavor::Grpc),
             );
-            if plugins
-                .iter()
-                .any(|plugin| plugin.requires_response_committed_hook())
-            {
-                for (index, plugin) in plugins.iter().enumerate() {
-                    if !plugin.requires_response_committed_hook() {
-                        continue;
-                    }
-                    let deadline_exceeded = if let Some(translated) = translated.as_ref() {
-                        crate::plugins::await_grpc_deadline(
-                            ctx.grpc_deadline_at(),
-                            plugin.on_response_committed(
-                                ctx,
-                                StatusCode::OK.as_u16(),
-                                &translated.headers,
-                                &translated.body,
-                            ),
-                        )
-                        .await
-                        .is_err()
-                    } else {
-                        crate::plugins::await_grpc_deadline(
-                            ctx.grpc_deadline_at(),
-                            plugin.on_response_committed(
-                                ctx,
-                                normalized.http_status.as_u16(),
-                                &normalized.headers,
-                                &normalized.body,
-                            ),
-                        )
-                        .await
-                        .is_err()
-                    };
-                    if deadline_exceeded {
-                        let deadline = normalized_h3_grpc_deadline();
-                        (normalized, translated) = normalize_reject_for_client(
-                            ctx,
-                            deadline.http_status,
-                            &deadline.body,
-                            &deadline.headers,
-                            matches!(flavor, HttpFlavor::Grpc),
-                        );
-                        for remaining in plugins[index + 1..]
-                            .iter()
-                            .filter(|plugin| plugin.requires_response_committed_hook())
-                        {
-                            if let Some(translated) = translated.as_ref() {
-                                remaining
-                                    .on_response_committed(
-                                        ctx,
-                                        StatusCode::OK.as_u16(),
-                                        &translated.headers,
-                                        &translated.body,
-                                    )
-                                    .await;
-                            } else {
-                                remaining
-                                    .on_response_committed(
-                                        ctx,
-                                        normalized.http_status.as_u16(),
-                                        &normalized.headers,
-                                        &normalized.body,
-                                    )
-                                    .await;
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
+            run_cross_protocol_reject_committed_hooks(
+                plugins,
+                ctx,
+                matches!(flavor, HttpFlavor::Grpc),
+                &mut normalized,
+                &mut translated,
+            )
+            .await;
             let mut outcome = if let Some(translated) = translated {
                 write_reject_with_headers(
                     stream,
@@ -2315,9 +2253,27 @@ where
                 let send_result = {
                     tokio::pin!(send_future);
                     tokio::pin!(reader_future);
+                    let grpc_web_deadline_active = grpc_web_deadline_at.is_some();
+                    let grpc_web_deadline = tokio::time::sleep_until(
+                        grpc_web_deadline_at.unwrap_or_else(|| {
+                            tokio::time::Instant::now() + Duration::from_secs(86_400)
+                        }),
+                    );
+                    tokio::pin!(grpc_web_deadline);
                     let mut reader_done = false;
                     loop {
                         tokio::select! {
+                            biased;
+                            _ = &mut grpc_web_deadline, if grpc_web_deadline_active => {
+                                // The absolute RPC ceiling owns the whole streaming
+                                // dispatch, including an upload that never finishes
+                                // and a backend that withholds response headers.
+                                // Drop both borrowed futures immediately; the
+                                // unconditional STOP_SENDING below closes the H3
+                                // receive half without delaying the status-4 writer.
+                                drop(pending_slot.take());
+                                break None;
+                            }
                             result = &mut send_future => {
                                 drop(pending_slot.take());
                                 if !reader_done {
@@ -2338,7 +2294,7 @@ where
                                             .await;
                                     }
                                 }
-                                break result;
+                                break Some(result);
                             }
                             _ = &mut reader_future, if !reader_done => {
                                 reader_done = true;
@@ -2361,6 +2317,31 @@ where
                 // reader cost only one extra frame.
                 crate::http3::stream_util::halt_request_body(stream);
                 let bytes_sent = bytes_read.load(Ordering::Relaxed);
+                let Some(send_result) = send_result else {
+                    record_plain_grpc_web_client_deadline(
+                        state,
+                        epoch,
+                        proxy,
+                        upstream_balancer,
+                        current_target.as_deref(),
+                        current_cb_target_key.as_deref(),
+                        cb_retry_probe_slot_available,
+                        backend_start,
+                        &mut backend_admission_permits,
+                        backend_admission_start.elapsed(),
+                    );
+                    return write_plain_grpc_web_client_deadline(
+                        stream,
+                        plugins,
+                        ctx,
+                        response_committed_plugins,
+                        initial_response_header_policy_plugins,
+                        backend_start,
+                        bytes_sent,
+                        &current_url,
+                    )
+                    .await;
+                };
                 if oversized.load(Ordering::Relaxed) {
                     record_cross_protocol_backend_admission_outcome(
                         &mut backend_admission_permits,
@@ -2549,26 +2530,16 @@ where
         );
         let reject_status =
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let (normalized, translated) =
+        let (mut normalized, mut translated) =
             normalize_reject_for_client(ctx, reject_status, &reject.body, &reject.headers, false);
-        if !response_committed_plugins.is_empty() {
-            for plugin in response_committed_plugins {
-                if let Some(translated) = translated.as_ref() {
-                    plugin
-                        .on_response_committed(ctx, 200, &translated.headers, &translated.body)
-                        .await;
-                } else {
-                    plugin
-                        .on_response_committed(
-                            ctx,
-                            normalized.http_status.as_u16(),
-                            &normalized.headers,
-                            &normalized.body,
-                        )
-                        .await;
-                }
-            }
-        }
+        run_cross_protocol_reject_committed_hooks(
+            response_committed_plugins,
+            ctx,
+            false,
+            &mut normalized,
+            &mut translated,
+        )
+        .await;
         let mut outcome = if let Some(translated) = translated {
             write_reject_with_headers(
                 stream,
@@ -5900,9 +5871,25 @@ where
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                     client_deadline_expired = true;
                     coalesce_buf.clear();
-                    trailers = None;
+                    if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                        bytes_streamed,
+                    ) {
+                        let mut deadline_trailers = HeaderMap::new();
+                        deadline_trailers.insert(
+                            "grpc-status",
+                            HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER),
+                        );
+                        deadline_trailers.insert(
+                            "grpc-message",
+                            HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER),
+                        );
+                        trailers = Some(deadline_trailers);
+                        clean_deadline_completion = true;
+                    } else {
+                        trailers = None;
+                        crate::http3::stream_util::abort_response_stream(stream);
+                    }
                     body_error_class = Some(ErrorClass::ClientDisconnect);
-                    crate::http3::stream_util::abort_response_stream(stream);
                     false
                 }
                 Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
@@ -5931,7 +5918,9 @@ where
             _ = &mut grpc_deadline, if grpc_deadline_active && !stream_done => {
                 client_deadline_expired = true;
                 coalesce_buf.clear();
-                if bytes_streamed == 0 {
+                if crate::http3::stream_util::grpc_deadline_can_send_terminal_status(
+                    bytes_streamed,
+                ) {
                     let mut deadline_trailers = HeaderMap::new();
                     deadline_trailers.insert(
                         "grpc-status",
@@ -6299,6 +6288,78 @@ fn normalize_reject_for_client(
     (normalized, translated)
 }
 
+fn reject_committed_response_view<'a>(
+    normalized: &'a crate::proxy::NormalizedRejectResponse,
+    translated: Option<&'a crate::plugins::grpc_web::GrpcWebErrorResponse>,
+) -> (u16, &'a HashMap<String, String>, &'a [u8]) {
+    if let Some(translated) = translated {
+        (
+            StatusCode::OK.as_u16(),
+            &translated.headers,
+            &translated.body,
+        )
+    } else {
+        (
+            normalized.http_status.as_u16(),
+            &normalized.headers,
+            &normalized.body,
+        )
+    }
+}
+
+async fn run_cross_protocol_reject_committed_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    native_grpc: bool,
+    normalized: &mut crate::proxy::NormalizedRejectResponse,
+    translated: &mut Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+) -> bool {
+    for (index, plugin) in plugins.iter().enumerate() {
+        if !plugin.requires_response_committed_hook() {
+            continue;
+        }
+        let (status, headers, body) =
+            reject_committed_response_view(normalized, translated.as_ref());
+        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+        let Some(pending_hook) = crate::proxy::run_response_committed_hook_until_deadline(
+            Arc::clone(plugin),
+            ctx,
+            status,
+            headers,
+            body,
+            terminal_gateway_deadline,
+        )
+        .await
+        else {
+            continue;
+        };
+
+        let deadline_replaced = !terminal_gateway_deadline;
+        if deadline_replaced {
+            ctx.mark_gateway_deadline_response_selected();
+            let deadline = normalized_h3_grpc_deadline();
+            (*normalized, *translated) = normalize_reject_for_client(
+                ctx,
+                deadline.http_status,
+                &deadline.body,
+                &deadline.headers,
+                native_grpc,
+            );
+        }
+        let (status, headers, body) =
+            reject_committed_response_view(normalized, translated.as_ref());
+        crate::proxy::spawn_detached_response_committed_hooks(
+            pending_hook,
+            plugins[index + 1..].to_vec(),
+            status,
+            Arc::new(headers.clone()),
+            Arc::new(body.to_vec()),
+        );
+        return deadline_replaced;
+    }
+    false
+}
+
 async fn write_plain_gateway_error<S>(
     stream: &mut RequestStream<S, Bytes>,
     ctx: &mut RequestContext,
@@ -6513,91 +6574,19 @@ where
         &headers,
         matches!(flavor, HttpFlavor::Grpc),
     );
-    let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-    if !response_committed_plugins.is_empty() {
-        for (index, plugin) in response_committed_plugins.iter().enumerate() {
-            if terminal_gateway_deadline {
-                if let Some(translated) = grpc_web_reject.as_ref() {
-                    plugin
-                        .on_response_committed(
-                            ctx,
-                            StatusCode::OK.as_u16(),
-                            &translated.headers,
-                            &translated.body,
-                        )
-                        .await;
-                } else {
-                    plugin
-                        .on_response_committed(
-                            ctx,
-                            normalized.http_status.as_u16(),
-                            &normalized.headers,
-                            &normalized.body,
-                        )
-                        .await;
-                }
-                continue;
-            }
-            let deadline_exceeded = if let Some(translated) = grpc_web_reject.as_ref() {
-                crate::plugins::await_grpc_deadline(
-                    ctx.grpc_deadline_at(),
-                    plugin.on_response_committed(ctx, 200, &translated.headers, &translated.body),
-                )
-                .await
-                .is_err()
-            } else {
-                crate::plugins::await_grpc_deadline(
-                    ctx.grpc_deadline_at(),
-                    plugin.on_response_committed(
-                        ctx,
-                        normalized.http_status.as_u16(),
-                        &normalized.headers,
-                        &normalized.body,
-                    ),
-                )
-                .await
-                .is_err()
-            };
-            if deadline_exceeded {
-                ctx.mark_gateway_deadline_response_selected();
-                let deadline = normalized_h3_grpc_deadline();
-                (normalized, grpc_web_reject) = normalize_reject_for_client(
-                    ctx,
-                    deadline.http_status,
-                    &deadline.body,
-                    &deadline.headers,
-                    matches!(flavor, HttpFlavor::Grpc),
-                );
-                for remaining in &response_committed_plugins[index + 1..] {
-                    if let Some(translated) = grpc_web_reject.as_ref() {
-                        remaining
-                            .on_response_committed(
-                                ctx,
-                                StatusCode::OK.as_u16(),
-                                &translated.headers,
-                                &translated.body,
-                            )
-                            .await;
-                    } else {
-                        remaining
-                            .on_response_committed(
-                                ctx,
-                                normalized.http_status.as_u16(),
-                                &normalized.headers,
-                                &normalized.body,
-                            )
-                            .await;
-                    }
-                }
-                break;
-            }
-        }
-    }
-    // Cleanup above must run unbounded once the canonical upload deadline has
-    // been selected, but the downstream terminal write remains best-effort: it
-    // must not park forever on exhausted QUIC flow-control credit. Give the
-    // complete HEADERS/DATA/FIN writer one immediate poll after expiry and reset
-    // the stream if any constituent write would block.
+    run_cross_protocol_reject_committed_hooks(
+        response_committed_plugins,
+        ctx,
+        matches!(flavor, HttpFlavor::Grpc),
+        &mut normalized,
+        &mut grpc_web_reject,
+    )
+    .await;
+    // Pending committed observers continue on owned state under a post-response
+    // bound, while the downstream terminal write remains best-effort: it must
+    // not park forever on exhausted QUIC flow-control credit. Give the complete
+    // HEADERS/DATA/FIN writer one immediate poll after expiry and reset the
+    // stream if any constituent write would block.
     let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if let Some(translated) = grpc_web_reject {
         let write = write_reject_with_headers(
@@ -6825,56 +6814,36 @@ where
     let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
     let mut normalized = normalize_h3_grpc_reject(http_status, &parts.body, &headers);
     apply_h3_grpc_reject_metadata(ctx, &normalized);
-    if plugins
-        .iter()
-        .any(|plugin| plugin.requires_response_committed_hook())
-    {
-        for (index, plugin) in plugins.iter().enumerate() {
-            if !plugin.requires_response_committed_hook() {
-                continue;
-            }
-            if ctx.gateway_deadline_response_selected() {
-                plugin
-                    .on_response_committed(
-                        ctx,
-                        normalized.http_status.as_u16(),
-                        &normalized.headers,
-                        &normalized.body,
-                    )
-                    .await;
-                continue;
-            }
-            if crate::plugins::await_grpc_deadline(
-                ctx.grpc_deadline_at(),
-                plugin.on_response_committed(
-                    ctx,
-                    normalized.http_status.as_u16(),
-                    &normalized.headers,
-                    &normalized.body,
-                ),
-            )
-            .await
-            .is_err()
-            {
-                ctx.mark_gateway_deadline_response_selected();
-                normalized = normalized_h3_grpc_deadline();
-                apply_h3_grpc_reject_metadata(ctx, &normalized);
-                for remaining in plugins[index + 1..]
-                    .iter()
-                    .filter(|plugin| plugin.requires_response_committed_hook())
-                {
-                    remaining
-                        .on_response_committed(
-                            ctx,
-                            normalized.http_status.as_u16(),
-                            &normalized.headers,
-                            &normalized.body,
-                        )
-                        .await;
-                }
-                break;
-            }
+    for (index, plugin) in plugins.iter().enumerate() {
+        if !plugin.requires_response_committed_hook() {
+            continue;
         }
+        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+        let Some(pending_hook) = crate::proxy::run_response_committed_hook_until_deadline(
+            Arc::clone(plugin),
+            ctx,
+            normalized.http_status.as_u16(),
+            &normalized.headers,
+            &normalized.body,
+            terminal_gateway_deadline,
+        )
+        .await
+        else {
+            continue;
+        };
+        if !terminal_gateway_deadline {
+            ctx.mark_gateway_deadline_response_selected();
+            normalized = normalized_h3_grpc_deadline();
+            apply_h3_grpc_reject_metadata(ctx, &normalized);
+        }
+        crate::proxy::spawn_detached_response_committed_hooks(
+            pending_hook,
+            plugins[index + 1..].to_vec(),
+            normalized.http_status.as_u16(),
+            Arc::new(normalized.headers.clone()),
+            Arc::new(normalized.body.clone()),
+        );
+        break;
     }
     let write = write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent);
     if !ctx.gateway_deadline_response_selected() {

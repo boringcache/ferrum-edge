@@ -1106,6 +1106,10 @@ pub mod _test_support {
         )
     }
 
+    pub fn grpc_deadline_can_send_terminal_status_for_test(bytes_streamed: u64) -> bool {
+        crate::http3::stream_util::grpc_deadline_can_send_terminal_status(bytes_streamed)
+    }
+
     pub fn client_grpc_deadline_response_for_request_for_test(
         content_type: &str,
     ) -> DeadlineBackendResponse {

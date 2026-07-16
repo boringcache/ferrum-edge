@@ -886,6 +886,63 @@ impl Plugin for PendingAuth {
 
 struct DeadlineRejectDecorator;
 
+struct PendingDeadlineRejectCleanup {
+    started: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<tokio::sync::Notify>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Plugin for PendingDeadlineRejectCleanup {
+    fn name(&self) -> &str {
+        "pending_deadline_reject_cleanup"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        self.started.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release.notified().await;
+        self.completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        PluginResult::Continue
+    }
+}
+
+struct DeadlineRejectCleanupFollower {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    completed: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Plugin for DeadlineRejectCleanupFollower {
+    fn name(&self) -> &str {
+        "deadline_reject_cleanup_follower"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.completed.notify_one();
+        PluginResult::Continue
+    }
+}
+
 #[async_trait]
 impl Plugin for DeadlineRejectDecorator {
     fn name(&self) -> &str {
@@ -912,6 +969,63 @@ struct DeadlineRejectReplacer;
 struct DeadlineCommittedObserver {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     saw_decorator: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PendingDeadlineCommittedObserver {
+    started: Arc<std::sync::atomic::AtomicBool>,
+    release: Arc<tokio::sync::Notify>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Plugin for PendingDeadlineCommittedObserver {
+    fn name(&self) -> &str {
+        "pending_deadline_committed_observer"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        self.started.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release.notified().await;
+        self.completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct DeadlineCommittedFollower {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    completed: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Plugin for DeadlineCommittedFollower {
+    fn name(&self) -> &str {
+        "deadline_committed_follower"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.completed.notify_one();
+    }
 }
 
 #[async_trait]
@@ -1476,6 +1590,66 @@ async fn terminal_deadline_reject_runs_decorators_but_not_replacers() {
 }
 
 #[tokio::test]
+async fn rejection_hook_pending_at_deadline_does_not_delay_status_four() {
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let follower_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let follower_completed = Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(PendingDeadlineRejectCleanup {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+        }),
+        Arc::new(DeadlineRejectCleanupFollower {
+            calls: Arc::clone(&follower_calls),
+            completed: Arc::clone(&follower_completed),
+        }),
+    ];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(20));
+
+    let (status, body, headers) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        finalize_plugin_rejection_for_test(
+            &plugins,
+            &mut ctx,
+            503,
+            b"backend unavailable".to_vec(),
+            HashMap::new(),
+        ),
+    )
+    .await
+    .expect("a pending rejection cleanup hook must not retain the client response");
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        follower_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "ordered cleanup must wait for the pending hook on detached state"
+    );
+
+    release.notify_waiters();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        follower_completed.notified(),
+    )
+    .await
+    .expect("detached rejection cleanup must continue in plugin order");
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(follower_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn deadline_text_without_typed_provenance_does_not_claim_gateway_ownership() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(DeadlineRejectReplacer)];
     let mut ctx = RequestContext::new(
@@ -1544,6 +1718,61 @@ async fn grpc_web_upload_deadline_finalization_preserves_decorators_and_committe
         saw_decorator.load(std::sync::atomic::Ordering::SeqCst),
         "the committed observer must see the translated decorated response exactly once"
     );
+}
+
+#[tokio::test]
+async fn pending_committed_observer_does_not_retain_terminal_deadline_response() {
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let follower_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let follower_completed = Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(PendingDeadlineCommittedObserver {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+        }),
+        Arc::new(DeadlineCommittedFollower {
+            calls: Arc::clone(&follower_calls),
+            completed: Arc::clone(&follower_completed),
+        }),
+    ];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        finalized_upload_deadline_response_for_test(&plugins, &mut ctx, None),
+    )
+    .await
+    .expect("a pending committed observer must not retain the terminal response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("4")
+    );
+    assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(follower_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    release.notify_waiters();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        follower_completed.notified(),
+    )
+    .await
+    .expect("detached committed observers must continue in plugin order");
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(follower_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]

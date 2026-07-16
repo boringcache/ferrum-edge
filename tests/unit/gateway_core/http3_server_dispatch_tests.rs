@@ -554,6 +554,93 @@ async fn ready_h3_terminal_status_can_finish_after_deadline_selection() {
 }
 
 #[test]
+fn h3_grpc_deadline_terminal_status_depends_on_client_visible_data() {
+    assert!(
+        ferrum_edge::_test_support::grpc_deadline_can_send_terminal_status_for_test(0),
+        "the first blocked DATA write may still be replaced by clean status-4 trailers"
+    );
+    assert!(
+        !ferrum_edge::_test_support::grpc_deadline_can_send_terminal_status_for_test(1),
+        "once any DATA is client-visible the stream must reset instead of hiding a partial message"
+    );
+
+    let native = include_str!("../../../src/http3/server.rs");
+    let native = native
+        .split("async fn dispatch_grpc_native_h3(")
+        .nth(1)
+        .expect("native H3 gRPC relay")
+        .split("async fn log_h3_grpc_transaction(")
+        .next()
+        .expect("bounded native H3 gRPC relay");
+    let native_loop = native
+        .split("'outer: loop")
+        .nth(1)
+        .expect("native response loop");
+    let native_select = native_loop
+        .split("tokio::select! {")
+        .nth(1)
+        .expect("native response select");
+    let native_deadline = native_select
+        .find("_ = &mut grpc_deadline_sleep")
+        .expect("native response deadline arm");
+    let native_data = native_select
+        .find("h3_resp.recv_stream.recv_data()")
+        .expect("native response DATA arm");
+    assert!(native_select[..native_deadline].contains("biased;"));
+    assert!(
+        native_deadline < native_data,
+        "simultaneously-ready native DATA must lose to the absolute deadline"
+    );
+    assert!(native.contains("await_downstream_grpc_write!"));
+    assert!(native.contains("grpc_deadline_can_send_terminal_status("));
+
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let bridge = bridge
+        .split("async fn stream_hyper_incoming<S>(")
+        .nth(1)
+        .expect("H3-to-H2 gRPC response relay")
+        .split("fn should_finish_h3_stream_without_trailers(")
+        .next()
+        .expect("bounded H3-to-H2 gRPC response relay");
+    assert!(bridge.contains("await_downstream_write!"));
+    assert!(bridge.contains("grpc_deadline_can_send_terminal_status("));
+    assert!(bridge.contains("trailers = Some(deadline_trailers);"));
+    assert!(bridge.contains("abort_response_stream(stream);"));
+}
+
+#[test]
+fn streaming_h3_grpc_web_dispatch_is_bounded_before_response_headers() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = source
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+    let bridge = dispatch
+        .split("let send_result = {")
+        .nth(1)
+        .expect("streaming upload/backend response race");
+    let deadline = bridge
+        .find("_ = &mut grpc_web_deadline")
+        .expect("absolute gRPC-Web deadline arm");
+    let response = bridge
+        .find("result = &mut send_future")
+        .expect("backend response-header arm");
+    assert!(bridge[..deadline].contains("biased;"));
+    assert!(
+        deadline < response,
+        "a simultaneous backend response must not outlive the RPC deadline"
+    );
+    assert!(bridge[deadline..response].contains("drop(pending_slot.take());"));
+    assert!(bridge[deadline..response].contains("break None;"));
+    assert!(bridge.contains("halt_request_body(stream);"));
+    assert!(bridge.contains("record_plain_grpc_web_client_deadline("));
+    assert!(bridge.contains("write_plain_grpc_web_client_deadline("));
+}
+
+#[test]
 fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
     let source = include_str!("../../../src/http3/server.rs");
     let helper = source

@@ -13474,6 +13474,140 @@ fn replace_rejection_with_gateway_deadline(
     );
 }
 
+const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct OwnedRejectionHookResult {
+    ctx: RequestContext,
+    status_code: u16,
+    response_body: Option<Vec<u8>>,
+    response_headers: HashMap<String, String>,
+    result: PluginResult,
+}
+
+type OwnedRejectionHookFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = OwnedRejectionHookResult> + Send + 'static>,
+>;
+
+fn owned_rejection_hook_future(
+    plugin: Arc<dyn Plugin>,
+    mut ctx: RequestContext,
+    status_code: u16,
+    response_body: Option<Vec<u8>>,
+    mut response_headers: HashMap<String, String>,
+) -> OwnedRejectionHookFuture {
+    Box::pin(async move {
+        let result = plugin
+            .after_proxy(&mut ctx, status_code, &mut response_headers)
+            .await;
+        OwnedRejectionHookResult {
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+            result,
+        }
+    })
+}
+
+async fn poll_owned_rejection_hook_once(
+    future: &mut OwnedRejectionHookFuture,
+) -> Option<OwnedRejectionHookResult> {
+    futures_util::future::poll_fn(|cx| {
+        Poll::Ready(match std::future::Future::poll(future.as_mut(), cx) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        })
+    })
+    .await
+}
+
+fn adopt_owned_rejection_hook_result(
+    outcome: OwnedRejectionHookResult,
+    ctx: &mut RequestContext,
+    status_code: &mut u16,
+    response_body: &mut Option<&mut Vec<u8>>,
+    response_headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    *ctx = outcome.ctx;
+    *status_code = outcome.status_code;
+    if let (Some(body), Some(owned_body)) =
+        (response_body.as_deref_mut(), outcome.response_body)
+    {
+        *body = owned_body;
+    }
+    *response_headers = outcome.response_headers;
+    outcome.result
+}
+
+fn restore_rejection_response_markers(
+    ctx: &mut RequestContext,
+    previous_marker: Option<String>,
+    previous_replaceable_marker: Option<String>,
+) {
+    if let Some(previous_marker) = previous_marker {
+        ctx.metadata
+            .insert(REJECTION_RESPONSE_METADATA_KEY.to_string(), previous_marker);
+    } else {
+        ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
+    }
+    if let Some(previous_marker) = previous_replaceable_marker {
+        ctx.metadata.insert(
+            REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY.to_string(),
+            previous_marker,
+        );
+    } else {
+        ctx.metadata
+            .remove(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY);
+    }
+}
+
+fn spawn_detached_rejection_cleanup(
+    pending_hook: OwnedRejectionHookFuture,
+    remaining_plugins: Vec<Arc<dyn Plugin>>,
+    previous_marker: Option<String>,
+    previous_replaceable_marker: Option<String>,
+) {
+    std::mem::drop(tokio::spawn(async move {
+        let cleanup = async move {
+            let OwnedRejectionHookResult {
+                mut ctx,
+                mut status_code,
+                mut response_body,
+                mut response_headers,
+                result: _,
+            } = pending_hook.await;
+            ctx.mark_gateway_deadline_response_selected();
+            replace_rejection_with_gateway_deadline(
+                &mut status_code,
+                response_body.as_mut(),
+                &mut response_headers,
+            );
+            for plugin in remaining_plugins {
+                if plugin.may_replace_rejection_response() {
+                    continue;
+                }
+                let _ = plugin
+                    .after_proxy(&mut ctx, status_code, &mut response_headers)
+                    .await;
+            }
+            restore_rejection_response_markers(
+                &mut ctx,
+                previous_marker,
+                previous_replaceable_marker,
+            );
+        };
+        if tokio::time::timeout(DETACHED_REJECTION_CLEANUP_TIMEOUT, cleanup)
+            .await
+            .is_err()
+        {
+            warn!(
+                timeout_seconds = DETACHED_REJECTION_CLEANUP_TIMEOUT.as_secs(),
+                "detached rejection cleanup exceeded its post-response bound"
+            );
+        }
+    }));
+}
+
 async fn run_after_proxy_hooks_on_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -13494,47 +13628,134 @@ async fn run_after_proxy_hooks_on_rejection(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
         "true".to_string(),
     );
-    let mut terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
-
-    for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
+    let deadline_already_elapsed = ctx
+        .grpc_deadline_at()
+        .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+    let initial_terminal_gateway_deadline =
+        ctx.gateway_deadline_response_selected() || deadline_already_elapsed;
+    if initial_terminal_gateway_deadline {
+        ctx.mark_gateway_deadline_response_selected();
+        replace_rejection_with_gateway_deadline(
+            status_code,
+            response_body.as_deref_mut(),
+            response_headers,
+        );
+    }
+    for (index, plugin) in plugins.iter().enumerate() {
+        if !plugin.applies_after_proxy_on_reject() {
+            continue;
+        }
+        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected()
+            || ctx
+                .grpc_deadline_at()
+                .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+        if terminal_gateway_deadline {
+            ctx.mark_gateway_deadline_response_selected();
+            replace_rejection_with_gateway_deadline(
+                status_code,
+                response_body.as_deref_mut(),
+                response_headers,
+            );
+        }
         // Once an earlier phase has selected the canonical client-deadline
-        // response, non-replacing decorators and cleanup hooks must still
-        // finish. Keeping the expired RPC timer around those hooks would turn
-        // them into an ignored synthetic rejection before they can attach CORS,
-        // correlation, trace, cookie, or accounting state. Response-replacing
-        // hooks are skipped after the terminal deadline is selected: an
-        // already-ready replacer can win `timeout_at`'s boundary race even when
-        // the deadline has expired and must never overwrite DEADLINE_EXCEEDED.
+        // response, give non-replacing decorators and cleanup hooks one
+        // immediate poll. Pending work continues in order on owned state under
+        // the detached cleanup bound and cannot retain the response writer.
+        // Response-replacing hooks are skipped after the terminal deadline is
+        // selected: an already-ready replacer must never overwrite
+        // DEADLINE_EXCEEDED at the boundary.
         if terminal_gateway_deadline && plugin.may_replace_rejection_response() {
             continue;
         }
         let result = if terminal_gateway_deadline {
-            crate::plugins::RequestPluginDeadlineResult::Completed(
-                plugin
-                    .after_proxy(ctx, *status_code, response_headers)
-                    .await,
-            )
-        } else {
-            crate::plugins::await_rejection_plugin_deadline_with_provenance(
-                ctx.grpc_deadline_at(),
-                plugin.after_proxy(ctx, *status_code, response_headers),
-            )
-            .await
-        };
-        let result = match result {
-            crate::plugins::RequestPluginDeadlineResult::Completed(result) => result,
-            crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded => {
-                ctx.mark_gateway_deadline_response_selected();
-                terminal_gateway_deadline = true;
-                replace_rejection_with_gateway_deadline(
+            let mut future = owned_rejection_hook_future(
+                Arc::clone(plugin),
+                ctx.clone(),
+                *status_code,
+                response_body.as_deref().cloned(),
+                response_headers.clone(),
+            );
+            match poll_owned_rejection_hook_once(&mut future).await {
+                Some(outcome) => adopt_owned_rejection_hook_result(
+                    outcome,
+                    ctx,
                     status_code,
-                    response_body.as_deref_mut(),
+                    &mut response_body,
                     response_headers,
-                );
-                continue;
+                ),
+                None => {
+                    spawn_detached_rejection_cleanup(
+                        future,
+                        plugins[index + 1..]
+                            .iter()
+                            .filter(|plugin| plugin.applies_after_proxy_on_reject())
+                            .cloned()
+                            .collect(),
+                        previous_marker.clone(),
+                        previous_replaceable_marker.clone(),
+                    );
+                    restore_rejection_response_markers(
+                        ctx,
+                        previous_marker,
+                        previous_replaceable_marker,
+                    );
+                    return;
+                }
             }
+        } else if let Some(deadline) = ctx.grpc_deadline_at() {
+            let mut future = owned_rejection_hook_future(
+                Arc::clone(plugin),
+                ctx.clone(),
+                *status_code,
+                response_body.as_deref().cloned(),
+                response_headers.clone(),
+            );
+            let deadline_sleep = tokio::time::sleep_until(deadline);
+            tokio::pin!(deadline_sleep);
+            tokio::select! {
+                biased;
+                () = &mut deadline_sleep => {
+                    ctx.mark_gateway_deadline_response_selected();
+                    replace_rejection_with_gateway_deadline(
+                        status_code,
+                        response_body.as_deref_mut(),
+                        response_headers,
+                    );
+                    spawn_detached_rejection_cleanup(
+                        future,
+                        plugins[index + 1..]
+                            .iter()
+                            .filter(|plugin| plugin.applies_after_proxy_on_reject())
+                            .cloned()
+                            .collect(),
+                        previous_marker.clone(),
+                        previous_replaceable_marker.clone(),
+                    );
+                    restore_rejection_response_markers(
+                        ctx,
+                        previous_marker,
+                        previous_replaceable_marker,
+                    );
+                    return;
+                }
+                outcome = &mut future => adopt_owned_rejection_hook_result(
+                    outcome,
+                    ctx,
+                    status_code,
+                    &mut response_body,
+                    response_headers,
+                ),
+            }
+        } else {
+            plugin
+                .after_proxy(ctx, *status_code, response_headers)
+                .await
         };
+        if terminal_gateway_deadline {
+            ctx.mark_gateway_deadline_response_selected();
+        }
         match result {
+            PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     warn!(
@@ -13628,29 +13849,19 @@ async fn run_after_proxy_hooks_on_rejection(
                      ignoring (response already committed)"
                 );
             }
-            PluginResult::Continue => {}
         }
     }
 
-    if terminal_gateway_deadline {
+    if ctx.gateway_deadline_response_selected()
+        || ctx
+            .grpc_deadline_at()
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    {
+        ctx.mark_gateway_deadline_response_selected();
         replace_rejection_with_gateway_deadline(status_code, response_body, response_headers);
     }
 
-    if let Some(previous_marker) = previous_marker {
-        ctx.metadata
-            .insert(REJECTION_RESPONSE_METADATA_KEY.to_string(), previous_marker);
-    } else {
-        ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
-    }
-    if let Some(previous_marker) = previous_replaceable_marker {
-        ctx.metadata.insert(
-            REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY.to_string(),
-            previous_marker,
-        );
-    } else {
-        ctx.metadata
-            .remove(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY);
-    }
+    restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
 }
 
 pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
@@ -14003,51 +14214,35 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     {
         let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
         let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
-        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
         for (index, plugin) in plugins.iter().enumerate() {
             if !plugin.requires_response_committed_hook() {
                 continue;
             }
-            // Upload collection can discover expiry only after the absolute
-            // timer has fired. The canonical terminal result is already fixed
-            // at that point, so observers and cleanup hooks must run exactly
-            // once without re-applying the expired request timer.
-            if terminal_gateway_deadline {
-                plugin
-                    .on_response_committed(
-                        ctx,
-                        normalized.http_status.as_u16(),
-                        &normalized.headers,
-                        &normalized.body,
-                    )
-                    .await;
-                continue;
-            }
-            let deadline = ctx.grpc_deadline_at();
-            if crate::plugins::await_grpc_deadline(
-                deadline,
-                plugin.on_response_committed(
-                    ctx,
-                    normalized.http_status.as_u16(),
-                    &normalized.headers,
-                    &normalized.body,
-                ),
+            let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+            let Some(pending_hook) = run_response_committed_hook_until_deadline(
+                Arc::clone(plugin),
+                ctx,
+                normalized.http_status.as_u16(),
+                &normalized.headers,
+                &normalized.body,
+                terminal_gateway_deadline,
             )
             .await
-            .is_err()
-            {
+            else {
+                continue;
+            };
+            if !terminal_gateway_deadline {
                 ctx.mark_gateway_deadline_response_selected();
                 replace_rejection_with_gateway_deadline(status, Some(body), headers);
-                for remaining in plugins[index + 1..]
-                    .iter()
-                    .filter(|plugin| plugin.requires_response_committed_hook())
-                {
-                    remaining
-                        .on_response_committed(ctx, *status, headers, body)
-                        .await;
-                }
-                break;
             }
+            spawn_detached_response_committed_hooks(
+                pending_hook,
+                plugins[index + 1..].to_vec(),
+                *status,
+                Arc::new(headers.clone()),
+                Arc::new(body.clone()),
+            );
+            break;
         }
     }
 }
@@ -14717,36 +14912,126 @@ pub(crate) fn strip_content_length_for_streaming_grpc_deadline(
     }
 }
 
-/// Poll a committed hook before the deadline branch so even an already-expired
-/// budget invokes the selected observer once before cancellation.
-async fn run_response_committed_hook_until_deadline(
-    plugin: &Arc<dyn Plugin>,
+pub(crate) type OwnedResponseCommittedHookFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = RequestContext> + Send + 'static>,
+>;
+
+fn owned_response_committed_hook_future(
+    plugin: Arc<dyn Plugin>,
+    mut ctx: RequestContext,
+    response_status: u16,
+    response_headers: Arc<HashMap<String, String>>,
+    response_body: Arc<Vec<u8>>,
+) -> OwnedResponseCommittedHookFuture {
+    Box::pin(async move {
+        plugin
+            .on_response_committed(
+                &mut ctx,
+                response_status,
+                response_headers.as_ref(),
+                response_body.as_ref(),
+            )
+            .await;
+        ctx
+    })
+}
+
+/// Await a committed observer only while it can still affect the synchronous
+/// terminal lifecycle. Once the client deadline is selected, give an
+/// immediately-ready observer one poll; a pending observer is returned with
+/// owned state so cleanup can continue without borrowing the response writer.
+pub(crate) async fn run_response_committed_hook_until_deadline(
+    plugin: Arc<dyn Plugin>,
     ctx: &mut RequestContext,
     response_status: u16,
     response_headers: &HashMap<String, String>,
     response_body: &[u8],
-) -> bool {
+    terminal_gateway_deadline: bool,
+) -> Option<OwnedResponseCommittedHookFuture> {
     let deadline = ctx.grpc_deadline_at();
-    let hook = plugin.on_response_committed(ctx, response_status, response_headers, response_body);
+    if !terminal_gateway_deadline && deadline.is_none() {
+        plugin
+            .on_response_committed(ctx, response_status, response_headers, response_body)
+            .await;
+        return None;
+    }
+    let mut hook = owned_response_committed_hook_future(
+        plugin,
+        ctx.clone(),
+        response_status,
+        Arc::new(response_headers.clone()),
+        Arc::new(response_body.to_vec()),
+    );
+    if terminal_gateway_deadline {
+        let completed = futures_util::future::poll_fn(|cx| {
+            Poll::Ready(match std::future::Future::poll(hook.as_mut(), cx) {
+                Poll::Ready(ctx) => Some(ctx),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+        if let Some(completed) = completed {
+            *ctx = completed;
+            return None;
+        }
+        return Some(hook);
+    }
     let Some(deadline) = deadline else {
-        hook.await;
-        return true;
+        return Some(hook);
     };
-    tokio::pin!(hook);
     let deadline_sleep = tokio::time::sleep_until(deadline);
     tokio::pin!(deadline_sleep);
     tokio::select! {
         biased;
-        () = &mut hook => true,
-        () = &mut deadline_sleep => false,
+        () = &mut deadline_sleep => Some(hook),
+        completed = &mut hook => {
+            *ctx = completed;
+            None
+        },
     }
 }
 
-/// Run every opted-in committed-response observer exactly once. If the RPC
+pub(crate) fn spawn_detached_response_committed_hooks(
+    pending_hook: OwnedResponseCommittedHookFuture,
+    remaining_plugins: Vec<Arc<dyn Plugin>>,
+    response_status: u16,
+    response_headers: Arc<HashMap<String, String>>,
+    response_body: Arc<Vec<u8>>,
+) {
+    std::mem::drop(tokio::spawn(async move {
+        let cleanup = async move {
+            let mut ctx = pending_hook.await;
+            for plugin in remaining_plugins {
+                if !plugin.requires_response_committed_hook() {
+                    continue;
+                }
+                plugin
+                    .on_response_committed(
+                        &mut ctx,
+                        response_status,
+                        response_headers.as_ref(),
+                        response_body.as_ref(),
+                    )
+                    .await;
+            }
+        };
+        if tokio::time::timeout(DETACHED_REJECTION_CLEANUP_TIMEOUT, cleanup)
+            .await
+            .is_err()
+        {
+            warn!(
+                timeout_seconds = DETACHED_REJECTION_CLEANUP_TIMEOUT.as_secs(),
+                "detached committed-response cleanup exceeded its post-response bound"
+            );
+        }
+    }));
+}
+
+/// Invoke each opted-in committed-response observer at most once. If the RPC
 /// deadline expires inside one observer, select the canonical deadline
-/// response and run only the remaining observers, without the already-expired
-/// timer, against that replacement. Earlier and timed-out observers are never
-/// replayed; later audit/cleanup exporters cannot be skipped.
+/// response and transfer that exact pending invocation plus the remaining
+/// observers to bounded, owned post-response cleanup. Earlier observers are
+/// never replayed and no observer can retain the client response writer.
 pub(crate) async fn run_deadline_bounded_response_committed_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -14755,21 +15040,24 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
     response_body: &mut Vec<u8>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
+    let terminal_at_entry = ctx.gateway_deadline_response_selected();
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.requires_response_committed_hook() {
             continue;
         }
-        if run_response_committed_hook_until_deadline(
-            plugin,
+        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+        let Some(pending_hook) = run_response_committed_hook_until_deadline(
+            Arc::clone(plugin),
             ctx,
             *response_status,
             response_headers,
             response_body,
+            terminal_gateway_deadline,
         )
         .await
-        {
+        else {
             continue;
-        }
+        };
 
         let grpc_web_response_content_type =
             crate::plugins::grpc_web::retained_response_content_type(ctx).or_else(|| {
@@ -14790,17 +15078,16 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             initial_response_header_policy_plugins,
         )
         .as_u16();
-        for remaining in plugins[index + 1..]
-            .iter()
-            .filter(|plugin| plugin.requires_response_committed_hook())
-        {
-            remaining
-                .on_response_committed(ctx, *response_status, response_headers, response_body)
-                .await;
-        }
+        spawn_detached_response_committed_hooks(
+            pending_hook,
+            plugins[index + 1..].to_vec(),
+            *response_status,
+            Arc::new(response_headers.clone()),
+            Arc::new(response_body.clone()),
+        );
         return true;
     }
-    false
+    terminal_at_entry
 }
 
 fn build_grpc_web_error_response_from_parts(
@@ -14862,7 +15149,6 @@ async fn build_grpc_web_reject_response(
         &message,
     );
     finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));
-    let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if plugins
         .iter()
         .any(|plugin| plugin.requires_response_committed_hook())
@@ -14871,19 +15157,20 @@ async fn build_grpc_web_reject_response(
             if !plugin.requires_response_committed_hook() {
                 continue;
             }
-            if terminal_gateway_deadline {
-                plugin
-                    .on_response_committed(ctx, 200, &translated.headers, &translated.body)
-                    .await;
-                continue;
-            }
-            if crate::plugins::await_grpc_deadline(
-                ctx.grpc_deadline_at(),
-                plugin.on_response_committed(ctx, 200, &translated.headers, &translated.body),
+            let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+            let Some(pending_hook) = run_response_committed_hook_until_deadline(
+                Arc::clone(plugin),
+                ctx,
+                StatusCode::OK.as_u16(),
+                &translated.headers,
+                &translated.body,
+                terminal_gateway_deadline,
             )
             .await
-            .is_err()
-            {
+            else {
+                continue;
+            };
+            if !terminal_gateway_deadline {
                 ctx.mark_gateway_deadline_response_selected();
                 grpc_status = grpc_proxy::grpc_status::DEADLINE_EXCEEDED;
                 message = GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string();
@@ -14904,21 +15191,15 @@ async fn build_grpc_web_reject_response(
                     Some(&deadline_headers),
                 );
                 insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, &message);
-                for remaining in plugins[index + 1..]
-                    .iter()
-                    .filter(|plugin| plugin.requires_response_committed_hook())
-                {
-                    remaining
-                        .on_response_committed(
-                            ctx,
-                            StatusCode::OK.as_u16(),
-                            &translated.headers,
-                            &translated.body,
-                        )
-                        .await;
-                }
-                break;
             }
+            spawn_detached_response_committed_hooks(
+                pending_hook,
+                plugins[index + 1..].to_vec(),
+                StatusCode::OK.as_u16(),
+                Arc::new(translated.headers.clone()),
+                Arc::new(translated.body.clone()),
+            );
+            break;
         }
     }
     Some(build_grpc_web_error_response_from_parts(
