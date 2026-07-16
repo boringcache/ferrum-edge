@@ -338,7 +338,7 @@ pub mod _test_support {
     pub async fn lock_namespace_config_admission_for_test(
         namespace: &str,
     ) -> tokio::sync::MutexGuard<'static, ()> {
-        crate::admin::crud::lock_namespace_config_admission(namespace).await
+        crate::admin::crud::lock_local_namespace_config_admission(namespace).await
     }
 
     pub fn validate_plugin_configs_fatal_for_test(

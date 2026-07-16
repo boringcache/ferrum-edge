@@ -6,7 +6,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
@@ -90,26 +92,30 @@ pub(crate) enum BatchPreparationError {
 
 const NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS: usize = 64;
 static NAMESPACE_CONFIG_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+const CONFIG_ADMISSION_LEASE_DURATION: Duration = Duration::from_secs(120);
+const CONFIG_ADMISSION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+const CONFIG_ADMISSION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Best-effort serialization of graph- and credential-sensitive admin
-/// mutations for a namespace from candidate validation through persistence. A
-/// bounded process-global lock set covers every `AdminState` served by this
-/// process without retaining attacker-chosen namespace strings indefinitely.
+/// Serialize graph- and credential-sensitive admin mutations for a namespace
+/// from candidate validation through persistence. A bounded process-global
+/// lock set is the cheap first tier; the datastore lease below coordinates
+/// writable gateway instances that share SQL or MongoDB persistence.
 ///
 /// The datastore's exact mTLS credential index remains the authoritative
 /// cross-process backstop for exact identities. The additional ASCII-folded
 /// `san_dns` constraint is conditional on effective plugin associations, so it
 /// cannot use an unconditional case-folded unique index without rejecting valid
 /// case variants used by exact-match policies. Fully serializing that dynamic
-/// check across SQL and MongoDB writers requires backend-specific transactions;
-/// this lock deliberately does not claim to coordinate separate admin processes.
-/// Every credential mutation takes this lock, even for non-mTLS types, because
+/// check across SQL and MongoDB writers uses the same renewable namespace lease.
+/// Every credential mutation takes this fence, even for non-mTLS types, because
 /// those endpoints persist the complete `Consumer` and could otherwise replay
 /// stale `mtls_auth` entries loaded before a concurrent mTLS mutation. Every
 /// plugin-graph mutation (including API-spec bundles) uses the same lock so a
 /// prospective transaction-log schema snapshot remains authoritative until
 /// the corresponding write commits.
-pub(crate) async fn lock_namespace_config_admission(namespace: &str) -> MutexGuard<'static, ()> {
+pub(crate) async fn lock_local_namespace_config_admission(
+    namespace: &str,
+) -> MutexGuard<'static, ()> {
     let locks = NAMESPACE_CONFIG_ADMISSION_LOCKS.get_or_init(|| {
         (0..NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS)
             .map(|_| Mutex::new(()))
@@ -119,6 +125,148 @@ pub(crate) async fn lock_namespace_config_admission(namespace: &str) -> MutexGua
     namespace.hash(&mut hasher);
     let shard = hasher.finish() as usize % NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS;
     locks[shard].lock().await
+}
+
+pub(crate) struct NamespaceConfigAdmissionGuard {
+    _local: MutexGuard<'static, ()>,
+    db: Option<Arc<dyn DatabaseBackend>>,
+    namespace: String,
+    owner: String,
+    stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+    renew_task: Option<tokio::task::JoinHandle<()>>,
+    valid: Arc<AtomicBool>,
+}
+
+impl NamespaceConfigAdmissionGuard {
+    pub(crate) fn ensure_held(&self) -> Result<(), anyhow::Error> {
+        if self.valid.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            anyhow::bail!("namespace config admission lease was lost before persistence")
+        }
+    }
+}
+
+impl Drop for NamespaceConfigAdmissionGuard {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        let Some(db) = self.db.take() else {
+            return;
+        };
+        let namespace = std::mem::take(&mut self.namespace);
+        let owner = std::mem::take(&mut self.owner);
+        let renew_task = self.renew_task.take();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Some(task) = renew_task {
+                    let _ = task.await;
+                }
+                if let Err(error) = db
+                    .release_namespace_config_admission_lease(&namespace, &owner)
+                    .await
+                {
+                    tracing::warn!(
+                        namespace = %namespace,
+                        %error,
+                        "Failed to release namespace config admission lease; expiry will recover it"
+                    );
+                }
+            });
+        }
+    }
+}
+
+pub(crate) async fn lock_namespace_config_admission(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+) -> Result<NamespaceConfigAdmissionGuard, anyhow::Error> {
+    let local = lock_local_namespace_config_admission(namespace).await;
+    let owner = Uuid::new_v4().to_string();
+    loop {
+        if db
+            .try_acquire_namespace_config_admission_lease(namespace, &owner)
+            .await?
+        {
+            break;
+        }
+        tokio::time::sleep(CONFIG_ADMISSION_LEASE_RETRY_INTERVAL).await;
+    }
+
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let renew_db = db.clone();
+    let renew_namespace = namespace.to_string();
+    let renew_owner = owner.clone();
+    let valid = Arc::new(AtomicBool::new(true));
+    let renew_valid = valid.clone();
+    let renew_task = tokio::spawn(async move {
+        let mut valid_until = Instant::now() + CONFIG_ADMISSION_LEASE_DURATION;
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(CONFIG_ADMISSION_LEASE_RENEW_INTERVAL) => {}
+            }
+
+            loop {
+                match renew_db
+                    .renew_namespace_config_admission_lease(&renew_namespace, &renew_owner)
+                    .await
+                {
+                    Ok(true) => {
+                        valid_until = Instant::now() + CONFIG_ADMISSION_LEASE_DURATION;
+                        break;
+                    }
+                    Ok(false) => {
+                        renew_valid.store(false, Ordering::Release);
+                        tracing::error!(
+                            namespace = %renew_namespace,
+                            "Namespace config admission lease renewal lost ownership"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        if Instant::now() + CONFIG_ADMISSION_LEASE_RETRY_INTERVAL >= valid_until {
+                            renew_valid.store(false, Ordering::Release);
+                            tracing::error!(
+                                namespace = %renew_namespace,
+                                %error,
+                                "Namespace config admission lease expired after renewal failures"
+                            );
+                            return;
+                        }
+                        tracing::debug!(
+                            namespace = %renew_namespace,
+                            %error,
+                            "Namespace config admission lease renewal failed; retrying before expiry"
+                        );
+                        tokio::select! {
+                            changed = stop_rx.changed() => {
+                                if changed.is_err() || *stop_rx.borrow() {
+                                    return;
+                                }
+                            }
+                            _ = tokio::time::sleep(CONFIG_ADMISSION_LEASE_RETRY_INTERVAL) => {}
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(NamespaceConfigAdmissionGuard {
+        _local: local,
+        db: Some(db),
+        namespace: namespace.to_string(),
+        owner,
+        stop_tx: Some(stop_tx),
+        renew_task: Some(renew_task),
+        valid,
+    })
 }
 
 async fn validate_transaction_log_schema_graph_on_blocking_pool(
@@ -903,7 +1051,10 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     };
     let db = db_arc.as_ref();
     let _namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
-        Some(lock_namespace_config_admission(namespace).await)
+        match lock_namespace_config_admission(db_arc.clone(), namespace).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return Ok(R::map_precheck_db_error(&error)),
+        }
     } else {
         None
     };
@@ -923,6 +1074,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         return Ok(map_after_validate_error::<R>(error));
     }
 
+    if let Some(guard) = _namespace_config_admission_guard.as_ref()
+        && let Err(error) = guard.ensure_held()
+    {
+        return Ok(R::map_precheck_db_error(&error));
+    }
     match R::db_delete(db, namespace, id).await {
         Ok(true) => {
             let event = AuditEvent::new(
@@ -3038,7 +3194,10 @@ async fn handle_write<R: AdminResource>(
     };
     let db = db_arc.as_ref();
     let _namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
-        Some(lock_namespace_config_admission(namespace).await)
+        match lock_namespace_config_admission(db_arc.clone(), namespace).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return Ok(R::map_precheck_db_error(&error)),
+        }
     } else {
         None
     };
@@ -3076,6 +3235,11 @@ async fn handle_write<R: AdminResource>(
         },
     };
 
+    if let Some(guard) = _namespace_config_admission_guard.as_ref()
+        && let Err(error) = guard.ensure_held()
+    {
+        return Ok(R::map_precheck_db_error(&error));
+    }
     match action {
         WriteAction::Create => {
             if resource.id().is_empty() {

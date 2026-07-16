@@ -119,10 +119,11 @@ database snapshot; validation does not depend on whether a runtime poll has
 already refreshed the live registry.
 
 Graph-relevant direct CRUD, batch, restore, and API-spec mutations for the same
-namespace are serialized within an admin process from the authoritative
-snapshot read through persistence. Concurrent requests therefore cannot both
-validate against snapshots that omit the other request's committed graph
-change.
+namespace hold a renewable datastore lease from the authoritative snapshot read
+through persistence. The process-local admission guard remains as a cheap first
+tier, while the SQL/MongoDB lease also serializes writable gateway instances
+that share persistence. Concurrent requests therefore cannot both validate
+against snapshots that omit the other request's committed graph change.
 
 Batch and restore payloads use the same definition-first graph pass, so a
 payload can list referrers before definitions. Each namespace is validated in
@@ -130,6 +131,8 @@ isolation: the same schema name can be defined independently in separate
 namespaces, while a referrer cannot resolve a definition from another
 namespace. File reloads, DB poll cycles, and control-plane snapshots use the
 same prospective graph rules before atomically publishing a new runtime cache.
+SQL keeps every enabled graph participant in one batch transaction even when
+an unrelated large plugin import would normally be split into bounded chunks.
 API-spec `POST` validates extracted plugins against the same authoritative
 namespace snapshot, and exact `PUT` first removes the plugins owned by the old
 spec before overlaying the replacement bundle. API-spec `DELETE` validates the
@@ -141,10 +144,10 @@ writes screen literal endpoints even for disabled configurations; disabled
 configurations defer construction and graph validation until they are enabled.
 Enabled `schema_ref` consumers also receive the policy-only checks that follow
 prospective graph construction, including custom plugins and plugins that ignore
-an unrecognized `schema_ref` key. SQL, MongoDB, and control-plane runtime snapshots
-reject dangling/non-string
-references before cache publication, while unrelated constructor failures on
-optional logging sinks retain their existing fail-open warning behavior.
+an unrecognized `schema_ref` key. SQL, MongoDB, and control-plane runtime
+snapshots reject dangling/non-string references before cache publication, while
+unrelated constructor failures on optional logging sinks retain their existing
+fail-open warning behavior.
 
 Upgrade note: every **enabled** plugin carrying a top-level `schema_ref`
 participates in this fail-closed graph, even if that plugin does not otherwise

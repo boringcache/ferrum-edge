@@ -43,8 +43,9 @@
 mod inner {
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
-        IncrementalResult, NamespaceResourceCounts, NamespacedResourceId,
-        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
+        IncrementalResult, NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts,
+        NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+        SnapshotDataIntegrityError, SortOrder,
     };
     use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
     use crate::config::types::{
@@ -95,6 +96,7 @@ mod inner {
         MONGO_MIGRATION_LEASE_DURATION.as_millis() as i64;
     const MONGO_MIGRATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
     const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+    const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
     const HMAC_SECRET_HASHES_FIELD: &str = "_ferrum_hmac_secret_hashes";
     // Dedicated migration-lease pool size. Lease upkeep only issues tiny
     // update_one/delete_one operations, so a couple of connections is ample
@@ -1433,6 +1435,10 @@ mod inner {
 
         fn config_change_counters(&self) -> MongoCollectionHandle {
             self.collection("config_change_counters")
+        }
+
+        fn config_admission_locks(&self) -> MongoCollectionHandle {
+            self.collection("config_admission_locks")
         }
 
         /// Merged consumer identity keyspace (id ∪ username ∪ custom_id per
@@ -3216,6 +3222,89 @@ mod inner {
     // -----------------------------------------------------------------------
     // DatabaseBackend trait implementation
     // -----------------------------------------------------------------------
+
+    #[async_trait]
+    impl NamespaceConfigAdmissionLeaseBackend for MongoStore {
+        async fn try_acquire_namespace_config_admission_lease(
+            &self,
+            namespace: &str,
+            owner: &str,
+        ) -> Result<bool, anyhow::Error> {
+            let now = BsonDateTime::now();
+            let expires_at = BsonDateTime::from_millis(
+                now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+            );
+            let result = self
+                .config_admission_locks()
+                .find_one_and_update(
+                    doc! {
+                        "_id": namespace,
+                        "$or": [
+                            { "expires_at": { "$exists": false } },
+                            { "expires_at": { "$lte": now } },
+                            { "owner": owner },
+                        ],
+                    },
+                    doc! {
+                        "$set": {
+                            "owner": owner,
+                            "expires_at": expires_at,
+                            "updated_at": now,
+                        },
+                        "$setOnInsert": { "created_at": now },
+                    },
+                )
+                .upsert(true)
+                .return_document(ReturnDocument::After)
+                .await;
+            match result {
+                Ok(Some(document)) => Ok(document.get_str("owner").ok() == Some(owner)),
+                Ok(None) => Ok(false),
+                Err(error) if is_duplicate_key(&error) => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        }
+
+        async fn renew_namespace_config_admission_lease(
+            &self,
+            namespace: &str,
+            owner: &str,
+        ) -> Result<bool, anyhow::Error> {
+            let now = BsonDateTime::now();
+            let expires_at = BsonDateTime::from_millis(
+                now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+            );
+            let result = self
+                .config_admission_locks()
+                .update_one(
+                    doc! {
+                        "_id": namespace,
+                        "owner": owner,
+                        "expires_at": { "$gt": now },
+                    },
+                    doc! {
+                        "$set": {
+                            "expires_at": expires_at,
+                            "updated_at": now,
+                        },
+                    },
+                )
+                .await?;
+            Ok(result.matched_count == 1)
+        }
+
+        async fn release_namespace_config_admission_lease(
+            &self,
+            namespace: &str,
+            owner: &str,
+        ) -> Result<bool, anyhow::Error> {
+            let result = self
+                .config_admission_locks()
+                .delete_one(doc! { "_id": namespace, "owner": owner })
+                .await?;
+            Ok(result.deleted_count == 1)
+        }
+    }
 
     #[async_trait]
     impl DatabaseBackend for MongoStore {

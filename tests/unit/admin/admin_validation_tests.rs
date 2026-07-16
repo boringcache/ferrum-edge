@@ -52,6 +52,10 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("is_enabled_config_graph_participant(resource)"));
     assert!(crud_source.contains("const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;"));
     assert!(crud_source.contains("tokio::task::spawn_blocking(move ||"));
+    assert!(crud_source.contains("try_acquire_namespace_config_admission_lease("));
+    assert!(crud_source.contains("renew_namespace_config_admission_lease("));
+    assert!(crud_source.contains("release_namespace_config_admission_lease("));
+    assert!(crud_source.contains("guard.ensure_held()"));
 
     let graph_validation = crud_source
         .rfind("validate_transaction_log_schema_candidates(")
@@ -85,11 +89,16 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     );
     assert!(
         batch_source
-            .matches("crud::lock_namespace_config_admission(namespace).await")
+            .matches("crud::lock_namespace_config_admission(db.clone(), namespace).await")
             .count()
             >= 6,
         "credential, batch, and restore mutations must share namespace admission"
     );
+    let sql_store_source = include_str!("../../../src/config/db_loader.rs");
+    assert!(sql_store_source.contains("config_admission_locks"));
+    assert!(sql_store_source.contains("self.batch_create_plugin_configs_chunk(configs).await?"));
+    let mongo_store_source = include_str!("../../../src/config/mongo_store.rs");
+    assert!(mongo_store_source.contains("config_admission_locks"));
 
     let pipeline_source = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(pipeline_source.contains("transaction_log_schema::validate_config_graph("));
@@ -101,20 +110,22 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     );
     assert_eq!(
         api_spec_source
-            .matches("crate::admin::crud::lock_namespace_config_admission(namespace).await")
+            .matches(
+                "crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await",
+            )
             .count(),
         3,
         "API-spec POST, PUT, and DELETE must serialize through persistence"
     );
     let post_lock = api_spec_source
-        .find("crate::admin::crud::lock_namespace_config_admission(namespace).await")
+        .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .expect("POST admission guard");
     let post_persist = api_spec_source
         .find("db.submit_api_spec_bundle(&bundle, &spec).await")
         .expect("POST persistence");
     assert!(post_lock < post_persist);
     let put_lock = api_spec_source[post_lock + 1..]
-        .find("crate::admin::crud::lock_namespace_config_admission(namespace).await")
+        .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .map(|position| position + post_lock + 1)
         .expect("PUT admission guard");
     let put_persist = api_spec_source
@@ -122,7 +133,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .expect("PUT persistence");
     assert!(put_lock < put_persist);
     let delete_lock = api_spec_source[put_lock + 1..]
-        .find("crate::admin::crud::lock_namespace_config_admission(namespace).await")
+        .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .map(|position| position + put_lock + 1)
         .expect("DELETE admission guard");
     let delete_persist = api_spec_source

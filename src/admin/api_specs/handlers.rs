@@ -2389,7 +2389,10 @@ pub async fn handle_post_api_spec(
     // stable through bundle persistence. This is shared with direct CRUD,
     // batch, restore, and API-spec PUT/DELETE mutations.
     let _namespace_config_admission_guard =
-        crate::admin::crud::lock_namespace_config_admission(namespace).await;
+        match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(error) => return Ok(error_response(classify_db_error(error))),
+        };
 
     // Validate: field checks + DB cross-checks (listen_path uniqueness, etc.)
     let ValidatedBundle { bundle, metadata } = match validate_bundle(
@@ -2421,6 +2424,9 @@ pub async fn handle_post_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
+    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
+        return Ok(error_response(classify_db_error(error)));
+    }
     match db.submit_api_spec_bundle(&bundle, &spec).await {
         Ok(()) => {}
         Err(e) => return Ok(error_response(classify_db_error(e))),
@@ -2502,7 +2508,10 @@ pub async fn handle_put_api_spec(
     // persistence. Re-read the spec after acquiring the guard so a concurrent
     // API-spec delete cannot leave validation based on a stale owner row.
     let _namespace_config_admission_guard =
-        crate::admin::crud::lock_namespace_config_admission(namespace).await;
+        match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(error) => return Ok(error_response(classify_db_error(error))),
+        };
     let existing_spec = match db.get_api_spec(namespace, id).await {
         Ok(Some(spec)) => spec,
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
@@ -2598,6 +2607,9 @@ pub async fn handle_put_api_spec(
     // Preserve original created_at
     spec.created_at = existing_spec.created_at;
 
+    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
+        return Ok(error_response(classify_db_error(error)));
+    }
     match db.replace_api_spec_bundle(&bundle, &spec).await {
         Ok(()) => {}
         Err(e) => return Ok(error_response(classify_db_error(e))),
@@ -2773,7 +2785,10 @@ pub async fn handle_delete_api_spec(
     };
 
     let _namespace_config_admission_guard =
-        crate::admin::crud::lock_namespace_config_admission(namespace).await;
+        match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(error) => return Ok(error_response(classify_db_error(error))),
+        };
 
     let existing = match db.get_api_spec(namespace, id).await {
         Ok(Some(spec)) => spec,
@@ -2808,6 +2823,9 @@ pub async fn handle_delete_api_spec(
         }
     }
 
+    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
+        return Ok(error_response(classify_db_error(error)));
+    }
     match db.delete_api_spec(namespace, id).await {
         Ok(true) => {
             let event = audit::AuditEvent::new(

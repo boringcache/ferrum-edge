@@ -50,9 +50,11 @@ use tracing::{debug, error, info, warn};
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, NamespaceResourceCounts,
-    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
-    SortOrder, extract_db_hostname, redact_url,
+    NamespaceConfigAdmissionLeaseBackend, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR,
+    PaginatedResult, SnapshotDataIntegrityError, SortOrder, extract_db_hostname, redact_url,
 };
+
+const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FullLoadPurpose {
@@ -680,6 +682,23 @@ impl DatabaseStore {
             _ => self.q("INSERT INTO config_change_locks \
                  (lock_name, updated_at) VALUES (?, ?) \
                  ON CONFLICT (lock_name) DO NOTHING"),
+        }
+    }
+
+    fn config_admission_lease_acquire_sql(&self) -> String {
+        match self.db_type.as_str() {
+            "mysql" => "INSERT INTO config_admission_locks \
+                 (namespace, owner, expires_at) VALUES (?, ?, ?) \
+                 ON DUPLICATE KEY UPDATE \
+                 owner = IF(expires_at <= ? OR owner = VALUES(owner), VALUES(owner), owner), \
+                 expires_at = IF(owner = VALUES(owner), VALUES(expires_at), expires_at)"
+                .to_string(),
+            _ => self.q("INSERT INTO config_admission_locks \
+                 (namespace, owner, expires_at) VALUES (?, ?, ?) \
+                 ON CONFLICT (namespace) DO UPDATE SET \
+                 owner = excluded.owner, expires_at = excluded.expires_at \
+                 WHERE config_admission_locks.expires_at <= ? \
+                    OR config_admission_locks.owner = excluded.owner"),
         }
     }
 
@@ -5033,8 +5052,9 @@ impl DatabaseStore {
         Ok(count)
     }
 
-    /// Batch-create multiple plugin configs, chunked into transactions of
-    /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
+    /// Batch-create multiple plugin configs. Graph-aware batches stay in one
+    /// transaction so a later insert failure cannot strand a referrer or its
+    /// schema definition; unrelated large imports retain bounded chunks.
     pub async fn batch_create_plugin_configs(
         &self,
         configs: &[PluginConfig],
@@ -5043,10 +5063,17 @@ impl DatabaseStore {
         if configs.is_empty() {
             return Ok(0);
         }
-        let mut total = 0usize;
-        for chunk in configs.chunks(Self::BATCH_CHUNK_SIZE) {
-            total += self.batch_create_plugin_configs_chunk(chunk).await?;
-        }
+        let total = if configs.iter().any(
+            crate::plugins::transaction_log_schema::is_enabled_config_graph_participant,
+        ) {
+            self.batch_create_plugin_configs_chunk(configs).await?
+        } else {
+            let mut total = 0usize;
+            for chunk in configs.chunks(Self::BATCH_CHUNK_SIZE) {
+                total += self.batch_create_plugin_configs_chunk(chunk).await?;
+            }
+            total
+        };
         self.check_slow_query("batch_create_plugin_configs", start);
         Ok(total)
     }
@@ -7327,6 +7354,62 @@ impl DatabaseStore {
 // ---------------------------------------------------------------------------
 // DatabaseBackend trait implementation for sqlx-backed DatabaseStore
 // ---------------------------------------------------------------------------
+
+#[async_trait]
+impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
+    async fn try_acquire_namespace_config_admission_lease(
+        &self,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let now = Utc::now().timestamp_millis();
+        let expires_at = now + CONFIG_ADMISSION_LEASE_DURATION_MILLIS;
+        let sql = self.config_admission_lease_acquire_sql();
+        let result = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(owner)
+            .bind(expires_at)
+            .bind(now)
+            .execute(&self.pool())
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn renew_namespace_config_admission_lease(
+        &self,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let now = Utc::now().timestamp_millis();
+        let expires_at = now + CONFIG_ADMISSION_LEASE_DURATION_MILLIS;
+        let sql = self.q(
+            "UPDATE config_admission_locks SET expires_at = ? \
+             WHERE namespace = ? AND owner = ? AND expires_at > ?",
+        );
+        let result = sqlx::query(&sql)
+            .bind(expires_at)
+            .bind(namespace)
+            .bind(owner)
+            .bind(now)
+            .execute(&self.pool())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn release_namespace_config_admission_lease(
+        &self,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<bool, anyhow::Error> {
+        let sql = self.q("DELETE FROM config_admission_locks WHERE namespace = ? AND owner = ?");
+        let result = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(owner)
+            .execute(&self.pool())
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+}
 
 #[async_trait]
 impl DatabaseBackend for DatabaseStore {
