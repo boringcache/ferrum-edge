@@ -32,7 +32,7 @@ fn country_mmdb_bytes() -> Vec<u8> {
 fn upstream_country_mmdb_fixture_has_pinned_sha256() {
     let digest = Sha256::digest(country_mmdb_bytes());
     assert_eq!(
-        format!("{digest:x}"),
+        hex::encode(digest),
         "b37601903448683d241af52893c8cbf0fed461e0cdebe0bfaca01891fdeb6db9"
     );
 }
