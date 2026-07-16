@@ -184,6 +184,25 @@ impl super::Plugin for SsePlugin {
         self.wrap_non_sse_responses
     }
 
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        _ctx: &RequestContext,
+        _content_type: Option<&str>,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.wrap_non_sse_responses && super::response_body_rewrite_allowed(response_status)
+    }
+
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        _ctx: &RequestContext,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.wrap_non_sse_responses && !super::response_body_rewrite_allowed(response_status)
+    }
+
     fn applies_after_proxy_on_reject(&self) -> bool {
         false
     }
@@ -298,12 +317,22 @@ impl super::Plugin for SsePlugin {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         let is_sse = response_headers
             .get("content-type")
             .is_some_and(|ct| Self::is_sse_content_type(ct));
+
+        // For a non-SSE backend response, forcing SSE headers depends on the
+        // configured body wrapper running. Preserved 206/226 bytes cannot be
+        // wrapped, so do not relabel them as an SSE event stream.
+        if !is_sse
+            && self.wrap_non_sse_responses
+            && !super::response_body_rewrite_allowed(response_status)
+        {
+            return PluginResult::Continue;
+        }
 
         // If the backend didn't return SSE and we're not forcing, nothing to do.
         if !is_sse && !self.force_sse_content_type {

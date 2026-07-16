@@ -1274,6 +1274,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "copied-query-other-host",
         "renamed-query-other-host",
         "copied-query-path-other-host",
+        "copied-query-path-parameter",
+        "copied-query-encoded-path-delimiter",
         "literal-plus-encoded-candidate",
         "encoded-plus-literal-candidate",
         "fragment-query-scalar",
@@ -1289,6 +1291,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-path-lookalike",
         "benign-query-value-lookalike",
         "benign-query-path-lookalike",
+        "benign-query-path-parameter-lookalike",
         "benign-plus-space-distinct",
         "benign-fragment-lookalike",
         "benign-fragment-label",
@@ -1369,6 +1372,12 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "copied-query-path-other-host" => {
                 "https://redirect.example/secret/value".to_string()
             }
+            "copied-query-path-parameter" => {
+                "https://redirect.example/next;leak=secret/value".to_string()
+            }
+            "copied-query-encoded-path-delimiter" => {
+                "https://redirect.example/next%3Fleak%3Dsecret/value".to_string()
+            }
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }
@@ -1403,6 +1412,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-query-path-lookalike" => {
                 "https://redirect.example/secret/value-extra".to_string()
+            }
+            "benign-query-path-parameter-lookalike" => {
+                "https://redirect.example/next;leak=secret/value-extra".to_string()
             }
             "benign-plus-space-distinct" => {
                 "https://redirect.example/next?leak=token+part".to_string()
@@ -1783,6 +1795,53 @@ async fn test_terminate_preserves_head_no_body_semantics() {
             assert!(!headers.contains_key("content-length"));
         }
         other => panic!("expected HEAD terminal response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_strips_body_from_no_content_statuses() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for status in [204, 205, 304] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_string("forbidden-status-body")
+                    .insert_header("etag", "\"status-version\""),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/func", server.uri()),
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+
+        match plugin
+            .before_proxy(&mut create_test_context(), &mut HashMap::new())
+            .await
+        {
+            PluginResult::RejectBinary {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(status_code, status);
+                assert!(body.is_empty(), "status {status} retained a body");
+                assert_eq!(
+                    headers.get("etag").map(String::as_str),
+                    Some("\"status-version\"")
+                );
+                assert!(!headers.contains_key("content-length"));
+            }
+            other => panic!("expected terminal status {status}, got {other:?}"),
+        }
     }
 }
 

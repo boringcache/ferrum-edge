@@ -1059,12 +1059,13 @@ impl FunctionDestination {
         }
 
         // Query credentials can also be copied into an attacker-controlled
-        // redirect path. Match only complete slash-delimited components so a
-        // value such as `secret/value` is blocked at `/secret/value`, while
+        // redirect path or path parameter. Match complete URI components so a
+        // value such as `secret/value` is blocked at `/secret/value`,
+        // `/next;leak=secret/value`, and `/next?leak=secret/value`, while
         // `/secret/value-extra` remains distinct.
         if self.sensitive_query_pairs.iter().any(|(_, value)| {
             let value = value.trim_matches('/');
-            !value.is_empty() && path_contains_segment_sequence(&candidate_path, value)
+            !value.is_empty() && uri_component_contains_sequence(&candidate_path, value)
         }) {
             return true;
         }
@@ -1120,13 +1121,13 @@ impl FunctionDestination {
             if self
                 .sensitive_path
                 .as_deref()
-                .is_some_and(|path| fragment_contains_component_sequence(
+                .is_some_and(|path| uri_component_contains_sequence(
                     &decoded_fragment.value,
                     path,
                 ))
                 || self.sensitive_query_pairs.iter().any(|(_, value)| {
                     !value.is_empty()
-                        && fragment_contains_component_sequence(&decoded_fragment.value, value)
+                        && uri_component_contains_sequence(&decoded_fragment.value, value)
                 })
             {
                 return true;
@@ -1301,7 +1302,7 @@ fn path_contains_segment_sequence(candidate: &str, sensitive: &str) -> bool {
     })
 }
 
-fn fragment_contains_component_sequence(candidate: &str, sensitive: &str) -> bool {
+fn uri_component_contains_sequence(candidate: &str, sensitive: &str) -> bool {
     let sensitive = sensitive.trim_matches('/');
     if sensitive.is_empty() {
         return false;
@@ -1755,7 +1756,8 @@ impl Plugin for ServerlessFunction {
                     "serverless_function: terminate mode — returning function response (status {})",
                     status
                 );
-                let body = if ctx.method.eq_ignore_ascii_case("HEAD") || matches!(status, 204 | 304)
+                let body = if ctx.method.eq_ignore_ascii_case("HEAD")
+                    || matches!(status, 204 | 205 | 304)
                 {
                     Bytes::new()
                 } else {

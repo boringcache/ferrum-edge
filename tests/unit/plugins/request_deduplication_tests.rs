@@ -613,6 +613,132 @@ async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
 }
 
 #[tokio::test]
+async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("side-effect-result"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({
+        "max_entries": 1,
+        "ttl_seconds": 300,
+        "inflight_ttl_seconds": 300
+    }));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "terminal-a".to_string())]);
+    assert!(matches!(
+        dedup
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) = match serverless
+        .before_proxy(&mut first_ctx, &mut first_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => (status_code, headers, body),
+        other => panic!("expected terminal serverless response, got {other:?}"),
+    };
+
+    // A distinct active request saturates max_entries before the terminal
+    // response publishes. The owned completion must remain replayable instead
+    // of being selected as the only capacity-eviction candidate.
+    let mut second_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/other".to_string(),
+    );
+    let mut second_headers =
+        HashMap::from([("idempotency-key".to_string(), "ordinary-b".to_string())]);
+    assert!(matches!(
+        dedup
+            .before_proxy(&mut second_ctx, &mut second_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, status, &response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    dedup
+        .on_response_committed(&mut first_ctx, status, &response_headers, &body)
+        .await;
+
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut replay_headers =
+        HashMap::from([("idempotency-key".to_string(), "terminal-a".to_string())]);
+    match dedup
+        .before_proxy(&mut replay_ctx, &mut replay_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(&body[..], b"side-effect-result");
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+        }
+        other => panic!("owned completion was not replayable under active pressure: {other:?}"),
+    }
+
+    // Once the other request completes, strict capacity can no longer retain
+    // both responses. Evicting the protected terminal replay must leave an
+    // in-flight tombstone, so a later Redis outage/lock expiry cannot allow the
+    // external side effect to execute again.
+    complete_response(&dedup, &mut second_ctx).await;
+    let mut tombstone_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut tombstone_headers =
+        HashMap::from([("idempotency-key".to_string(), "terminal-a".to_string())]);
+    assert!(matches!(
+        dedup
+            .before_proxy(&mut tombstone_ctx, &mut tombstone_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn oversized_terminal_serverless_response_retains_inflight_protection() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};

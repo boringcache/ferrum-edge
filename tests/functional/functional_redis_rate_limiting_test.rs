@@ -1516,6 +1516,7 @@ plugin_configs:
       redis_key_prefix: "{prefix}"
       ttl_seconds: 60
       inflight_ttl_seconds: 10
+      max_entries: 1
       max_entry_size_bytes: 1048576
       max_total_size_bytes: 2097152
       scope_by_consumer: false

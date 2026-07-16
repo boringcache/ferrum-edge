@@ -168,6 +168,11 @@ enum DeduplicationEntry {
         cached: CachedResponse,
         sequence: u64,
         fingerprint: String,
+        /// Replace this replay with a short-lived in-flight tombstone instead
+        /// of removing it when capacity pressure makes retention impossible.
+        /// This is set for externally executing terminal responses until a
+        /// distributed replay is known to be visible.
+        retain_inflight_on_eviction: bool,
     },
 }
 
@@ -208,6 +213,7 @@ enum RedisPayloadAdmission {
 enum LocalCompletionAction {
     Published {
         cached: CachedResponse,
+        sequence: u64,
         completed_count: usize,
         inflight_count: usize,
     },
@@ -626,6 +632,7 @@ impl RequestDeduplication {
                     cached,
                     sequence,
                     fingerprint: cached_fingerprint,
+                    ..
                 } => {
                     if now.duration_since(cached.inserted_at) < self.ttl {
                         if cached_fingerprint == fingerprint {
@@ -892,6 +899,7 @@ impl RequestDeduplication {
         headers: HashMap<String, String>,
         body: &[u8],
         retain_inflight_on_skip: bool,
+        retain_inflight_on_eviction: bool,
     ) -> LocalCompletionAction {
         let entry_size = cached_response_retained_size(body.len(), &headers);
         let _guard = self.accounting_guard();
@@ -967,14 +975,39 @@ impl RequestDeduplication {
             cached,
             sequence,
             fingerprint: fingerprint.to_string(),
+            retain_inflight_on_eviction,
         });
         self.add_completed_size_locked(entry_size);
         self.completed_order
             .insert(sequence, CompletedOrderEntry::Published(key.to_string()));
         LocalCompletionAction::Published {
             cached: redis_copy,
+            sequence,
             completed_count: self.completed_count.fetch_add(1, Ordering::Relaxed) + 1,
             inflight_count: decrement_atomic(&self.inflight_count),
+        }
+    }
+
+    fn set_completed_inflight_retention(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        sequence: u64,
+        retain: bool,
+    ) {
+        let Some(mut entry) = self.local_cache.get_mut(key) else {
+            return;
+        };
+        if let DeduplicationEntry::Completed {
+            sequence: current_sequence,
+            fingerprint: current_fingerprint,
+            retain_inflight_on_eviction,
+            ..
+        } = entry.value_mut()
+            && *current_sequence == sequence
+            && current_fingerprint.as_str() == fingerprint
+        {
+            *retain_inflight_on_eviction = retain;
         }
     }
 
@@ -1038,7 +1071,7 @@ impl RequestDeduplication {
             // originating request must have died (timeout, downstream reject,
             // connection drop) without ever reaching `on_final_response_body`.
             // Without this, duplicate requests would receive 409 Conflict
-            // forever (until LRU max-entries eviction).
+            // forever.
             DeduplicationEntry::InFlight { started_at, .. } => {
                 let keep = now.duration_since(*started_at) < self.inflight_ttl;
                 if !keep {
@@ -1051,16 +1084,31 @@ impl RequestDeduplication {
         self.evict_completed_over_capacity_locked(
             self.completed_count.load(Ordering::Relaxed),
             self.inflight_count.load(Ordering::Relaxed),
+            false,
         );
         self.advance_completed_evict_cursor_locked();
     }
 
-    fn evict_completed_over_capacity(&self, completed_hint: usize, inflight_hint: usize) {
+    fn evict_completed_over_capacity(
+        &self,
+        completed_hint: usize,
+        inflight_hint: usize,
+        preserve_one_completed: bool,
+    ) {
         let _guard = self.accounting_guard();
-        self.evict_completed_over_capacity_locked(completed_hint, inflight_hint);
+        self.evict_completed_over_capacity_locked(
+            completed_hint,
+            inflight_hint,
+            preserve_one_completed,
+        );
     }
 
-    fn evict_completed_over_capacity_locked(&self, completed_hint: usize, inflight_hint: usize) {
+    fn evict_completed_over_capacity_locked(
+        &self,
+        completed_hint: usize,
+        inflight_hint: usize,
+        preserve_one_completed: bool,
+    ) {
         if completed_hint == 0 || completed_hint.saturating_add(inflight_hint) <= self.max_entries {
             return;
         }
@@ -1072,10 +1120,16 @@ impl RequestDeduplication {
         self.evict_completed_over_capacity_guarded(
             self.completed_count.load(Ordering::Relaxed),
             self.inflight_count.load(Ordering::Relaxed),
+            preserve_one_completed,
         );
     }
 
-    fn evict_completed_over_capacity_guarded(&self, completed_hint: usize, inflight_hint: usize) {
+    fn evict_completed_over_capacity_guarded(
+        &self,
+        completed_hint: usize,
+        inflight_hint: usize,
+        preserve_one_completed: bool,
+    ) {
         // Enforce max entries by removing oldest Completed entries first. Active
         // (non-stale) InFlight markers are NEVER evicted by LRU because evicting
         // them would release the in-flight lock while the original request is
@@ -1088,7 +1142,11 @@ impl RequestDeduplication {
         let mut to_remove = completed_hint
             .saturating_add(inflight_hint)
             .saturating_sub(self.max_entries)
-            .min(completed_hint);
+            .min(if preserve_one_completed {
+                completed_hint.saturating_sub(1)
+            } else {
+                completed_hint
+            });
         if to_remove == 0 {
             return;
         }
@@ -1098,7 +1156,7 @@ impl RequestDeduplication {
         while to_remove > 0 && sequence < limit {
             let current_sequence = sequence;
             match self.remove_completed_sequence_locked(sequence) {
-                CompletedSequenceRemoval::Removed => {
+                CompletedSequenceRemoval::Removed | CompletedSequenceRemoval::Tombstoned => {
                     to_remove -= 1;
                     sequence += 1;
                     self.next_completed_evict_sequence
@@ -1137,39 +1195,51 @@ impl RequestDeduplication {
         };
         drop(order_entry);
 
-        let still_current = self.local_cache.get(&key).is_some_and(|entry| {
-            matches!(
-                entry.value(),
-                DeduplicationEntry::Completed {
-                    sequence: current,
-                    ..
-                } if *current == sequence
-            )
-        });
-        if !still_current {
-            self.remove_stale_completed_order(sequence, &key);
-            return CompletedSequenceRemoval::Stale;
-        }
-
-        if let Some((_, removed)) = self.local_cache.remove_if(&key, |_, entry| {
-            matches!(
-                entry,
-                DeduplicationEntry::Completed {
-                    sequence: current,
-                    ..
-                } if *current == sequence
-            )
-        }) {
-            if let DeduplicationEntry::Completed { cached, .. } = removed {
-                self.sub_completed_size_locked(cached.retained_size());
+        let mut entry = match self.local_cache.entry(key.clone()) {
+            Entry::Occupied(entry) => entry,
+            Entry::Vacant(_) => {
+                self.remove_stale_completed_order(sequence, &key);
+                return CompletedSequenceRemoval::Stale;
             }
-            decrement_atomic(&self.completed_count);
-            self.remove_stale_completed_order(sequence, &key);
-            CompletedSequenceRemoval::Removed
+        };
+        let (retained_size, fingerprint, retain_inflight_on_eviction) = match entry.get() {
+            DeduplicationEntry::Completed {
+                cached,
+                sequence: current,
+                fingerprint,
+                retain_inflight_on_eviction,
+            } if *current == sequence => (
+                cached.retained_size(),
+                fingerprint.clone(),
+                *retain_inflight_on_eviction,
+            ),
+            _ => {
+                drop(entry);
+                self.remove_stale_completed_order(sequence, &key);
+                return CompletedSequenceRemoval::Stale;
+            }
+        };
+
+        self.sub_completed_size_locked(retained_size);
+        decrement_atomic(&self.completed_count);
+        let result = if retain_inflight_on_eviction {
+            // A distributed lock may still be the only cross-gateway guard for
+            // an externally executed response. If the replay cannot remain in
+            // the bounded local cache, retain a small local tombstone so Redis
+            // loss cannot turn an identical retry into another side effect.
+            entry.insert(DeduplicationEntry::InFlight {
+                started_at: Instant::now(),
+                fingerprint,
+                owner_token: self.next_local_inflight_owner_token(),
+            });
+            self.inflight_count.fetch_add(1, Ordering::Relaxed);
+            CompletedSequenceRemoval::Tombstoned
         } else {
-            self.remove_stale_completed_order(sequence, &key);
-            CompletedSequenceRemoval::Stale
-        }
+            entry.remove();
+            CompletedSequenceRemoval::Removed
+        };
+        self.remove_stale_completed_order(sequence, &key);
+        result
     }
 
     fn remove_stale_completed_order(&self, sequence: u64, key: &str) {
@@ -1246,6 +1316,7 @@ enum CompletedOrderEntry {
 
 enum CompletedSequenceRemoval {
     Removed,
+    Tombstoned,
     Stale,
     NotPublished,
 }
@@ -1980,7 +2051,7 @@ impl Plugin for RequestDeduplication {
         // sanitization on store. See [`super::utils::cache_headers`].
         let safe_headers = sanitize_cached_headers(response_headers);
 
-        let (cached, completed, inflight) = match self.local_publish_completed(
+        let (cached, sequence, completed, inflight) = match self.local_publish_completed(
             &key,
             &fingerprint,
             &local_inflight_owner_token,
@@ -1988,12 +2059,14 @@ impl Plugin for RequestDeduplication {
             safe_headers,
             body,
             retain_inflight_on_storage_skip,
+            retain_inflight_on_storage_skip || redis_lock_token.is_some(),
         ) {
             LocalCompletionAction::Published {
                 cached,
+                sequence,
                 completed_count,
                 inflight_count,
-            } => (cached, completed_count, inflight_count),
+            } => (cached, sequence, completed_count, inflight_count),
             LocalCompletionAction::Skipped {
                 inflight_count,
                 reason,
@@ -2070,14 +2143,22 @@ impl Plugin for RequestDeduplication {
                 return PluginResult::Continue;
             }
         };
-        self.evict_completed_over_capacity(completed, inflight);
-
         // Also store in Redis if available. Release the distributed in-flight
         // lock only after the completed response is visible in Redis, so a peer
         // cannot miss both the lock and the replayable response.
+        let mut preserve_local_completion = self.redis_client.is_none()
+            && retain_inflight_on_storage_skip;
         if self.redis_client.is_some() {
             match self.redis_set(&key, &fingerprint, &cached).await {
                 RedisStoreAction::Stored => {
+                    // Redis now carries the replay, so ordinary LRU eviction is
+                    // safe even for an externally executing terminal response.
+                    self.set_completed_inflight_retention(
+                        &key,
+                        &fingerprint,
+                        sequence,
+                        false,
+                    );
                     if let Some(token) = redis_lock_token.as_deref() {
                         self.redis_release_inflight(&key, &fingerprint, token)
                             .await;
@@ -2087,16 +2168,48 @@ impl Plugin for RequestDeduplication {
                 // an externally executing terminal response, retain the
                 // distributed lock until its TTL instead of allowing a peer to
                 // re-execute the side effect immediately.
-                RedisStoreAction::SkippedSize if retain_inflight_on_storage_skip => {}
+                RedisStoreAction::SkippedSize if retain_inflight_on_storage_skip => {
+                    preserve_local_completion = true;
+                }
                 RedisStoreAction::SkippedSize => {
+                    self.set_completed_inflight_retention(
+                        &key,
+                        &fingerprint,
+                        sequence,
+                        false,
+                    );
                     if let Some(token) = redis_lock_token.as_deref() {
                         self.redis_release_inflight(&key, &fingerprint, token)
                             .await;
                     }
                 }
-                RedisStoreAction::Failed => {}
+                RedisStoreAction::Failed => {
+                    // If this response owns a terminal side effect or a Redis
+                    // in-flight lock, no distributed replay is known to exist.
+                    // Keep the local replay when possible and retain a local
+                    // tombstone if later capacity pressure must evict it.
+                    preserve_local_completion = retain_inflight_on_storage_skip
+                        || redis_lock_token.is_some();
+                    if !preserve_local_completion {
+                        self.set_completed_inflight_retention(
+                            &key,
+                            &fingerprint,
+                            sequence,
+                            false,
+                        );
+                    }
+                }
             }
         }
+
+        // Admission to Redis is now settled. Until this point an owned
+        // completion is already marked for tombstone conversion, so a
+        // concurrent capacity trim cannot silently remove the last local
+        // safety state. When no distributed replay exists, retain one completed
+        // replay even if active in-flight requests temporarily push the cache
+        // over max_entries; later pressure converts older protected replays to
+        // bounded-TTL in-flight tombstones rather than dropping them.
+        self.evict_completed_over_capacity(completed, inflight, preserve_local_completion);
 
         PluginResult::Continue
     }
