@@ -90,10 +90,10 @@ impl TransactionDebugger {
     pub fn classify_http_outcome(summary: &TransactionSummary) -> &'static str {
         if summary.error_class.is_some() {
             "dispatch_error"
-        } else if summary.body_error_class.is_some() {
-            "body_error"
         } else if summary.client_disconnected {
             "client_disconnected"
+        } else if summary.body_error_class.is_some() {
+            "body_error"
         } else if summary.response_streamed && !summary.body_completed {
             "body_incomplete"
         } else if summary

@@ -539,6 +539,34 @@ fn test_transaction_debugger_classifies_authoritative_http_terminal_states() {
 }
 
 #[test]
+fn test_transaction_debugger_prioritizes_client_disconnect_body_outcome() {
+    let mut summary = create_test_transaction_summary();
+    summary.response_streamed = true;
+    summary.body_completed = false;
+    summary.body_error_class = Some(ErrorClass::ClientDisconnect);
+    summary.client_disconnected = true;
+    assert_eq!(
+        TransactionDebugger::classify_http_outcome(&summary),
+        "client_disconnected"
+    );
+
+    summary.body_error_class = Some(ErrorClass::ProtocolError);
+    summary.client_disconnected = false;
+    assert_eq!(
+        TransactionDebugger::classify_http_outcome(&summary),
+        "body_error"
+    );
+
+    summary.error_class = Some(ErrorClass::ConnectionRefused);
+    summary.body_error_class = Some(ErrorClass::ClientDisconnect);
+    summary.client_disconnected = true;
+    assert_eq!(
+        TransactionDebugger::classify_http_outcome(&summary),
+        "dispatch_error"
+    );
+}
+
+#[test]
 fn test_transaction_debugger_classifies_nonzero_grpc_status_under_http_200() {
     let mut summary = create_test_transaction_summary();
     summary.response_status_code = 200;
