@@ -51,7 +51,9 @@ mod inner {
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
         Upstream,
     };
-    use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
+    use crate::config::validation_pipeline::{
+        ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
+    };
     use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
     use arc_swap::ArcSwap;
@@ -3392,6 +3394,17 @@ mod inner {
                     .into_anyhow(),
                 );
             }
+
+            // Match relational database full-load semantics for node-local
+            // plugin files. Warning-mode validation keeps an absent MMDB a
+            // supported data-plane fallback, while the accepted generation
+            // hands every successfully validated snapshot to the subsequent
+            // plugin-cache build. This must run only after all rejecting
+            // validation has passed so an invalid Mongo snapshot cannot leave
+            // a claimable MMDB handoff behind.
+            ValidationPipeline::new(&mut config)
+                .validate_plugin_file_dependencies(ValidationAction::Warn)
+                .run()?;
 
             Ok(config)
         }
@@ -10954,6 +10967,9 @@ mod inner {
             let non_empty_guard = load_body
                 .find("if !validation_errors.is_empty() {")
                 .expect("load_full_config non-empty validation guard");
+            let plugin_file_dependencies = load_body
+                .find("validate_plugin_file_dependencies(ValidationAction::Warn)")
+                .expect("load_full_config database-mode plugin file dependency validation");
             let success = load_body
                 .find("Ok(config)")
                 .expect("load_full_config success return");
@@ -10986,9 +11002,12 @@ mod inner {
                  consumer identity quarantine"
             );
             assert!(
-                rejecting_validation < non_empty_guard && non_empty_guard < success,
+                rejecting_validation < non_empty_guard
+                    && non_empty_guard < plugin_file_dependencies
+                    && plugin_file_dependencies < success,
                 "the rejecting validation guard must sit between the shared validation call and \
-                 the Ok(config) success return"
+                 database-mode plugin file dependency generation, which must commit before the \
+                 Ok(config) success return"
             );
             // The guard must fail closed by RETURNING a typed
             // `ConfigValidationRejection` (issue #2158) rather than merely
