@@ -1439,9 +1439,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "query-value-trailing-slash" => {
                 "https://redirect.example/next?leak=secret%2F".to_string()
             }
-            "query-value-slash-only" => {
-                "https://redirect.example/next?leak=%2F".to_string()
-            }
+            "query-value-slash-only" => "https://redirect.example/next?leak=%2F".to_string(),
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }

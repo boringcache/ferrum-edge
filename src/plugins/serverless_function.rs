@@ -911,10 +911,7 @@ fn unambiguous_query_params(
         // payload so policy egress cannot resurrect a credential that the
         // backend will not receive.
         let effective_query = crate::proxy::query_string_after_plugin_strips(ctx, raw_query);
-        for pair in effective_query
-            .split('&')
-            .filter(|pair| !pair.is_empty())
-        {
+        for pair in effective_query.split('&').filter(|pair| !pair.is_empty()) {
             let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
             if raw_key.contains('+') || raw_value.contains('+') {
                 return Err(InvocationFailure::governed_input(
