@@ -3448,14 +3448,25 @@ jobs:
               # secrets, and unrelated operating modes are not observable here
               # and should not pay for a 17-minute release build.
               while IFS= read -r path; do
+                # Every top-level src/*.rs module is shared runtime
+                # infrastructure (request_epoch, overload, load balancing,
+                # pooling, adaptive concurrency, metrics — see the CLAUDE.md
+                # source layout) consumed on or beside the measured request
+                # path; gate the whole tier instead of enumerating files.
+                # `case` globs match `/`, so test the tier explicitly:
+                # starts with src/, ends with .rs, no deeper directory.
+                rest="${path#src/}"
+                if [ "${rest}" != "${path}" ] \
+                  && [ "${rest%.rs}" != "${rest}" ] \
+                  && [ "${rest#*/}" = "${rest}" ]; then
+                  run_benchmark=true
+                  reason="Performance-sensitive paths changed."
+                  break
+                fi
                 case "${path}" in
                   src/proxy/*|src/http3/*|src/dns/*|src/pool/*|\
-                  src/connection_pool.rs|src/load_balancer.rs|src/health_check.rs|\
-                  src/circuit_breaker.rs|src/retry.rs|src/overload.rs|\
-                  src/router_cache.rs|src/plugin_cache.rs|src/consumer_index.rs|\
-                  src/date_cache.rs|src/lazy_timeout.rs|src/socket_opts.rs|src/tls_offload.rs|\
                   src/config/*|src/plugins/mod.rs|\
-                  src/main.rs|src/startup.rs|src/modes/file.rs|src/modes/mod.rs|\
+                  src/modes/file.rs|src/modes/mod.rs|\
                   vendor/*|ebpf/*|tests/performance/*|proto/*|.cargo/*|.github/actions/*|\
                   build.rs|ferrum.conf|Cargo.toml|Cargo.lock|rust-toolchain.toml|\
                   .github/workflows/ci.yml)
@@ -3584,8 +3595,9 @@ jobs:
               echo "Skipped expensive benchmark: ${REASON}"
               echo ""
               echo "Relevant paths:"
-              echo "- Proxy and connection hot paths: \`src/proxy/**\`, \`src/http3/**\`, \`src/dns/**\`, \`src/pool/**\`, \`src/connection_pool.rs\`, \`src/load_balancer.rs\`, \`src/health_check.rs\`, \`src/circuit_breaker.rs\`, \`src/retry.rs\`, \`src/overload.rs\`, \`src/router_cache.rs\`, \`src/plugin_cache.rs\`, \`src/consumer_index.rs\`, \`src/date_cache.rs\`, \`src/lazy_timeout.rs\`, \`src/socket_opts.rs\`, and \`src/tls_offload.rs\`."
-              echo "- File-mode gateway path: \`src/config/**\` (env/conf precedence, file loading, validation, pool tuning, and domain types all feed the measured startup and request flow), \`src/plugins/mod.rs\`, \`src/main.rs\`, \`src/startup.rs\`, \`src/modes/file.rs\`, and \`src/modes/mod.rs\`."
+              echo "- Shared runtime infrastructure: every top-level \`src/*.rs\` module (request epoch, overload, load balancing, pooling, adaptive concurrency, metrics, startup — all consumed on or beside the measured request path)."
+              echo "- Proxy and connection hot paths: \`src/proxy/**\`, \`src/http3/**\`, \`src/dns/**\`, and \`src/pool/**\`."
+              echo "- File-mode gateway path: \`src/config/**\` (env/conf precedence, file loading, validation, pool tuning, and domain types all feed the measured startup and request flow), \`src/plugins/mod.rs\`, \`src/modes/file.rs\`, and \`src/modes/mod.rs\`."
               echo "- Build and dependency graph: \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`proto/**\`, \`.cargo/**\`, \`build.rs\`, \`ferrum.conf\`, \`Cargo.toml\`, \`Cargo.lock\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, and \`.github/actions/**\`."
               echo ""
               echo "Changed files:"
