@@ -87,7 +87,10 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
             .count(),
         1
     );
-    assert_eq!(finalizer.matches("log_rejected_request_with_path(").count(), 1);
+    assert_eq!(
+        finalizer.matches("log_rejected_request_with_path(").count(),
+        1
+    );
     assert_eq!(finalizer.matches("record_request(state,").count(), 1);
     let decorate = finalizer
         .find("apply_reject_after_proxy_and_synthetic_body_hooks(")
