@@ -253,7 +253,13 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
         .expect("bounded relay body");
     assert!(relay.contains("_ = &mut grpc_deadline"));
     assert!(relay.contains("GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER"));
-    assert!(relay.contains("grpc_deadline_can_send_terminal_status(bytes_streamed)"));
+    assert_eq!(
+        relay
+            .matches("grpc_deadline_can_send_terminal_status(")
+            .count(),
+        2,
+        "write-bound and select-loop deadlines must both use client-visible DATA"
+    );
     assert!(relay.contains("abort_response_stream(stream)"));
     assert!(relay.contains("_ = &mut read_deadline"));
     assert!(relay.contains("await_response_write_before_deadline("));
