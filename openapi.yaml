@@ -15156,30 +15156,32 @@ components:
 
     SpecExposeConfig:
       type: object
-      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) on a /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s) to avoid hitting the upstream document store on every /specz request; failures are not cached."
+      additionalProperties: false
+      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) for GET and HEAD on the canonical /specz sub-path. HEAD retains the GET representation through response-body policy, then returns the final status and representation headers without a wire body. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s). Failed fetches are coalesced and negatively cached with bounded exponential backoff; excess cache-miss waiters receive HTTP 503 with Retry-After."
       required:
         - spec_url
       properties:
         spec_url:
           type: string
-          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml)"
+          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml). URL userinfo is rejected. Paths and queries may be used for origin routing or signed access, but are omitted from gateway diagnostics."
         content_type:
-          type: string
-          description: "Override the response Content-Type. When omitted, the upstream response's Content-Type is passed through."
+          type: [string, "null"]
+          description: "Trusted response Content-Type override; it is not restricted by the upstream allow-list. When omitted or null, only supported spec media types are preserved from upstream (case-insensitive media-type comparison, with original parameters retained); every other or missing value falls back to application/octet-stream."
         tls_no_verify:
-          type: boolean
-          description: "Skip TLS certificate verification when fetching the spec. Defaults to the gateway's FERRUM_TLS_NO_VERIFY setting."
+          type: [boolean, "null"]
+          description: "Skip TLS certificate verification when fetching the spec. Omitted or null defaults to the gateway's FERRUM_TLS_NO_VERIFY setting. When verification is enabled and a gateway CA bundle is configured, load or parse failure rejects plugin construction instead of widening trust."
         cache_ttl_seconds:
-          type: integer
+          type: [integer, "null"]
           format: uint64
+          minimum: 0
           default: 300
-          description: "Time-to-live for the in-process spec body cache (seconds). The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Failed fetches are never cached. Set to 0 to disable caching entirely (every request re-fetches)."
+          description: "Time-to-live for the in-process spec body cache (seconds). Omitted or null defaults to 300. The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Set to 0 to disable durable positive caching; callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay, while later requests immediately re-fetch. Failed fetches use bounded negative-cache backoff regardless of this value."
         max_response_body_bytes:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           minimum: 1
           default: 26214400
-          description: "Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth."
+          description: "Maximum upstream spec response body size to buffer and cache. Omitted or null defaults to 26214400. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth."
 
     LoadTestingConfig:
       type: object

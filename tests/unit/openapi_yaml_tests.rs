@@ -2846,6 +2846,52 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
 }
 
 #[test]
+fn spec_expose_schema_matches_strict_runtime_null_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/SpecExposeConfig")
+        .expect("SpecExposeConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(["spec_url"]));
+    for (field, scalar_type) in [
+        ("content_type", "string"),
+        ("tls_no_verify", "boolean"),
+        ("cache_ttl_seconds", "integer"),
+        ("max_response_body_bytes", "integer"),
+    ] {
+        assert_eq!(
+            schema["properties"][field]["type"],
+            json!([scalar_type, "null"]),
+            "{field} must document the runtime's explicit-null default"
+        );
+    }
+
+    assert_component_validity(
+        &spec,
+        "SpecExposeConfig",
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "content_type": null,
+            "tls_no_verify": null,
+            "cache_ttl_seconds": null,
+            "max_response_body_bytes": null
+        }),
+        true,
+    );
+    for invalid in [
+        json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verfy": true}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "content_type": 7}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verify": "false"}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": -1}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 0}),
+    ] {
+        assert_component_validity(&spec, "SpecExposeConfig", &invalid, false);
+    }
+}
+
+#[test]
 fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
     use ferrum_edge::plugins::bot_detection::{BOT_DETECTION_CONFIG_KEYS, BotDetection};
 

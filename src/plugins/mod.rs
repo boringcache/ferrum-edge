@@ -3662,6 +3662,17 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when a successful reject-path response replacement
+    /// should emit a warning.
+    ///
+    /// Fail-closed enforcement plugins should retain the default. A plugin
+    /// performing an expected protocol normalization (for example suppressing
+    /// a `HEAD` response body without changing its representation) may return
+    /// `false`; the replacement is then logged at debug level instead.
+    fn warn_on_rejection_response_replacement(&self) -> bool {
+        true
+    }
+
     /// Returns `true` if this plugin needs the entire response body buffered
     /// in memory before forwarding to the client. When any active plugin
     /// returns `true`, the gateway forces buffered mode for that proxy
