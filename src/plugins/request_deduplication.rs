@@ -2130,8 +2130,7 @@ impl Plugin for RequestDeduplication {
                     }
                     return PluginResult::Continue;
                 }
-                if !retain_inflight_on_storage_skip
-                    && let Some(token) = redis_lock_token.as_deref()
+                if !retain_inflight_on_storage_skip && let Some(token) = redis_lock_token.as_deref()
                 {
                     self.redis_release_inflight(&key, &fingerprint, token).await;
                 }
