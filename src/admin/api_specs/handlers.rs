@@ -439,9 +439,9 @@ async fn compensate_late_api_spec_delete(
             errors.join("; ")
         ),
         Err(crate::admin::crud::AfterValidateError::Db(error)) => return Err(error),
-        Err(crate::admin::crud::AfterValidateError::Response(_)) => anyhow::bail!(
-            "late API-spec delete compensation validation returned an HTTP response"
-        ),
+        Err(crate::admin::crud::AfterValidateError::Response(_)) => {
+            anyhow::bail!("late API-spec delete compensation validation returned an HTTP response")
+        }
     }
     let additional_plugin_ids = additional_plugins
         .iter()
