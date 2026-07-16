@@ -617,9 +617,7 @@ impl WorkerGuard {
         self.state
             .shutdown_incomplete_records
             .fetch_add(incomplete, Ordering::Relaxed);
-        self.state
-            .shutdown_timeouts
-            .fetch_add(1, Ordering::Release);
+        self.state.shutdown_timeouts.fetch_add(1, Ordering::Release);
         false
     }
 }
