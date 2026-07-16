@@ -6,7 +6,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, MutexGuard};
@@ -135,11 +135,17 @@ pub(crate) struct NamespaceConfigAdmissionGuard {
     stop_tx: Option<tokio::sync::watch::Sender<bool>>,
     renew_task: Option<tokio::task::JoinHandle<()>>,
     valid: Arc<AtomicBool>,
+    lease_started_at: Instant,
+    valid_until_millis: Arc<AtomicU64>,
 }
 
 impl NamespaceConfigAdmissionGuard {
     pub(crate) fn ensure_held(&self) -> Result<(), anyhow::Error> {
-        if self.valid.load(Ordering::Acquire) {
+        let elapsed_millis = u64::try_from(self.lease_started_at.elapsed().as_millis())
+            .unwrap_or(u64::MAX);
+        if self.valid.load(Ordering::Acquire)
+            && elapsed_millis < self.valid_until_millis.load(Ordering::Acquire)
+        {
             Ok(())
         } else {
             anyhow::bail!("namespace config admission lease was lost before persistence")
@@ -184,15 +190,16 @@ pub(crate) async fn lock_namespace_config_admission(
 ) -> Result<NamespaceConfigAdmissionGuard, anyhow::Error> {
     let local = lock_local_namespace_config_admission(namespace).await;
     let owner = Uuid::new_v4().to_string();
-    loop {
+    let lease_started_at = loop {
+        let attempt_started_at = Instant::now();
         if db
             .try_acquire_namespace_config_admission_lease(namespace, &owner)
             .await?
         {
-            break;
+            break attempt_started_at;
         }
         tokio::time::sleep(CONFIG_ADMISSION_LEASE_RETRY_INTERVAL).await;
-    }
+    };
 
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let renew_db = db.clone();
@@ -200,8 +207,12 @@ pub(crate) async fn lock_namespace_config_admission(
     let renew_owner = owner.clone();
     let valid = Arc::new(AtomicBool::new(true));
     let renew_valid = valid.clone();
+    let lease_duration_millis =
+        u64::try_from(CONFIG_ADMISSION_LEASE_DURATION.as_millis()).unwrap_or(u64::MAX);
+    let valid_until_millis = Arc::new(AtomicU64::new(lease_duration_millis));
+    let renew_valid_until_millis = valid_until_millis.clone();
     let renew_task = tokio::spawn(async move {
-        let mut valid_until = Instant::now() + CONFIG_ADMISSION_LEASE_DURATION;
+        let mut valid_until = lease_started_at + CONFIG_ADMISSION_LEASE_DURATION;
         loop {
             tokio::select! {
                 changed = stop_rx.changed() => {
@@ -213,12 +224,23 @@ pub(crate) async fn lock_namespace_config_admission(
             }
 
             loop {
+                let renewal_started_at = Instant::now();
                 match renew_db
                     .renew_namespace_config_admission_lease(&renew_namespace, &renew_owner)
                     .await
                 {
                     Ok(true) => {
-                        valid_until = Instant::now() + CONFIG_ADMISSION_LEASE_DURATION;
+                        valid_until = renewal_started_at + CONFIG_ADMISSION_LEASE_DURATION;
+                        let elapsed_millis = u64::try_from(
+                            renewal_started_at
+                                .duration_since(lease_started_at)
+                                .as_millis(),
+                        )
+                        .unwrap_or(u64::MAX);
+                        renew_valid_until_millis.store(
+                            elapsed_millis.saturating_add(lease_duration_millis),
+                            Ordering::Release,
+                        );
                         break;
                     }
                     Ok(false) => {
@@ -266,6 +288,8 @@ pub(crate) async fn lock_namespace_config_admission(
         stop_tx: Some(stop_tx),
         renew_task: Some(renew_task),
         valid,
+        lease_started_at,
+        valid_until_millis,
     })
 }
 
@@ -3330,6 +3354,11 @@ async fn handle_write<R: AdminResource>(
         }
     }
 
+    if let Some(guard) = _namespace_config_admission_guard.as_ref()
+        && let Err(error) = guard.ensure_held()
+    {
+        return Ok(R::map_precheck_db_error(&error));
+    }
     match action {
         WriteAction::Create => {
             if let Err(error) = R::db_create(db, &resource).await {
