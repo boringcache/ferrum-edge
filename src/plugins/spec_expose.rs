@@ -55,9 +55,9 @@ use http::header::HeaderValue;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
-use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use url::{Host, Url};
 
@@ -69,6 +69,7 @@ use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
 use super::{Plugin, PluginResult, RequestContext};
+use crate::proxy::SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY;
 
 /// Default cache TTL for fetched spec bodies (5 minutes).
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
@@ -137,11 +138,48 @@ struct CachedFailure {
 }
 
 type FetchOutcome = Result<CachedSpec, FetchFailure>;
-type InFlightFetch = OnceCell<FetchOutcome>;
+
+/// A fetch generation whose completion is published by an independently owned
+/// task. Request cancellation can drop any or every waiter without cancelling
+/// the origin request or losing its positive/negative cache outcome.
+struct InFlightFetch {
+    outcome: OnceLock<FetchOutcome>,
+    notify: Notify,
+}
+
+impl InFlightFetch {
+    fn new() -> Self {
+        Self {
+            outcome: OnceLock::new(),
+            notify: Notify::new(),
+        }
+    }
+
+    fn publish(&self, outcome: FetchOutcome) {
+        if self.outcome.set(outcome).is_ok() {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) -> FetchOutcome {
+        loop {
+            // Register before checking the durable cell so publication cannot
+            // fall between the check and the wait and strand this caller.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(outcome) = self.outcome.get() {
+                return outcome.clone();
+            }
+            notified.await;
+        }
+    }
+}
 
 struct FetchAdmission {
     _permit: OwnedSemaphorePermit,
     cell: Arc<InFlightFetch>,
+    starts_fetch: bool,
 }
 
 fn lock_in_flight_fetch(
@@ -157,6 +195,7 @@ fn lock_in_flight_fetch(
 }
 
 /// Spec Expose plugin — serves API spec documents on `{listen_path}/specz`.
+#[derive(Clone)]
 pub struct SpecExpose {
     spec_url: String,
     /// Credential-free origin label used for every diagnostic. The request URL
@@ -166,14 +205,14 @@ pub struct SpecExpose {
     warmup_hostname: Option<String>,
     cache_ttl: Duration,
     max_response_body_bytes: usize,
-    cache: ArcSwap<Option<CachedSpec>>,
-    failure_cache: ArcSwap<Option<CachedFailure>>,
-    consecutive_failures: AtomicU32,
+    cache: Arc<ArcSwap<Option<CachedSpec>>>,
+    failure_cache: Arc<ArcSwap<Option<CachedFailure>>>,
+    consecutive_failures: Arc<AtomicU32>,
     /// One transient single-flight completion shared only by callers admitted
     /// before it finishes. Completion removes the plugin-owned reference;
     /// admitted waiters retain their own `Arc`, so a zero-TTL body lives only
     /// until that fetch group drains.
-    in_flight_fetch: Mutex<Option<Arc<InFlightFetch>>>,
+    in_flight_fetch: Arc<Mutex<Option<Arc<InFlightFetch>>>>,
     /// Bounds both the in-flight fetch and callers waiting for its completion.
     /// Excess anonymous requests fail quickly instead of growing a mutex queue.
     fetch_admission: Arc<Semaphore>,
@@ -368,10 +407,10 @@ impl SpecExpose {
             warmup_hostname,
             cache_ttl,
             max_response_body_bytes,
-            cache: ArcSwap::from_pointee(None),
-            failure_cache: ArcSwap::from_pointee(None),
-            consecutive_failures: AtomicU32::new(0),
-            in_flight_fetch: Mutex::new(None),
+            cache: Arc::new(ArcSwap::from_pointee(None)),
+            failure_cache: Arc::new(ArcSwap::from_pointee(None)),
+            consecutive_failures: Arc::new(AtomicU32::new(0)),
+            in_flight_fetch: Arc::new(Mutex::new(None)),
             fetch_admission: Arc::new(Semaphore::new(MAX_PENDING_FETCHES)),
             http_client,
         })
@@ -422,17 +461,18 @@ impl SpecExpose {
             Ok(permit) => permit,
             Err(_) => return None,
         };
-        let cell = match active.as_ref() {
-            Some(cell) => Arc::clone(cell),
+        let (cell, starts_fetch) = match active.as_ref() {
+            Some(cell) => (Arc::clone(cell), false),
             None => {
                 let cell = Arc::new(InFlightFetch::new());
                 *active = Some(Arc::clone(&cell));
-                cell
+                (cell, true)
             }
         };
         Some(FetchAdmission {
             _permit: permit,
             cell,
+            starts_fetch,
         })
     }
 
@@ -586,6 +626,24 @@ impl SpecExpose {
         };
 
         Ok(entry)
+    }
+
+    /// Complete one fetch generation independently of the request that created
+    /// it. The worker owns a clone of all shared cache/admission state, so a
+    /// disconnected anonymous caller cannot cancel the origin fetch and make
+    /// the next caller restart it.
+    async fn complete_fetch(self, cell: Arc<InFlightFetch>) {
+        let outcome = match self.fetch_spec().await {
+            Ok(entry) => {
+                self.record_success(&entry);
+                Ok(entry)
+            }
+            Err(failure) => Err(self.record_failure(failure)),
+        };
+        cell.publish(outcome);
+        // Retire only after publishing the outcome. Callers that registered
+        // earlier retain this cell; later zero-TTL callers create a fresh group.
+        self.retire_fetch(&cell);
     }
 }
 
@@ -743,8 +801,14 @@ impl Plugin for SpecExpose {
         if is_head {
             ctx.metadata
                 .insert(HEAD_RESPONSE_MARKER.to_string(), "true".to_string());
+            ctx.metadata.insert(
+                SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY.to_string(),
+                "GET".to_string(),
+            );
         } else {
             ctx.metadata.remove(HEAD_RESPONSE_MARKER);
+            ctx.metadata
+                .remove(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY);
         }
 
         // Fast paths are lock-free. A cached failure is the completion state
@@ -765,36 +829,27 @@ impl Plugin for SpecExpose {
             None => return fetch_busy_response(),
         };
 
-        // Re-check durable outcomes after joining the fetch group: a preceding
-        // caller may have completed between the lock-free lookup and admission.
-        if let Some(entry) = self.cached_spec() {
-            self.retire_fetch(&admission.cell);
-            return spec_response(entry);
-        }
-        if let Some(failure) = self.cached_failure() {
-            self.retire_fetch(&admission.cell);
-            return failure.into_plugin_result();
+        if admission.starts_fetch {
+            // Only the generation creator performs the durable re-check. It
+            // publishes an already-completed outcome for concurrent joiners;
+            // otherwise it starts an independently owned worker before this
+            // request reaches another await/cancellation point.
+            if let Some(entry) = self.cached_spec() {
+                admission.cell.publish(Ok(entry));
+                self.retire_fetch(&admission.cell);
+            } else if let Some(failure) = self.cached_failure() {
+                admission.cell.publish(Err(failure));
+                self.retire_fetch(&admission.cell);
+            } else {
+                let worker = self.clone();
+                let cell = Arc::clone(&admission.cell);
+                tokio::spawn(async move {
+                    worker.complete_fetch(cell).await;
+                });
+            }
         }
 
-        let in_flight = Arc::clone(&admission.cell);
-        let outcome = admission
-            .cell
-            .get_or_init(|| async {
-                let outcome = match self.fetch_spec().await {
-                    Ok(entry) => {
-                        self.record_success(&entry);
-                        Ok(entry)
-                    }
-                    Err(failure) => Err(self.record_failure(failure)),
-                };
-                // Retire only after the outcome is fully built. Callers that
-                // registered earlier retain this cell; later zero-TTL callers
-                // create a fresh group and re-fetch.
-                self.retire_fetch(&in_flight);
-                outcome
-            })
-            .await
-            .clone();
+        let outcome = admission.cell.wait().await;
 
         match outcome {
             Ok(entry) => spec_response(entry),

@@ -1419,6 +1419,78 @@ async fn test_concurrent_cold_cache_fetches_deduplicated() {
     // MockServer drops with .expect(1) — panics if more than one hit.
 }
 
+// The request that creates a fetch generation must not own the origin future.
+// Disconnecting it after the origin has accepted the request must leave the
+// fetch running so a subsequent anonymous caller joins the same completion.
+#[tokio::test]
+async fn test_cancelled_fetch_creator_does_not_restart_origin_request() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/yaml")
+                .set_body_bytes(b"openapi: 3.0.0\n".to_vec())
+                .set_delay(std::time::Duration::from_millis(250)),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = Arc::new(
+        SpecExpose::new(
+            &json!({
+                "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+                "cache_ttl_seconds": 60
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    );
+
+    let creator = {
+        let plugin = Arc::clone(&plugin);
+        tokio::spawn(async move {
+            let mut ctx = make_ctx("GET", "/api/specz", "/api");
+            plugin.on_request_received(&mut ctx).await
+        })
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if mock_server
+                .received_requests()
+                .await
+                .is_some_and(|requests| requests.len() == 1)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("origin did not receive the creator's fetch");
+    creator.abort();
+
+    let mut follower_ctx = make_ctx("GET", "/api/specz", "/api");
+    let follower = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        plugin.on_request_received(&mut follower_ctx),
+    )
+    .await
+    .expect("follower did not receive the independently owned completion");
+    assert!(matches!(
+        follower,
+        PluginResult::RejectBinary {
+            status_code: 200,
+            ..
+        }
+    ));
+}
+
 #[tokio::test(start_paused = true)]
 async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
     use wiremock::matchers::{method, path};

@@ -192,6 +192,14 @@ pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_
 /// precise signal; the normal buffered backend-response path never sets it.
 pub(crate) const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
 
+/// One-shot request-method override used only while synthetic response-body
+/// hooks inspect a plugin-generated representation. `spec_expose` sets `GET`
+/// for canonical HEAD responses so response guards evaluate the representation
+/// exactly as they do for GET; the real method is restored before rejection
+/// `after_proxy` hooks normalize the final wire response.
+pub(crate) const SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY: &str =
+    "ferrum:synthetic_response_method_override";
+
 /// Internal marker carried only on a response-decision context clone while an
 /// effective retry policy is active. It never reaches transaction metadata.
 const RETRY_RESPONSE_BUFFERING_METADATA_KEY: &str = "ferrum:retry_response_buffering";
@@ -13596,6 +13604,10 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) {
+    let original_method = ctx
+        .metadata
+        .remove(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY)
+        .map(|method_override| std::mem::replace(&mut ctx.method, method_override));
     let applied_synthetic_body_hooks = !plugins.is_empty()
         && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx);
     if applied_synthetic_body_hooks {
@@ -13628,6 +13640,9 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         // The two requirements directly conflict; we keep the one-shot guarantee
         // and accept the minor body-transform divergence on the synthetic path.
         apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
+    }
+    if let Some(original_method) = original_method {
+        ctx.method = original_method;
     }
     // Apply the after_proxy reject hooks exactly once, over the final response
     // (the synthetic 2xx or the body-rejection response produced above), so
@@ -29693,6 +29708,8 @@ mod tests {
 
     struct SyntheticNormalizationProbePlugin;
 
+    struct HeadSkippingSyntheticGuardPlugin;
+
     struct RejectHeaderPlugin;
 
     struct ReplaceRejectPlugin;
@@ -29741,6 +29758,53 @@ mod tests {
             _response_headers: &HashMap<String, String>,
         ) -> Option<Vec<u8>> {
             Some(b"incorrectly-normalized".to_vec())
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for HeadSkippingSyntheticGuardPlugin {
+        fn name(&self) -> &str {
+            "head_skipping_synthetic_guard"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+            !ctx.method.eq_ignore_ascii_case("HEAD")
+        }
+
+        async fn on_response_body(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            _response_headers: &HashMap<String, String>,
+            _body: &[u8],
+        ) -> PluginResult {
+            ctx.metadata.insert(
+                "test:synthetic_body_method".to_string(),
+                ctx.method.clone(),
+            );
+            PluginResult::Reject {
+                status_code: 451,
+                body: "blocked synthetic representation".to_string(),
+                headers: HashMap::new(),
+            }
+        }
+
+        fn applies_after_proxy_on_reject(&self) -> bool {
+            true
+        }
+
+        async fn after_proxy(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            response_headers.insert("x-after-proxy-method".to_string(), ctx.method.clone());
+            PluginResult::Continue
         }
     }
 
@@ -30372,6 +30436,53 @@ mod tests {
 
         assert_eq!(response.http_status, StatusCode::OK);
         assert_eq!(response.body, body);
+    }
+
+    #[tokio::test]
+    async fn synthetic_head_representation_uses_get_guardrails_then_restores_head() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(HeadSkippingSyntheticGuardPlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "HEAD".to_string(),
+            "/api/specz".to_string(),
+        );
+        ctx.metadata.insert(
+            SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY.to_string(),
+            "GET".to_string(),
+        );
+        let mut status = 200;
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let mut body = br#"{"secret":"must be inspected"}"#.to_vec();
+
+        apply_reject_after_proxy_and_synthetic_body_hooks(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, 451);
+        assert_eq!(body, b"blocked synthetic representation");
+        assert_eq!(
+            ctx.metadata
+                .get("test:synthetic_body_method")
+                .map(String::as_str),
+            Some("GET")
+        );
+        assert_eq!(ctx.method, "HEAD");
+        assert_eq!(
+            headers.get("x-after-proxy-method").map(String::as_str),
+            Some("HEAD")
+        );
+        assert!(
+            !ctx.metadata
+                .contains_key(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY)
+        );
     }
 
     #[tokio::test]
