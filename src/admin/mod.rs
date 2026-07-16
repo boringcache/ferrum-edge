@@ -2889,13 +2889,19 @@ async fn persist_consumer_update(
         Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
             Ok(true) => {
                 let lost_generation = namespace_admission.generation();
+                if let Err(release_error) = admission.release_guard().await {
+                    error!(
+                        namespace = %consumer.namespace,
+                        %release_error,
+                        "Credential mTLS admission guard could not be released before namespace recovery"
+                    );
+                    return mtls_dns_admission_unavailable_response();
+                }
                 drop(namespace_admission);
                 match recover_late_credential_update(
                     db,
                     &consumer.namespace,
                     lost_generation,
-                    admission,
-                    mode,
                     &consumer,
                     previous,
                 )
@@ -2951,8 +2957,6 @@ async fn recover_late_credential_update(
     db: Arc<dyn DatabaseBackend>,
     namespace: &str,
     lost_generation: u64,
-    admission: &MtlsDnsAdmissionOperation,
-    mode: &BatchConfigWriteMode,
     written: &Consumer,
     previous: &Consumer,
 ) -> Result<bool, anyhow::Error> {
@@ -2961,27 +2965,35 @@ async fn recover_late_credential_update(
         return Ok(true);
     }
 
-    let compensation = admission.run_mutation(async {
+    let mut recovery_admission = MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace)
+        .await?;
+    let recovery_mode = BatchConfigWriteMode::GuardedAdmission {
+        guard_owner: recovery_admission.guard_owner().to_string(),
+    };
+    let recovery_operation = recovery_admission.operation();
+    let compensation = recovery_operation.run_mutation(async {
         if db
             .get_consumer(namespace, &written.id)
             .await?
             .is_some_and(|current| current.updated_at == written.updated_at)
-            && !db.update_consumer(previous, mode).await?
+            && !db.update_consumer(previous, &recovery_mode).await?
         {
             anyhow::bail!("late credential update compensation found no matching consumer");
         }
         Ok(())
     });
-    match recovery_guard
+    let completion = recovery_guard
         .run_to_completion_while_held(compensation)
-        .await?
-    {
+        .await;
+    let release_result = recovery_admission.release().await;
+    match completion? {
         crud::NamespaceConfigAdmissionCompletion::Held(result) => result?,
         crud::NamespaceConfigAdmissionCompletion::Lost { result, error } => {
             result?;
             return Err(error);
         }
     }
+    release_result?;
     Ok(false)
 }
 
@@ -3012,13 +3024,27 @@ impl MtlsDnsAdmissionMutationState {
 
 #[derive(Clone)]
 struct MtlsDnsAdmissionOperation {
+    db: Arc<dyn DatabaseBackend>,
+    namespace: String,
     guard_owner: String,
     mutation_state: Arc<AtomicU8>,
+    released: Arc<AtomicBool>,
 }
 
 impl MtlsDnsAdmissionOperation {
     fn guard_owner(&self) -> &str {
         &self.guard_owner
+    }
+
+    async fn release_guard(&self) -> Result<(), anyhow::Error> {
+        if self.released.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.db
+            .release_mtls_dns_admission_guard(&self.namespace, &self.guard_owner)
+            .await?;
+        self.released.store(true, Ordering::Release);
+        Ok(())
     }
 
     async fn run_mutation<T, F>(&self, mutation: F) -> T
@@ -3043,6 +3069,7 @@ struct MtlsDnsAdmissionGuardLifecycle {
     namespace: String,
     guard_owner: String,
     mutation_state: Arc<AtomicU8>,
+    released: Arc<AtomicBool>,
     armed: bool,
 }
 
@@ -3074,14 +3101,18 @@ impl MtlsDnsAdmissionGuardLifecycle {
             mutation_state: Arc::new(AtomicU8::new(
                 MtlsDnsAdmissionMutationState::NotStarted as u8,
             )),
+            released: Arc::new(AtomicBool::new(false)),
             armed: true,
         }
     }
 
     fn operation(&self) -> MtlsDnsAdmissionOperation {
         MtlsDnsAdmissionOperation {
+            db: self.db.clone(),
+            namespace: self.namespace.clone(),
             guard_owner: self.guard_owner.clone(),
             mutation_state: self.mutation_state.clone(),
+            released: self.released.clone(),
         }
     }
 
@@ -3097,11 +3128,16 @@ impl MtlsDnsAdmissionGuardLifecycle {
     }
 
     async fn release(&mut self) -> Result<(), anyhow::Error> {
+        if self.released.load(Ordering::Acquire) {
+            self.armed = false;
+            return Ok(());
+        }
         let result = self
             .db
             .release_mtls_dns_admission_guard(&self.namespace, &self.guard_owner)
             .await;
         if result.is_ok() {
+            self.released.store(true, Ordering::Release);
             self.armed = false;
         }
         result
@@ -3110,7 +3146,7 @@ impl MtlsDnsAdmissionGuardLifecycle {
 
 impl Drop for MtlsDnsAdmissionGuardLifecycle {
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.armed || self.released.load(Ordering::Acquire) {
             return;
         }
         let state =
@@ -4826,9 +4862,7 @@ async fn handle_batch_create(
                 plugin_config.id, plugin_config.plugin_name
             ));
         }
-        if crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(
-            plugin_config,
-        ) {
+        if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin_config) {
             if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
                 &plugin_config.plugin_name,
                 &plugin_config.config,
@@ -5965,6 +5999,17 @@ async fn handle_restore(
             "Restore: namespace admission was lost during clear; reacquiring for recovery"
         );
         let lost_generation = namespace_config_admission_guard.generation();
+        if let Err(release_error) = restore_guard.release().await {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": format!(
+                        "Config admission was lost during restore clear and the restore guard could not be released before recovery: {release_error}"
+                    ),
+                    "restore_errors": [error.to_string()],
+                }),
+            ));
+        }
         drop(namespace_config_admission_guard);
         namespace_config_admission_guard = match crud::lock_namespace_config_admission(
             db.clone(),
@@ -5995,6 +6040,20 @@ async fn handle_restore(
                 }),
             ));
         }
+        restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(recovery_error) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Config admission was reacquired after restore clear, but the restore guard could not be reacquired: {recovery_error}"
+                        ),
+                        "restore_errors": [error.to_string()],
+                    }),
+                ));
+            }
+        };
         if delete_result.is_ok() {
             let rollback = finish_failed_restore(
                 state,
@@ -6142,6 +6201,17 @@ async fn handle_restore(
                 format!("namespace admission was lost during restore import: {error}"),
             );
             let lost_generation = namespace_config_admission_guard.generation();
+            if let Err(release_error) = restore_guard.release().await {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Config admission was lost during restore import and the restore guard could not be released before rollback: {release_error}"
+                        ),
+                        "restore_errors": errors,
+                    }),
+                ));
+            }
             drop(namespace_config_admission_guard);
             let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
                 .await
@@ -6169,6 +6239,21 @@ async fn handle_restore(
                     }),
                 ));
             }
+            restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await
+            {
+                Ok(guard) => guard,
+                Err(rollback_error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was reacquired after restore import, but the restore guard could not be reacquired: {rollback_error}"
+                            ),
+                            "restore_errors": errors,
+                        }),
+                    ));
+                }
+            };
             let rollback = finish_failed_restore(
                 state,
                 db.clone(),

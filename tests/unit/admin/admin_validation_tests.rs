@@ -59,6 +59,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("run_to_completion_while_held"));
     assert!(crud_source.contains("NamespaceConfigAdmissionCompletion::Lost"));
     assert!(crud_source.contains("immediately_succeeds_generation"));
+    assert!(crud_source.contains("SKIP_LATE_RESTORATION_AFTER_INTERVENING_WRITE"));
+    assert!(crud_source.contains("mark_mtls_dns_admission_unavailable(anyhow::anyhow!("));
     assert!(crud_source.contains("late_create_compensation_safe("));
     assert!(crud_source.contains("late plugin delete compensation could not restore proxy"));
     assert!(crud_source.contains("late_delete_api_spec_snapshot("));
@@ -123,6 +125,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "every credential read/modify/write endpoint must take namespace admission"
     );
     assert!(batch_source.contains("async fn recover_late_credential_update("));
+    assert!(batch_source.contains("async fn release_guard(&self)"));
+    assert!(batch_source.contains("participates_in_config_graph(plugin_config)"));
     assert!(batch_source.contains("admission.run_mutation(db.update_consumer(&consumer, mode))"));
     assert!(
         batch_source.contains("late credential update compensation found no matching consumer")

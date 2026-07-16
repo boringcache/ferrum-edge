@@ -130,6 +130,7 @@ async fn run_api_spec_persistence_while_held<T, F, C>(
     guard: crate::admin::crud::NamespaceConfigAdmissionGuard,
     future: F,
     compensation: C,
+    compensate_after_intervening_write: bool,
 ) -> Result<T, ApiSpecError>
 where
     F: Future<Output = Result<T, anyhow::Error>>,
@@ -157,10 +158,13 @@ where
                             %recovery_error,
                             "Failed to reacquire API-spec namespace admission after a late write"
                         );
-                        ApiSpecError::NoDatabase
+                        ApiSpecError::AdmissionUnavailable(recovery_error.to_string())
                     })?;
                     if recovery_guard.immediately_succeeds_generation(lost_generation) {
                         return Ok(result);
+                    }
+                    if !compensate_after_intervening_write {
+                        return Err(ApiSpecError::AdmissionUnavailable(error.to_string()));
                     }
                     match recovery_guard
                         .run_to_completion_while_held(compensation)
@@ -192,7 +196,7 @@ where
                             );
                         }
                     }
-                    Err(ApiSpecError::NoDatabase)
+                    Err(ApiSpecError::AdmissionUnavailable(error.to_string()))
                 }
                 Err(error) => Err(classify_db_error(error)),
             }
@@ -202,7 +206,7 @@ where
                 %error,
                 "API-spec persistence could not start with namespace config admission held"
             );
-            Err(ApiSpecError::NoDatabase)
+            Err(ApiSpecError::AdmissionUnavailable(error.to_string()))
         }
     }
 }
@@ -2647,6 +2651,7 @@ pub async fn handle_post_api_spec(
         _namespace_config_admission_guard,
         db.submit_api_spec_bundle(&bundle, &spec),
         compensate_late_api_spec_create(db.clone(), bundle.clone(), spec.clone()),
+        true,
     )
     .await
     {
@@ -2863,6 +2868,7 @@ pub async fn handle_put_api_spec(
             previous_bundle,
             existing_spec.clone(),
         ),
+        false,
     )
     .await
     {
@@ -3149,6 +3155,7 @@ pub async fn handle_delete_api_spec(
             existing.clone(),
             additional_plugins,
         ),
+        false,
     )
     .await
     {

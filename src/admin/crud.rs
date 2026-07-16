@@ -19,7 +19,7 @@ use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
     PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
-    is_mtls_dns_identity_conflict,
+    is_mtls_dns_identity_conflict, mark_mtls_dns_admission_unavailable,
 };
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
@@ -495,6 +495,13 @@ async fn recover_late_resource_write<R: AdminResource>(
     let recovery_guard = lock_namespace_config_admission(db.clone(), namespace).await?;
     if recovery_guard.immediately_succeeds_generation(lost_generation) {
         return Ok(true);
+    }
+    if matches!(
+        &action,
+        LateResourceWrite::Update { .. } | LateResourceWrite::Delete { .. }
+    ) && R::SKIP_LATE_RESTORATION_AFTER_INTERVENING_WRITE
+    {
+        return Ok(false);
     }
 
     let compensation = async {
@@ -1048,6 +1055,7 @@ pub(crate) trait AdminResource:
     const NOT_FOUND_MESSAGE: &'static str;
     const ID_CONFLICT_LABEL: &'static str = Self::RESOURCE_LABEL;
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = false;
+    const SKIP_LATE_RESTORATION_AFTER_INTERVENING_WRITE: bool = false;
 
     fn id(&self) -> &str;
     fn set_id(&mut self, id: String);
@@ -1450,12 +1458,12 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                 .await
                 {
                     Ok(true) => Ok(true),
-                    Ok(false) => Err(anyhow::anyhow!(
+                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                         "namespace config admission was lost during delete; the late write was compensated: {error}"
-                    )),
-                    Err(recovery_error) => Err(anyhow::anyhow!(
+                    ))),
+                    Err(recovery_error) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                         "namespace config admission was lost during delete and recovery failed: {recovery_error}; original error: {error}"
-                    )),
+                    ))),
                 }
             }
             other => other,
@@ -2632,6 +2640,7 @@ impl AdminResource for PluginConfig {
     const VALIDATION_ERROR_LABEL: &'static str = "plugin config fields";
     const NOT_FOUND_MESSAGE: &'static str = "Plugin config not found";
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
+    const SKIP_LATE_RESTORATION_AFTER_INTERVENING_WRITE: bool = true;
     const ID_CONFLICT_LABEL: &'static str = "PluginConfig";
 
     fn id(&self) -> &str {
@@ -2861,7 +2870,7 @@ impl AdminResource for PluginConfig {
             }
         }
 
-        if crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(resource) {
+        if crate::plugins::transaction_log_schema::participates_in_config_graph(resource) {
             if let Err(error) = crate::plugins::validate_plugin_config_policy_only(
                 &resource.plugin_name,
                 &resource.config,
@@ -4050,12 +4059,12 @@ async fn handle_write<R: AdminResource>(
                         .await
                         {
                             Ok(true) => Ok(()),
-                            Ok(false) => Err(anyhow::anyhow!(
+                            Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                                 "namespace config admission was lost during create; the late write was compensated: {error}"
-                            )),
-                            Err(recovery_error) => Err(anyhow::anyhow!(
+                            ))),
+                            Err(recovery_error) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                                 "namespace config admission was lost during create and recovery failed: {recovery_error}; original error: {error}"
-                            )),
+                            ))),
                         }
                     }
                     Err(persistence_error) => Err(persistence_error),
@@ -4104,17 +4113,17 @@ async fn handle_write<R: AdminResource>(
                         Ok(true) => {}
                         Ok(false) => {
                             return Ok(R::map_persist_db_error(
-                                &anyhow::anyhow!(
+                                &mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                                     "namespace config admission was lost during update; the late write was compensated: {error}"
-                                ),
+                                )),
                                 action,
                             ));
                         }
                         Err(recovery_error) => {
                             return Ok(R::map_persist_db_error(
-                                &anyhow::anyhow!(
+                                &mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                                     "namespace config admission was lost during update and recovery failed: {recovery_error}; original error: {error}"
-                                ),
+                                )),
                                 action,
                             ));
                         }
