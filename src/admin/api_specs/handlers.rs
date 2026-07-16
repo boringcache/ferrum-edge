@@ -281,9 +281,9 @@ async fn compensate_late_api_spec_create(
             errors.join("; ")
         ),
         Err(crate::admin::crud::AfterValidateError::Db(error)) => return Err(error),
-        Err(crate::admin::crud::AfterValidateError::Response(_)) => anyhow::bail!(
-            "late API-spec create compensation validation returned an HTTP response"
-        ),
+        Err(crate::admin::crud::AfterValidateError::Response(_)) => {
+            anyhow::bail!("late API-spec create compensation validation returned an HTTP response")
+        }
     }
     if !late_api_spec_create_compensation_safe(db.as_ref(), &bundle, &spec).await? {
         anyhow::bail!(

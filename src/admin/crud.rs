@@ -410,10 +410,7 @@ pub(crate) async fn lock_namespace_config_admission(
         let _acquire_task = tokio::spawn(async move {
             let attempt_started_at = Instant::now();
             let result = acquire_db
-                .try_acquire_namespace_config_admission_lease(
-                    &acquire_namespace,
-                    &acquire_owner,
-                )
+                .try_acquire_namespace_config_admission_lease(&acquire_namespace, &acquire_owner)
                 .await;
 
             // An error can be an ambiguous datastore outcome. Make one
