@@ -1472,10 +1472,7 @@ async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
                     headers.get("content-length").map(String::as_str),
                     Some("76")
                 );
-                assert_eq!(
-                    headers.get("retry-after").map(String::as_str),
-                    Some("1")
-                );
+                assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
             }
             other => panic!("unexpected status {other}"),
         }
