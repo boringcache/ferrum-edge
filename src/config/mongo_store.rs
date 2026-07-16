@@ -10636,8 +10636,11 @@ mod inner {
                 .build();
             let client = mongodb::Client::with_options(opts.clone())
                 .expect("Client::with_options should accept empty hosts");
+            let lease_client = mongodb::Client::with_options(opts)
+                .expect("lease Client::with_options should accept empty hosts");
             let db = client.database(&settings.database_name);
-            let connection = MongoConnectionBundle::new(client, db, opts, Vec::new());
+            let connection =
+                MongoConnectionBundle::new(client, db, lease_client, Vec::new());
             MongoStore {
                 connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
                 conn_settings: settings,
@@ -10733,6 +10736,7 @@ mod inner {
                 .hosts(vec![])
                 .build();
             let new_client = mongodb::Client::with_options(opts.clone()).unwrap();
+            let new_lease_client = mongodb::Client::with_options(opts).unwrap();
             let new_db = new_client.database("after_failover");
 
             // Confirm the accessor sees the original namespace before the swap.
@@ -10744,7 +10748,7 @@ mod inner {
                 .store(std::sync::Arc::new(MongoConnectionBundle::new(
                     new_client,
                     new_db,
-                    opts,
+                    new_lease_client,
                     Vec::new(),
                 )));
 
@@ -10867,13 +10871,15 @@ mod inner {
                 .hosts(vec![])
                 .build();
             let old_client = mongodb::Client::with_options(old_opts.clone()).expect("old client");
+            let old_lease_client =
+                mongodb::Client::with_options(old_opts).expect("old lease client");
             let old_db = old_client.database("old_with_temp");
             store
                 .connection
                 .store(std::sync::Arc::new(MongoConnectionBundle::new(
                     old_client,
                     old_db,
-                    old_opts,
+                    old_lease_client,
                     vec![temp_path],
                 )));
 
@@ -10882,13 +10888,15 @@ mod inner {
                 .hosts(vec![])
                 .build();
             let new_client = mongodb::Client::with_options(new_opts.clone()).expect("new client");
+            let new_lease_client =
+                mongodb::Client::with_options(new_opts).expect("new lease client");
             let new_db = new_client.database("new_without_temp");
             store
                 .connection
                 .store(std::sync::Arc::new(MongoConnectionBundle::new(
                     new_client,
                     new_db,
-                    new_opts,
+                    new_lease_client,
                     Vec::new(),
                 )));
 
