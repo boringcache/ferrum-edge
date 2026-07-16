@@ -194,8 +194,9 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     let delete_persist = api_spec_source
         .find("persistence_db.delete_api_spec(&settlement_namespace, &persistence_id)")
         .expect("DELETE persistence");
-    let delete_validation = api_spec_source
+    let delete_validation = api_spec_source[delete_lock..]
         .find("validate_transaction_log_schema_api_spec_deletion_candidate(")
+        .map(|position| position + delete_lock)
         .expect("DELETE prospective graph validation");
     assert!(delete_lock < delete_validation);
     assert!(delete_validation < delete_persist);
