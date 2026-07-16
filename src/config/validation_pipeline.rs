@@ -1,5 +1,5 @@
 use crate::config::BackendEgressPolicy;
-use crate::config::types::GatewayConfig;
+use crate::config::types::{CountryMmdbValidationGeneration, GatewayConfig};
 use tracing::{error, warn};
 
 pub(crate) enum ValidationAction<'a> {
@@ -312,6 +312,7 @@ impl<'a> ValidationPipeline<'a> {
     pub(crate) fn run(self) -> Result<Vec<String>, anyhow::Error> {
         let ValidationPipeline { config, steps } = self;
         let mut collected_errors = Vec::new();
+        let mut country_mmdb_validation_generation = None;
 
         for step in steps {
             match step {
@@ -429,10 +430,14 @@ impl<'a> ValidationPipeline<'a> {
                     }
                 }
                 ValidationStep::PluginFileDependencies { action } => {
-                    let errors = config.validate_plugin_file_dependencies();
+                    let generation = CountryMmdbValidationGeneration::begin()
+                        .map_err(anyhow::Error::msg)?;
+                    let errors =
+                        config.validate_plugin_file_dependencies_for_generation(&generation);
                     if !errors.is_empty() {
                         handle_validation_errors(action, errors, &mut collected_errors)?;
                     }
+                    country_mmdb_validation_generation = Some(generation);
                 }
                 ValidationStep::StreamProxies { action } => {
                     if let Err(errors) = config.validate_stream_proxies() {
@@ -440,6 +445,10 @@ impl<'a> ValidationPipeline<'a> {
                     }
                 }
             }
+        }
+
+        if let Some(generation) = country_mmdb_validation_generation {
+            generation.commit();
         }
 
         Ok(collected_errors)

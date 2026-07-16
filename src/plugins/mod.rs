@@ -4436,6 +4436,9 @@ pub(crate) fn validate_plugin_config_with_http_client(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<(), String> {
+    if name == "geo_restriction" {
+        return geo_restriction::GeoRestriction::validate_config(config);
+    }
     if name == "oidc_relying_party" {
         screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
         return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);

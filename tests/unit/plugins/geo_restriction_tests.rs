@@ -1,11 +1,14 @@
 use base64::Engine;
 use chrono::Utc;
+use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::config::types::{
     GatewayConfig, MAX_COUNTRY_MMDB_SIZE_BYTES, PluginConfig, PluginScope, default_namespace,
     load_validated_country_mmdb, validate_mmdb_file,
 };
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
-use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
+use ferrum_edge::plugins::{
+    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, priority, validate_plugin_config,
+};
 use http::{HeaderMap, HeaderValue};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -68,6 +71,28 @@ fn replace_direct_country_with_unsupported_code(mut bytes: Vec<u8>) -> Vec<u8> {
     assert_eq!(country, Some("ZZ"));
     drop(reader);
 
+    bytes
+}
+
+fn replace_direct_country_with_supported_code(
+    mut bytes: Vec<u8>,
+    replacement: &[u8; 2],
+) -> Vec<u8> {
+    let mut replacements = 0;
+    for offset in 0..bytes.len().saturating_sub(1) {
+        if &bytes[offset..offset + 2] == b"SE" {
+            bytes[offset..offset + 2].copy_from_slice(replacement);
+            replacements += 1;
+        }
+    }
+    assert!(replacements > 0, "fixture contains the SE country code");
+
+    let reader = maxminddb::Reader::from_source(bytes.as_slice())
+        .expect("supported country-code replacement preserves MMDB structure");
+    reader
+        .verify()
+        .expect("supported country-code replacement preserves verification");
+    drop(reader);
     bytes
 }
 
@@ -638,6 +663,102 @@ fn validate_mmdb_file_rejects_oversized_sparse_file_before_reading() {
 }
 
 #[test]
+fn plugin_shape_validation_does_not_scan_node_local_mmdb() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("oversized.mmdb");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(MAX_COUNTRY_MMDB_SIZE_BYTES + 1).unwrap();
+    drop(file);
+    let config = json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["US"],
+        "on_lookup_failure": "deny"
+    });
+
+    assert!(
+        validate_plugin_config("geo_restriction", &config).is_ok(),
+        "generic plugin validation must remain shape-only for file dependencies"
+    );
+    assert!(
+        validate_mmdb_file("geo_restriction.db_path", path_text(&path)).is_err(),
+        "the mode-aware dependency stage must still enforce the MMDB bound"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_rereads_same_length_timestamp_preserving_replacement() {
+    let directory = TempDir::new().unwrap();
+    let valid = country_mmdb_bytes();
+    let replacement = replace_direct_country_with_unsupported_code(valid.clone());
+    assert_eq!(valid.len(), replacement.len());
+    let path = write_fixture(&directory, "country.mmdb", &valid);
+    let old_snapshot = load_validated_country_mmdb(path_text(&path)).unwrap();
+    let old_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    std::fs::write(&path, replacement).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old_modified))
+        .unwrap();
+
+    assert!(
+        load_validated_country_mmdb(path_text(&path)).is_err(),
+        "metadata-equivalent replacement must be re-digested on Windows"
+    );
+    assert_eq!(old_snapshot.metadata.database_type, "GeoIP2-Country");
+}
+
+#[test]
+fn rejected_config_generation_releases_mmdb_handoff() {
+    let directory = TempDir::new().unwrap();
+    let unique = replace_direct_country_with_supported_code(country_mmdb_bytes(), b"XK");
+    let path = write_fixture(&directory, "country-xk.mmdb", &unique);
+    let snapshot = load_validated_country_mmdb(path_text(&path)).unwrap();
+    assert_eq!(Arc::strong_count(&snapshot), 1);
+
+    let config_path = directory.path().join("rejected.json");
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "invalid-stream",
+            "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9000
+        }],
+        "consumers": [],
+        "plugin_configs": [{
+            "id": "geo",
+            "plugin_name": "geo_restriction",
+            "config": {
+                "db_path": path_text(&path),
+                "allow_countries": ["XK"],
+                "on_lookup_failure": "deny"
+            },
+            "scope": "global",
+            "enabled": true
+        }]
+    });
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let error = load_config_from_file(
+        path_text(&config_path),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("the stream validation stage must reject this generation");
+    assert!(error.to_string().contains("stream proxy"));
+    assert_eq!(
+        Arc::strong_count(&snapshot),
+        1,
+        "rejected generation must release its validation handoff"
+    );
+}
+
+#[test]
 fn validated_mmdb_snapshots_are_shared_across_live_instances() {
     let directory = TempDir::new().unwrap();
     let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
@@ -717,15 +838,29 @@ fn validate_mmdb_file_rejects_partial_corruption_after_open() {
 fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
     let source = include_str!("../../../src/plugins/geo_restriction.rs");
     let config_source = include_str!("../../../src/config/types.rs");
+    let plugin_cache_source = include_str!("../../../src/plugin_cache.rs");
+    let validation_source = include_str!("../../../src/config/validation_pipeline.rs");
+    let lookup_source = source
+        .split("fn lookup_country")
+        .nth(1)
+        .and_then(|tail| tail.split("fn check_ip").next())
+        .expect("lookup_country source section");
     assert!(!source.contains("open_mmap"));
     assert!(!source.contains("Reader<Mmap>"));
     assert!(!source.contains("HashSet<String>"));
     assert!(!source.contains("Option<String>"));
     assert!(source.contains("decode_path(&maxminddb::path!"));
     assert!(source.contains("CountrySet"));
+    assert!(!lookup_source.contains("is_supported"));
     assert!(config_source.contains("try_reserve_exact(initial_capacity)"));
     assert!(config_source.contains("validation_handoffs"));
-    assert!(config_source.contains("retain_for_plugin_construction"));
+    assert!(config_source.contains("validation_handoff_bytes"));
+    assert!(config_source.contains("CountryMmdbValidationGeneration"));
+    assert!(config_source.contains("abort_validation_generation"));
+    assert!(config_source.contains("COUNTRY_MMDB_FILE_VERSION_IS_CONTENT_SAFE"));
+    assert!(config_source.contains("MAX_COUNTRY_MMDB_SIZE_BYTES"));
+    assert!(plugin_cache_source.contains("CountryMmdbLoadSession::claim"));
+    assert!(validation_source.contains("generation.commit()"));
 }
 
 // --- validate_plugin_file_dependencies tests ---

@@ -17,10 +17,11 @@
 
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::types::{GatewayConfig, PluginScope};
+use crate::config::types::{CountryMmdbLoadSession, GatewayConfig, PluginScope};
 use tracing::{error, warn};
 
 use crate::adaptive_concurrency::{
@@ -637,6 +638,7 @@ fn try_create_plugin(
     pc: &PluginConfig,
     gateway_config: &GatewayConfig,
     http_client: &PluginHttpClient,
+    country_mmdb_load_session: &CountryMmdbLoadSession,
     current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
     staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
@@ -648,6 +650,12 @@ fn try_create_plugin(
             current_adaptive_states,
             staged_adaptive_states,
         )
+    } else if pc.plugin_name == "geo_restriction" {
+        crate::plugins::geo_restriction::GeoRestriction::new_with_load_session(
+            &pc.config,
+            country_mmdb_load_session,
+        )
+        .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else {
         create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone())
     };
@@ -704,6 +712,16 @@ fn try_create_plugin(
             }
         }
     }
+}
+
+fn country_mmdb_paths(config: &GatewayConfig) -> HashSet<PathBuf> {
+    config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.enabled && plugin.plugin_name == "geo_restriction")
+        .filter_map(|plugin| plugin.config.get("db_path").and_then(|path| path.as_str()))
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// A list of plugins shared across requests via Arc.
@@ -1816,6 +1834,7 @@ pub(crate) fn validate_hmac_request_transform_candidate(
     let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+    let country_mmdb_load_session = CountryMmdbLoadSession::default();
 
     for plugin_config in &config.plugin_configs {
         if !plugin_config.enabled
@@ -1828,6 +1847,7 @@ pub(crate) fn validate_hmac_request_transform_candidate(
             plugin_config,
             config,
             http_client,
+            &country_mmdb_load_session,
             &current_adaptive_states,
             &mut staged_adaptive_states,
         ) {
@@ -2678,6 +2698,8 @@ impl PluginCache {
         rebuild_globals: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
+        let country_mmdb_load_session =
+            CountryMmdbLoadSession::claim(&country_mmdb_paths(config))?;
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
@@ -2720,6 +2742,7 @@ impl PluginCache {
                     pc,
                     config,
                     &self.http_client,
+                    &country_mmdb_load_session,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
                 ) {
@@ -2744,6 +2767,7 @@ impl PluginCache {
                         pc,
                         config,
                         &self.http_client,
+                        &country_mmdb_load_session,
                         &current.adaptive_concurrency_instances,
                         &mut adaptive_concurrency_instances,
                     ) {
@@ -2785,6 +2809,7 @@ impl PluginCache {
                     pc,
                     config,
                     &self.http_client,
+                    &country_mmdb_load_session,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
                 ) {
@@ -2893,6 +2918,7 @@ impl PluginCache {
                             pc,
                             config,
                             &self.http_client,
+                            &country_mmdb_load_session,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
                         ) {
@@ -2959,6 +2985,7 @@ impl PluginCache {
                             pc,
                             config,
                             &self.http_client,
+                            &country_mmdb_load_session,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
                         ) {
@@ -3334,6 +3361,8 @@ impl PluginCache {
         ),
         String,
     > {
+        let country_mmdb_load_session =
+            CountryMmdbLoadSession::claim(&country_mmdb_paths(config))?;
         // Step 1: Create all enabled global plugins (shared across proxies)
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
         let mut adaptive_concurrency_instances =
@@ -3374,6 +3403,7 @@ impl PluginCache {
                 pc,
                 config,
                 http_client,
+                &country_mmdb_load_session,
                 current_adaptive_states,
                 &mut adaptive_concurrency_instances,
             ) {
@@ -3397,6 +3427,7 @@ impl PluginCache {
                     pc,
                     config,
                     http_client,
+                    &country_mmdb_load_session,
                     current_adaptive_states,
                     &mut adaptive_concurrency_instances,
                 ) {
@@ -3455,6 +3486,7 @@ impl PluginCache {
                             pc,
                             config,
                             http_client,
+                            &country_mmdb_load_session,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
                         ) {
@@ -3497,6 +3529,7 @@ impl PluginCache {
                             pc,
                             config,
                             http_client,
+                            &country_mmdb_load_session,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
                         ) {
