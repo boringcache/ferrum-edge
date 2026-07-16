@@ -225,6 +225,12 @@ enum LocalCompletionAction {
     Stale,
 }
 
+struct LocalCompletionCandidate<'a> {
+    status_code: u16,
+    headers: HashMap<String, String>,
+    body: &'a [u8],
+}
+
 enum CompletionSkipReason {
     EntryTooLarge {
         entry_size: usize,
@@ -896,12 +902,15 @@ impl RequestDeduplication {
         key: &str,
         fingerprint: &str,
         owner_token: &str,
-        status_code: u16,
-        headers: HashMap<String, String>,
-        body: &[u8],
+        candidate: LocalCompletionCandidate<'_>,
         retain_inflight_on_skip: bool,
         retain_inflight_on_eviction: bool,
     ) -> LocalCompletionAction {
+        let LocalCompletionCandidate {
+            status_code,
+            headers,
+            body,
+        } = candidate;
         let entry_size = cached_response_retained_size(body.len(), &headers);
         let _guard = self.accounting_guard();
         let mut entry = match self.local_cache.entry(key.to_string()) {
@@ -2049,9 +2058,11 @@ impl Plugin for RequestDeduplication {
             &key,
             &fingerprint,
             &local_inflight_owner_token,
-            response_status,
-            safe_headers,
-            body,
+            LocalCompletionCandidate {
+                status_code: response_status,
+                headers: safe_headers,
+                body,
+            },
             retain_inflight_on_storage_skip,
             retain_inflight_on_storage_skip || redis_lock_token.is_some(),
         ) {
@@ -2119,10 +2130,10 @@ impl Plugin for RequestDeduplication {
                     }
                     return PluginResult::Continue;
                 }
-                if !retain_inflight_on_storage_skip {
-                    if let Some(token) = redis_lock_token.as_deref() {
-                        self.redis_release_inflight(&key, &fingerprint, token).await;
-                    }
+                if !retain_inflight_on_storage_skip
+                    && let Some(token) = redis_lock_token.as_deref()
+                {
+                    self.redis_release_inflight(&key, &fingerprint, token).await;
                 }
                 return PluginResult::Continue;
             }
