@@ -1149,23 +1149,16 @@ impl FunctionDestination {
             // reference check so `#secret/value` and
             // `#leak=secret/value` cannot expose a signed query value (and the
             // same applies to a configured signed path).
-            if self
-                .sensitive_path
-                .as_deref()
-                .is_some_and(|path| {
-                    // Path-edge slashes are structural delimiters, unlike the
-                    // slash bytes retained in protected query scalars. Omit
-                    // them only for this scalar-fragment path comparison so
-                    // both `#signed/trigger` and `#/signed/trigger` remain
-                    // governed without weakening query-scalar matching.
-                    uri_component_contains_sequence(
-                        &decoded_fragment.value,
-                        path.trim_matches('/'),
-                    )
-                })
-                || self
-                    .sensitive_query_scalars()
-                    .any(|value| uri_component_contains_sequence(&decoded_fragment.value, value))
+            if self.sensitive_path.as_deref().is_some_and(|path| {
+                // Path-edge slashes are structural delimiters, unlike the
+                // slash bytes retained in protected query scalars. Omit
+                // them only for this scalar-fragment path comparison so
+                // both `#signed/trigger` and `#/signed/trigger` remain
+                // governed without weakening query-scalar matching.
+                uri_component_contains_sequence(&decoded_fragment.value, path.trim_matches('/'))
+            }) || self
+                .sensitive_query_scalars()
+                .any(|value| uri_component_contains_sequence(&decoded_fragment.value, value))
             {
                 return true;
             }
