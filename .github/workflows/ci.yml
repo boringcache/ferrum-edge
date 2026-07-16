@@ -2662,6 +2662,15 @@ jobs:
 
       - uses: ./.github/actions/setup-fast-linker
 
+      - name: Cache eBPF Rust dependencies and compiler outputs
+        if: steps.changes.outputs.ebpf_changed == 'true'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "ci-ebpf-programs"
+          workspaces: |
+            ebpf -> target
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+
       - name: Install bpf-linker
         run: cargo install bpf-linker --locked
 
@@ -3050,10 +3059,41 @@ jobs:
               run_benchmark=false
               reason="No performance-sensitive paths changed."
 
-              if grep -Eq '^(src/|custom_plugins/|vendor/|ebpf/|tests/performance/|build\.rs$|ferrum\.conf$|proto/|Cargo\.toml$|Cargo\.lock$|\.cargo/|rust-toolchain\.toml$|\.github/workflows/ci\.yml$|\.github/actions/)' <<<"${changed_files}"; then
-                run_benchmark=true
-                reason="Performance-sensitive paths changed."
-              fi
+              # This smoke benchmark drives plain HTTP/1.1 through a file-mode
+              # proxy route. Gate it on shared/deep proxy hot paths, file-mode
+              # startup, and dependency/build surfaces that can affect that
+              # measurement. Individual plugin implementations, admin,
+              # secrets, and unrelated operating modes are not observable here
+              # and should not pay for a 17-minute release build.
+              while IFS= read -r path; do
+                # Every top-level src/*.rs module is shared runtime
+                # infrastructure (request_epoch, overload, load balancing,
+                # pooling, adaptive concurrency, metrics — see the CLAUDE.md
+                # source layout) consumed on or beside the measured request
+                # path; gate the whole tier instead of enumerating files.
+                # `case` globs match `/`, so test the tier explicitly:
+                # starts with src/, ends with .rs, no deeper directory.
+                rest="${path#src/}"
+                if [ "${rest}" != "${path}" ] \
+                  && [ "${rest%.rs}" != "${rest}" ] \
+                  && [ "${rest#*/}" = "${rest}" ]; then
+                  run_benchmark=true
+                  reason="Performance-sensitive paths changed."
+                  break
+                fi
+                case "${path}" in
+                  src/proxy/*|src/http3/*|src/dns/*|src/pool/*|\
+                  src/config/*|src/plugins/mod.rs|\
+                  src/modes/file.rs|src/modes/mod.rs|\
+                  vendor/*|ebpf/*|tests/performance/*|proto/*|.cargo/*|.github/actions/*|\
+                  build.rs|ferrum.conf|Cargo.toml|Cargo.lock|rust-toolchain.toml|\
+                  .github/workflows/ci.yml)
+                    run_benchmark=true
+                    reason="Performance-sensitive paths changed."
+                    break
+                    ;;
+                esac
+              done <<<"${changed_files}"
             else
               run_benchmark=true
               reason="Could not diff against origin/${BASE_REF}; running benchmark to be safe."
@@ -3172,7 +3212,11 @@ jobs:
             {
               echo "Skipped expensive benchmark: ${REASON}"
               echo ""
-              echo "Relevant paths: \`src/**\`, \`custom_plugins/**\`, \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`build.rs\`, \`ferrum.conf\`, \`proto/**\`, \`Cargo.toml\`, \`Cargo.lock\`, \`.cargo/**\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, \`.github/actions/**\`."
+              echo "Relevant paths:"
+              echo "- Shared runtime infrastructure: every top-level \`src/*.rs\` module (request epoch, overload, load balancing, pooling, adaptive concurrency, metrics, startup — all consumed on or beside the measured request path)."
+              echo "- Proxy and connection hot paths: \`src/proxy/**\`, \`src/http3/**\`, \`src/dns/**\`, and \`src/pool/**\`."
+              echo "- File-mode gateway path: \`src/config/**\` (env/conf precedence, file loading, validation, pool tuning, and domain types all feed the measured startup and request flow), \`src/plugins/mod.rs\`, \`src/modes/file.rs\`, and \`src/modes/mod.rs\`."
+              echo "- Build and dependency graph: \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`proto/**\`, \`.cargo/**\`, \`build.rs\`, \`ferrum.conf\`, \`Cargo.toml\`, \`Cargo.lock\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, and \`.github/actions/**\`."
               echo ""
               echo "Changed files:"
               echo '```'
@@ -3274,6 +3318,7 @@ jobs:
         continue-on-error: true
         with:
           shared-key: "build-${{ matrix.target }}"
+          cache-directories: ${{ github.workspace }}/.cache/sccache
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
