@@ -88,7 +88,7 @@ const HARD_MAX_SCAN_BYTES: usize = 1_048_576;
 /// Maximum aggregate eligible prompt bytes considered in one body.
 const MAX_TARGET_TEXT_BYTES: usize = 524_288;
 /// Largest meaningful per-field token floor under the eligible-text ceiling.
-const MAX_MIN_CONTENT_TOKENS: usize = (MAX_TARGET_TEXT_BYTES + 3) / 4;
+const MAX_MIN_CONTENT_TOKENS: usize = MAX_TARGET_TEXT_BYTES.div_ceil(4);
 /// Maximum aggregate whitespace-delimited units admitted before token allocation.
 const MAX_TOKEN_UNITS: usize = 32_768;
 /// Maximum independently rewritable text fields in one request body.
@@ -1100,11 +1100,9 @@ fn decode_json_string_ascii(body: &[u8], start: usize) -> Option<(Option<u8>, us
         b'u' => {
             let digits = body.get(start + 2..start + 6)?;
             let scalar = digits.iter().try_fold(0u16, |value, byte| {
-                Some(
-                    value
-                        .checked_mul(16)?
-                        .checked_add(hex_digit(*byte)? as u16)?,
-                )
+                value
+                    .checked_mul(16)?
+                    .checked_add(hex_digit(*byte)? as u16)
             })?;
             return Some((
                 (scalar <= u8::MAX as u16).then_some(scalar as u8),
