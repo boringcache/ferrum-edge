@@ -166,6 +166,7 @@ fn make_tcp_stream_context(ip: &str) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: ip.to_string(),
         direct_client_ip: ip.to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "p1".to_string(),
         proxy_name: Some("Proxy p1".to_string()),
         listen_port: 15432,

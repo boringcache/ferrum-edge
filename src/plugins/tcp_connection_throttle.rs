@@ -36,6 +36,8 @@ struct CleanupTask {
 /// Stable accounting state shared by compatible plugin-cache generations.
 pub(crate) struct TcpConnectionThrottleState {
     active_counts: DashMap<String, Arc<ConnectionCounter>>,
+    // Retained for the public construction-path normalization assertion.
+    #[allow(dead_code)]
     shard_amount: usize,
     cleanup_task: Mutex<CleanupTask>,
 }
@@ -165,6 +167,9 @@ pub struct TcpConnectionThrottle {
 }
 
 impl TcpConnectionThrottle {
+    // Kept as the standalone plugin constructor; production cache builds use
+    // `new_with_pool_shard_amount` to carry the normalized runtime setting.
+    #[allow(dead_code)]
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::new_with_pool_shard_amount(config, 0)
     }
@@ -203,6 +208,9 @@ impl TcpConnectionThrottle {
         self.cleanup_interval_seconds
     }
 
+    // Exposes the construction result for focused external validation without
+    // enabling DashMap's raw shard API in production.
+    #[allow(dead_code)]
     pub fn shard_amount(&self) -> usize {
         self.state.shard_amount
     }
