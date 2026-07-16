@@ -3018,13 +3018,10 @@ async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
     use ferrum_edge::plugins::available_plugins;
     use ferrum_edge::plugins::create_plugin;
 
-    // Every non-WS-frame built-in plugin must return false for requires_ws_frame_hooks().
-    // This is the zero-overhead guarantee — only explicit WS frame plugins opt in.
-    const WS_FRAME_PLUGINS: &[&str] = &[
-        "ws_message_size_limiting",
-        "ws_frame_logging",
-        "ws_rate_limiting",
-    ];
+    // Every non-message-hook built-in plugin must return false for
+    // requires_ws_frame_hooks(). Parser-only policies use the independent
+    // requires_websocket_framing() aggregate.
+    const WS_FRAME_PLUGINS: &[&str] = &["ws_frame_logging", "ws_rate_limiting"];
 
     for name in available_plugins() {
         if WS_FRAME_PLUGINS.contains(&name) {
@@ -3223,7 +3220,8 @@ fn test_ws_frame_direction_debug_and_equality() {
 
 #[test]
 fn test_plugin_cache_requires_ws_frame_hooks_true_with_ws_size_plugin() {
-    // When a WS frame plugin is assigned to a proxy, requires_ws_frame_hooks must be TRUE.
+    // A parser-policy-only plugin must select the framed relay even though it
+    // does not opt into the post-reassembly message hook.
     let config = make_config(
         vec![make_proxy("p1", "/ws", vec!["ws1"])],
         vec![make_plugin_config(
@@ -3237,7 +3235,7 @@ fn test_plugin_cache_requires_ws_frame_hooks_true_with_ws_size_plugin() {
     let cache = PluginCache::new(&config).unwrap();
     assert!(
         cache.requires_ws_frame_hooks("p1"),
-        "requires_ws_frame_hooks must be TRUE when ws_message_size_limiting is attached"
+        "parser size policy must select the framed relay"
     );
 }
 

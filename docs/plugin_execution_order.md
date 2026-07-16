@@ -330,7 +330,10 @@ Plugins execute in priority order (lower number runs first):
 
 ### Zero-Overhead Opt-In
 
-When no plugins on a proxy return `true` from `requires_ws_frame_hooks()`, the frame forwarding loop has zero overhead — frames are forwarded directly without entering the plugin pipeline. The `requires_ws_frame_hooks` flag is pre-computed per-proxy in `PluginCache` at config reload time.
+When no plugin contributes parser policy or returns `true` from
+`requires_ws_frame_hooks()`, tunnel mode may use raw copy and the parsed relay
+otherwise forwards messages without entering plugin hooks. This aggregate
+framing requirement is pre-computed per proxy in `PluginCache` at reload time.
 
 ## UDP Datagram Lifecycle (`on_udp_datagram`)
 

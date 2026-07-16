@@ -1393,11 +1393,11 @@ pub(crate) async fn handle_h3_websocket(
         }
     }));
 
-    // ── Collect WebSocket frame and disconnect plugin lists ─────────
+    // ── Collect parsed-relay and disconnect plugin lists ────────────
     let ws_frame_plugins: Vec<Arc<dyn Plugin>> = if requires_ws_frame_hooks {
         plugins
             .iter()
-            .filter(|p| p.requires_ws_frame_hooks())
+            .filter(|p| p.requires_websocket_framing())
             .cloned()
             .collect()
     } else {

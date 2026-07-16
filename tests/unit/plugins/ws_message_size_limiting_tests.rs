@@ -48,7 +48,11 @@ fn test_supported_protocols_and_frame_parser_opt_in() {
     assert!(!protocols.contains(&ProxyProtocol::Grpc));
     assert!(!protocols.contains(&ProxyProtocol::Tcp));
     assert!(!protocols.contains(&ProxyProtocol::Udp));
-    assert!(plugin.requires_ws_frame_hooks());
+    assert!(
+        !plugin.requires_ws_frame_hooks(),
+        "parser policy must not require the post-reassembly message hook"
+    );
+    assert!(plugin.requires_websocket_framing());
 }
 
 #[test]

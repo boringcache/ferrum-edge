@@ -4457,6 +4457,14 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Returns `true` when this plugin requires the parsed WebSocket relay.
+    ///
+    /// Parser-policy plugins automatically opt out of raw tunnel mode even if
+    /// they do not need the post-reassembly [`Plugin::on_ws_frame`] hook.
+    fn requires_websocket_framing(&self) -> bool {
+        self.requires_ws_frame_hooks() || self.websocket_size_limits().is_some()
+    }
+
     /// Called for each complete WebSocket message when a plugin opts in.
     ///
     /// Tungstenite reassembles Text/Binary continuation frames before this

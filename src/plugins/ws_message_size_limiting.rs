@@ -6,8 +6,8 @@
 //! payload reservation and fragmented messages have an independent bound.
 //!
 //! This is the WebSocket equivalent of `request_size_limiting` for HTTP.
-//! `requires_ws_frame_hooks()` keeps tunnel mode disabled; enforcement itself
-//! is parser-level because `on_ws_frame` receives reassembled messages.
+//! Its parser policy automatically keeps tunnel mode disabled; enforcement
+//! does not use `on_ws_frame` because that hook receives reassembled messages.
 //!
 //! Config:
 //! ```json
@@ -105,10 +105,6 @@ impl Plugin for WsMessageSizeLimiting {
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         WS_ONLY_PROTOCOLS
-    }
-
-    fn requires_ws_frame_hooks(&self) -> bool {
-        true
     }
 
     fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {

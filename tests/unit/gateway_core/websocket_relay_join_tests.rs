@@ -291,6 +291,39 @@ fn test_policy_close_publishes_cancellation_before_bounded_writes() {
     }
 }
 
+/// Expected size-policy rejections are neutral policy outcomes rather than
+/// generic relay failures that can pollute backend alerts and health signals.
+#[test]
+fn test_size_policy_rejections_use_explicit_error_classes() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    for (direction_marker, end_marker, expected_class) in [
+        (
+            "direction = \"client->backend\"",
+            "Client -> backend forwarding completed",
+            "retry::ErrorClass::RequestBodyTooLarge",
+        ),
+        (
+            "direction = \"backend->client\"",
+            "Backend -> client forwarding completed",
+            "retry::ErrorClass::ResponseBodyTooLarge",
+        ),
+    ] {
+        let branch = source
+            .split_once(direction_marker)
+            .unwrap_or_else(|| panic!("missing size-policy branch: {direction_marker}"))
+            .1;
+        let branch = branch
+            .split_once(end_marker)
+            .unwrap_or_else(|| panic!("missing relay branch end: {end_marker}"))
+            .0;
+        assert!(
+            branch.contains(expected_class),
+            "{direction_marker} must record {expected_class}"
+        );
+    }
+}
+
 /// Paired happy-path assertion: when the inner future completes synchronously
 /// (the common case for a small Close frame on healthy TCP), `lazy_timeout`
 /// pays zero timer cost and returns immediately with the inner result.

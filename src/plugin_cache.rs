@@ -836,7 +836,7 @@ type BufferingMap = HashMap<String, bool>;
 /// Map from proxy_id to whether any plugin may require request body buffering
 /// for at least some requests.
 type RequestBufferingMap = HashMap<String, bool>;
-/// Map from proxy_id to whether any plugin requires per-frame WebSocket hooks.
+/// Map from proxy_id to whether any plugin requires parsed WebSocket framing.
 type WsFrameMap = HashMap<String, bool>;
 /// Map from proxy_group plugin_config_id to its shared plugin instance.
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
@@ -2358,9 +2358,9 @@ pub(crate) struct PluginCacheInner {
     /// Pre-computed per-protocol plugin lists + phase data (auth plugin lists,
     /// capability bitsets).
     protocol_snapshot: ProtocolSnapshot,
-    /// Pre-computed: does any plugin for this proxy require per-frame WebSocket hooks?
+    /// Pre-computed: does any plugin require parser policy or message hooks?
     requires_ws_frame: WsFrameMap,
-    /// Whether global-only plugins require per-frame WebSocket hooks (fallback).
+    /// Whether global-only plugins require parsed WebSocket framing (fallback).
     global_requires_ws_frame: bool,
     /// Shared proxy-group plugin instances, keyed by plugin_config_id. Kept
     /// across incremental updates so rebuilt proxies can keep sharing state
@@ -2751,7 +2751,7 @@ impl PluginCacheRequestView {
         self.requires_request_body_buffering
     }
 
-    /// Check WebSocket frame-hook requirement from this request view.
+    /// Check parsed WebSocket relay requirement from this request view.
     pub fn requires_ws_frame_hooks(&self) -> bool {
         self.requires_ws_frame_hooks
     }
@@ -3313,7 +3313,7 @@ impl PluginCache {
                 );
                 new_ws_frame.insert(
                     proxy.id.clone(),
-                    plugins.iter().any(|p| p.requires_ws_frame_hooks()),
+                    plugins.iter().any(|p| p.requires_websocket_framing()),
                 );
             }
         }
@@ -3392,7 +3392,7 @@ impl PluginCache {
             current.global_requires_request_buffering
         };
         let new_global_requires_ws_frame = if global_plugins_changed {
-            new_globals.iter().any(|p| p.requires_ws_frame_hooks())
+            new_globals.iter().any(|p| p.requires_websocket_framing())
         } else {
             current.global_requires_ws_frame
         };
@@ -3523,7 +3523,7 @@ impl PluginCache {
         inner.requires_request_body_buffering(proxy_id)
     }
 
-    /// Check whether any plugin for this proxy requires per-frame WebSocket hooks.
+    /// Check whether any plugin for this proxy requires parsed WebSocket framing.
     /// When false, the WebSocket frame forwarding loop skips plugins entirely (zero overhead).
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
     ///
@@ -3840,8 +3840,9 @@ impl PluginCache {
             let needs_req_buffering = merged.iter().any(|p| p.requires_request_body_buffering());
             req_buffering_map.insert(proxy.id.clone(), needs_req_buffering);
 
-            // Pre-compute whether any plugin requires per-frame WebSocket hooks
-            let needs_ws_frame = merged.iter().any(|p| p.requires_ws_frame_hooks());
+            // Pre-compute whether any plugin requires WebSocket parsing for a
+            // parser policy or post-reassembly message hook.
+            let needs_ws_frame = merged.iter().any(|p| p.requires_websocket_framing());
             ws_frame_map.insert(proxy.id.clone(), needs_ws_frame);
 
             proxy_map.insert(proxy.id.clone(), Arc::new(merged));
@@ -3893,7 +3894,9 @@ impl PluginCache {
         let global_needs_req_buffering = global_plugins
             .iter()
             .any(|p| p.requires_request_body_buffering());
-        let global_needs_ws_frame = global_plugins.iter().any(|p| p.requires_ws_frame_hooks());
+        let global_needs_ws_frame = global_plugins
+            .iter()
+            .any(|p| p.requires_websocket_framing());
 
         Ok((
             proxy_map,

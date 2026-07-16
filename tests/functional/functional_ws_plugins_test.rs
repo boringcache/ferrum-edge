@@ -541,16 +541,26 @@ async fn test_ws_message_size_limiting_reassembly_bound_e2e() {
     write_ws_config_with_plugins(
         &config_path,
         backend_port,
-        r#"  - id: "ws-size-limit"
+        r#"  - id: "ws-frame-limit"
     plugin_name: "ws_message_size_limiting"
     scope: "proxy"
     proxy_id: "ws-echo-proxy"
     enabled: true
     config:
       max_frame_bytes: 50
-      max_message_bytes: 80
+      max_message_bytes: 100
+      close_reason: "frame limit"
+  - id: "ws-message-limit"
+    plugin_name: "ws_message_size_limiting"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      max_frame_bytes: 50
+      max_message_bytes: 50
       close_reason: "reassembly limit""#,
-        r#"      - plugin_config_id: "ws-size-limit""#,
+        r#"      - plugin_config_id: "ws-frame-limit"
+      - plugin_config_id: "ws-message-limit""#,
     );
 
     let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
@@ -561,7 +571,6 @@ async fn test_ws_message_size_limiting_reassembly_bound_e2e() {
 
     for (opcode, final_fragment) in [
         (OpCode::Data(Data::Binary), false),
-        (OpCode::Data(Data::Continue), false),
         (OpCode::Data(Data::Continue), true),
     ] {
         ws.send(Message::Frame(Frame::message(

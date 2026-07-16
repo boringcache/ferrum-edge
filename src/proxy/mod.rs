@@ -9375,13 +9375,14 @@ async fn handle_websocket_request_authenticated(
             response
         });
 
-    // Collect plugins that opted into per-frame WebSocket hooks. `plugins`
-    // was resolved from the request's plugin-cache snapshot, so the upgrade
-    // path does not reload the cache and risk mixing generations.
+    // Collect plugins that require the parsed relay for parser policy or
+    // post-reassembly hooks. `plugins` was resolved from the request's
+    // plugin-cache snapshot, so the upgrade path does not reload the cache
+    // and risk mixing generations.
     let ws_frame_plugins: Vec<Arc<dyn Plugin>> = if requires_ws_frame_hooks {
         plugins
             .iter()
-            .filter(|p| p.requires_ws_frame_hooks())
+            .filter(|p| p.requires_websocket_framing())
             .cloned()
             .collect()
     } else {
@@ -10805,9 +10806,9 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 }
 
 /// `connection_id` — unique per-connection identifier for stateful frame plugins.
-/// `ws_frame_plugins` — plugins that opted into per-frame hooks by returning `true`
-/// from `requires_ws_frame_hooks()`. Pass an empty `Vec` for zero-overhead forwarding
-/// when no plugin on this proxy needs frame inspection.
+/// `ws_frame_plugins` — plugins that require parsing for a parser-level policy
+/// or post-reassembly hook. Pass an empty `Vec` for zero-overhead forwarding
+/// when no plugin on this proxy needs WebSocket framing.
 /// `ws_disconnect_plugins` — plugins that opted into end-of-session hooks by
 /// returning `true` from `requires_ws_disconnect_hooks()`. Pass an empty `Vec`
 /// to skip disconnect bookkeeping entirely.
@@ -10875,17 +10876,22 @@ impl EffectiveWsSizeLimits {
         }
 
         let global_message_bytes = global_frame_bytes.saturating_mul(4);
+        let max_frame_bytes = plugin_frame
+            .as_ref()
+            .map(|rule| global_frame_bytes.min(rule.max_bytes))
+            .unwrap_or(global_frame_bytes);
+        let max_message_bytes = plugin_message
+            .as_ref()
+            .map(|rule| global_message_bytes.min(rule.max_bytes))
+            .unwrap_or(global_message_bytes);
         Self {
-            max_frame_bytes: plugin_frame
-                .as_ref()
-                .map(|rule| global_frame_bytes.min(rule.max_bytes))
-                .unwrap_or(global_frame_bytes),
-            max_message_bytes: plugin_message
-                .as_ref()
-                .map(|rule| global_message_bytes.min(rule.max_bytes))
-                .unwrap_or(global_message_bytes),
-            plugin_frame,
-            plugin_message,
+            max_frame_bytes,
+            max_message_bytes,
+            // Keep only rules that actually determine an effective parser
+            // ceiling. This prevents an inactive plugin frame rule from being
+            // mistaken for a numerically equal global message rejection.
+            plugin_frame: plugin_frame.filter(|rule| rule.max_bytes == max_frame_bytes),
+            plugin_message: plugin_message.filter(|rule| rule.max_bytes == max_message_bytes),
         }
     }
 
@@ -10903,19 +10909,22 @@ impl EffectiveWsSizeLimits {
             _ => return None,
         };
         // Tungstenite reports both its pre-reservation frame check and its
-        // continuation-accumulation check through MessageTooLong. The active
-        // parser ceiling identifies which configured policy fired; when both
-        // are numerically equal, actual-frame checking occurs first.
+        // continuation-accumulation check through MessageTooLong. Prefer the
+        // active message rule when the effective ceilings are numerically
+        // equal: a frame exceeding that shared ceiling also violates the
+        // message policy, while valid bounded fragments can violate only the
+        // cumulative message rule. Inactive plugin rules were removed above,
+        // so a global-only rejection cannot inherit an unrelated reason.
         let (rule, kind) = self
-            .plugin_frame
+            .plugin_message
             .as_ref()
-            .filter(|rule| rule.max_bytes == max_size)
-            .map(|rule| (rule, "frame"))
+            .filter(|rule| self.max_message_bytes == max_size && rule.max_bytes == max_size)
+            .map(|rule| (rule, "message"))
             .or_else(|| {
-                self.plugin_message
+                self.plugin_frame
                     .as_ref()
-                    .filter(|rule| rule.max_bytes == max_size)
-                    .map(|rule| (rule, "message"))
+                    .filter(|rule| self.max_frame_bytes == max_size && rule.max_bytes == max_size)
+                    .map(|rule| (rule, "frame"))
             })?;
         Some((
             CloseFrame {
@@ -11630,8 +11639,7 @@ where
                             trace!("Client -> Backend: Frame");
                         }
                         Err(e) => {
-                            error!("Error receiving from client: {}", e);
-                            if let Some((close, limit_kind, size, max_size)) =
+                            let error_class = if let Some((close, limit_kind, size, max_size)) =
                                 size_limits_ctb.plugin_close_for_error(&e)
                             {
                                 warn!(
@@ -11653,12 +11661,16 @@ where
                                     policy_close_ctb.get().cloned(),
                                 )
                                 .await;
-                            }
+                                retry::ErrorClass::RequestBodyTooLarge
+                            } else {
+                                error!("Error receiving from client: {}", e);
+                                retry::classify_boxed_error(&e)
+                            };
                             // Read-side failure on the c2b path means the client
                             // dropped / reset the socket.
                             let _ = first_failure_ctb.set((
                                 crate::plugins::Direction::ClientToBackend,
-                                retry::classify_boxed_error(&e),
+                                error_class,
                                 Some(tcp_proxy::StreamIoSide::Read),
                             ));
                             break;
@@ -11831,8 +11843,7 @@ where
                             trace!("Backend -> Client: Frame");
                         }
                         Err(e) => {
-                            error!("Error receiving from backend: {}", e);
-                            if let Some((close, limit_kind, size, max_size)) =
+                            let error_class = if let Some((close, limit_kind, size, max_size)) =
                                 size_limits_btc.plugin_close_for_error(&e)
                             {
                                 warn!(
@@ -11852,12 +11863,16 @@ where
                                     policy_close_btc.get().cloned(),
                                 )
                                 .await;
-                            }
+                                retry::ErrorClass::ResponseBodyTooLarge
+                            } else {
+                                error!("Error receiving from backend: {}", e);
+                                retry::classify_boxed_error(&e)
+                            };
                             // Read-side failure on the b2c path means the
                             // backend closed / reset the socket.
                             let _ = first_failure_btc.set((
                                 crate::plugins::Direction::BackendToClient,
-                                retry::classify_boxed_error(&e),
+                                error_class,
                                 Some(tcp_proxy::StreamIoSide::Read),
                             ));
                             break;
