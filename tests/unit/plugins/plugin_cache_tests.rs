@@ -807,6 +807,49 @@ fn test_registered_custom_plugin_is_resolved_before_unknown_rejection() {
 }
 
 #[test]
+fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "custom-1",
+            "example_plugin",
+            json!({"header_value": "accepted-generation"}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid example plugin cache");
+    let before = cache.get_plugins("p1");
+    assert_eq!(before.len(), 1);
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "custom-1",
+            "example_plugin",
+            json!({"header_value": 7}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("malformed example config must reject cache publication");
+    assert!(error.contains("example_plugin"), "got: {error}");
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted example plugin instance"
+    );
+}
+
+#[test]
 fn test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache() {
     let config1 = make_config(
         vec![make_proxy("p1", "/api", vec!["pc1"])],
