@@ -277,6 +277,7 @@ fn entry_budget_config_for(
         "include_status_class_label": include_status_class_label,
         "max_entry_bytes": max_entry_bytes,
         "buffer_max_bytes": 8192,
+        "gzip": false,
     })
 }
 
