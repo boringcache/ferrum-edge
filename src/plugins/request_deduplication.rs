@@ -420,6 +420,7 @@ impl RequestDeduplication {
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn request_identity_for_tests(
         &self,
         ctx: &RequestContext,
