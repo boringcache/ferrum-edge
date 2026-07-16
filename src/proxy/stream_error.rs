@@ -64,6 +64,11 @@ pub enum StreamSetupKind {
     /// (`on_stream_connect`/`before_proxy`). Covers ACL/policy/throttle
     /// rejections — they all share the same client-side classification.
     RejectedByPlugin,
+    /// The client reset the connection or the socket reported a transport
+    /// error while the fault-injection plugin was still delaying admission.
+    /// Client-side; used to cancel the delay without retaining the connection
+    /// task. A graceful read-half close is not classified as a disconnect.
+    ClientDisconnectedDuringAdmission,
     /// Load balancer returned no healthy targets for the configured upstream.
     /// Backend-side — the configured pool is empty or all targets are
     /// failing active health checks.
@@ -105,6 +110,7 @@ impl StreamSetupKind {
             Self::FrontendTlsHandshake => Some(TlsErrorSide::Frontend),
             Self::BackendTlsHandshake | Self::BackendDtlsHandshake => Some(TlsErrorSide::Backend),
             Self::RejectedByPlugin
+            | Self::ClientDisconnectedDuringAdmission
             | Self::NoHealthyTargets
             | Self::CircuitBreakerOpen
             | Self::BackendMaxConnectionsExceeded
@@ -127,7 +133,10 @@ impl StreamSetupKind {
         if let Some(side) = self.tls_side() {
             return matches!(side, TlsErrorSide::Frontend);
         }
-        matches!(self, Self::RejectedByPlugin)
+        matches!(
+            self,
+            Self::RejectedByPlugin | Self::ClientDisconnectedDuringAdmission
+        )
     }
 
     /// Direction attribution for [`crate::plugins::StreamTransactionSummary::disconnect_direction`].
@@ -164,6 +173,9 @@ impl StreamSetupKind {
                 crate::proxy::udp_proxy::STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED
             }
             Self::RejectedByPlugin => crate::proxy::tcp_proxy::STREAM_ERR_REJECTED_BY_PLUGIN,
+            Self::ClientDisconnectedDuringAdmission => {
+                crate::proxy::tcp_proxy::STREAM_ERR_CLIENT_DISCONNECTED_DURING_ADMISSION
+            }
             Self::NoHealthyTargets => crate::proxy::tcp_proxy::STREAM_ERR_NO_HEALTHY_TARGETS,
             Self::CircuitBreakerOpen => crate::proxy::tcp_proxy::STREAM_ERR_CIRCUIT_BREAKER_OPEN,
             Self::BackendMaxConnectionsExceeded => {
@@ -295,6 +307,10 @@ mod tests {
             Some(TlsErrorSide::Backend)
         );
         assert_eq!(StreamSetupKind::RejectedByPlugin.tls_side(), None);
+        assert_eq!(
+            StreamSetupKind::ClientDisconnectedDuringAdmission.tls_side(),
+            None
+        );
         assert_eq!(StreamSetupKind::NoHealthyTargets.tls_side(), None);
         assert_eq!(StreamSetupKind::CircuitBreakerOpen.tls_side(), None);
         assert_eq!(
@@ -311,6 +327,7 @@ mod tests {
         for kind in [
             StreamSetupKind::FrontendTlsHandshake,
             StreamSetupKind::RejectedByPlugin,
+            StreamSetupKind::ClientDisconnectedDuringAdmission,
         ] {
             assert!(
                 kind.is_client_side(),
@@ -355,6 +372,10 @@ mod tests {
         assert_eq!(
             StreamSetupKind::RejectedByPlugin.prefix(),
             "rejected by plugin"
+        );
+        assert_eq!(
+            StreamSetupKind::ClientDisconnectedDuringAdmission.prefix(),
+            "client disconnected during plugin admission"
         );
         assert_eq!(
             StreamSetupKind::NoHealthyTargets.prefix(),
