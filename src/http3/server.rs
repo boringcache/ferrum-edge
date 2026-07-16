@@ -1394,7 +1394,7 @@ async fn handle_h3_request(
     // Method-filtered Extended CONNECT requests still require WebSocket-scoped
     // initial response policy and transport-managed header stripping.
     let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);
-    ctx.set_websocket_response_boundary(matches!(http_flavor, HttpFlavor::WebSocket));
+    ctx.set_request_http_flavor(http_flavor);
     let initial_response_header_policy_plugins = epoch
         .plugin_cache
         .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);

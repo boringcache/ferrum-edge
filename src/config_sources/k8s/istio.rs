@@ -26,10 +26,11 @@ use super::{
     mesh_route_dispatch_plugin_from_rules, mesh_route_dispatch_rules_for_proxy,
     optional_port_field, optional_target_weight_field, parse_istio_duration_ms, port_from_u64,
     proxy_for_route, request_termination_plugin_for_proxy, resource_id,
-    route_backends_require_node_waypoint_authz, route_local_fault_value_for_rule,
-    route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
-    sidecar_selector_from_istio, string_array, string_field, string_map, upstream_for_route,
-    workload_entry_service_key_from_host, workload_selector_from_istio,
+    route_backends_require_node_waypoint_authz, route_local_fault_delay_for_rule,
+    route_local_fault_value_for_rule, route_request_transformer_plugin_for_proxy,
+    route_response_transformer_plugin_for_proxy, sidecar_selector_from_istio, string_array,
+    string_field, string_map, upstream_for_route, workload_entry_service_key_from_host,
+    workload_selector_from_istio,
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -2813,6 +2814,29 @@ fn virtual_service_routes(
             // historical fail-closed escape hatch
             // (`route_has_uncollapsible_local_policy` returning true on a
             // fault-carrying merged route) is no longer needed for fault.
+            if let Some(delay) = http
+                .get("fault")
+                .and_then(route_local_fault_delay_for_rule)
+                .filter(|delay| delay.was_clamped())
+            {
+                let warning = format!(
+                    "VirtualService {}/{} http[{index}].fault.delay.fixedDelay is {} ms; \
+                     clamping to Ferrum's {} ms fault-delay cap",
+                    object.metadata.namespace,
+                    object.metadata.name,
+                    delay.requested_ms,
+                    delay.applied_ms,
+                );
+                tracing::warn!(
+                    resource = %object.metadata.name,
+                    namespace = %object.metadata.namespace,
+                    http_route_index = index,
+                    requested_delay_ms = delay.requested_ms,
+                    applied_delay_ms = delay.applied_ms,
+                    "{warning}"
+                );
+                acc.warnings.push(warning);
+            }
             let route_fault_value = http.get("fault").and_then(route_local_fault_value_for_rule);
 
             let consumes_pending_uri_less = pending_uri_less_route.is_some();
@@ -9816,6 +9840,40 @@ extensionProviders:
     }
 
     #[test]
+    fn virtual_service_fault_delay_above_runtime_cap_is_clamped_and_warned() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/v1"}}],
+                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                        "fault": {
+                            "delay": {
+                                "fixedDelay": "1h",
+                                "percentage": {"value": 100.0}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let plugin = &result.config.plugin_configs[0];
+        let fault = dispatch_rule_fault(plugin);
+        assert_eq!(fault["delay"]["duration_ms"], 60_000);
+        assert_eq!(fault["delay"]["percentage"], 100.0);
+        assert!(result.warnings.iter().any(|warning| {
+            warning.contains("http[0].fault.delay.fixedDelay")
+                && warning.contains("clamping")
+                && warning.contains("60000 ms")
+        }));
+    }
+
+    #[test]
     fn virtual_service_fault_abort_defaults_percentage_100() {
         let result = translate_k8s_objects(
             &[object(
@@ -9922,15 +9980,6 @@ extensionProviders:
                             }
                         }
                     }, {
-                        "match": [{"uri": {"prefix": "/too-long-delay"}}],
-                        "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
-                        "fault": {
-                            "delay": {
-                                "fixedDelay": "2h",
-                                "percentage": {"value": 100.0}
-                            }
-                        }
-                    }, {
                         "match": [{"uri": {"prefix": "/zero-percent"}}],
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
                         "fault": {
@@ -9955,7 +10004,7 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        assert_eq!(result.config.proxies.len(), 4);
+        assert_eq!(result.config.proxies.len(), 3);
         assert!(result.config.plugin_configs.is_empty());
     }
 

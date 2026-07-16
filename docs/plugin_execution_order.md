@@ -243,7 +243,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
 | `api_chargeback_sink` | | ✓ | Exports durable stream charge events or snapshot deltas to ClickHouse |
 | `workload_metrics` | ✓ | ✓ | Adds direction-aware mesh source/destination labels to stream metadata and emits mesh spans when Telemetry providers are configured |
-| `transaction_debugger` | | ✓ | Prints debug info for stream connections |
+| `transaction_debugger` | | ✓ | Prints typed terminal diagnostics for stream connections |
 
 ### When Hooks Fire
 
@@ -257,6 +257,16 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 ## WebSocket Frame Lifecycle (`on_ws_frame`)
 
 WebSocket connections go through the normal HTTP plugin pipeline during the upgrade handshake — authentication, authorization, rate limiting, and all other HTTP phases execute before the connection is upgraded. Once the WebSocket upgrade completes, the frame-level hooks kick in.
+
+Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
+after both relay directions finish, including clean closes, typed errors, drain
+timeouts, and upgrades that never establish frame flow. The disconnect-plugin
+list is cloned from the same request-generation snapshot that accepted the
+upgrade, so a configuration reload cannot mix plugin generations within a live
+session. `transaction_debugger` emits the ordinary HTTP handshake terminal
+diagnostic plus one WebSocket terminal diagnostic. Both expose the same
+selected `request_id` / `trace_id` correlation metadata when present, after
+central sensitivity classification; neither dumps raw metadata.
 
 The `on_ws_frame` phase fires for every **Text**, **Binary**, **Ping**, and **Pong** frame in both directions:
 
@@ -375,7 +385,7 @@ priority overrides that interleave another plugin between dispatch instances.
 
 When a `mesh_route_dispatch` rule matches on query params, the plugin opts the whole proxy into decoded query-param materialization for HTTP/3 so its `query_params` predicates see the same percent-decoded values as HTTP/1.1 and HTTP/2. That means every plugin on that proxy observes decoded `ctx.query_params` while the query-rule instance is configured.
 
-A `mesh_route_dispatch` rule may also carry a per-rule `fault` action (`{delay, abort}`) that runs as soon as the rule matches and BEFORE any route override is applied. The fault uses the shared `FaultRoller` (`src/plugins/utils/fault_roll.rs`) so a static-percentage rule samples identically to the proxy-scoped `fault_injection` plugin. When delay and abort both trigger, the delay runs first; the abort then short-circuits dispatch and the route override is skipped. The plugin honours `ctx.metadata["fault_injected"]=true` set by an earlier-priority `fault_injection` plugin (2940 < 2995) and no-ops in that case so the two surfaces never stack a second delay + abort.
+A `mesh_route_dispatch` rule may also carry a per-rule `fault` action (`{delay, abort}`) that runs as soon as the rule matches and BEFORE any route override is applied. The fault uses the shared `FaultRoller` (`src/plugins/utils/fault_roll.rs`) so a static-percentage rule uses the same 64-bit threshold math as the proxy-scoped `fault_injection` plugin. When delay and abort both trigger, the delay runs first; the abort then short-circuits dispatch and the route override is skipped. An earlier proxy-scoped fault marks the request so the route-local surface does not stack; a route-local fault writes a private source marker so a priority-overridden later proxy-scoped fault also no-ops. Ordinary sibling `fault_injection` instances do not suppress one another: each independently decides until an abort short-circuits the chain.
 
 ## Complete Execution Order
 
@@ -457,7 +467,7 @@ Given all built-in plugins enabled, the execution order is:
 | 72 | `loki_logging` | 9155 | log, on_stream_disconnect |
 | 73 | `udp_logging` | 9160 | log, on_stream_disconnect |
 | 74 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 75 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 75 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect, on_ws_disconnect |
 | 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
 | 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect, on_ws_disconnect |
 | 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
@@ -723,7 +733,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
 | `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
-| `fault_injection` | ✓ | ✓ | ✓ | ✓ | ✓ | Probabilistic aborts and delays for chaos testing |
+| `fault_injection` | ✓ | ✓ | ✓ | ✓ | | Probabilistic aborts and delays; raw TCP only for stream hooks (no UDP/DTLS) |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
 | `request_mirror` | ✓ | ✓ | | | | Duplicates traffic to a shadow destination for validation |
 | `load_testing` | ✓ | | | | | On-demand load testing via header trigger with multi-node fan-out |

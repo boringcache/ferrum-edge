@@ -2318,6 +2318,7 @@ async fn start_dtls_frontend_listener(
                     // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
                     // direct_client_ip always equals client_ip for UDP sessions.
                     direct_client_ip: client_ip,
+                    canonical_client_ip: Default::default(),
                     proxy_id: proxy.id.clone(),
                     proxy_name: proxy_name.clone(),
                     listen_port: port,
@@ -3228,7 +3229,8 @@ async fn create_session(
         client_ip: client_ip.clone(),
         // PROXY protocol is not supported on plain UDP (TCP-borne only);
         // direct_client_ip always equals client_ip for UDP sessions.
-        direct_client_ip: client_ip.clone(),
+                    direct_client_ip: client_ip.clone(),
+                    canonical_client_ip: Default::default(),
         proxy_id: proxy_id.to_string(),
         proxy_name: proxy_name.clone(),
         listen_port,

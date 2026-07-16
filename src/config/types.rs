@@ -20,7 +20,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
 
 /// Maximum length for resource IDs.
-const MAX_ID_LENGTH: usize = 254;
+pub(crate) const MAX_ID_LENGTH: usize = 254;
 
 // ---- Field length limits (aligned with DB schema VARCHAR widths) ----
 
