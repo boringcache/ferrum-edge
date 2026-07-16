@@ -1055,8 +1055,8 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `endpoint_url` | string | (required) | HTTP(S) Loki push API URL; URL user information is rejected |
-| `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic) |
-| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`) |
+| `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic); leading/trailing whitespace is rejected |
+| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`); names use HTTP token syntax and are at most 65,535 bytes |
 | `labels` | object | `{"service":"ferrum-edge"}` | Static labels; names beginning `__` and reserved `ferrum_emitter` are rejected; names are at most 1,024 characters and values at most 2,048 characters |
 | `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label |
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
@@ -1064,18 +1064,20 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `batch_size` | integer | `100` | Max entries per batch (1–10,000) |
 | `flush_interval_ms` | integer | `1000` | Flush timer interval (minimum 100) |
 | `buffer_capacity` | integer | `10000` | Channel buffer capacity (1–1,000,000) |
-| `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576); the configured serializer's minimum HTTP and stream lines plus static, reserved, and unavoidable dynamic labels must fit |
+| `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576); the configured serializer's minimum HTTP and stream lines plus static, reserved, and worst-case dynamic label values must fit |
 | `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`) |
 | `max_retries` | integer | `3` | Retries after the initial attempt (0–10) |
 | `retry_delay_ms` | integer | `1000` | Initial exponential-backoff delay (1–60,000 ms) |
 | `schema` | object | (none) | Inline transaction-log schema |
 | `schema_ref` | string | (none) | Named `transaction_log_schema` reference; mutually exclusive with `schema` |
 
-Only HTTP **204 No Content** is delivery success. Transport failures, 408, 429, 5xx, and an incomplete or oversized 204 response drain retry with capped exponential backoff and full jitter. Loki's blocked-ingestion status **260** is a terminal failure, as are every other 2xx, 3xx, and non-retryable 4xx status. Response bodies are never logged or retained: they are discarded with a 1 MiB cap and a one-second timeout, and diagnostics contain only status and bounded size/drain classifications.
+HTTP **204 No Content** is Loki's canonical delivery success. A received 204 is treated as committed even if the best-effort response drain is incomplete, because retrying after the sink accepted the batch can duplicate entries. Other 2xx responses from Loki-compatible receivers or intermediaries are accepted only when their response drains completely and is empty. Loki's blocked-ingestion status **260**, non-empty or anomalously drained compatible-success responses, 3xx, and non-retryable 4xx responses are terminal; transport failures, 408, 429, and 5xx retry with capped exponential backoff and full jitter. Response bodies are never logged or retained: they are discarded with a 1 MiB cap and a one-second timeout, and diagnostics contain only status and bounded size/drain classifications.
 
-The outer Loki timestamp is assigned in the plugin's single flush order and is strictly increasing across batches. The original request/session timestamps remain in the structured JSON line, so completion-order batching does not invent event chronology. Ferrum Edge adds a unique `ferrum_emitter` label to each plugin instance; independently ordered replicas and reload generations therefore do not share a Loki stream.
+The outer Loki timestamp is assigned in the plugin's single flush order and is strictly increasing across batches. The original request/session timestamps remain in the structured JSON line, so completion-order batching does not invent event chronology. Ferrum Edge adds a unique `ferrum_emitter` label to each plugin instance; independently ordered replicas and reload generations therefore do not share a Loki stream. Reusing an emitter across generations would be unsafe because old and new cache generations can flush concurrently. Consequently, every replica and every rebuilt Loki plugin generation creates one active Loki stream per remaining label combination until the prior stream ages out. Operators with frequent file/DP/mesh/global reloads should monitor tenant stream utilization, avoid unnecessary rebuilds, and size Loki `max_streams_per_user` (or equivalent compatible-receiver limits) for replica count × generation overlap × label combinations; 429 responses are retried but sustained limit pressure still drops batches after the configured attempts.
 
-The channel slot is reserved before serialization. Serialization is capped by `max_entry_bytes`, and retained entry content remains charged to `buffer_max_bytes` until delivery, terminal loss, or shutdown drain completes. Pressure drops are non-blocking and diagnostics never contain entry content. Operational logs show only the endpoint scheme/host/port; path, query, authorization, and all custom-header values are redacted from audit records and non-admin config reads. Shared plugin HTTP clients ignore ambient proxy environment variables, while preserving configured DNS, TLS, redirect, and backend-egress policy.
+Compatibility note: earlier Ferrum Edge releases treated every 2xx status, including Loki's blocked-ingestion 260, as success. This release makes 260 and non-empty/anomalous non-204 2xx responses terminal and accepts empty non-204 2xx responses for compatible receivers. Receivers should prefer the Loki-standard 204 contract.
+
+The channel slot is reserved before serialization. Serialization is capped by `max_entry_bytes`, and retained entry content remains charged to `buffer_max_bytes` until delivery, terminal loss, or shutdown drain completes. Construction reserves the configured serializer's smallest HTTP/stream shape plus maximum admitted proxy-ID and other dynamic label values; request-shaped fields can still make an individual JSON line exceed the configured per-entry limit, in which case that entry is dropped. Pressure drops are non-blocking and diagnostics never contain entry content. Operational logs show only the endpoint scheme/host/port; path, query, authorization, and all custom-header values are redacted from audit records and non-admin config reads. Shared plugin HTTP clients ignore ambient proxy environment variables, while preserving configured DNS, TLS, redirect, and backend-egress policy.
 
 ### `transaction_debugger`
 

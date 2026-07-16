@@ -31,6 +31,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+use crate::config::types::MAX_ID_LENGTH;
+
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::response_body::{BoundedReadError, measure_response_body_bounded};
 use super::utils::{
@@ -65,6 +67,7 @@ pub const LOKI_DEFAULT_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const LOKI_MAX_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
 pub const LOKI_MAX_RETRIES: u64 = 10;
 pub const LOKI_MAX_RETRY_DELAY_MS: u64 = 60_000;
+pub const LOKI_MAX_CUSTOM_HEADER_NAME_BYTES: usize = u16::MAX as usize;
 
 const LOKI_MIN_RESOURCE_BYTES: usize = 1024;
 const LOKI_MAX_LABEL_NAME_CHARS: usize = 1024;
@@ -77,7 +80,7 @@ const LOKI_EMITTER_LABEL: &str = "ferrum_emitter";
 // A fixed width keeps construction-time and runtime label accounting identical.
 const LOKI_EMITTER_VALUE_BYTES: usize = 16 * 2 + 1 + std::mem::size_of::<u64>() * 2;
 const LOKI_MIN_PROXY_ID: &str = "0";
-const LOKI_MIN_STREAM_PROTOCOL: &str = "tcp";
+const LOKI_WORST_CASE_STREAM_PROTOCOL: &str = "dtls";
 const LOKI_MIN_TIMESTAMP: &str = "1970-01-01T00:00:00+00:00";
 
 static LOKI_EMITTER_PREFIX: LazyLock<Result<[u8; 16], ()>> = LazyLock::new(|| {
@@ -330,6 +333,7 @@ impl LokiLogging {
             include_status_class,
         };
 
+        validate_custom_header_name_lengths(config)?;
         let custom_headers = parse_custom_headers(config, "loki_logging")?;
 
         let authorization_header = match optional_non_empty_string(config, "authorization_header")?
@@ -464,15 +468,38 @@ fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>
         Some(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("loki_logging: '{key}' must be a string"))?
-                .trim();
-            if value.is_empty() {
+                .ok_or_else(|| format!("loki_logging: '{key}' must be a string"))?;
+            if value.trim().is_empty() {
                 return Err(format!("loki_logging: '{key}' must not be empty"));
+            }
+            if value.trim() != value {
+                return Err(format!(
+                    "loki_logging: '{key}' must not have leading or trailing whitespace"
+                ));
             }
             Ok(Some(value.to_string()))
         }
         None => Ok(None),
     }
+}
+
+fn validate_custom_header_name_lengths(config: &Value) -> Result<(), String> {
+    let Some(headers) = config.get("custom_headers") else {
+        return Ok(());
+    };
+    let headers = headers
+        .as_object()
+        .ok_or_else(|| "loki_logging: 'custom_headers' must be an object".to_string())?;
+    if let Some(name) = headers
+        .keys()
+        .find(|name| name.len() > LOKI_MAX_CUSTOM_HEADER_NAME_BYTES)
+    {
+        return Err(format!(
+            "loki_logging: custom_headers name is {} bytes; maximum is {LOKI_MAX_CUSTOM_HEADER_NAME_BYTES}",
+            name.len()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_known_config_fields(config: &serde_json::Map<String, Value>) -> Result<(), String> {
@@ -667,7 +694,7 @@ fn minimum_http_summary() -> TransactionSummary {
         http_method: "A".to_string(),
         request_path: "/".to_string(),
         proxy_id: Some(LOKI_MIN_PROXY_ID.to_string()),
-        response_status_code: 200,
+        response_status_code: u16::MAX,
         ..TransactionSummary::default()
     }
 }
@@ -682,7 +709,7 @@ fn minimum_stream_summary() -> StreamTransactionSummary {
         auth_method: None,
         backend_target: "a:1".to_string(),
         backend_resolved_ip: None,
-        protocol: LOKI_MIN_STREAM_PROTOCOL.to_string(),
+        protocol: LOKI_WORST_CASE_STREAM_PROTOCOL.to_string(),
         listen_port: 1,
         duration_ms: 0.0,
         bytes_sent: 0,
@@ -714,7 +741,9 @@ fn validate_minimum_entry_budget(
         )?,
         None => serialized_entry_bytes(&http_summary, "HTTP entry")?,
     };
-    let http_labels = label_config.build_http_labels(&http_summary);
+    let mut http_label_summary = http_summary.clone();
+    http_label_summary.proxy_id = Some("a".repeat(MAX_ID_LENGTH));
+    let http_labels = label_config.build_http_labels(&http_label_summary);
     let http_retained_bytes = retained_entry_bytes(http_line_bytes, &http_labels);
 
     let stream_summary = minimum_stream_summary();
@@ -728,7 +757,9 @@ fn validate_minimum_entry_budget(
         )?,
         None => serialized_entry_bytes(&stream_summary, "stream entry")?,
     };
-    let stream_labels = label_config.build_stream_labels(&stream_summary);
+    let mut stream_label_summary = stream_summary.clone();
+    stream_label_summary.proxy_id = "a".repeat(MAX_ID_LENGTH);
+    let stream_labels = label_config.build_stream_labels(&stream_label_summary);
     let stream_retained_bytes = retained_entry_bytes(stream_line_bytes, &stream_labels);
 
     let minimum_retained_bytes = http_retained_bytes
@@ -739,7 +770,7 @@ fn validate_minimum_entry_budget(
         })?;
     if minimum_retained_bytes > max_entry_bytes {
         return Err(format!(
-            "loki_logging: 'max_entry_bytes' must fit a minimum serialized HTTP and stream entry plus configured, reserved, and unavoidable dynamic labels (requires at least {minimum_retained_bytes} bytes, configured {max_entry_bytes})"
+            "loki_logging: 'max_entry_bytes' must fit a minimum serialized HTTP and stream entry plus configured, reserved, and worst-case dynamic label values (requires at least {minimum_retained_bytes} bytes, configured {max_entry_bytes})"
         ));
     }
     Ok(())
@@ -1011,16 +1042,20 @@ async fn send_batch_once(
     };
     let status = response.status();
     let drain = drain_loki_response(response).await;
-    let drain_diagnostic = drain.diagnostic();
+    classify_loki_response(status, drain)
+}
 
+fn classify_loki_response(
+    status: http::StatusCode,
+    drain: LokiDrainOutcome,
+) -> LokiAttemptOutcome {
     if status.as_u16() == 204 {
-        return match drain {
-            LokiDrainOutcome::Complete(_) => LokiAttemptOutcome::Delivered,
-            _ => LokiAttemptOutcome::Retryable(format!(
-                "Loki returned status 204 but {drain_diagnostic}"
-            )),
-        };
+        // A received 204 is Loki's committed success signal. Retrying merely
+        // because connection cleanup failed can duplicate an already-ingested
+        // batch, so the bounded drain is best-effort after this status.
+        return LokiAttemptOutcome::Delivered;
     }
+    let drain_diagnostic = drain.diagnostic();
     if status.as_u16() == 260 {
         return LokiAttemptOutcome::Terminal(format!(
             "Loki blocked ingestion with status 260; {drain_diagnostic}"
@@ -1031,6 +1066,19 @@ async fn send_batch_once(
             "Loki returned retryable status {}; {drain_diagnostic}",
             status.as_u16()
         ));
+    }
+    if status.is_success() {
+        return match drain {
+            LokiDrainOutcome::Complete(0) => LokiAttemptOutcome::Delivered,
+            LokiDrainOutcome::Complete(bytes) => LokiAttemptOutcome::Terminal(format!(
+                "Loki-compatible receiver returned status {} with an unexpected non-empty response ({bytes} bytes discarded)",
+                status.as_u16()
+            )),
+            _ => LokiAttemptOutcome::Terminal(format!(
+                "Loki-compatible receiver returned status {} but an empty response could not be confirmed: {drain_diagnostic}",
+                status.as_u16()
+            )),
+        };
     }
 
     LokiAttemptOutcome::Terminal(format!(
@@ -1142,6 +1190,17 @@ mod tests {
         assert!(!is_valid_loki_label_name("bad-label"));
         assert!(validate_loki_label_name("__internal").is_err());
         assert!(validate_loki_label_name(LOKI_EMITTER_LABEL).is_err());
+    }
+
+    #[test]
+    fn committed_204_is_delivered_after_transport_drain_failure() {
+        assert!(matches!(
+            classify_loki_response(
+                http::StatusCode::NO_CONTENT,
+                LokiDrainOutcome::TransportFailure,
+            ),
+            LokiAttemptOutcome::Delivered
+        ));
     }
 
     #[test]

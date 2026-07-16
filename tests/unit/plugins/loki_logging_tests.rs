@@ -4,11 +4,11 @@ use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient,
     loki_logging::{
         LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES, LOKI_LOGGING_CONFIG_KEYS,
-        LokiLogging,
+        LOKI_MAX_CUSTOM_HEADER_NAME_BYTES, LokiLogging,
     },
 };
 use serde_json::json;
-use std::io;
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -155,6 +155,8 @@ async fn test_loki_logging_rejects_invalid_config_shapes() {
         json!({"endpoint_url": "http://127.0.0.1:1/loki", "custom_headers": {"Bad Header": "value"}}),
         json!({"endpoint_url": "http://127.0.0.1:1/loki", "custom_headers": {"X-Bad": "bad\u{0001}value"}}),
         json!({"endpoint_url": "http://127.0.0.1:1/loki", "authorization_header": ""}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "authorization_header": " Bearer token"}),
+        json!({"endpoint_url": "http://127.0.0.1:1/loki", "authorization_header": "Bearer token\t"}),
         json!({"endpoint_url": "http://127.0.0.1:1/loki", "authorization_header": 123}),
         json!({"endpoint_url": "http://127.0.0.1:1/loki", "authorization_header": "bad\u{0001}value"}),
         json!({"endpoint_url": "http://127.0.0.1:1/loki", "batch_size": "100"}),
@@ -211,8 +213,17 @@ async fn test_loki_logging_strict_config_admission_and_bounds() {
         );
     }
 
-    let valid = json!({
+    let oversized_header_name = "x".repeat(LOKI_MAX_CUSTOM_HEADER_NAME_BYTES + 1);
+    let mut oversized_headers = serde_json::Map::new();
+    oversized_headers.insert(oversized_header_name, json!("value"));
+    let oversized_header_config = json!({
         "endpoint_url": endpoint,
+        "custom_headers": oversized_headers
+    });
+    assert!(LokiLogging::new(&oversized_header_config, default_client()).is_err());
+
+    let valid = json!({
+        "endpoint_url": "HTTP://127.0.0.1:1/loki/api/v1/push",
         "max_entry_bytes": LOKI_DEFAULT_MAX_ENTRY_BYTES,
         "buffer_max_bytes": LOKI_DEFAULT_BUFFER_MAX_BYTES,
         "labels": {"tenant_name": "dynamic-value"},
@@ -245,8 +256,22 @@ fn entry_budget_config(
     include_proxy_id_label: bool,
     include_status_class_label: bool,
 ) -> serde_json::Value {
+    entry_budget_config_for(
+        "http://127.0.0.1:1/loki/api/v1/push",
+        max_entry_bytes,
+        include_proxy_id_label,
+        include_status_class_label,
+    )
+}
+
+fn entry_budget_config_for(
+    endpoint_url: &str,
+    max_entry_bytes: usize,
+    include_proxy_id_label: bool,
+    include_status_class_label: bool,
+) -> serde_json::Value {
     json!({
-        "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",
+        "endpoint_url": endpoint_url,
         "labels": {"service": "x".repeat(2048)},
         "include_proxy_id_label": include_proxy_id_label,
         "include_status_class_label": include_status_class_label,
@@ -331,6 +356,40 @@ async fn test_loki_logging_entry_budget_exact_boundary_includes_dynamic_labels()
             "the exact minimum retained size must be accepted"
         );
     }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/loki/api/v1/push"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let plugin = LokiLogging::new(
+        &entry_budget_config_for(
+            &format!("{}/loki/api/v1/push", server.uri()),
+            with_default_labels,
+            true,
+            true,
+        ),
+        default_client(),
+    )
+    .unwrap();
+    let proxy_id = "123e4567-e89b-12d3-a456-426614174000";
+    let summary = ferrum_edge::plugins::TransactionSummary {
+        namespace: "0".to_string(),
+        timestamp_received: "1970-01-01T00:00:00+00:00".to_string(),
+        client_ip: "::".to_string(),
+        http_method: "A".to_string(),
+        request_path: "/".to_string(),
+        proxy_id: Some(proxy_id.to_string()),
+        response_status_code: u16::MAX,
+        ..Default::default()
+    };
+    plugin.log(&summary).await;
+
+    let requests = wait_for_requests(&server, 1).await;
+    let payload: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(payload["streams"][0]["stream"]["proxy_id"], proxy_id);
+    assert_eq!(payload["streams"][0]["stream"]["status_class"], "other");
 }
 
 #[tokio::test]
@@ -416,7 +475,7 @@ async fn test_loki_timestamps_are_strictly_monotonic_within_and_across_batches()
 }
 
 #[tokio::test]
-async fn test_loki_plugin_instances_use_distinct_emitter_stream_labels() {
+async fn test_loki_overlapping_plugin_generations_use_distinct_emitter_stream_labels() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/loki/api/v1/push"))
@@ -424,6 +483,9 @@ async fn test_loki_plugin_instances_use_distinct_emitter_stream_labels() {
         .mount(&server)
         .await;
     let config = delivery_config(format!("{}/loki/api/v1/push", server.uri()));
+    // Cache swaps can leave the prior generation alive for in-flight requests
+    // while the replacement starts flushing. They must not share a timestamp
+    // domain or a Loki stream even when their operator config is identical.
     let first = LokiLogging::new(&config, default_client()).unwrap();
     let second = LokiLogging::new(&config, default_client()).unwrap();
     first.log(&create_test_transaction_summary()).await;
@@ -569,8 +631,8 @@ async fn test_loki_status_260_is_terminal_and_diagnostics_are_redacted() {
 }
 
 #[tokio::test]
-async fn test_loki_retries_429_and_5xx_but_not_unexpected_2xx() {
-    for first_status in [429_u16, 503_u16] {
+async fn test_loki_retries_408_429_and_5xx() {
+    for first_status in [408_u16, 429_u16, 503_u16] {
         let server = MockServer::start().await;
         let calls = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
@@ -594,11 +656,33 @@ async fn test_loki_retries_429_and_5xx_but_not_unexpected_2xx() {
         wait_for_requests(&server, 2).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_loki_accepts_empty_200_but_rejects_nonempty_200_without_retry() {
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
 
     let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
         .and(path("/loki/api/v1/push"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("not accepted"))
+        .respond_with({
+            let calls = Arc::clone(&calls);
+            move |_: &wiremock::Request| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200)
+                } else {
+                    ResponseTemplate::new(200).set_body_string("not accepted")
+                }
+            }
+        })
         .mount(&server)
         .await;
     let mut config = delivery_config(format!("{}/loki/api/v1/push", server.uri()));
@@ -607,11 +691,101 @@ async fn test_loki_retries_429_and_5xx_but_not_unexpected_2xx() {
     plugin.log(&create_test_transaction_summary()).await;
     wait_for_requests(&server, 1).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_requests(&server, 2).await;
+    for _ in 0..100 {
+        if writer.contents().contains("unexpected non-empty response") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap_or_default().len(),
+        2,
+        "neither successful 200 response should retry"
+    );
+    drop(plugin);
+    drop(guard);
+
+    let logs = writer.contents();
+    assert!(logs.contains("unexpected non-empty response"));
+    assert_eq!(
+        logs.matches("returned status 200").count(),
+        1,
+        "the empty 200 must be delivered while the non-empty 200 is terminal: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn test_loki_committed_204_drain_anomaly_is_not_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/loki/api/v1/push"))
+        .respond_with(ResponseTemplate::new(204).set_body_bytes(vec![b'x'; 1024 * 1024 + 1]))
+        .mount(&server)
+        .await;
+    let mut config = delivery_config(format!("{}/loki/api/v1/push", server.uri()));
+    config["max_retries"] = json!(2);
+    let plugin = LokiLogging::new(&config, default_client()).unwrap();
+    plugin.log(&create_test_transaction_summary()).await;
+    wait_for_requests(&server, 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         server.received_requests().await.unwrap_or_default().len(),
         1,
-        "unexpected 200 must be terminal"
+        "a received 204 is committed even when its bounded drain is anomalous"
     );
+}
+
+#[tokio::test]
+async fn test_loki_gzip_body_and_header_are_reused_across_retry() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/loki/api/v1/push"))
+        .respond_with({
+            let calls = Arc::clone(&calls);
+            move |_: &wiremock::Request| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(204)
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut config = delivery_config(format!("{}/loki/api/v1/push", server.uri()));
+    config["gzip"] = json!(true);
+    config["max_retries"] = json!(1);
+    let plugin = LokiLogging::new(&config, default_client()).unwrap();
+    let mut summary = create_test_transaction_summary();
+    summary.request_path = "/gzip-retry-canary".to_string();
+    plugin.log(&summary).await;
+
+    let requests = wait_for_requests(&server, 2).await;
+    for request in requests.iter().take(2) {
+        assert_eq!(
+            request
+                .headers
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+    }
+    assert_eq!(
+        requests[0].body.as_slice(),
+        requests[1].body.as_slice(),
+        "retry must reuse the exact serialized and compressed bytes"
+    );
+
+    let mut decoder = flate2::read::GzDecoder::new(requests[0].body.as_slice());
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+    let line: serde_json::Value =
+        serde_json::from_str(payload["streams"][0]["values"][0][1].as_str().unwrap()).unwrap();
+    assert_eq!(line["request_path"], "/gzip-retry-canary");
 }
 
 #[tokio::test]
@@ -680,6 +854,77 @@ async fn test_loki_retained_content_budget_bounds_buffered_entries() {
         retained_entries < 100,
         "byte budget must cap retained content independently of channel count"
     );
+}
+
+#[tokio::test]
+async fn test_loki_retained_content_budget_is_released_after_delivery() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/loki/api/v1/push"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(200)))
+        .mount(&server)
+        .await;
+    let plugin = LokiLogging::new(
+        &json!({
+            "endpoint_url": format!("{}/loki/api/v1/push", server.uri()),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "buffer_capacity": 10,
+            "max_entry_bytes": 4096,
+            "buffer_max_bytes": 4096,
+            "max_retries": 0,
+            "retry_delay_ms": 1,
+            "gzip": false
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let large_path = "x".repeat(1800);
+    let mut first = create_test_transaction_summary();
+    first.request_path = format!("/first-budget-canary/{large_path}");
+    plugin.log(&first).await;
+    wait_for_requests(&server, 1).await;
+
+    let mut rejected_while_reserved = first.clone();
+    rejected_while_reserved.request_path = format!("/rejected-budget-canary/{large_path}");
+    plugin.log(&rejected_while_reserved).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut admitted_after_release = first;
+    admitted_after_release.request_path = format!("/released-budget-canary/{large_path}");
+    plugin.log(&admitted_after_release).await;
+
+    let requests = wait_for_requests(&server, 2).await;
+    assert_eq!(requests.len(), 2);
+    let lines = requests
+        .iter()
+        .take(2)
+        .map(|request| {
+            let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            serde_json::from_str::<serde_json::Value>(
+                payload["streams"][0]["values"][0][1].as_str().unwrap(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["request_path"].as_str().unwrap().contains("first-budget-canary"))
+    );
+    assert!(lines.iter().any(|line| {
+        line["request_path"]
+            .as_str()
+            .unwrap()
+            .contains("released-budget-canary")
+    }));
+    assert!(lines.iter().all(|line| {
+        !line["request_path"]
+            .as_str()
+            .unwrap()
+            .contains("rejected-budget-canary")
+    }));
 }
 
 #[tokio::test]

@@ -1455,8 +1455,8 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
     use ferrum_edge::plugins::PluginHttpClient;
     use ferrum_edge::plugins::loki_logging::{
         LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES, LOKI_LOGGING_CONFIG_KEYS,
-        LOKI_MAX_BUFFER_MAX_BYTES, LOKI_MAX_MAX_ENTRY_BYTES, LOKI_MAX_RETRIES,
-        LOKI_MAX_RETRY_DELAY_MS, LokiLogging,
+        LOKI_MAX_BUFFER_MAX_BYTES, LOKI_MAX_CUSTOM_HEADER_NAME_BYTES,
+        LOKI_MAX_MAX_ENTRY_BYTES, LOKI_MAX_RETRIES, LOKI_MAX_RETRY_DELAY_MS, LokiLogging,
     };
 
     let spec: serde_json::Value =
@@ -1506,9 +1506,13 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
         schema["properties"]["retry_delay_ms"]["maximum"],
         json!(LOKI_MAX_RETRY_DELAY_MS)
     );
+    assert_eq!(
+        schema["properties"]["custom_headers"]["propertyNames"]["maxLength"],
+        json!(LOKI_MAX_CUSTOM_HEADER_NAME_BYTES)
+    );
 
     let valid = json!({
-        "endpoint_url": "https://logs.example.com/loki/api/v1/push?tenant=dynamic",
+        "endpoint_url": "HTTPS://logs.example.com/loki/api/v1/push?tenant=dynamic",
         "authorization_header": "Bearer test",
         "custom_headers": {"X-Scope-OrgID": "tenant-a", "X-Dynamic": "value"},
         "labels": {"service": "edge", "tenant_name": "tenant-a"},
@@ -1532,8 +1536,8 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
         "batch_size": 1,
         "flush_interval_ms": 100,
         "buffer_capacity": 1,
-        "max_entry_bytes": 1024,
-        "buffer_max_bytes": 1024,
+        "max_entry_bytes": 2048,
+        "buffer_max_bytes": 2048,
         "max_retries": 0,
         "retry_delay_ms": 1
     });
@@ -1547,6 +1551,8 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
         json!({"endpoint_url": "https://logs.example.com/push", "labels": {"ferrum_emitter": "x"}}),
         json!({"endpoint_url": "https://logs.example.com/push", "labels": {"tenant": "x".repeat(2049)}}),
         json!({"endpoint_url": "https://logs.example.com/push", "authorization_header": "   "}),
+        json!({"endpoint_url": "https://logs.example.com/push", "authorization_header": " Bearer test"}),
+        json!({"endpoint_url": "https://logs.example.com/push", "authorization_header": "Bearer test\t"}),
         json!({"endpoint_url": "https://logs.example.com/push", "custom_headers": {"Bad Header": "x"}}),
         json!({"endpoint_url": "https://logs.example.com/push", "custom_headers": {"X-Bad": "bad\nvalue"}}),
         json!({"endpoint_url": "https://logs.example.com/push", "batch_size": 10001}),
@@ -1557,6 +1563,13 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
         json!({"endpoint_url": "https://logs.example.com/push", "max_entry_bytes": 1023}),
         json!({"endpoint_url": "https://logs.example.com/push", "buffer_max_bytes": 268435457}),
     ];
+    let oversized_header_name = "x".repeat(LOKI_MAX_CUSTOM_HEADER_NAME_BYTES + 1);
+    let mut oversized_headers = serde_json::Map::new();
+    oversized_headers.insert(oversized_header_name, json!("value"));
+    invalid.push(json!({
+        "endpoint_url": "https://logs.example.com/push",
+        "custom_headers": oversized_headers
+    }));
     for key in LOKI_LOGGING_CONFIG_KEYS {
         let mut config = json!({"endpoint_url": "https://logs.example.com/push"});
         config

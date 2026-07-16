@@ -10455,18 +10455,20 @@ components:
       additionalProperties: false
       description: >-
         Plugin: loki_logging — Ships transaction logs to Grafana Loki via the
-        push API in bounded, label-grouped streams. Only HTTP 204 is accepted
-        as delivery success. Loki's blocked-ingestion status 260 and every
-        other non-retryable response are terminal losses; 408, 429, and 5xx
-        responses use bounded exponential backoff with jitter. Explicit nulls
-        and unknown top-level fields are rejected.
+        push API in bounded, label-grouped streams. HTTP 204 is the canonical
+        success response; other 2xx responses are accepted only when their body
+        drains completely and is empty. Loki's blocked-ingestion status 260,
+        non-empty/anomalous compatible-success responses, and every other
+        non-retryable response are terminal; 408, 429, and 5xx responses use
+        bounded exponential backoff with jitter. Explicit nulls and unknown
+        top-level fields are rejected.
       required:
         - endpoint_url
       properties:
         endpoint_url:
           type: string
           format: uri
-          pattern: '^https?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
+          pattern: '^[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
           description: >-
             Loki push API URL (for example,
             http://loki:3100/loki/api/v1/push). URL user information is
@@ -10476,8 +10478,10 @@ components:
         authorization_header:
           type: string
           minLength: 1
-          pattern: '^(?=.*[^ \t])[\u0009\u0020-\u007E]+$'
-          description: Full Authorization header value (e.g. "Bearer <token>" or "Basic <b64>")
+          pattern: '^[\u0021-\u007E](?:[\u0009\u0020-\u007E]*[\u0021-\u007E])?$'
+          description: >-
+            Full Authorization header value (e.g. "Bearer <token>" or
+            "Basic <b64>"). Leading and trailing whitespace is rejected.
         custom_headers:
           type: object
           propertyNames:
@@ -10490,7 +10494,8 @@ components:
             pattern: '^[\u0009\u0020-\u007E]*$'
           description: >-
             Extra HTTP headers (for example, X-Scope-OrgID for multi-tenant
-            Loki). All values are redacted from audit records and non-admin
+            Loki). Names use HTTP token syntax and are at most 65,535 ASCII
+            bytes. All values are redacted from audit records and non-admin
             config reads.
         labels:
           type: object
@@ -10506,7 +10511,10 @@ components:
             because labels are indexed. Names beginning with __ and the
             reserved ferrum_emitter label are rejected. Ferrum Edge adds a
             unique ferrum_emitter value per plugin instance so independently
-            ordered emitters never share a Loki stream.
+            ordered emitters never share a Loki stream. Each replica and each
+            rebuilt plugin generation therefore consumes a distinct active
+            stream for every other label combination; size Loki
+            max_streams_per_user limits and reload cadence accordingly.
         include_proxy_id_label:
           type: boolean
           default: true
@@ -10537,7 +10545,8 @@ components:
           maximum: 10
           description: >-
             Retries after the initial delivery attempt. Only transport
-            failures, 408, 429, 5xx, and incomplete 204 response drains retry.
+            failures, 408, 429, and 5xx retry. A received 204 is committed even
+            when its best-effort body drain is anomalous, avoiding duplicates.
         retry_delay_ms:
           type: integer
           default: 1000
@@ -10559,8 +10568,9 @@ components:
             Maximum retained bytes for one serialized JSON line plus its Loki
             labels. Configuration is rejected unless the configured
             serializer's minimum HTTP and stream lines plus static, reserved,
-            and unavoidable dynamic labels fit this budget. Oversized entries
-            are dropped before enqueue.
+            and worst-case dynamic label values fit this budget. Request-shaped
+            fields can still make an individual serialized line exceed the
+            budget; those oversized entries are dropped before enqueue.
         buffer_max_bytes:
           type: integer
           default: 16777216

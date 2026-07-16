@@ -259,11 +259,17 @@ fn build_dns_cached_fallback_client(
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .unwrap_or_else(|e3| {
+                        // The production gateway builds this shared client
+                        // before its initial plugin cache. Full and delta
+                        // cache rebuilds clone that existing client and never
+                        // re-enter this builder.
+                        //
                         // Invariant: a bare reqwest builder with no custom
                         // resolver, TLS material, proxy, or redirect policy
                         // has no fallible operator input. If reqwest ever
-                        // breaks that invariant, refusing startup is safer
-                        // than silently re-enabling ambient proxy routing.
+                        // breaks that invariant, aborting client construction
+                        // is safer than silently re-enabling ambient proxy
+                        // routing.
                         panic!("Failed to build fail-closed minimal plugin HTTP client: {e3}")
                     })
             }
