@@ -690,6 +690,103 @@ fn access_control_schema_matches_runtime_validation() {
 }
 
 #[test]
+fn grpc_method_router_schema_matches_runtime_validation() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/GrpcMethodRouterConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("GrpcMethodRouterConfig schema compiles");
+
+    for config in [
+        json!({"allow_methods": []}),
+        json!({"deny_methods": ["pkg.Service/Denied"]}),
+        json!({"deny_methods": [" /pkg.Service/Denied "]}),
+        json!({
+            "method_rate_limits": {
+                "/pkg.Service/Call": {"max_requests": 1, "window_seconds": 60}
+            }
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379/0",
+            "redis_key_prefix": "ferrum:grpc",
+            "redis_pool_size": 1,
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 1
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "config should be valid: {config}"
+        );
+    }
+
+    for config in [
+        json!({}),
+        json!({"deny_methods": []}),
+        json!({"method_rate_limits": {}}),
+        json!({"deny_methods": ["not-a-grpc-method"]}),
+        json!({"deny_methods": ["pkg.Service/Method", "pkg.Service/Method"]}),
+        json!({
+            "method_rate_limits": {
+                "pkg.Service/Call/Extra": {"max_requests": 1, "window_seconds": 60}
+            }
+        }),
+        json!({
+            "method_rate_limits": {
+                "pkg.Service/Call": {"max_requests": 0, "window_seconds": 60}
+            }
+        }),
+        json!({"deny_methods": ["pkg.Service/Denied"], "sync_mode": "redis"}),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": ""
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "http://localhost:6379"
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_key_prefix": ""
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_pool_size": 0
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_connect_timeout_seconds": 0
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_health_check_interval_seconds": 0
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "config should be invalid: {config}"
+        );
+    }
+}
+
+#[test]
 fn key_auth_location_schema_matches_runtime_whitespace_contract() {
     use ferrum_edge::plugins::key_auth::KeyAuth;
 

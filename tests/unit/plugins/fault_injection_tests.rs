@@ -32,6 +32,7 @@ fn test_valid_abort_only() {
         p.priority(),
         ferrum_edge::plugins::priority::FAULT_INJECTION
     );
+    assert!(p.defer_before_proxy_until_backend_path_resolved());
 }
 
 #[test]
