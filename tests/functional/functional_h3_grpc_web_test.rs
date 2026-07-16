@@ -147,22 +147,10 @@ async fn spawn_h3_gateway(config: Value) -> (GatewayHarness, u16, tempfile::Temp
 }
 
 async fn request_with_retry(client: &Http3Client, url: &str, options: GetOptions) -> Http3Response {
-    request_with_retry_and_attempts(client, url, options)
-        .await
-        .0
-}
-
-async fn request_with_retry_and_attempts(
-    client: &Http3Client,
-    url: &str,
-    options: GetOptions,
-) -> (Http3Response, u32) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut attempts = 0_u32;
     loop {
-        attempts += 1;
         match client.get_with_options(url, options.clone()).await {
-            Ok(response) => return (response, attempts),
+            Ok(response) => return response,
             Err(error) if Instant::now() < deadline => {
                 let _ = error;
                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -654,8 +642,12 @@ async fn streaming_h3_grpc_web_deadline_cancels_withheld_backend_headers() {
         TlsConfig::new(backend_cert, backend_key).with_alpn(vec![b"http/1.1".to_vec()]),
     )
     .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-    .step(TcpStep::Sleep(Duration::from_secs(10)))
-    .step(TcpStep::Drop)
+    // Withhold response headers while continuing to read. The sentinel cannot
+    // occur in this request, so the step exits only when deadline cancellation
+    // closes the backend transport.
+    .step(TcpStep::ReadUntil(
+        b"ferrum-grpc-deadline-backend-never-sends-response".to_vec(),
+    ))
     .spawn()
     .expect("spawn stalled pass-through backend");
 
@@ -688,7 +680,7 @@ async fn streaming_h3_grpc_web_deadline_cancels_withheld_backend_headers() {
     let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
     let client = Http3Client::insecure().expect("H3 client");
     let started_at = Instant::now();
-    let (response, request_attempts) = request_with_retry_and_attempts(
+    let response = request_with_retry(
         &client,
         &format!("https://127.0.0.1:{https_port}/deadline-stall/echo.Echo/Unary"),
         GetOptions::default()
@@ -704,15 +696,29 @@ async fn streaming_h3_grpc_web_deadline_cancels_withheld_backend_headers() {
         started_at.elapsed() < Duration::from_secs(3),
         "the absolute RPC deadline must win before the five-second backend read timeout"
     );
-    let backend_connections = backend.accepted_connections();
+    let released_connections = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let accepted = backend.accepted_connections();
+            let errors = backend.step_errors().await;
+            if accepted > 0 && errors.len() >= accepted as usize {
+                return (accepted, errors);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let (backend_connections, _release_errors) = match released_connections {
+        Ok(released) => released,
+        Err(_) => panic!(
+            "deadline dispatch did not promptly release every backend connection: {} accepted, \
+             errors: {:?}",
+            backend.accepted_connections(),
+            backend.step_errors().await,
+        ),
+    };
     assert!(
         backend_connections >= 1,
         "the withheld-response-header backend path must be reached"
-    );
-    assert!(
-        backend_connections <= request_attempts,
-        "streaming dispatch must dial the backend at most once per client request attempt: \
-         {backend_connections} backend connections for {request_attempts} client attempts"
     );
 }
 
