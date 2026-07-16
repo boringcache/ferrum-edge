@@ -601,9 +601,12 @@ is not universally fire-and-forget. `log_with_mirror` awaits each primary
 transaction hook sequentially:
 
 - Buffered H1/H2/gRPC responses, synchronous rejection/error paths, and other
-  buffered terminal paths await all log hooks before the response is returned.
-  Direct network or filesystem I/O therefore adds client-visible handler
-  latency, with multiple hooks adding that latency serially.
+  buffered terminal paths normally await all log hooks before the response is
+  returned. Direct network or filesystem I/O therefore adds client-visible
+  handler latency, with multiple hooks adding that latency serially. When an
+  absolute gRPC deadline is active, Ferrum moves the owned summary, context, and
+  plugin list to a five-second detached cleanup task so a blocked log sink
+  cannot delay the terminal RPC response.
 - Hyper-owned streamed H1/H2 and gRPC bodies return from the handler first.
   Body completion fires a spawned task that awaits streaming terminal hooks and
   then log hooks sequentially. The task can be lost when no Tokio runtime is

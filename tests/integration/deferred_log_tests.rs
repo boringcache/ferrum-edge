@@ -29,7 +29,7 @@ use http_body::Body as _;
 
 use ferrum_edge::plugins::{
     Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
-    create_plugin, create_response_stream_inspector, log_with_mirror,
+    create_plugin, create_response_stream_inspector, log_with_mirror_before_buffered_response,
 };
 use ferrum_edge::proxy::ProxyBody;
 use ferrum_edge::proxy::deferred_log::{BodyOutcome, DeferredTransactionLogger};
@@ -227,7 +227,7 @@ async fn wait_for_events(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn log_with_mirror_awaits_plugins_sequentially() {
+async fn buffered_logging_without_deadline_awaits_plugins_sequentially() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -249,7 +249,7 @@ async fn log_with_mirror_awaits_plugins_sequentially() {
     let ctx = make_ctx();
 
     let log_task = tokio::spawn(async move {
-        log_with_mirror(&plugins, &summary, &ctx).await;
+        log_with_mirror_before_buffered_response(&plugins, summary, &ctx).await;
     });
     started.notified().await;
 
@@ -264,6 +264,37 @@ async fn log_with_mirror_awaits_plugins_sequentially() {
     assert_eq!(
         events.lock().unwrap().as_slice(),
         ["first-started", "first-finished", "second-started"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deadline_buffered_logging_does_not_await_a_blocked_sink() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(OrderedLogPlugin {
+        label: "deadline-log-started",
+        events: Arc::clone(&events),
+        started: Some(Arc::clone(&started)),
+        release: Some(Arc::clone(&release)),
+    })];
+    let summary = make_summary_with_status(200);
+    let mut ctx = make_ctx();
+    ferrum_edge::_test_support::set_grpc_deadline_budget_for_test(&mut ctx, Some(5_000));
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        log_with_mirror_before_buffered_response(&plugins, summary, &ctx),
+    )
+    .await
+    .expect("deadline-bearing response must not await the blocked log sink");
+
+    started.notified().await;
+    assert_eq!(events.lock().unwrap().as_slice(), ["deadline-log-started"]);
+    release.notify_one();
+    assert_eq!(
+        wait_for_events(&events, 2).await.as_slice(),
+        ["deadline-log-started", "first-finished"]
     );
 }
 

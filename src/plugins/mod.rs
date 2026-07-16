@@ -3051,6 +3051,41 @@ pub async fn log_with_mirror(
     });
 }
 
+/// Run terminal transaction logging before a buffered H1/H2 response is handed
+/// to hyper without allowing logging cleanup to extend an active gRPC deadline.
+///
+/// Ordinary requests preserve the historical sequential, awaited logging
+/// contract. Once an absolute RPC deadline is installed, the client-visible
+/// response owns the deadline and logging continues on cloned state under a
+/// finite cleanup bound. This keeps audit delivery best-effort without letting
+/// a blocked sink suppress the terminal response.
+pub async fn log_with_mirror_before_buffered_response(
+    plugins: &[Arc<dyn Plugin>],
+    summary: TransactionSummary,
+    ctx: &RequestContext,
+) {
+    if ctx.grpc_deadline_at().is_none() {
+        log_with_mirror(plugins, &summary, ctx).await;
+        return;
+    }
+
+    let plugins = plugins.to_vec();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            log_with_mirror(&plugins, &summary, &ctx),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "Detached transaction logging exceeded the post-response cleanup timeout"
+            );
+        }
+    });
+}
+
 async fn collect_mirror_result(
     mut rx: tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>,
 ) -> Option<MirrorResponseMeta> {
@@ -4269,14 +4304,17 @@ pub trait Plugin: Send + Sync {
 
     /// Called for transaction logging.
     ///
-    /// Buffered HTTP-family handlers await each plugin's hook sequentially
-    /// before returning the response. Native H3 also awaits the hooks after it
-    /// has synchronously driven the response body to completion. Hyper-owned
-    /// streamed H1/H2/gRPC bodies instead spawn terminal hooks and logging when
-    /// the body completes; that spawned work can be lost if no runtime remains
-    /// during shutdown. Plugins should hand slow I/O to a bounded,
-    /// lifecycle-owned worker rather than awaiting it inline or spawning one
-    /// unbounded task per transaction.
+    /// Buffered HTTP-family handlers normally await each plugin's hook
+    /// sequentially before returning the response. When an absolute gRPC
+    /// deadline is active, buffered H1/H2 handlers instead move logging to a
+    /// bounded detached cleanup task so a blocked sink cannot suppress the
+    /// terminal RPC response. Native H3 awaits the hooks after it has
+    /// synchronously driven the response body to completion. Hyper-owned
+    /// streamed H1/H2/gRPC bodies spawn terminal hooks and logging when the body
+    /// completes; spawned work can be lost if no runtime remains during
+    /// shutdown. Plugins should hand slow I/O to a bounded, lifecycle-owned
+    /// worker rather than awaiting it inline or spawning one unbounded task per
+    /// transaction.
     async fn log(&self, _summary: &TransactionSummary) {}
 
     /// Called for transaction logging with a precomputed mesh RED key when

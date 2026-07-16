@@ -71,7 +71,8 @@ fn h1_h2_buffered_terminal_logging_precedes_response_construction() {
             "if body_will_stream {",
             "DeferredTransactionLogger::new_with_start_time(",
             "} else {",
-            "crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;",
+            "crate::plugins::log_with_mirror_before_buffered_response(",
+            "&plugins, summary, &ctx,",
             "record_request(&state, response_status);",
             "// Build final response",
             "let mut resp_builder = Response::builder()",
@@ -152,4 +153,21 @@ fn trait_example_and_guides_describe_buffered_streaming_and_h3_log_timing() {
     assert!(EXAMPLE_SOURCE.contains("Hyper-owned streamed bodies spawn logging"));
     assert!(H3_SOURCE.contains("# Why H3 does not use `DeferredTransactionLogger`"));
     assert!(H3_SOURCE.contains("drives the\n/// QUIC send stream to completion synchronously"));
+}
+
+#[test]
+fn deadline_bearing_buffered_logging_uses_owned_bounded_cleanup() {
+    let helper = TRAIT_SOURCE
+        .split("pub async fn log_with_mirror_before_buffered_response(")
+        .nth(1)
+        .expect("deadline-aware buffered logging helper")
+        .split("async fn collect_mirror_result(")
+        .next()
+        .expect("bounded deadline-aware buffered logging helper");
+    assert!(helper.contains("if ctx.grpc_deadline_at().is_none()"));
+    assert!(helper.contains("log_with_mirror(plugins, &summary, ctx).await;"));
+    assert!(helper.contains("let plugins = plugins.to_vec();"));
+    assert!(helper.contains("let ctx = ctx.clone();"));
+    assert!(helper.contains("tokio::spawn(async move"));
+    assert!(helper.contains("std::time::Duration::from_secs(5)"));
 }

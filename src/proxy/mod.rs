@@ -9121,7 +9121,10 @@ async fn handle_websocket_request_authenticated(
                             metadata,
                             ..TransactionSummary::default()
                         };
-                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                        crate::plugins::log_with_mirror_before_buffered_response(
+                            &plugins, summary, &ctx,
+                        )
+                        .await;
                     }
                 } else {
                     crate::runtime_metrics::global_ref()
@@ -9280,7 +9283,7 @@ async fn handle_websocket_request_authenticated(
         ..TransactionSummary::default()
     };
 
-    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+    crate::plugins::log_with_mirror_before_buffered_response(&plugins, summary, &ctx).await;
 
     // Apply response policy before gateway-owned affinity and transport fields.
     // This matches ordinary HTTP/gRPC ordering: operator policy governs backend
@@ -13387,7 +13390,7 @@ pub(crate) async fn log_rejected_request_with_path(
         ..TransactionSummary::default()
     };
 
-    crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
+    crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
 }
 
 /// Keep already-applied response decorators while removing fields that describe
@@ -19831,8 +19834,13 @@ async fn handle_proxy_request_inner(
                     if body_exceeded {
                         // Request body exceeded the size limit; we're about to
                         // return a trailers-only RESOURCE_EXHAUSTED error. The
-                        // response body never streams, so log synchronously here.
-                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                        // response body never streams, so start terminal logging
+                        // here. An active RPC deadline moves that cleanup to
+                        // owned, bounded detached state.
+                        crate::plugins::log_with_mirror_before_buffered_response(
+                            &plugins, summary, &ctx,
+                        )
+                        .await;
                         None
                     } else {
                         // Streaming gRPC response: defer so the summary reflects
@@ -20590,7 +20598,10 @@ async fn handle_proxy_request_inner(
                         metadata: clone_log_metadata(&ctx),
                         ..TransactionSummary::default()
                     };
-                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                    crate::plugins::log_with_mirror_before_buffered_response(
+                        &plugins, summary, &ctx,
+                    )
+                    .await;
                 }
 
                 record_request(&state, response_status);
@@ -20769,7 +20780,10 @@ async fn handle_proxy_request_inner(
                             metadata,
                             ..TransactionSummary::default()
                         };
-                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                        crate::plugins::log_with_mirror_before_buffered_response(
+                            &plugins, summary, &ctx,
+                        )
+                        .await;
                     }
                 } else {
                     crate::runtime_metrics::global_ref().record_grpc_error(
@@ -21071,7 +21085,16 @@ async fn handle_proxy_request_inner(
             r#"{"error":"Bad Gateway","message":"Sidecar mTLS dispatch required for this backend target"}"#,
         ));
     }
-    let mut current_dispatch_h3 = !requires_response_stream_inspection
+    // The native H3 backend path does not yet bound DNS/connect, response
+    // headers, retry dispatch, and body drains by the client RPC deadline.
+    // Keep deadline-bound untranslated gRPC-Web on the reqwest path, whose
+    // entire exchange is guarded and can still synthesize the browser-visible
+    // status-4 trailer frame before any response bytes are committed.
+    let deadline_bound_grpc_web_pass_through = grpc_web_request
+        && !grpc_request_is_web_translated
+        && ctx.grpc_deadline_at().is_some();
+    let mut current_dispatch_h3 = !deadline_bound_grpc_web_pass_through
+        && !requires_response_stream_inspection
         && supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     // Client end-to-end gRPC deadline for any gRPC-flavored request riding the
     // generic path (native gRPC or gRPC-Web). The typed instant was anchored at
@@ -21298,7 +21321,8 @@ async fn handle_proxy_request_inner(
                     // gracefully fall through to reqwest, so an
                     // un-pre-warmed target degrades to the safe path until
                     // the periodic refresh classifies it.
-                    current_dispatch_h3 = !requires_response_stream_inspection
+                    current_dispatch_h3 = !deadline_bound_grpc_web_pass_through
+                        && !requires_response_stream_inspection
                         && supports_native_http3_backend(&state, &proxy, current_target.as_deref());
                 }
             }
@@ -22203,7 +22227,10 @@ async fn handle_proxy_request_inner(
                     ),
                 )
             } else {
-                crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                crate::plugins::log_with_mirror_before_buffered_response(
+                    &plugins, summary, &ctx,
+                )
+                .await;
                 None
             }
         } else {

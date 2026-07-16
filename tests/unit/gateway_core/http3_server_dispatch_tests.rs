@@ -647,6 +647,55 @@ fn streaming_h3_grpc_web_dispatch_is_bounded_before_response_headers() {
 }
 
 #[test]
+fn deadline_bound_h3_grpc_web_pass_through_bypasses_native_backend_h3() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let dispatch = source
+        .split("let deadline_bound_grpc_web_pass_through =")
+        .nth(1)
+        .expect("deadline-bound gRPC-Web pass-through classifier")
+        .split("let backend_url =")
+        .next()
+        .expect("native H3 selection block");
+    assert!(dispatch.contains("ctx.grpc_deadline_at().is_some()"));
+    assert!(dispatch.contains("let use_native_h3_pool ="));
+    assert!(dispatch.contains("&& !deadline_bound_grpc_web_pass_through"));
+
+    let bridge = source
+        .split("let native_h3_direct_dispatch = use_native_h3_pool || use_native_h3_grpc;")
+        .nth(1)
+        .expect("native H3 direct-dispatch gate");
+    assert!(bridge.contains("if !use_native_h3_pool"));
+}
+
+#[test]
+fn h3_plain_grpc_web_client_acquisition_is_deadline_bounded() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = source
+        .split("async fn dispatch_plain<S>(")
+        .nth(1)
+        .expect("cross-protocol plain dispatcher")
+        .split("async fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol plain dispatcher");
+    assert_eq!(
+        dispatch.matches("get_cross_protocol_client(").count(),
+        2,
+        "both buffered and streaming client acquisitions must remain explicit"
+    );
+    assert_eq!(
+        dispatch
+            .matches("let client_result = match crate::plugins::await_grpc_deadline(")
+            .count(),
+        2,
+        "both client acquisitions must use the absolute RPC deadline"
+    );
+    assert!(dispatch.contains("drop(pending_slot);"));
+    assert!(dispatch.contains("halt_request_body(stream);"));
+    assert!(dispatch.contains("record_plain_grpc_web_client_deadline("));
+    assert!(dispatch.contains("write_plain_grpc_web_client_deadline("));
+}
+
+#[test]
 fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
     let source = include_str!("../../../src/http3/server.rs");
     let helper = source

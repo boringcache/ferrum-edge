@@ -1643,23 +1643,54 @@ where
                         current_target.as_deref(),
                     );
 
-                    let client = match get_cross_protocol_client(
-                        state,
-                        dispatch_proxy,
-                        epoch,
-                        upstream_balancer,
-                        current_target.as_deref(),
-                        current_cb_target_key.as_deref(),
-                        cb_retry_probe_slot_available,
-                        backend_start,
-                        &mut backend_admission_permits,
-                        backend_admission_start.elapsed(),
-                        stream,
-                        ctx,
-                        Some(&mut pending_slot),
+                    let client_result = match crate::plugins::await_grpc_deadline(
+                        grpc_web_deadline_at,
+                        get_cross_protocol_client(
+                            state,
+                            dispatch_proxy,
+                            epoch,
+                            upstream_balancer,
+                            current_target.as_deref(),
+                            current_cb_target_key.as_deref(),
+                            cb_retry_probe_slot_available,
+                            backend_start,
+                            &mut backend_admission_permits,
+                            backend_admission_start.elapsed(),
+                            stream,
+                            ctx,
+                            Some(&mut pending_slot),
+                        ),
                     )
-                    .await?
-                    {
+                    .await {
+                        Ok(result) => result?,
+                        Err(()) => {
+                            drop(pending_slot);
+                            record_plain_grpc_web_client_deadline(
+                                state,
+                                epoch,
+                                proxy,
+                                upstream_balancer,
+                                current_target.as_deref(),
+                                current_cb_target_key.as_deref(),
+                                cb_retry_probe_slot_available,
+                                backend_start,
+                                &mut backend_admission_permits,
+                                backend_admission_start.elapsed(),
+                            );
+                            return write_plain_grpc_web_client_deadline(
+                                stream,
+                                plugins,
+                                ctx,
+                                response_committed_plugins,
+                                initial_response_header_policy_plugins,
+                                backend_start,
+                                bytes_sent,
+                                &current_url,
+                            )
+                            .await;
+                        }
+                    };
+                    let client = match client_result {
                         Ok(client) => client,
                         Err(outcome) => return Ok(outcome),
                     };
@@ -2061,23 +2092,55 @@ where
                     current_target.as_deref(),
                 );
 
-                let client = match get_cross_protocol_client(
-                    state,
-                    dispatch_proxy,
-                    epoch,
-                    upstream_balancer,
-                    current_target.as_deref(),
-                    current_cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                    backend_start,
-                    &mut backend_admission_permits,
-                    backend_admission_start.elapsed(),
-                    stream,
-                    ctx,
-                    Some(&mut pending_slot),
+                let client_result = match crate::plugins::await_grpc_deadline(
+                    grpc_web_deadline_at,
+                    get_cross_protocol_client(
+                        state,
+                        dispatch_proxy,
+                        epoch,
+                        upstream_balancer,
+                        current_target.as_deref(),
+                        current_cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                        backend_start,
+                        &mut backend_admission_permits,
+                        backend_admission_start.elapsed(),
+                        stream,
+                        ctx,
+                        Some(&mut pending_slot),
+                    ),
                 )
-                .await?
-                {
+                .await {
+                    Ok(result) => result?,
+                    Err(()) => {
+                        drop(pending_slot);
+                        crate::http3::stream_util::halt_request_body(stream);
+                        record_plain_grpc_web_client_deadline(
+                            state,
+                            epoch,
+                            proxy,
+                            upstream_balancer,
+                            current_target.as_deref(),
+                            current_cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                            backend_start,
+                            &mut backend_admission_permits,
+                            backend_admission_start.elapsed(),
+                        );
+                        return write_plain_grpc_web_client_deadline(
+                            stream,
+                            plugins,
+                            ctx,
+                            response_committed_plugins,
+                            initial_response_header_policy_plugins,
+                            backend_start,
+                            0,
+                            &current_url,
+                        )
+                        .await;
+                    }
+                };
+                let client = match client_result {
                     Ok(client) => client,
                     Err(outcome) => return Ok(outcome),
                 };

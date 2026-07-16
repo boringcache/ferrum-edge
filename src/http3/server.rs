@@ -3427,6 +3427,7 @@ async fn handle_h3_request(
     let retry_response_needs_header_refinement =
         has_retry && crate::proxy::plugins_may_release_response_body_under_retries(&plugins, &ctx);
     let use_native_h3_pool = backend_http_flavor == HttpFlavor::Plain
+        && !deadline_bound_grpc_web_pass_through
         && !forces_reqwest_dispatch
         && backend_supports_native_h3;
 
