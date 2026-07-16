@@ -1062,9 +1062,7 @@ impl FunctionDestination {
         let exposes_explicit_port_scalar = explicit_uri_authority_port(reference)
             .into_iter()
             .chain(explicit_uri_authority_port(&decoded_reference.value))
-            .any(|port| {
-                self.sensitive_query_scalars().any(|value| value == port)
-            });
+            .any(|port| self.sensitive_query_scalars().any(|value| value == port));
         if exposes_explicit_port_scalar {
             return true;
         }
@@ -1510,12 +1508,13 @@ fn explicit_uri_authority_port(value: &str) -> Option<&str> {
     let host_and_port = authority.rsplit('@').next()?;
     let port = if let Some(bracketed) = host_and_port.strip_prefix('[') {
         let closing_bracket = bracketed.find(']')? + 1;
-        host_and_port.get(closing_bracket + 1..)?.strip_prefix(':')?
+        host_and_port
+            .get(closing_bracket + 1..)?
+            .strip_prefix(':')?
     } else {
         host_and_port.rsplit_once(':')?.1
     };
-    (!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
-        .then_some(port)
+    (!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())).then_some(port)
 }
 
 fn is_valid_uri_scheme(value: &str) -> bool {
@@ -1710,9 +1709,7 @@ fn sanitize_function_response_headers(
                         Some(existing) => {
                             existing.push_str(", ");
                             existing.push_str(value);
-                            function_destination.response_header_exposes_destination(
-                                kind, existing,
-                            )
+                            function_destination.response_header_exposes_destination(kind, existing)
                         }
                         None => true,
                     }

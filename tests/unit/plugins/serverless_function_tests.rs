@@ -1414,8 +1414,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "authority-query-port" => {
                 format!("{}/signed%2Ftrigger?code=18443", server.uri())
             }
-            "authority-query-default-https-port"
-            | "benign-authority-default-port-lookalike" => {
+            "authority-query-default-https-port" | "benign-authority-default-port-lookalike" => {
                 format!("{}/signed%2Ftrigger?code=443", server.uri())
             }
             "authority-query-default-network-port" => {
