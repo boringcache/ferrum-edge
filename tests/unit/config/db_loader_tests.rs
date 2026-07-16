@@ -761,7 +761,7 @@ async fn independent_sqlite_stores_atomically_serialize_policy_association_and_i
         .unwrap();
     assert_eq!(
         !stored_proxy.plugins.is_empty(),
-        stored_consumer.credentials.get("mtls_auth").is_none()
+        !stored_consumer.credentials.contains_key("mtls_auth")
     );
 }
 
