@@ -4448,16 +4448,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
         1
     );
     assert_eq!(view.grpc_deadline_plugins, vec!["grpc_deadline"]);
-    assert!(
-        view.backend_path_plugins
-            .iter()
-            .any(|name| name == "grpc_method_router")
-    );
-    assert!(
-        view.backend_path_plugins
-            .iter()
-            .any(|name| name == "grpc_deadline")
-    );
+    assert_eq!(view.backend_path_plugins, vec!["grpc_method_router"]);
 
     let merged_names = cache
         .get_plugins("p1")
