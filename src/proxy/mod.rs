@@ -16976,6 +16976,12 @@ async fn handle_proxy_request_inner(
             bodyless => bodyless,
         };
     }
+    // Build the lightweight mutable hook context before `proxy_headers` may
+    // borrow `ctx.headers`. The selected dispatch branch takes this one context;
+    // early-prepared bodies already ran their transform/final hooks above.
+    let mut deferred_body_hook_ctx = (!request_body_prepared
+        && needs_final_request_body_context)
+        .then(|| ctx.clone_for_final_request_body_hooks());
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
@@ -17433,11 +17439,7 @@ async fn handle_proxy_request_inner(
             );
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
-            let mut body_hook_ctx = if needs_final_request_body_context {
-                Some(ctx.clone_for_final_request_body_hooks())
-            } else {
-                None
-            };
+            let mut body_hook_ctx = deferred_body_hook_ctx.take();
             let final_body_result = run_final_request_body_hooks(
                 &plugins,
                 body_hook_ctx.as_mut(),
@@ -19853,11 +19855,7 @@ async fn handle_proxy_request_inner(
         let mut final_upstream_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
-        let mut body_hook_ctx = if needs_final_request_body_context {
-            Some(ctx.clone_for_final_request_body_hooks())
-        } else {
-            None
-        };
+        let mut body_hook_ctx = deferred_body_hook_ctx.take();
         let initial_dispatch = proxy_to_backend(
             &state,
             &proxy,
@@ -20247,11 +20245,7 @@ async fn handle_proxy_request_inner(
         }
         (result, current_cb_target_key, final_upstream_target)
     } else {
-        let mut body_hook_ctx = if needs_final_request_body_context {
-            Some(ctx.clone_for_final_request_body_hooks())
-        } else {
-            None
-        };
+        let mut body_hook_ctx = deferred_body_hook_ctx.take();
         let dispatch = proxy_to_backend(
             &state,
             &proxy,
