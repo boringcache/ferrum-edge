@@ -144,10 +144,6 @@ pub mod _test_support {
             }
         }
 
-        pub fn observe(&self) -> u64 {
-            self.transition.load()
-        }
-
         pub fn begin_structural_reset(&self) -> AdaptiveConcurrencyResetToken {
             AdaptiveConcurrencyResetToken {
                 reset: self.transition.begin_structural_reset(),
@@ -160,17 +156,8 @@ pub mod _test_support {
                 .map(|reset| AdaptiveConcurrencyResetToken { reset })
         }
 
-        pub fn try_begin_observed_drain_reset(
-            &self,
-            observed: u64,
-        ) -> Option<AdaptiveConcurrencyResetToken> {
-            self.transition
-                .try_begin_drain_reset(observed)
-                .map(|reset| AdaptiveConcurrencyResetToken { reset })
-        }
-
-        pub fn finish_reset(&self, reset: AdaptiveConcurrencyResetToken, drain: bool) -> bool {
-            self.transition.finish_reset(reset.reset, drain)
+        pub fn finish_reset(&self, reset: AdaptiveConcurrencyResetToken) -> bool {
+            self.transition.finish_reset(reset.reset)
         }
 
         pub fn is_active(&self) -> bool {

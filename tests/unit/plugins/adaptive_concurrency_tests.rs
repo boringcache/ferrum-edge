@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -151,86 +151,55 @@ fn assert_rejected(decision: BackendAdmissionDecision) {
     }
 }
 
+fn assert_generation_handoff_rejected_without_headers(decision: BackendAdmissionDecision) {
+    match decision {
+        BackendAdmissionDecision::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert!(
+                !headers.contains_key("x-adaptive-concurrency-limit"),
+                "a generation handoff has no truthful per-target limit"
+            );
+            assert!(
+                !headers.contains_key("x-adaptive-concurrency-inflight"),
+                "a generation handoff has no truthful per-target in-flight count"
+            );
+        }
+        _ => panic!("retired generation should be rejected"),
+    }
+}
+
 #[test]
-fn adaptive_concurrency_newer_writer_wins_after_drain_observation() {
-    let transition = Arc::new(AdaptiveConcurrencyTransitionHarness::new());
-
-    let first_writer = transition.begin_structural_reset();
-    assert!(transition.finish_reset(first_writer, true));
-    let request_observation = transition.observe();
-
-    // Deterministically place the newer writer after the request's DRAINING
-    // observation and before that request can claim/reset/reactivate it.
-    let writer_transition = Arc::clone(&transition);
-    let (writer_claimed_tx, writer_claimed_rx) = mpsc::sync_channel(0);
-    let writer = thread::spawn(move || {
-        let newer_writer = writer_transition.begin_structural_reset();
-        writer_claimed_tx
-            .send(newer_writer)
-            .expect("request side should receive the claimed writer epoch");
-    });
-    let newer_writer = writer_claimed_rx
-        .recv()
-        .expect("newer writer should claim its reset epoch");
-    writer
-        .join()
-        .expect("newer structural writer should not panic");
+fn adaptive_concurrency_structural_reset_owner_is_exclusive() {
+    let transition = AdaptiveConcurrencyTransitionHarness::new();
+    let writer = transition.begin_structural_reset();
     assert!(
-        transition
-            .try_begin_observed_drain_reset(request_observation)
-            .is_none(),
-        "a stale drain observation must not claim a newer writer's reset epoch"
+        transition.try_begin_structural_reset().is_none(),
+        "a second writer must not replace the active reset owner"
     );
     assert!(
         !transition.is_active(),
-        "the newer structural writer must remain fail-closed until it commits"
+        "admission must remain fail-closed until the reset owner commits"
     );
-    assert!(transition.finish_reset(newer_writer, false));
+    assert!(transition.finish_reset(writer));
     assert!(transition.is_active());
 }
 
 #[test]
-fn adaptive_concurrency_drain_reset_owner_cannot_be_overwritten_by_newer_writer() {
-    let transition = Arc::new(AdaptiveConcurrencyTransitionHarness::new());
-    let first_writer = transition.begin_structural_reset();
-    assert!(transition.finish_reset(first_writer, true));
-
-    let observed = transition.observe();
-    let request_reset = transition
-        .try_begin_observed_drain_reset(observed)
-        .expect("the request should own the observed drain epoch");
-
-    // Force a newer writer to attempt its claim while the request owns the
-    // exact RESETTING epoch. Unlike the old unconditional store, it cannot
-    // replace that ownership with an indistinguishable state value.
-    let writer_transition = Arc::clone(&transition);
-    let writer = thread::spawn(move || writer_transition.try_begin_structural_reset().is_some());
-    assert!(
-        !writer
-            .join()
-            .expect("newer structural writer should not panic"),
-        "a newer writer must wait for the exact reset owner to publish"
-    );
-    assert!(!transition.is_active());
-    assert!(transition.finish_reset(request_reset, false));
-
-    let newer_writer = transition.begin_structural_reset();
-    assert!(!transition.is_active());
-    assert!(transition.finish_reset(newer_writer, false));
-    assert!(transition.is_active());
-}
-
-#[test]
-fn adaptive_concurrency_ordinary_drain_completion_reactivates_its_exact_epoch() {
+fn adaptive_concurrency_stale_reset_token_cannot_reactivate_newer_writer() {
     let transition = AdaptiveConcurrencyTransitionHarness::new();
-    let writer = transition.begin_structural_reset();
-    assert!(transition.finish_reset(writer, true));
-
-    let observed = transition.observe();
-    let drain_reset = transition
-        .try_begin_observed_drain_reset(observed)
-        .expect("the unchanged draining epoch should be claimable");
-    assert!(transition.finish_reset(drain_reset, false));
+    let first_writer = transition.begin_structural_reset();
+    assert!(transition.finish_reset(first_writer));
+    let newer_writer = transition.begin_structural_reset();
+    assert!(
+        !transition.finish_reset(first_writer),
+        "an older epoch token must not reactivate a newer reset"
+    );
+    assert!(!transition.is_active());
+    assert!(transition.finish_reset(newer_writer));
     assert!(transition.is_active());
 }
 
@@ -1143,7 +1112,8 @@ fn adaptive_concurrency_structural_config_change_does_not_wait_for_old_permits()
             "min_limit": 1,
             "initial_limit": 2,
             "max_limit": 2,
-            "shadow_mode": true
+            "shadow_mode": true,
+            "expose_headers": true
         }),
     );
     let cache = PluginCache::new(&config).expect("initial cache should build");
@@ -1159,7 +1129,11 @@ fn adaptive_concurrency_structural_config_change_does_not_wait_for_old_permits()
     // The replacement has an independent tracking space. A long-lived permit
     // from the retired space must not pin the structural handoff.
     let new_generation = expect_admitted(acquire_from_cache(&cache, &reloaded));
-    assert_rejected(acquire_from_plugin(&old_view, &config.proxies[0], None));
+    assert_generation_handoff_rejected_without_headers(acquire_from_plugin(
+        &old_view,
+        &config.proxies[0],
+        None,
+    ));
     drop(new_generation);
     drop(held);
     drop(old_view);
@@ -1511,7 +1485,8 @@ fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
             "min_limit": 1,
             "initial_limit": 2,
             "max_limit": 2,
-            "shadow_mode": false
+            "shadow_mode": true,
+            "expose_headers": true
         }),
     );
     config.proxies[0].upstream_id = Some("upstream-1".to_string());
@@ -1533,9 +1508,10 @@ fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
     );
     config.resolve_dispatch_port_overrides();
     let cache = PluginCache::new(&config).expect("initial cache should build");
+    let retired_view = adaptive_plugin_from_cache(&cache);
     let first_target = config.upstreams[0].targets[0].clone();
     let held = expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+        &retired_view,
         &config.proxies[0],
         Some(&first_target),
     ));
@@ -1552,21 +1528,28 @@ fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
         .expect("effective upstream port lane change should publish");
 
     let second_target = &reloaded.upstreams[0].targets[1];
+    assert_generation_handoff_rejected_without_headers(acquire_from_plugin(
+        &retired_view,
+        &config.proxies[0],
+        Some(&first_target),
+    ));
+    let replacement_view = adaptive_plugin_from_cache(&cache);
     let first_replacement = expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+        &replacement_view,
         &reloaded.proxies[0],
         Some(second_target),
     ));
     let second_replacement = expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+        &replacement_view,
         &reloaded.proxies[0],
         Some(second_target),
     ));
-    assert_rejected(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+    let shadow_replacement = expect_admitted(acquire_from_plugin(
+        &replacement_view,
         &reloaded.proxies[0],
         Some(second_target),
     ));
+    drop(shadow_replacement);
     drop(first_replacement);
     drop(second_replacement);
     drop(held);
@@ -1930,7 +1913,8 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
             "min_limit": 1,
             "initial_limit": 2,
             "max_limit": 2,
-            "shadow_mode": false
+            "shadow_mode": true,
+            "expose_headers": true
         }),
     );
     config.plugin_configs.push(
@@ -1983,6 +1967,7 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
         &effective_proxy,
         None,
     )));
+    let retired_view = adaptive_plugin_from_cache(&cache);
 
     let mut replacement = normalized_equivalent.clone();
     replacement.plugin_configs[1].config["rules"][0]["destination"]["backend_tls"]["sni"] =
@@ -1995,21 +1980,28 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
             false,
         )
         .expect("changed TLS identity should publish");
+    assert_generation_handoff_rejected_without_headers(acquire_from_plugin(
+        &retired_view,
+        &effective_proxy,
+        None,
+    ));
+    let replacement_view = adaptive_plugin_from_cache(&cache);
     let first_replacement = expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+        &replacement_view,
         &effective_proxy,
         None,
     ));
     let second_replacement = expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+        &replacement_view,
         &effective_proxy,
         None,
     ));
-    assert_rejected(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
+    let shadow_replacement = expect_admitted(acquire_from_plugin(
+        &replacement_view,
         &effective_proxy,
         None,
     ));
+    drop(shadow_replacement);
     drop(first_replacement);
     drop(second_replacement);
     drop(held);

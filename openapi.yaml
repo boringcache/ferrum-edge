@@ -13546,11 +13546,11 @@ components:
         shadow_mode:
           type: boolean
           default: false
-          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit.
+          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. Retired cache/load-balancer views and requests crossing a structural generation handoff still fail closed so they cannot repopulate the replacement tracking space.
         expose_headers:
           type: boolean
           default: false
-          description: Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on rejection responses.
+          description: Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Generation-handoff rejections omit them because no truthful per-target limit or in-flight value exists.
 
     IpRestrictionConfig:
       type: object

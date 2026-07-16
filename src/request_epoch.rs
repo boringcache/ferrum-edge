@@ -1058,8 +1058,20 @@ mod tests {
         let replacement_target =
             replacement_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
         match acquire(&initial_epoch, &first_target) {
-            BackendAdmissionDecision::Reject { status_code, .. } => {
-                assert_eq!(status_code, 503)
+            BackendAdmissionDecision::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 503);
+                assert!(
+                    !headers.contains_key("x-adaptive-concurrency-limit"),
+                    "a retired LB view has no truthful per-target limit"
+                );
+                assert!(
+                    !headers.contains_key("x-adaptive-concurrency-inflight"),
+                    "a retired LB view has no truthful per-target in-flight count"
+                );
             }
             _ => panic!("a retired load-balancer view must not recreate the old target"),
         }
@@ -1109,8 +1121,20 @@ mod tests {
         let newest_epoch = store.load();
         let newest_target = newest_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
         match acquire(&replacement_epoch, &replacement_target) {
-            BackendAdmissionDecision::Reject { status_code, .. } => {
-                assert_eq!(status_code, 503)
+            BackendAdmissionDecision::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 503);
+                assert!(
+                    !headers.contains_key("x-adaptive-concurrency-limit"),
+                    "the middle retired LB view must omit a per-target limit"
+                );
+                assert!(
+                    !headers.contains_key("x-adaptive-concurrency-inflight"),
+                    "the middle retired LB view must omit a per-target in-flight count"
+                );
             }
             _ => panic!("the middle load-balancer view must stay retired"),
         }

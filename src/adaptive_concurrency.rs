@@ -21,11 +21,10 @@ use crate::plugins::{BackendAdmissionOutcome, BackendAdmissionPermit};
 const EWMA_PREVIOUS_WEIGHT: u64 = 8;
 const EWMA_SAMPLE_WEIGHT: u64 = 2;
 const EWMA_WEIGHT_SUM: u64 = EWMA_PREVIOUS_WEIGHT + EWMA_SAMPLE_WEIGHT;
-const POLICY_STATE_BITS: u32 = 2;
+const POLICY_STATE_BITS: u32 = 1;
 const POLICY_STATE_MASK: u64 = (1_u64 << POLICY_STATE_BITS) - 1;
 const POLICY_ACTIVE: u64 = 0;
-const POLICY_DRAINING: u64 = 1;
-const POLICY_RESETTING: u64 = 2;
+const POLICY_RESETTING: u64 = 1;
 const MAX_POLICY_TRANSITION_EPOCH: u64 = u64::MAX >> POLICY_STATE_BITS;
 
 #[derive(Clone, Copy)]
@@ -36,10 +35,10 @@ pub(crate) struct AdaptiveConcurrencyResetEpoch {
 
 /// Epoch-tagged structural lifecycle.
 ///
-/// The state and its reset epoch share one atomic word so a drain completer can
-/// reactivate only the exact epoch it claimed. A structural writer may claim
-/// `ACTIVE` or `DRAINING`, but never overwrite a `RESETTING` owner; this keeps a
-/// stale map clear from crossing a newer writer's clear/commit boundary.
+/// The state and its reset epoch share one atomic word so only the exact reset
+/// owner can reactivate admission. A structural writer never overwrites a
+/// `RESETTING` owner; this keeps a stale map rotation from crossing a newer
+/// writer's commit boundary.
 pub(crate) struct AdaptiveConcurrencyPolicyTransition {
     word: AtomicU64,
 }
@@ -53,10 +52,6 @@ impl AdaptiveConcurrencyPolicyTransition {
 
     pub(crate) fn is_active(&self) -> bool {
         policy_transition_state(self.word.load(Ordering::Acquire)) == POLICY_ACTIVE
-    }
-
-    pub(crate) fn load(&self) -> u64 {
-        self.word.load(Ordering::Acquire)
     }
 
     /// Claim a new structural reset epoch. Reset ownership is exclusive: a
@@ -81,7 +76,7 @@ impl AdaptiveConcurrencyPolicyTransition {
         }
         let current_epoch = policy_transition_epoch(observed);
         let (next_epoch, can_reactivate) = if current_epoch == MAX_POLICY_TRANSITION_EPOCH {
-            // More than 2^62 structural resets cannot occur in a process in
+            // More than 2^63 structural resets cannot occur in a process in
             // practice. If the counter is nevertheless exhausted, claim the
             // reset but leave the lifecycle fail-closed rather than permit an
             // ABA reactivation with a reused epoch.
@@ -104,45 +99,16 @@ impl AdaptiveConcurrencyPolicyTransition {
             })
     }
 
-    /// Upgrade the exact observed draining epoch to exclusive reset ownership.
-    /// If a newer writer won after the observation, this CAS fails without
-    /// disturbing that writer's epoch.
-    pub(crate) fn try_begin_drain_reset(
-        &self,
-        observed: u64,
-    ) -> Option<AdaptiveConcurrencyResetEpoch> {
-        if policy_transition_state(observed) != POLICY_DRAINING {
-            return None;
-        }
-        let resetting_word =
-            policy_transition_word(policy_transition_epoch(observed), POLICY_RESETTING);
-        self.word
-            .compare_exchange(
-                observed,
-                resetting_word,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok()
-            .map(|_| AdaptiveConcurrencyResetEpoch {
-                resetting_word,
-                can_reactivate: true,
-            })
-    }
-
-    /// Release exclusive reset ownership to either active admission or a drain.
+    /// Release exclusive reset ownership to active admission.
     /// The exact epoch CAS is the publication edge for the completed map clear.
-    pub(crate) fn finish_reset(&self, reset: AdaptiveConcurrencyResetEpoch, drain: bool) -> bool {
+    pub(crate) fn finish_reset(&self, reset: AdaptiveConcurrencyResetEpoch) -> bool {
         if !reset.can_reactivate {
             return false;
         }
-        let next_state = if drain {
-            POLICY_DRAINING
-        } else {
-            POLICY_ACTIVE
-        };
-        let next =
-            policy_transition_word(policy_transition_epoch(reset.resetting_word), next_state);
+        let next = policy_transition_word(
+            policy_transition_epoch(reset.resetting_word),
+            POLICY_ACTIVE,
+        );
         self.word
             .compare_exchange(
                 reset.resetting_word,
@@ -285,9 +251,6 @@ struct AdaptiveConcurrencyPolicyLifecycle {
     /// compatible plugin view must use these bounds instead of reviving its
     /// retired minimum, initial limit, key cap, or shadow-mode setting.
     active_config: ArcSwapOption<AdaptiveConcurrencyPolicyConfig>,
-    /// Permits across every target key. This is used only as a cold-generation
-    /// transition barrier; ordinary admission remains target-local.
-    total_in_flight: AtomicU64,
     /// Feedback callbacks that linearized under the active generation. Reload
     /// waits for this short synchronous critical section before clamping and
     /// publishing replacement policy bounds.
@@ -319,7 +282,6 @@ impl AdaptiveConcurrencyPolicyLifecycle {
             pending_generation: AtomicU64::new(0),
             pending_requires_reset: AtomicBool::new(false),
             active_config: ArcSwapOption::empty(),
-            total_in_flight: AtomicU64::new(0),
             feedback_in_progress: AtomicU64::new(0),
             feedback_blocked: AtomicBool::new(false),
             transition: AdaptiveConcurrencyPolicyTransition::new(),
@@ -408,13 +370,13 @@ impl AdaptiveConcurrencyLimiter {
         lb_generation: u64,
     ) -> Result<Arc<AdaptiveConcurrencyPermit>, AdaptiveConcurrencyLimitExceeded> {
         'admission: loop {
-            // Pin one target/accounting domain before reserving the policy
-            // slot. Structural publication can then detach this entire space
-            // without an old admission repopulating the replacement map.
+            // Pin one target/accounting domain before validating generation
+            // ownership. Structural publication can then detach this entire
+            // space without an old admission repopulating the replacement map.
             let tracking_space = self.tracking_space.load();
             let (config, config_generation) =
                 self.admission_config(generation, Arc::clone(&request_config));
-            self.reserve_policy_slot(generation, lb_generation, &config)?;
+            self.ensure_policy_generation_admitted(generation, lb_generation)?;
             let key = build_key(
                 self.resolve_scope(&tracking_space, proxy, config.key_by),
                 proxy,
@@ -423,27 +385,26 @@ impl AdaptiveConcurrencyLimiter {
             let state = match tracking_space.inner.entry(key) {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
                 Entry::Vacant(entry) => {
-                    match self.reserve_key_slot(&tracking_space, config.max_tracked_keys) {
-                        Ok(()) => {
-                            let state =
-                                Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
-                            entry.insert(Arc::clone(&state));
-                            state
-                        }
-                        Err(_) => {
-                            // Key-cardinality cap reached. Fail OPEN with a per-request,
-                            // untracked state rather than rejecting: `max_tracked_keys`
-                            // only bounds the limiter's own memory, so a target beyond
-                            // the cap must still be admitted (never black-holed by a
-                            // blanket 503), and `shadow_mode` must never reject at all.
-                            // This state is NOT inserted into the map (memory stays
-                            // bounded) and dies with the permit, so overflow targets run
-                            // without adaptive limiting until the policy is removed and
-                            // recreated (or a structural key-space change resets it).
-                            // Starting at `in_flight = 0` it always admits below.
-                            drop(entry);
-                            Arc::new(AdaptiveConcurrencyState::new(config.initial_limit))
-                        }
+                    if self.reserve_key_slot(&tracking_space, config.max_tracked_keys) {
+                        let state =
+                            Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
+                        entry.insert(Arc::clone(&state));
+                        state
+                    } else {
+                        // Key-cardinality cap reached. Fail OPEN with a per-request,
+                        // untracked state rather than rejecting: `max_tracked_keys`
+                        // only bounds the limiter's own memory, so a target beyond
+                        // the cap must still be admitted (never black-holed by a
+                        // blanket 503). `shadow_mode` likewise stays fail-open for
+                        // current-generation capacity decisions; the separate
+                        // generation-ownership checks still fail closed.
+                        // This state is NOT inserted into the map (memory stays
+                        // bounded) and dies with the permit, so overflow targets run
+                        // without adaptive limiting until the policy is removed and
+                        // recreated (or a structural key-space change resets it).
+                        // Starting at `in_flight = 0` it always admits below.
+                        drop(entry);
+                        Arc::new(AdaptiveConcurrencyState::new(config.initial_limit))
                     }
                 }
             };
@@ -464,17 +425,14 @@ impl AdaptiveConcurrencyLimiter {
                     let tracking_space_current = self.tracking_space_is_current(&tracking_space);
                     let config_current = self.admission_config_current(config_generation);
                     if !generation_admitted || !tracking_space_current {
-                        self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
-                        return Err(self.policy_transition_rejection(&config));
+                        return Err(self.generation_handoff_rejection());
                     }
                     if !config_current {
-                        self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
                         self.clamp_to_active_config(&state);
                         continue 'admission;
                     }
                     state.rejections.fetch_add(1, Ordering::Relaxed);
-                    self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
-                    return Err(AdaptiveConcurrencyLimitExceeded {
+                    return Err(AdaptiveConcurrencyLimitExceeded::TargetLimit {
                         current_in_flight: current,
                         limit,
                         expose_headers: config.expose_headers,
@@ -499,12 +457,11 @@ impl AdaptiveConcurrencyLimiter {
                         let config_current = self.admission_config_current(config_generation);
                         if !generation_admitted || !tracking_space_current || !config_current {
                             state.in_flight.fetch_sub(1, Ordering::AcqRel);
-                            self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
                             if generation_admitted && tracking_space_current && !config_current {
                                 self.clamp_to_active_config(&state);
                                 continue 'admission;
                             }
-                            return Err(self.policy_transition_rejection(&config));
+                            return Err(self.generation_handoff_rejection());
                         }
                         let feedback_epoch = state.feedback_epoch.load(Ordering::Acquire);
                         return Ok(Arc::new(AdaptiveConcurrencyPermit {
@@ -571,51 +528,15 @@ impl AdaptiveConcurrencyLimiter {
             )));
     }
 
-    fn reserve_policy_slot(
+    fn ensure_policy_generation_admitted(
         &self,
         generation: u64,
         lb_generation: u64,
-        config: &AdaptiveConcurrencyConfig,
     ) -> Result<(), AdaptiveConcurrencyLimitExceeded> {
-        loop {
-            if !self.policy_generation_current(generation, lb_generation) {
-                return Err(self.policy_transition_rejection(config));
-            }
-
-            let observed_transition = self.policy.transition.load();
-            match policy_transition_state(observed_transition) {
-                POLICY_ACTIVE => {}
-                POLICY_DRAINING => {
-                    if self.policy.total_in_flight.load(Ordering::Acquire) != 0 {
-                        return Err(self.policy_transition_rejection(config));
-                    }
-                    let Some(reset) = self
-                        .policy
-                        .transition
-                        .try_begin_drain_reset(observed_transition)
-                    else {
-                        continue;
-                    };
-                    // No permit from either generation exists once the total
-                    // reaches zero. Clear the retired key space before making
-                    // the replacement policy visible to competing acquirers.
-                    // The reset epoch remains exclusively owned across the
-                    // clears, so a newer writer cannot publish over them.
-                    self.reset_tracking_space();
-                    if !self.policy.transition.finish_reset(reset, false) {
-                        // Epoch exhaustion or an invariant violation stays
-                        // fail-closed; retrying can never reopen another epoch.
-                        continue;
-                    }
-                }
-                _ => return Err(self.policy_transition_rejection(config)),
-            }
-
-            self.policy.total_in_flight.fetch_add(1, Ordering::AcqRel);
-            if self.policy_generation_admitted(generation, lb_generation) {
-                return Ok(());
-            }
-            self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
+        if self.policy_generation_admitted(generation, lb_generation) {
+            Ok(())
+        } else {
+            Err(self.generation_handoff_rejection())
         }
     }
 
@@ -654,17 +575,8 @@ impl AdaptiveConcurrencyLimiter {
                     .load(Ordering::Acquire))
     }
 
-    fn policy_transition_rejection(
-        &self,
-        config: &AdaptiveConcurrencyConfig,
-    ) -> AdaptiveConcurrencyLimitExceeded {
-        AdaptiveConcurrencyLimitExceeded {
-            current_in_flight: self.policy.total_in_flight.load(Ordering::Acquire),
-            limit: config.min_limit,
-            // A structural transition is policy-wide: neither the aggregate
-            // count nor any configured bound is a truthful per-target value.
-            expose_headers: false,
-        }
+    fn generation_handoff_rejection(&self) -> AdaptiveConcurrencyLimitExceeded {
+        AdaptiveConcurrencyLimitExceeded::GenerationHandoff
     }
 
     /// Stage a fully validated generation immediately before its plugin-cache
@@ -683,8 +595,9 @@ impl AdaptiveConcurrencyLimiter {
     }
 
     /// Commit the staged generation immediately after its cache snapshot is
-    /// published. Already-linearized feedback completes before replacement
-    /// bounds are clamped; later retired feedback is ignored.
+    /// published. Already-linearized feedback completes before retained bounds
+    /// are clamped or a structural tracking space rotates; later retired
+    /// feedback is ignored.
     pub(crate) fn commit_policy_generation(
         &self,
         generation: u64,
@@ -721,8 +634,8 @@ impl AdaptiveConcurrencyLimiter {
 
         let structural_reset = if reset_tracking_space {
             // Exclusively block admission before retiring the older key-space
-            // generations. The epoch claim waits for an in-progress drain
-            // completer rather than stealing its RESETTING state.
+            // generations. The epoch claim waits for an in-progress structural
+            // writer rather than stealing its RESETTING state.
             let reset = self.policy.transition.begin_structural_reset();
             self.policy
                 .minimum_admission_generation
@@ -773,18 +686,26 @@ impl AdaptiveConcurrencyLimiter {
                 .store(false, Ordering::Release);
         }
 
-        // Learned state and in-flight accounting survive compatible config
-        // changes, but the replacement bounds become authoritative at commit.
-        let tracking_space = self.tracking_space.load();
-        for entry in &tracking_space.inner {
-            clamp_limit(&entry.value().limit, config.min_limit, config.max_limit);
-        }
         if let Some(reset) = structural_reset {
+            // Structural commits retire this entire space, so scanning up to
+            // max_tracked_keys entries to clamp it would only extend the
+            // fail-closed reset window. The mutually exclusive branch below is
+            // the only commit path that clamps retained target state.
+            debug_assert!(reset_tracking_space);
             self.reset_tracking_space();
             // Retired permits own their detached target states directly. The
             // replacement can therefore reopen immediately without waiting
             // for those permits, while retired generation views stay rejected.
-            let _ = self.policy.transition.finish_reset(reset, false);
+            let _ = self.policy.transition.finish_reset(reset);
+        } else {
+            debug_assert!(!reset_tracking_space);
+            // Learned state and in-flight accounting survive compatible config
+            // changes, but the replacement bounds become authoritative at
+            // commit.
+            let tracking_space = self.tracking_space.load();
+            for entry in &tracking_space.inner {
+                clamp_limit(&entry.value().limit, config.min_limit, config.max_limit);
+            }
         }
         self.policy.feedback_blocked.store(false, Ordering::Release);
     }
@@ -871,7 +792,7 @@ impl AdaptiveConcurrencyLimiter {
             self.reset_tracking_space();
             // An old service-discovery permit remains attached to the retired
             // space and cannot pin or repopulate the replacement target map.
-            let _ = self.policy.transition.finish_reset(reset, false);
+            let _ = self.policy.transition.finish_reset(reset);
         }
         self.policy.feedback_blocked.store(false, Ordering::Release);
     }
@@ -880,17 +801,11 @@ impl AdaptiveConcurrencyLimiter {
         &self,
         tracking_space: &AdaptiveConcurrencyTrackingSpace,
         max_tracked_keys: usize,
-    ) -> Result<(), AdaptiveConcurrencyLimitExceeded> {
+    ) -> bool {
         let mut current = tracking_space.tracked_keys.load(Ordering::Acquire);
         loop {
             if current >= max_tracked_keys {
-                return Err(AdaptiveConcurrencyLimitExceeded {
-                    current_in_flight: current as u64,
-                    limit: max_tracked_keys as u64,
-                    // Key-cap errors are internal sentinels: overflow targets
-                    // fail open and this value is never rendered to a client.
-                    expose_headers: false,
-                });
+                return false;
             }
             match tracking_space.tracked_keys.compare_exchange_weak(
                 current,
@@ -898,7 +813,7 @@ impl AdaptiveConcurrencyLimiter {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => return true,
                 Err(observed) => current = observed,
             }
         }
@@ -992,14 +907,16 @@ impl AdaptiveConcurrencySnapshot {
 }
 
 #[derive(Clone, Debug)]
-pub struct AdaptiveConcurrencyLimitExceeded {
-    pub current_in_flight: u64,
-    pub limit: u64,
-    /// Whether a genuine per-target limit rejection should expose its target
-    /// values. Policy-wide generation/reset transitions always set this false;
-    /// a request pinned to an older compatible plugin view otherwise uses the
-    /// active configuration's header policy.
-    pub expose_headers: bool,
+pub enum AdaptiveConcurrencyLimitExceeded {
+    TargetLimit {
+        current_in_flight: u64,
+        limit: u64,
+        /// A request pinned to an older compatible plugin view uses the active
+        /// configuration's header policy for genuine target-limit rejections.
+        expose_headers: bool,
+    },
+    /// Policy/LB generation handoffs have no truthful per-target values.
+    GenerationHandoff,
 }
 
 pub struct AdaptiveConcurrencyPermit {
@@ -1155,7 +1072,6 @@ impl BackendAdmissionPermit for AdaptiveConcurrencyPermit {
 impl Drop for AdaptiveConcurrencyPermit {
     fn drop(&mut self) {
         self.state.in_flight.fetch_sub(1, Ordering::AcqRel);
-        self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
