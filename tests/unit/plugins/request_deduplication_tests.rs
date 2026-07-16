@@ -588,7 +588,14 @@ async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
             "POST".to_string(),
             "/api".to_string(),
         );
-        let mut retry_headers = HashMap::from([(header_name.to_string(), key.to_string())]);
+        let mut retry_headers = HashMap::from([
+            ("idempotency-key-a".to_string(), "owner-a".to_string()),
+            ("idempotency-key-b".to_string(), "owner-b".to_string()),
+        ]);
+        assert_eq!(
+            retry_headers.get(header_name).map(String::as_str),
+            Some(key)
+        );
         match plugin
             .before_proxy(&mut retry_ctx, &mut retry_headers)
             .await
