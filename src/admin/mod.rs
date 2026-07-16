@@ -36,7 +36,7 @@ use crate::admin::backup::{
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
-    AtomicClearVerification, BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
+    BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
     MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, NamespaceResourceCounts, SnapshotDataIntegrityError,
     classify_atomic_clear_verification, is_mtls_dns_admission_unavailable,
 };
