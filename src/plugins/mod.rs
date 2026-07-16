@@ -1247,6 +1247,10 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            // Final request-body hooks cannot observe or mutate the real CORS
+            // aggregate. CORS has no body hook, and only metadata is copied
+            // back from this compatibility context.
+            cors_state: cors::CorsRequestState::default(),
             // Claim-header staging stays on the real request context. Final
             // body hooks never consume it, and copying raw claim values into a
             // compatibility clone would extend their lifetime unnecessarily.
