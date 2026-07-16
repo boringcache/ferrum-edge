@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
@@ -18,6 +18,7 @@ const SPEC_SOURCE_BODY: &str = r#"{"openapi":"3.1.0","info":{"title":"Ferrum"}}"
 struct StaticServer {
     port: u16,
     hits: Arc<AtomicUsize>,
+    h2c_probes: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -28,40 +29,66 @@ impl StaticServer {
             .expect("bind static server");
         let port = listener.local_addr().expect("static server addr").port();
         let hits = Arc::new(AtomicUsize::new(0));
+        let h2c_probes = Arc::new(AtomicUsize::new(0));
         let task_hits = Arc::clone(&hits);
+        let task_h2c_probes = Arc::clone(&h2c_probes);
         let task = tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
+                let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
                 let hits = Arc::clone(&task_hits);
+                let h2c_probes = Arc::clone(&task_h2c_probes);
                 tokio::spawn(async move {
-                    let mut request = vec![0_u8; 8_192];
-                    let Ok(Ok(read)) =
-                        tokio::time::timeout(Duration::from_secs(5), stream.read(&mut request))
-                            .await
+                    let mut reader = BufReader::new(stream);
+                    let mut request_line = Vec::with_capacity(128);
+                    let Ok(Ok(read)) = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        reader.read_until(b'\n', &mut request_line),
+                    )
+                    .await
                     else {
                         return;
                     };
                     if read == 0 {
                         return;
                     }
-                    hits.fetch_add(1, Ordering::SeqCst);
+                    // File-mode startup sends an HTTP/2 prior-knowledge preface
+                    // to each plaintext backend to populate the capability
+                    // registry even when pool warmup is disabled. Keep that
+                    // protocol probe separate from HTTP/1 requests routed by
+                    // the gateway so the assertions below measure only real
+                    // backend traffic.
+                    if request_line.starts_with(b"PRI * HTTP/2.0") {
+                        h2c_probes.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                    }
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
+                    let mut stream = reader.into_inner();
                     let _ = stream.write_all(response.as_bytes()).await;
                     let _ = stream.shutdown().await;
                 });
             }
         });
 
-        Self { port, hits, task }
+        Self {
+            port,
+            hits,
+            h2c_probes,
+            task,
+        }
     }
 
     fn hits(&self) -> usize {
         self.hits.load(Ordering::SeqCst)
+    }
+
+    fn h2c_probes(&self) -> usize {
+        self.h2c_probes.load(Ordering::SeqCst)
     }
 }
 
@@ -217,6 +244,17 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
         .wait_for_proxy_port(Duration::from_secs(10))
         .await
         .expect("proxy port ready");
+
+    // The binary harness disables pool warmup, so file-mode startup performs
+    // one asynchronous h2c capability probe against the shared backend. Wait
+    // for and classify that preface before asserting request-driven traffic;
+    // otherwise it races the first spec request and looks like a route leak.
+    let probe_deadline = Instant::now() + Duration::from_secs(5);
+    while backend.h2c_probes() == 0 && Instant::now() < probe_deadline {
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(backend.h2c_probes(), 1);
+    assert_eq!(backend.hits(), 0);
 
     let h1 = reqwest::Client::builder()
         .http1_only()
