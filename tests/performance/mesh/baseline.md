@@ -26,7 +26,8 @@ Each row below records the criterion-reported mean (and an estimate of the varia
 `IpRestriction::on_request_received` over 10,000 sparse exact IPv4 intervals.
 The authoritative client IP cache is initialized before timing so the result
 isolates the async plugin hook and compiled interval lookup. The hosted
-`Performance Regression Check` runs all four cases and retains Criterion output.
+`Performance Regression Check` runs all four cases, pairs each with a 100-rule
+same-run reference, enforces the guardrails below, and retains Criterion output.
 
 | Decision shape | Instances | Mean per iteration | Notes |
 |---|---:|---|---|
@@ -34,6 +35,13 @@ isolates the async plugin hook and compiled interval lookup. The hosted
 | Deny miss above every interval | 4 | _TBD_ | Supported multiple scoped-instance composition. |
 | Allow match in final interval | 1 | _TBD_ | High-address match. |
 | Allow match in final interval | 4 | _TBD_ | High-address match across multiple instances. |
+
+Hosted guardrails are intentionally generous and separate from the directional
+reference numbers in this file. For each decision shape and instance count, the
+10,000-rule Criterion mean must be at most 8x its 100-rule same-run mean and at
+most 10 microseconds per plugin instance. The self-relative limit detects a
+return to rule-count-proportional scans; the absolute ceiling also catches a
+catastrophic regression in the cached client-IP or constant-time hook overhead.
 
 ## slice_apply
 
