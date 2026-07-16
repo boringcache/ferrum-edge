@@ -889,8 +889,7 @@ impl Plugin for DeadlineCommittedObserver {
         response_headers: &HashMap<String, String>,
         _body: &[u8],
     ) {
-        self.calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if response_status == 200
             && response_headers
                 .get("x-deadline-decorated")
@@ -1540,8 +1539,14 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
 fn streaming_deadline_wraps_client_visible_body_after_inspection() {
     let source = include_str!("../../../src/proxy/mod.rs");
     for (arm, next_arm) in [
-        ("ResponseBody::StreamingH2(resp) => {", "ResponseBody::StreamingH3(h3_resp) => {"),
-        ("ResponseBody::StreamingH3(h3_resp) => {", "ResponseBody::Buffered(data) => {"),
+        (
+            "ResponseBody::StreamingH2(resp) => {",
+            "ResponseBody::StreamingH3(h3_resp) => {",
+        ),
+        (
+            "ResponseBody::StreamingH3(h3_resp) => {",
+            "ResponseBody::Buffered(data) => {",
+        ),
     ] {
         let body = source
             .split(arm)
@@ -1592,10 +1597,22 @@ fn generic_retry_backoff_uses_request_aware_grpc_deadline_response() {
 fn direct_h2_response_header_wait_uses_earliest_client_or_operator_deadline() {
     use ferrum_edge::_test_support::response_header_deadline_for_test;
 
-    assert_eq!(response_header_deadline_for_test(Some(500), 50), Some((false, 50)));
-    assert_eq!(response_header_deadline_for_test(Some(50), 500), Some((true, 50)));
-    assert_eq!(response_header_deadline_for_test(Some(50), 0), Some((true, 50)));
-    assert_eq!(response_header_deadline_for_test(None, 50), Some((false, 50)));
+    assert_eq!(
+        response_header_deadline_for_test(Some(500), 50),
+        Some((false, 50))
+    );
+    assert_eq!(
+        response_header_deadline_for_test(Some(50), 500),
+        Some((true, 50))
+    );
+    assert_eq!(
+        response_header_deadline_for_test(Some(50), 0),
+        Some((true, 50))
+    );
+    assert_eq!(
+        response_header_deadline_for_test(None, 50),
+        Some((false, 50))
+    );
     assert_eq!(response_header_deadline_for_test(None, 0), None);
 }
 
@@ -1610,8 +1627,7 @@ fn streaming_grpc_deadline_removes_backend_content_length_before_headers_commit(
     strip_content_length_for_streaming_grpc_deadline_for_test(&mut deadline_headers, true);
     assert!(!deadline_headers.contains_key("content-length"));
 
-    let mut unbounded_headers =
-        HashMap::from([("content-length".to_string(), "128".to_string())]);
+    let mut unbounded_headers = HashMap::from([("content-length".to_string(), "128".to_string())]);
     strip_content_length_for_streaming_grpc_deadline_for_test(&mut unbounded_headers, false);
     assert_eq!(
         unbounded_headers.get("content-length").map(String::as_str),

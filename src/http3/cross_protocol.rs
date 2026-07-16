@@ -119,8 +119,7 @@ use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::{record_backend_outcome, record_backend_outcome_no_conn_end};
 use crate::proxy::grpc_proxy::{
     self, GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
-    GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind,
-    proxy_grpc_request_from_bytes,
+    GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
     apply_response_headers, is_backend_response_strip_header, parse_connection_listed_headers,
@@ -3152,11 +3151,13 @@ where
                     )
                     .await
                 }
-                Ok(()) => crate::http3::stream_util::await_response_write_before_deadline(
-                    streaming.grpc_deadline_at,
-                    stream.finish(),
-                )
-                .await,
+                Ok(()) => {
+                    crate::http3::stream_util::await_response_write_before_deadline(
+                        streaming.grpc_deadline_at,
+                        stream.finish(),
+                    )
+                    .await
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = trailer_and_finish {
@@ -3173,12 +3174,11 @@ where
                 final_body_completed = false;
             }
         } else if had_trailers
-            && let Err(error) =
-                crate::http3::stream_util::await_response_write_before_deadline(
-                    streaming.grpc_deadline_at,
-                    stream.finish(),
-                )
-                .await
+            && let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
+                streaming.grpc_deadline_at,
+                stream.finish(),
+            )
+            .await
         {
             // Every trailer was hop-by-hop and got stripped to empty. The
             // map was non-empty on return, so stream_hyper_incoming left
@@ -4311,11 +4311,13 @@ where
                         )
                         .await
                     }
-                    Ok(()) => crate::http3::stream_util::await_response_write_before_deadline(
-                        grpc_deadline_at,
-                        stream.finish(),
-                    )
-                    .await,
+                    Ok(()) => {
+                        crate::http3::stream_util::await_response_write_before_deadline(
+                            grpc_deadline_at,
+                            stream.finish(),
+                        )
+                        .await
+                    }
                     Err(error) => Err(error),
                 };
                 if let Err(error) = trailer_and_finish {
@@ -5396,14 +5398,7 @@ async fn stream_hyper_incoming<S>(
     max_response_body_size_bytes: usize,
     response_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
-) -> (
-    u64,
-    bool,
-    bool,
-    Option<ErrorClass>,
-    Option<HeaderMap>,
-    bool,
-)
+) -> (u64, bool, bool, Option<ErrorClass>, Option<HeaderMap>, bool)
 where
     // Send-only: this loop writes the response (`send_data` / `finish` /
     // `abort_response_stream`) and never reads the request half, so it accepts
@@ -5606,12 +5601,11 @@ where
             // no trailers frame is needed, but the QUIC stream still must be
             // closed with FIN.
             if should_finish_h3_stream_without_trailers(trailers.as_ref())
-                && let Err(error) =
-                    crate::http3::stream_util::await_response_write_before_deadline(
-                        grpc_deadline_at,
-                        stream.finish(),
-                    )
-                    .await
+                && let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
+                    grpc_deadline_at,
+                    stream.finish(),
+                )
+                .await
             {
                 if matches!(
                     error,
@@ -5628,8 +5622,8 @@ where
         }
     }
 
-    let body_completed = clean_deadline_completion
-        || (body_error_class.is_none() && !client_disconnected);
+    let body_completed =
+        clean_deadline_completion || (body_error_class.is_none() && !client_disconnected);
     (
         bytes_streamed,
         body_completed,

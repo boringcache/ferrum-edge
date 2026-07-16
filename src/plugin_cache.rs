@@ -2489,8 +2489,7 @@ impl PluginCacheInner {
                 .get_initial_response_header_policy_plugins(proxy_id, protocol),
             initial_response_header_policy_names: self
                 .get_initial_response_header_policy_names(proxy_id, protocol),
-            response_committed_plugins: self
-                .get_response_committed_plugins(proxy_id, protocol),
+            response_committed_plugins: self.get_response_committed_plugins(proxy_id, protocol),
             capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),

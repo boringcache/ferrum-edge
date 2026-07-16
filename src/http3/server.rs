@@ -33,13 +33,13 @@ use crate::plugins::{
     normalize_response_body_for_inspection,
 };
 use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
+use crate::proxy::grpc_proxy::{
+    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+};
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
     is_proxy_generated_forwarding_header, parse_connection_listed_from_str_map,
     strip_response_hop_by_hop_trailers,
-};
-use crate::proxy::grpc_proxy::{
-    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
@@ -8382,12 +8382,11 @@ async fn dispatch_grpc_native_h3(
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC response: {}", e))?;
-    let response_header_write =
-        crate::http3::stream_util::await_response_write_before_deadline(
-            grpc_deadline_at,
-            stream.send_response(resp),
-        )
-        .await;
+    let response_header_write = crate::http3::stream_util::await_response_write_before_deadline(
+        grpc_deadline_at,
+        stream.send_response(resp),
+    )
+    .await;
     if let Err(write_error) = response_header_write {
         let (response_header_deadline_expired, response_header_client_disconnected) =
             match write_error {
@@ -10057,9 +10056,9 @@ async fn finalize_h3_upload_deadline_rejection(
     plugin_execution_ns: u64,
 ) -> Result<(), anyhow::Error> {
     ctx.mark_gateway_deadline_response_selected();
-    let Some(mut reject) = plugin_result_into_reject_parts(
-        crate::plugins::grpc_deadline_exceeded_plugin_result(),
-    ) else {
+    let Some(mut reject) =
+        plugin_result_into_reject_parts(crate::plugins::grpc_deadline_exceeded_plugin_result())
+    else {
         return Err(anyhow::anyhow!(
             "canonical gRPC deadline rejection could not be normalized"
         ));
@@ -10074,8 +10073,7 @@ async fn finalize_h3_upload_deadline_rejection(
         false,
     )
     .await;
-    let http_status =
-        StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_REQUEST);
+    let http_status = StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_REQUEST);
     run_h3_reject_response_committed_hooks(
         plugins,
         ctx,
@@ -10086,13 +10084,8 @@ async fn finalize_h3_upload_deadline_rejection(
         &reject.headers,
     )
     .await;
-    let log_status = h3_reject_log_status_and_metadata(
-        ctx,
-        flavor,
-        http_status,
-        &reject.body,
-        &reject.headers,
-    );
+    let log_status =
+        h3_reject_log_status_and_metadata(ctx, flavor, http_status, &reject.body, &reject.headers);
     log_rejected_request(
         plugins,
         ctx,
@@ -10293,12 +10286,8 @@ async fn finish_h3_grpc_stream_trailers_only(
             {
                 trailers.insert("grpc-status-details-bin", value);
             }
-            send_h3_grpc_trailers_and_finish_before_deadline(
-                stream,
-                trailers,
-                grpc_deadline_at,
-            )
-            .await
+            send_h3_grpc_trailers_and_finish_before_deadline(stream, trailers, grpc_deadline_at)
+                .await
         }
         None => match crate::http3::stream_util::await_response_write_before_deadline(
             grpc_deadline_at,

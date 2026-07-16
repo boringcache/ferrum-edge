@@ -860,11 +860,8 @@ async fn run_script(
                     let Some(sender) = current_body_sender.as_mut() else {
                         return Err("ExpectReset: no response stream is open".into());
                     };
-                    tokio::time::timeout(
-                        duration,
-                        std::future::poll_fn(|cx| sender.poll_reset(cx)),
-                    )
-                    .await
+                    tokio::time::timeout(duration, std::future::poll_fn(|cx| sender.poll_reset(cx)))
+                        .await
                 };
                 match reset {
                     Ok(Ok(_reason)) => {
@@ -875,9 +872,7 @@ async fn run_script(
                         return Err(format!("ExpectReset: polling reset failed: {error}"));
                     }
                     Err(_) => {
-                        return Err(format!(
-                            "ExpectReset: no stream reset within {duration:?}"
-                        ));
+                        return Err(format!("ExpectReset: no stream reset within {duration:?}"));
                     }
                 }
             }

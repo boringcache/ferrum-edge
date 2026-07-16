@@ -439,8 +439,10 @@ async fn ready_h3_terminal_status_can_finish_after_deadline_selection() {
         .checked_sub(std::time::Duration::from_millis(1))
         .expect("one millisecond before now is representable");
     assert!(
-        ferrum_edge::_test_support::ready_h3_terminal_write_wins_expired_deadline_for_test(deadline)
-            .await,
+        ferrum_edge::_test_support::ready_h3_terminal_write_wins_expired_deadline_for_test(
+            deadline
+        )
+        .await,
         "an immediately-ready status-4 trailer must retain the clean zero-DATA completion path"
     );
 }

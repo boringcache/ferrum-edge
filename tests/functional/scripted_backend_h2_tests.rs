@@ -960,16 +960,15 @@ async fn grpc_deadline_after_partial_data_resets_stream_and_preserves_backend_he
 
         let response = tokio::time::timeout(Duration::from_secs(4), async {
             if bidi {
-                client.bidi_with_headers(
-                    &format!("/grpc{method}"),
-                    Bytes::from_static(b"request remains open"),
-                    &[],
-                )
-                .await
-            } else {
                 client
-                    .unary(&format!("/grpc{method}"), Bytes::new())
+                    .bidi_with_headers(
+                        &format!("/grpc{method}"),
+                        Bytes::from_static(b"request remains open"),
+                        &[],
+                    )
                     .await
+            } else {
+                client.unary(&format!("/grpc{method}"), Bytes::new()).await
             }
         })
         .await

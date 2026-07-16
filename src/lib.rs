@@ -990,10 +990,7 @@ pub mod _test_support {
         deadline_enabled: bool,
     ) {
         let deadline = deadline_enabled.then(tokio::time::Instant::now);
-        crate::proxy::strip_content_length_for_streaming_grpc_deadline(
-            response_headers,
-            deadline,
-        );
+        crate::proxy::strip_content_length_for_streaming_grpc_deadline(response_headers, deadline);
     }
 
     /// Return true when an indefinitely stalled downstream H3 write is
@@ -1003,11 +1000,8 @@ pub mod _test_support {
     ) -> bool {
         let write = std::future::pending::<Result<(), ()>>();
         matches!(
-            crate::http3::stream_util::await_response_write_before_deadline(
-                Some(deadline),
-                write,
-            )
-            .await,
+            crate::http3::stream_util::await_response_write_before_deadline(Some(deadline), write,)
+                .await,
             Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
         )
     }
@@ -1072,10 +1066,7 @@ pub mod _test_support {
         )
         .map(|(deadline, source)| {
             (
-                matches!(
-                    source,
-                    crate::proxy::ResponseHeaderDeadlineSource::Client
-                ),
+                matches!(source, crate::proxy::ResponseHeaderDeadlineSource::Client),
                 deadline
                     .saturating_duration_since(read_started_at)
                     .as_millis(),
@@ -1121,11 +1112,7 @@ pub mod _test_support {
         body_bytes: Vec<u8>,
     ) -> Vec<u8> {
         crate::proxy::apply_request_body_plugins_with_context(
-            plugins,
-            None,
-            None,
-            headers,
-            body_bytes,
+            plugins, None, None, headers, body_bytes,
         )
         .await
     }

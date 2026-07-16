@@ -998,10 +998,7 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
         Some("p1"),
     );
     audit.priority_override = Some(125);
-    let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["audit"])],
-        vec![audit],
-    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
     let cache = PluginCache::new(&config).unwrap();
     let view = cache.request_view("p1", ProxyProtocol::Http);
 
@@ -1010,7 +1007,10 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
     );
     assert_eq!(view.response_committed_plugins().len(), 1);
-    assert_eq!(view.response_committed_plugins()[0].name(), "ai_transcript_audit");
+    assert_eq!(
+        view.response_committed_plugins()[0].name(),
+        "ai_transcript_audit"
+    );
     assert_eq!(view.response_committed_plugins()[0].priority(), 125);
     assert!(
         !cache
@@ -2952,10 +2952,7 @@ fn test_priority_override_delegates_rejection_replacement_capability() {
         Some("p1"),
     );
     audit.priority_override = Some(100);
-    let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["audit"])],
-        vec![audit],
-    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
     let cache = PluginCache::new(&config).unwrap();
     let plugins = cache.get_plugins("p1");
 

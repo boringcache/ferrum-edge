@@ -199,7 +199,8 @@ impl GrpcClient {
         body: Bytes,
         extra_headers: &[(&str, String)],
     ) -> Result<GrpcResponse, Box<dyn std::error::Error + Send + Sync>> {
-        self.request_with_headers(path, body, extra_headers, true).await
+        self.request_with_headers(path, body, extra_headers, true)
+            .await
     }
 
     /// Send the first message of a bidirectional RPC while deliberately

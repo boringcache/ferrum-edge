@@ -129,10 +129,10 @@ use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
     ProtocolSupport, RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
 };
+pub use self::body::ProxyBody;
 use self::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
 };
-pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::hbone_pool::{HboneConnectionPool, HbonePoolError};
 use self::http2_pool::Http2ConnectionPool;
@@ -3367,7 +3367,9 @@ pub(crate) async fn apply_request_body_plugins_with_context(
                     Err(_) => break,
                 }
             } else {
-                plugin.transform_request_body(&current, content_type, headers).await
+                plugin
+                    .transform_request_body(&current, content_type, headers)
+                    .await
             };
             if let Some(transformed) = transformed {
                 current = transformed;
@@ -14551,12 +14553,7 @@ async fn run_response_committed_hook_until_deadline(
     response_body: &[u8],
 ) -> bool {
     let deadline = ctx.grpc_deadline_at();
-    let hook = plugin.on_response_committed(
-        ctx,
-        response_status,
-        response_headers,
-        response_body,
-    );
+    let hook = plugin.on_response_committed(ctx, response_status, response_headers, response_body);
     let Some(deadline) = deadline else {
         hook.await;
         return true;
@@ -14624,12 +14621,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             .filter(|plugin| plugin.requires_response_committed_hook())
         {
             remaining
-                .on_response_committed(
-                    ctx,
-                    *response_status,
-                    response_headers,
-                    response_body,
-                )
+                .on_response_committed(ctx, *response_status, response_headers, response_body)
                 .await;
         }
         return true;
@@ -14966,13 +14958,8 @@ async fn build_finalized_upload_deadline_response(
     )
     .await;
     apply_grpc_reject_metadata(ctx, &reject);
-    let grpc_web_response = build_grpc_web_reject_response(
-        plugins,
-        ctx,
-        grpc_web_response_content_type,
-        &reject,
-    )
-    .await;
+    let grpc_web_response =
+        build_grpc_web_reject_response(plugins, ctx, grpc_web_response_content_type, &reject).await;
     let log_status = reject.http_status.as_u16();
     let response =
         grpc_web_response.unwrap_or_else(|| build_response_from_normalized_reject(reject));
@@ -15000,12 +14987,9 @@ async fn finalize_upload_deadline_rejection(
     original_request_path: Option<&str>,
     grpc_web_response_content_type: Option<&str>,
 ) -> Response<ProxyBody> {
-    let (response, log_status) = build_finalized_upload_deadline_response(
-        plugins,
-        ctx,
-        grpc_web_response_content_type,
-    )
-    .await;
+    let (response, log_status) =
+        build_finalized_upload_deadline_response(plugins, ctx, grpc_web_response_content_type)
+            .await;
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -19854,11 +19838,10 @@ async fn handle_proxy_request_inner(
                     .await
                     .0
                     {
-                        authoritative_trailers_only_terminal_metadata = Some(
-                            grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                        authoritative_trailers_only_terminal_metadata =
+                            Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
                                 &plugin_response_headers,
-                            ),
-                        );
+                            ));
                         response_trailers.clear();
                         buffered_initial_response_header_policy_state = None;
                     }
@@ -20252,9 +20235,7 @@ async fn handle_proxy_request_inner(
                 // Use a generic client-facing message to avoid leaking
                 // internal backend details (hostnames, DNS errors, etc.).
                 let msg = match &e {
-                    GrpcProxyError::ClientDeadlineExceeded(_) => {
-                        GATEWAY_DEADLINE_EXCEEDED_MESSAGE
-                    }
+                    GrpcProxyError::ClientDeadlineExceeded(_) => GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
                     _ if grpc_code == grpc_proxy::grpc_status::DEADLINE_EXCEEDED => {
                         "Backend deadline exceeded"
                     }
@@ -22108,10 +22089,7 @@ async fn handle_proxy_request_inner(
             // returning empty Forward; only bytes yielded by this outer body
             // are client-visible for the clean-status-4 versus reset decision.
             if let Some(deadline) = h2_total_deadline {
-                body = body.with_client_grpc_deadline(
-                    deadline,
-                    grpc_web_response_content_type,
-                );
+                body = body.with_client_grpc_deadline(deadline, grpc_web_response_content_type);
             }
             // Deferred admission/dispatch outcomes stay on the client-visible
             // body. The least-connections guard moves into the inspection task
@@ -22253,10 +22231,7 @@ async fn handle_proxy_request_inner(
                 body.with_lb_connection_guard(lb_connection_guard)
             };
             if let Some(deadline) = grpc_request_deadline {
-                body = body.with_client_grpc_deadline(
-                    deadline,
-                    grpc_web_response_content_type,
-                );
+                body = body.with_client_grpc_deadline(deadline, grpc_web_response_content_type);
             }
             body = body.with_success_on_drop_after_response_bytes(success_on_drop_after_bytes);
             if let Some(permits) = backend_admission_permits.take() {
@@ -28983,14 +28958,8 @@ async fn proxy_to_backend_http3(
             request_body,
         )
         .await;
-        match run_final_request_body_hooks(
-            plugins,
-            ctx,
-            grpc_deadline_at,
-            headers,
-            &request_body,
-        )
-        .await
+        match run_final_request_body_hooks(plugins, ctx, grpc_deadline_at, headers, &request_body)
+            .await
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {

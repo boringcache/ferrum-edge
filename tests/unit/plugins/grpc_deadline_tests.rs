@@ -235,9 +235,7 @@ fn create_grpc_context_with_timeout(timeout: Option<&str>) -> ferrum_edge::plugi
 fn grpc_timeout_metadata_is_not_populated_without_deadline_policy() {
     let mut ctx = create_grpc_context_with_timeout(Some("250m"));
 
-    assert_continue(
-        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[], &mut ctx),
-    );
+    assert_continue(ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[], &mut ctx));
 
     assert!(
         ctx.grpc_deadline_at().is_some(),
@@ -309,8 +307,7 @@ impl Plugin for CommittedHookProbe {
         response_headers: &HashMap<String, String>,
         _body: &[u8],
     ) {
-        self.calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.observed_grpc_statuses
             .lock()
             .expect("probe observations lock")
@@ -324,8 +321,7 @@ impl Plugin for CommittedHookProbe {
 #[tokio::test]
 async fn committed_deadline_replacement_runs_remaining_hooks_exactly_once() {
     use ferrum_edge::_test_support::{
-        run_deadline_bounded_response_committed_hooks_for_test,
-        set_grpc_deadline_budget_for_test,
+        run_deadline_bounded_response_committed_hooks_for_test, set_grpc_deadline_budget_for_test,
     };
 
     let calls = (0..3)
@@ -442,10 +438,7 @@ async fn response_transform_deadline_replaces_native_and_grpc_web_responses() {
                     .any(|window| window == b"grpc-status: 4")
             );
         } else {
-            assert_eq!(
-                headers.get("grpc-status").map(String::as_str),
-                Some("4")
-            );
+            assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
             assert!(body.is_empty());
         }
     }
@@ -495,13 +488,14 @@ async fn response_normalizer_deadline_preserves_grpc_web_framing() {
         "application/grpc-web+proto",
         "application/grpc-web-text+proto",
     ] {
-        let deadline_plugin =
-            create_plugin("grpc_deadline", &json!({ "default_deadline_ms": 1 }))
-                .unwrap()
-                .unwrap();
+        let deadline_plugin = create_plugin("grpc_deadline", &json!({ "default_deadline_ms": 1 }))
+            .unwrap()
+            .unwrap();
         let grpc_web_plugin = create_plugin("grpc_web", &json!({})).unwrap().unwrap();
-        let plugins: Vec<Arc<dyn Plugin>> =
-            vec![Arc::clone(&deadline_plugin), Arc::new(StalledResponseNormalizer)];
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::clone(&deadline_plugin),
+            Arc::new(StalledResponseNormalizer),
+        ];
         let mut ctx = create_grpc_context_with_timeout(None);
         ctx.headers
             .insert("content-type".to_string(), content_type.to_string());
