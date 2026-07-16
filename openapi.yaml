@@ -4787,7 +4787,13 @@ paths:
         the database `ON DELETE CASCADE` constraint removes the spec row in that
         case too.
 
-        Returns 204 on success, 404 if the spec does not exist.
+        Before deletion, Ferrum validates the prospective namespace plugin graph
+        after applying every spec-owned and proxy cascade. The request returns
+        422 without deleting anything when a retained enabled plugin would be
+        left with a dangling `schema_ref`.
+
+        Returns 204 on success, 404 if the spec does not exist, or 422 when the
+        prospective deletion fails plugin-graph validation.
 
         This mutation requires the `admin` role.
       tags: [API Specs]
@@ -4807,6 +4813,15 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "422":
+          description: |
+            Deleting the spec and its cascaded resources would leave an invalid
+            transaction-log schema graph in the namespace. No resources are
+            deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiSpecValidationError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -18540,17 +18555,20 @@ components:
       type: object
       description: |
         Response body for 422 Unprocessable Entity from `POST /api-specs` or
-        `PUT /api-specs/{id}`. The spec document was parsed successfully and the
-        Ferrum extensions were found, but one or more extracted resources failed
-        structural validation or database cross-checks (e.g., duplicate
-        `listen_path`, invalid plugin config).
+        `PUT /api-specs/{id}`, or for prospective plugin-graph validation from
+        `DELETE /api-specs/{id}`. For POST/PUT, the spec document was parsed
+        successfully and the Ferrum extensions were found, but one or more
+        extracted resources failed structural validation or database
+        cross-checks (e.g., duplicate `listen_path`, invalid plugin config).
+        For DELETE, removing the spec-owned and cascaded resources would leave
+        an invalid transaction-log schema graph.
       properties:
         error:
           type: string
           example: "Spec validation failed"
         spec_version:
           type: string
-          description: Version string detected from the submitted document
+          description: Version string detected from the submitted document, or from the stored spec for DELETE
         failures:
           type: array
           description: One entry per resource that failed validation
@@ -18559,7 +18577,7 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, plugin]
+                enum: [proxy, upstream, plugin, plugin_graph]
                 description: Kind of resource that failed
               id:
                 type: string
