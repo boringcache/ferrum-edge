@@ -14635,11 +14635,14 @@ struct SetCookieStorageKey<'a> {
 fn set_cookie_storage_key<'a>(
     set_cookie: &'a str,
     default_path: &'a str,
+    request_is_secure: bool,
 ) -> Option<SetCookieStorageKey<'a>> {
     let name = set_cookie_name(set_cookie)?;
     let mut domain_attribute = None;
     let mut path_attribute = None;
     let mut partitioned = false;
+    let mut secure = false;
+    let mut same_site_none = false;
 
     for attribute in set_cookie.split(';').skip(1) {
         let attribute = attribute.trim_matches([' ', '\t']);
@@ -14658,14 +14661,19 @@ fn set_cookie_storage_key<'a>(
         };
         if attribute_name.eq_ignore_ascii_case("partitioned") {
             partitioned = true;
-        } else if attribute_name.eq_ignore_ascii_case("domain")
-            && let Some(attribute_value) = attribute_value
-        {
-            // Empty and trailing-dot Domain attributes are ignored by user
-            // agents, leaving any earlier valid Domain attribute effective.
-            if !attribute_value.is_empty() && !attribute_value.ends_with('.') {
-                domain_attribute = Some(attribute_value);
-            }
+        } else if attribute_name.eq_ignore_ascii_case("secure") {
+            secure = true;
+        } else if attribute_name.eq_ignore_ascii_case("samesite") {
+            // The last SameSite attribute wins; invalid and bare values map to
+            // the default enforcement rather than preserving an earlier None.
+            same_site_none = attribute_value
+                .is_some_and(|value| value.eq_ignore_ascii_case("none"));
+        } else if attribute_name.eq_ignore_ascii_case("domain") {
+            // A bare Domain is parsed with an empty value. The last Domain
+            // attribute wins, including an empty value that makes the cookie
+            // host-only. Invalid non-empty values make the whole line
+            // non-comparable below.
+            domain_attribute = Some(attribute_value.unwrap_or(""));
         } else if attribute_name.eq_ignore_ascii_case("path") {
             // A bare Path is the last Path attribute with an empty value, so
             // it supersedes an earlier value and resolves to default_path.
@@ -14673,18 +14681,37 @@ fn set_cookie_storage_key<'a>(
         }
     }
 
-    // RFC 6265 uses the last Domain/Path attribute. An empty Domain attribute
-    // and a trailing-dot Domain attribute are ignored, and an invalid Path
-    // attribute falls back to the request's default path. Other malformed
-    // domain forms remain non-comparable.
+    // RFC 6265 uses the last Domain/Path attribute. An empty Domain value
+    // creates a host-only cookie, while a trailing-dot or otherwise malformed
+    // non-empty Domain rejects the cookie. An invalid Path value falls back to
+    // the request's default path.
     let (domain, host_only) = match domain_attribute {
+        Some("") | None => (None, true),
         Some(domain) => (Some(canonical_set_cookie_domain(domain)?), false),
-        None => (None, true),
     };
     let path = match path_attribute {
         Some(path) if valid_set_cookie_path(path) => path,
         Some(_) | None => default_path,
     };
+
+    let secure_prefix = name
+        .get(.."__Secure-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Secure-"));
+    let host_prefix = name
+        .get(.."__Host-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__Host-"));
+    // Cookies that a browser will reject cannot own a staged cookie's storage
+    // key. Keep the selected line in the response, but make it non-comparable
+    // so a valid earlier cleanup is appended after it. `__Host-` additionally
+    // requires an explicit Path=/ attribute, not merely a default path of `/`.
+    if (secure && !request_is_secure)
+        || (partitioned && !secure)
+        || (same_site_none && !secure)
+        || (secure_prefix && !secure)
+        || (host_prefix && (!secure || !host_only || path_attribute != Some("/")))
+    {
+        return None;
+    }
 
     Some(SetCookieStorageKey {
         name,
@@ -14695,11 +14722,18 @@ fn set_cookie_storage_key<'a>(
     })
 }
 
-fn set_cookie_same_storage_key(existing: &str, candidate: &str, default_path: &str) -> bool {
-    let Some(existing_key) = set_cookie_storage_key(existing, default_path) else {
+fn set_cookie_same_storage_key(
+    existing: &str,
+    candidate: &str,
+    default_path: &str,
+    request_is_secure: bool,
+) -> bool {
+    let Some(existing_key) = set_cookie_storage_key(existing, default_path, request_is_secure)
+    else {
         return false;
     };
-    let Some(candidate_key) = set_cookie_storage_key(candidate, default_path) else {
+    let Some(candidate_key) = set_cookie_storage_key(candidate, default_path, request_is_secure)
+    else {
         return false;
     };
 
@@ -14724,10 +14758,21 @@ fn set_cookie_same_storage_key(existing: &str, candidate: &str, default_path: &s
 /// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
 /// earlier line only when a later line owns the same RFC 6265 storage key.
 /// Invalid cookie-pairs can only replace byte-identical lines.
-fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str, default_path: &str) {
+fn collect_later_set_cookies(
+    cookies: &mut Vec<String>,
+    joined: &str,
+    default_path: &str,
+    request_is_secure: bool,
+) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
         if let Some(index) = cookies.iter().position(|existing| {
-            existing == candidate || set_cookie_same_storage_key(existing, candidate, default_path)
+            existing == candidate
+                || set_cookie_same_storage_key(
+                    existing,
+                    candidate,
+                    default_path,
+                    request_is_secure,
+                )
         }) {
             cookies.remove(index);
         }
@@ -14735,9 +14780,15 @@ fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str, default_pa
     }
 }
 
-fn set_cookie_conflicts(cookies: &[String], candidate: &str, default_path: &str) -> bool {
+fn set_cookie_conflicts(
+    cookies: &[String],
+    candidate: &str,
+    default_path: &str,
+    request_is_secure: bool,
+) -> bool {
     cookies.iter().any(|existing| {
-        existing == candidate || set_cookie_same_storage_key(existing, candidate, default_path)
+        existing == candidate
+            || set_cookie_same_storage_key(existing, candidate, default_path, request_is_secure)
     })
 }
 
@@ -14747,9 +14798,9 @@ pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: 
     let default_path = default_set_cookie_path(&ctx.path);
     let mut staged = Vec::new();
     if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
-        collect_later_set_cookies(&mut staged, existing, default_path);
+        collect_later_set_cookies(&mut staged, existing, default_path, ctx.request_is_secure);
     }
-    collect_later_set_cookies(&mut staged, &cookie, default_path);
+    collect_later_set_cookies(&mut staged, &cookie, default_path, ctx.request_is_secure);
 
     if staged.is_empty() {
         ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
@@ -14785,16 +14836,26 @@ fn attach_auth_rejection_set_cookie(
 
     let mut merged = Vec::new();
     for (_, value) in selected_variants {
-        collect_later_set_cookies(&mut merged, &value, default_path);
+        collect_later_set_cookies(&mut merged, &value, default_path, ctx.request_is_secure);
     }
 
     let mut staged_cookies = Vec::new();
-    collect_later_set_cookies(&mut staged_cookies, &staged, default_path);
+    collect_later_set_cookies(
+        &mut staged_cookies,
+        &staged,
+        default_path,
+        ctx.request_is_secure,
+    );
     for candidate in staged_cookies {
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
         // independently scoped requester-owned cookies from earlier rejects.
-        if !set_cookie_conflicts(&merged, &candidate, default_path) {
+        if !set_cookie_conflicts(
+            &merged,
+            &candidate,
+            default_path,
+            ctx.request_is_secure,
+        ) {
             merged.push(candidate);
         }
     }
@@ -15051,6 +15112,7 @@ async fn handle_proxy_request_inner(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.request_is_secure = is_tls;
     ctx.metadata.insert(
         "ferrum.frontend_scheme".to_string(),
         if is_tls { "https" } else { "http" }.to_string(),
