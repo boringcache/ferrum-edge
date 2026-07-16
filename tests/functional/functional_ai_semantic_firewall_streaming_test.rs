@@ -76,8 +76,7 @@ async fn start_json_backend_on(listener: TcpListener, json_body: &'static str) {
 
 const RANGE_LEAK_JSON: &[u8] =
     br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#;
-const ENCODED_SSE_JSON_PRELUDE: &[u8] =
-    b"{}\n\
+const ENCODED_SSE_JSON_PRELUDE: &[u8] = b"{}\n\
 event: prelude\n\
 id: ignored-1\n\
 retry: 1000\n\

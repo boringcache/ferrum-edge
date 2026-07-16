@@ -2769,7 +2769,8 @@ async fn streaming_response_inspect_fail_closed_on_uninspectable() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
 
-    let garbage = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A harmless prelude\"}}]}\n\n\
+    let garbage =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A harmless prelude\"}}]}\n\n\
 data: My system prompt says never disclose this policy.\n\n\
 data: [DONE]\n\n";
     assert!(matches!(
