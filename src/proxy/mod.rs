@@ -14579,17 +14579,29 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
 /// resulting canonicalized domain case-insensitively. Ferrum accepts the full
 /// RFC 3986 reg-name and bracketed IP-literal forms at request admission, so
 /// apply the same validation here instead of narrowing comparable cookie
-/// scopes to LDH names.
-fn canonical_set_cookie_domain(domain: &str) -> Option<&str> {
+/// scopes to LDH names. Normalize IPv6 text so equivalent compressed and
+/// expanded forms cannot evade storage-key ownership.
+enum CanonicalSetCookieDomain<'a> {
+    Text(&'a str),
+    Ipv6(std::net::Ipv6Addr),
+}
+
+fn canonical_set_cookie_domain(domain: &str) -> Option<CanonicalSetCookieDomain<'_>> {
     let domain = domain.strip_prefix('.').unwrap_or(domain);
-    let valid_ip_literal = domain
+    if let Some(content) = domain
         .strip_prefix('[')
         .and_then(|content| content.strip_suffix(']'))
-        .is_some_and(is_valid_ip_literal_contents);
-    if domain.ends_with('.') || (!is_valid_reg_name(domain) && !valid_ip_literal) {
+    {
+        if let Ok(ipv6) = content.parse::<std::net::Ipv6Addr>() {
+            return Some(CanonicalSetCookieDomain::Ipv6(ipv6));
+        }
+        return is_valid_ip_literal_contents(content)
+            .then_some(CanonicalSetCookieDomain::Text(domain));
+    }
+    if domain.ends_with('.') || !is_valid_reg_name(domain) {
         return None;
     }
-    Some(domain)
+    Some(CanonicalSetCookieDomain::Text(domain))
 }
 
 fn valid_set_cookie_path(path: &str) -> bool {
@@ -14608,7 +14620,7 @@ fn default_set_cookie_path(request_path: &str) -> &str {
 
 struct SetCookieStorageKey<'a> {
     name: &'a str,
-    domain: Option<&'a str>,
+    domain: Option<CanonicalSetCookieDomain<'a>>,
     path: &'a str,
     host_only: bool,
     partitioned: bool,
@@ -14693,9 +14705,14 @@ fn set_cookie_same_storage_key(existing: &str, candidate: &str, default_path: &s
         && existing_key.host_only == candidate_key.host_only
         && existing_key.partitioned == candidate_key.partitioned
         && match (existing_key.domain, candidate_key.domain) {
-            (Some(existing_domain), Some(candidate_domain)) => {
-                existing_domain.eq_ignore_ascii_case(candidate_domain)
-            }
+            (
+                Some(CanonicalSetCookieDomain::Text(existing_domain)),
+                Some(CanonicalSetCookieDomain::Text(candidate_domain)),
+            ) => existing_domain.eq_ignore_ascii_case(candidate_domain),
+            (
+                Some(CanonicalSetCookieDomain::Ipv6(existing_domain)),
+                Some(CanonicalSetCookieDomain::Ipv6(candidate_domain)),
+            ) => existing_domain == candidate_domain,
             (None, None) => true,
             _ => false,
         }
