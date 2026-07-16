@@ -335,10 +335,7 @@ pub enum AtomicClearVerification {
 impl AtomicClearVerification {
     /// Whether an unknown commit result remains unresolved after verification.
     pub fn is_still_unknown(self) -> bool {
-        matches!(
-            self,
-            Self::PriorCountsStillVisible | Self::UnknownOutcome
-        )
+        matches!(self, Self::PriorCountsStillVisible | Self::UnknownOutcome)
     }
 }
 
