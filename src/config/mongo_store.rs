@@ -644,13 +644,15 @@ mod inner {
             // a socket even if the store's bundle was already swapped/dropped.
             let connection = self._connection.clone();
             let connection_generation_guard = self.connection_generation_guard.take();
-            let retained_admission_pins = self.retained_admission_pins.clone();
-            let retain_pin_on_cleanup_error = self.mode == MongoLockMode::UntilExplicitRelease
-                && self.mutation_state == DurableAdmissionMutationState::Settled;
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let _cleanup_task = runtime.spawn(async move {
                     let _connection = connection;
-                    let mut connection_generation_guard = connection_generation_guard;
+                    // Keep the generation stable only while this final retry
+                    // is running. Its protected mutation is settled, so even
+                    // a failed retry must release the local pin and leave the
+                    // durable owner-qualified document as the fail-closed
+                    // operator-recovery fence.
+                    let _connection_generation_guard = connection_generation_guard;
                     if let Some(renew_task) = renew_task {
                         let _ = renew_task.await;
                     }
@@ -658,34 +660,12 @@ mod inner {
                         "_id": &lock_id,
                         "owner": &owner,
                     });
-                    let cleanup_result = if majority {
+                    let _ = if majority {
                         delete.write_concern(WriteConcern::majority()).await
                     } else {
                         delete.await
                     };
-                    if cleanup_result.is_err()
-                        && retain_pin_on_cleanup_error
-                        && let Some(generation_guard) = connection_generation_guard.take()
-                    {
-                        let _ = retained_admission_pins.insert(
-                            format!("{lock_id}:{owner}"),
-                            MongoAdmissionConnectionPin {
-                                connection: _connection,
-                                _generation_guard: generation_guard,
-                            },
-                        );
-                    }
                 });
-            } else if retain_pin_on_cleanup_error
-                && let Some(generation_guard) = connection_generation_guard
-            {
-                let _ = retained_admission_pins.insert(
-                    format!("{}:{}", self.lock_id, self.owner),
-                    MongoAdmissionConnectionPin {
-                        connection,
-                        _generation_guard: generation_guard,
-                    },
-                );
             }
         }
     }
