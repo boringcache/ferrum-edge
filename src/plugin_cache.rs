@@ -3104,8 +3104,7 @@ impl PluginCache {
         // registry doesn't get mutated by a config that's being rejected.
         if !plugin_errors.is_empty() {
             if rebuild_globals
-                && let Err(error) =
-                    crate::plugins::utils::log_schema::registry::abort_reload()
+                && let Err(error) = crate::plugins::utils::log_schema::registry::abort_reload()
             {
                 plugin_errors.push(error);
             }
