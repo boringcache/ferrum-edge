@@ -464,9 +464,7 @@ async fn multiple_instances_release_only_their_own_inflight_ownership() {
         "second-key".to_string(),
     );
     assert!(matches!(
-        first
-            .before_proxy(&mut retry_ctx, &mut retry_headers)
-            .await,
+        first.before_proxy(&mut retry_ctx, &mut retry_headers).await,
         PluginResult::Continue
     ));
     assert!(matches!(

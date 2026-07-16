@@ -30,8 +30,7 @@ use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
     PluginResult, ProxyProtocol, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
-    ResponseStreamAction, TransactionSummary,
-    normalize_response_body_for_inspection,
+    ResponseStreamAction, TransactionSummary, normalize_response_body_for_inspection,
 };
 use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
 use crate::proxy::grpc_proxy::{

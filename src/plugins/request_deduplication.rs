@@ -2018,9 +2018,7 @@ impl Plugin for RequestDeduplication {
                     }
                     return PluginResult::Continue;
                 }
-                if !retained_inflight
-                    && let Some(token) = redis_lock_token.as_deref()
-                {
+                if !retained_inflight && let Some(token) = redis_lock_token.as_deref() {
                     self.redis_release_inflight(&key, &fingerprint, token).await;
                 }
                 return PluginResult::Continue;
