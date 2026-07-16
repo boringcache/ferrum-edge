@@ -237,7 +237,10 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
 
     let h1_get = h1.get(&canonical).send().await.expect("H1 GET");
     assert_eq!(h1_get.status(), reqwest::StatusCode::OK);
-    assert_eq!(assert_spec_metadata(h1_get.headers()), representation_length);
+    assert_eq!(
+        assert_spec_metadata(h1_get.headers()),
+        representation_length
+    );
     let h1_body = h1_get.text().await.expect("H1 GET body");
     assert_eq!(h1_body.len(), representation_length);
     assert_transformed_spec(&h1_body);
@@ -283,13 +286,19 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
         .expect("h2c client");
     let h2_get = h2.get(&canonical).send().await.expect("H2 GET");
     assert_eq!(h2_get.version(), reqwest::Version::HTTP_2);
-    assert_eq!(assert_spec_metadata(h2_get.headers()), representation_length);
+    assert_eq!(
+        assert_spec_metadata(h2_get.headers()),
+        representation_length
+    );
     let h2_body = h2_get.text().await.expect("H2 GET body");
     assert_eq!(h2_body.len(), representation_length);
     assert_transformed_spec(&h2_body);
     let h2_head = h2.head(&canonical).send().await.expect("H2 HEAD");
     assert_eq!(h2_head.version(), reqwest::Version::HTTP_2);
-    assert_eq!(assert_spec_metadata(h2_head.headers()), representation_length);
+    assert_eq!(
+        assert_spec_metadata(h2_head.headers()),
+        representation_length
+    );
     assert!(h2_head.bytes().await.expect("H2 HEAD body").is_empty());
 
     let h3 = Http3Client::insecure().expect("H3 client");
@@ -301,7 +310,10 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
     assert_transformed_spec(&h3_get.body_text());
     let h3_head = h3_request_until_ready(&h3, &h3_url, Method::HEAD).await;
     assert_eq!(h3_head.status, StatusCode::OK);
-    assert_eq!(assert_spec_metadata(&h3_head.headers), representation_length);
+    assert_eq!(
+        assert_spec_metadata(&h3_head.headers),
+        representation_length
+    );
     assert!(h3_head.body_bytes.is_empty());
 
     let h3_blocked_url = format!("https://localhost:{https_port}/blocked/specz");

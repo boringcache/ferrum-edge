@@ -840,11 +840,8 @@ async fn test_head_failure_has_get_metadata_and_no_body() {
     );
     assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
 
-    let (_, suppressed_body, suppressed_headers) = reject_parts(
-        plugin
-            .after_proxy(&mut ctx, status, &mut headers)
-            .await,
-    );
+    let (_, suppressed_body, suppressed_headers) =
+        reject_parts(plugin.after_proxy(&mut ctx, status, &mut headers).await);
     assert!(suppressed_body.is_empty());
     assert_eq!(suppressed_headers, headers);
 }
@@ -1422,7 +1419,7 @@ async fn test_concurrent_cold_cache_fetches_deduplicated() {
     // MockServer drops with .expect(1) — panics if more than one hit.
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1458,10 +1455,28 @@ async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
     let mut upstream_failures = 0;
     let mut busy_rejections = 0;
     for handle in handles {
-        let (status, _, headers) = reject_parts(handle.await.expect("request task"));
+        let (status, body, headers) = reject_parts(handle.await.expect("request task"));
         match status {
             502 => upstream_failures += 1,
-            503 => busy_rejections += 1,
+            503 => {
+                busy_rejections += 1;
+                assert_eq!(
+                    body,
+                    br#"{"error":"API specification fetch is busy; retry after the indicated delay"}"#
+                );
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some("application/json")
+                );
+                assert_eq!(
+                    headers.get("content-length").map(String::as_str),
+                    Some("76")
+                );
+                assert_eq!(
+                    headers.get("retry-after").map(String::as_str),
+                    Some("1")
+                );
+            }
             other => panic!("unexpected status {other}"),
         }
         assert!(headers.contains_key("retry-after"));
@@ -1478,7 +1493,7 @@ async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
     assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_cached_failure_retry_after_reports_remaining_backoff() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1507,7 +1522,7 @@ async fn test_cached_failure_retry_after_reports_remaining_backoff() {
         Some("1")
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
     let mut second_ctx = make_ctx("GET", "/api/specz", "/api");
     let (_, _, second_headers) = reject_parts(plugin.on_request_received(&mut second_ctx).await);
     assert_eq!(
@@ -1515,7 +1530,7 @@ async fn test_cached_failure_retry_after_reports_remaining_backoff() {
         Some("2")
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
     let mut cached_ctx = make_ctx("GET", "/api/specz", "/api");
     let (_, _, cached_headers) = reject_parts(plugin.on_request_received(&mut cached_ctx).await);
     assert_eq!(

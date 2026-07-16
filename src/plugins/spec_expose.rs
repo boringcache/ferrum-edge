@@ -56,8 +56,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::time::Instant;
 use url::{Host, Url};
 
 use crate::dns::DnsCacheResolver;
@@ -79,6 +80,9 @@ const MAX_PENDING_FETCHES: usize = 32;
 /// Failed fetches back off from one second to a maximum of thirty seconds.
 const FAILURE_BACKOFF_BASE_SECONDS: u64 = 1;
 const FAILURE_BACKOFF_MAX_SECONDS: u64 = 30;
+const FETCH_BUSY_BODY: &[u8] =
+    br#"{"error":"API specification fetch is busy; retry after the indicated delay"}"#;
+const FETCH_BUSY_BODY_LENGTH: &str = "76";
 /// Private request marker kept only until the rejection-response hook phase.
 /// It ensures HEAD carries the full GET representation through body policy and
 /// suppresses it only after those hooks have established the final metadata.
@@ -418,9 +422,9 @@ impl SpecExpose {
             return None;
         }
         let mut failure = entry.failure.clone();
-        failure.retry_after_seconds = remaining.as_secs().saturating_add(u64::from(
-            remaining.subsec_nanos() != 0,
-        ));
+        failure.retry_after_seconds = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() != 0));
         Some(failure)
     }
 
@@ -738,11 +742,7 @@ impl Plugin for SpecExpose {
         let _admission = match Arc::clone(&self.fetch_admission).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                return fetch_failure(
-                    503,
-                    "API specification fetch is busy; retry after the indicated delay",
-                )
-                .into_plugin_result();
+                return fetch_busy_response();
             }
         };
         let _guard = self.fetch_lock.lock().await;
@@ -809,6 +809,24 @@ fn spec_response(entry: CachedSpec) -> PluginResult {
     PluginResult::RejectBinary {
         status_code: 200,
         body: entry.body,
+        headers,
+    }
+}
+
+fn fetch_busy_response() -> PluginResult {
+    // PluginResult owns its header map, but the response body and every
+    // derived header value are static so overload shedding does not serialize
+    // JSON or format lengths on the anonymous request path.
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert(
+        "content-length".to_string(),
+        FETCH_BUSY_BODY_LENGTH.to_string(),
+    );
+    headers.insert("retry-after".to_string(), "1".to_string());
+    PluginResult::RejectBinary {
+        status_code: 503,
+        body: Bytes::from_static(FETCH_BUSY_BODY),
         headers,
     }
 }
