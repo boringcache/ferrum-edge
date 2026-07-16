@@ -382,8 +382,11 @@ Helper constructors:
 Use `response_body_mode: buffer` when:
 
 - A plugin needs to inspect or transform the **response body** (not just headers)
-- You are debugging response content with `transaction_debugger` and `log_response_body: true`
 - Your responses are small and the latency difference is negligible
+
+`transaction_debugger` does not capture payloads and does not require buffer
+mode. It reports final body completion, byte counts, disconnects, and typed
+streaming errors from the terminal transaction summary instead.
 
 Note: response body size limits are now enforced via `SizeLimitedStreamingResponse` even when Content-Length is absent — explicit buffer mode is no longer required for size enforcement.
 
