@@ -2439,13 +2439,13 @@ async fn test_single_auth_rejects_when_mandatory_plugin_rejects_despite_mesh_per
 fn deadline_bound_grpc_web_pass_through_never_selects_native_backend_h3() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let dispatch = source
-        .split("let deadline_bound_grpc_web_pass_through = grpc_web_request")
+        .split("let deadline_bound_grpc_web_pass_through =")
         .nth(1)
         .expect("deadline-bound untranslated gRPC-Web classifier")
         .split("let bytes_sent_observed =")
         .next()
         .expect("initial backend H3 selection block");
-    assert!(dispatch.contains("&& !grpc_request_is_web_translated"));
+    assert!(dispatch.contains("grpc_web_request && !grpc_request_is_web_translated"));
     assert!(dispatch.contains("&& ctx.grpc_deadline_at().is_some();"));
     assert!(
         dispatch.contains("let mut current_dispatch_h3 = !deadline_bound_grpc_web_pass_through")
