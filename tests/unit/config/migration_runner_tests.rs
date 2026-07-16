@@ -138,6 +138,40 @@ async fn test_run_pending_restores_route_lock_table_on_existing_v001_db() {
     .expect("restored proxy_route_locks must be writable");
 }
 
+/// The conditional mTLS DNS admission lock is also folded into V001, so the
+/// compatibility pass must materialize it for databases that recorded V001
+/// before the table existed.
+#[tokio::test]
+async fn test_run_pending_restores_mtls_dns_admission_lock_on_existing_v001_db() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    runner.run_pending().await.unwrap();
+    assert!(table_exists(&pool, "mtls_dns_admission_locks").await);
+    sqlx::query("DROP TABLE mtls_dns_admission_locks")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!table_exists(&pool, "mtls_dns_admission_locks").await);
+
+    let applied = runner.run_pending().await.unwrap();
+    assert!(
+        applied.is_empty(),
+        "the compatibility pass must not record a second migration"
+    );
+    assert!(
+        table_exists(&pool, "mtls_dns_admission_locks").await,
+        "run_pending must restore the mTLS DNS admission lock table"
+    );
+    sqlx::query(
+        "INSERT INTO mtls_dns_admission_locks (namespace, updated_at) \
+         VALUES ('ferrum', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("restored mTLS DNS admission lock table must be writable");
+}
+
 #[tokio::test]
 async fn test_run_pending_restores_config_change_indexes_on_existing_v001_db() {
     let pool = test_pool().await;

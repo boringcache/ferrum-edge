@@ -13,7 +13,10 @@ use uuid::Uuid;
 use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
-use crate::config::db_backend::{DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult};
+use crate::config::db_backend::{
+    DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+    is_mtls_dns_identity_conflict,
+};
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
@@ -91,18 +94,17 @@ pub(crate) enum BatchPreparationError {
 const MTLS_ADMISSION_LOCK_SHARDS: usize = 64;
 static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
 
-/// Best-effort serialization of mTLS-sensitive admin mutations for a namespace
+/// Same-process serialization of mTLS-sensitive admin mutations for a namespace
 /// from candidate validation through persistence. A bounded process-global
 /// lock set covers every `AdminState` served by this process without retaining
 /// attacker-chosen namespace strings indefinitely.
 ///
-/// The datastore's exact mTLS credential index remains the authoritative
-/// cross-process backstop for exact identities. The additional ASCII-folded
-/// `san_dns` constraint is conditional on effective plugin associations, so it
-/// cannot use an unconditional case-folded unique index without rejecting valid
-/// case variants used by exact-match policies. Fully serializing that dynamic
-/// check across SQL and MongoDB writers requires backend-specific transactions;
-/// this lock deliberately does not claim to coordinate separate admin processes.
+/// SQL transactions and MongoDB leases provide the authoritative cross-process
+/// backstop. The additional ASCII-folded `san_dns` constraint is conditional on
+/// effective plugin associations, so it cannot use an unconditional case-folded
+/// unique index without rejecting valid case variants used by exact-match
+/// policies. This lock avoids redundant same-process candidate work while the
+/// backend serialization covers separate admin processes.
 /// Every credential mutation takes this lock, even for non-mTLS types, because
 /// those endpoints persist the complete `Consumer` and could otherwise replay
 /// stale `mtls_auth` entries loaded before a concurrent mTLS mutation.
@@ -473,7 +475,9 @@ pub(crate) trait AdminResource:
         // Surface the constraint message (it names the conflicting key);
         // everything else stays a redacted 500.
         let message = error.to_string();
-        if super::is_unique_constraint_violation(&message) {
+        if is_mtls_dns_identity_conflict(error)
+            || super::is_unique_constraint_violation(&message)
+        {
             super::json_response(StatusCode::CONFLICT, &json!({ "error": message }))
         } else {
             super::json_response(
@@ -484,10 +488,17 @@ pub(crate) trait AdminResource:
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
-        super::json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &super::db_error_response(error),
-        )
+        if is_mtls_dns_identity_conflict(error) {
+            super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": error.to_string()}),
+            )
+        } else {
+            super::json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &super::db_error_response(error),
+            )
+        }
     }
 
     fn allow_cached_read_fallback(_error: &anyhow::Error) -> bool {
@@ -791,7 +802,8 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     if config_update_target_was_not_found(error) {
         return not_found_response::<Consumer>();
     }
-    let unique_conflict = super::is_unique_constraint_violation(&error.to_string());
+    let unique_conflict = is_mtls_dns_identity_conflict(error)
+        || super::is_unique_constraint_violation(&error.to_string());
     let message = consumer_persist_error_message(error);
     let status = if unique_conflict {
         StatusCode::CONFLICT
@@ -806,7 +818,9 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
 /// values; callers need the conflict disposition, never credential or index
 /// metadata.
 pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
-    if super::is_unique_constraint_violation(&error.to_string()) {
+    if is_mtls_dns_identity_conflict(error) {
+        error.to_string()
+    } else if super::is_unique_constraint_violation(&error.to_string()) {
         "Consumer identity or credential conflicts with another Consumer in the namespace"
             .to_string()
     } else {
@@ -2348,7 +2362,9 @@ impl AdminResource for Proxy {
                 &json!({"error": PROXY_ROUTE_CONFLICT_ERROR}),
             );
         }
-        if super::is_unique_constraint_violation(&message) {
+        if is_mtls_dns_identity_conflict(error)
+            || super::is_unique_constraint_violation(&message)
+        {
             return super::json_response(StatusCode::CONFLICT, &json!({ "error": message }));
         }
 

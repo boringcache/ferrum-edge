@@ -4,11 +4,13 @@ use ferrum_edge::_test_support::{
     db_wrap_mysql_isolation_read_error, is_config_validation_rejection, parse_auth_mode,
     parse_scheme, statement_timeout_sql,
 };
-use ferrum_edge::config::db_backend::{DatabaseBackend, is_incremental_full_reload_required};
+use ferrum_edge::config::db_backend::{
+    DatabaseBackend, is_incremental_full_reload_required, is_mtls_dns_identity_conflict,
+};
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginConfig, PluginScope, Upstream,
-    UpstreamTarget,
+    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
+    PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use serde_json::json;
 use sqlx::error::{DatabaseError, ErrorKind};
@@ -16,6 +18,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct TestDatabaseError {
@@ -548,7 +551,7 @@ async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
     assert_eq!(loaded.consumers[0].username, "alice");
 
     let now = chrono::Utc::now();
-    store
+    let error = store
         .create_plugin_config(&PluginConfig {
             id: "dns-mtls".to_string(),
             plugin_name: "mtls_auth".to_string(),
@@ -563,12 +566,15 @@ async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
             updated_at: now,
         })
         .await
-        .unwrap();
-    let error = store
+        .expect_err("activating san_dns must atomically reject the ambiguous snapshot");
+    assert!(is_mtls_dns_identity_conflict(&error));
+
+    let loaded = store
         .load_full_config("ferrum")
         .await
-        .expect_err("DNS identity collisions must reject the runtime snapshot");
-    assert!(is_config_validation_rejection(&error));
+        .expect("the rejected policy must not leave an invalid runtime snapshot");
+    assert_eq!(loaded.consumers.len(), 2);
+    assert!(loaded.plugin_configs.is_empty());
 
     let mut c3 = make_consumer("c3", "carol");
     c3.credentials.insert(
@@ -585,6 +591,186 @@ async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
             || message.contains("UNIQUE")
             || message.contains("constraint"),
         "unexpected exact duplicate-identity error: {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_sqlite_stores_serialize_mtls_dns_consumer_admission() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("mtls_dns_cross_process_consumers.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store_a = DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    let store_b = DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    let now = chrono::Utc::now();
+    store_a
+        .create_plugin_config(&PluginConfig {
+            id: "dns-mtls".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    let mut upper = make_consumer("upper", "alice");
+    upper.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut lower = make_consumer("lower", "bob");
+    lower.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "api.example.com"}]),
+    );
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let barrier_a = barrier.clone();
+    let barrier_b = barrier.clone();
+    let (upper_result, lower_result) = tokio::join!(
+        async {
+            barrier_a.wait().await;
+            store_a.create_consumer(&upper).await
+        },
+        async {
+            barrier_b.wait().await;
+            store_b.create_consumer(&lower).await
+        }
+    );
+
+    assert_ne!(upper_result.is_ok(), lower_result.is_ok());
+    let conflict = upper_result.err().or_else(|| lower_result.err()).unwrap();
+    assert!(is_mtls_dns_identity_conflict(&conflict), "{conflict:#}");
+
+    let loaded = store_a.load_full_config("ferrum").await.unwrap();
+    assert_eq!(loaded.consumers.len(), 1);
+    loaded
+        .validate_unique_mtls_dns_identities()
+        .expect("the persisted winner must remain unambiguous");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_sqlite_stores_atomically_serialize_policy_association_and_identity_update() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("mtls_dns_cross_process_association.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store_a = DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    let store_b = DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    let mut owner = make_consumer("owner", "alice");
+    owner.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "API.Example.COM"}]),
+    );
+    store_a.create_consumer(&owner).await.unwrap();
+    let rotating = make_consumer("rotating", "bob");
+    store_a.create_consumer(&rotating).await.unwrap();
+
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "api",
+        "namespace": "ferrum",
+        "hosts": ["api.test"],
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .unwrap();
+    store_a.create_proxy(&proxy).await.unwrap();
+    let now = chrono::Utc::now();
+    store_a
+        .create_plugin_config(&PluginConfig {
+            id: "dns-mtls".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some(proxy.id.clone()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    let mut associated_proxy = proxy.clone();
+    associated_proxy.plugins.push(PluginAssociation {
+        plugin_config_id: "dns-mtls".to_string(),
+    });
+    let mut rotated_consumer = rotating.clone();
+    rotated_consumer.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "api.example.com"}]),
+    );
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let barrier_a = barrier.clone();
+    let barrier_b = barrier.clone();
+    let (association_result, rotation_result) = tokio::join!(
+        async {
+            barrier_a.wait().await;
+            store_a.update_proxy(&associated_proxy).await
+        },
+        async {
+            barrier_b.wait().await;
+            store_b.update_consumer(&rotated_consumer).await
+        }
+    );
+
+    let association_succeeded = matches!(&association_result, Ok(true));
+    let rotation_succeeded = matches!(&rotation_result, Ok(true));
+    assert_ne!(association_succeeded, rotation_succeeded);
+    let conflict = association_result
+        .err()
+        .or_else(|| rotation_result.err())
+        .unwrap();
+    assert!(is_mtls_dns_identity_conflict(&conflict), "{conflict:#}");
+
+    let loaded = store_a.load_full_config("ferrum").await.unwrap();
+    loaded
+        .validate_unique_mtls_dns_identities()
+        .expect("association and credential admission must commit as one valid order");
+    let stored_proxy = store_a.get_proxy("ferrum", "api").await.unwrap().unwrap();
+    let stored_consumer = store_a
+        .get_consumer("ferrum", "rotating")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        !stored_proxy.plugins.is_empty(),
+        stored_consumer.credentials.get("mtls_auth").is_none()
     );
 }
 

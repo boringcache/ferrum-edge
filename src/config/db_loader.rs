@@ -50,8 +50,8 @@ use tracing::{debug, error, info, warn};
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, NamespaceResourceCounts,
-    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
-    SortOrder, extract_db_hostname, redact_url,
+    MtlsDnsIdentityConflict, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+    SnapshotDataIntegrityError, SortOrder, extract_db_hostname, redact_url,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -683,6 +683,20 @@ impl DatabaseStore {
         }
     }
 
+    fn mtls_dns_admission_lock_insert_sql(&self) -> String {
+        match self.db_type.as_str() {
+            "mysql" => "INSERT IGNORE INTO mtls_dns_admission_locks \
+                 (namespace, updated_at) VALUES (?, ?)"
+                .to_string(),
+            "sqlite" => "INSERT OR IGNORE INTO mtls_dns_admission_locks \
+                 (namespace, updated_at) VALUES (?, ?)"
+                .to_string(),
+            _ => self.q("INSERT INTO mtls_dns_admission_locks \
+                 (namespace, updated_at) VALUES (?, ?) \
+                 ON CONFLICT (namespace) DO NOTHING"),
+        }
+    }
+
     fn config_change_retention_upsert_sql(&self) -> String {
         match self.db_type.as_str() {
             "mysql" => "INSERT INTO config_change_retention \
@@ -840,6 +854,77 @@ impl DatabaseStore {
         }
 
         Ok(())
+    }
+
+    /// Serialize every mutation that can change either consumer mTLS
+    /// credentials or the effective plugin association graph for a namespace.
+    /// The caller holds this row through candidate validation and commit.
+    async fn lock_mtls_dns_admission_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<(), anyhow::Error> {
+        let now = Utc::now().to_rfc3339();
+        let insert_sql = self.mtls_dns_admission_lock_insert_sql();
+        sqlx::query(&insert_sql)
+            .bind(namespace)
+            .bind(&now)
+            .execute(&mut **tx)
+            .await?;
+
+        if self.db_type == "sqlite" {
+            // SQLite has no SELECT ... FOR UPDATE. This write takes the
+            // database writer lock inside the same transaction that will
+            // persist and validate the candidate.
+            sqlx::query(
+                "UPDATE mtls_dns_admission_locks SET updated_at = ? WHERE namespace = ?",
+            )
+            .bind(now)
+            .bind(namespace)
+            .execute(&mut **tx)
+            .await?;
+        } else {
+            let lock_sql = self.q("SELECT namespace FROM mtls_dns_admission_locks \
+                 WHERE namespace = ? FOR UPDATE");
+            sqlx::query(&lock_sql)
+                .bind(namespace)
+                .fetch_optional(&mut **tx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate the exact transaction candidate after its resource mutations
+    /// but before its change record and commit. Because every relevant writer
+    /// first holds [`Self::lock_mtls_dns_admission_tx`], the snapshot cannot be
+    /// invalidated by a second admin process between this check and commit.
+    async fn validate_mtls_dns_admission_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<(), anyhow::Error> {
+        let proxies = self
+            .load_proxies_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .await?;
+        let consumers = self
+            .load_consumers_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .await?;
+        let plugin_configs = self
+            .load_plugin_configs_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .await?;
+        let mut candidate = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            consumers,
+            plugin_configs,
+            loaded_at: Utc::now(),
+            ..Default::default()
+        };
+        candidate.normalize_fields();
+        candidate
+            .validate_unique_mtls_dns_identities()
+            .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
     }
 
     async fn ensure_proxy_route_unique_tx(
@@ -2074,6 +2159,8 @@ impl DatabaseStore {
         };
 
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, &proxy.namespace)
+            .await?;
         self.ensure_proxy_route_unique_tx(&mut tx, proxy, None)
             .await?;
 
@@ -2194,6 +2281,8 @@ impl DatabaseStore {
             .await?;
         }
 
+        self.validate_mtls_dns_admission_tx(&mut tx, &proxy.namespace)
+            .await?;
         self.record_config_change_tx(&mut tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
             .await?;
         self.compact_config_changes_tx(&mut tx, &proxy.namespace)
@@ -2222,6 +2311,8 @@ impl DatabaseStore {
         };
 
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, &proxy.namespace)
+            .await?;
         // Existence read inside the transaction is the not-found authority —
         // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
         // (sqlx's default) counts *changed* rows, so an update writing
@@ -2330,6 +2421,8 @@ impl DatabaseStore {
                 .await?;
         }
 
+        self.validate_mtls_dns_admission_tx(&mut tx, &proxy.namespace)
+            .await?;
         self.record_config_change_tx(&mut tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
             .await?;
         self.compact_config_changes_tx(&mut tx, &proxy.namespace)
@@ -2343,6 +2436,8 @@ impl DatabaseStore {
     pub async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+            .await?;
 
         // Look up the proxy's current upstream_id before deleting so we can
         // cascade-delete that upstream if it becomes orphaned. Also capture the
@@ -2448,6 +2543,8 @@ impl DatabaseStore {
                 .await?;
         }
 
+        self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+            .await?;
         self.record_config_change_tx(&mut tx, namespace, "proxy", id, "delete")
             .await?;
         for (plugin_id, plugin_namespace) in proxy_scoped_plugins {
@@ -2650,6 +2747,8 @@ impl DatabaseStore {
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, &consumer.namespace)
+            .await?;
         sqlx::query(
             &self.q("INSERT INTO consumers (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         )
@@ -2669,6 +2768,8 @@ impl DatabaseStore {
         // cross-field identity collision aborts the whole create via the
         // consumer_identity_index PK (mapped to HTTP 409 by the admin layer).
         self.insert_consumer_identity_index_tx(&mut tx, consumer)
+            .await?;
+        self.validate_mtls_dns_admission_tx(&mut tx, &consumer.namespace)
             .await?;
         self.record_config_change_tx(
             &mut tx,
@@ -2691,6 +2792,8 @@ impl DatabaseStore {
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, &consumer.namespace)
+            .await?;
         // Existence read inside the transaction is the not-found authority —
         // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
         // (sqlx's default) counts *changed* rows, so an update writing
@@ -2731,6 +2834,8 @@ impl DatabaseStore {
             .await?;
         self.insert_consumer_identity_index_tx(&mut tx, consumer)
             .await?;
+        self.validate_mtls_dns_admission_tx(&mut tx, &consumer.namespace)
+            .await?;
         self.record_config_change_tx(
             &mut tx,
             &consumer.namespace,
@@ -2750,6 +2855,8 @@ impl DatabaseStore {
     pub async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+            .await?;
         // Scope the existence check to the caller's namespace (issue #2122):
         // consumer ids are only unique per namespace.
         let existing: Option<AnyRow> =
@@ -2773,6 +2880,8 @@ impl DatabaseStore {
             .bind(id)
             .bind(namespace)
             .execute(&mut *tx)
+            .await?;
+        self.validate_mtls_dns_admission_tx(&mut tx, namespace)
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "consumer", id, "delete")
             .await?;
@@ -2816,6 +2925,8 @@ impl DatabaseStore {
             PluginScope::Global => "global",
         };
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, &pc.namespace)
+            .await?;
         sqlx::query(
             &self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
@@ -2839,6 +2950,8 @@ impl DatabaseStore {
             self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
                 .await?;
         }
+        self.validate_mtls_dns_admission_tx(&mut tx, &pc.namespace)
+            .await?;
         self.compact_config_changes_tx(&mut tx, &pc.namespace)
             .await?;
         tx.commit().await?;
@@ -2856,6 +2969,8 @@ impl DatabaseStore {
             PluginScope::Global => "global",
         };
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, &pc.namespace)
+            .await?;
         // Existence read inside the transaction is the not-found authority —
         // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
         // (sqlx's default) counts *changed* rows, so an update writing
@@ -2898,6 +3013,8 @@ impl DatabaseStore {
             self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
                 .await?;
         }
+        self.validate_mtls_dns_admission_tx(&mut tx, &pc.namespace)
+            .await?;
         self.compact_config_changes_tx(&mut tx, &pc.namespace)
             .await?;
         tx.commit().await?;
@@ -2913,6 +3030,8 @@ impl DatabaseStore {
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+            .await?;
         // Scope the existence check to the caller's namespace (issue #2122) so
         // a tenant cannot delete a same-id plugin config in another namespace.
         let existing: Option<AnyRow> =
@@ -2962,6 +3081,8 @@ impl DatabaseStore {
                 .bind(namespace)
                 .execute(&mut *tx)
                 .await?;
+        self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+            .await?;
         self.record_config_change_tx(&mut tx, namespace, "plugin_config", id, "delete")
             .await?;
         for proxy_id in affected_proxy_ids {
@@ -4755,6 +4876,14 @@ impl DatabaseStore {
         attach_plugins: bool,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        let mut admission_namespaces: Vec<&str> =
+            proxies.iter().map(|proxy| proxy.namespace.as_str()).collect();
+        admission_namespaces.sort_unstable();
+        admission_namespaces.dedup();
+        for namespace in &admission_namespaces {
+            self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+                .await?;
+        }
         let mut touched_namespaces = HashSet::new();
         let insert_sql = self.q(Self::PROXY_INSERT_SQL);
         let assoc_sql =
@@ -4898,6 +5027,10 @@ impl DatabaseStore {
             touched_namespaces.insert(proxy.namespace.clone());
         }
 
+        for namespace in &admission_namespaces {
+            self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                .await?;
+        }
         for namespace in &touched_namespaces {
             self.compact_config_changes_tx(&mut tx, namespace).await?;
         }
@@ -4920,6 +5053,14 @@ impl DatabaseStore {
             self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
             let mut tx = self.pool().begin().await?;
+            let mut admission_namespaces: Vec<&str> =
+                chunk.iter().map(|proxy| proxy.namespace.as_str()).collect();
+            admission_namespaces.sort_unstable();
+            admission_namespaces.dedup();
+            for namespace in &admission_namespaces {
+                self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
             let mut seen = HashSet::new();
             let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
             let mut touched_namespaces = HashSet::new();
@@ -4959,6 +5100,10 @@ impl DatabaseStore {
                         .await?;
                 }
             }
+            for namespace in &admission_namespaces {
+                self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
             for namespace in &touched_namespaces {
                 self.compact_config_changes_tx(&mut tx, namespace).await?;
             }
@@ -4993,6 +5138,16 @@ impl DatabaseStore {
         consumers: &[Consumer],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        let mut admission_namespaces: Vec<&str> = consumers
+            .iter()
+            .map(|consumer| consumer.namespace.as_str())
+            .collect();
+        admission_namespaces.sort_unstable();
+        admission_namespaces.dedup();
+        for namespace in &admission_namespaces {
+            self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+                .await?;
+        }
         let mut touched_namespaces = HashSet::new();
         let sql = self.q("INSERT INTO consumers (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
@@ -5025,6 +5180,10 @@ impl DatabaseStore {
             touched_namespaces.insert(consumer.namespace.clone());
         }
 
+        for namespace in &admission_namespaces {
+            self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                .await?;
+        }
         for namespace in &touched_namespaces {
             self.compact_config_changes_tx(&mut tx, namespace).await?;
         }
@@ -5057,6 +5216,16 @@ impl DatabaseStore {
         configs: &[PluginConfig],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        let mut admission_namespaces: Vec<&str> = configs
+            .iter()
+            .map(|config| config.namespace.as_str())
+            .collect();
+        admission_namespaces.sort_unstable();
+        admission_namespaces.dedup();
+        for namespace in &admission_namespaces {
+            self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+                .await?;
+        }
         let mut touched_namespaces = HashSet::new();
         let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
@@ -5099,6 +5268,10 @@ impl DatabaseStore {
             touched_namespaces.insert(pc.namespace.clone());
         }
 
+        for namespace in &admission_namespaces {
+            self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                .await?;
+        }
         for namespace in &touched_namespaces {
             self.compact_config_changes_tx(&mut tx, namespace).await?;
         }
@@ -5213,6 +5386,8 @@ impl DatabaseStore {
     pub async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+            .await?;
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
         let proxy_ids = self
             .select_resource_ids_tx(&mut tx, "proxies", namespace, None, true)
@@ -5262,6 +5437,8 @@ impl DatabaseStore {
         sqlx::query(&self.q("DELETE FROM upstreams WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut *tx)
+            .await?;
+        self.validate_mtls_dns_admission_tx(&mut tx, namespace)
             .await?;
         for id in proxy_ids {
             self.record_config_change_tx(&mut tx, namespace, "proxy", &id, "delete")
@@ -5830,6 +6007,8 @@ impl DatabaseStore {
         use crate::config::types::{AuthMode, ResponseBodyMode};
 
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
+            .await?;
 
         // 1. INSERT upstream (if present), tagged with api_spec_id.
         if let Some(u) = &bundle.upstream {
@@ -6058,6 +6237,8 @@ impl DatabaseStore {
 
         // 4. INSERT api_specs row.
         self.insert_api_spec_tx(&mut tx, spec).await?;
+        self.validate_mtls_dns_admission_tx(&mut tx, &spec.namespace)
+            .await?;
         if let Some(u) = &bundle.upstream {
             self.record_config_change_tx(&mut tx, &u.namespace, "upstream", &u.id, "upsert")
                 .await?;
@@ -6098,6 +6279,8 @@ impl DatabaseStore {
         // admin CRUD drift forces the full replace path even when the submitted
         // spec's resource_hash matches the stored metadata.
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, &spec.namespace)
+            .await?;
 
         let existing_spec: Option<crate::config::types::ApiSpec> =
             sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ?"))
@@ -6525,6 +6708,8 @@ impl DatabaseStore {
         .bind(&spec.id)
         .execute(&mut *tx)
         .await?;
+        self.validate_mtls_dns_admission_tx(&mut tx, &spec.namespace)
+            .await?;
         self.record_config_change_tx(
             &mut tx,
             &bundle.proxy.namespace,
@@ -7001,6 +7186,8 @@ impl DatabaseStore {
     /// have no FK to proxies, so they are cleaned up manually by api_spec_id.
     pub async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+            .await?;
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
 
         // Find the proxy_id for this spec.
@@ -7103,6 +7290,8 @@ impl DatabaseStore {
             .bind(id)
             .bind(namespace)
             .execute(&mut *tx)
+            .await?;
+        self.validate_mtls_dns_admission_tx(&mut tx, namespace)
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "proxy", &proxy_id, "delete")
             .await?;

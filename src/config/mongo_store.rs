@@ -43,7 +43,7 @@
 mod inner {
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
-        IncrementalResult, NamespaceResourceCounts, NamespacedResourceId,
+        IncrementalResult, MtlsDnsIdentityConflict, NamespaceResourceCounts, NamespacedResourceId,
         PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
     };
     use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
@@ -313,12 +313,10 @@ mod inner {
     struct MongoConnectionBundle {
         client: Client,
         db: Database,
-        // Fully materialized effective `ClientOptions` (TLS applied, primary
-        // read preference forced) captured before `Client::with_options`
-        // consumed a clone of them. The migration-lease upkeep path clones
-        // these to build a dedicated small pool so it never re-derives or
-        // forks the TLS materialization logic.
-        client_options: ClientOptions,
+        // Reusable small-pool client for migration and admission lease upkeep.
+        // It uses the same materialized TLS/read-preference options as the
+        // primary client but cannot be starved by long-running datastore work.
+        lease_client: Client,
         // Own generated TLS PEM files for exactly as long as this driver
         // client can open new sockets using their paths.
         _tls_temp_paths: Vec<tempfile::TempPath>,
@@ -344,11 +342,12 @@ mod inner {
     }
 
     struct MongoMigrationLease {
-        // Collection handle bound to the DEDICATED lease client/pool (see
-        // `acquire_migration_lease`), deliberately separate from the store's
-        // migration-work pool so acquire/renew/release/Drop cleanup can never
-        // be starved by a long-running create_index.
+        // Collection handle bound to the reusable DEDICATED lease client/pool,
+        // deliberately separate from the store's work pool so acquire, renew,
+        // release, and Drop cleanup cannot be starved by a long operation.
         collection: Collection<Document>,
+        lock_id: String,
+        label: &'static str,
         owner: String,
         // The update mode chosen at acquisition, carried so release/diagnostics
         // stay consistent with how acquire/renew stamped the lock. Release is a
@@ -359,7 +358,7 @@ mod inner {
         valid: Arc<AtomicBool>,
         released: bool,
         // Keeps the live connection bundle — and the generated TLS PEM temp
-        // files it owns — alive for as long as the dedicated lease client may
+        // files it owns — alive for as long as the reusable lease client may
         // open new sockets, including the best-effort Drop cleanup task.
         _connection: Arc<MongoConnectionBundle>,
     }
@@ -370,27 +369,39 @@ mod inner {
                 let _ = stop_tx.send(true);
             }
             if let Some(renew_task) = self.renew_task.take() {
+                let label = self.label;
                 renew_task.await.map_err(|error| {
-                    anyhow::anyhow!("MongoDB migration lease renewal task failed: {error}")
+                    anyhow::anyhow!("MongoDB {label} lease renewal task failed: {error}")
                 })?;
             }
 
             // Release is mode-independent: the owning document is deleted by
             // `_id`+`owner` regardless of how acquire/renew stamped it.
-            debug!("Releasing MongoDB migration lease (mode={:?})", self.mode);
+            debug!(
+                "Releasing MongoDB {} lease '{}' (mode={:?})",
+                self.label, self.lock_id, self.mode
+            );
             let result = self
                 .collection
                 .delete_one(doc! {
-                    "_id": MONGO_MIGRATION_LOCK_ID,
+                    "_id": &self.lock_id,
                     "owner": &self.owner,
                 })
                 .await?;
             self.released = true;
             if !self.valid.load(Ordering::Acquire) {
-                anyhow::bail!("MongoDB migration lease expired or was lost while migrations ran");
+                anyhow::bail!(
+                    "MongoDB {} lease '{}' expired or was lost while the operation ran",
+                    self.label,
+                    self.lock_id
+                );
             }
             if result.deleted_count != 1 {
-                anyhow::bail!("MongoDB migration lease release did not match the owning document");
+                anyhow::bail!(
+                    "MongoDB {} lease '{}' release did not match the owning document",
+                    self.label,
+                    self.lock_id
+                );
             }
             Ok(())
         }
@@ -406,6 +417,7 @@ mod inner {
             }
 
             let collection = self.collection.clone();
+            let lock_id = self.lock_id.clone();
             let owner = self.owner.clone();
             let renew_task = self.renew_task.take();
             // Keep the bundle (and its TLS temp files) alive for the whole
@@ -420,7 +432,7 @@ mod inner {
                     }
                     let _ = collection
                         .delete_one(doc! {
-                            "_id": MONGO_MIGRATION_LOCK_ID,
+                            "_id": lock_id,
                             "owner": owner,
                         })
                         .await;
@@ -433,13 +445,13 @@ mod inner {
         fn new(
             client: Client,
             db: Database,
-            client_options: ClientOptions,
+            lease_client: Client,
             tls_temp_paths: Vec<tempfile::TempPath>,
         ) -> Self {
             Self {
                 client,
                 db,
-                client_options,
+                lease_client,
                 _tls_temp_paths: tls_temp_paths,
             }
         }
@@ -766,10 +778,18 @@ mod inner {
                 );
             }
 
-            // Capture the fully materialized effective options before the
-            // client consumes a clone so the migration-lease path can build a
-            // dedicated pool from the identical TLS/read-preference settings.
+            // Build one reusable, independently capped lease-upkeep pool from
+            // the fully materialized effective options. Reusing this client is
+            // important for the per-write admission lease: constructing a new
+            // driver client and pool for every admin mutation would create
+            // avoidable connection churn.
             let client = Client::with_options(client_options.clone())?;
+            let mut lease_options = client_options;
+            lease_options.max_pool_size = Some(MONGO_MIGRATION_LEASE_POOL_SIZE);
+            // Never let a URL-derived minPoolSize exceed the capped max (which
+            // would fail client construction) or eagerly warm this upkeep pool.
+            lease_options.min_pool_size = None;
+            let lease_client = Client::with_options(lease_options)?;
             let db = client.database(&settings.database_name);
 
             // Verify connectivity
@@ -789,7 +809,7 @@ mod inner {
             );
 
             Ok((
-                MongoConnectionBundle::new(client, db, client_options, tls_temp_paths),
+                MongoConnectionBundle::new(client, db, lease_client, tls_temp_paths),
                 replica_set_configured,
             ))
         }
@@ -1148,8 +1168,16 @@ mod inner {
             owner: &str,
             client_now: BsonDateTime,
         ) -> Document {
+            Self::lease_acquire_filter_classic(MONGO_MIGRATION_LOCK_ID, owner, client_now)
+        }
+
+        fn lease_acquire_filter_classic(
+            lock_id: &str,
+            owner: &str,
+            client_now: BsonDateTime,
+        ) -> Document {
             doc! {
-                "_id": MONGO_MIGRATION_LOCK_ID,
+                "_id": lock_id,
                 "$or": [
                     { "expires_at": { "$exists": false } },
                     { "expires_at": { "$lte": client_now } },
@@ -1192,30 +1220,83 @@ mod inner {
         }
 
         async fn acquire_migration_lease(&self) -> Result<MongoMigrationLease, anyhow::Error> {
-            // Give the lease acquire/renew/release (and Drop cleanup) path its
-            // own dedicated connection pool, separate from the store's
-            // migration-work pool. Cloning the bundle's already-materialized
-            // effective `ClientOptions` reuses the exact TLS/read-preference
-            // setup with no re-derivation, while capping the pool at a couple
-            // of connections keeps it cheap — the lease only issues tiny
-            // update_one/delete_one commands. This isolation is what prevents a
-            // long-running `create_index` from holding the sole pooled
-            // connection (e.g. maxPoolSize=1) and starving the 30s renewal:
-            // otherwise the 120s lease could expire mid-migration and let a
-            // second replica run the index/drop sequence concurrently, or make
-            // this instance fail lease release after the indexes succeeded.
+            self.acquire_named_lease(
+                "_ferrum_migration_locks",
+                MONGO_MIGRATION_LOCK_ID,
+                "migration",
+            )
+            .await
+        }
+
+        async fn acquire_mtls_dns_admission_lease(
+            &self,
+            namespace: &str,
+        ) -> Result<MongoMigrationLease, anyhow::Error> {
+            self.acquire_named_lease(
+                "mtls_dns_admission_locks",
+                namespace,
+                "mTLS DNS admission",
+            )
+            .await
+        }
+
+        async fn acquire_mtls_dns_admission_leases<'a>(
+            &self,
+            namespaces: impl IntoIterator<Item = &'a str>,
+        ) -> Result<Vec<MongoMigrationLease>, anyhow::Error> {
+            let mut namespaces: Vec<&str> = namespaces.into_iter().collect();
+            namespaces.sort_unstable();
+            namespaces.dedup();
+            let mut leases = Vec::with_capacity(namespaces.len());
+            for namespace in namespaces {
+                leases.push(self.acquire_mtls_dns_admission_lease(namespace).await?);
+            }
+            Ok(leases)
+        }
+
+        async fn release_mtls_dns_admission_leases(
+            leases: &mut Vec<MongoMigrationLease>,
+        ) -> Result<(), anyhow::Error> {
+            while let Some(mut lease) = leases.pop() {
+                lease.release().await?;
+            }
+            Ok(())
+        }
+
+        async fn validate_mtls_dns_candidate<F>(
+            &self,
+            namespace: &str,
+            mutate: F,
+        ) -> Result<(), anyhow::Error>
+        where
+            F: FnOnce(&mut GatewayConfig),
+        {
+            let mut candidate =
+                <Self as DatabaseBackend>::load_namespace_snapshot(self, namespace).await?;
+            mutate(&mut candidate);
+            candidate.normalize_fields();
+            candidate
+                .validate_unique_mtls_dns_identities()
+                .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
+        }
+
+        async fn acquire_named_lease(
+            &self,
+            collection_name: &str,
+            lock_id: &str,
+            label: &'static str,
+        ) -> Result<MongoMigrationLease, anyhow::Error> {
+            // Lease upkeep uses the connection bundle's reusable dedicated
+            // pool. This isolates tiny acquire/renew/release commands from the
+            // datastore work pool without constructing a new driver client for
+            // every admission attempt.
             let connection = self.connection();
-            let mut lease_options = connection.client_options.clone();
-            lease_options.max_pool_size = Some(MONGO_MIGRATION_LEASE_POOL_SIZE);
-            // Never let a URL-derived minPoolSize exceed the capped max (which
-            // would fail client construction) or eagerly warm this throwaway
-            // upkeep pool.
-            lease_options.min_pool_size = None;
-            let lease_client = Client::with_options(lease_options)?;
-            let collection = lease_client
+            let collection = connection
+                .lease_client
                 .database(connection.db.name())
-                .collection::<Document>("_ferrum_migration_locks");
+                .collection::<Document>(collection_name);
             let owner = Uuid::new_v4().to_string();
+            let lock_id = lock_id.to_string();
 
             // Start in server-time (`$$NOW`) pipeline mode, the skew-immune
             // primary path for real MongoDB. Only the FIRST acquire attempt may
@@ -1229,7 +1310,7 @@ mod inner {
                     MigrationLeaseMode::ServerTimePipeline => {
                         collection
                             .find_one_and_update(
-                                doc! { "_id": MONGO_MIGRATION_LOCK_ID },
+                                doc! { "_id": &lock_id },
                                 Self::migration_lease_acquire_pipeline(&owner),
                             )
                             .upsert(true)
@@ -1240,7 +1321,11 @@ mod inner {
                         let client_now = BsonDateTime::now();
                         collection
                             .find_one_and_update(
-                                Self::migration_lease_acquire_filter_classic(&owner, client_now),
+                                Self::lease_acquire_filter_classic(
+                                    &lock_id,
+                                    &owner,
+                                    client_now,
+                                ),
                                 Self::migration_lease_acquire_update_classic(&owner, client_now),
                             )
                             .upsert(true)
@@ -1273,9 +1358,10 @@ mod inner {
                             && is_pipeline_update_unsupported(&error) =>
                     {
                         warn!(
-                            "MongoDB rejected the aggregation-pipeline migration-lease update \
+                            "MongoDB rejected the aggregation-pipeline {}-lease update \
                              (AWS DocumentDB-compatible backend); falling back to the classic \
-                             client-time lease for this migration run: {error}"
+                             client-time lease for this operation: {error}",
+                            label
                         );
                         mode = MigrationLeaseMode::ClientTimeClassic;
                         continue;
@@ -1288,6 +1374,8 @@ mod inner {
             let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
             let renew_collection = collection.clone();
             let renew_owner = owner.clone();
+            let renew_lock_id = lock_id.clone();
+            let renew_label = label;
             let valid = Arc::new(AtomicBool::new(true));
             let renew_valid = valid.clone();
             let renew_task = tokio::spawn(async move {
@@ -1307,7 +1395,7 @@ mod inner {
                         // DocumentDB lease never re-sends the unsupported
                         // pipeline. The owner filter is identical in both modes.
                         let renew_filter = doc! {
-                            "_id": MONGO_MIGRATION_LOCK_ID,
+                            "_id": &renew_lock_id,
                             "owner": &renew_owner,
                         };
                         let renewal = match mode {
@@ -1339,7 +1427,8 @@ mod inner {
                             Ok(_) => {
                                 renew_valid.store(false, Ordering::Release);
                                 error!(
-                                    "MongoDB migration lease renewal lost the owning lock document"
+                                    "MongoDB {} lease renewal lost the owning lock document",
+                                    renew_label
                                 );
                                 return;
                             }
@@ -1350,13 +1439,15 @@ mod inner {
                                 {
                                     renew_valid.store(false, Ordering::Release);
                                     error!(
-                                        "MongoDB migration lease expired after renewal failures: {}",
+                                        "MongoDB {} lease expired after renewal failures: {}",
+                                        renew_label,
                                         error
                                     );
                                     return;
                                 }
                                 debug!(
-                                    "MongoDB migration lease renewal failed; retrying before expiry: {}",
+                                    "MongoDB {} lease renewal failed; retrying before expiry: {}",
+                                    renew_label,
                                     error
                                 );
                                 tokio::select! {
@@ -1375,6 +1466,8 @@ mod inner {
 
             Ok(MongoMigrationLease {
                 collection,
+                lock_id,
+                label,
                 owner,
                 mode,
                 stop_tx: Some(stop_tx),
@@ -3790,6 +3883,13 @@ mod inner {
 
         async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self
+                .acquire_mtls_dns_admission_lease(&proxy.namespace)
+                .await?;
+            self.validate_mtls_dns_candidate(&proxy.namespace, |candidate| {
+                candidate.proxies.push(proxy.clone());
+            })
+            .await?;
             let doc = proxy_to_doc(proxy)?;
             let guard_params = ProxyWriteGuardParams::from_proxy(proxy);
             if self.replica_set_configured() {
@@ -3922,12 +4022,26 @@ mod inner {
                     return Err(err);
                 }
             }
+            mtls_lease.release().await?;
             self.check_slow_query("create_proxy", start);
             Ok(())
         }
 
         async fn update_proxy(&self, proxy: &Proxy) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self
+                .acquire_mtls_dns_admission_lease(&proxy.namespace)
+                .await?;
+            self.validate_mtls_dns_candidate(&proxy.namespace, |candidate| {
+                if let Some(existing) = candidate
+                    .proxies
+                    .iter_mut()
+                    .find(|existing| existing.id == proxy.id)
+                {
+                    *existing = proxy.clone();
+                }
+            })
+            .await?;
             // Preserve api_spec_id: the incoming Proxy from the admin CRUD
             // endpoint has api_spec_id: None (stripped in normalize()), but
             // the stored document may carry an ownership tag from a spec
@@ -4045,6 +4159,7 @@ mod inner {
                         }
                     }
                 }
+                mtls_lease.release().await?;
                 self.check_slow_query("update_proxy", start);
                 return Ok(matched);
             }
@@ -4058,6 +4173,7 @@ mod inner {
                 .find_one(doc! { "_id": &proxy.id, "namespace": &proxy.namespace })
                 .await?;
             let Some(previous_doc) = previous_doc else {
+                mtls_lease.release().await?;
                 self.check_slow_query("update_proxy", start);
                 return Ok(false);
             };
@@ -4095,6 +4211,7 @@ mod inner {
                 .await?;
             if replace_result.matched_count == 0 {
                 // Phantom update (concurrent delete): no config-change record.
+                mtls_lease.release().await?;
                 self.check_slow_query("update_proxy", start);
                 return Ok(false);
             }
@@ -4170,12 +4287,21 @@ mod inner {
                     .await?;
             }
 
+            mtls_lease.release().await?;
             self.check_slow_query("update_proxy", start);
             Ok(true)
         }
 
         async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
+            self.validate_mtls_dns_candidate(namespace, |candidate| {
+                candidate.proxies.retain(|proxy| proxy.id != id);
+                candidate
+                    .plugin_configs
+                    .retain(|plugin| plugin.proxy_id.as_deref() != Some(id));
+            })
+            .await?;
             if self.replica_set_configured.load(Ordering::Acquire) {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -4426,6 +4552,7 @@ mod inner {
                         }
                     }
                 }
+                mtls_lease.release().await?;
                 self.check_slow_query("delete_proxy", start);
                 return Ok(deleted);
             }
@@ -4435,6 +4562,7 @@ mod inner {
                 .find_one(doc! { "_id": id, "namespace": namespace })
                 .await?;
             if proxy_doc_for_changes.is_none() {
+                mtls_lease.release().await?;
                 self.check_slow_query("delete_proxy", start);
                 return Ok(false);
             };
@@ -4477,6 +4605,7 @@ mod inner {
                 .as_ref()
                 .and_then(|doc| doc.get_str("upstream_id").ok().map(str::to_string));
             if proxy_doc.is_none() {
+                mtls_lease.release().await?;
                 self.check_slow_query("delete_proxy", start);
                 return Ok(false);
             }
@@ -4591,6 +4720,7 @@ mod inner {
                         .await?;
                 }
             }
+            mtls_lease.release().await?;
             self.check_slow_query("delete_proxy", start);
             Ok(result.deleted_count > 0)
         }
@@ -4658,6 +4788,21 @@ mod inner {
 
         async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self
+                .acquire_mtls_dns_admission_lease(&consumer.namespace)
+                .await?;
+            self.validate_mtls_dns_candidate(&consumer.namespace, |candidate| {
+                if let Some(existing) = candidate
+                    .consumers
+                    .iter_mut()
+                    .find(|existing| existing.id == consumer.id)
+                {
+                    *existing = consumer.clone();
+                } else {
+                    candidate.consumers.push(consumer.clone());
+                }
+            })
+            .await?;
             let doc = consumer_to_doc(consumer)?;
             let identity_values = consumer_identity_values(consumer);
             if self.replica_set_configured() {
@@ -4755,12 +4900,26 @@ mod inner {
                     return Err(err);
                 }
             }
+            mtls_lease.release().await?;
             self.check_slow_query("create_consumer", start);
             Ok(())
         }
 
         async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self
+                .acquire_mtls_dns_admission_lease(&consumer.namespace)
+                .await?;
+            self.validate_mtls_dns_candidate(&consumer.namespace, |candidate| {
+                if let Some(existing) = candidate
+                    .consumers
+                    .iter_mut()
+                    .find(|existing| existing.id == consumer.id)
+                {
+                    *existing = consumer.clone();
+                }
+            })
+            .await?;
             let doc = consumer_to_doc(consumer)?;
             let new_identity_values = consumer_identity_values(consumer);
             let composite_id = consumer_doc_id(&consumer.namespace, &consumer.id);
@@ -4853,6 +5012,7 @@ mod inner {
                     .find_one(doc! { "_id": &composite_id })
                     .await?;
                 let Some(previous_doc) = previous_doc else {
+                    mtls_lease.release().await?;
                     self.check_slow_query("update_consumer", start);
                     return Ok(false);
                 };
@@ -4903,6 +5063,7 @@ mod inner {
                         &added,
                     )
                     .await;
+                    mtls_lease.release().await?;
                     self.check_slow_query("update_consumer", start);
                     return Ok(false);
                 }
@@ -4940,12 +5101,18 @@ mod inner {
                 .await;
                 true
             };
+            mtls_lease.release().await?;
             self.check_slow_query("update_consumer", start);
             Ok(matched)
         }
 
         async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
+            self.validate_mtls_dns_candidate(namespace, |candidate| {
+                candidate.consumers.retain(|consumer| consumer.id != id);
+            })
+            .await?;
             let composite_id = consumer_doc_id(namespace, id);
             let deleted = if self.replica_set_configured() {
                 let connection = self.connection();
@@ -5017,6 +5184,7 @@ mod inner {
                 }
                 result.deleted_count > 0
             };
+            mtls_lease.release().await?;
             self.check_slow_query("delete_consumer", start);
             Ok(deleted)
         }
@@ -5069,6 +5237,21 @@ mod inner {
 
         async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self
+                .acquire_mtls_dns_admission_lease(&pc.namespace)
+                .await?;
+            self.validate_mtls_dns_candidate(&pc.namespace, |candidate| {
+                if let Some(existing) = candidate
+                    .plugin_configs
+                    .iter_mut()
+                    .find(|existing| existing.id == pc.id)
+                {
+                    *existing = pc.clone();
+                } else {
+                    candidate.plugin_configs.push(pc.clone());
+                }
+            })
+            .await?;
             let doc = plugin_config_to_doc(pc)?;
             if self.replica_set_configured() {
                 let connection = self.connection();
@@ -5148,12 +5331,26 @@ mod inner {
                     return Err(err);
                 }
             }
+            mtls_lease.release().await?;
             self.check_slow_query("create_plugin_config", start);
             Ok(())
         }
 
         async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self
+                .acquire_mtls_dns_admission_lease(&pc.namespace)
+                .await?;
+            self.validate_mtls_dns_candidate(&pc.namespace, |candidate| {
+                if let Some(existing) = candidate
+                    .plugin_configs
+                    .iter_mut()
+                    .find(|existing| existing.id == pc.id)
+                {
+                    *existing = pc.clone();
+                }
+            })
+            .await?;
             // Preserve api_spec_id by carrying it into the replacement document.
             // Returning an error is safer than silently detaching spec ownership.
             let mut doc = plugin_config_to_doc(pc)?;
@@ -5164,6 +5361,7 @@ mod inner {
             if existing_doc.is_none() {
                 // No document in this namespace — phantom update, no
                 // config-change record (DB-M4).
+                mtls_lease.release().await?;
                 self.check_slow_query("update_plugin_config", start);
                 return Ok(false);
             }
@@ -5240,6 +5438,7 @@ mod inner {
                 if matched {
                     self.compact_config_changes_best_effort(&pc.namespace).await;
                 }
+                mtls_lease.release().await?;
                 self.check_slow_query("update_plugin_config", start);
                 return Ok(matched);
             } else {
@@ -5250,6 +5449,7 @@ mod inner {
                 if replace_result.matched_count == 0 {
                     // Phantom update (concurrent delete): no config-change
                     // record (DB-M4).
+                    mtls_lease.release().await?;
                     self.check_slow_query("update_plugin_config", start);
                     return Ok(false);
                 }
@@ -5277,6 +5477,7 @@ mod inner {
                     return Err(err);
                 }
             }
+            mtls_lease.release().await?;
             self.check_slow_query("update_plugin_config", start);
             Ok(true)
         }
@@ -5287,6 +5488,16 @@ mod inner {
             id: &str,
         ) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
+            self.validate_mtls_dns_candidate(namespace, |candidate| {
+                candidate.plugin_configs.retain(|plugin| plugin.id != id);
+                for proxy in &mut candidate.proxies {
+                    proxy
+                        .plugins
+                        .retain(|association| association.plugin_config_id != id);
+                }
+            })
+            .await?;
             let existing = self
                 .plugin_configs()
                 .find_one(doc! { "_id": id, "namespace": namespace })
@@ -5294,6 +5505,7 @@ mod inner {
             if existing.is_none() {
                 // No document in this namespace — nothing to delete, and no
                 // proxy associations to pull.
+                mtls_lease.release().await?;
                 self.check_slow_query("delete_plugin_config", start);
                 return Ok(false);
             }
@@ -5400,6 +5612,7 @@ mod inner {
                 }
                 result.deleted_count > 0
             };
+            mtls_lease.release().await?;
             self.check_slow_query("delete_plugin_config", start);
             Ok(deleted)
         }
@@ -6187,6 +6400,26 @@ mod inner {
             if proxies.is_empty() {
                 return Ok(0);
             }
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases(
+                    proxies.iter().map(|proxy| proxy.namespace.as_str()),
+                )
+                .await?;
+            let namespaces: HashSet<&str> = proxies
+                .iter()
+                .map(|proxy| proxy.namespace.as_str())
+                .collect();
+            for namespace in namespaces {
+                self.validate_mtls_dns_candidate(namespace, |candidate| {
+                    candidate.proxies.extend(
+                        proxies
+                            .iter()
+                            .filter(|proxy| proxy.namespace == namespace)
+                            .cloned(),
+                    );
+                })
+                .await?;
+            }
             let docs: Vec<Document> = proxies.iter().map(proxy_to_doc).collect::<Result<_, _>>()?;
             if self.replica_set_configured() {
                 let connection = self.connection();
@@ -6229,6 +6462,7 @@ mod inner {
                 for namespace in namespaces {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
+                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 Ok(count)
             } else {
                 let ids: Vec<&str> = proxies.iter().map(|proxy| proxy.id.as_str()).collect();
@@ -6262,6 +6496,7 @@ mod inner {
                         .await;
                     return Err(err);
                 }
+                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 Ok(result.inserted_ids.len())
             }
         }
@@ -6291,6 +6526,26 @@ mod inner {
         ) -> Result<usize, anyhow::Error> {
             if consumers.is_empty() {
                 return Ok(0);
+            }
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases(
+                    consumers.iter().map(|consumer| consumer.namespace.as_str()),
+                )
+                .await?;
+            let namespaces: HashSet<&str> = consumers
+                .iter()
+                .map(|consumer| consumer.namespace.as_str())
+                .collect();
+            for namespace in namespaces {
+                self.validate_mtls_dns_candidate(namespace, |candidate| {
+                    candidate.consumers.extend(
+                        consumers
+                            .iter()
+                            .filter(|consumer| consumer.namespace == namespace)
+                            .cloned(),
+                    );
+                })
+                .await?;
             }
             let docs: Vec<Document> = consumers
                 .iter()
@@ -6361,6 +6616,7 @@ mod inner {
                 for namespace in namespaces {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
+                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 Ok(count)
             } else {
                 // Standalone RESERVE FIRST: insert identity reservations for
@@ -6434,6 +6690,7 @@ mod inner {
                     .await;
                     return Err(err);
                 }
+                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 Ok(result.inserted_ids.len())
             }
         }
@@ -6444,6 +6701,26 @@ mod inner {
         ) -> Result<usize, anyhow::Error> {
             if configs.is_empty() {
                 return Ok(0);
+            }
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases(
+                    configs.iter().map(|config| config.namespace.as_str()),
+                )
+                .await?;
+            let namespaces: HashSet<&str> = configs
+                .iter()
+                .map(|config| config.namespace.as_str())
+                .collect();
+            for namespace in namespaces {
+                self.validate_mtls_dns_candidate(namespace, |candidate| {
+                    candidate.plugin_configs.extend(
+                        configs
+                            .iter()
+                            .filter(|config| config.namespace == namespace)
+                            .cloned(),
+                    );
+                })
+                .await?;
             }
             let docs: Vec<Document> = configs
                 .iter()
@@ -6490,6 +6767,7 @@ mod inner {
                 for namespace in namespaces {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
+                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 Ok(count)
             } else {
                 let ids: Vec<&str> = configs.iter().map(|config| config.id.as_str()).collect();
@@ -6528,6 +6806,7 @@ mod inner {
                     .await;
                     return Err(err);
                 }
+                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 Ok(result.inserted_ids.len())
             }
         }
@@ -6638,6 +6917,10 @@ mod inner {
                 DeleteMode::NonAtomic
             };
             let delete_error = |source: anyhow::Error| DeleteAllResourcesError::new(mode, source);
+            let mut mtls_lease = self
+                .acquire_mtls_dns_admission_lease(namespace)
+                .await
+                .map_err(&delete_error)?;
             let ns_filter = doc! { "namespace": namespace };
             if mode.is_atomic() {
                 let connection = self.connection();
@@ -6836,6 +7119,7 @@ mod inner {
                         .map_err(&delete_error)?;
                 }
             }
+            mtls_lease.release().await.map_err(&delete_error)?;
             info!("All MongoDB resources deleted (namespace='{}')", namespace);
             Ok(mode)
         }
@@ -7125,14 +7409,18 @@ mod inner {
                     .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
                     .await?;
 
-                // proxy_route_locks and upstream_ref_guards are keyed purely by
-                // `_id` ("{namespace}:{route_key_hash}" /
-                // "{namespace}:{upstream_id}") and need no indexes — but they are
-                // written from INSIDE transactions, and MongoDB < 4.4 cannot
-                // implicitly create a collection in a multi-document transaction,
-                // so create them explicitly here. NamespaceExists (code 48) is
-                // tolerated for idempotent multi-instance startup.
-                for lock_collection in ["proxy_route_locks", "upstream_ref_guards"] {
+                // The guard collections are keyed purely by `_id`
+                // (`{namespace}:{route_key_hash}`, `{namespace}:{upstream_id}`,
+                // or the namespace itself) and need no secondary indexes. Some
+                // are written from inside transactions, and MongoDB < 4.4 cannot
+                // implicitly create a collection there, so create every guard
+                // collection explicitly. NamespaceExists (code 48) is tolerated
+                // for idempotent multi-instance startup.
+                for lock_collection in [
+                    "proxy_route_locks",
+                    "upstream_ref_guards",
+                    "mtls_dns_admission_locks",
+                ] {
                     match self.db().create_collection(lock_collection).await {
                         Ok(()) => {}
                         Err(e) if is_namespace_exists(&e) => {}
@@ -7485,6 +7773,33 @@ mod inner {
                 );
             }
 
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases(
+                    std::iter::once(spec.namespace.as_str())
+                        .chain(std::iter::once(bundle.proxy.namespace.as_str()))
+                        .chain(bundle.plugins.iter().map(|plugin| plugin.namespace.as_str())),
+                )
+                .await?;
+            let namespaces: HashSet<&str> = std::iter::once(spec.namespace.as_str())
+                .chain(std::iter::once(bundle.proxy.namespace.as_str()))
+                .chain(bundle.plugins.iter().map(|plugin| plugin.namespace.as_str()))
+                .collect();
+            for namespace in namespaces {
+                self.validate_mtls_dns_candidate(namespace, |candidate| {
+                    if bundle.proxy.namespace == namespace {
+                        candidate.proxies.push(bundle.proxy.clone());
+                    }
+                    candidate.plugin_configs.extend(
+                        bundle
+                            .plugins
+                            .iter()
+                            .filter(|plugin| plugin.namespace == namespace)
+                            .cloned(),
+                    );
+                })
+                .await?;
+            }
+
             let use_replica_set = self.replica_set_configured();
             let mut orphaned_proxy_group_plugin_deletes = Vec::new();
             if use_replica_set {
@@ -7632,6 +7947,7 @@ mod inner {
                     .await;
                     return Err(e);
                 }
+                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 return Ok(());
             }
 
@@ -7650,6 +7966,7 @@ mod inner {
                 self.compact_config_changes_best_effort(&namespace).await;
             }
 
+            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
             Ok(())
         }
 
@@ -7672,6 +7989,14 @@ mod inner {
                     bson_bytes.len()
                 );
             }
+
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases(
+                    std::iter::once(spec.namespace.as_str())
+                        .chain(std::iter::once(bundle.proxy.namespace.as_str()))
+                        .chain(bundle.plugins.iter().map(|plugin| plugin.namespace.as_str())),
+                )
+                .await?;
 
             let existing_spec_doc = self
                 .api_specs()
@@ -7708,6 +8033,7 @@ mod inner {
                         spec_doc_check,
                     )
                     .await?;
+                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 return Ok(());
             }
 
@@ -7810,6 +8136,43 @@ mod inner {
                 .filter(|id| !new_spec_upstream_ids.contains(*id))
                 .cloned()
                 .collect();
+
+            let namespaces: HashSet<&str> = std::iter::once(spec.namespace.as_str())
+                .chain(std::iter::once(effective_bundle.proxy.namespace.as_str()))
+                .chain(
+                    effective_bundle
+                        .plugins
+                        .iter()
+                        .map(|plugin| plugin.namespace.as_str()),
+                )
+                .collect();
+            for namespace in namespaces {
+                self.validate_mtls_dns_candidate(namespace, |candidate| {
+                    candidate.plugin_configs.retain(|plugin| {
+                        !old_spec_plugin_ids.contains(&plugin.id)
+                            && !previous_declared_assoc_ids.contains(&plugin.id)
+                    });
+                    if effective_bundle.proxy.namespace == namespace {
+                        if let Some(existing) = candidate
+                            .proxies
+                            .iter_mut()
+                            .find(|proxy| proxy.id == effective_bundle.proxy.id)
+                        {
+                            *existing = effective_bundle.proxy.clone();
+                        } else {
+                            candidate.proxies.push(effective_bundle.proxy.clone());
+                        }
+                    }
+                    candidate.plugin_configs.extend(
+                        effective_bundle
+                            .plugins
+                            .iter()
+                            .filter(|plugin| plugin.namespace == namespace)
+                            .cloned(),
+                    );
+                })
+                .await?;
+            }
 
             let use_replica_set = self.replica_set_configured();
             let mut old_plugin_configs_deleted_for_changes = true;
@@ -8114,6 +8477,7 @@ mod inner {
                 for namespace in namespaces_to_compact {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
+                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 return Ok(());
             }
 
@@ -8154,6 +8518,7 @@ mod inner {
                     .await?;
             }
 
+            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
             Ok(())
         }
 
@@ -8430,6 +8795,7 @@ mod inner {
 
         async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
 
             // Check existence first (namespace-scoped).
             let existing = self
@@ -8438,6 +8804,7 @@ mod inner {
                 .await?;
 
             if existing.is_none() {
+                mtls_lease.release().await?;
                 self.check_slow_query("delete_api_spec", start);
                 return Ok(false);
             }
@@ -8447,6 +8814,15 @@ mod inner {
                 .as_ref()
                 .and_then(|d| d.get_str("proxy_id").ok())
                 .map(str::to_string);
+            self.validate_mtls_dns_candidate(namespace, |candidate| {
+                if let Some(proxy_id) = proxy_id.as_deref() {
+                    candidate.proxies.retain(|proxy| proxy.id != proxy_id);
+                    candidate
+                        .plugin_configs
+                        .retain(|plugin| plugin.proxy_id.as_deref() != Some(proxy_id));
+                }
+            })
+            .await?;
 
             let use_replica_set = self.replica_set_configured();
             let (
@@ -8669,6 +9045,7 @@ mod inner {
                             .await;
                     }
                 }
+                mtls_lease.release().await?;
                 self.check_slow_query("delete_api_spec", start);
                 return Ok(true);
             } else {
@@ -8769,6 +9146,7 @@ mod inner {
                     .await?;
             }
 
+            mtls_lease.release().await?;
             self.check_slow_query("delete_api_spec", start);
             Ok(true)
         }

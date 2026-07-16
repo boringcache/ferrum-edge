@@ -26,6 +26,7 @@ use crate::admin::spec_codec;
 use crate::admin::{AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, SortOrder,
+    is_mtls_dns_identity_conflict,
 };
 use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
 use crate::util::body_limit::is_length_limit_error;
@@ -79,6 +80,9 @@ struct ValidationFailure {
 // ---------------------------------------------------------------------------
 
 fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
+    if is_mtls_dns_identity_conflict(&e) {
+        return ApiSpecError::Conflict(e.to_string());
+    }
     if e.chain().any(|cause| {
         cause
             .downcast_ref::<sqlx::Error>()

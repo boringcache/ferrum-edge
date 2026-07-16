@@ -14,6 +14,39 @@ use std::collections::HashSet;
 pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
     "A proxy with overlapping hosts and listen_path already exists";
 
+/// A datastore-serialized candidate would make an effective `mtls_auth`
+/// `san_dns` policy ambiguous under ASCII case folding.
+///
+/// Persistence implementations carry this typed error through their normal
+/// transaction/lease boundary so the admin API can return a conflict without
+/// exposing unrelated database details. The identities themselves are not
+/// secrets, but callers should still prefer the validation messages already
+/// produced by [`GatewayConfig::validate_unique_mtls_dns_identities`].
+#[derive(Debug)]
+pub struct MtlsDnsIdentityConflict {
+    errors: Vec<String>,
+}
+
+impl MtlsDnsIdentityConflict {
+    pub fn new(errors: Vec<String>) -> Self {
+        Self { errors }
+    }
+}
+
+impl std::fmt::Display for MtlsDnsIdentityConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mTLS DNS identity conflict: {}", self.errors.join("; "))
+    }
+}
+
+impl std::error::Error for MtlsDnsIdentityConflict {}
+
+pub fn is_mtls_dns_identity_conflict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<MtlsDnsIdentityConflict>())
+}
+
 // ---------------------------------------------------------------------------
 // ApiSpec list filter types (Wave 5)
 // ---------------------------------------------------------------------------
