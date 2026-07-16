@@ -2965,8 +2965,8 @@ async fn recover_late_credential_update(
         return Ok(true);
     }
 
-    let mut recovery_admission = MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace)
-        .await?;
+    let mut recovery_admission =
+        MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await?;
     let recovery_mode = BatchConfigWriteMode::GuardedAdmission {
         guard_owner: recovery_admission.guard_owner().to_string(),
     };
@@ -6239,7 +6239,8 @@ async fn handle_restore(
                     }),
                 ));
             }
-            restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await
+            restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace)
+                .await
             {
                 Ok(guard) => guard,
                 Err(rollback_error) => {

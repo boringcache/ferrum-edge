@@ -1461,9 +1461,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                     Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                         "namespace config admission was lost during delete; the late write was compensated: {error}"
                     ))),
-                    Err(recovery_error) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                        "namespace config admission was lost during delete and recovery failed: {recovery_error}; original error: {error}"
-                    ))),
+                    Err(recovery_error) => {
+                        Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                            "namespace config admission was lost during delete and recovery failed: {recovery_error}; original error: {error}"
+                        )))
+                    }
                 }
             }
             other => other,
@@ -4062,9 +4064,11 @@ async fn handle_write<R: AdminResource>(
                             Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
                                 "namespace config admission was lost during create; the late write was compensated: {error}"
                             ))),
-                            Err(recovery_error) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                                "namespace config admission was lost during create and recovery failed: {recovery_error}; original error: {error}"
-                            ))),
+                            Err(recovery_error) => {
+                                Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                                    "namespace config admission was lost during create and recovery failed: {recovery_error}; original error: {error}"
+                                )))
+                            }
                         }
                     }
                     Err(persistence_error) => Err(persistence_error),
