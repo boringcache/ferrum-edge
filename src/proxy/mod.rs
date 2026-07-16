@@ -16521,10 +16521,7 @@ async fn handle_proxy_request_inner(
             // A deferred routing function can return arbitrary headers.
             // Restore gateway-owned identity and reapply the egress baggage
             // policy before those headers can reach any backend transport.
-            refresh_effective_backend_consumer_identity_headers(
-                &mut ctx,
-                &mut owned_proxy_headers,
-            );
+            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
