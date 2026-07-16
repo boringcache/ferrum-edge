@@ -1,8 +1,15 @@
 //! Tests for the Bot Detection plugin
 
-use ferrum_edge::plugins::bot_detection::{BOT_DETECTION_PRIORITY, BotDetection};
-use ferrum_edge::plugins::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
-use serde_json::json;
+use ferrum_edge::_test_support::normalize_reject_response;
+use ferrum_edge::plugins::bot_detection::{
+    BOT_DETECTION_CONFIG_KEYS, BOT_DETECTION_PRIORITY, BotDetection,
+};
+use ferrum_edge::plugins::{
+    HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
+};
+use ferrum_edge::proxy::grpc_proxy::grpc_status;
+use hyper::StatusCode;
+use serde_json::{Value, json};
 
 use super::plugin_utils;
 
@@ -39,10 +46,29 @@ fn test_plugin_priority() {
     assert_eq!(plugin.priority(), BOT_DETECTION_PRIORITY);
     assert_eq!(plugin.priority(), priority::BOT_DETECTION);
     assert_eq!(plugin.priority(), 200);
-    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
     assert!(!plugin.modifies_request_headers());
     assert!(!plugin.applies_after_proxy_on_reject());
     assert!(!plugin.is_auth_plugin());
+}
+
+#[test]
+fn test_supported_protocols_cover_every_http_family_transport_only() {
+    let plugin = BotDetection::new(&json!({})).unwrap();
+    let protocols = plugin.supported_protocols();
+
+    // ProxyProtocol::Http selects HTTP/1.1, HTTP/2, and HTTP/3. The other two
+    // variants select native gRPC and WebSocket handshake request paths.
+    assert_eq!(protocols, HTTP_FAMILY_PROTOCOLS);
+    assert_eq!(
+        protocols,
+        &[
+            ProxyProtocol::Http,
+            ProxyProtocol::Grpc,
+            ProxyProtocol::WebSocket,
+        ]
+    );
+    assert!(!protocols.contains(&ProxyProtocol::Tcp));
+    assert!(!protocols.contains(&ProxyProtocol::Udp));
 }
 
 // ── Normal browser user-agents pass ─────────────────────────────────────
@@ -378,14 +404,14 @@ async fn test_custom_response_code_404() {
 }
 
 #[tokio::test]
-async fn test_custom_response_code_boundary_100() {
+async fn test_custom_response_code_boundary_400() {
     let plugin = BotDetection::new(&json!({
-        "custom_response_code": 100
+        "custom_response_code": 400
     }))
     .unwrap();
     let mut ctx = make_ctx_with_ua("curl/7.88.1");
     let result = plugin.on_request_received(&mut ctx).await;
-    plugin_utils::assert_reject(result, Some(100));
+    plugin_utils::assert_reject(result, Some(400));
 }
 
 #[tokio::test]
@@ -399,7 +425,148 @@ async fn test_custom_response_code_boundary_599() {
     plugin_utils::assert_reject(result, Some(599));
 }
 
+#[tokio::test]
+async fn test_custom_response_code_zero_fraction_is_accepted() {
+    let plugin = BotDetection::new(&json!({
+        "custom_response_code": 403.0
+    }))
+    .unwrap();
+    let mut ctx = make_ctx_with_ua("curl/7.88.1");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
 // ── Invalid config is rejected at construction ──────────────────────────
+
+#[test]
+fn test_config_requires_a_top_level_object() {
+    for config in [
+        Value::Null,
+        json!([]),
+        json!("blocked_patterns"),
+        json!(false),
+        json!(42),
+    ] {
+        let err = BotDetection::new(&config)
+            .err()
+            .expect("non-object config must be rejected");
+        assert!(err.contains("JSON object"), "got: {err}");
+        for &key in BOT_DETECTION_CONFIG_KEYS {
+            assert!(err.contains(key), "missing allowed key {key} in: {err}");
+        }
+    }
+}
+
+#[test]
+fn test_policy_affecting_unknown_keys_are_rejected() {
+    for (config, typo) in [
+        (
+            json!({"blocked_paterns": ["FerrumAuditCrawler"]}),
+            "blocked_paterns",
+        ),
+        (json!({"allowlist": ["GoodBot"]}), "allowlist"),
+        (json!({"custom_reponse_code": 451}), "custom_reponse_code"),
+        (
+            json!({"allow_missing_useragent": false}),
+            "allow_missing_useragent",
+        ),
+        (json!({"deny": ["FerrumAuditCrawler"]}), "deny"),
+        (json!({"mode": "deny"}), "mode"),
+        (
+            json!({
+                "blocked_patterns": ["FerrumAuditCrawler"],
+                "allow_missing_useragent": false
+            }),
+            "allow_missing_useragent",
+        ),
+    ] {
+        let err = BotDetection::new(&config)
+            .err()
+            .expect("unknown config key must be rejected");
+        assert!(err.contains("unknown config key"), "got: {err}");
+        assert!(err.contains(typo), "got: {err}");
+        for &key in BOT_DETECTION_CONFIG_KEYS {
+            assert!(err.contains(key), "missing allowed key {key} in: {err}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_field_nulls_intentionally_select_documented_defaults() {
+    let plugin = BotDetection::new(&json!({
+        "blocked_patterns": null,
+        "allow_list": null,
+        "custom_response_code": null,
+        "allow_missing_user_agent": null
+    }))
+    .expect("field-level nulls should select defaults");
+
+    let mut blocked = make_ctx_with_ua("curl/7.88.1");
+    plugin_utils::assert_reject(plugin.on_request_received(&mut blocked).await, Some(403));
+
+    let mut missing = make_ctx_without_ua();
+    plugin_utils::assert_continue(plugin.on_request_received(&mut missing).await);
+}
+
+#[test]
+fn test_null_missing_user_agent_policy_does_not_make_empty_patterns_effective() {
+    let err = BotDetection::new(&json!({
+        "blocked_patterns": [],
+        "allow_missing_user_agent": null
+    }))
+    .err()
+    .expect("null selects the default true policy, leaving this config a no-op");
+    assert!(err.contains("no effect"), "got: {err}");
+}
+
+#[test]
+fn test_each_field_rejects_wrong_types() {
+    for (config, field) in [
+        (json!({"blocked_patterns": "curl"}), "blocked_patterns"),
+        (json!({"blocked_patterns": [42]}), "blocked_patterns"),
+        (json!({"allow_list": "GoodBot"}), "allow_list"),
+        (json!({"allow_list": [false]}), "allow_list"),
+        (
+            json!({"allow_missing_user_agent": "false"}),
+            "allow_missing_user_agent",
+        ),
+        (
+            json!({"custom_response_code": "451"}),
+            "custom_response_code",
+        ),
+        (
+            json!({"custom_response_code": 451.5}),
+            "custom_response_code",
+        ),
+        (
+            json!({"custom_response_code": false}),
+            "custom_response_code",
+        ),
+    ] {
+        let err = BotDetection::new(&config)
+            .err()
+            .expect("wrong field type must be rejected");
+        assert!(err.contains(field), "got: {err}");
+    }
+}
+
+#[test]
+fn test_informational_no_body_and_out_of_range_statuses_are_rejected() {
+    for code in [-1, 99, 100, 199, 204, 205, 304, 399, 600] {
+        let err = BotDetection::new(&json!({"custom_response_code": code}))
+            .err()
+            .expect("non-4xx/5xx status must be rejected");
+        assert!(err.contains("400 to 599"), "status {code}: {err}");
+    }
+}
+
+#[test]
+fn test_hostile_numeric_response_code_is_rejected() {
+    let err = BotDetection::new(&json!({"custom_response_code": 1e100}))
+        .err()
+        .expect("hostile numeric status must be rejected");
+    assert!(err.contains("400 to 599"), "got: {err}");
+}
 
 #[test]
 fn test_invalid_response_code_below_range_rejects_creation() {
@@ -476,7 +643,21 @@ fn test_empty_blocked_pattern_rejects_creation() {
     }))
     .err()
     .expect("empty blocked pattern must be rejected");
-    assert!(err.contains("non-empty"), "got: {err}");
+    assert!(err.contains("non-whitespace"), "got: {err}");
+}
+
+#[test]
+fn test_blank_pattern_entries_are_rejected_after_trimming() {
+    for (config, field) in [
+        (json!({"blocked_patterns": [" \t "]}), "blocked_patterns"),
+        (json!({"allow_list": ["\n"]}), "allow_list"),
+    ] {
+        let err = BotDetection::new(&config)
+            .err()
+            .expect("blank pattern must be rejected");
+        assert!(err.contains(field), "got: {err}");
+        assert!(err.contains("non-whitespace"), "got: {err}");
+    }
 }
 
 #[test]
@@ -567,13 +748,55 @@ async fn test_user_agent_containing_blocked_pattern_as_substring() {
 #[tokio::test]
 async fn test_reject_body_is_json_error() {
     let plugin = BotDetection::new(&json!({})).unwrap();
-    let mut ctx = make_ctx_with_ua("curl/7.88.1");
+    let hostile_user_agent = r#"curl/7.88.1 <script>alert("reflected")</script>"#;
+    let mut ctx = make_ctx_with_ua(hostile_user_agent);
     let result = plugin.on_request_received(&mut ctx).await;
     match result {
         PluginResult::Reject { body, headers, .. } => {
             assert_eq!(body, r#"{"error":"Forbidden"}"#);
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).expect("rejection body must be valid JSON"),
+                json!({"error": "Forbidden"})
+            );
+            assert!(!body.contains(hostile_user_agent));
             assert!(headers.is_empty());
         }
         _ => panic!("Expected Reject, got {:?}", result),
     }
+}
+
+#[tokio::test]
+async fn test_native_grpc_rejection_is_normalized_without_json_body() {
+    let plugin = BotDetection::new(&json!({"custom_response_code": 429})).unwrap();
+    let mut ctx = make_ctx_with_ua("curl/7.88.1");
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = plugin.on_request_received(&mut ctx).await
+    else {
+        panic!("blocked User-Agent must be rejected");
+    };
+
+    let normalized = normalize_reject_response(
+        StatusCode::from_u16(status_code).unwrap(),
+        body.as_bytes(),
+        &headers,
+        true,
+    );
+    assert_eq!(normalized.http_status, StatusCode::OK);
+    assert!(normalized.body.is_empty());
+    assert_eq!(
+        normalized.grpc_status,
+        Some(grpc_status::RESOURCE_EXHAUSTED)
+    );
+    assert_eq!(normalized.grpc_message.as_deref(), Some("Forbidden"));
+    assert_eq!(
+        normalized.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(
+        normalized.headers.get("grpc-status").map(String::as_str),
+        Some("8")
+    );
 }

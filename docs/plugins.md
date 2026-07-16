@@ -2381,10 +2381,12 @@ Detects and blocks bot traffic based on the User-Agent header. `blocked_patterns
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `blocked_patterns` | String[] | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Setting this field replaces the defaults. Setting it to `[]` is valid only when `allow_missing_user_agent: false` creates a missing-header reject path; an allow-list alone is not enforcement. |
-| `allow_list` | String[] | `[]` | User-Agent tokens that always pass, evaluated before `blocked_patterns` (allow wins). Case-insensitive and word-boundary anchored, so an entry only matches when it appears as a standalone token. |
-| `allow_missing_user_agent` | bool | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. |
-| `custom_response_code` | u16 | `403` | HTTP status code for blocked requests. Values outside 100–599 (or non-numeric) are coerced to 403. |
+| `blocked_patterns` | String[] \| null | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Array entries are trimmed and must be nonblank. An array replaces the defaults; `null` or omission installs the defaults. Setting this field to `[]` is valid only when `allow_missing_user_agent: false` creates a missing-header reject path; an allow-list alone is not enforcement. |
+| `allow_list` | String[] \| null | `[]` | User-Agent tokens that always pass, evaluated before `blocked_patterns` (allow wins). Entries are trimmed, must be nonblank, and are matched case-insensitively with word-boundary anchors. `null` or omission installs an empty list. |
+| `allow_missing_user_agent` | bool \| null | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. `null` or omission selects `true`. |
+| `custom_response_code` | u16 \| null | `403` | For non-gRPC requests, the final 4xx or 5xx HTTP status for blocked requests. Native gRPC maps it to `grpc-status` under HTTP 200. Only 400–599 is accepted; informational, no-body, out-of-range, and non-integer values are rejected. `null` or omission selects 403. |
+
+Configuration must be a top-level object. The only accepted keys are `blocked_patterns`, `allow_list`, `allow_missing_user_agent`, and `custom_response_code`; unknown keys are rejected instead of falling back to defaults. Pattern entry whitespace follows Rust `str::trim` Unicode `White_Space` semantics. Non-gRPC rejections use the fixed JSON body `{"error":"Forbidden"}` with `Content-Type: application/json`, and never reflect the client-controlled User-Agent. Native gRPC rejections instead use an empty-body HTTP 200 trailers-only response: the configured HTTP code is mapped through the gateway's standard HTTP-to-gRPC mapping into `grpc-status`, and the fixed error text becomes `grpc-message: Forbidden`.
 
 ```yaml
 plugin_name: bot_detection
