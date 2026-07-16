@@ -3881,6 +3881,106 @@ fn test_tcp_connection_throttle_rejects_udp_and_dtls_attachments() {
     assert!(error.contains("HTTP-family"), "{error}");
 }
 
+#[test]
+fn test_tcp_connection_throttle_accepts_tcp_and_tcp_tls_attachments() {
+    for scheme in [BackendScheme::Tcp, BackendScheme::Tcps] {
+        let mut proxy = make_tcp_proxy("p1", vec!["throttle"]);
+        proxy.backend_scheme = Some(scheme);
+        proxy.dispatch_kind = DispatchKind::from(scheme);
+        let config = make_config(
+            vec![proxy],
+            vec![make_plugin_config_with_json(
+                "throttle",
+                "tcp_connection_throttle",
+                json!({"max_connections_per_key": 1}),
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let cache = PluginCache::new(&config)
+            .unwrap_or_else(|error| panic!("{scheme} attachment was rejected: {error}"));
+        let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name(), "tcp_connection_throttle");
+    }
+}
+
+#[test]
+fn test_tcp_connection_throttle_global_mixed_protocol_scope_protects_only_tcp() {
+    let config = make_config(
+        vec![
+            make_tcp_proxy("tcp", vec![]),
+            make_udp_proxy("udp", vec![], BackendScheme::Udp),
+        ],
+        vec![make_plugin_config_with_json(
+            "global-throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("mixed global scope has TCP coverage");
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("tcp", ProxyProtocol::Tcp)
+            .len(),
+        1
+    );
+    assert!(
+        cache
+            .get_plugins_for_protocol("udp", ProxyProtocol::Udp)
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_tcp_connection_throttle_proxy_group_rejects_mixed_protocol_attachment() {
+    let config = make_config(
+        vec![
+            make_tcp_proxy("tcp", vec!["group-throttle"]),
+            make_udp_proxy("udp", vec!["group-throttle"], BackendScheme::Dtls),
+        ],
+        vec![make_plugin_config_with_json(
+            "group-throttle",
+            "tcp_connection_throttle",
+            json!({"max_connections_per_key": 1}),
+            PluginScope::ProxyGroup,
+            None,
+        )],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("mixed-protocol proxy-group attachment must fail closed");
+    assert!(error.contains("udp (dtls)"), "{error}");
+    assert!(error.contains("only TCP/TCP+TLS is supported"), "{error}");
+}
+
+#[test]
+fn test_tcp_connection_throttle_global_validation_is_namespace_scoped() {
+    let mut tenant_a_http = make_proxy("shared-id", "/tenant-a", vec![]);
+    tenant_a_http.namespace = "tenant-a".to_string();
+    let mut tenant_b_tcp = make_tcp_proxy("shared-id", vec![]);
+    tenant_b_tcp.namespace = "tenant-b".to_string();
+    let mut tenant_a_throttle = make_plugin_config_with_json(
+        "global-throttle",
+        "tcp_connection_throttle",
+        json!({"max_connections_per_key": 1}),
+        PluginScope::Global,
+        None,
+    );
+    tenant_a_throttle.namespace = "tenant-a".to_string();
+
+    let config = make_config(
+        vec![tenant_a_http, tenant_b_tcp],
+        vec![tenant_a_throttle],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("another namespace's TCP proxy must not satisfy global coverage");
+    assert!(error.contains("has no TCP/TCP+TLS proxy"), "{error}");
+}
+
 #[tokio::test]
 async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances() {
     let mut wide = make_plugin_config_with_json(

@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -233,14 +234,15 @@ impl TcpConnectionThrottle {
     }
 }
 
-fn canonical_client_ip(client_ip: &str) -> String {
-    match client_ip.parse::<IpAddr>() {
-        Ok(IpAddr::V6(ip)) => ip
-            .to_ipv4_mapped()
-            .map(|mapped| mapped.to_string())
-            .unwrap_or_else(|| IpAddr::V6(ip).to_string()),
-        Ok(ip) => ip.to_string(),
-        Err(_) => client_ip.to_string(),
+fn canonical_client_ip(client_ip: &str) -> Cow<'_, str> {
+    if let Ok(IpAddr::V6(ip)) = client_ip.parse::<IpAddr>()
+        && let Some(mapped) = ip.to_ipv4_mapped()
+    {
+        Cow::Owned(mapped.to_string())
+    } else {
+        // Gateway-produced client IP strings are already canonical. Borrow the
+        // common case so the throttle allocates only its final map key.
+        Cow::Borrowed(client_ip)
     }
 }
 

@@ -569,10 +569,9 @@ async fn fast_path_releases_throttle_permit_on_connection_teardown() {
     drop(blocked);
 
     // Drop the holding connection. The gateway's accept-loop spawns
-    // each connection in its own task; disconnect logging runs after the
-    // relay future returns, then dropping the connection context releases
-    // the opaque throttle permit. Wait for that with a short retry loop on
-    // a fresh connection.
+    // each connection in its own task. Once the relay future returns, the
+    // gateway releases the opaque throttle permit before disconnect logging.
+    // Wait for that with a short retry loop on a fresh connection.
     drop(conn1);
 
     let deadline = std::time::Instant::now() + TEST_TIMEOUT;

@@ -13576,8 +13576,11 @@ components:
         Plugin: tcp_connection_throttle — Caps active TCP/TCP+TLS connections
         per Consumer when a stream auth plugin identified one, else per
         canonical client IP. Explicit proxy/proxy-group attachment to any other
-        protocol is rejected during plugin-cache validation. UDP/DTLS is not
-        protected; use udp_rate_limiting for datagram/session admission.
+        protocol is rejected during configuration admission and plugin-cache
+        validation. A global policy with a nonempty effective target set must
+        cover at least one TCP/TCP+TLS proxy; mixed global scope is filtered
+        from unsupported listeners. UDP/DTLS is not protected; use
+        udp_rate_limiting for datagram/session admission.
         Enforcement is process-local, so each replica independently permits up
         to the configured limit and the deployment-wide allowance can be the
         limit multiplied by the number of replicas receiving the same identity.

@@ -2845,8 +2845,9 @@ async fn collect_mirror_result(
 ///
 /// The constructor is crate-private so plugins can attach permits without
 /// exposing their keys or counter identities through transaction metadata.
-/// Each permit invokes its release action exactly once, either when a later
-/// plugin rejects the connection or when the connection context is dropped.
+/// Each permit invokes its release action exactly once, either when the stream
+/// runner releases it at rejection/teardown or when the connection context is
+/// dropped as a fallback.
 pub struct StreamAdmissionPermit {
     release: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
 }
@@ -2995,9 +2996,10 @@ impl StreamConnectionContext {
 
     /// Release every admission permit acquired so far, in reverse plugin order.
     ///
-    /// TCP connect runners call this immediately when a later plugin rejects.
+    /// TCP runners call this immediately when a later plugin rejects and when
+    /// transport teardown completes, before awaiting disconnect observers.
     /// Draining the vector is idempotent, and dropping the context remains the
-    /// fallback for every other connection exit path.
+    /// fallback for exceptional exit paths.
     pub fn release_admission_permits(&mut self) {
         while let Some(permit) = self.admission_permits.pop() {
             drop(permit);

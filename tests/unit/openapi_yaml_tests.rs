@@ -2871,6 +2871,12 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
         &json!({"max_connections_per_key": 1, "cleanup_intervl_seconds": 60}),
         false,
     );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 86401}),
+        false,
+    );
     for text in [schema_text.as_str(), plugin_docs, cache_docs] {
         assert!(text.contains("process-local"), "missing process-local scope");
         assert!(text.contains("residual"), "missing residual sweep semantics");

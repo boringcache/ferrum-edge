@@ -1461,6 +1461,9 @@ async fn run_tcp_accept_loop(
                         mesh_enforcement_snapshot.as_ref(),
                     )
                     .await;
+                    // The transport has ended. Release admission capacity before
+                    // awaiting disconnect observers, which may perform network I/O.
+                    stream_ctx.release_admission_permits();
 
                     let duration_ms = connected_at.elapsed().as_millis() as f64;
                     let final_proxy_id = stream_ctx.proxy_id.clone();

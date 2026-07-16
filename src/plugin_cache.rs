@@ -663,7 +663,9 @@ fn validate_tcp_connection_throttle_attachment(
     let attached = gateway_config
         .proxies
         .iter()
-        .filter(|proxy| plugin_config_effectively_applies_to_proxy(pc, proxy, gateway_config));
+        .filter(|proxy| {
+            tcp_connection_throttle_effectively_applies_to_proxy(pc, proxy, gateway_config)
+        });
     let mut attached_count = 0usize;
     let mut unsupported = Vec::new();
     for proxy in attached {
@@ -686,6 +688,26 @@ fn validate_tcp_connection_throttle_attachment(
             unsupported.join(", ")
         )),
         _ => Ok(()),
+    }
+}
+
+/// Validate protocol attachment semantics for every enabled TCP throttle in a
+/// complete candidate graph. Admin admission and config-source validation use
+/// this before persistence/publication so unsupported protection is never
+/// accepted only to be silently filtered from a UDP/DTLS or HTTP plugin list.
+pub(crate) fn validate_tcp_connection_throttle_attachments(
+    gateway_config: &GatewayConfig,
+) -> Result<(), Vec<String>> {
+    let errors: Vec<String> = gateway_config
+        .plugin_configs
+        .iter()
+        .filter(|pc| pc.enabled && pc.plugin_name == "tcp_connection_throttle")
+        .filter_map(|pc| validate_tcp_connection_throttle_attachment(pc, gateway_config).err())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }
 
@@ -960,6 +982,27 @@ fn plugin_config_effectively_applies_to_proxy(
     }
 }
 
+fn tcp_connection_throttle_effectively_applies_to_proxy(
+    pc: &PluginConfig,
+    proxy: &crate::config::types::Proxy,
+    config: &GatewayConfig,
+) -> bool {
+    if !pc.enabled || proxy.namespace != pc.namespace {
+        return false;
+    }
+    match &pc.scope {
+        PluginScope::Global => !config.plugin_configs.iter().any(|candidate| {
+            candidate.namespace == pc.namespace
+                && candidate.enabled
+                && candidate.plugin_name == pc.plugin_name
+                && scoped_plugin_config_applies_to_proxy(candidate, proxy)
+        }),
+        PluginScope::Proxy | PluginScope::ProxyGroup => {
+            scoped_plugin_config_applies_to_proxy(pc, proxy)
+        }
+    }
+}
+
 fn tcp_connection_throttle_policy_is_active(
     pc: &PluginConfig,
     config: &GatewayConfig,
@@ -969,7 +1012,10 @@ fn tcp_connection_throttle_policy_is_active(
         PluginScope::Proxy | PluginScope::ProxyGroup => config
             .proxies
             .iter()
-            .any(|proxy| scoped_plugin_config_applies_to_proxy(pc, proxy)),
+            .any(|proxy| {
+                proxy.namespace == pc.namespace
+                    && scoped_plugin_config_applies_to_proxy(pc, proxy)
+            }),
     }
 }
 
@@ -2795,6 +2841,8 @@ impl PluginCache {
         current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
+        validate_tcp_connection_throttle_attachments(config)
+            .map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
             globals,
@@ -2917,11 +2965,8 @@ impl PluginCache {
         rebuild_globals: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
-        for pc in &config.plugin_configs {
-            if pc.enabled && pc.plugin_name == "tcp_connection_throttle" {
-                validate_tcp_connection_throttle_attachment(pc, config)?;
-            }
-        }
+        validate_tcp_connection_throttle_attachments(config)
+            .map_err(|errors| errors.join("; "))?;
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;

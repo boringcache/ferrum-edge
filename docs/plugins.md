@@ -2070,7 +2070,7 @@ Bare-host registry entries match only requests whose Host header omits an explic
 
 ### `tcp_connection_throttle`
 
-Limits concurrent TCP connections per observed client identity on a per-proxy basis. Returns HTTP 429 (mapped to a refused connection at the TCP layer) when the limit is exceeded. The plugin supports TCP and TCP+TLS only. An explicit proxy/proxy-group attachment to any other protocol is rejected during plugin-cache validation; for UDP or DTLS, use [`udp_rate_limiting`](#udp_rate_limiting) for datagram/session admission.
+Limits concurrent TCP connections per observed client identity on a per-proxy basis. Returns HTTP 429 (mapped to a refused connection at the TCP layer) when the limit is exceeded. The plugin supports TCP and TCP+TLS only. An explicit proxy/proxy-group attachment to any other protocol is rejected during configuration admission and plugin-cache validation. When a global policy has a nonempty effective target set, that set must include at least one TCP/TCP+TLS proxy; in a mixed-protocol deployment it is filtered from the unsupported listeners. For UDP or DTLS, use [`udp_rate_limiting`](#udp_rate_limiting) for datagram/session admission.
 
 **Priority:** 2050
 **Protocols:** TCP only

@@ -4299,7 +4299,7 @@ async fn handle_batch_create(
     }
 
     if !batch.proxies.is_empty() || !batch.plugin_configs.is_empty() {
-        match crud::validate_hmac_request_transform_candidates(
+        match crud::validate_plugin_graph_candidates(
             db.as_ref(),
             state,
             namespace,
@@ -4314,11 +4314,11 @@ async fn handle_batch_create(
                 validation_errors.extend(errors);
             }
             Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
-                "Failed to load config for HMAC request-transform candidate validation: {}",
+                "Failed to load config for plugin-graph candidate validation: {}",
                 error
             )),
             Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-                "HMAC request-transform candidate validation returned an unexpected response"
+                "Plugin-graph candidate validation returned an unexpected response"
                     .to_string(),
             ),
         }
@@ -4929,7 +4929,7 @@ async fn handle_restore(
                 }
             }
         }
-        match crud::validate_hmac_request_transform_restore_candidate(state, &temp_config) {
+        match crud::validate_plugin_graph_restore_candidate(state, &temp_config) {
             Ok(()) => {}
             Err(crud::AfterValidateError::BadRequest(errors)) => {
                 validation_errors.extend(errors);
@@ -4946,7 +4946,7 @@ async fn handle_restore(
                 ));
             }
             Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-                "HMAC request-transform candidate validation returned an unexpected response"
+                "Plugin-graph candidate validation returned an unexpected response"
                     .to_string(),
             ),
         }
