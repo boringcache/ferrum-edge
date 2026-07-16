@@ -15150,6 +15150,7 @@ components:
 
     ServerlessFunctionConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: serverless_function — Invokes AWS Lambda, Azure Functions, or
         Google Cloud Functions as middleware in the proxy pipeline. In
@@ -15158,7 +15159,12 @@ components:
         response is returned directly to the client (HTTP only — gRPC
         rejection normalization would drop the body, so terminate mode on
         gRPC requests is rejected with 500). Cloud credential fields fall
-        back to well-known environment variables.
+        back to well-known environment variables. Terminate mode forwards
+        applicable end-to-end response headers, preserving repeated Set-Cookie,
+        while stripping hop-by-hop, Connection-listed, transport-managed,
+        provider-control, and credential-bearing fields. HEAD/204/304 bodies
+        are empty. Automatic redirects are disabled; pre_proxy accepts only
+        2xx as approval, while terminate may intentionally return final 3xx.
       required:
         - provider
       properties:
@@ -15176,8 +15182,8 @@ components:
         function_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#\\s]+"
-          description: "HTTP(S) trigger URL. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied."
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^@/?#\\s]+(?:[/?][^#\\s]*)?$"
+          description: "HTTP(S) trigger URL without URL userinfo or a fragment. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied. Path/query credentials are structurally redacted from diagnostics and non-admin/audit projections."
         aws_region:
           type: string
           description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars."
@@ -15199,10 +15205,11 @@ components:
         aws_endpoint_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#\\s]+"
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^@/?#\\s]+/?$"
           description: >-
             Optional HTTP(S) Lambda endpoint override for LocalStack or a
-            VPC-internal endpoint. Falls back to `AWS_LAMBDA_ENDPOINT_URL`.
+            VPC-internal endpoint. Must be an origin without userinfo, path,
+            query, or fragment. Falls back to `AWS_LAMBDA_ENDPOINT_URL`.
         azure_function_key:
           type: string
           description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var."
@@ -15212,7 +15219,7 @@ components:
         forward_body:
           type: boolean
           default: false
-          description: "Include request body in function payload (forces request-body buffering for JSON POST requests)."
+          description: "Include the lossless request body in the function payload for every HTTP method. JSON is structured when valid, UTF-8 bodies are strings, and other bytes are base64 with body_encoding=base64. The plugin buffers before invocation and fails closed if bytes are unavailable or use a non-identity Content-Encoding. Cannot be combined with a request-body transformer on the same protocol chain."
         forward_headers:
           type: array
           items:
@@ -15221,7 +15228,7 @@ components:
         forward_query_params:
           type: boolean
           default: false
-          description: "Include query parameters in function payload."
+          description: "Include decoded query parameters in the function payload. Duplicate decoded names, invalid percent-encoded UTF-8, raw '+' ambiguity, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
         timeout_ms:
           type: integer
           format: uint64
@@ -15242,10 +15249,10 @@ components:
         error_status_code:
           type: integer
           format: uint16
-          minimum: 100
+          minimum: 400
           maximum: 599
           default: 502
-          description: "HTTP status when rejecting on error. Must be in range 100-599."
+          description: "Final HTTP error status when rejecting an invocation or pre_proxy non-2xx response. Must be in range 400-599."
       allOf:
         - if:
             required: [provider]

@@ -7,6 +7,7 @@ use ferrum_edge::_test_support::{
     request_deduplication_redis_payload_for_test,
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
+use ferrum_edge::plugins::serverless_function::ServerlessFunction;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
 };
@@ -424,6 +425,85 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
         "second request with same key must pass through, not replay a synthetic body; got {result:?}"
     );
     assert!(ctx2.metadata.contains_key(DEDUP_KEY_METADATA));
+}
+
+#[tokio::test]
+async fn terminal_serverless_side_effect_is_stored_and_replayed() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201).set_body_string("created-once"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers = HashMap::new();
+    first_headers.insert("idempotency-key".to_string(), "side-effect-key".to_string());
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) = match serverless
+        .before_proxy(&mut first_ctx, &mut first_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => (status_code, headers, body),
+        other => panic!("expected terminal serverless response, got {other:?}"),
+    };
+    first_ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, status, &response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert("idempotency-key".to_string(), "side-effect-key".to_string());
+    match dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 201);
+            assert_eq!(&body[..], b"created-once");
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+        }
+        other => panic!("retry must replay without invoking again, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

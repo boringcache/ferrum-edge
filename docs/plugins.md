@@ -2455,13 +2455,14 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | `aws_function_name` | String | — | Lambda function name or ARN. Falls back to `AWS_LAMBDA_FUNCTION_NAME` env var |
 | `aws_session_token` | String | — | STS session token. Falls back to `AWS_SESSION_TOKEN` env var |
 | `aws_qualifier` | String | — | Optional version/alias qualifier (e.g., `$LATEST`, `prod`) |
+| `aws_endpoint_url` | String | — | Optional HTTP(S) origin-only Lambda endpoint override. No userinfo, path, query, or fragment; falls back to `AWS_LAMBDA_ENDPOINT_URL` |
 
 **Azure Functions** — calls the HTTP trigger URL:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `provider` | String | (required) | `"azure_functions"` |
-| `function_url` | String | (required) | HTTPS trigger URL |
+| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
 | `azure_function_key` | String | — | Function key for auth. Falls back to `AZURE_FUNCTIONS_KEY` env var |
 
 **GCP Cloud Functions** — calls the HTTPS trigger URL:
@@ -2469,7 +2470,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `provider` | String | (required) | `"gcp_cloud_functions"` |
-| `function_url` | String | (required) | HTTPS trigger URL |
+| `function_url` | String | (required) | HTTP(S) trigger URL without URL userinfo or a fragment. Path/query credentials are accepted for provider compatibility but redacted structurally from diagnostics and non-admin/audit projections |
 | `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var |
 
 #### Common Parameters
@@ -2477,15 +2478,19 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"`. Unknown values rejected at plugin load. **Note:** terminate mode is not supported for gRPC requests — gRPC reject normalization would drop the function response body, so the request fails with 500 |
-| `forward_body` | bool | `false` | Include request body in function payload |
+| `forward_body` | bool | `false` | Include the lossless buffered request body for every method. Valid JSON is structured, other UTF-8 is a string, and binary bytes are base64 with `body_encoding: "base64"` |
 | `forward_headers` | String[] | `[]` | Header names to forward to the function (lowercased at config load) |
-| `forward_query_params` | bool | `false` | Include query parameters in function payload |
+| `forward_query_params` | bool | `false` | Include decoded query parameters. Duplicate decoded names, invalid percent-encoded UTF-8, raw `+` ambiguity, and parameters lacking the original encoded representation fail before invocation |
 | `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds. Must be > 0 |
 | `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB). Must be > 0 |
 | `on_error` | String | `"reject"` | `"reject"` returns error to client; `"continue"` skips and proxies normally. Unknown values rejected at plugin load |
-| `error_status_code` | u16 | `502` | HTTP status when rejecting on error. Must be in range 100-599 |
+| `error_status_code` | u16 | `502` | Final HTTP error status when rejecting on error. Must be in range 400-599 |
 
-**Strict config validation:** unknown `provider`, `mode`, or `on_error` values are rejected at plugin construction (no silent defaulting). Non-string values for `mode` / `on_error`, `timeout_ms` of `0`, `max_response_body_bytes` of `0`, and `error_status_code` outside 100-599 are also rejected.
+**Strict config validation:** the config must be an object, unknown fields are rejected, and explicit `null` is rejected for every property (omit an optional field to use its default). Unknown `provider`, `mode`, or `on_error` values, non-string values for string fields, `timeout_ms` of `0`, `max_response_body_bytes` of `0`, and `error_status_code` outside 400-599 are rejected.
+
+`function_url` and `aws_endpoint_url` reject URL userinfo (`user:password@host`). The AWS endpoint override must be an origin only, with no path, query, or fragment. Automatic redirects are disabled. In `pre_proxy` mode only a 2xx function response is approval; 1xx/3xx/4xx/5xx responses use `on_error` and `error_status_code`. In `terminate` mode final 2xx-5xx statuses are returned intentionally.
+
+When `forward_body` is enabled, the plugin buffers before `before_proxy` for every HTTP method and fails closed without calling the function if the exact body bytes are unavailable or carry a non-identity `Content-Encoding`. Query/body representation ambiguity is also governed input and remains fail-closed even with `on_error: "continue"`; that option applies to invocation/response failures, not to inputs the configured policy cannot inspect faithfully. A serverless body-egress instance cannot share a protocol chain with a request-body transformer; cache construction rejects that composition so the external decision and backend cannot observe different representations. Policy ordering that belongs to the shared pipeline or another plugin remains that component's responsibility.
 
 #### Function Request Payload
 
@@ -2504,6 +2509,8 @@ The plugin sends a JSON payload to the function:
 }
 ```
 
+For a non-UTF-8 body the final two fields are instead `"body": "<base64>"` and `"body_encoding": "base64"`.
+
 #### Function Response Format (pre_proxy mode)
 
 The function should return JSON with optional `headers` and `metadata` fields:
@@ -2521,7 +2528,9 @@ The function should return JSON with optional `headers` and `metadata` fields:
 }
 ```
 
-Headers are injected into the proxied request. Metadata is stored in `ctx.metadata` with a `serverless_` prefix and flows into transaction logs.
+Headers are validated before injection; invalid and hop-by-hop/protocol-managed request headers are ignored. Metadata is stored under `serverless_function.<plugin-config-id>.metadata.<key>`, while invocation status and sanitized error class use the same instance namespace. Namespace segments percent-encode punctuation other than `-`/`_`. This keeps multiple instances independent and deterministic in transaction metadata.
+
+In `terminate` mode, applicable end-to-end function response headers (including repeated `Set-Cookie`, `Location`, `Retry-After`, `ETag`, and `Content-Disposition`) are returned with the function status/body. Hop-by-hop, `Connection`-listed, transport-managed, provider-control, and credential-bearing fields are stripped. Ferrum recomputes framing; HEAD, 204, and 304 responses have no body. If request deduplication acquired the idempotency key earlier in the chain, the externally executed terminal response is stored and replayed so a retry does not repeat the function side effect.
 
 #### Environment Variable Fallback
 

@@ -135,27 +135,40 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
     Ok(())
 }
 
-/// HMAC authenticates the exact client-visible request body and digest. A later
-/// body transform would make the backend-visible bytes disagree with the
-/// signed `Digest`/`Content-Digest` and `Authorization` fields. Reject that
-/// composition at cache build time instead of forwarding stale integrity
-/// metadata or silently weakening authentication.
+/// Reject request-body security compositions whose early decision would govern
+/// bytes different from those ultimately sent to the backend. This covers both
+/// HMAC integrity and plugins that egress the body during `before_proxy`.
 fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
-        if !plugins
+        let has_hmac = plugins
             .iter()
             .filter(|plugin| plugin.supported_protocols().contains(&protocol))
-            .any(|plugin| plugin.name() == "hmac_auth")
-        {
-            continue;
-        }
-        if let Some(transformer) = plugins
-            .iter()
-            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
-            .find(|plugin| plugin.modifies_request_body())
+            .any(|plugin| plugin.name() == "hmac_auth");
+        if has_hmac
+            && let Some(transformer) = plugins
+                .iter()
+                .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+                .find(|plugin| plugin.modifies_request_body())
         {
             return Err(format!(
                 "hmac_auth cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; HMAC authenticates the client-to-gateway representation and Ferrum will not forward stale signed digest metadata",
+                transformer.name(),
+                protocol
+            ));
+        }
+
+        if let Some(serverless) = plugins
+            .iter()
+            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+            .find(|plugin| plugin.egresses_request_body_before_finalization())
+            && let Some(transformer) = plugins
+                .iter()
+                .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+                .find(|plugin| plugin.modifies_request_body())
+        {
+            return Err(format!(
+                "{} with forward_body cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; the function runs before body transformation and Ferrum will not let an external decision govern bytes different from those sent to the backend",
+                serverless.name(),
                 transformer.name(),
                 protocol
             ));
@@ -199,6 +212,9 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn modifies_request_body(&self) -> bool {
         self.inner.modifies_request_body()
+    }
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        self.inner.egresses_request_body_before_finalization()
     }
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.inner.requires_request_body_before_before_proxy()
@@ -648,6 +664,13 @@ fn try_create_plugin(
             current_adaptive_states,
             staged_adaptive_states,
         )
+    } else if pc.plugin_name == "serverless_function" {
+        crate::plugins::serverless_function::ServerlessFunction::new_with_instance_id(
+            &pc.config,
+            http_client.clone(),
+            &pc.id,
+        )
+        .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else {
         create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone())
     };
@@ -1779,13 +1802,13 @@ struct ProxyGroupPluginInstance {
     config: PluginConfig,
 }
 
-/// Built-in plugin types whose constructed instance can participate in the
-/// HMAC request-body composition invariant. Keep this list aligned with
-/// `Plugin::modifies_request_body()` implementations. Registered custom
-/// plugins are also constructed because their capability is defined by their
-/// `Plugin` implementation rather than a core allowlist.
+/// Built-in plugin types whose constructed instance can participate in a
+/// request-body security composition invariant. Keep this list aligned with
+/// the relevant `Plugin` capabilities. Registered custom plugins are also
+/// constructed because their capability is defined by their implementation.
 const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "hmac_auth",
+    "serverless_function",
     "request_transformer",
     "compression",
     "grpc_web",
@@ -1796,17 +1819,23 @@ const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "ai_request_guard",
 ];
 
-/// Validate the HMAC/request-body-transform invariant against a candidate
-/// config before an admin Proxy or PluginConfig write is persisted. Runtime
-/// cache construction repeats the same check as a fail-closed backstop.
+/// Validate request-body security composition against a candidate config before
+/// an admin Proxy or PluginConfig write is persisted. Runtime cache construction
+/// repeats the same check as a fail-closed backstop.
 pub(crate) fn validate_hmac_request_transform_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
-    if !config
-        .plugin_configs
-        .iter()
-        .any(|plugin| plugin.enabled && plugin.plugin_name == "hmac_auth")
+    if !config.plugin_configs.iter().any(|plugin| {
+        plugin.enabled
+            && (plugin.plugin_name == "hmac_auth"
+                || (plugin.plugin_name == "serverless_function"
+                    && plugin
+                        .config
+                        .get("forward_body")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)))
+    })
     {
         return Ok(());
     }
@@ -1882,7 +1911,7 @@ pub(crate) fn validate_hmac_request_transform_candidate(
         Ok(())
     } else {
         Err(format!(
-            "{} HMAC request-transform composition error(s): {}",
+            "{} request-body security composition error(s): {}",
             errors.len(),
             errors.join("; ")
         ))

@@ -266,6 +266,8 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 `soap_ws_security` keeps AuthN-band priority 1500 for ordering, but validates SOAP bodies in `before_proxy` after request-body buffering is available.
 
+`serverless_function` also runs in `before_proxy`. With `forward_body: true` it receives the exact lossless client representation before any request-body transform. Cache construction therefore rejects a same-protocol chain that also contains a body transformer (including request decompression); Ferrum does not allow the function to approve bytes different from those ultimately dispatched. Non-identity encoded bodies fail closed before function egress.
+
 `mcp_gateway` sits at priority 2992: generic admission/auth/body validation runs first, then MCP JSON-RPC metadata is extracted and aggregate-router calls can set `RequestContext.route_override_*` before final route-dispatch plugins and request transformers. It is HTTP-only and does not implement generic auth, rate limiting, retry, timeout, tracing, WAF, DLP, or semantic safety behavior; those remain separate Ferrum plugins that can consume emitted `mcp.*` metadata.
 
 `a2a_gateway` sits at priority 2993: it runs after MCP handling and before final mesh route dispatch. It observes HTTP JSON-RPC, HTTP+JSON/REST, and gRPC A2A methods, applies optional method policy, rewrites HTTP Agent Card responses, and emits `a2a.*` metadata. It preserves SSE/gRPC streaming and does not own A2A task state.

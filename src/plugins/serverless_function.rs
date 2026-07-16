@@ -62,19 +62,71 @@
 //! ```
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use chrono::Utc;
-use http::header::HeaderName;
+use http::header::{HeaderName, HeaderValue};
+use percent_encoding::percent_decode_str;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
 use super::utils::aws_sigv4;
+use super::utils::body_transform::is_json_content_type;
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+
+const ALLOWED_CONFIG_FIELDS: &[&str] = &[
+    "provider",
+    "mode",
+    "function_url",
+    "aws_region",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_function_name",
+    "aws_session_token",
+    "aws_qualifier",
+    "aws_endpoint_url",
+    "azure_function_key",
+    "gcp_bearer_token",
+    "forward_body",
+    "forward_headers",
+    "forward_query_params",
+    "timeout_ms",
+    "max_response_body_bytes",
+    "on_error",
+    "error_status_code",
+];
+
+const DEFAULT_INSTANCE_ID: &str = "standalone";
+
+#[derive(Debug)]
+struct InvocationFailure {
+    code: &'static str,
+    operator_detail: String,
+    must_reject: bool,
+}
+
+impl InvocationFailure {
+    fn new(code: &'static str, operator_detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            operator_detail: operator_detail.into(),
+            must_reject: false,
+        }
+    }
+
+    fn governed_input(code: &'static str, operator_detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            operator_detail: operator_detail.into(),
+            must_reject: true,
+        }
+    }
+}
 
 /// Cloud provider for the serverless function.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +153,7 @@ enum ErrorAction {
 }
 
 /// AWS Lambda–specific configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(dead_code)]
 struct AwsLambdaConfig {
     region: String,
@@ -118,7 +170,10 @@ pub struct ServerlessFunction {
     mode: InvocationMode,
     /// For Azure/GCP: the user-supplied URL. For AWS: the computed Lambda Invoke API URL.
     function_url: String,
+    /// Credential-safe structural form used in every diagnostic and client error path.
+    function_display_url: String,
     function_hostname: Option<String>,
+    metadata_prefix: String,
     aws_config: Option<AwsLambdaConfig>,
     azure_function_key: Option<String>,
     gcp_authorization_header: Option<String>,
@@ -135,11 +190,37 @@ pub struct ServerlessFunction {
 
 impl ServerlessFunction {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("serverless_function: config must be an object".to_string());
+        Self::new_with_instance_id(config, http_client, DEFAULT_INSTANCE_ID)
+    }
+
+    pub(crate) fn new_with_instance_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        instance_id: &str,
+    ) -> Result<Self, String> {
+        let config_object = config
+            .as_object()
+            .ok_or_else(|| "serverless_function: config must be an object".to_string())?;
+
+        let mut unknown_fields: Vec<&str> = config_object
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !ALLOWED_CONFIG_FIELDS.contains(key))
+            .collect();
+        unknown_fields.sort_unstable();
+        if !unknown_fields.is_empty() {
+            return Err(format!(
+                "serverless_function: unknown configuration field(s): {}",
+                unknown_fields.join(", ")
+            ));
+        }
+        if let Some((key, _)) = config_object.iter().find(|(_, value)| value.is_null()) {
+            return Err(format!(
+                "serverless_function: '{key}' must not be null; omit the field to use its default"
+            ));
         }
 
-        let provider = match config["provider"].as_str() {
+        let provider = match config.get("provider").and_then(Value::as_str) {
             Some("aws_lambda") => Provider::AwsLambda,
             Some("azure_functions") => Provider::AzureFunctions,
             Some("gcp_cloud_functions") => Provider::GcpCloudFunctions,
@@ -172,7 +253,7 @@ impl ServerlessFunction {
                     ));
                 }
             },
-            Some(Value::Null) | None => InvocationMode::PreProxy,
+            None => InvocationMode::PreProxy,
             Some(_) => {
                 return Err("serverless_function: 'mode' must be a string".to_string());
             }
@@ -208,16 +289,16 @@ impl ServerlessFunction {
                     ));
                 }
             },
-            Some(Value::Null) | None => ErrorAction::Reject,
+            None => ErrorAction::Reject,
             Some(_) => {
                 return Err("serverless_function: 'on_error' must be a string".to_string());
             }
         };
 
         let raw_status = optional_u64(config, "error_status_code")?.unwrap_or(502);
-        if !(100..=599).contains(&raw_status) {
+        if !(400..=599).contains(&raw_status) {
             return Err(format!(
-                "serverless_function: error_status_code must be in range 100-599 (got {raw_status})"
+                "serverless_function: error_status_code must be in range 400-599 (got {raw_status})"
             ));
         }
         let error_status_code = raw_status as u16;
@@ -297,7 +378,7 @@ impl ServerlessFunction {
                     let endpoint_override = optional_config_string(config, "aws_endpoint_url")?
                         .or_else(|| env_non_empty("AWS_LAMBDA_ENDPOINT_URL"));
                     if let Some(ref endpoint) = endpoint_override {
-                        validate_http_url_field(endpoint, "aws_endpoint_url")?;
+                        validate_aws_endpoint_url(endpoint)?;
                     }
 
                     // Log which values came from env vars (without leaking secrets)
@@ -399,6 +480,11 @@ impl ServerlessFunction {
         let function_hostname = Url::parse(&function_url)
             .ok()
             .and_then(|u| http_url_hostname(&u, "function_url").ok());
+        let function_display_url = redact_serverless_url(&function_url);
+        let metadata_prefix = format!(
+            "serverless_function.{}.",
+            encode_metadata_segment(instance_id)
+        );
 
         let requires_body = forward_body;
 
@@ -407,7 +493,9 @@ impl ServerlessFunction {
             provider,
             mode,
             function_url,
+            function_display_url,
             function_hostname,
+            metadata_prefix,
             aws_config,
             azure_function_key,
             gcp_authorization_header,
@@ -427,7 +515,7 @@ impl ServerlessFunction {
         &self,
         ctx: &RequestContext,
         proxy_headers: &HashMap<String, String>,
-    ) -> Value {
+    ) -> Result<Value, InvocationFailure> {
         let mut payload = serde_json::Map::new();
 
         payload.insert("method".into(), Value::String(ctx.method.clone()));
@@ -463,28 +551,46 @@ impl ServerlessFunction {
         }
 
         // Forward query params
-        if self.forward_query_params && !ctx.query_params.is_empty() {
-            let params: serde_json::Map<String, Value> = ctx
-                .query_params
-                .iter()
-                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-                .collect();
-            payload.insert("query_params".into(), Value::Object(params));
-        }
-
-        // Forward request body
-        if self.forward_body
-            && let Some(body) = ctx.metadata.get("request_body")
-        {
-            // Try to parse as JSON for structured forwarding, otherwise send as string
-            if let Ok(json_body) = serde_json::from_str::<Value>(body) {
-                payload.insert("body".into(), json_body);
-            } else {
-                payload.insert("body".into(), Value::String(body.clone()));
+        if self.forward_query_params {
+            let params = unambiguous_query_params(ctx)?;
+            if !params.is_empty() {
+                payload.insert("query_params".into(), Value::Object(params));
             }
         }
 
-        Value::Object(payload)
+        // Forward request body
+        if self.forward_body {
+            reject_encoded_request_body(ctx)?;
+            let empty_body = Bytes::new();
+            let body = if let Some(body) = ctx.request_body_bytes.as_ref() {
+                body
+            } else if !crate::proxy::request_may_have_body(&ctx.method, &ctx.headers) {
+                &empty_body
+            } else {
+                return Err(InvocationFailure::governed_input(
+                    "request_body_unavailable",
+                    "governed request body was unavailable before function invocation",
+                ));
+            };
+            // Interpret the bytes according to the original client metadata,
+            // not a header-only transform that may have run earlier.
+            let content_type = ctx.headers.get("content-type");
+            if content_type.is_some_and(is_json_content_type)
+                && let Ok(json_body) = serde_json::from_slice::<Value>(body)
+            {
+                payload.insert("body".into(), json_body);
+            } else if let Ok(text) = std::str::from_utf8(body) {
+                payload.insert("body".into(), Value::String(text.to_string()));
+            } else {
+                payload.insert(
+                    "body".into(),
+                    Value::String(base64::engine::general_purpose::STANDARD.encode(body)),
+                );
+                payload.insert("body_encoding".into(), Value::String("base64".into()));
+            }
+        }
+
+        Ok(Value::Object(payload))
     }
 
     /// Invoke the serverless function and return (status_code, headers, body_bytes).
@@ -492,9 +598,13 @@ impl ServerlessFunction {
         &self,
         payload: &Value,
         ctx: &RequestContext,
-    ) -> Result<(u16, HashMap<String, String>, Bytes), String> {
-        let payload_bytes = serde_json::to_vec(payload)
-            .map_err(|e| format!("serverless_function: failed to serialize payload: {e}"))?;
+    ) -> Result<(u16, HashMap<String, String>, Bytes), InvocationFailure> {
+        let payload_bytes = serde_json::to_vec(payload).map_err(|_| {
+            InvocationFailure::new(
+                "payload_serialization_failed",
+                "failed to serialize function payload",
+            )
+        })?;
 
         let mut req_builder = self
             .http_client
@@ -508,8 +618,18 @@ impl ServerlessFunction {
             Provider::AwsLambda => {
                 if let Some(ref aws) = self.aws_config {
                     let now = Utc::now();
-                    let auth_headers =
-                        sign_aws_request(aws, &self.function_url, &payload_bytes, &now)?;
+                    let auth_headers = sign_aws_request(
+                        aws,
+                        &self.function_url,
+                        &payload_bytes,
+                        &now,
+                    )
+                    .map_err(|_| {
+                        InvocationFailure::new(
+                            "request_signing_failed",
+                            "failed to sign AWS Lambda invocation",
+                        )
+                    })?;
                     for (k, v) in &auth_headers {
                         req_builder = req_builder.header(k.as_str(), v.as_str());
                     }
@@ -531,17 +651,19 @@ impl ServerlessFunction {
 
         let response = self
             .http_client
-            .execute_tracked(request, "serverless_function", &ctx.plugin_http_call_ns)
+            .execute_redacted_tracked(
+                request,
+                "serverless_function",
+                &self.function_display_url,
+                &ctx.plugin_http_call_ns,
+            )
             .await
-            .map_err(|e| format!("serverless_function: invocation failed: {e}"))?;
+            .map_err(|detail| InvocationFailure::new("invocation_failed", detail))?;
 
         let status = response.status().as_u16();
-
-        let response_headers: HashMap<String, String> = response
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
-            .collect();
+        let lambda_function_error = self.provider == Provider::AwsLambda
+            && response.headers().contains_key("x-amz-function-error");
+        let response_headers = sanitize_function_response_headers(response.headers());
 
         // Stream the response body with a hard cap. Calling `.bytes().await`
         // would buffer the whole payload before any size check fires — a
@@ -550,32 +672,68 @@ impl ServerlessFunction {
         // soon as the running total crosses the limit.
         let body = read_response_body_bounded(response, self.max_response_body_bytes)
             .await
-            .map_err(|e| match e {
-                BoundedReadError::LimitExceeded { .. } => format!("serverless_function: {e}"),
-                BoundedReadError::Stream(_) => {
-                    format!("serverless_function: failed to read response body: {e}")
-                }
+            .map_err(|error| match error {
+                BoundedReadError::LimitExceeded { .. } => InvocationFailure::new(
+                    "response_body_too_large",
+                    "function response exceeded max_response_body_bytes",
+                ),
+                BoundedReadError::Stream(_) => InvocationFailure::new(
+                    "response_body_read_failed",
+                    "failed to read function response body",
+                ),
             })?;
 
         // AWS Lambda returns HTTP 200 even on function errors, signaling via
         // X-Amz-Function-Error header. Treat this as an invocation failure.
-        if self.provider == Provider::AwsLambda
-            && let Some(error_type) = response_headers.get("x-amz-function-error")
-        {
-            return Err(format!(
-                "serverless_function: Lambda function error ({})",
-                error_type,
+        if lambda_function_error {
+            return Err(InvocationFailure::new(
+                "lambda_function_error",
+                "AWS Lambda reported a function error",
             ));
         }
 
         Ok((status, response_headers, body))
+    }
+
+    fn metadata_key(&self, suffix: &str) -> String {
+        let mut key = String::with_capacity(self.metadata_prefix.len() + suffix.len());
+        key.push_str(&self.metadata_prefix);
+        key.push_str(suffix);
+        key
+    }
+
+    fn record_failure(&self, ctx: &mut RequestContext, failure: &InvocationFailure) {
+        ctx.metadata
+            .insert(self.metadata_key("error_class"), failure.code.to_string());
+    }
+
+    fn failure_result(&self, ctx: &mut RequestContext, failure: InvocationFailure) -> PluginResult {
+        warn!(
+            error_class = failure.code,
+            destination = %self.function_display_url,
+            detail = %failure.operator_detail,
+            "serverless_function invocation failed"
+        );
+        self.record_failure(ctx, &failure);
+        if self.on_error == ErrorAction::Continue && !failure.must_reject {
+            PluginResult::Continue
+        } else {
+            PluginResult::Reject {
+                status_code: self.error_status_code,
+                body: format!(
+                    r#"{{"error":"serverless function invocation failed","code":"{}"}}"#,
+                    failure.code
+                ),
+                headers: HashMap::new(),
+            }
+        }
     }
 }
 
 fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        Some(Value::Null) | None => Ok(None),
+        None => Ok(None),
         Some(_) => Err(format!("serverless_function: '{key}' must be a boolean")),
     }
 }
@@ -586,7 +744,7 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
             .as_u64()
             .map(Some)
             .ok_or_else(|| format!("serverless_function: '{key}' must be an unsigned integer")),
-        Some(Value::Null) | None => Ok(None),
+        None => Ok(None),
         Some(_) => Err(format!(
             "serverless_function: '{key}' must be an unsigned integer"
         )),
@@ -596,7 +754,7 @@ fn optional_u64(config: &Value, key: &str) -> Result<Option<u64>, String> {
 fn optional_config_string(config: &Value, key: &str) -> Result<Option<String>, String> {
     match config.get(key) {
         Some(Value::String(value)) => Ok((!value.is_empty()).then(|| value.clone())),
-        Some(Value::Null) | None => Ok(None),
+        None => Ok(None),
         Some(_) => Err(format!("serverless_function: '{key}' must be a string")),
     }
 }
@@ -611,9 +769,6 @@ fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
     };
 
     let Value::Array(headers) = value else {
-        if value.is_null() {
-            return Ok(Vec::new());
-        }
         return Err("serverless_function: 'forward_headers' must be an array".to_string());
     };
 
@@ -631,53 +786,9 @@ fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
     Ok(parsed)
 }
 
-/// Escape special characters for safe JSON string interpolation.
-fn escape_json_string(s: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut escaped = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '\u{08}' => escaped.push_str("\\b"),
-            '\u{0c}' => escaped.push_str("\\f"),
-            '<' => escaped.push_str("\\u003c"),
-            '>' => escaped.push_str("\\u003e"),
-            ch if ch < '\u{20}' => {
-                escaped.push_str("\\u00");
-                let byte = ch as u8;
-                escaped.push(HEX[(byte >> 4) as usize] as char);
-                escaped.push(HEX[(byte & 0x0f) as usize] as char);
-            }
-            ch => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
 /// Validate a function URL (Azure/GCP `function_url`).
 fn validate_function_url(url: &str) -> Result<(), String> {
     validate_http_url_field(url, "function_url")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn serverless_escape_json_string_round_trips_control_characters() {
-        let raw = "invoke failed\"\n<script>\u{00}\u{1f}\\";
-        let body = format!(r#"{{"details":"{}"}}"#, escape_json_string(raw));
-        let parsed: Value =
-            serde_json::from_str(&body).expect("escaped serverless error should be valid JSON");
-
-        assert_eq!(parsed["details"], raw);
-        assert!(!escape_json_string(raw).chars().any(|ch| ch < '\u{20}'));
-    }
 }
 
 /// Shared HTTP(S) URL validator for `function_url` (Azure/GCP) and the AWS
@@ -685,13 +796,13 @@ mod tests {
 /// so operators see exactly which config key was rejected.
 fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
     let parsed =
-        Url::parse(url).map_err(|e| format!("serverless_function: invalid {field}: {e}"))?;
+        Url::parse(url).map_err(|_| format!("serverless_function: invalid {field}"))?;
 
     match parsed.scheme() {
         "http" | "https" => {}
-        scheme => {
+        _ => {
             return Err(format!(
-                "serverless_function: {field} must use http:// or https:// (got '{scheme}')"
+                "serverless_function: {field} must use http:// or https://"
             ));
         }
     }
@@ -703,7 +814,199 @@ fn validate_http_url_field(url: &str, field: &str) -> Result<(), String> {
     }
     http_url_hostname(&parsed, field)?;
 
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "serverless_function: {field} must not contain URL userinfo; use the provider credential fields"
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(format!(
+            "serverless_function: {field} must not contain a URL fragment"
+        ));
+    }
+
     Ok(())
+}
+
+fn validate_aws_endpoint_url(url: &str) -> Result<(), String> {
+    validate_http_url_field(url, "aws_endpoint_url")?;
+    let parsed = Url::parse(url)
+        .map_err(|_| "serverless_function: invalid aws_endpoint_url".to_string())?;
+    if parsed.path() != "/" || parsed.query().is_some() {
+        return Err(
+            "serverless_function: aws_endpoint_url must be an HTTP(S) origin without a path, query, or fragment"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Return a credential-safe structural URL suitable for logs, diagnostics, and
+/// admin projections. Paths and queries can carry signed trigger credentials,
+/// so only the origin is retained verbatim.
+pub fn redact_serverless_url(url: &str) -> String {
+    let Ok(parsed) = Url::parse(url) else {
+        return "[REDACTED_URL]".to_string();
+    };
+    let mut redacted = parsed.origin().ascii_serialization();
+    if parsed.path() != "/" {
+        redacted.push_str("/[REDACTED_PATH]");
+    }
+    if parsed.query().is_some() {
+        redacted.push_str("?[REDACTED_QUERY]");
+    }
+    redacted
+}
+
+fn encode_metadata_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
+
+fn reject_encoded_request_body(ctx: &RequestContext) -> Result<(), InvocationFailure> {
+    if let Some(encoding) = ctx.headers.get("content-encoding")
+        && !encoding.trim().eq_ignore_ascii_case("identity")
+    {
+        return Err(InvocationFailure::governed_input(
+            "encoded_request_body_unsupported",
+            "governed request body used a non-identity content-encoding",
+        ));
+    }
+    Ok(())
+}
+
+fn unambiguous_query_params(
+    ctx: &RequestContext,
+) -> Result<serde_json::Map<String, Value>, InvocationFailure> {
+    let mut ordered = BTreeMap::new();
+    if let Some(raw_query) = ctx.raw_query_string() {
+        for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+            let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+            if raw_key.contains('+') || raw_value.contains('+') {
+                return Err(InvocationFailure::governed_input(
+                    "ambiguous_query_encoding",
+                    "query forwarding rejected a raw '+' character",
+                ));
+            }
+            if !has_valid_percent_triplets(raw_key) || !has_valid_percent_triplets(raw_value) {
+                return Err(InvocationFailure::governed_input(
+                    "invalid_query_encoding",
+                    "query forwarding rejected malformed percent encoding",
+                ));
+            }
+            let key = percent_decode_str(raw_key).decode_utf8().map_err(|_| {
+                InvocationFailure::governed_input(
+                    "invalid_query_encoding",
+                    "query parameter name was not valid percent-encoded UTF-8",
+                )
+            })?;
+            let value = percent_decode_str(raw_value).decode_utf8().map_err(|_| {
+                InvocationFailure::governed_input(
+                    "invalid_query_encoding",
+                    "query parameter value was not valid percent-encoded UTF-8",
+                )
+            })?;
+            if ordered.insert(key.into_owned(), value.into_owned()).is_some() {
+                return Err(InvocationFailure::governed_input(
+                    "duplicate_query_parameter",
+                    "query forwarding rejected a duplicate decoded parameter name",
+                ));
+            }
+        }
+    } else if !ctx.query_params.is_empty() {
+        return Err(InvocationFailure::governed_input(
+            "raw_query_unavailable",
+            "query parameters were materialized without their original encoded representation",
+        ));
+    }
+    Ok(ordered
+        .into_iter()
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect())
+}
+
+fn has_valid_percent_triplets(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+fn sanitize_function_response_headers(headers: &http::HeaderMap) -> HashMap<String, String> {
+    let connection_listed: HashSet<HeaderName> =
+        crate::proxy::headers::parse_connection_listed_headers(headers)
+            .into_iter()
+            .collect();
+    let mut safe = HashMap::new();
+    for (name, value) in headers {
+        let lower = name.as_str();
+        if connection_listed.contains(name)
+            || crate::proxy::headers::is_backend_response_strip_header(lower)
+            || is_protocol_managed_or_unsafe_response_header(lower)
+        {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        if lower == "set-cookie" {
+            crate::proxy::headers::append_set_cookie_header(&mut safe, value.to_string());
+        } else {
+            safe.entry(lower.to_string())
+                .and_modify(|existing: &mut String| {
+                    existing.push_str(", ");
+                    existing.push_str(value);
+                })
+                .or_insert_with(|| value.to_string());
+        }
+    }
+    safe
+}
+
+fn is_protocol_managed_or_unsafe_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "content-length"
+            | "authorization"
+            | "proxy-authorization"
+            | "authentication-info"
+            | "proxy-authentication-info"
+            | "cookie"
+            | "x-api-key"
+            | "x-functions-key"
+            | "alt-svc"
+            | "server"
+            | "via"
+            | "cf-ray"
+    ) || name.starts_with("x-amz-")
+        || name.starts_with("x-goog-")
+        || name.starts_with("x-functions-")
+        || name.starts_with("x-ms-")
+        || name.starts_with("x-azure-")
+        || name.starts_with("x-cloud-")
+        || name.starts_with("x-envoy-")
 }
 
 fn http_url_hostname(parsed: &Url, field: &str) -> Result<String, String> {
@@ -730,13 +1033,6 @@ fn has_non_empty_authority(url: &str) -> bool {
         .unwrap_or(authority_and_path.len());
 
     authority_end > 0
-}
-
-fn contains_json_ascii(value: &str) -> bool {
-    value
-        .as_bytes()
-        .windows(b"json".len())
-        .any(|window| window.eq_ignore_ascii_case(b"json"))
 }
 
 fn starts_with_grpc_content_type(value: &str) -> bool {
@@ -838,17 +1134,28 @@ impl Plugin for ServerlessFunction {
         self.mode == InvocationMode::PreProxy
     }
 
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        self.forward_body
+    }
+
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.requires_body
     }
 
-    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+    fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
         self.requires_body
-            && ctx.method == "POST"
-            && ctx
-                .headers
-                .get("content-type")
-                .is_some_and(|ct| contains_json_ascii(ct))
+    }
+
+    fn needs_request_body_bytes(&self) -> bool {
+        self.requires_body
+    }
+
+    fn needs_request_body_text(&self) -> bool {
+        false
+    }
+
+    fn requires_decoded_query_params(&self) -> bool {
+        self.forward_query_params
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -892,91 +1199,106 @@ impl Plugin for ServerlessFunction {
             }
         }
 
-        let payload = self.build_invocation_payload(ctx, headers);
+        let payload = match self.build_invocation_payload(ctx, headers) {
+            Ok(payload) => payload,
+            Err(failure) => return self.failure_result(ctx, failure),
+        };
+
+        if self.mode == InvocationMode::Terminate {
+            // The request_deduplication plugin uses this private provenance to
+            // distinguish an attempted externally executing terminal response
+            // from other synthetic short-circuits that must not be cached.
+            // Set it only after all plugin-local fail-closed inspection passes.
+            ctx.serverless_external_side_effect = true;
+        }
 
         let (status, response_headers, body) = match self.invoke(&payload, ctx).await {
             Ok(result) => result,
-            Err(err) => {
-                warn!("serverless_function: {}", err);
-                return match self.on_error {
-                    ErrorAction::Continue => {
-                        ctx.metadata
-                            .insert("serverless_function_error".to_string(), err.clone());
-                        PluginResult::Continue
-                    }
-                    ErrorAction::Reject => PluginResult::Reject {
-                        status_code: self.error_status_code,
-                        body: format!(
-                            r#"{{"error":"serverless function invocation failed","details":"{}"}}"#,
-                            escape_json_string(&err)
-                        ),
-                        headers: HashMap::new(),
-                    },
-                };
-            }
+            Err(failure) => return self.failure_result(ctx, failure),
         };
+        ctx.metadata
+            .insert(self.metadata_key("status"), status.to_string());
 
         match self.mode {
             InvocationMode::Terminate => {
+                if status < 200 {
+                    return self.failure_result(
+                        ctx,
+                        InvocationFailure::new(
+                            "informational_function_status",
+                            format!("function returned non-final status {status}"),
+                        ),
+                    );
+                }
                 // Return the function's response directly to the client
                 debug!(
                     "serverless_function: terminate mode — returning function response (status {})",
                     status
                 );
-                let mut resp_headers = HashMap::new();
-                // Forward content-type from function response
-                if let Some(ct) = response_headers.get("content-type") {
-                    resp_headers.insert("content-type".to_string(), ct.clone());
-                }
+                let body = if ctx.method.eq_ignore_ascii_case("HEAD")
+                    || matches!(status, 204 | 304)
+                {
+                    Bytes::new()
+                } else {
+                    body
+                };
                 PluginResult::RejectBinary {
                     status_code: status,
                     body,
-                    headers: resp_headers,
+                    headers: response_headers,
                 }
             }
             InvocationMode::PreProxy => {
-                // Check for function-level rejection
-                if status >= 400 {
-                    warn!(
-                        "serverless_function: function returned status {} in pre_proxy mode",
-                        status
+                // Only a 2xx function response is an affirmative pre-proxy
+                // decision. Redirects are deliberately not followed by the
+                // shared client and cannot become implicit approval.
+                if !(200..=299).contains(&status) {
+                    return self.failure_result(
+                        ctx,
+                        InvocationFailure::new(
+                            "function_non_success_status",
+                            format!("function returned non-2xx status {status} in pre_proxy mode"),
+                        ),
                     );
-                    return match self.on_error {
-                        ErrorAction::Continue => {
-                            ctx.metadata.insert(
-                                "serverless_function_status".to_string(),
-                                status.to_string(),
-                            );
-                            PluginResult::Continue
-                        }
-                        ErrorAction::Reject => PluginResult::Reject {
-                            status_code: status,
-                            body: String::from_utf8_lossy(&body).into_owned(),
-                            headers: HashMap::new(),
-                        },
-                    };
                 }
 
                 // Parse the response body as JSON to extract headers to inject
                 if let Ok(resp_json) = serde_json::from_slice::<Value>(&body) {
                     // Inject headers from response: { "headers": { "X-Custom": "value" } }
                     if let Some(header_map) = resp_json.get("headers").and_then(|h| h.as_object()) {
+                        let mut candidates = HashMap::new();
                         for (key, val) in header_map {
-                            if let Some(v) = val.as_str() {
-                                headers.insert(key.to_ascii_lowercase(), v.to_string());
+                            let Some(value) = val.as_str() else {
+                                continue;
+                            };
+                            let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
+                                continue;
+                            };
+                            if HeaderValue::from_str(value).is_err() {
+                                continue;
                             }
+                            candidates.insert(name.as_str().to_string(), value.to_string());
+                        }
+                        let connection_listed: HashSet<String> =
+                            crate::proxy::headers::parse_connection_listed_from_str_map(&candidates)
+                                .into_iter()
+                                .collect();
+                        for (key, value) in candidates {
+                            if connection_listed.contains(&key)
+                                || crate::proxy::headers::is_backend_request_strip_header(&key)
+                            {
+                                continue;
+                            }
+                            headers.insert(key, value);
                         }
                     }
 
                     // Store metadata from response: { "metadata": { "key": "value" } }
                     if let Some(meta_map) = resp_json.get("metadata").and_then(|m| m.as_object()) {
                         for (key, val) in meta_map {
-                            if let Some(v) = val.as_str() {
-                                let mut metadata_key =
-                                    String::with_capacity("serverless_".len() + key.len());
-                                metadata_key.push_str("serverless_");
-                                metadata_key.push_str(key);
-                                ctx.metadata.insert(metadata_key, v.to_string());
+                            if let Some(value) = val.as_str() {
+                                let suffix = format!("metadata.{}", encode_metadata_segment(key));
+                                ctx.metadata.insert(self.metadata_key(&suffix), value.to_string());
                             }
                         }
                     }

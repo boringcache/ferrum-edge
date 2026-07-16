@@ -8,13 +8,17 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_serverless_mirror
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::Request;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
 // ============================================================================
@@ -60,7 +64,7 @@ async fn start_function_server(port: u16) {
 
                 let body = r#"{"source":"serverless-function","message":"hello from function"}"#;
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nContent-Type: application/json\r\nRetry-After: 30\r\nETag: \"function-v1\"\r\nContent-Disposition: attachment; filename=decision.json\r\nSet-Cookie: first=1; Path=/\r\nSet-Cookie: second=2; Path=/\r\nConnection: close, x-function-internal\r\nX-Function-Internal: strip-me\r\nX-Amz-Request-Id: provider-control\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -254,10 +258,32 @@ upstreams: []
 
     assert_eq!(
         resp.status().as_u16(),
-        200,
-        "Expected 200 from serverless function, got {}",
+        429,
+        "Expected 429 from serverless function, got {}",
         resp.status()
     );
+    assert_eq!(
+        resp.headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("30")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok()),
+        Some("\"function-v1\"")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-disposition")
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=decision.json")
+    );
+    assert_eq!(resp.headers().get_all("set-cookie").iter().count(), 2);
+    assert!(!resp.headers().contains_key("connection"));
+    assert!(!resp.headers().contains_key("x-function-internal"));
+    assert!(!resp.headers().contains_key("x-amz-request-id"));
 
     let body = resp.text().await.unwrap();
     assert!(
@@ -270,6 +296,43 @@ upstreams: []
         "Response should NOT come from the backend. Got: {}",
         body
     );
+
+    // Exercise the same terminate contract over an H2 frontend connection.
+    let stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect H2 frontend");
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .expect("H2 handshake");
+    let connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://example.com/fn/h2")
+        .header("host", "example.com")
+        .body(Full::new(Bytes::new()))
+        .expect("build H2 request");
+    let response = sender.send_request(request).await.expect("H2 request");
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("30")
+    );
+    assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+    assert!(!response.headers().contains_key("x-function-internal"));
+    let h2_body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect H2 response")
+        .to_bytes();
+    assert!(String::from_utf8_lossy(&h2_body).contains("serverless-function"));
+    connection_task.abort();
 
     let _ = gw.kill();
     let _ = gw.wait();

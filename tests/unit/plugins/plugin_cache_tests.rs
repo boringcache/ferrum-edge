@@ -1115,6 +1115,153 @@ fn test_multiple_global_and_proxy_plugins() {
     assert!(names.contains(&"key_auth"));
 }
 
+#[tokio::test]
+async fn serverless_instances_keep_independent_transaction_metadata() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let first_server = MockServer::start().await;
+    let second_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "metadata": {"decision": "first"}
+        })))
+        .mount(&first_server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "metadata": {"decision": "second"}
+        })))
+        .mount(&second_server)
+        .await;
+
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["policy.primary", "policy-secondary"],
+        )],
+        vec![
+            make_plugin_config_with_json(
+                "policy.primary",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": format!("{}/first", first_server.uri())
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "policy-secondary",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": format!("{}/second", second_server.uri())
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+
+    assert!(matches!(
+        run_before_proxy_chain(&plugins, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy%2Eprimary.metadata.decision")
+            .map(String::as_str),
+        Some("first")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy-secondary.metadata.decision")
+            .map(String::as_str),
+        Some("second")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy%2Eprimary.status")
+            .map(String::as_str),
+        Some("200")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.policy-secondary.status")
+            .map(String::as_str),
+        Some("200")
+    );
+}
+
+#[test]
+fn serverless_body_egress_rejects_request_body_transform_composition() {
+    for (transform_id, transform_name, transform_config) in [
+        (
+            "body-transform",
+            "request_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "trusted",
+                    "value": true
+                }]
+            }),
+        ),
+        (
+            "request-decompression",
+            "compression",
+            json!({"decompress_request": true}),
+        ),
+    ] {
+        let config = make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                vec!["external-policy", transform_id],
+            )],
+            vec![
+                make_plugin_config_with_json(
+                    "external-policy",
+                    "serverless_function",
+                    json!({
+                        "provider": "azure_functions",
+                        "function_url": "https://example.com/policy",
+                        "forward_body": true
+                    }),
+                    PluginScope::Proxy,
+                    Some("p1"),
+                ),
+                make_plugin_config_with_json(
+                    transform_id,
+                    transform_name,
+                    transform_config,
+                    PluginScope::Proxy,
+                    Some("p1"),
+                ),
+            ],
+        );
+
+        let error = match PluginCache::new(&config) {
+            Ok(_) => panic!("serverless body egress plus {transform_name} must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("request-body") || error.contains("validation"),
+            "transform={transform_name}, got: {error}"
+        );
+    }
+}
+
 #[test]
 fn test_proxy_count() {
     let config = make_config(

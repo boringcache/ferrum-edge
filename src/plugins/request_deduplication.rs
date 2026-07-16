@@ -1856,7 +1856,7 @@ impl Plugin for RequestDeduplication {
         // Synthetic short-circuit guard. When a *fresh* request that this plugin
         // marked in-flight is then short-circuited by a LATER `before_proxy`
         // plugin (e.g. a 2xx `fault_injection`/`mesh_route_dispatch` abort,
-        // `response_mock`, `serverless` terminate, `request_termination`, an
+        // `response_mock`, `request_termination`, an
         // `ai_federation` synthetic response, or an `ai_semantic_cache` hit), the
         // synthetic body now flows back through the response-body hooks (the
         // generic 2xx short-circuit path) and would otherwise be cached and
@@ -1868,9 +1868,16 @@ impl Plugin for RequestDeduplication {
         // RELEASE the in-flight locks so the marker transitions to a clean state
         // instead of dangling until `inflight_ttl`, which keeps duplicate
         // detection accurate once the synthetic short-circuit returns.
+        //
+        // A terminal serverless response is the deliberate exception: the
+        // external function has already executed and may have produced a side
+        // effect, so releasing the key would let the retry execute it again.
+        // Serverless records private provenance before invocation; in that case
+        // the ordinary completed-response path below stores a replay instead.
         if ctx
             .metadata
             .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
+            && !ctx.serverless_external_side_effect
         {
             self.remove_matching_local_inflight(&key, &fingerprint, &local_inflight_owner_token);
             if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {

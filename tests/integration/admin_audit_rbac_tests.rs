@@ -461,6 +461,65 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
 }
 
 #[tokio::test]
+async fn serverless_config_audit_and_non_admin_reads_redact_url_credentials() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let trigger_secret = "signed-trigger-secret";
+    let function_key = "azure-function-key-secret";
+    let plugin = json!({
+        "id": "serverless-redaction",
+        "plugin_name": "serverless_function",
+        "scope": "global",
+        "config": {
+            "provider": "azure_functions",
+            "function_url": format!(
+                "https://functions.example/private/{trigger_secret}?code={trigger_secret}"
+            ),
+            "azure_function_key": function_key
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "plugin create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=serverless-redaction",
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(
+        event["diff"]["after"]["config"]["function_url"],
+        "https://functions.example/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(
+        event["diff"]["after"]["config"]["azure_function_key"],
+        "[REDACTED]"
+    );
+
+    let (status, viewer_body) = get_json(
+        &base,
+        "/plugins/config/serverless-redaction",
+        &viewer,
+    )
+    .await;
+    assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
+    assert_eq!(
+        viewer_body["config"]["function_url"],
+        "https://functions.example/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(viewer_body["config"]["azure_function_key"], "[REDACTED]");
+    let serialized = format!("{event:?}{viewer_body:?}");
+    assert!(!serialized.contains(trigger_secret));
+    assert!(!serialized.contains(function_key));
+}
+
+#[tokio::test]
 async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);

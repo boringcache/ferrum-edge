@@ -753,6 +753,10 @@ pub struct RequestContext {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Private provenance for a terminal serverless invocation. Deduplication
+    /// uses this to cache an externally executed synthetic response rather than
+    /// releasing the idempotency key and repeating the side effect on retry.
+    pub(crate) serverless_external_side_effect: bool,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -1075,6 +1079,7 @@ impl RequestContext {
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
+            serverless_external_side_effect: false,
             gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
@@ -1227,6 +1232,7 @@ impl RequestContext {
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
+            serverless_external_side_effect: self.serverless_external_side_effect,
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
@@ -3162,13 +3168,23 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this plugin sends the buffered request body to an
+    /// external service during `before_proxy`, before request-body transforms
+    /// and final-body policy hooks run. Cache validation rejects a same-protocol
+    /// transformer in that chain so policy cannot govern different bytes than
+    /// the backend receives.
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs the raw request body to be available
     /// during `before_proxy`.
     ///
     /// This is narrower than `requires_request_body_buffering()`: body
     /// transformers can buffer later, after `before_proxy` rejects have had a
-    /// chance to short-circuit. Override this only for plugins that read
-    /// `ctx.metadata["request_body"]` inside `before_proxy`.
+    /// chance to short-circuit. Override this only for plugins that inspect
+    /// `ctx.metadata["request_body"]` or `ctx.request_body_bytes` inside
+    /// `before_proxy`.
     fn requires_request_body_before_before_proxy(&self) -> bool {
         false
     }
