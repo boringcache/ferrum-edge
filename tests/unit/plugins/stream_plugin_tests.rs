@@ -768,7 +768,6 @@ fn test_http_grpc_plugins_complete_coverage() {
     // configs with no policies, so we configure max_messages to satisfy
     // its no-op rejection check.
     let plugins = vec![
-        ("ai_token_metrics", json!({})),
         ("ai_request_guard", json!({"max_messages": 100})),
         ("ai_rate_limiter", json!({"token_limit": 1000})),
         ("ai_prompt_shield", json!({})),
@@ -805,6 +804,7 @@ fn test_http_only_plugins_complete_coverage() {
     let plugins = vec![
         ("response_caching", json!({"ttl_seconds": 60})),
         ("graphql", json!({"max_depth": 100})),
+        ("ai_token_metrics", json!({})),
         (
             "ai_semantic_firewall",
             json!({

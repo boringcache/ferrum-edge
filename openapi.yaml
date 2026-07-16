@@ -16481,11 +16481,17 @@ components:
 
     AiTokenMetricsConfig:
       type: object
-      description: "Plugin: ai_token_metrics — Extracts token usage from LLM response bodies."
+      additionalProperties: false
+      description: >-
+        Plugin: ai_token_metrics — Extracts token usage from HTTP JSON/SSE LLM
+        response bodies. Native gRPC protobuf messages are unsupported and the
+        plugin is not registered for the Grpc protocol view. Unknown keys are
+        rejected.
       properties:
         provider:
           type: string
           default: auto
+          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]
           description: "LLM provider format (auto, openai, anthropic, google, cohere, mistral, bedrock)"
         include_model:
           type: boolean
@@ -16498,6 +16504,9 @@ components:
         metadata_prefix:
           type: string
           default: ai
+          minLength: 1
+          maxLength: 64
+          pattern: '^[A-Za-z0-9_.-]+$'
           description: Prefix for metadata keys
         buffer_streaming_responses:
           type: boolean
@@ -16506,10 +16515,14 @@ components:
         cost_per_prompt_token:
           type: number
           format: double
+          minimum: 0
+          maximum: 18446744073709.55
           description: Calculate estimated cost per request (prompt tokens)
         cost_per_completion_token:
           type: number
           format: double
+          minimum: 0
+          maximum: 18446744073709.55
           description: Calculate estimated cost per request (completion tokens)
 
     AiRequestGuardConfig:

@@ -4157,7 +4157,7 @@ config:
 
 ### `ai_token_metrics`
 
-Extracts token usage from LLM JSON response bodies and writes it to request metadata for downstream logging and observability plugins. This plugin is observability-only: it never rejects requests and does not enforce a token budget. Use `ai_rate_limiter` for enforced budget controls. SSE (Server-Sent Events) usage extraction is available only when explicitly opted into because it requires buffering the full stream.
+Extracts token usage from LLM HTTP JSON response bodies and writes it to request metadata for downstream logging and observability plugins. This plugin is observability-only: it never rejects requests and does not enforce a token budget. Use `ai_rate_limiter` for enforced budget controls. SSE (Server-Sent Events) usage extraction is available only when explicitly opted into because it requires buffering the full stream. Native gRPC protobuf responses are not supported: the plugin advertises only HTTP attachment and logs an explicit HTTP-only warning when configured rather than pretending arbitrary protobuf messages have a verifiable usage schema.
 
 **Priority:** 4100
 
@@ -4166,18 +4166,22 @@ Extracts token usage from LLM JSON response bodies and writes it to request meta
 | `provider` | String | `"auto"` | LLM provider format |
 | `include_model` | Boolean | `true` | Extract model name into metadata |
 | `include_token_details` | Boolean | `true` | Extract prompt/completion tokens separately |
-| `metadata_prefix` | String | `"ai"` | Prefix for metadata keys |
+| `metadata_prefix` | String | `"ai"` | Prefix for metadata keys (1–64 ASCII letters, digits, `.`, `_`, or `-`) |
 | `buffer_streaming_responses` | Boolean | `false` | Buffer `text/event-stream` responses so final SSE usage events can be parsed; this disables streaming delivery for those responses |
 | `cost_per_prompt_token` | Float | *(none)* | Calculate estimated cost per request |
 | `cost_per_completion_token` | Float | *(none)* | Calculate estimated cost per request |
 
 **Note**: Requires response body buffering for JSON responses. `text/event-stream` responses are not buffered by default so LLM streaming remains live; set `buffer_streaming_responses: true` only when buffered SSE token metrics are more important than streaming delivery.
 
-`provider` is parsed case-insensitively and ignores surrounding whitespace.
+`provider` is parsed case-insensitively and ignores surrounding whitespace. Allowed values are `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, and `bedrock`. Every unknown root configuration key is rejected at startup with the allowed-key list, so misspellings cannot silently change accounting or cost behavior.
 
 **Status filtering**: Only 2xx responses are inspected for token usage. Error responses (4xx, 5xx) are typically not LLM-shaped JSON and would otherwise pollute token metrics and chargeback accounting.
 
-**SSE streaming support:** When `buffer_streaming_responses: true` and the response content-type is `text/event-stream`, the plugin buffers the stream and parses `data:` lines to extract token usage. For OpenAI-compatible providers, usage data is found in the final SSE event (when `stream_options.include_usage: true` is set on the request). For Anthropic streaming, usage is extracted from `message_start` (input tokens) and `message_delta` (output tokens) events. Model name is extracted from the first parseable chunk. Sets `{prefix}_streaming: true` metadata when processing a streaming response.
+**Provider and streaming support:** OpenAI Chat Completions and the Responses API (`input_tokens`/`output_tokens`, including `response.completed`) are supported. Anthropic `message_start` and `message_delta` usage is merged without losing an earlier input count. Gemini/Vertex `usageMetadata`, Cohere billed units, Bedrock Converse usage, and Amazon Titan InvokeModel `inputTextTokenCount` plus a single `results[].tokenCount` are supported. AWS binary event-stream frames are not parsed. When `buffer_streaming_responses: true`, cumulative and partial SSE snapshots are merged field-by-field; repeated cumulative terminal events replace their fields instead of being summed, and `response.incomplete`/`response.failed` events are not treated as authoritative usage. Malformed, non-integer, ambiguous, or overflowing usage is ignored rather than saturated or invented. Model name is extracted from the first parseable event. Sets `{prefix}_streaming: true` metadata when processing an SSE response.
+
+**Origin content encodings:** JSON and opted-in SSE inspection supports case-insensitive `gzip` and `br`, including correctly ordered coding chains. Inspection is bounded to four codings, 4 MiB final decoded data, and 8 MiB cumulative decoded work. Parameterized, unsupported, malformed, truncated, trailing/concatenated, or oversized encodings are skipped safely. Decoding is inspection-only: the original encoded response bytes and headers remain exactly client-visible.
+
+**Prometheus export:** A globally scoped `prometheus_metrics` plugin exports prompt, completion, and total token counters plus estimated cost. Labels are limited to `proxy_id`, the bounded provider family, and the configured metrics namespace—raw model names, metadata prefixes, and arbitrary request metadata are never labels. Multiple `ai_token_metrics` instances contribute one most-complete usage snapshot per request, so overlapping prefixes cannot double count. Estimated cost is emitted and aggregated in currency units with exactly six decimal places (internally integer micro-units).
 
 ```yaml
 plugin_name: ai_token_metrics

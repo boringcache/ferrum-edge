@@ -54,6 +54,121 @@ pub struct CounterKey {
     pub grpc_status: Option<&'static str>,
 }
 
+/// Bounded AI usage key. Provider is normalized to one of the compiled-in
+/// provider labels; raw model names and arbitrary metadata never become labels.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AiUsageKey {
+    pub proxy_id: Arc<str>,
+    pub provider: &'static str,
+}
+
+#[derive(Debug)]
+struct AiMetadataUsage {
+    prefix: String,
+    provider: &'static str,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cost_microunits: Option<u64>,
+}
+
+impl AiMetadataUsage {
+    fn completeness(&self) -> usize {
+        usize::from(self.prompt_tokens.is_some())
+            + usize::from(self.completion_tokens.is_some())
+            + usize::from(self.total_tokens.is_some())
+            + usize::from(self.cost_microunits.is_some())
+    }
+}
+
+fn ai_provider_label(value: &str) -> Option<&'static str> {
+    match value {
+        "openai" => Some("openai"),
+        "anthropic" => Some("anthropic"),
+        "google" => Some("google"),
+        "cohere" => Some("cohere"),
+        "mistral" => Some("mistral"),
+        "bedrock" => Some("bedrock"),
+        _ => None,
+    }
+}
+
+fn parse_canonical_u64(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// Parse the plugin's fixed six-decimal configured-currency representation to
+/// integer micro-units. Exponents, signs, excess precision, and overflow fail.
+fn parse_cost_microunits(value: &str) -> Option<u64> {
+    let (whole, fraction) = value.split_once('.')?;
+    if fraction.len() != 6 {
+        return None;
+    }
+    let whole = parse_canonical_u64(whole)?;
+    let fraction = parse_canonical_u64(fraction)?;
+    whole.checked_mul(1_000_000)?.checked_add(fraction)
+}
+
+fn ai_metadata_usage(
+    metadata: &std::collections::HashMap<String, String>,
+) -> Option<AiMetadataUsage> {
+    let mut selected: Option<AiMetadataUsage> = None;
+
+    for (marker_key, marker_value) in metadata {
+        if marker_value != "v1" {
+            continue;
+        }
+        let Some(prefix) = marker_key.strip_suffix(super::ai_token_metrics::PROMETHEUS_EXPORT_SUFFIX)
+        else {
+            continue;
+        };
+        if prefix.is_empty() {
+            continue;
+        }
+
+        let key = |suffix: &str| format!("{prefix}_{suffix}");
+        let Some(provider) = metadata
+            .get(&key("provider"))
+            .and_then(|value| ai_provider_label(value))
+        else {
+            continue;
+        };
+        let candidate = AiMetadataUsage {
+            prefix: prefix.to_string(),
+            provider,
+            prompt_tokens: metadata
+                .get(&key("prompt_tokens"))
+                .and_then(|value| parse_canonical_u64(value)),
+            completion_tokens: metadata
+                .get(&key("completion_tokens"))
+                .and_then(|value| parse_canonical_u64(value)),
+            total_tokens: metadata
+                .get(&key("total_tokens"))
+                .and_then(|value| parse_canonical_u64(value)),
+            cost_microunits: metadata
+                .get(&key("estimated_cost"))
+                .and_then(|value| parse_cost_microunits(value)),
+        };
+        if candidate.completeness() == 0 {
+            continue;
+        }
+
+        let replace = selected.as_ref().is_none_or(|current| {
+            candidate.completeness() > current.completeness()
+                || (candidate.completeness() == current.completeness()
+                    && candidate.prefix < current.prefix)
+        });
+        if replace {
+            selected = Some(candidate);
+        }
+    }
+
+    selected
+}
+
 /// Composite key for stream connection counter: (proxy_id, protocol).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamCounterKey {
@@ -319,7 +434,11 @@ impl TimestampedCounter {
     }
 
     fn add(&self, value: u64, epoch: Instant) {
-        self.value.fetch_add(value, Ordering::Relaxed);
+        let _ = self
+            .value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(value))
+            });
         self.last_updated
             .store(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
@@ -434,6 +553,14 @@ pub struct MetricsRegistry {
     pub backend_duration_buckets: DashMap<Arc<str>, HistogramBuckets>,
     /// Gateway overhead histogram buckets by proxy_id
     pub gateway_overhead_buckets: DashMap<Arc<str>, HistogramBuckets>,
+    /// Prompt tokens from one selected ai_token_metrics instance per request.
+    pub ai_prompt_tokens_counter: DashMap<AiUsageKey, TimestampedCounter>,
+    /// Completion tokens from one selected ai_token_metrics instance per request.
+    pub ai_completion_tokens_counter: DashMap<AiUsageKey, TimestampedCounter>,
+    /// Total tokens from one selected ai_token_metrics instance per request.
+    pub ai_total_tokens_counter: DashMap<AiUsageKey, TimestampedCounter>,
+    /// Estimated configured-currency cost stored as integer micro-units.
+    pub ai_estimated_cost_microunits_counter: DashMap<AiUsageKey, TimestampedCounter>,
     /// Mesh request count by Istio/GAMMA RED label set.
     pub mesh_request_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Mesh request duration histogram by the same bounded RED label set.
@@ -544,6 +671,10 @@ impl MetricsRegistry {
             request_duration_buckets: DashMap::new(),
             backend_duration_buckets: DashMap::new(),
             gateway_overhead_buckets: DashMap::new(),
+            ai_prompt_tokens_counter: DashMap::new(),
+            ai_completion_tokens_counter: DashMap::new(),
+            ai_total_tokens_counter: DashMap::new(),
+            ai_estimated_cost_microunits_counter: DashMap::new(),
             mesh_request_counter: DashMap::new(),
             mesh_request_duration_buckets: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
@@ -602,6 +733,7 @@ impl MetricsRegistry {
         if let Ok(mut ns_label) = self.namespace_label.write() {
             *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
         }
+        self.render_cache.store(Arc::new(None));
     }
 
     pub fn record_stream(&self, summary: &StreamTransactionSummary) {
@@ -1001,6 +1133,37 @@ impl MetricsRegistry {
             .or_insert_with(|| HistogramBuckets::new(self.epoch))
             .observe(summary.latency_gateway_overhead_ms, self.epoch);
 
+        if let Some(usage) = ai_metadata_usage(&summary.metadata) {
+            let key = AiUsageKey {
+                proxy_id: Arc::clone(&proxy_id),
+                provider: usage.provider,
+            };
+            if let Some(value) = usage.prompt_tokens {
+                self.ai_prompt_tokens_counter
+                    .entry(key.clone())
+                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                    .add(value, self.epoch);
+            }
+            if let Some(value) = usage.completion_tokens {
+                self.ai_completion_tokens_counter
+                    .entry(key.clone())
+                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                    .add(value, self.epoch);
+            }
+            if let Some(value) = usage.total_tokens {
+                self.ai_total_tokens_counter
+                    .entry(key.clone())
+                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                    .add(value, self.epoch);
+            }
+            if let Some(value) = usage.cost_microunits {
+                self.ai_estimated_cost_microunits_counter
+                    .entry(key)
+                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                    .add(value, self.epoch);
+            }
+        }
+
         if let Some(mesh_key) = mesh_key {
             if !prometheus_helpers::mesh_metric_disabled(
                 summary,
@@ -1103,6 +1266,21 @@ impl MetricsRegistry {
             }
             keep
         });
+
+        for counters in [
+            &self.ai_prompt_tokens_counter,
+            &self.ai_completion_tokens_counter,
+            &self.ai_total_tokens_counter,
+            &self.ai_estimated_cost_microunits_counter,
+        ] {
+            counters.retain(|_, value| {
+                let keep = value.nanos_since_update(self.epoch) < ttl_nanos;
+                if !keep {
+                    evicted += 1;
+                }
+                keep
+            });
+        }
 
         self.mesh_request_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
@@ -1306,6 +1484,10 @@ impl MetricsRegistry {
             + self.request_duration_buckets.len() * 800
             + self.backend_duration_buckets.len() * 800
             + self.gateway_overhead_buckets.len() * 800
+            + self.ai_prompt_tokens_counter.len() * 180
+            + self.ai_completion_tokens_counter.len() * 180
+            + self.ai_total_tokens_counter.len() * 180
+            + self.ai_estimated_cost_microunits_counter.len() * 200
             + self.mesh_request_counter.len() * 600
             + self.mesh_request_duration_buckets.len() * 1800
             + self.stream_connection_counter.len() * 200
@@ -1376,6 +1558,47 @@ impl MetricsRegistry {
                 output.push_str(&format!(
                     "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"{}}} {}\n",
                     proxy_id, key.method, key.status_code, ns_label, count
+                ));
+            }
+        }
+
+        render_ai_counter_family(
+            &mut output,
+            "ferrum_ai_prompt_tokens_total",
+            "Prompt tokens reported by AI providers.",
+            &self.ai_prompt_tokens_counter,
+            &ns_label,
+        );
+        render_ai_counter_family(
+            &mut output,
+            "ferrum_ai_completion_tokens_total",
+            "Completion tokens reported by AI providers.",
+            &self.ai_completion_tokens_counter,
+            &ns_label,
+        );
+        render_ai_counter_family(
+            &mut output,
+            "ferrum_ai_tokens_total",
+            "Total tokens reported by AI providers.",
+            &self.ai_total_tokens_counter,
+            &ns_label,
+        );
+        if !self.ai_estimated_cost_microunits_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_ai_estimated_cost_currency_units_total Estimated AI cost in the configured currency units, accumulated at six-decimal precision.\n",
+            );
+            output.push_str("# TYPE ferrum_ai_estimated_cost_currency_units_total counter\n");
+            for entry in self.ai_estimated_cost_microunits_counter.iter() {
+                let key = entry.key();
+                let value = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(&key.proxy_id);
+                output.push_str(&format!(
+                    "ferrum_ai_estimated_cost_currency_units_total{{proxy_id=\"{}\",provider=\"{}\"{}}} {}.{:06}\n",
+                    proxy_id,
+                    key.provider,
+                    ns_label,
+                    value / 1_000_000,
+                    value % 1_000_000
                 ));
             }
         }
@@ -2072,6 +2295,29 @@ impl MetricsRegistry {
         }
 
         output
+    }
+}
+
+fn render_ai_counter_family(
+    output: &mut String,
+    metric_name: &str,
+    help: &str,
+    counters: &DashMap<AiUsageKey, TimestampedCounter>,
+    ns_label: &str,
+) {
+    if counters.is_empty() {
+        return;
+    }
+    output.push_str(&format!("# HELP {metric_name} {help}\n"));
+    output.push_str(&format!("# TYPE {metric_name} counter\n"));
+    for entry in counters.iter() {
+        let key = entry.key();
+        let value = entry.value().value.load(Ordering::Relaxed);
+        let proxy_id = escape_label_value(&key.proxy_id);
+        output.push_str(&format!(
+            "{metric_name}{{proxy_id=\"{}\",provider=\"{}\"{}}} {}\n",
+            proxy_id, key.provider, ns_label, value
+        ));
     }
 }
 

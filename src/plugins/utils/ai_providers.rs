@@ -35,6 +35,43 @@ pub struct AiTokenUsage {
 }
 
 impl AiTokenUsage {
+    /// Merge a newer cumulative/partial provider usage snapshot.
+    ///
+    /// Present fields in the newer snapshot are authoritative; omitted fields
+    /// retain the last known value. Components are never added across events,
+    /// because supported streaming providers report cumulative counts. A total
+    /// is recomputed only with checked arithmetic when both components exist.
+    pub fn merge_cumulative(&mut self, newer: Self) {
+        if self.provider.is_some()
+            && newer.provider.is_some()
+            && self.provider != newer.provider
+        {
+            return;
+        }
+
+        let component_updated =
+            newer.prompt_tokens.is_some() || newer.completion_tokens.is_some();
+        if newer.prompt_tokens.is_some() {
+            self.prompt_tokens = newer.prompt_tokens;
+        }
+        if newer.completion_tokens.is_some() {
+            self.completion_tokens = newer.completion_tokens;
+        }
+        self.total_tokens = if newer.total_tokens.is_some() {
+            newer.total_tokens
+        } else if component_updated {
+            sum_pair(self.prompt_tokens, self.completion_tokens)
+        } else {
+            self.total_tokens
+        };
+        if newer.model.is_some() {
+            self.model = newer.model;
+        }
+        if newer.provider.is_some() {
+            self.provider = newer.provider;
+        }
+    }
+
     pub fn total_for_mode(&self, count_mode: &str) -> Option<u64> {
         match count_mode {
             "prompt_tokens" => self.prompt_tokens.or(Some(0)),
@@ -42,7 +79,7 @@ impl AiTokenUsage {
             _ => self
                 .total_tokens
                 .or_else(|| match (self.prompt_tokens, self.completion_tokens) {
-                    (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
+                    (Some(prompt), Some(completion)) => prompt.checked_add(completion),
                     (Some(prompt), None) => Some(prompt),
                     (None, Some(completion)) => Some(completion),
                     _ => None,
@@ -70,6 +107,18 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
         .is_some()
     {
         return Some(AiProvider::Google);
+    }
+
+    // OpenAI Responses objects use the same `input_tokens` spelling as
+    // Anthropic but carry an unambiguous top-level object discriminator.
+    if json.get("object").and_then(Value::as_str) == Some("response")
+        && json
+            .get("usage")
+            .is_some_and(|usage| {
+                usage.get("input_tokens").is_some() || usage.get("output_tokens").is_some()
+            })
+    {
+        return Some(AiProvider::OpenAi);
     }
 
     if json
@@ -108,6 +157,10 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
         .and_then(|usage| usage.get("inputTokens"))
         .is_some()
     {
+        return Some(AiProvider::Bedrock);
+    }
+
+    if json.get("inputTextTokenCount").is_some() {
         return Some(AiProvider::Bedrock);
     }
 
@@ -152,7 +205,7 @@ pub fn detect_sse_provider(json: &Value) -> Option<AiProvider> {
     if json
         .get("object")
         .and_then(|value| value.as_str())
-        .is_some_and(|value| value.contains("chat.completion"))
+        .is_some_and(|value| value.contains("chat.completion") || value == "response")
     {
         return Some(AiProvider::OpenAi);
     }
@@ -345,10 +398,20 @@ fn extract_openai_usage(json: &Value, provider: AiProvider) -> AiTokenUsage {
     let usage = json.get("usage");
     let prompt = usage
         .and_then(|value| value.get("prompt_tokens"))
-        .and_then(|value| value.as_u64());
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            usage
+                .and_then(|value| value.get("input_tokens"))
+                .and_then(|value| value.as_u64())
+        });
     let completion = usage
         .and_then(|value| value.get("completion_tokens"))
-        .and_then(|value| value.as_u64());
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            usage
+                .and_then(|value| value.get("output_tokens"))
+                .and_then(|value| value.as_u64())
+        });
 
     AiTokenUsage {
         prompt_tokens: prompt,
@@ -443,12 +506,25 @@ fn extract_cohere_usage(json: &Value) -> AiTokenUsage {
 
 fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
     let usage = json.get("usage");
-    let prompt = usage
+    let converse_prompt = usage
         .and_then(|value| value.get("inputTokens"))
         .and_then(|value| value.as_u64());
-    let completion = usage
+    let converse_completion = usage
         .and_then(|value| value.get("outputTokens"))
         .and_then(|value| value.as_u64());
+    let titan_prompt = json
+        .get("inputTextTokenCount")
+        .and_then(|value| value.as_u64());
+    // Titan Text InvokeModel returns exactly one result for one invocation.
+    // More than one result is ambiguous, so do not sum it or select one.
+    let titan_completion = json
+        .get("results")
+        .and_then(|value| value.as_array())
+        .filter(|results| results.len() == 1)
+        .and_then(|results| results[0].get("tokenCount"))
+        .and_then(|value| value.as_u64());
+    let prompt = converse_prompt.or(titan_prompt);
+    let completion = converse_completion.or(titan_completion);
     AiTokenUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
@@ -463,7 +539,7 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
 
 fn sum_pair(prompt: Option<u64>, completion: Option<u64>) -> Option<u64> {
     match (prompt, completion) {
-        (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
+        (Some(prompt), Some(completion)) => prompt.checked_add(completion),
         _ => None,
     }
 }

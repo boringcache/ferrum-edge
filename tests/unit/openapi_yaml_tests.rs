@@ -2563,6 +2563,44 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
 }
 
 #[test]
+fn ai_token_metrics_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiTokenMetricsConfig")
+        .expect("missing AiTokenMetricsConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiTokenMetricsConfig schema compiles");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    for config in [
+        json!({}),
+        json!({"provider": "openai"}),
+        json!({"provider": "google"}),
+        json!({"metadata_prefix": "tenant.ai_1"}),
+        json!({"buffer_streaming_responses": true}),
+        json!({"cost_per_prompt_token": 0.000003}),
+    ] {
+        assert!(validator.validate(&config).is_ok(), "schema rejected {config}");
+        assert!(AiTokenMetrics::new(&config).is_ok(), "runtime rejected {config}");
+    }
+
+    for config in [
+        json!({"providre": "openai"}),
+        json!({"provider": "unknown"}),
+        json!({"metadata_prefix": "not allowed"}),
+        json!({"metadata_prefix": "x".repeat(65)}),
+        json!({"cost_per_prompt_token": -1}),
+    ] {
+        assert!(validator.validate(&config).is_err(), "schema accepted {config}");
+        assert!(AiTokenMetrics::new(&config).is_err(), "runtime accepted {config}");
+    }
+}
+
+#[test]
 fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
