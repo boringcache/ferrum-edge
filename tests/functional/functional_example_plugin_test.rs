@@ -31,10 +31,7 @@ impl HeaderEchoBackend {
             .expect("bind example backend");
         let port = listener.local_addr().expect("example backend addr").port();
         let contract_requests = Arc::new(Mutex::new(Vec::new()));
-        let task = tokio::spawn(serve_header_echo(
-            listener,
-            Arc::clone(&contract_requests),
-        ));
+        let task = tokio::spawn(serve_header_echo(listener, Arc::clone(&contract_requests)));
         sleep(Duration::from_millis(100)).await;
         Self {
             port,
