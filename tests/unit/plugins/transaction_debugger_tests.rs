@@ -627,6 +627,31 @@ fn test_transaction_debugger_classifies_typed_stream_teardown() {
     );
 }
 
+#[test]
+fn test_transaction_debugger_treats_each_websocket_failure_signal_as_authoritative() {
+    let mut summary = websocket_summary();
+
+    summary.direction = Some(Direction::ClientToBackend);
+    assert_eq!(
+        TransactionDebugger::classify_ws_outcome(&summary),
+        "websocket_error"
+    );
+
+    summary.direction = None;
+    summary.io_side = Some(StreamIoSide::Read);
+    assert_eq!(
+        TransactionDebugger::classify_ws_outcome(&summary),
+        "websocket_error"
+    );
+
+    summary.io_side = None;
+    summary.error_class = Some(ErrorClass::ConnectionReset);
+    assert_eq!(
+        TransactionDebugger::classify_ws_outcome(&summary),
+        "websocket_error"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_transaction_debugger_http_terminal_output_is_bounded_and_redacted() {
     let plugin = TransactionDebugger::new(&json!({})).unwrap();

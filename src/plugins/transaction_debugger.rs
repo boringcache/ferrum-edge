@@ -134,6 +134,8 @@ impl TransactionDebugger {
 
     /// Stable terminal classification derived from WebSocket teardown state.
     pub fn classify_ws_outcome(summary: &WsDisconnectContext) -> &'static str {
+        // Core relay paths derive all three fields from one failure tuple, but keep each
+        // public typed signal authoritative so a partial context cannot look completed.
         if summary.error_class.is_some() || summary.direction.is_some() || summary.io_side.is_some()
         {
             "websocket_error"
@@ -212,6 +214,9 @@ impl Plugin for TransactionDebugger {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        if !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
+            return;
+        }
         let outcome = Self::classify_stream_outcome(summary);
         let error_class = summary.error_class.map(|class| class.as_str());
         let disconnect_direction = summary.disconnect_direction.map(direction_label);
@@ -248,6 +253,9 @@ impl Plugin for TransactionDebugger {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
+        if !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
+            return;
+        }
         let outcome = Self::classify_http_outcome(summary);
         let error_class = summary.error_class.map(|class| class.as_str());
         let body_error_class = summary.body_error_class.map(|class| class.as_str());
@@ -295,6 +303,9 @@ impl Plugin for TransactionDebugger {
     }
 
     async fn on_ws_disconnect(&self, summary: &WsDisconnectContext) {
+        if !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
+            return;
+        }
         let outcome = Self::classify_ws_outcome(summary);
         let direction = summary.direction.map(direction_label);
         let io_side = summary.io_side.map(stream_io_side_label);
