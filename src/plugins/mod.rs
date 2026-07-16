@@ -853,6 +853,10 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Aggregate CORS policy state staged across every attached CORS instance
+    /// and consumed by the cache-inserted CORS finalizer. Kept outside public
+    /// metadata so policy details never enter transaction logs.
+    pub(crate) cors_state: cors::CorsRequestState,
     /// Claim-derived upstream headers committed by the first accepted
     /// authentication attempt and held until `before_proxy`. Kept out of
     /// `metadata` so authorization-phase rejection logging can never serialize
@@ -940,6 +944,21 @@ pub struct RequestContext {
     /// can be stored. Committed hooks run sequentially, so at most one instance
     /// occupies the slot.
     pub(crate) serverless_owned_dedup_publication: Option<u64>,
+    /// Per-`ai_prompt_compressor`-instance source digest, transformed bytes, and
+    /// stats staged by `before_proxy`. Kept out of public metadata so a staged
+    /// prompt copy and prompt-derived digest cannot enter transaction logs.
+    pub(crate) ai_prompt_compressor_staged: HashMap<u64, ai_prompt_compressor::StagedCompression>,
+    /// Incoming request path captured once by the first auto-family compressor
+    /// before backend routing can rewrite `path`. All compressor instances share
+    /// this single bounded snapshot, and public metadata cannot spoof it.
+    pub(crate) ai_prompt_compressor_classification_path: Option<String>,
+    /// Whether the authoritative wire transform has reset provisional
+    /// `before_proxy` compressor counters for this request.
+    pub(crate) ai_prompt_compressor_wire_stats_started: bool,
+    /// Final-hook rejection staged when configured preserve-marker sanitation
+    /// cannot safely produce bounded provider-visible bytes. Kept private so
+    /// request metadata cannot spoof or clear the fail-closed decision.
+    pub(crate) ai_prompt_compressor_marker_reject_status: Option<u16>,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -1256,6 +1275,7 @@ impl RequestContext {
             auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
+            cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
@@ -1273,6 +1293,10 @@ impl RequestContext {
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
             serverless_owned_dedup_publication: None,
+            ai_prompt_compressor_staged: HashMap::new(),
+            ai_prompt_compressor_classification_path: None,
+            ai_prompt_compressor_wire_stats_started: false,
+            ai_prompt_compressor_marker_reject_status: None,
             gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
@@ -1397,10 +1421,14 @@ impl RequestContext {
 
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
-    /// transforms. Only `metadata` is copied back to the real context by the
-    /// proxy caller, so this deliberately skips raw headers, raw query strings,
-    /// parsed query maps, prebuffered body bytes, and mirror receivers.
-    pub(crate) fn clone_for_final_request_body_hooks(&self) -> Self {
+    /// transforms. The compressor's private staged representation and incoming
+    /// classification path are moved into this context so the authoritative
+    /// wire transform can consume them without recomputing or retaining a
+    /// prompt-sized copy on the real context. Only `metadata` and selected
+    /// policy state are copied back by the proxy caller, so this deliberately
+    /// skips raw headers, raw query strings, parsed query maps, prebuffered body
+    /// bytes, and mirror receivers.
+    pub(crate) fn clone_for_final_request_body_hooks(&mut self) -> Self {
         Self {
             client_ip: self.client_ip.clone(),
             direct_client_ip: self.direct_client_ip.clone(),
@@ -1434,6 +1462,10 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            // Final request-body hooks cannot observe or mutate the real CORS
+            // aggregate. CORS has no body hook, and only metadata is copied
+            // back from this compatibility context.
+            cors_state: cors::CorsRequestState::default(),
             // Claim-header staging stays on the real request context. Final
             // body hooks never consume it, and copying raw claim values into a
             // compatibility clone would extend their lifetime unnecessarily.
@@ -1456,6 +1488,19 @@ impl RequestContext {
                 .clone(),
             serverless_terminate_response: self.serverless_terminate_response,
             serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
+            // Transfer rather than clone the potentially body-sized compressor
+            // stage. The final wire hook consumes it from this compatibility
+            // context, while the live context no longer retains a second copy.
+            ai_prompt_compressor_staged: std::mem::take(&mut self.ai_prompt_compressor_staged),
+            ai_prompt_compressor_classification_path: std::mem::take(
+                &mut self.ai_prompt_compressor_classification_path,
+            ),
+            ai_prompt_compressor_wire_stats_started: std::mem::take(
+                &mut self.ai_prompt_compressor_wire_stats_started,
+            ),
+            ai_prompt_compressor_marker_reject_status: std::mem::take(
+                &mut self.ai_prompt_compressor_marker_reject_status,
+            ),
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
@@ -3382,6 +3427,12 @@ pub trait Plugin: Send + Sync {
     /// not be inferred from whether this ordinary request hook ran.
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Identifies the cache-internal wrapper used to defer a composed CORS
+    /// chain. This prevents incremental cache rebuilds from nesting wrappers.
+    fn is_deferred_cors_wrapper(&self) -> bool {
+        false
     }
 
     /// Authentication phase. Uses ConsumerIndex for O(1) credential lookups.

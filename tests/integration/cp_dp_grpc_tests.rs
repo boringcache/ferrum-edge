@@ -16,8 +16,8 @@ use tonic::transport::{Certificate, Identity, Server};
 
 use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm, Proxy,
-    Upstream, UpstreamTarget,
+    AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
+    PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
@@ -1659,6 +1659,100 @@ async fn test_dp_rejects_snapshot_with_invalid_proxy_hosts() {
         recovered.is_ok(),
         "Client should continue processing valid updates after rejecting invalid hosts"
     );
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update() {
+    let cp_config = create_test_config(1);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "test-node-mtls-dns-collision",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("DP should receive the initial snapshot");
+
+    let mut upper = Consumer {
+        id: "upper".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: "alice".to_string(),
+        custom_id: None,
+        credentials: HashMap::new(),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    upper.credentials.insert(
+        "mtls_auth".to_string(),
+        serde_json::json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut lower = upper.clone();
+    lower.id = "lower".to_string();
+    lower.username = "bob".to_string();
+    lower.credentials.insert(
+        "mtls_auth".to_string(),
+        serde_json::json!([{"identity": "api.example.com"}]),
+    );
+    let mut invalid_config = create_test_config(2);
+    invalid_config.consumers = vec![upper, lower];
+    invalid_config.plugin_configs = vec![PluginConfig {
+        id: "dns-mtls".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mtls_auth".to_string(),
+        config: serde_json::json!({"cert_field": "san_dns"}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }];
+    CpGrpcServer::broadcast_update(&update_tx, &invalid_config);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let retained = proxy_state.config.load();
+    assert_eq!(retained.proxies.len(), 1);
+    assert!(
+        retained.consumers.is_empty(),
+        "DP must not publish an ambiguous case-folded ConsumerIndex"
+    );
+    drop(retained);
+
+    let valid_config = create_test_config(2);
+    CpGrpcServer::broadcast_update(&update_tx, &valid_config);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("DP should continue after rejecting the ambiguous update");
 
     client_handle.abort();
 }

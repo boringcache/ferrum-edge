@@ -26,7 +26,8 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 | `PortExhaustion` | EADDRNOTAVAIL — all ephemeral ports in use. | `false` (pre-wire) |
 | `ClientDisconnect` | Client gave up before the gateway could complete the response. | `true` (post-wire) |
 | `GracefulRemoteClose` | Peer closed the session cleanly: HTTP/3 `H3_NO_ERROR`/GOAWAY at the response read boundary, or RFC 6455 Close frame on a WebSocket. Excluded from H3 capability downgrades so a backend that closes after every response stays on H3. | `true` (post-wire) |
-| `RequestError` | Catch-all for unclassified gateway-side rejections (plugin denials, unknown failure modes). | `true` (post-wire) |
+| `DispatchPolicyRejected` | Terminal gateway decision before a backend dial, including egress/SNI policy, admission overflow, and final request-body hook rejection. It is non-retryable and backend-health-neutral. | `true` (gateway-local terminal) |
+| `RequestError` | Catch-all for unclassified gateway-side rejections and unknown failure modes. | `true` (post-wire) |
 
 Two helpers live with the enum:
 
