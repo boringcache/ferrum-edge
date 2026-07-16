@@ -41,3 +41,6 @@ comparison/results/*.json
 
 # Performance test artifacts
 tests/performance/ci_results/
+
+# CI sccache local-disk cache (persisted via rust-cache cache-directories)
+/.cache/
