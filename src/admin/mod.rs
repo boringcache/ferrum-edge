@@ -2882,9 +2882,7 @@ async fn persist_consumer_update(
         return mtls_dns_admission_unavailable_response();
     }
     let persistence = match namespace_admission
-        .run_to_completion_while_held(
-            admission.run_mutation(db.update_consumer(&consumer, mode)),
-        )
+        .run_to_completion_while_held(admission.run_mutation(db.update_consumer(&consumer, mode)))
         .await
     {
         Ok(crud::NamespaceConfigAdmissionCompletion::Held(result)) => result,

@@ -123,9 +123,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "every credential read/modify/write endpoint must take namespace admission"
     );
     assert!(batch_source.contains("async fn recover_late_credential_update("));
-    assert!(batch_source.contains(
-        "admission.run_mutation(db.update_consumer(&consumer, mode))"
-    ));
+    assert!(batch_source.contains("admission.run_mutation(db.update_consumer(&consumer, mode))"));
     assert!(
         batch_source.contains("late credential update compensation found no matching consumer")
     );
