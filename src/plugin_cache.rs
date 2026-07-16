@@ -1724,24 +1724,35 @@ fn create_adaptive_concurrency_plugin(
     let (limiter, generation, drain_older_generation) = if let Some(existing) =
         current.get(&identity)
     {
-        let generation = existing.generation.checked_add(1).ok_or_else(|| {
-            format!(
-                "adaptive_concurrency: plugin config '{}:{}' exhausted its reload generation counter",
-                pc.namespace, pc.id
+        let structural_change = existing.config.key_by != parsed.key_by
+            || parsed.max_tracked_keys < existing.config.max_tracked_keys
+            || existing.scope != pc.scope
+            || existing.proxy_id != pc.proxy_id
+            || adaptive_concurrency_route_definition_requires_drain(
+                &existing.route_definition,
+                &route_definition,
+            );
+        if structural_change {
+            // A structural policy change has a different key space, so its
+            // learned state is not reusable. More importantly, keeping the
+            // lifecycle shared would make long-lived permits from the old
+            // generation block every replacement admission while it drains.
+            (
+                Arc::new(AdaptiveConcurrencyLimiter::new(
+                    http_client.pool_shard_amount(),
+                )),
+                1,
+                false,
             )
-        })?;
-        (
-            Arc::clone(&existing.limiter),
-            generation,
-            existing.config.key_by != parsed.key_by
-                || parsed.max_tracked_keys < existing.config.max_tracked_keys
-                || existing.scope != pc.scope
-                || existing.proxy_id != pc.proxy_id
-                || adaptive_concurrency_route_definition_requires_drain(
-                    &existing.route_definition,
-                    &route_definition,
-                ),
-        )
+        } else {
+            let generation = existing.generation.checked_add(1).ok_or_else(|| {
+                format!(
+                    "adaptive_concurrency: plugin config '{}:{}' exhausted its reload generation counter",
+                    pc.namespace, pc.id
+                )
+            })?;
+            (Arc::clone(&existing.limiter), generation, false)
+        }
     } else {
         (
             Arc::new(AdaptiveConcurrencyLimiter::new(

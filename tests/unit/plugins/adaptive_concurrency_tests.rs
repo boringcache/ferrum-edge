@@ -1135,7 +1135,7 @@ fn adaptive_concurrency_scoped_detach_and_reattach_starts_fresh_state() {
 }
 
 #[test]
-fn adaptive_concurrency_structural_config_change_drains_old_key_space() {
+fn adaptive_concurrency_structural_config_change_does_not_wait_for_old_permits() {
     let config = cache_config(
         "proxy",
         json!({
@@ -1156,17 +1156,16 @@ fn adaptive_concurrency_structural_config_change_drains_old_key_space() {
         .rebuild(&reloaded)
         .expect("valid key-space change should publish");
 
-    // Structural transitions fail closed even in shadow mode: admitting under
-    // the replacement key space would otherwise omit this older live permit.
-    assert_rejected(acquire_from_cache(&cache, &reloaded));
-    drop(held);
+    // The replacement has an independent limiter. A long-lived permit from
+    // the retired key space must not pin all replacement traffic in a drain.
     let new_generation = expect_admitted(acquire_from_cache(&cache, &reloaded));
-    assert_rejected(acquire_from_plugin(&old_view, &config.proxies[0], None));
     drop(new_generation);
+    drop(held);
+    drop(old_view);
 }
 
 #[test]
-fn adaptive_concurrency_transition_rejection_omits_per_target_headers() {
+fn adaptive_concurrency_replacement_uses_its_own_target_headers() {
     let config = cache_config(
         "proxy",
         json!({
@@ -1186,26 +1185,6 @@ fn adaptive_concurrency_transition_rejection_omits_per_target_headers() {
         .rebuild(&reloaded)
         .expect("structural key-space change should publish");
 
-    match acquire_from_cache(&cache, &reloaded) {
-        BackendAdmissionDecision::Reject {
-            status_code,
-            headers,
-            ..
-        } => {
-            assert_eq!(status_code, 503);
-            assert!(
-                !headers.contains_key("x-adaptive-concurrency-limit"),
-                "a policy-wide drain has no truthful per-target limit"
-            );
-            assert!(
-                !headers.contains_key("x-adaptive-concurrency-inflight"),
-                "a policy-wide drain has no truthful per-target in-flight count"
-            );
-        }
-        _ => panic!("replacement policy should reject during the structural drain"),
-    }
-
-    drop(held);
     let replacement_permit = expect_admitted(acquire_from_cache(&cache, &reloaded));
     match acquire_from_cache(&cache, &reloaded) {
         BackendAdmissionDecision::Reject {
@@ -1230,10 +1209,11 @@ fn adaptive_concurrency_transition_rejection_omits_per_target_headers() {
         _ => panic!("a genuine per-target limit rejection should expose target headers"),
     }
     drop(replacement_permit);
+    drop(held);
 }
 
 #[test]
-fn adaptive_concurrency_overlapping_structural_reloads_keep_newest_reset_authoritative() {
+fn adaptive_concurrency_overlapping_structural_reloads_remain_independent() {
     let config = cache_config(
         "proxy",
         json!({
@@ -1245,7 +1225,6 @@ fn adaptive_concurrency_overlapping_structural_reloads_keep_newest_reset_authori
         }),
     );
     let cache = PluginCache::new(&config).expect("initial cache should build");
-    let oldest_view = adaptive_plugin_from_cache(&cache);
     let retired_permit = expect_admitted(acquire_from_cache(&cache, &config));
 
     let mut first_reload = config.clone();
@@ -1253,26 +1232,18 @@ fn adaptive_concurrency_overlapping_structural_reloads_keep_newest_reset_authori
     cache
         .rebuild(&first_reload)
         .expect("first structural generation should publish");
-    let middle_view = adaptive_plugin_from_cache(&cache);
-    assert_rejected(acquire_from_cache(&cache, &first_reload));
+    let middle_permit = expect_admitted(acquire_from_cache(&cache, &first_reload));
 
     let mut newest_reload = first_reload.clone();
     newest_reload.plugin_configs[0].config["key_by"] = json!("upstream_target");
     cache
         .rebuild(&newest_reload)
         .expect("overlapping structural generation should publish");
-    assert_rejected(acquire_from_cache(&cache, &newest_reload));
-
-    drop(retired_permit);
     let newest_permit = expect_admitted(acquire_from_cache(&cache, &newest_reload));
-    assert_rejected(acquire_from_plugin(&oldest_view, &config.proxies[0], None));
-    assert_rejected(acquire_from_plugin(
-        &middle_view,
-        &first_reload.proxies[0],
-        None,
-    ));
     assert_rejected(acquire_from_cache(&cache, &newest_reload));
     drop(newest_permit);
+    drop(middle_permit);
+    drop(retired_permit);
 }
 
 #[test]
