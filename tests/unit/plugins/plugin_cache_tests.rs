@@ -2860,6 +2860,31 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
+#[test]
+fn test_priority_override_delegates_rejection_replacement_capability() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "spec_expose",
+        json!({"spec_url": "https://example.com/openapi.json"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(211);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "spec_expose");
+    assert_eq!(plugins[0].priority(), 211);
+    assert!(plugins[0].applies_after_proxy_on_reject());
+    assert!(plugins[0].may_replace_rejection_response());
+}
+
 #[tokio::test]
 async fn test_priority_override_delegates_response_stream_termination_hook() {
     let config = make_config(

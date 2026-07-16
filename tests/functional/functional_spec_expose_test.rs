@@ -98,6 +98,7 @@ plugin_configs:
     plugin_name: spec_expose
     scope: global
     enabled: true
+    priority_override: 211
     config:
       spec_url: "http://127.0.0.1:{spec_origin_port}/private/openapi.yaml?token=signed"
       cache_ttl_seconds: 60

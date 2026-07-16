@@ -113,7 +113,8 @@ fn test_creation_valid_config() {
     assert_eq!(plugin.priority(), 210);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(!plugin.modifies_request_headers());
-    assert!(!plugin.applies_after_proxy_on_reject());
+    assert!(plugin.applies_after_proxy_on_reject());
+    assert!(plugin.may_replace_rejection_response());
     assert!(!plugin.is_auth_plugin());
 }
 

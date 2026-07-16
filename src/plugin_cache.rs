@@ -319,6 +319,9 @@ impl Plugin for PriorityOverridePlugin {
     fn applies_after_proxy_on_reject(&self) -> bool {
         self.inner.applies_after_proxy_on_reject()
     }
+    fn may_replace_rejection_response(&self) -> bool {
+        self.inner.may_replace_rejection_response()
+    }
     fn requires_response_body_buffering(&self) -> bool {
         self.inner.requires_response_body_buffering()
     }
