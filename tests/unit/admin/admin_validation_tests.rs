@@ -627,32 +627,36 @@ fn recovery_plugin(
 
 #[test]
 fn intervening_clear_recovery_preserves_both_valid_schema_graphs() {
-    let mut snapshot = ferrum_edge::config::types::GatewayConfig::default();
-    snapshot.plugin_configs = vec![
-        recovery_plugin(
-            "snapshot-schema",
-            "transaction_log_schema",
-            json!({"schemas": {"snapshot": {"summary_type": "both"}}}),
-        ),
-        recovery_plugin(
-            "snapshot-logger",
-            "stdout_logging",
-            json!({"schema_ref": "snapshot"}),
-        ),
-    ];
-    let mut current = ferrum_edge::config::types::GatewayConfig::default();
-    current.plugin_configs = vec![
-        recovery_plugin(
-            "intervening-schema",
-            "transaction_log_schema",
-            json!({"schemas": {"intervening": {"summary_type": "both"}}}),
-        ),
-        recovery_plugin(
-            "intervening-logger",
-            "stdout_logging",
-            json!({"schema_ref": "intervening"}),
-        ),
-    ];
+    let snapshot = ferrum_edge::config::types::GatewayConfig {
+        plugin_configs: vec![
+            recovery_plugin(
+                "snapshot-schema",
+                "transaction_log_schema",
+                json!({"schemas": {"snapshot": {"summary_type": "both"}}}),
+            ),
+            recovery_plugin(
+                "snapshot-logger",
+                "stdout_logging",
+                json!({"schema_ref": "snapshot"}),
+            ),
+        ],
+        ..Default::default()
+    };
+    let current = ferrum_edge::config::types::GatewayConfig {
+        plugin_configs: vec![
+            recovery_plugin(
+                "intervening-schema",
+                "transaction_log_schema",
+                json!({"schemas": {"intervening": {"summary_type": "both"}}}),
+            ),
+            recovery_plugin(
+                "intervening-logger",
+                "stdout_logging",
+                json!({"schema_ref": "intervening"}),
+            ),
+        ],
+        ..Default::default()
+    };
 
     let candidate = ferrum_edge::_test_support::intervening_clear_recovery_candidate_for_test(
         snapshot, current,
@@ -673,32 +677,36 @@ fn intervening_clear_recovery_preserves_both_valid_schema_graphs() {
 
 #[test]
 fn intervening_clear_recovery_keeps_current_ids_and_rejects_invalid_union() {
-    let mut snapshot = ferrum_edge::config::types::GatewayConfig::default();
-    snapshot.plugin_configs = vec![
-        recovery_plugin(
-            "same-id",
-            "transaction_log_schema",
-            json!({"schemas": {"snapshot-only": {"summary_type": "both"}}}),
-        ),
-        recovery_plugin(
-            "snapshot-schema",
-            "transaction_log_schema",
-            json!({"schemas": {"duplicate": {"summary_type": "both"}}}),
-        ),
-    ];
-    let mut current = ferrum_edge::config::types::GatewayConfig::default();
-    current.plugin_configs = vec![
-        recovery_plugin(
-            "same-id",
-            "transaction_log_schema",
-            json!({"schemas": {"current-wins": {"summary_type": "both"}}}),
-        ),
-        recovery_plugin(
-            "intervening-schema",
-            "transaction_log_schema",
-            json!({"schemas": {"duplicate": {"summary_type": "both"}}}),
-        ),
-    ];
+    let snapshot = ferrum_edge::config::types::GatewayConfig {
+        plugin_configs: vec![
+            recovery_plugin(
+                "same-id",
+                "transaction_log_schema",
+                json!({"schemas": {"snapshot-only": {"summary_type": "both"}}}),
+            ),
+            recovery_plugin(
+                "snapshot-schema",
+                "transaction_log_schema",
+                json!({"schemas": {"duplicate": {"summary_type": "both"}}}),
+            ),
+        ],
+        ..Default::default()
+    };
+    let current = ferrum_edge::config::types::GatewayConfig {
+        plugin_configs: vec![
+            recovery_plugin(
+                "same-id",
+                "transaction_log_schema",
+                json!({"schemas": {"current-wins": {"summary_type": "both"}}}),
+            ),
+            recovery_plugin(
+                "intervening-schema",
+                "transaction_log_schema",
+                json!({"schemas": {"duplicate": {"summary_type": "both"}}}),
+            ),
+        ],
+        ..Default::default()
+    };
 
     let candidate = ferrum_edge::_test_support::intervening_clear_recovery_candidate_for_test(
         snapshot, current,

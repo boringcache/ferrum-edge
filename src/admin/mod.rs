@@ -3811,6 +3811,9 @@ fn intervening_clear_recovery_candidate(
 }
 
 #[doc(hidden)]
+// External tests reach this through the lib target's `_test_support` shim;
+// the bin target recompiles this module without that caller.
+#[allow(dead_code)]
 pub(crate) fn intervening_clear_recovery_candidate_for_test(
     snapshot: GatewayConfig,
     current: GatewayConfig,
