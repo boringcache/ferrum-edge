@@ -444,9 +444,10 @@ impl SpecExpose {
                 upstream_status = status,
                 "spec_expose: upstream returned non-success status"
             );
-            return Err(fetch_failure(502, format!(
-                "Upstream spec endpoint returned status {status}"
-            )));
+            return Err(fetch_failure(
+                502,
+                format!("Upstream spec endpoint returned status {status}"),
+            ));
         }
 
         // Content-Length is an untrusted upstream hint, so this is only a

@@ -127,11 +127,7 @@ fn assert_spec_metadata(headers: &HeaderMap) {
     );
 }
 
-async fn h3_request_until_ready(
-    client: &Http3Client,
-    url: &str,
-    method: Method,
-) -> Http3Response {
+async fn h3_request_until_ready(client: &Http3Client, url: &str, method: Method) -> Http3Response {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match client
@@ -198,7 +194,11 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
     assert_eq!(h1_get.status(), reqwest::StatusCode::OK);
     assert_spec_metadata(h1_get.headers());
     assert_eq!(h1_get.text().await.expect("H1 GET body"), SPEC_BODY);
-    assert_eq!(origin.hits(), 1, "GET should reuse the HEAD-populated cache");
+    assert_eq!(
+        origin.hits(),
+        1,
+        "GET should reuse the HEAD-populated cache"
+    );
 
     // The double-slash alias is deliberately ordinary backend traffic.
     let alias = h1

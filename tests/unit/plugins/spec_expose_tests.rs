@@ -560,8 +560,7 @@ fn test_creation_accepts_all_certificates_in_a_configured_ca_bundle() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let bundle_path = tempdir.path().join("ca-bundle.pem");
     let certificate = include_str!("../../certs/server.crt");
-    std::fs::write(&bundle_path, format!("{certificate}\n{certificate}"))
-        .expect("write CA bundle");
+    std::fs::write(&bundle_path, format!("{certificate}\n{certificate}")).expect("write CA bundle");
 
     let result = SpecExpose::new(
         &json!({ "spec_url": "https://example.com/openapi.yaml" }),
@@ -733,7 +732,10 @@ async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
             assert_eq!(status_code, 200);
             assert_eq!(body, bytes::Bytes::from_static(b"openapi: 3.0.0\n"));
             assert_eq!(headers.get("content-type").unwrap(), "application/yaml");
-            assert_eq!(headers.get("content-length").map(String::as_str), Some("15"));
+            assert_eq!(
+                headers.get("content-length").map(String::as_str),
+                Some("15")
+            );
             // Finding #68: the served /specz response always carries nosniff.
             assert_eq!(
                 headers.get("x-content-type-options").map(String::as_str),
@@ -1408,9 +1410,7 @@ async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/openapi.yaml"))
-        .respond_with(
-            ResponseTemplate::new(500).set_delay(std::time::Duration::from_millis(250)),
-        )
+        .respond_with(ResponseTemplate::new(500).set_delay(std::time::Duration::from_millis(250)))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -1452,11 +1452,8 @@ async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
     // A request during the negative-cache window reuses the same failure and
     // does not generate another origin request.
     let mut cached_failure_ctx = make_ctx("GET", "/api/specz", "/api");
-    let (status, _, headers) = reject_parts(
-        plugin
-            .on_request_received(&mut cached_failure_ctx)
-            .await,
-    );
+    let (status, _, headers) =
+        reject_parts(plugin.on_request_received(&mut cached_failure_ctx).await);
     assert_eq!(status, 502);
     assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
 }
