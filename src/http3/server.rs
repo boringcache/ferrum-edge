@@ -38,6 +38,7 @@ use crate::proxy::headers::{
     is_proxy_generated_forwarding_header, parse_connection_listed_from_str_map,
     strip_response_hop_by_hop_trailers,
 };
+use crate::proxy::grpc_proxy::GATEWAY_DEADLINE_EXCEEDED_MESSAGE;
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
     log_rejected_request, log_rejected_request_with_path, plugin_result_into_reject_parts,
@@ -107,7 +108,7 @@ fn h3_request_body_timeout_contract<E>(
     match error {
         H3RequestBodyReadError::DeadlineExceeded => (
             r#"{"error":"Request deadline exceeded"}"#,
-            "Deadline exceeded at gateway",
+            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
         ),
         H3RequestBodyReadError::TimedOut | H3RequestBodyReadError::Read(_) => (
             r#"{"error":"Request body read timed out"}"#,
@@ -1530,7 +1531,10 @@ async fn handle_h3_request(
     // H3 and the H3→H2 bridge both consume this same monotonic absolute instant
     // instead of reconstructing a fresh timer from a rewritten header.
     if request_protocol == ProxyProtocol::Grpc {
-        let prepared = crate::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx);
+        let prepared = crate::plugins::grpc_deadline::prepare_request_deadline(
+            plugin_cache_view.grpc_deadline_plugins(),
+            &mut ctx,
+        );
         if let reject @ (PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }) = prepared
         {
             let Some(reject) = plugin_result_into_reject_parts(reject) else {
@@ -3132,9 +3136,11 @@ async fn handle_h3_request(
         hook_headers
             .entry(":method".to_string())
             .or_insert_with(|| method.clone());
+        let grpc_deadline_at = ctx.grpc_deadline_at();
         let transformed = crate::proxy::apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
+            grpc_deadline_at,
             &hook_headers,
             body_data,
         )
@@ -3142,6 +3148,7 @@ async fn handle_h3_request(
         match crate::proxy::run_final_request_body_hooks(
             &plugins,
             Some(&mut ctx),
+            grpc_deadline_at,
             &hook_headers,
             &transformed,
         )
@@ -3792,8 +3799,7 @@ async fn handle_h3_request(
                 backend_admission_plugins: backend_admission_plugins.as_ref(),
                 preacquired_backend_admission,
                 requires_response_body_buffering: maybe_requires_response_body_buffering,
-                has_response_committed_hook: capabilities
-                    .has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK),
+                response_committed_plugins: plugin_cache_view.response_committed_plugins(),
                 requires_response_stream_hooks: stream_hooks_enabled,
                 sticky_cookie_needed,
             })
@@ -4919,9 +4925,11 @@ async fn handle_h3_request(
         hook_headers
             .entry(":method".to_string())
             .or_insert_with(|| method.clone());
+        let grpc_deadline_at = ctx.grpc_deadline_at();
         crate::proxy::apply_request_body_plugins_with_context(
             &plugins,
             Some(&mut ctx),
+            grpc_deadline_at,
             &hook_headers,
             body_data,
         )
@@ -4937,15 +4945,16 @@ async fn handle_h3_request(
     let final_body_result = if request_body_prepared {
         PluginResult::Continue
     } else {
-        let body_hook_ctx: Option<&mut RequestContext> =
-            if needs_ctx_headers_for_body_hooks || ctx.grpc_deadline_at().is_some() {
-                Some(&mut ctx)
-            } else {
-                None
-            };
+        let grpc_deadline_at = ctx.grpc_deadline_at();
+        let body_hook_ctx: Option<&mut RequestContext> = if needs_ctx_headers_for_body_hooks {
+            Some(&mut ctx)
+        } else {
+            None
+        };
         crate::proxy::run_final_request_body_hooks(
             &plugins,
             body_hook_ctx,
+            grpc_deadline_at,
             &proxy_headers,
             &body_data,
         )
@@ -5895,30 +5904,17 @@ async fn handle_h3_request(
 
         if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
             let phase_start = std::time::Instant::now();
-            for plugin in plugins.iter() {
-                if crate::plugins::await_grpc_deadline(
-                    ctx.grpc_deadline_at(),
-                    plugin.on_response_committed(
-                        &mut ctx,
-                        response_status,
-                        &response_headers,
-                        &response_body,
-                    ),
-                )
-                .await
-                .is_err()
-                {
-                    response_status = replace_buffered_h3_response_with_grpc_deadline(
-                        &mut ctx,
-                        grpc_web_response_content_type.as_deref(),
-                        &mut response_headers,
-                        &mut response_body,
-                        initial_response_header_policy_plugins.as_ref(),
-                    )
-                    .as_u16();
-                    response_trailers = None;
-                    break;
-                }
+            if crate::proxy::run_deadline_bounded_response_committed_hooks(
+                plugin_cache_view.response_committed_plugins(),
+                &mut ctx,
+                &mut response_status,
+                &mut response_headers,
+                &mut response_body,
+                initial_response_header_policy_plugins.as_ref(),
+            )
+            .await
+            {
+                response_trailers = None;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
@@ -7795,7 +7791,7 @@ async fn dispatch_grpc_native_h3(
             } else if is_client_side_neutral_timeout {
                 (
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Deadline exceeded at gateway",
+                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
                 )
             } else if is_read_timeout {
                 (
@@ -8465,7 +8461,7 @@ async fn dispatch_grpc_native_h3(
                 crate::proxy::insert_grpc_error_metadata(
                     &mut ctx.metadata,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Deadline exceeded at gateway",
+                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
                 );
                 break 'outer;
             }
@@ -8556,7 +8552,7 @@ async fn dispatch_grpc_native_h3(
                             crate::proxy::insert_grpc_error_metadata(
                                 &mut ctx.metadata,
                                 crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                "Deadline exceeded at gateway",
+                                GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
                             );
                             break;
                         }
@@ -9639,7 +9635,10 @@ pub(crate) async fn run_h3_reject_response_committed_hooks(
             grpc_message.as_ref(),
         );
         crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, &[], Some(headers));
-        for plugin in plugins {
+        for plugin in plugins
+            .iter()
+            .filter(|plugin| plugin.requires_response_committed_hook())
+        {
             plugin
                 .on_response_committed(ctx, 200, &translated.headers, &translated.body)
                 .await;
@@ -9653,7 +9652,10 @@ pub(crate) async fn run_h3_reject_response_committed_hooks(
         headers,
         matches!(flavor, HttpFlavor::Grpc),
     );
-    for plugin in plugins {
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| plugin.requires_response_committed_hook())
+    {
         plugin
             .on_response_committed(
                 ctx,
@@ -9705,6 +9707,9 @@ async fn run_h3_deadline_bounded_reject_committed_hooks(
     };
 
     for (index, plugin) in plugins.iter().enumerate() {
+        if !plugin.requires_response_committed_hook() {
+            continue;
+        }
         if crate::plugins::await_grpc_deadline(
             ctx.grpc_deadline_at(),
             plugin.on_response_committed(
@@ -9729,7 +9734,10 @@ async fn run_h3_deadline_bounded_reject_committed_hooks(
             &mut deadline_body,
             initial_response_header_policy_plugins,
         );
-        for remaining in &plugins[index + 1..] {
+        for remaining in plugins[index + 1..]
+            .iter()
+            .filter(|plugin| plugin.requires_response_committed_hook())
+        {
             remaining
                 .on_response_committed(
                     ctx,
@@ -10078,32 +10086,6 @@ fn h3_reject_log_status_and_metadata(
     StatusCode::OK.as_u16()
 }
 
-/// Replace a not-yet-written H3 response when the absolute RPC deadline
-/// expires inside its final committed-response hook. This keeps the H3
-/// buffered, circuit-breaker, and admission-rejection paths aligned with the
-/// H1/H2 canonical Trailers-Only DEADLINE_EXCEEDED contract.
-fn replace_h3_response_with_grpc_deadline(
-    ctx: &mut RequestContext,
-    headers: &mut HashMap<String, String>,
-    body: &mut Vec<u8>,
-    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
-) -> StatusCode {
-    headers.clear();
-    crate::proxy::grpc_proxy::finalize_grpc_error_response_headers(
-        headers,
-        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-        "Deadline exceeded at gateway",
-        initial_response_header_policy_plugins,
-    );
-    body.clear();
-    crate::proxy::insert_grpc_error_metadata(
-        &mut ctx.metadata,
-        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-        "Deadline exceeded at gateway",
-    );
-    StatusCode::OK
-}
-
 /// Replace a buffered H3 response that will be written directly as HEADERS +
 /// DATA. Unlike the rejection paths, this response does not pass through the
 /// flavor-aware sender, so gRPC-Web must be encoded here before the caller
@@ -10115,33 +10097,13 @@ pub(crate) fn replace_buffered_h3_response_with_grpc_deadline(
     body: &mut Vec<u8>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
-    let Some(content_type) = grpc_web_response_content_type else {
-        return replace_h3_response_with_grpc_deadline(
-            ctx,
-            headers,
-            body,
-            initial_response_header_policy_plugins,
-        );
-    };
-
-    let mut response = crate::plugins::grpc_web::error_response_for_content_type(
-        content_type,
-        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-        "Deadline exceeded at gateway",
-    );
-    crate::proxy::finalize_grpc_web_error_response_headers(
-        &mut response,
+    crate::proxy::replace_buffered_grpc_response_with_deadline(
+        ctx,
+        grpc_web_response_content_type,
+        headers,
+        body,
         initial_response_header_policy_plugins,
-        None,
-    );
-    *headers = response.headers;
-    *body = response.body;
-    crate::proxy::insert_grpc_error_metadata(
-        &mut ctx.metadata,
-        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-        "Deadline exceeded at gateway",
-    );
-    StatusCode::OK
+    )
 }
 
 fn h3_grpc_reject_signal(
@@ -10352,7 +10314,7 @@ mod h3_request_body_timeout_tests {
         assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
         assert_eq!(
             headers.get("grpc-message").map(String::as_str),
-            Some("Deadline exceeded at gateway")
+            Some(GATEWAY_DEADLINE_EXCEEDED_MESSAGE)
         );
         assert!(body.is_empty());
         assert_eq!(
@@ -10361,7 +10323,7 @@ mod h3_request_body_timeout_tests {
         );
         assert_eq!(
             ctx.metadata.get("grpc_message").map(String::as_str),
-            Some("Deadline exceeded at gateway")
+            Some(GATEWAY_DEADLINE_EXCEEDED_MESSAGE)
         );
     }
 

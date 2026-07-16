@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::plugins::BackendAdmissionOutcome;
+use crate::proxy::grpc_proxy::{
+    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+};
 use crate::retry::ErrorClass;
 
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
@@ -584,7 +587,7 @@ impl ProxyBody {
             let response = crate::plugins::grpc_web::error_response_for_content_type(
                 content_type,
                 crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                "Deadline exceeded at gateway",
+                GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
             );
             Frame::data(Bytes::from(response.body))
         });
@@ -2608,7 +2611,10 @@ where
                     return Poll::Ready(Some(Ok(frame)));
                 }
                 let mut trailers = http::HeaderMap::new();
-                trailers.insert("grpc-status", http::HeaderValue::from_static("4"));
+                trailers.insert(
+                    "grpc-status",
+                    http::HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER),
+                );
                 trailers.insert(
                     "grpc-message",
                     http::HeaderValue::from_static("Deadline%20exceeded%20at%20gateway"),

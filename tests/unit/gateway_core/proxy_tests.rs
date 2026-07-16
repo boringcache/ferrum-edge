@@ -1420,6 +1420,98 @@ fn generic_retry_backoff_uses_request_aware_grpc_deadline_response() {
     assert!(backoff.contains("proxy_headers,"));
 }
 
+#[test]
+fn direct_h2_response_header_wait_uses_earliest_client_or_operator_deadline() {
+    use ferrum_edge::_test_support::response_header_deadline_for_test;
+
+    assert_eq!(response_header_deadline_for_test(Some(500), 50), Some((false, 50)));
+    assert_eq!(response_header_deadline_for_test(Some(50), 500), Some((true, 50)));
+    assert_eq!(response_header_deadline_for_test(Some(50), 0), Some((true, 50)));
+    assert_eq!(response_header_deadline_for_test(None, 50), Some((false, 50)));
+    assert_eq!(response_header_deadline_for_test(None, 0), None);
+}
+
+#[test]
+fn mesh_mtls_arms_operator_read_window_after_sender_readiness() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let function = source
+        .split("async fn proxy_to_backend_mesh_mtls")
+        .nth(1)
+        .expect("mesh mTLS dispatch function")
+        .split("async fn proxy_to_backend_http2")
+        .next()
+        .expect("mesh mTLS dispatch body");
+    let readiness = function
+        .find("sender.ready()")
+        .expect("sender readiness boundary");
+    let read_window = function
+        .find("let backend_read_deadline")
+        .expect("operator read window");
+
+    assert!(
+        readiness < read_window,
+        "operator response-read timeout must not include pool acquisition/readiness"
+    );
+}
+
+#[test]
+fn grpc_deadline_phase_zero_precedes_request_security_hooks_on_h1_h2_and_h3() {
+    let h1_h2 = include_str!("../../../src/proxy/mod.rs")
+        .split("async fn handle_proxy_request_inner")
+        .nth(1)
+        .expect("H1/H2 request handler");
+    let h3 = include_str!("../../../src/http3/server.rs")
+        .split("let prepared = crate::plugins::grpc_deadline::prepare_request_deadline")
+        .nth(1)
+        .expect("H3 deadline preflight tail");
+
+    let h1_h2_deadline = h1_h2
+        .find("prepare_request_deadline")
+        .expect("H1/H2 deadline preflight");
+    let h1_h2_request_hooks = h1_h2
+        .find("// Execute on_request_received hooks")
+        .expect("H1/H2 request hook phase");
+    let h1_h2_auth = h1_h2
+        .find("run_authentication_phase")
+        .expect("H1/H2 authentication phase");
+    assert!(h1_h2_deadline < h1_h2_request_hooks);
+    assert!(h1_h2_deadline < h1_h2_auth);
+
+    let h3_request_hooks = h3
+        .find("// Execute on_request_received hooks")
+        .expect("H3 request hook phase");
+    let h3_auth = h3
+        .find("run_authentication_phase")
+        .expect("H3 authentication phase");
+    assert!(h3_request_hooks > 0);
+    assert!(h3_auth > 0);
+}
+
+#[test]
+fn grpc_deadline_hot_paths_use_cached_preflight_lists_without_deadline_only_context_clones() {
+    for (surface, source) in [
+        ("H1/H2", include_str!("../../../src/proxy/mod.rs")),
+        ("H3", include_str!("../../../src/http3/server.rs")),
+    ] {
+        let call = source
+            .split("prepare_request_deadline(")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{surface}: deadline preflight"));
+        assert!(
+            call.starts_with("\n            plugin_cache_view.grpc_deadline_plugins(),"),
+            "{surface}: preflight must use the PluginCache capability list"
+        );
+        assert!(
+            !source.contains("needs_final_request_body_context ||"),
+            "{surface}: a deadline alone must not clone final-body RequestContext"
+        );
+        assert!(
+            source.contains("plugin_cache_view.response_committed_plugins(),"),
+            "{surface}: committed hooks must use the PluginCache observer list"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministically() {
     let staged: Arc<dyn Plugin> = Arc::new(StagedCookieRejectingAuth);

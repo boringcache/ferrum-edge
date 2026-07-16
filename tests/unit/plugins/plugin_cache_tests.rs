@@ -941,21 +941,23 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
 
 #[tokio::test]
 async fn test_request_view_precomputes_response_committed_hook_capability() {
+    let mut audit = make_plugin_config_with_json(
+        "audit",
+        "ai_transcript_audit",
+        json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    audit.priority_override = Some(125);
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["audit"])],
-        vec![make_plugin_config_with_json(
-            "audit",
-            "ai_transcript_audit",
-            json!({
-                "capture": { "request": true, "response": true },
-                "sink": {
-                    "type": "http",
-                    "endpoint_url": "https://audit.example.com/ingest"
-                }
-            }),
-            PluginScope::Proxy,
-            Some("p1"),
-        )],
+        vec![audit],
     );
     let cache = PluginCache::new(&config).unwrap();
     let view = cache.request_view("p1", ProxyProtocol::Http);
@@ -964,11 +966,42 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
         view.capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
     );
+    assert_eq!(view.response_committed_plugins().len(), 1);
+    assert_eq!(view.response_committed_plugins()[0].name(), "ai_transcript_audit");
+    assert_eq!(view.response_committed_plugins()[0].priority(), 125);
     assert!(
         !cache
             .request_view("missing", ProxyProtocol::Http)
             .capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+    );
+}
+
+#[test]
+fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
+    let mut deadline = make_plugin_config_with_json(
+        "deadline",
+        "grpc_deadline",
+        json!({"default_deadline_ms": 1000}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    deadline.priority_override = Some(120);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["deadline"])],
+        vec![deadline],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    assert_eq!(grpc_view.grpc_deadline_plugins().len(), 1);
+    assert_eq!(grpc_view.grpc_deadline_plugins()[0].name(), "grpc_deadline");
+    assert_eq!(grpc_view.grpc_deadline_plugins()[0].priority(), 120);
+    assert!(
+        cache
+            .request_view("p1", ProxyProtocol::Http)
+            .grpc_deadline_plugins()
+            .is_empty()
     );
 }
 
@@ -2858,6 +2891,34 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
     assert_eq!(plugins[0].name(), "stdout_logging");
+}
+
+#[test]
+fn test_priority_override_delegates_rejection_replacement_capability() {
+    let mut audit = make_plugin_config_with_json(
+        "audit",
+        "ai_transcript_audit",
+        json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    audit.priority_override = Some(100);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["audit"])],
+        vec![audit],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].may_replace_rejection_response());
 }
 
 #[test]

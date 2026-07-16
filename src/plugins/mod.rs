@@ -123,6 +123,9 @@ use crate::config::types::{
 };
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
+use crate::proxy::grpc_proxy::{
+    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JwtAuthAttributeValue {
@@ -2053,10 +2056,13 @@ pub(crate) fn grpc_deadline_exceeded_plugin_result() -> PluginResult {
         body: String::new(),
         headers: HashMap::from([
             ("content-type".to_string(), "application/grpc".to_string()),
-            ("grpc-status".to_string(), "4".to_string()),
+            (
+                "grpc-status".to_string(),
+                GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+            ),
             (
                 "grpc-message".to_string(),
-                "Deadline exceeded at gateway".to_string(),
+                GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
             ),
         ]),
     }
@@ -2348,18 +2354,14 @@ pub async fn normalize_response_body_for_inspection(
         {
             Ok(body) => body,
             Err(()) => {
-                response_headers.clear();
-                response_headers.insert("content-type".to_string(), "application/grpc".to_string());
-                response_headers.insert("grpc-status".to_string(), "4".to_string());
-                response_headers.insert(
-                    "grpc-message".to_string(),
-                    "Deadline exceeded at gateway".to_string(),
-                );
-                response_body.clear();
-                crate::proxy::insert_grpc_error_metadata(
-                    &mut ctx.metadata,
-                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Deadline exceeded at gateway",
+                let grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx);
+                crate::proxy::replace_buffered_grpc_response_with_deadline(
+                    ctx,
+                    grpc_web_response_content_type,
+                    response_headers,
+                    response_body,
+                    &[],
                 );
                 normalized = true;
                 break;
@@ -3289,6 +3291,14 @@ pub trait Plugin: Send + Sync {
     /// emits the relative upstream value from the typed absolute state.
     fn prepare_grpc_deadline(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin participates in the synchronous gRPC
+    /// deadline preflight. The plugin cache uses this to build a dedicated
+    /// phase list so ordinary gRPC requests do not scan the full plugin chain
+    /// before the first asynchronous hook.
+    fn requires_grpc_deadline_preflight(&self) -> bool {
+        false
     }
 
     /// Called when a request is first received (before routing).

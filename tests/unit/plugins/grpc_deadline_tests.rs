@@ -231,6 +231,22 @@ fn create_grpc_context_with_timeout(timeout: Option<&str>) -> ferrum_edge::plugi
     ctx
 }
 
+#[test]
+fn grpc_timeout_metadata_is_not_populated_without_deadline_policy() {
+    let mut ctx = create_grpc_context_with_timeout(Some("250m"));
+
+    assert_continue(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[], &mut ctx),
+    );
+
+    assert!(
+        ctx.grpc_deadline_at().is_some(),
+        "the client RPC ceiling remains active without a policy plugin"
+    );
+    assert!(!ctx.metadata.contains_key("grpc_original_deadline_ms"));
+    assert!(!ctx.metadata.contains_key("grpc_adjusted_deadline_ms"));
+}
+
 struct StalledResponseNormalizer;
 
 #[async_trait::async_trait]
@@ -249,6 +265,103 @@ impl Plugin for StalledResponseNormalizer {
     ) -> Option<Vec<u8>> {
         std::future::pending().await
     }
+}
+
+struct CommittedHookProbe {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    observed_grpc_statuses: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    stall: bool,
+}
+
+#[async_trait::async_trait]
+impl Plugin for CommittedHookProbe {
+    fn name(&self) -> &str {
+        "committed_hook_probe"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.observed_grpc_statuses
+            .lock()
+            .expect("probe observations lock")
+            .push(response_headers.get("grpc-status").cloned());
+        if self.stall {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn committed_deadline_replacement_runs_remaining_hooks_exactly_once() {
+    use ferrum_edge::_test_support::{
+        run_deadline_bounded_response_committed_hooks_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+
+    let calls = (0..3)
+        .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+        .collect::<Vec<_>>();
+    let observed = (0..3)
+        .map(|_| Arc::new(std::sync::Mutex::new(Vec::new())))
+        .collect::<Vec<_>>();
+    let plugins: Vec<Arc<dyn Plugin>> = (0..3)
+        .map(|index| {
+            Arc::new(CommittedHookProbe {
+                calls: Arc::clone(&calls[index]),
+                observed_grpc_statuses: Arc::clone(&observed[index]),
+                stall: index == 1,
+            }) as Arc<dyn Plugin>
+        })
+        .collect();
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(50));
+    let mut status = 200;
+    let mut headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("x-backend".to_string(), "present".to_string()),
+    ]);
+    let mut body = b"backend response".to_vec();
+
+    assert!(
+        run_deadline_bounded_response_committed_hooks_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await
+    );
+
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert!(body.is_empty());
+    for call_count in &calls {
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    assert_eq!(
+        observed[0].lock().expect("first probe lock").as_slice(),
+        &[None]
+    );
+    assert_eq!(
+        observed[1].lock().expect("second probe lock").as_slice(),
+        &[None]
+    );
+    assert_eq!(
+        observed[2].lock().expect("third probe lock").as_slice(),
+        &[Some("4".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -284,6 +397,79 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
         ctx.metadata.get("grpc_status").map(String::as_str),
         Some("4")
     );
+}
+
+#[tokio::test]
+async fn response_normalizer_deadline_preserves_grpc_web_framing() {
+    use base64::Engine as _;
+    use ferrum_edge::_test_support::{GRPC_FRAME_TRAILER, parse_grpc_frames};
+
+    for content_type in [
+        "application/grpc-web+proto",
+        "application/grpc-web-text+proto",
+    ] {
+        let deadline_plugin =
+            create_plugin("grpc_deadline", &json!({ "default_deadline_ms": 1 }))
+                .unwrap()
+                .unwrap();
+        let grpc_web_plugin = create_plugin("grpc_web", &json!({})).unwrap().unwrap();
+        let plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::clone(&deadline_plugin), Arc::new(StalledResponseNormalizer)];
+        let mut ctx = create_grpc_context_with_timeout(None);
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        assert_continue(grpc_web_plugin.on_request_received(&mut ctx).await);
+        assert_continue(
+            ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
+                &[deadline_plugin],
+                &mut ctx,
+            ),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("x-backend".to_string(), "discard-me".to_string()),
+        ]);
+        let mut body = b"backend response".to_vec();
+
+        assert!(
+            normalize_response_body_for_inspection(
+                &plugins,
+                &mut ctx,
+                200,
+                &mut headers,
+                &mut body,
+            )
+            .await
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some(content_type)
+        );
+        assert_eq!(headers.get("x-grpc-web").map(String::as_str), Some("1"));
+        assert!(headers.contains_key("access-control-expose-headers"));
+        assert!(!headers.contains_key("grpc-status"));
+        assert!(!headers.contains_key("grpc-message"));
+        let expected_length = body.len().to_string();
+        assert_eq!(headers.get("content-length"), Some(&expected_length));
+
+        let decoded = if content_type.contains("-text") {
+            base64::engine::general_purpose::STANDARD
+                .decode(&body)
+                .expect("text gRPC-Web deadline body must be base64")
+        } else {
+            body
+        };
+        let frames = parse_grpc_frames(&decoded);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
+        assert!(
+            frames[0]
+                .1
+                .windows(b"grpc-status: 4".len())
+                .any(|window| window == b"grpc-status: 4")
+        );
+    }
 }
 
 // ── Plugin creation ──

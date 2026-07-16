@@ -57,6 +57,15 @@ use crate::tls::backend::{
 };
 use crate::util::body_limit::is_length_limit_error;
 
+/// Canonical terminal message for a gateway-owned client RPC deadline.
+///
+/// Response builders and the terminal-response ownership guard must share this
+/// exact value; otherwise a wording change could let a later response replacer
+/// overwrite `DEADLINE_EXCEEDED` after the gateway has selected it.
+pub(crate) const GATEWAY_DEADLINE_EXCEEDED_MESSAGE: &str = "Deadline exceeded at gateway";
+/// Canonical serialized `grpc-status` paired with the gateway message above.
+pub(crate) const GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER: &str = "4";
+
 /// Observer fired exactly when the streaming gRPC **request upload** reaches a
 /// terminal state — clean EOF, overflow abort, or stream drop (client/backend
 /// reset). Attached to the `GrpcBody::Streaming` request-body wrapper and
@@ -2406,12 +2415,16 @@ async fn proxy_grpc_streaming_dispatch(
     // When no gRPC deadline is set: fall back to backend_read_timeout_ms
     // as a safety net against indefinitely stalled backends. Slow uploads
     // without deadlines should be bounded.
-    let effective_timeout_ms = grpc_deadline_at
-        .map(|deadline| {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1)
-        })
-        .or_else(|| streaming_effective_timeout_ms(&headers, proxy));
+    // The absolute client deadline is consumed directly by the first branch
+    // below. Compute the relative operator fallback only when no client policy
+    // exists; storing a remaining client duration here is dead because
+    // `response_read_timeout_ms` is intentionally ignored whenever the
+    // absolute deadline is present.
+    let effective_timeout_ms = if grpc_deadline_at.is_none() {
+        streaming_effective_timeout_ms(&headers, proxy)
+    } else {
+        None
+    };
 
     let mut backend_req = Request::new(grpc_body);
     *backend_req.method_mut() = method;

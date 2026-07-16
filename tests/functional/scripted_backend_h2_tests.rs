@@ -19,6 +19,8 @@
 //! `H2Step::SendGoawayAndClose`, `H2Step::SendRstStream`, and
 //! `H2Step::DropConnection` are exercised through the corresponding
 //! `GrpcStep::{SendGoaway,SendRstStream,CloseAfterHeaders}` lowering.
+//! `GrpcStep::{AcceptStreamingRpc,ExpectReset}` cover the live bidi deadline
+//! cancellation path.
 //! `H2Step::SendGoaway` (the non-closing graceful form) is intentionally
 //! reserved for in-flight graceful-drain coverage: the round-2 matrix needs
 //! a terminal connection fault, so it uses `SendGoawayAndClose` instead.
@@ -226,6 +228,23 @@ fn grpc_deadline_file_config(port: u16, deadline_config: Value) -> String {
         }],
     });
     serde_yaml::to_string(&config).expect("serialize grpc_deadline yaml")
+}
+
+/// Add a one-failure circuit breaker to the deadline fixture. A follow-up
+/// healthy RPC then proves client-owned deadline expiry was recorded as neutral
+/// rather than poisoning backend health.
+fn grpc_deadline_cb_file_config(port: u16, deadline_config: Value) -> String {
+    let mut config: Value = serde_yaml::from_str(&grpc_deadline_file_config(port, deadline_config))
+        .expect("parse grpc_deadline yaml");
+    config["proxies"][0]["circuit_breaker"] = json!({
+        "failure_threshold": 1,
+        "success_threshold": 1,
+        "timeout_seconds": 30,
+        "failure_status_codes": [500, 502, 503, 504],
+        "half_open_max_requests": 1,
+        "trip_on_connection_errors": true,
+    });
+    serde_yaml::to_string(&config).expect("serialize grpc_deadline circuit-breaker yaml")
 }
 
 /// Spawn a gateway harness with the Phase-2 test defaults.
@@ -875,6 +894,124 @@ async fn grpc_deadline_expiry_after_headers_emits_deadline_exceeded_trailers() {
             1,
             "{case}: backend attempts"
         );
+    }
+}
+
+// #2498 / #2497 — exercise the real H2 body path after response DATA has
+// already reached the client. Once DATA is committed the gateway cannot safely
+// append a trailers-only replacement, so expiry must abort downstream, drop the
+// upstream body (RST_STREAM), and remain neutral to backend health. Cover both
+// a closed unary request direction (server-stream shape) and an open request
+// direction (bidi shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_deadline_after_partial_data_resets_stream_and_preserves_backend_health() {
+    let cases = [
+        ("server-stream", "/ferrum.Echo/ServerStream", false),
+        ("bidi", "/ferrum.Echo/Bidi", true),
+    ];
+
+    for (case, method, bidi) in cases {
+        let reservation = reserve_port().await.expect("reserve port");
+        let backend_port = reservation.port;
+        let partial_message = Bytes::from_static(b"partial");
+        let builder = ScriptedGrpcBackend::builder_plain(reservation.into_listener());
+        let builder = if bidi {
+            builder.step(GrpcStep::AcceptStreamingRpc(MatchRpc::method(method)))
+        } else {
+            builder.step(GrpcStep::AcceptRpc(MatchRpc::method(method)))
+        };
+        let backend = builder
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::RespondMessage(partial_message.clone()))
+            .step(GrpcStep::ExpectReset(Duration::from_secs(4)))
+            .step(GrpcStep::AcceptRpc(MatchRpc::method("/ferrum.Echo/Health")))
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::RespondMessage(Bytes::from_static(b"healthy")))
+            .step(GrpcStep::RespondStatus {
+                code: 0,
+                message: "",
+            })
+            .spawn()
+            .expect("spawn backend");
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(grpc_deadline_cb_file_config(
+                backend_port,
+                json!({
+                    "default_deadline_ms": 1000,
+                    "subtract_gateway_processing": true,
+                }),
+            ))
+            // Select the production zero-buffering H2 body branch so the
+            // backend's first DATA frame is committed before expiry.
+            .env("FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES", "0")
+            .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("spawn gateway");
+        let gw_port = harness
+            .proxy_base_url()
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .expect("gateway port");
+        let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+
+        let response = tokio::time::timeout(Duration::from_secs(4), async {
+            if bidi {
+                client.bidi_with_headers(
+                    &format!("/grpc{method}"),
+                    Bytes::from_static(b"request remains open"),
+                    &[],
+                )
+                .await
+            } else {
+                client
+                    .unary(&format!("/grpc{method}"), Bytes::new())
+                    .await
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{case}: partial-DATA RPC exceeded deadline envelope"))
+        .unwrap_or_else(|error| panic!("{case}: response failed: {error}"));
+
+        assert_eq!(response.http_status, 200, "{case}: initial gRPC status");
+        assert_eq!(
+            response.messages,
+            vec![partial_message],
+            "{case}: partial message must be delivered before expiry"
+        );
+        assert!(
+            response.stream_error.is_some(),
+            "{case}: post-DATA expiry must abort instead of ending cleanly: {response:?}"
+        );
+        assert!(
+            response.trailers.is_none(),
+            "{case}: terminal grpc-status cannot be appended after DATA: {response:?}"
+        );
+        let reset_deadline = Instant::now() + Duration::from_secs(1);
+        while backend.stream_reset_count() == 0 && Instant::now() < reset_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            backend.stream_reset_count(),
+            1,
+            "{case}: dropping the expired upstream body must reset its H2 stream"
+        );
+
+        let health = client
+            .unary("/grpc/ferrum.Echo/Health", Bytes::new())
+            .await
+            .unwrap_or_else(|error| panic!("{case}: health RPC failed: {error}"));
+        assert_eq!(health.grpc_status(), Some(0), "{case}: health RPC");
+        assert_eq!(
+            backend.received_stream_count(),
+            2,
+            "{case}: client deadline must not trip the one-failure circuit breaker"
+        );
+        backend.assert_no_matcher_mismatches().await;
+        backend.assert_no_step_errors().await;
     }
 }
 

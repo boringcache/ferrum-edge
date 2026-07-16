@@ -117,7 +117,11 @@ use crate::plugins::{
 };
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::{record_backend_outcome, record_backend_outcome_no_conn_end};
-use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
+use crate::proxy::grpc_proxy::{
+    self, GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+    GrpcResponseKind,
+    proxy_grpc_request_from_bytes,
+};
 use crate::proxy::headers::{
     apply_response_headers, is_backend_response_strip_header, parse_connection_listed_headers,
     strip_response_hop_by_hop_trailers,
@@ -201,7 +205,7 @@ where
     pub backend_admission_plugins: &'a [Arc<dyn Plugin>],
     pub preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
     pub requires_response_body_buffering: bool,
-    pub has_response_committed_hook: bool,
+    pub response_committed_plugins: &'a [Arc<dyn Plugin>],
     pub requires_response_stream_hooks: bool,
     pub sticky_cookie_needed: bool,
 }
@@ -388,7 +392,10 @@ where
                 .iter()
                 .any(|plugin| plugin.requires_response_committed_hook())
             {
-                for plugin in plugins {
+                for (index, plugin) in plugins.iter().enumerate() {
+                    if !plugin.requires_response_committed_hook() {
+                        continue;
+                    }
                     let deadline_exceeded = if let Some(translated) = translated.as_ref() {
                         crate::plugins::await_grpc_deadline(
                             ctx.grpc_deadline_at(),
@@ -423,6 +430,30 @@ where
                             &deadline.headers,
                             matches!(flavor, HttpFlavor::Grpc),
                         );
+                        for remaining in plugins[index + 1..]
+                            .iter()
+                            .filter(|plugin| plugin.requires_response_committed_hook())
+                        {
+                            if let Some(translated) = translated.as_ref() {
+                                remaining
+                                    .on_response_committed(
+                                        ctx,
+                                        StatusCode::OK.as_u16(),
+                                        &translated.headers,
+                                        &translated.body,
+                                    )
+                                    .await;
+                            } else {
+                                remaining
+                                    .on_response_committed(
+                                        ctx,
+                                        normalized.http_status.as_u16(),
+                                        &normalized.headers,
+                                        &normalized.body,
+                                    )
+                                    .await;
+                            }
+                        }
                         break;
                     }
                 }
@@ -621,7 +652,7 @@ where
         backend_admission_plugins,
         preacquired_backend_admission,
         requires_response_body_buffering,
-        has_response_committed_hook,
+        response_committed_plugins,
         requires_response_stream_hooks,
         sticky_cookie_needed,
     } = request;
@@ -648,9 +679,11 @@ where
             // gates on the real request method) run on the H3 bridge exactly as
             // they do on the H1/H2 dispatch path. This bridge path has no
             // `:method` pseudo-header for the no-context hook to consult.
+            let grpc_deadline_at = ctx.grpc_deadline_at();
             let transformed = crate::proxy::apply_request_body_plugins_with_context(
                 plugins,
                 Some(&mut *ctx),
+                grpc_deadline_at,
                 proxy_headers,
                 body,
             )
@@ -662,6 +695,7 @@ where
             match crate::proxy::run_final_request_body_hooks(
                 plugins,
                 Some(ctx),
+                grpc_deadline_at,
                 proxy_headers,
                 &transformed,
             )
@@ -684,7 +718,7 @@ where
                         plugins,
                         ctx,
                         reject,
-                        has_response_committed_hook,
+                        response_committed_plugins,
                         initial_response_header_policy_plugins.as_ref(),
                         RejectWriteAccounting {
                             backend_start,
@@ -724,10 +758,11 @@ where
                 backend_start,
                 ctx,
                 plugins,
+                initial_response_header_policy_plugins.as_ref(),
                 backend_admission_plugins,
                 preacquired_backend_admission,
                 requires_response_body_buffering,
-                has_response_committed_hook,
+                response_committed_plugins,
                 requires_response_stream_hooks,
                 sticky_cookie_needed,
             )
@@ -763,7 +798,7 @@ where
                 backend_admission_plugins,
                 preacquired_backend_admission,
                 requires_response_body_buffering,
-                has_response_committed_hook,
+                response_committed_plugins,
                 sticky_cookie_needed,
             )
             .await
@@ -1315,10 +1350,11 @@ async fn dispatch_plain<S>(
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
     mut preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
     requires_response_body_buffering: bool,
-    has_response_committed_hook: bool,
+    response_committed_plugins: &[Arc<dyn Plugin>],
     requires_response_stream_hooks: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -2252,8 +2288,8 @@ where
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let (normalized, translated) =
             normalize_reject_for_client(ctx, reject_status, &reject.body, &reject.headers, false);
-        if has_response_committed_hook {
-            for plugin in plugins {
+        if !response_committed_plugins.is_empty() {
+            for plugin in response_committed_plugins {
                 if let Some(translated) = translated.as_ref() {
                     plugin
                         .on_response_committed(ctx, 200, &translated.headers, &translated.body)
@@ -2444,17 +2480,16 @@ where
                 }
             }
 
-            if has_response_committed_hook {
-                for plugin in plugins {
-                    plugin
-                        .on_response_committed(
-                            ctx,
-                            response_status,
-                            &response_headers,
-                            &response_body,
-                        )
-                        .await;
-                }
+            if !response_committed_plugins.is_empty() {
+                crate::proxy::run_deadline_bounded_response_committed_hooks(
+                    response_committed_plugins,
+                    ctx,
+                    &mut response_status,
+                    &mut response_headers,
+                    &mut response_body,
+                    initial_response_header_policy_plugins,
+                )
+                .await;
             }
         }
 
@@ -3211,7 +3246,7 @@ async fn dispatch_grpc<S>(
     backend_admission_plugins: &[Arc<dyn Plugin>],
     mut preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
     requires_response_body_buffering: bool,
-    has_response_committed_hook: bool,
+    response_committed_plugins: &[Arc<dyn Plugin>],
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -3356,7 +3391,7 @@ where
                     stream,
                     ctx,
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Deadline exceeded at gateway",
+                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
                     backend_start,
                     0,
                     initial_response_header_policy_plugins,
@@ -3736,7 +3771,7 @@ where
                         body: Bytes::from(reject.body),
                         headers: reject.headers,
                     },
-                    has_response_committed_hook,
+                    response_committed_plugins,
                     initial_response_header_policy_plugins,
                     RejectWriteAccounting {
                         backend_start,
@@ -4016,31 +4051,18 @@ where
                 response_trailers.clear();
             }
 
-            if has_response_committed_hook {
-                for plugin in plugins.iter() {
-                    if crate::plugins::await_grpc_deadline(
-                        ctx.grpc_deadline_at(),
-                        plugin.on_response_committed(
-                            ctx,
-                            response_status,
-                            &response_headers,
-                            &response_body,
-                        ),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        replace_buffered_grpc_response_with_deadline(
-                            ctx,
-                            &mut response_status,
-                            &mut response_headers,
-                            &mut response_body,
-                            &mut response_trailers,
-                            initial_response_header_policy_plugins,
-                        );
-                        break;
-                    }
-                }
+            if !response_committed_plugins.is_empty()
+                && crate::proxy::run_deadline_bounded_response_committed_hooks(
+                    response_committed_plugins,
+                    ctx,
+                    &mut response_status,
+                    &mut response_headers,
+                    &mut response_body,
+                    initial_response_header_policy_plugins,
+                )
+                .await
+            {
+                response_trailers.clear();
             }
 
             if let Err(error) =
@@ -4184,7 +4206,7 @@ where
             let (grpc_status_code, grpc_message): (u32, &str) = match &err {
                 grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_) => (
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Deadline exceeded at gateway",
+                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
                 ),
                 grpc_proxy::GrpcProxyError::BackendTimeout { .. } => (
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -4578,7 +4600,7 @@ pub(crate) async fn dispatch_grpc_streaming(
             let (grpc_status_code, grpc_message): (u32, &str) = match &err {
                 grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_) => (
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                    "Deadline exceeded at gateway",
+                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
                 ),
                 grpc_proxy::GrpcProxyError::BackendTimeout { .. } => (
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -4761,10 +4783,13 @@ fn normalized_h3_grpc_deadline() -> crate::proxy::NormalizedRejectResponse {
         &[],
         &HashMap::from([
             ("content-type".to_string(), "application/grpc".to_string()),
-            ("grpc-status".to_string(), "4".to_string()),
+            (
+                "grpc-status".to_string(),
+                GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+            ),
             (
                 "grpc-message".to_string(),
-                "Deadline exceeded at gateway".to_string(),
+                GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
             ),
         ]),
     )
@@ -5602,7 +5627,7 @@ async fn write_final_body_reject<S>(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     reject: PluginResult,
-    has_response_committed_hook: bool,
+    response_committed_plugins: &[Arc<dyn Plugin>],
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     accounting: RejectWriteAccounting,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -5656,8 +5681,8 @@ where
         &headers,
         matches!(flavor, HttpFlavor::Grpc),
     );
-    if has_response_committed_hook {
-        for plugin in plugins {
+    if !response_committed_plugins.is_empty() {
+        for (index, plugin) in response_committed_plugins.iter().enumerate() {
             let deadline_exceeded = if let Some(translated) = grpc_web_reject.as_ref() {
                 crate::plugins::await_grpc_deadline(
                     ctx.grpc_deadline_at(),
@@ -5687,6 +5712,27 @@ where
                     &deadline.headers,
                     matches!(flavor, HttpFlavor::Grpc),
                 );
+                for remaining in &response_committed_plugins[index + 1..] {
+                    if let Some(translated) = grpc_web_reject.as_ref() {
+                        remaining
+                            .on_response_committed(
+                                ctx,
+                                StatusCode::OK.as_u16(),
+                                &translated.headers,
+                                &translated.body,
+                            )
+                            .await;
+                    } else {
+                        remaining
+                            .on_response_committed(
+                                ctx,
+                                normalized.http_status.as_u16(),
+                                &normalized.headers,
+                                &normalized.body,
+                            )
+                            .await;
+                    }
+                }
                 break;
             }
         }
@@ -5855,7 +5901,10 @@ where
         .iter()
         .any(|plugin| plugin.requires_response_committed_hook())
     {
-        for plugin in plugins {
+        for (index, plugin) in plugins.iter().enumerate() {
+            if !plugin.requires_response_committed_hook() {
+                continue;
+            }
             if crate::plugins::await_grpc_deadline(
                 ctx.grpc_deadline_at(),
                 plugin.on_response_committed(
@@ -5870,6 +5919,19 @@ where
             {
                 normalized = normalized_h3_grpc_deadline();
                 apply_h3_grpc_reject_metadata(ctx, &normalized);
+                for remaining in plugins[index + 1..]
+                    .iter()
+                    .filter(|plugin| plugin.requires_response_committed_hook())
+                {
+                    remaining
+                        .on_response_committed(
+                            ctx,
+                            normalized.http_status.as_u16(),
+                            &normalized.headers,
+                            &normalized.body,
+                        )
+                        .await;
+                }
                 break;
             }
         }
@@ -6180,7 +6242,7 @@ mod tests {
         assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
         assert_eq!(
             headers.get("grpc-message").map(String::as_str),
-            Some("Deadline exceeded at gateway")
+            Some(GATEWAY_DEADLINE_EXCEEDED_MESSAGE)
         );
         assert!(body.is_empty());
         assert!(trailers.is_empty());

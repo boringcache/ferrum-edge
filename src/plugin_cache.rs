@@ -175,6 +175,9 @@ impl Plugin for PriorityOverridePlugin {
     fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.prepare_grpc_deadline(ctx)
     }
+    fn requires_grpc_deadline_preflight(&self) -> bool {
+        self.inner.requires_grpc_deadline_preflight()
+    }
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.on_request_received(ctx).await
     }
@@ -341,6 +344,9 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn applies_after_proxy_on_reject(&self) -> bool {
         self.inner.applies_after_proxy_on_reject()
+    }
+    fn may_replace_rejection_response(&self) -> bool {
+        self.inner.may_replace_rejection_response()
     }
     fn requires_response_body_buffering(&self) -> bool {
         self.inner.requires_response_body_buffering()
@@ -1968,6 +1974,8 @@ impl PluginCapabilities {
 /// Built at config reload time so the hot path does zero filtering or allocation.
 #[derive(Clone)]
 pub struct PluginPhaseData {
+    /// gRPC deadline-policy plugins only, in configured priority order.
+    pub grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Auth plugins only (pre-filtered from the protocol plugin list).
     pub auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Authorization plugins only (pre-filtered from the protocol plugin list).
@@ -1983,6 +1991,8 @@ pub struct PluginPhaseData {
     pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Unique canonical field names touched by initial-response policy.
     pub initial_response_header_policy_names: Arc<Vec<String>>,
+    /// Final committed-response observers only, in configured priority order.
+    pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
 }
@@ -1991,13 +2001,18 @@ pub struct PluginPhaseData {
 fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut caps = 0u16;
     let mut auth = Vec::new();
+    let mut grpc_deadline = Vec::new();
     let mut authorize = Vec::new();
     let mut backend_admission = Vec::new();
     let mut backend_path = Vec::new();
     let mut request_headers_to_redact = Vec::new();
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
+    let mut response_committed = Vec::new();
     for p in plugins {
+        if p.requires_grpc_deadline_preflight() {
+            grpc_deadline.push(Arc::clone(p));
+        }
         if p.is_auth_plugin() {
             caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
             auth.push(Arc::clone(p));
@@ -2057,12 +2072,14 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
+            response_committed.push(Arc::clone(p));
         }
         if p.requires_response_stream_hooks() {
             caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;
         }
     }
     PluginPhaseData {
+        grpc_deadline_plugins: Arc::new(grpc_deadline),
         auth_plugins: Arc::new(auth),
         authorize_plugins: Arc::new(authorize),
         backend_admission_plugins: Arc::new(backend_admission),
@@ -2070,6 +2087,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         request_headers_to_redact: Arc::new(request_headers_to_redact),
         initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
+        response_committed_plugins: Arc::new(response_committed),
         capabilities: PluginCapabilities(caps),
     }
 }
@@ -2339,6 +2357,16 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_grpc_deadline_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.grpc_deadline_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_authorize_plugins(
         &self,
         proxy_id: &str,
@@ -2399,6 +2427,16 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_response_committed_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.response_committed_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_capabilities(
         &self,
         proxy_id: &str,
@@ -2441,6 +2479,7 @@ impl PluginCacheInner {
             .then(|| self.get_backend_path_plugins(proxy_id, protocol));
         PluginCacheRequestView {
             plugins: self.get_plugins_for_protocol(proxy_id, protocol),
+            grpc_deadline_plugins: self.get_grpc_deadline_plugins(proxy_id, protocol),
             auth_plugins: self.get_auth_plugins(proxy_id, protocol),
             authorize_plugins: self.get_authorize_plugins(proxy_id, protocol),
             backend_admission_plugins: self.get_backend_admission_plugins(proxy_id, protocol),
@@ -2450,6 +2489,8 @@ impl PluginCacheInner {
                 .get_initial_response_header_policy_plugins(proxy_id, protocol),
             initial_response_header_policy_names: self
                 .get_initial_response_header_policy_names(proxy_id, protocol),
+            response_committed_plugins: self
+                .get_response_committed_plugins(proxy_id, protocol),
             capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
@@ -2466,6 +2507,7 @@ impl PluginCacheInner {
 #[derive(Clone)]
 pub struct PluginCacheRequestView {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -2473,6 +2515,7 @@ pub struct PluginCacheRequestView {
     request_headers_to_redact: Arc<Vec<String>>,
     initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     initial_response_header_policy_names: Arc<Vec<String>>,
+    response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -2483,6 +2526,11 @@ impl PluginCacheRequestView {
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.plugins)
+    }
+
+    /// Get the pre-filtered synchronous gRPC deadline-policy chain.
+    pub fn grpc_deadline_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.grpc_deadline_plugins.as_slice()
     }
 
     /// Get pre-computed auth plugins from this request view.
@@ -2521,6 +2569,11 @@ impl PluginCacheRequestView {
     /// Get canonical field names touched by initial-response policy.
     pub fn initial_response_header_policy_names(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.initial_response_header_policy_names)
+    }
+
+    /// Get the pre-filtered committed-response observer chain.
+    pub fn response_committed_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.response_committed_plugins.as_slice()
     }
 
     /// Get pre-computed capability bitset from this request view.

@@ -946,6 +946,24 @@ pub mod _test_support {
         }
     }
 
+    pub async fn run_deadline_bounded_response_committed_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+    ) -> bool {
+        crate::proxy::run_deadline_bounded_response_committed_hooks(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            &[],
+        )
+        .await
+    }
+
     pub fn client_grpc_deadline_response_for_request_for_test(
         content_type: &str,
     ) -> DeadlineBackendResponse {
@@ -974,6 +992,32 @@ pub mod _test_support {
             connection_error: response.connection_error,
             error_class: response.error_class,
         }
+    }
+
+    pub fn response_header_deadline_for_test(
+        client_deadline_after_ms: Option<u64>,
+        backend_read_timeout_ms: u64,
+    ) -> Option<(bool, u128)> {
+        let read_started_at = tokio::time::Instant::now();
+        let client_deadline = client_deadline_after_ms.and_then(|millis| {
+            read_started_at.checked_add(std::time::Duration::from_millis(millis))
+        });
+        crate::proxy::response_header_deadline(
+            client_deadline,
+            backend_read_timeout_ms,
+            read_started_at,
+        )
+        .map(|(deadline, source)| {
+            (
+                matches!(
+                    source,
+                    crate::proxy::ResponseHeaderDeadlineSource::Client
+                ),
+                deadline
+                    .saturating_duration_since(read_started_at)
+                    .as_millis(),
+            )
+        })
     }
 
     pub fn can_use_direct_http2_pool(
@@ -1013,8 +1057,14 @@ pub mod _test_support {
         headers: &HashMap<String, String>,
         body_bytes: Vec<u8>,
     ) -> Vec<u8> {
-        crate::proxy::apply_request_body_plugins_with_context(plugins, None, headers, body_bytes)
-            .await
+        crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            None,
+            None,
+            headers,
+            body_bytes,
+        )
+        .await
     }
 
     pub fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {

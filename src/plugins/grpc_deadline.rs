@@ -17,6 +17,9 @@ use std::time::Duration;
 use tracing::debug;
 
 use super::{GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
+use crate::proxy::grpc_proxy::{
+    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+};
 
 const MAX_GRPC_TIMEOUT_VALUE: u64 = 99_999_999;
 const ALLOWED_CONFIG_KEYS: [&str; 4] = [
@@ -245,11 +248,17 @@ pub fn prepare_request_deadline(
     plugins: &[std::sync::Arc<dyn Plugin>],
     ctx: &mut RequestContext,
 ) -> PluginResult {
+    // This API accepts the cache's pre-filtered deadline-policy list. Every
+    // gRPC request still anchors a valid client grpc-timeout once for transport
+    // correctness, but the transaction-log metadata belongs to the configured
+    // grpc_deadline policy and is therefore omitted when this list is empty.
     if !ctx.grpc_deadline_initialized {
         let deadline_ms = timeout_header(&ctx.headers)
             .and_then(parse_grpc_timeout)
             .and_then(duration_millis_ceil_saturating);
-        if let Some(original_ms) = deadline_ms {
+        if !plugins.is_empty()
+            && let Some(original_ms) = deadline_ms
+        {
             ctx.metadata.insert(
                 "grpc_original_deadline_ms".to_string(),
                 original_ms.to_string(),
@@ -323,6 +332,10 @@ impl Plugin for GrpcDeadline {
         PluginResult::Continue
     }
 
+    fn requires_grpc_deadline_preflight(&self) -> bool {
+        true
+    }
+
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
         // grpc_method_router historically ran before this hook. Preserve that
         // terminal-policy ordering when method authorization moves to the
@@ -381,10 +394,13 @@ impl Plugin for GrpcDeadline {
                     "Deadline already exceeded after gateway processing"
                 );
                 let mut resp_headers = grpc_content_type_header();
-                resp_headers.insert("grpc-status".to_string(), "4".to_string());
+                resp_headers.insert(
+                    "grpc-status".to_string(),
+                    GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+                );
                 resp_headers.insert(
                     "grpc-message".to_string(),
-                    "Deadline exceeded at gateway".to_string(),
+                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
                 );
                 return PluginResult::Reject {
                     status_code: 200,

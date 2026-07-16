@@ -3344,11 +3344,11 @@ It parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m`
 
 Forwarded deadlines are re-encoded to stay within the gRPC wire-format limit of 8 digits, preserving millisecond precision whenever it fits.
 
-The gateway establishes one monotonic absolute deadline at request receipt, before authentication, authorization, body buffering, or plugin I/O. That same instant bounds connection acquisition, all H2/H3 attempts and retry backoff, and response headers/body/trailers. The header sent to a backend remains a relative duration; when `subtract_gateway_processing` is true it is derived from the absolute deadline. Later plugin instances and transports reuse the typed instant and never subtract elapsed time from that rewritten header again.
+The gateway establishes one monotonic absolute deadline at request receipt, before IP/geo/bot restrictions, authentication, authorization, body buffering, or plugin I/O. This phase-0 ordering is intentional and fail closed: when `reject_no_deadline` is enabled, a missing or malformed deadline is rejected before security plugins, so the deadline-policy response can precede the `401`/`403` that the same request would otherwise receive. It prevents unauthenticated requests from bypassing the configured total RPC resource ceiling. That same instant bounds connection acquisition, all H2/H3 attempts and retry backoff, and response headers/body/trailers. The header sent to a backend remains a relative duration; when `subtract_gateway_processing` is true it is derived from the absolute deadline. Later plugin instances and transports reuse the typed instant and never subtract elapsed time from that rewritten header again.
 
 When the absolute deadline is exhausted, the gateway returns gRPC status `DEADLINE_EXCEEDED` (status code 4). If H2 response headers were already committed but no DATA bytes were forwarded, it emits a terminal status-4 trailer frame; after partial DATA it aborts the stream because a complete gRPC message boundary cannot be assumed.
 
-Populates `ctx.metadata` with `grpc_original_deadline_ms` and `grpc_adjusted_deadline_ms`.
+When this plugin is configured, it populates `ctx.metadata` with `grpc_original_deadline_ms` and `grpc_adjusted_deadline_ms`. Merely sending a parseable `grpc-timeout` header without a `grpc_deadline` policy does not create those plugin-policy transaction-log fields.
 
 ```yaml
 plugin_name: grpc_deadline
