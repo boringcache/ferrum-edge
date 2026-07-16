@@ -3458,6 +3458,15 @@ jobs:
       - if: steps.changes.outputs.ebpf_changed == 'true'
         uses: ./.github/actions/setup-fast-linker
 
+      - name: Cache eBPF Rust dependencies and compiler outputs
+        if: steps.changes.outputs.ebpf_changed == 'true'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "ci-ebpf-programs"
+          workspaces: |
+            ebpf -> target
+          cache-directories: ${{ github.workspace }}/.cache/sccache
+
       - name: Install bpf-linker
         if: steps.changes.outputs.ebpf_changed == 'true'
         run: cargo install bpf-linker --locked
@@ -3850,10 +3859,30 @@ jobs:
               run_benchmark=false
               reason="No performance-sensitive paths changed."
 
-              if grep -Eq '^(src/|custom_plugins/|vendor/|ebpf/|tests/performance/|build\.rs$|ferrum\.conf$|proto/|Cargo\.toml$|Cargo\.lock$|\.cargo/|rust-toolchain\.toml$|\.github/workflows/ci\.yml$|\.github/actions/)' <<<"${changed_files}"; then
-                run_benchmark=true
-                reason="Performance-sensitive paths changed."
-              fi
+              # This smoke benchmark drives plain HTTP/1.1 through a file-mode
+              # proxy route. Gate it on shared/deep proxy hot paths, file-mode
+              # startup, and dependency/build surfaces that can affect that
+              # measurement. Individual plugin implementations, admin,
+              # secrets, and unrelated operating modes are not observable here
+              # and should not pay for a 17-minute release build.
+              while IFS= read -r path; do
+                case "${path}" in
+                  src/proxy/*|src/http3/*|src/dns/*|src/pool/*|\
+                  src/connection_pool.rs|src/load_balancer.rs|src/health_check.rs|\
+                  src/circuit_breaker.rs|src/retry.rs|src/overload.rs|\
+                  src/router_cache.rs|src/plugin_cache.rs|src/consumer_index.rs|\
+                  src/date_cache.rs|src/lazy_timeout.rs|src/socket_opts.rs|src/tls_offload.rs|\
+                  src/config/types.rs|src/plugins/mod.rs|\
+                  src/main.rs|src/startup.rs|src/modes/file.rs|src/modes/mod.rs|\
+                  vendor/*|ebpf/*|tests/performance/*|proto/*|.cargo/*|.github/actions/*|\
+                  build.rs|ferrum.conf|Cargo.toml|Cargo.lock|rust-toolchain.toml|\
+                  .github/workflows/ci.yml)
+                    run_benchmark=true
+                    reason="Performance-sensitive paths changed."
+                    break
+                    ;;
+                esac
+              done <<<"${changed_files}"
             else
               run_benchmark=true
               reason="Could not diff against origin/${BASE_REF}; running benchmark to be safe."
@@ -3972,7 +4001,10 @@ jobs:
             {
               echo "Skipped expensive benchmark: ${REASON}"
               echo ""
-              echo "Relevant paths: \`src/**\`, \`custom_plugins/**\`, \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`build.rs\`, \`ferrum.conf\`, \`proto/**\`, \`Cargo.toml\`, \`Cargo.lock\`, \`.cargo/**\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, \`.github/actions/**\`."
+              echo "Relevant paths:"
+              echo "- Proxy and connection hot paths: \`src/proxy/**\`, \`src/http3/**\`, \`src/dns/**\`, \`src/pool/**\`, \`src/connection_pool.rs\`, \`src/load_balancer.rs\`, \`src/health_check.rs\`, \`src/circuit_breaker.rs\`, \`src/retry.rs\`, \`src/overload.rs\`, \`src/router_cache.rs\`, \`src/plugin_cache.rs\`, \`src/consumer_index.rs\`, \`src/date_cache.rs\`, \`src/lazy_timeout.rs\`, \`src/socket_opts.rs\`, and \`src/tls_offload.rs\`."
+              echo "- File-mode gateway path: \`src/config/types.rs\`, \`src/plugins/mod.rs\`, \`src/main.rs\`, \`src/startup.rs\`, \`src/modes/file.rs\`, and \`src/modes/mod.rs\`."
+              echo "- Build and dependency graph: \`vendor/**\`, \`ebpf/**\`, \`tests/performance/**\`, \`proto/**\`, \`.cargo/**\`, \`build.rs\`, \`ferrum.conf\`, \`Cargo.toml\`, \`Cargo.lock\`, \`rust-toolchain.toml\`, \`.github/workflows/ci.yml\`, and \`.github/actions/**\`."
               echo ""
               echo "Changed files:"
               echo '```'
@@ -4074,6 +4106,7 @@ jobs:
         continue-on-error: true
         with:
           shared-key: "build-${{ matrix.target }}"
+          cache-directories: ${{ github.workspace }}/.cache/sccache
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
