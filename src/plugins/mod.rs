@@ -3310,9 +3310,10 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Returns `true` when a deferred `before_proxy` hook can mutate headers
-    /// that participate in upstream target selection. The gateway runs these
-    /// hooks in a separate deferred subphase, then reselects and reauthorizes
-    /// the backend-effective path if the selection hash changed.
+    /// that normally participate in upstream target selection. The gateway
+    /// runs these hooks in a separate deferred subphase after an access preview
+    /// and pins that previewed target across the external call; the returned
+    /// headers cannot steer this request onto an unpreviewed path.
     fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
         false
     }
@@ -3331,9 +3332,9 @@ pub trait Plugin: Send + Sync {
     /// upstream target path, but before any backend is dialed.
     ///
     /// When a deferred hook can mutate routing headers, `Preview` runs before
-    /// that hook and `Enforce` runs after target reselection settles. Otherwise
-    /// only `Enforce` runs. Implementations must keep `Preview` free of
-    /// state-consuming effects such as rate-limit charges.
+    /// that hook and `Enforce` runs afterward against the same pinned target.
+    /// Otherwise only `Enforce` runs. Implementations must keep `Preview` free
+    /// of state-consuming effects such as rate-limit charges.
     async fn on_backend_path_resolved(
         &self,
         _ctx: &mut RequestContext,

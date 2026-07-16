@@ -36,7 +36,7 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 5b. routing-header hook │  Deferred routing input, then target reselection
+│ 5b. routing-header hook │  Deferred enrichment with previewed target pinned
 └────────────┬────────────┘
              │
              ▼
@@ -107,11 +107,15 @@ segments used by the backend URL builder, including regex/exact/prefix match
 length, encoded-slash normalization, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
-backend wire. When a deferred hook can inject headers used by load balancing,
-the policy hook first receives a non-state-consuming preview phase for the
-initial path. After the header hook and any reselection, the settled path is
-enforced once; per-method rate limits are charged only in this final phase, so
-one request cannot consume both the provisional and final method buckets. Its
+backend wire. When a deferred external hook can inject headers used by load
+balancing, the policy hook first receives a non-state-consuming preview phase
+for the already selected path. That target remains pinned across the external
+call so the hook cannot cause side effects and then steer the request onto a
+method that was not authorized first. The same path is enforced once afterward;
+per-method rate limits are charged only in this final phase, so one request
+cannot consume two method buckets. Gateway-owned identity headers and
+configured egress baggage filtering are reapplied after every deferred mutation
+pass. Its
 pre-filtered plugin list is built on reload; proxies without an opt-in plugin do
 not scan the chain or allocate an effective-path string. Once policy binds the
 first target's path, retries may rotate host/port only when the candidate keeps
@@ -135,14 +139,14 @@ normal request semantics even when mesh routing rewrote the backend path.
 is active and `mirror_path` is unset, it mirrors the exact effective path that
 passed final authorization. An explicit operator-configured `mirror_path`
 still wins. A deferred hook that can inject routing headers runs after the
-initial access preview; if
-it changes the load-balancer hash key, Ferrum reselects the target and performs
-the single state-consuming enforcement against the settled effective path
-before any remaining external or synthetic hook. After each deferred pass, the
-gateway removes every case variant of the reserved `x-consumer-username` and
-`x-consumer-custom-id` headers and restores only authenticated gateway values;
-plugin-returned headers therefore cannot spoof backend identity or influence
-header-hash routing under a forged identity.
+selected target's access preview, and that target is pinned across the external
+call. Ferrum performs the single state-consuming enforcement against the same
+effective path before any remaining external or synthetic hook. After each
+deferred pass, the gateway removes every case variant of the reserved
+`x-consumer-username` and `x-consumer-custom-id` headers, restores only
+authenticated gateway values, and reapplies configured egress baggage-key
+filtering. Plugin-returned headers therefore cannot spoof backend identity,
+restore forbidden baggage, or steer this request to an unpreviewed target.
 
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
 

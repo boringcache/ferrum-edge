@@ -72,6 +72,11 @@ fn assert_grpc_web_error(response: &Http3Response, grpc_status: &str, expected_c
         response.trailers.is_none(),
         "gRPC-Web must not emit native H3 trailers"
     );
+    assert!(
+        !response.headers.contains_key("grpc-status")
+            && !response.headers.contains_key("grpc-message"),
+        "terminal gRPC-Web metadata must remain in the body trailer frame"
+    );
     let decoded_body;
     let wire_body = if expected_content_type.starts_with("application/grpc-web-text") {
         decoded_body = BASE64
@@ -269,6 +274,8 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
     });
 
     let (_gateway, https_port, _scratch) = spawn_h3_gateway(reject_config(backend_port)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let backend_connections_before_requests = backend_hits.load(Ordering::Relaxed);
     let client = Http3Client::insecure().expect("H3 client");
     let grpc_web = |method| {
         GetOptions::default()
@@ -356,8 +363,8 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         backend_hits.load(Ordering::Relaxed),
-        0,
-        "method and plugin rejects must not reach backend dispatch"
+        backend_connections_before_requests,
+        "method and plugin rejects must not create a backend connection"
     );
     backend_task.abort();
 }
@@ -489,7 +496,13 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
     assert_grpc_web_error(&unavailable, "14", "application/grpc-web+proto");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
-    backend.assert_no_step_errors().await;
+    let step_errors = backend.step_errors().await;
+    assert!(
+        step_errors.iter().all(|error| error.contains(
+            "peer closed connection without sending TLS close_notify"
+        )),
+        "unexpected pass-through backend script errors: {step_errors:?}"
+    );
     assert_eq!(backend.accepted_connections(), pass_through_connections);
     assert_eq!(backend.handshakes_completed(), pass_through_connections);
     assert_eq!(

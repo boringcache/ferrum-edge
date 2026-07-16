@@ -412,15 +412,15 @@ impl Plugin for GrpcMethodRouter {
             };
         }
 
-        // A deferred routing-header hook can change the selected target and
-        // therefore the backend-effective method. Preview access rules before
-        // that external work, but charge stateful policy only after selection
-        // settles so one request cannot consume two method buckets.
+        // A deferred routing-header hook performs external work and can return
+        // values that would normally change target selection. Preview access
+        // rules first; the proxy pins that target across the hook, then charges
+        // stateful policy once so one request cannot consume two method buckets.
         if matches!(phase, BackendPathPolicyPhase::Preview) {
             return PluginResult::Continue;
         }
 
-        // Check per-method rate limits on the final selected method.
+        // Check per-method rate limits on the pinned selected method.
         if let Some(spec) = self.method_rate_limits.get(full_method) {
             let key = self.rate_key(ctx, full_method);
             let outcome = self.check_rate(&key, spec).await;

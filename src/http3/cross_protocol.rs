@@ -5421,6 +5421,7 @@ struct RejectWriteAccounting {
     bytes_sent: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_final_body_reject<S>(
     stream: &mut RequestStream<S, Bytes>,
     flavor: HttpFlavor,

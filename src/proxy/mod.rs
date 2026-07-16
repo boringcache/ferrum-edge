@@ -16407,7 +16407,7 @@ async fn handle_proxy_request_inner(
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
     // enables true PASSTHROUGH load balancing when the upstream's algorithm is
     // Passthrough; it is ignored for every other algorithm.
-    let mut selection = backend_dispatch::select_upstream_target(
+    let selection = backend_dispatch::select_upstream_target(
         &proxy,
         &state,
         &epoch,
@@ -16415,8 +16415,8 @@ async fn handle_proxy_request_inner(
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
         ctx.orig_dst,
     );
-    let mut lb_hash_key = selection.lb_hash_key;
-    let mut upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
+    let lb_hash_key = selection.lb_hash_key;
+    let upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
         selection.target,
         request_host.as_deref(),
     );
@@ -16427,9 +16427,12 @@ async fn handle_proxy_request_inner(
     let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
 
     loop {
-        // Preview access rules before a deferred routing function performs
-        // external work, then enforce stateful policy exactly once after its
-        // header mutations and any target reselection have settled.
+        // Preview access rules for the already-selected target before a
+        // deferred routing function performs external work, then enforce
+        // stateful policy exactly once after its header mutations settle. The
+        // target is deliberately pinned across this hook: otherwise a cloud
+        // function could cause side effects before its hash header selected a
+        // different, denied backend-effective method.
         if backend_path_is_policy_bound {
             let backend_path = build_backend_effective_path(
                 &proxy,
@@ -16471,7 +16474,6 @@ async fn handle_proxy_request_inner(
         }
         run_deferred_routing_headers = false;
 
-        let headers_before = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
         // These hooks moved later for authorization ordering, but their
         // documented request view remains the original client path.
         let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
@@ -16507,36 +16509,20 @@ async fn handle_proxy_request_inner(
             break;
         }
 
-        // A deferred routing function can return arbitrary headers. Reserved
-        // consumer identity must be restored before those headers participate
-        // in hash-based target selection or reach any backend transport.
+        // A deferred routing function can return arbitrary headers. Restore
+        // gateway-owned identity and reapply the egress baggage policy before
+        // those headers can reach any backend transport. Backend-path policy
+        // pins the already-previewed target, so the returned headers cannot
+        // steer this request onto a path that was not authorized before the
+        // external call.
         refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
-
-        let selected_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
-        if selected_headers != &headers_before
-            && backend_dispatch::upstream_selection_hash_key(
-                &proxy,
-                &epoch,
-                &ctx.client_ip,
-                selected_headers,
-            ) != lb_hash_key
-        {
-            selection = backend_dispatch::select_upstream_target(
-                &proxy,
-                &state,
-                &epoch,
-                &ctx.client_ip,
-                selected_headers,
-                ctx.orig_dst,
-            );
-            lb_hash_key = selection.lb_hash_key;
-            upstream_target = backend_dispatch::concretize_wildcard_target_for_request(
-                selection.target,
-                request_host.as_deref(),
-            );
-        }
+        hbone_proxy::strip_egress_baggage_in_proxy_headers(
+            &mut owned_proxy_headers,
+            &ctx.headers,
+            &state.mesh_egress_strip_baggage_keys,
+        );
         // Always make one more pass after the routing-header hook so final
-        // enforcement charges only the settled backend-effective method.
+        // enforcement charges the pinned backend-effective method.
     }
 
     // Hooks that can dispatch external work or synthesize a terminal response
@@ -16579,6 +16565,11 @@ async fn handle_proxy_request_inner(
         }
         if matches!(deferred_result, PluginResult::Continue) {
             refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            hbone_proxy::strip_egress_baggage_in_proxy_headers(
+                &mut owned_proxy_headers,
+                &ctx.headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
         }
         match deferred_result {
             PluginResult::Continue => {}

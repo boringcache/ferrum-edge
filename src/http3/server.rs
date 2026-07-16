@@ -915,7 +915,7 @@ async fn handle_h3_request(
         .reject_new_requests
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        record_request(&state, 503);
+        record_h3_flavor_aware_reject(&state, http_flavor, 503);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
@@ -960,7 +960,7 @@ async fn handle_h3_request(
     for (name, value) in req.headers() {
         let header_size = name.as_str().len() + value.len();
         if header_size > state.max_single_header_size_bytes {
-            record_request(&state, 431);
+            record_h3_flavor_aware_reject(&state, http_flavor, 431);
             let body = format!(
                 r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
                 name.as_str(),
@@ -981,7 +981,7 @@ async fn handle_h3_request(
         total_header_size += header_size;
     }
     if total_header_size > state.max_header_size_bytes {
-        record_request(&state, 431);
+        record_h3_flavor_aware_reject(&state, http_flavor, 431);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
@@ -995,7 +995,7 @@ async fn handle_h3_request(
         return Ok(());
     }
     if state.max_header_count > 0 && req.headers().len() > state.max_header_count {
-        record_request(&state, 431);
+        record_h3_flavor_aware_reject(&state, http_flavor, 431);
         let body = format!(
             r#"{{"error":"Request header count ({}) exceeds maximum of {}"}}"#,
             req.headers().len(),
@@ -1027,7 +1027,7 @@ async fn handle_h3_request(
                 1 + query_string.len()
             };
         if url_len > state.max_url_length_bytes {
-            record_request(&state, 414);
+            record_h3_flavor_aware_reject(&state, http_flavor, 414);
             let body = format!(
                 r#"{{"error":"Request URL length ({} bytes) exceeds maximum of {} bytes"}}"#,
                 url_len, state.max_url_length_bytes
@@ -1052,7 +1052,7 @@ async fn handle_h3_request(
     if state.max_query_params > 0 && !query_string.is_empty() {
         let param_count = crate::proxy::count_query_params(&query_string);
         if param_count > state.max_query_params {
-            record_request(&state, 400);
+            record_h3_flavor_aware_reject(&state, http_flavor, 400);
             let body = format!(
                 r#"{{"error":"Query parameter count ({}) exceeds maximum of {}"}}"#,
                 param_count, state.max_query_params
@@ -1079,7 +1079,7 @@ async fn handle_h3_request(
         crate::proxy::check_protocol_headers(req.headers(), http::Version::HTTP_3)
     {
         warn!("Rejected HTTP/3 request: {}", error_body);
-        record_request(&state, 400);
+        record_h3_flavor_aware_reject(&state, http_flavor, 400);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
@@ -1098,7 +1098,7 @@ async fn handle_h3_request(
         http::Version::HTTP_3,
     ) {
         warn!("Rejected HTTP/3 request: {}", error_body);
-        record_request(&state, 400);
+        record_h3_flavor_aware_reject(&state, http_flavor, 400);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
@@ -1115,7 +1115,7 @@ async fn handle_h3_request(
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     if method == "TRACE" {
         warn!("Rejected HTTP/3 TRACE request");
-        record_request(&state, 405);
+        record_h3_flavor_aware_reject(&state, http_flavor, 405);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
@@ -1137,7 +1137,7 @@ async fn handle_h3_request(
     // bypasses proxy routing.
     if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket {
         warn!("Rejected non-WebSocket HTTP/3 CONNECT request");
-        record_request(&state, 405);
+        record_h3_flavor_aware_reject(&state, http_flavor, 405);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
@@ -1159,7 +1159,7 @@ async fn handle_h3_request(
             "Rejected HTTP/3 0-RTT request: method {} not in allowed early data methods",
             method
         );
-        record_request(&state, 425);
+        record_h3_flavor_aware_reject(&state, http_flavor, 425);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
@@ -1236,7 +1236,7 @@ async fn handle_h3_request(
                 limit = state.max_concurrent_requests_per_ip,
                 "Per-IP concurrent request limit exceeded (HTTP/3)"
             );
-            record_request(&state, 429);
+            record_h3_flavor_aware_reject(&state, http_flavor, 429);
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
@@ -1271,7 +1271,7 @@ async fn handle_h3_request(
             Some(normalized) => Some(normalized),
             None => {
                 warn!("Rejected HTTP/3 request: malformed Host/authority value");
-                record_request(&state, 400);
+                record_h3_flavor_aware_reject(&state, http_flavor, 400);
                 send_h3_error_flavor_aware(
                     &mut stream,
                     http_flavor,
@@ -1372,7 +1372,7 @@ async fn handle_h3_request(
             (rm.proxy, rm.matched_prefix_len)
         }
         None => {
-            record_request(&state, 404);
+            record_h3_flavor_aware_reject(&state, http_flavor, 404);
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
@@ -1403,7 +1403,7 @@ async fn handle_h3_request(
     if let Some(ref allowed) = proxy.allowed_methods
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
     {
-        record_request(&state, 405);
+        record_h3_flavor_aware_reject(&state, http_flavor, 405);
         let allow_header = allowed.join(", ");
         let mut headers = HashMap::new();
         headers.insert("allow".to_string(), allow_header.clone());
@@ -1444,7 +1444,7 @@ async fn handle_h3_request(
     // the H1/H2 dispatch contract.
     if matches!(http_flavor, HttpFlavor::Grpc) && method != "POST" {
         warn!(method = %method, "Rejected HTTP/3 gRPC request: method must be POST");
-        record_request(&state, 400);
+        record_h3_flavor_aware_reject(&state, http_flavor, 400);
         send_h3_error_flavor_aware_with_policy(
             &mut stream,
             http_flavor,
@@ -1493,7 +1493,7 @@ async fn handle_h3_request(
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     tracing::error!("Plugin result could not be converted to rejection parts");
-                    record_request(&state, 500);
+                    record_h3_flavor_aware_reject(&state, http_flavor, 500);
                     run_h3_reject_response_committed_hooks(
                         &plugins,
                         &mut ctx,
@@ -1651,7 +1651,7 @@ async fn handle_h3_request(
         match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await {
             Ok(true) => {}
             Ok(false) => {
-                record_request(&state, 413);
+                record_h3_flavor_aware_reject(&state, http_flavor, 413);
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
@@ -1820,7 +1820,7 @@ async fn handle_h3_request(
             {
                 Ok(true) => {}
                 Ok(false) => {
-                    record_request(&state, 413);
+                    record_h3_flavor_aware_reject(&state, http_flavor, 413);
                     send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
@@ -1863,7 +1863,7 @@ async fn handle_h3_request(
 
         if let Some(body_data) = prebuffered_body_data.as_ref() {
             if body_limit > 0 && body_data.len() > body_limit {
-                record_request(&state, 413);
+                record_h3_flavor_aware_reject(&state, http_flavor, 413);
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
@@ -1899,7 +1899,7 @@ async fn handle_h3_request(
                 | reject @ PluginResult::RejectBinary { .. } => {
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
-                        record_request(&state, 500);
+                        record_h3_flavor_aware_reject(&state, http_flavor, 500);
                         run_h3_reject_response_committed_hooks(
                             &plugins,
                             &mut ctx,
@@ -2044,7 +2044,7 @@ async fn handle_h3_request(
         match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await {
             Ok(true) => {}
             Ok(false) => {
-                record_request(&state, 413);
+                record_h3_flavor_aware_reject(&state, http_flavor, 413);
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
@@ -2116,7 +2116,7 @@ async fn handle_h3_request(
                 | reject @ PluginResult::RejectBinary { .. } => {
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
-                        record_request(&state, 500);
+                        record_h3_flavor_aware_reject(&state, http_flavor, 500);
                         run_h3_reject_response_committed_hooks(
                             &plugins,
                             &mut ctx,
@@ -2226,7 +2226,7 @@ async fn handle_h3_request(
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
                         ctx.headers = tmp_headers;
-                        record_request(&state, 500);
+                        record_h3_flavor_aware_reject(&state, http_flavor, 500);
                         run_h3_reject_response_committed_hooks(
                             &plugins,
                             &mut ctx,
@@ -2412,7 +2412,7 @@ async fn handle_h3_request(
         && let Ok(len) = content_length.parse::<usize>()
         && len > content_length_limit
     {
-        record_request(&state, 413);
+        record_h3_flavor_aware_reject(&state, http_flavor, 413);
         send_h3_error_flavor_aware_with_policy(
             &mut stream,
             http_flavor,
@@ -2449,7 +2449,7 @@ async fn handle_h3_request(
     // frontend never carries a captured original destination. A Passthrough
     // upstream therefore round-robins here (with the existing warn).
     let routing_proxy = Arc::clone(&proxy);
-    let mut selection = crate::proxy::backend_dispatch::select_upstream_target(
+    let selection = crate::proxy::backend_dispatch::select_upstream_target(
         &proxy,
         &state,
         &epoch,
@@ -2457,13 +2457,13 @@ async fn handle_h3_request(
         &proxy_headers,
         None,
     );
-    let mut lb_hash_key = selection.lb_hash_key;
-    let mut upstream_target =
+    let lb_hash_key = selection.lb_hash_key;
+    let upstream_target =
         crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
             selection.target,
             request_host.as_deref(),
         );
-    let mut upstream_balancer = selection.balancer;
+    let upstream_balancer = selection.balancer;
     // Mirror H1/H2 selected-target policy: cap per-request retries, then build
     // an effective proxy carrying per-target DestinationRule-derived
     // connectionPool/TLS overrides for the FIRST selected target. That
@@ -2474,7 +2474,7 @@ async fn handle_h3_request(
     // WebSocket dial loop — re-resolves the effective proxy per attempt from
     // the capped but UNRESOLVED base proxy, so a later target does not inherit
     // the first target's port-level TLS/SNI/H1 policy.
-    let mut selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
+    let selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
         Arc::clone(&routing_proxy),
         upstream_target.as_deref(),
     );
@@ -2482,7 +2482,7 @@ async fn handle_h3_request(
         &selected_base_proxy,
         upstream_target.as_deref(),
     );
-    let mut proxy = match effective_proxy {
+    let proxy = match effective_proxy {
         std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
         std::borrow::Cow::Owned(owned) => Arc::new(owned),
     };
@@ -2542,7 +2542,6 @@ async fn handle_h3_request(
         }
         run_deferred_routing_headers = false;
 
-        let headers_before = proxy_headers.clone();
         // Deferral changes authorization order, not the client-path view that
         // before_proxy hooks received before a mesh backend rewrite.
         let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
@@ -2561,49 +2560,18 @@ async fn handle_h3_request(
             break;
         }
 
-        // Re-establish gateway-authenticated identity before a deferred
-        // function's headers can affect target selection or backend dispatch.
+        // Re-establish gateway-authenticated identity and egress baggage
+        // policy before a deferred function's headers can reach a backend.
+        // Keep the already-previewed target pinned across this external hook:
+        // header-based reselection could otherwise invoke the function before
+        // authorizing the backend-effective method it selected.
         crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
-
-        if proxy_headers != headers_before
-            && crate::proxy::backend_dispatch::upstream_selection_hash_key(
-                &routing_proxy,
-                &epoch,
-                &ctx.client_ip,
-                &proxy_headers,
-            ) != lb_hash_key
-        {
-            selection = crate::proxy::backend_dispatch::select_upstream_target(
-                &routing_proxy,
-                &state,
-                &epoch,
-                &ctx.client_ip,
-                &proxy_headers,
-                None,
-            );
-            lb_hash_key = selection.lb_hash_key;
-            upstream_target =
-                crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
-                    selection.target,
-                    request_host.as_deref(),
-                );
-            upstream_balancer = selection.balancer;
-            selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
-                Arc::clone(&routing_proxy),
-                upstream_target.as_deref(),
-            );
-            let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
-                &selected_base_proxy,
-                upstream_target.as_deref(),
-            );
-            proxy = match effective_proxy {
-                std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
-                std::borrow::Cow::Owned(owned) => Arc::new(owned),
-            };
-            ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
-        }
+        crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+            &mut proxy_headers,
+            &state.mesh_egress_strip_baggage_keys,
+        );
         // Always make one more pass after the routing-header hook so final
-        // enforcement charges only the settled backend-effective method.
+        // enforcement charges only the pinned backend-effective method.
     }
 
     if backend_path_is_policy_bound {
@@ -2625,12 +2593,16 @@ async fn handle_h3_request(
         }
         if matches!(deferred_result, PluginResult::Continue) {
             crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+                &mut proxy_headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
         }
         match deferred_result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                    record_request(&state, 500);
+                    record_h3_flavor_aware_reject(&state, http_flavor, 500);
                     run_h3_reject_response_committed_hooks(
                         &plugins,
                         &mut ctx,
@@ -2964,7 +2936,7 @@ async fn handle_h3_request(
                     cb_is_half_open_probe,
                 );
                 let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
-                    record_request(&state, 500);
+                    record_h3_flavor_aware_reject(&state, http_flavor, 500);
                     run_h3_reject_response_committed_hooks(
                         &plugins,
                         &mut ctx,
@@ -9560,6 +9532,7 @@ async fn send_h3_error_flavor_aware(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_h3_error_flavor_aware_with_policy(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     flavor: HttpFlavor,
@@ -9875,6 +9848,21 @@ fn record_request(state: &ProxyState, status: u16) {
     crate::runtime_metrics::global_ref().record_http_status(status);
 }
 
+/// Record the HTTP status actually emitted by a flavor-aware H3 rejection.
+/// Native gRPC and gRPC-Web errors carry their status in trailers (or a
+/// gRPC-Web trailer frame) and therefore use HTTP 200 on the wire.
+#[inline]
+fn record_h3_flavor_aware_reject(state: &ProxyState, flavor: HttpFlavor, http_status: u16) {
+    record_request(
+        state,
+        if matches!(flavor, HttpFlavor::Grpc) {
+            StatusCode::OK.as_u16()
+        } else {
+            http_status
+        },
+    );
+}
+
 #[cfg(test)]
 mod h3_request_body_timeout_tests {
     #[tokio::test]
@@ -9946,9 +9934,9 @@ mod native_h3_retry_refinement_tests {
             .expect("end of handle_h3_request not found");
         let handler = &handler_tail[..handler_end];
         assert!(handler.contains("(!has_retry || retry_response_needs_header_refinement)"));
-        assert!(handler.contains(
-            "http_flavor == HttpFlavor::Plain && !forces_reqwest_dispatch && backend_supports_native_h3"
-        ));
+        assert!(handler.contains("backend_http_flavor == HttpFlavor::Plain"));
+        assert!(handler.contains("&& !forces_reqwest_dispatch"));
+        assert!(handler.contains("&& backend_supports_native_h3;"));
         assert!(handler.contains("let refined_body_data = if has_retry"));
         assert!(handler.contains("body_data.clone()"));
 

@@ -499,24 +499,20 @@ pub(crate) fn response_content_type(original_ct: &str) -> &'static str {
     match grpc_web_media_type(original_ct) {
         Some(GrpcWebMediaType {
             mode: GrpcWebMode::Text,
-            proto_suffix,
-        }) => {
-            if proto_suffix {
-                "application/grpc-web-text+proto"
-            } else {
-                "application/grpc-web-text"
-            }
-        }
+            proto_suffix: true,
+        }) => "application/grpc-web-text+proto",
+        Some(GrpcWebMediaType {
+            mode: GrpcWebMode::Text,
+            proto_suffix: false,
+        }) => "application/grpc-web-text",
         Some(GrpcWebMediaType {
             mode: GrpcWebMode::Binary,
-            proto_suffix,
-        }) => {
-            if proto_suffix {
-                "application/grpc-web+proto"
-            } else {
-                "application/grpc-web"
-            }
-        }
+            proto_suffix: true,
+        }) => "application/grpc-web+proto",
+        Some(GrpcWebMediaType {
+            mode: GrpcWebMode::Binary,
+            proto_suffix: false,
+        }) => "application/grpc-web",
         None => {
             // Callers classify before reaching this mapper. Keep the fallback
             // fixed rather than reflecting an unrecognized Content-Type.

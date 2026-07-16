@@ -752,12 +752,9 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
                 Some("application/grpc-web+proto"),
                 "{version:?} {phase} content type"
             );
-            assert_eq!(
-                headers
-                    .get("grpc-status")
-                    .and_then(|value| value.parse::<u32>().ok()),
-                Some(*grpc_status),
-                "{version:?} {phase} grpc-status header"
+            assert!(
+                !headers.contains_key("grpc-status") && !headers.contains_key("grpc-message"),
+                "{version:?} {phase} terminal gRPC metadata must remain body-only"
             );
             assert_eq!(
                 body.first(),
@@ -2344,13 +2341,8 @@ async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
             .and_then(|value| value.to_str().ok()),
         Some("application/grpc-web+proto")
     );
-    assert_eq!(
-        response
-            .headers()
-            .get("grpc-status")
-            .and_then(|value| value.to_str().ok()),
-        Some("7")
-    );
+    assert!(!response.headers().contains_key("grpc-status"));
+    assert!(!response.headers().contains_key("grpc-message"));
     let body = response
         .into_body()
         .collect()

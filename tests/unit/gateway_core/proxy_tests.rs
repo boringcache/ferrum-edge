@@ -373,7 +373,10 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     assert!(source.contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"));
     assert!(source.contains("BackendPathPolicyPhase::Preview"));
     assert!(source.contains("BackendPathPolicyPhase::Enforce"));
-    assert!(source.contains("backend_dispatch::upstream_selection_hash_key("));
+    assert!(
+        !source.contains("backend_dispatch::upstream_selection_hash_key("),
+        "an external deferred hook must not reselect an unpreviewed target"
+    );
     assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
 
     let mirror = include_str!("../../../src/plugins/request_mirror.rs");
@@ -423,9 +426,14 @@ fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
         !handler[routed..protocol].contains("let grpc_web_response_content_type"),
         "route-level rejects must reuse the WebSocket-safe strict classification"
     );
-    assert!(handler.contains(
-        "finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));"
-    ));
+    assert!(handler.contains("finalize_grpc_web_error_response_headers("));
+    assert!(handler.contains("Some(&reject.headers)"));
+    let finalizer = source
+        .find("pub(crate) fn finalize_grpc_web_error_response_headers(")
+        .map(|start| &source[start..])
+        .expect("gRPC-Web error finalizer must remain present");
+    assert!(finalizer.contains("\"grpc-status\","));
+    assert!(finalizer.contains("\"grpc-message\","));
 }
 
 #[test]
@@ -484,20 +492,29 @@ fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
     let refresh = after_routing_hook
         .find("refresh_effective_backend_consumer_identity_headers(")
         .expect("identity headers must be refreshed after deferred routing hooks");
-    let hash_selection = after_routing_hook
-        .find("backend_dispatch::upstream_selection_hash_key(")
-        .expect("deferred headers must still drive target reselection");
+    let baggage_strip = after_routing_hook
+        .find("hbone_proxy::strip_egress_baggage_in_proxy_headers(")
+        .expect("egress baggage policy must run after deferred routing hooks");
+    let remaining_hook = after_routing_hook
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .expect("remaining deferred hook pass must remain present");
     assert!(
-        refresh < hash_selection,
-        "gateway identity must be restored before header-hash target selection"
+        refresh < baggage_strip && baggage_strip < remaining_hook,
+        "gateway identity and baggage policy must be restored before final enforcement"
+    );
+    assert!(
+        !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
+        "deferred headers must not steer the request to an unpreviewed target"
     );
 
-    let remaining_hook = source
-        .rfind("BackendPathBeforeProxyPass::RemainingDeferred")
-        .expect("remaining deferred hook pass must remain present");
+    let remaining_hook = routing_hook + remaining_hook;
     assert!(
         source[remaining_hook..].contains("refresh_effective_backend_consumer_identity_headers("),
         "gateway identity must be restored after every deferred hook pass"
+    );
+    assert!(
+        source[remaining_hook..].contains("hbone_proxy::strip_egress_baggage_in_proxy_headers("),
+        "egress baggage policy must be restored after every deferred hook pass"
     );
     assert!(
         source.contains("name.eq_ignore_ascii_case(\"x-consumer-username\")")

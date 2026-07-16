@@ -187,34 +187,6 @@ pub(crate) struct UpstreamSelection {
     pub sticky_cookie_needed: bool,
 }
 
-/// Recompute the hash key that initial upstream selection would use without
-/// advancing a round-robin/random selector. Deferred routing-header hooks use
-/// this to decide whether target selection and backend-path policy must run
-/// again after they mutate the outbound request headers.
-pub(crate) fn upstream_selection_hash_key(
-    proxy: &Proxy,
-    epoch: &RequestEpoch,
-    client_ip: &str,
-    proxy_headers: &HashMap<String, String>,
-) -> Option<String> {
-    let upstream_id = proxy.upstream_id.as_deref()?;
-    let balancers = &epoch.load_balancer;
-    let dispatch_port = initial_dispatch_port(
-        proxy,
-        LoadBalancerCache::initial_dispatch_port_override_from(balancers, upstream_id),
-    );
-    let has_port_override =
-        has_effective_port_override(proxy, balancers, upstream_id, dispatch_port);
-    let port_scope = has_port_override.then_some(dispatch_port);
-    let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
-        balancers,
-        upstream_id,
-        port_scope,
-        proxy.upstream_subset.as_deref(),
-    );
-    Some(resolve_hash_key(&strategy, client_ip, proxy_headers).0)
-}
-
 /// Whether a direct HTTP-family dial would bypass a target's required mesh
 /// transport.
 ///

@@ -244,13 +244,13 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         "H3 backend-path rejects must retain the client's gRPC-Web response encoding"
     );
     assert!(
-        source.contains("backend_dispatch::upstream_selection_hash_key("),
-        "H3 must re-evaluate header-hash routing after deferred header mutations"
+        !source.contains("backend_dispatch::upstream_selection_hash_key("),
+        "H3 external deferred hooks must not select an unpreviewed target"
     );
     assert!(
         policy_block.contains("BackendPathPolicyPhase::Preview")
             && policy_block.contains("BackendPathPolicyPhase::Enforce"),
-        "H3 must preview access before deferred routing and charge final policy only after it settles"
+        "H3 must preview access before deferred routing and charge final policy on the pinned path"
     );
     assert!(
         source.contains("BackendPathBeforeProxyPass::RemainingDeferred"),
@@ -336,13 +336,13 @@ fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
     assert!(
         detected < websocket_precedence
             && websocket_precedence < effective
-            && effective < post_guard
-            && post_guard < plugin_protocol
+            && effective < plugin_protocol
+            && plugin_protocol < post_guard
             && plugin_protocol < backend_flavor
             && backend_flavor <= translated_marker
             && plugin_protocol < bridge,
-        "wire classification, WebSocket precedence, policy promotion, POST policy, plugin \
-         selection, translation-aware backend flavor, and dispatch must stay in that order"
+        "wire classification, WebSocket precedence, policy promotion, route policy selection, \
+         POST policy, translation-aware backend flavor, and dispatch must stay in that order"
     );
     assert!(
         source[bridge..].contains("flavor: backend_http_flavor,"),
@@ -612,20 +612,53 @@ fn h3_deferred_hooks_cannot_spoof_backend_consumer_identity() {
     let refresh = after_routing_hook
         .find("refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers)")
         .expect("H3 must refresh identity after deferred routing hooks");
-    let hash_selection = after_routing_hook
-        .find("upstream_selection_hash_key(")
-        .expect("H3 deferred headers must still drive target reselection");
+    let baggage_strip = after_routing_hook
+        .find("strip_egress_baggage_in_map(")
+        .expect("H3 must reapply egress baggage policy after deferred routing hooks");
+    let remaining_hook = after_routing_hook
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .expect("H3 remaining deferred hook pass must remain present");
     assert!(
-        refresh < hash_selection,
-        "H3 must restore gateway identity before header-hash target selection"
+        refresh < baggage_strip && baggage_strip < remaining_hook,
+        "H3 must restore gateway identity and baggage policy before final enforcement"
+    );
+    assert!(
+        !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
+        "H3 deferred headers must not steer onto an unpreviewed target"
     );
 
-    let remaining_hook = source
-        .rfind("BackendPathBeforeProxyPass::RemainingDeferred")
-        .expect("H3 remaining deferred hook pass must remain present");
+    let remaining_hook = routing_hook + remaining_hook;
     assert!(
         source[remaining_hook..]
             .contains("refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers)"),
         "H3 must restore gateway identity after every deferred hook pass"
     );
+    assert!(
+        source[remaining_hook..].contains("strip_egress_baggage_in_map("),
+        "H3 must restore egress baggage policy after every deferred hook pass"
+    );
+}
+
+#[test]
+fn h3_flavor_aware_reject_metrics_match_the_http_wire_status() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let helper = source
+        .find("fn record_h3_flavor_aware_reject(")
+        .map(|start| &source[start..])
+        .expect("H3 flavor-aware metric helper must remain present");
+    assert!(helper.contains("matches!(flavor, HttpFlavor::Grpc)"));
+    assert!(helper.contains("StatusCode::OK.as_u16()"));
+
+    for (status, phase) in [
+        (404, "route miss"),
+        (405, "method reject"),
+        (413, "body reject"),
+    ] {
+        assert!(
+            source.contains(&format!(
+                "record_h3_flavor_aware_reject(&state, http_flavor, {status})"
+            )),
+            "H3 {phase} must record its normalized gRPC/gRPC-Web wire status"
+        );
+    }
 }
