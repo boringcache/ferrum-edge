@@ -169,10 +169,10 @@ pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
 /// One-shot handoff for requester-owned auth session state that changed before
 /// authentication attempts rejected. Distinct cookie storage keys are
 /// newline-joined; a later attempt replaces an earlier candidate with the same
-/// exact name/domain/path/partitioned scope. The authentication phase removes
-/// this key on every exit: it attaches the cookies only to the final rejection
-/// and discards them when a later credential succeeds. The key contains
-/// "cookie" so metadata serialization still redacts the sealed values
+/// exact name/domain/host-only/path/partitioned scope. The authentication phase
+/// removes this key on every exit: it attaches the cookies only to the final
+/// rejection and discards them when a later credential succeeds. The key
+/// contains "cookie" so metadata serialization still redacts the sealed values
 /// defensively.
 pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_set_cookie";
 
@@ -14524,8 +14524,11 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     PluginResult::Continue
 }
 
-/// Return the RFC 6265 cookie-name from a valid leading cookie-pair.
-/// Attributes and malformed cookie values are rejected.
+/// Return the RFC 6265 cookie-name from a browser-comparable leading
+/// cookie-pair. Keep the existing strict producer grammar for names, but use
+/// the user-agent value boundary: browsers accept non-control value syntax
+/// that producers are discouraged from emitting, including spaces, commas,
+/// quotes, and backslashes.
 fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     let cookie_pair = set_cookie
         .split_once(';')
@@ -14562,33 +14565,14 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
         return None;
     }
 
-    let value = if let Some(quoted) = value.strip_prefix('"') {
-        quoted.strip_suffix('"')?
-    } else {
-        value
-    };
-    if !value.bytes().all(|byte| {
-        matches!(
-            byte,
-            b'!' | b'#'..=b'+' | b'-'..=b':' | b'<'..=b'[' | b']'..=b'~'
-        )
-    }) {
+    // The first semicolon already terminated `cookie_pair`. Reject C0/DEL so
+    // malformed or header-injection-bearing values remain non-comparable,
+    // while retaining ownership for values a user agent can actually store.
+    if value.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
         return None;
     }
 
     Some(name)
-}
-
-#[derive(Clone, Copy)]
-struct SetCookieDomain<'a> {
-    value: &'a str,
-    trailing_dot: bool,
-}
-
-impl<'a> SetCookieDomain<'a> {
-    fn same_domain(self, other: SetCookieDomain<'_>) -> bool {
-        self.trailing_dot == other.trailing_dot && self.value.eq_ignore_ascii_case(other.value)
-    }
 }
 
 /// RFC 6265 ignores one leading dot on Domain attributes and compares the
@@ -14596,7 +14580,7 @@ impl<'a> SetCookieDomain<'a> {
 /// RFC 3986 reg-name and bracketed IP-literal forms at request admission, so
 /// apply the same validation here instead of narrowing comparable cookie
 /// scopes to LDH names.
-fn canonical_set_cookie_domain(domain: &str) -> Option<SetCookieDomain<'_>> {
+fn canonical_set_cookie_domain(domain: &str) -> Option<&str> {
     let domain = domain.strip_prefix('.').unwrap_or(domain);
     let valid_ip_literal = domain
         .strip_prefix('[')
@@ -14605,10 +14589,7 @@ fn canonical_set_cookie_domain(domain: &str) -> Option<SetCookieDomain<'_>> {
     if domain.ends_with('.') || (!is_valid_reg_name(domain) && !valid_ip_literal) {
         return None;
     }
-    Some(SetCookieDomain {
-        value: domain,
-        trailing_dot: false,
-    })
+    Some(domain)
 }
 
 fn valid_set_cookie_path(path: &str) -> bool {
@@ -14625,43 +14606,22 @@ fn default_set_cookie_path(request_path: &str) -> &str {
     }
 }
 
-fn request_cookie_default_domain(ctx: &RequestContext) -> Option<SetCookieDomain<'_>> {
-    if let Some(host) = ctx
-        .request_authority
-        .as_deref()
-        .and_then(split_request_authority)
-        .map(|(host, _)| host)
-    {
-        return Some(SetCookieDomain {
-            value: host,
-            trailing_dot: ctx.request_host_had_trailing_dot,
-        });
-    }
-
-    ctx.raw_header_get("host")
-        .and_then(split_request_authority)
-        .map(|(host, _)| SetCookieDomain {
-            value: host.strip_suffix('.').unwrap_or(host),
-            trailing_dot: host.ends_with('.'),
-        })
-}
-
 struct SetCookieStorageKey<'a> {
     name: &'a str,
-    domain: Option<SetCookieDomain<'a>>,
+    domain: Option<&'a str>,
     path: &'a str,
     host_only: bool,
     partitioned: bool,
 }
 
-/// Return the effective RFC 6265 cookie storage key. Omitted Domain attributes
-/// use the request host, while omitted, empty, or non-absolute Path attributes
-/// use the request path's default directory. Host-only and Partitioned cookies
+/// Return the effective RFC 6265 cookie storage key. All compared lines belong
+/// to one response, so host-only cookies share the same request host without
+/// copying it into the key. Omitted, empty, or non-absolute Path attributes use
+/// the request path's default directory. Host-only and Partitioned cookies
 /// remain independent from otherwise equivalent domain and unpartitioned
 /// cookies.
 fn set_cookie_storage_key<'a>(
     set_cookie: &'a str,
-    default_domain: Option<SetCookieDomain<'a>>,
     default_path: &'a str,
 ) -> Option<SetCookieStorageKey<'a>> {
     let name = set_cookie_name(set_cookie)?;
@@ -14670,9 +14630,18 @@ fn set_cookie_storage_key<'a>(
     let mut partitioned = false;
 
     for attribute in set_cookie.split(';').skip(1) {
-        let attribute = attribute.trim();
+        let attribute = attribute.trim_matches([' ', '\t']);
+        // User agents reject control-bearing cookie attributes. Do not treat a
+        // hostile Path control as ordinary invalid syntax and resolve it to the
+        // default path, which could suppress a valid staged cleanup cookie.
+        if attribute.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+            return None;
+        }
         let (attribute_name, attribute_value) = match attribute.split_once('=') {
-            Some((name, value)) => (name.trim(), Some(value.trim())),
+            Some((name, value)) => (
+                name.trim_matches([' ', '\t']),
+                Some(value.trim_matches([' ', '\t'])),
+            ),
             None => (attribute, None),
         };
         if attribute_name.eq_ignore_ascii_case("partitioned") {
@@ -14695,7 +14664,7 @@ fn set_cookie_storage_key<'a>(
     // default path. Other malformed domain forms remain non-comparable.
     let (domain, host_only) = match domain_attribute {
         Some(domain) => (Some(canonical_set_cookie_domain(domain)?), false),
-        None => (default_domain, true),
+        None => (None, true),
     };
     let path = match path_attribute {
         Some(path) if valid_set_cookie_path(path) => path,
@@ -14714,14 +14683,12 @@ fn set_cookie_storage_key<'a>(
 fn set_cookie_same_storage_key(
     existing: &str,
     candidate: &str,
-    default_domain: Option<SetCookieDomain<'_>>,
     default_path: &str,
 ) -> bool {
-    let Some(existing_key) = set_cookie_storage_key(existing, default_domain, default_path) else {
+    let Some(existing_key) = set_cookie_storage_key(existing, default_path) else {
         return false;
     };
-    let Some(candidate_key) = set_cookie_storage_key(candidate, default_domain, default_path)
-    else {
+    let Some(candidate_key) = set_cookie_storage_key(candidate, default_path) else {
         return false;
     };
 
@@ -14731,7 +14698,7 @@ fn set_cookie_same_storage_key(
         && existing_key.partitioned == candidate_key.partitioned
         && match (existing_key.domain, candidate_key.domain) {
             (Some(existing_domain), Some(candidate_domain)) => {
-                existing_domain.same_domain(candidate_domain)
+                existing_domain.eq_ignore_ascii_case(candidate_domain)
             }
             (None, None) => true,
             _ => false,
@@ -14744,13 +14711,12 @@ fn set_cookie_same_storage_key(
 fn collect_later_set_cookies(
     cookies: &mut Vec<String>,
     joined: &str,
-    default_domain: Option<SetCookieDomain<'_>>,
     default_path: &str,
 ) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
         if let Some(index) = cookies.iter().position(|existing| {
             existing == candidate
-                || set_cookie_same_storage_key(existing, candidate, default_domain, default_path)
+                || set_cookie_same_storage_key(existing, candidate, default_path)
         }) {
             cookies.remove(index);
         }
@@ -14761,25 +14727,23 @@ fn collect_later_set_cookies(
 fn set_cookie_conflicts(
     cookies: &[String],
     candidate: &str,
-    default_domain: Option<SetCookieDomain<'_>>,
     default_path: &str,
 ) -> bool {
     cookies.iter().any(|existing| {
         existing == candidate
-            || set_cookie_same_storage_key(existing, candidate, default_domain, default_path)
+            || set_cookie_same_storage_key(existing, candidate, default_path)
     })
 }
 
 /// Stage requester-owned cookies from rejecting auth attempts. This remains on
 /// the rejection path: successful authentication only removes the metadata.
 pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
-    let default_domain = request_cookie_default_domain(ctx);
     let default_path = default_set_cookie_path(&ctx.path);
     let mut staged = Vec::new();
     if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
-        collect_later_set_cookies(&mut staged, existing, default_domain, default_path);
+        collect_later_set_cookies(&mut staged, existing, default_path);
     }
-    collect_later_set_cookies(&mut staged, &cookie, default_domain, default_path);
+    collect_later_set_cookies(&mut staged, &cookie, default_path);
 
     if staged.is_empty() {
         ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
@@ -14798,7 +14762,6 @@ fn attach_auth_rejection_set_cookie(
     let Some(staged) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
         return;
     };
-    let default_domain = request_cookie_default_domain(ctx);
     let default_path = default_set_cookie_path(&ctx.path);
 
     // A custom plugin can return multiple case variants because rejection
@@ -14816,16 +14779,16 @@ fn attach_auth_rejection_set_cookie(
 
     let mut merged = Vec::new();
     for (_, value) in selected_variants {
-        collect_later_set_cookies(&mut merged, &value, default_domain, default_path);
+        collect_later_set_cookies(&mut merged, &value, default_path);
     }
 
     let mut staged_cookies = Vec::new();
-    collect_later_set_cookies(&mut staged_cookies, &staged, default_domain, default_path);
+    collect_later_set_cookies(&mut staged_cookies, &staged, default_path);
     for candidate in staged_cookies {
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
         // independently scoped requester-owned cookies from earlier rejects.
-        if !set_cookie_conflicts(&merged, &candidate, default_domain, default_path) {
+        if !set_cookie_conflicts(&merged, &candidate, default_path) {
             merged.push(candidate);
         }
     }
@@ -15387,15 +15350,9 @@ async fn handle_proxy_request_inner(
     // HTTP/1.1 uses the Host header; HTTP/2 uses the :authority pseudo-header
     // (exposed via req.uri().authority()). Strip port if present and lowercase.
     // Uses raw_header_get() to avoid materializing the full HashMap.
-    let raw_host = if req.version() == hyper::Version::HTTP_2 {
-        req.uri()
-            .authority()
-            .map(|authority| authority.as_str())
-            .or_else(|| ctx.raw_header_get("host"))
-    } else {
-        ctx.raw_header_get("host")
-            .or_else(|| req.uri().authority().map(|authority| authority.as_str()))
-    };
+    let raw_host = ctx
+        .raw_header_get("host")
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
     // One `split_request_authority` pass yields both the routing host (port
     // stripped, as before) and the request's EXPLICIT authority port —
     // consumed only by mesh inbound multi-port sibling selection below, where
@@ -15403,11 +15360,9 @@ async fn handle_proxy_request_inner(
     // port. `is_valid_port` already bounded it to u16, so the parse is
     // infallible for any authority that got this far.
     let mut authority_port: Option<u16> = None;
-    let mut request_host_had_trailing_dot = false;
     let request_host: Option<String> = match raw_host {
         Some(h) => match split_request_authority(h) {
             Some((host, port)) => {
-                request_host_had_trailing_dot = host.ends_with('.');
                 let normalized = normalize_authority_host(host);
                 if normalized.is_empty() {
                     warn!("Rejected request: malformed Host/authority value");
@@ -15437,7 +15392,6 @@ async fn handle_proxy_request_inner(
             Some(if is_tls { "https" } else { "http" }),
         )
     });
-    ctx.request_host_had_trailing_dot = request_host_had_trailing_dot;
     ctx.request_authority = request_authority;
 
     // Classify before routing so route/method rejects can use the client's wire
@@ -24568,10 +24522,6 @@ fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
 fn normalize_authority_host(host: &str) -> String {
     let normalized = host.strip_suffix('.').unwrap_or(host);
     normalized.to_ascii_lowercase()
-}
-
-pub(crate) fn request_authority_host_has_trailing_dot(value: &str) -> bool {
-    split_request_authority(value).is_some_and(|(host, _)| host.ends_with('.'))
 }
 
 /// The `:authority` a multi-port Sidecar egress request sends to the peer's

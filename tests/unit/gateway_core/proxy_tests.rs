@@ -446,30 +446,6 @@ fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
 }
 
 #[test]
-fn test_h2_request_origin_prefers_uri_authority_before_host_header() {
-    let source = include_str!("../../../src/proxy/mod.rs");
-    let handler = source
-        .find("async fn handle_proxy_request_inner(")
-        .map(|start| &source[start..])
-        .expect("H1/H2 request handler must remain present");
-    let selection = handler
-        .find("let raw_host = if req.version() == hyper::Version::HTTP_2 {")
-        .map(|start| &handler[start..])
-        .expect("HTTP/2 request-origin authority selection must remain explicit");
-    let uri_authority = selection
-        .find("req.uri()")
-        .expect("HTTP/2 must inspect the request URI authority");
-    let host_fallback = selection
-        .find(".or_else(|| ctx.raw_header_get(\"host\"))")
-        .expect("HTTP/2 may fall back to Host when :authority is absent");
-
-    assert!(
-        uri_authority < host_fallback,
-        "HTTP/2 :authority must own cookie-origin trailing-dot semantics"
-    );
-}
-
-#[test]
 fn test_backend_path_bound_retries_preflight_before_backoff() {
     let source = include_str!("../../../src/proxy/mod.rs");
 
@@ -1276,7 +1252,6 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
             "GET".to_string(),
             "/mixed-cookie-rejection".to_string(),
         );
-        ctx.request_authority = Some("example.com:8443".to_string());
         let (status_code, body, headers) =
             run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
                 .await
@@ -1329,15 +1304,6 @@ async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
         "GET".to_string(),
         "/cookie-scope".to_string(),
     );
-    ctx.request_authority = Some("example.com".to_string());
-    let mut raw_headers = hyper::HeaderMap::new();
-    raw_headers.insert(
-        hyper::header::HOST,
-        hyper::header::HeaderValue::from_static("example.com."),
-    );
-    ctx.set_raw_headers(raw_headers);
-    ctx.request_host_had_trailing_dot = true;
-    ctx.materialize_headers();
 
     let (_, _, headers) =
         run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
@@ -1367,8 +1333,6 @@ async fn test_auth_rejection_cookie_storage_key_preserves_host_only_state() {
         "GET".to_string(),
         "/cookie-scope".to_string(),
     );
-    ctx.request_authority = Some("example.com".to_string());
-
     let (_, _, headers) =
         run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
             .await
@@ -1377,6 +1341,64 @@ async fn test_auth_rejection_cookie_storage_key_preserves_host_only_state() {
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some("session=selected; Domain=example.com; Path=/\nsession=staged; Path=/")
+    );
+}
+
+#[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_matches_user_agent_value_parsing() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "space=staged value; Path=/\ncomma=staged,value; Path=/\nquote=staged\"value; Path=/\nbackslash=staged\\value; Path=/\nunbalanced=staged; Path=/\ncontrol=staged; Path=/\ncarriage=staged; Path=/\ntab=staged; Path=/\ndel=staged; Path=/\npath_control=staged; Path=/",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "space=selected value; Path=/\ncomma=selected,value; Path=/\nquote=selected\"value; Path=/\nbackslash=selected\\value; Path=/\nunbalanced=\"selected; Path=/\ncontrol=selected\u{001f}value; Path=/\ncarriage=selected\rvalue; Path=/\ntab=selected\tvalue; Path=/\ndel=selected\u{007f}value; Path=/\npath_control=selected; Path=/app\rignored",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cookie-scope".to_string(),
+    );
+
+    let (_, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("both auth attempts must reject");
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(
+            "space=selected value; Path=/\ncomma=selected,value; Path=/\nquote=selected\"value; Path=/\nbackslash=selected\\value; Path=/\nunbalanced=\"selected; Path=/\ncontrol=selected\u{001f}value; Path=/\ncarriage=selected\rvalue; Path=/\ntab=selected\tvalue; Path=/\ndel=selected\u{007f}value; Path=/\npath_control=selected; Path=/app\rignored\ncontrol=staged; Path=/\ncarriage=staged; Path=/\ntab=staged; Path=/\ndel=staged; Path=/\npath_control=staged; Path=/"
+        )
+    );
+}
+
+#[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_uses_non_root_default_path_and_cookie_ows() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "same=staged; Path=/app\nroot=staged; Path=/\nslash=staged; Path=/app/\nnbsp=staged; Path=/app",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "same=selected\nroot=selected\nslash=selected\nnbsp=selected; Path=\u{00a0}/ignored",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/app/login".to_string(),
+    );
+
+    let (_, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("both auth attempts must reject");
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(
+            "same=selected\nroot=selected\nslash=selected\nnbsp=selected; Path=\u{00a0}/ignored\nroot=staged; Path=/\nslash=staged; Path=/app/"
+        )
     );
 }
 

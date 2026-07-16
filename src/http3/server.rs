@@ -1290,8 +1290,6 @@ async fn handle_h3_request(
     let request_authority = raw_host.and_then(|authority| {
         crate::proxy::normalize_request_authority_for_signing(authority, Some("https"))
     });
-    ctx.request_host_had_trailing_dot =
-        raw_host.is_some_and(crate::proxy::request_authority_host_has_trailing_dot);
     ctx.request_authority = request_authority;
 
     let epoch = state.request_epoch.load();
