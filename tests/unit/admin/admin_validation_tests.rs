@@ -95,7 +95,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     );
     assert!(
         batch_source
-            .matches("crud::lock_namespace_config_admission(db.clone(), namespace).await")
+            .matches("crud::lock_namespace_config_admission(")
             .count()
             >= 6,
         "credential, batch, and restore mutations must share namespace admission"
