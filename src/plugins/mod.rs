@@ -757,6 +757,10 @@ pub struct RequestContext {
     /// stats staged by `before_proxy`. Kept out of public metadata so a staged
     /// prompt copy and prompt-derived digest cannot enter transaction logs.
     pub(crate) ai_prompt_compressor_staged: HashMap<u64, ai_prompt_compressor::StagedCompression>,
+    /// Incoming request path captured once by the first auto-family compressor
+    /// before backend routing can rewrite `path`. All compressor instances share
+    /// this single bounded snapshot, and public metadata cannot spoof it.
+    pub(crate) ai_prompt_compressor_classification_path: Option<String>,
     /// Whether the authoritative wire transform has reset provisional
     /// `before_proxy` compressor counters for this request.
     pub(crate) ai_prompt_compressor_wire_stats_started: bool,
@@ -1083,6 +1087,7 @@ impl RequestContext {
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
             ai_prompt_compressor_staged: HashMap::new(),
+            ai_prompt_compressor_classification_path: None,
             ai_prompt_compressor_wire_stats_started: false,
             gateway_response_compression_algorithm: None,
             response_stream_id: None,
@@ -1185,12 +1190,13 @@ impl RequestContext {
 
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
-    /// transforms. The compressor's private staged representation is moved
-    /// into this context so the authoritative wire transform can consume it
-    /// without recomputing or retaining a prompt-sized copy on the real
-    /// context. Only `metadata` and selected policy state are copied back by
-    /// the proxy caller, so this deliberately skips raw headers, raw query
-    /// strings, parsed query maps, prebuffered body bytes, and mirror receivers.
+    /// transforms. The compressor's private staged representation and incoming
+    /// classification path are moved into this context so the authoritative
+    /// wire transform can consume them without recomputing or retaining a
+    /// prompt-sized copy on the real context. Only `metadata` and selected
+    /// policy state are copied back by the proxy caller, so this deliberately
+    /// skips raw headers, raw query strings, parsed query maps, prebuffered body
+    /// bytes, and mirror receivers.
     pub(crate) fn clone_for_final_request_body_hooks(&mut self) -> Self {
         Self {
             client_ip: self.client_ip.clone(),
@@ -1243,6 +1249,9 @@ impl RequestContext {
             // stage. The final wire hook consumes it from this compatibility
             // context, while the live context no longer retains a second copy.
             ai_prompt_compressor_staged: std::mem::take(&mut self.ai_prompt_compressor_staged),
+            ai_prompt_compressor_classification_path: std::mem::take(
+                &mut self.ai_prompt_compressor_classification_path,
+            ),
             ai_prompt_compressor_wire_stats_started: std::mem::take(
                 &mut self.ai_prompt_compressor_wire_stats_started,
             ),

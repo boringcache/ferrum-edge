@@ -156,11 +156,16 @@ plugin stages results of at most 65,536 bytes privately and reuses them when the
 authoritative input is unchanged; larger results are not duplicated beside
 request metadata and are recomputed on normal wire dispatch under the same work
 budget. If an earlier wire transform changed the bytes, the plugin discards any
-stage and recomputes against the actual representation. Opt-in gzip/brotli
-decompression therefore compresses and measures the resulting plaintext on the
-standard path. Compressed client uploads cannot be compressed for direct
-`ai_federation` dispatch because federation returns before request-body
-transforms run; use the standard backend-dispatch path for that combination.
+stage and recomputes against the actual representation. Auto-family admission
+continues to use the original incoming operation path even when routing rewrites
+the backend path, so staged reuse, recomputation, and the 65,536-byte threshold
+cannot change eligibility. The path snapshot is one private typed value per
+request, shared by all compressor instances rather than stored in public
+metadata. Opt-in gzip/brotli decompression therefore compresses and measures the
+resulting plaintext on the standard path. Compressed client uploads cannot be
+compressed for direct `ai_federation` dispatch because federation returns before
+request-body transforms run; use the standard backend-dispatch path for that
+combination.
 
 If `ai_prompt_shield` is redacting, the compressor operates on the already
 redacted text, so redaction is preserved and then compressed.

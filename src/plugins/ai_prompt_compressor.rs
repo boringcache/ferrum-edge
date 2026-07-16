@@ -49,7 +49,8 @@
 //!   earlier transform's final bytes. Larger direct-dispatch bodies retain only
 //!   their metadata representation. This hook produces the bytes actually sent
 //!   upstream and replaces provisional counters with authoritative wire
-//!   counters.
+//!   counters. Auto-family classification always uses the original incoming
+//!   path captured before routing can rewrite the backend path.
 //!   Compression is gated to POST requests: the context-aware variant checks
 //!   `ctx.method` (H1/H2 and the H3 cross-protocol bridge), and the no-context
 //!   compatibility variant requires explicit `:method` and `:path` pseudo-
@@ -474,6 +475,30 @@ impl AiPromptCompressor {
         self.compress_roles
             .iter()
             .any(|candidate| role.eq_ignore_ascii_case(candidate))
+    }
+
+    /// Keep auto-family admission tied to the client-visible operation even
+    /// after a routing plugin rebases `ctx.path` for backend dispatch. The
+    /// snapshot is typed private state, shared across every configured instance,
+    /// and therefore neither attacker-spoofable nor proportional to instance
+    /// count. Fixed families intentionally need no path classification.
+    fn preserve_classification_path(&self, ctx: &mut RequestContext) {
+        if self.request_family == RequestFamilyPolicy::Auto
+            && ctx.ai_prompt_compressor_classification_path.is_none()
+        {
+            ctx.ai_prompt_compressor_classification_path = Some(ctx.path.clone());
+        }
+    }
+
+    fn classification_path<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
+        match self.request_family {
+            RequestFamilyPolicy::Auto => Some(
+                ctx.ai_prompt_compressor_classification_path
+                    .as_deref()
+                    .unwrap_or(ctx.path.as_str()),
+            ),
+            RequestFamilyPolicy::ChatCompletions | RequestFamilyPolicy::TextCompletions => None,
+        }
     }
 
     /// Walk the admitted request family, compressing eligible prompt text in
@@ -981,6 +1006,7 @@ impl Plugin for AiPromptCompressor {
         if ctx.method != "POST" {
             return PluginResult::Continue;
         }
+        self.preserve_classification_path(ctx);
         let content_type = headers
             .get("content-type")
             .map(String::as_str)
@@ -1003,7 +1029,10 @@ impl Plugin for AiPromptCompressor {
         }
         let source_len = body.len();
 
-        if let Some(compression) = self.compress_body(body.as_bytes(), Some(&ctx.path)).await {
+        if let Some(compression) = self
+            .compress_body(body.as_bytes(), self.classification_path(ctx))
+            .await
+        {
             // Direct dispatchers consume the metadata representation and can
             // await a provider without ever running body transforms. Retain a
             // second representation only below a strict ceiling; larger bodies
@@ -1096,7 +1125,12 @@ impl Plugin for AiPromptCompressor {
         }
 
         let compression = self
-            .compress_wire_body(body, content_type, request_headers, Some(&ctx.path))
+            .compress_wire_body(
+                body,
+                content_type,
+                request_headers,
+                self.classification_path(ctx),
+            )
             .await?;
         record_stats_metadata(ctx, self.instance_id, &compression.stats);
         Some(compression.output)

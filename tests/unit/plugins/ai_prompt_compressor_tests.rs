@@ -794,6 +794,116 @@ async fn before_proxy_rewrites_metadata_and_records_stats() {
 }
 
 #[tokio::test]
+async fn auto_family_uses_incoming_path_for_staged_and_recomputed_wire_bodies() {
+    let plugin = compressor(5, 0.5);
+    let incoming_text = long_prompt_text();
+    let incoming_body = chat_body("user", &incoming_text);
+    let changed_text = format!(
+        "{} {}",
+        incoming_text,
+        "authoritative transformed representation terminology ".repeat(8)
+    );
+
+    for final_body in [incoming_body.clone(), chat_body("user", &changed_text)] {
+        let mut ctx = post_ctx(&incoming_body);
+        // Public metadata is attacker-influenced plugin state and must never be
+        // authoritative for request-family admission.
+        ctx.metadata.insert(
+            "ai_prompt_compressor.classification_path".to_string(),
+            "/v1/images/generations".to_string(),
+        );
+        let mut headers = json_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+        // Mirrors mesh_route_dispatch applying its staged rewrite after the
+        // complete before_proxy chain.
+        ctx.path = "/internal/provider/generate".to_string();
+        let final_bytes = serde_json::to_vec(&final_body).unwrap();
+        let output = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &final_bytes,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .expect("route rewrite must not change auto-family eligibility");
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+        assert!(
+            first_message_content(&parsed).len() < first_message_content(&final_body).len(),
+            "both staged reuse and changed-body recomputation must compress"
+        );
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_prompt_compressor.classification_path"),
+            "classification state must not survive in public metadata"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fixed_family_remains_eligible_across_custom_route_rewrites() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "request_family": "chat_completions",
+        "min_content_tokens": 5,
+        "target_ratio": 0.5
+    }))
+    .unwrap();
+    let incoming_body = chat_body("user", &long_prompt_text());
+    let mut ctx = post_ctx(&incoming_body);
+    ctx.path = "/custom/incoming/chat".to_string();
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    ctx.path = "/custom/backend/generate".to_string();
+    let changed_body = chat_body(
+        "user",
+        &format!(
+            "{} {}",
+            long_prompt_text(),
+            "body transformer output terminology ".repeat(8)
+        ),
+    );
+    let changed_bytes = serde_json::to_vec(&changed_body).unwrap();
+    let output = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &changed_bytes,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("fixed family must remain independent of incoming and backend paths");
+    let parsed: Value = serde_json::from_slice(&output).unwrap();
+    assert!(first_message_content(&parsed).len() < first_message_content(&changed_body).len());
+}
+
+#[tokio::test]
+async fn auto_family_does_not_gain_eligibility_from_backend_route_rewrite() {
+    let plugin = compressor(5, 0.5);
+    let body = chat_body("user", &long_prompt_text());
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    ctx.path = "/custom/incoming/generate".to_string();
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    ctx.path = "/v1/chat/completions".to_string();
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &raw,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "a backend rewrite to a standard path must not admit a custom incoming operation"
+    );
+}
+
+#[tokio::test]
 async fn large_metadata_rewrite_still_produces_wire_body_beyond_stage_cap() {
     let plugin = compressor(1, 0.9);
     let words = (0..10_000)
@@ -817,6 +927,7 @@ async fn large_metadata_rewrite_still_produces_wire_body_beyond_stage_cap() {
         ctx.metadata["request_body"].len() > 65_536,
         "fixture must exercise the no-large-private-stage path"
     );
+    ctx.path = "/internal/provider/generate".to_string();
 
     let wire = plugin
         .transform_request_body_with_context(
@@ -876,6 +987,13 @@ async fn multiple_instances_keep_distinct_final_wire_stats() {
 
     assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
     assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !ctx.metadata
+            .keys()
+            .any(|key| key.contains("classification_path")),
+        "shared request-family state must stay out of per-instance metadata"
+    );
+    ctx.path = "/internal/provider/generate".to_string();
     let first_wire = first
         .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
         .await
@@ -936,6 +1054,7 @@ async fn decompressed_gzip_and_brotli_record_authoritative_wire_stats() {
 
         assert_continue(decompressor.before_proxy(&mut ctx, &mut headers).await);
         assert_continue(compressor.before_proxy(&mut ctx, &mut headers).await);
+        ctx.path = "/internal/provider/generate".to_string();
         let decoded = decompressor
             .transform_request_body_with_context(
                 &mut ctx,
