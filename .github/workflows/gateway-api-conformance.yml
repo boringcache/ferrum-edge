@@ -29,14 +29,13 @@ on:
 permissions:
   contents: read
 
-# PRs and main pushes get independent lanes so current CI mirrors do not queue
+# PRs and main pushes get independent lanes so required checks do not queue
 # behind stale labs for older SHAs. Scheduled/manual runs keep sharing one lane
 # for lab budget.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('gateway-api-conformance-pr-{0}', github.event.pull_request.number) || (github.event_name == 'push' && format('gateway-api-conformance-{0}', github.ref) || 'gateway-api-conformance-shared') }}
-  # Cancel a superseded PR/main lab on rapid re-push (its mirror in ci.yml is
-  # already cancelled, so nothing reads the stale run). Scheduled and manual
-  # runs share one lane and must run to completion for lab budget.
+  # Cancel a superseded PR/main lab on rapid re-push. Scheduled and manual runs
+  # share one lane and must run to completion for lab budget.
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 env:
@@ -225,9 +224,14 @@ jobs:
             exit 1
           fi
 
-          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
+          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
             echo "Skipped full conformance: no Gateway API, controller, data-plane, routing, chart, image, proto, script, dependency, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
             exit 0
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
+            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
           if [ "${{ needs.gateway-api-conformance.result }}" != "success" ]; then
