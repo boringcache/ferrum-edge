@@ -845,19 +845,21 @@ async fn run_tcp_throttle_cross_process_admission_mongodb() {
         "enabled": true,
         "config": {"max_connections_per_key": 1}
     });
+    let proxy_url = format!("{}/proxies", harness.admin_a);
+    let throttle_url = format!("{}/plugins/config", harness.admin_b);
 
     let (proxy_response, throttle_response) = tokio::join!(
         admin_request(
             &client,
             reqwest::Method::POST,
-            &format!("{}/proxies", harness.admin_a),
+            &proxy_url,
             Some(&namespace),
             Some(&proxy),
         ),
         admin_request(
             &client,
             reqwest::Method::POST,
-            &format!("{}/plugins/config", harness.admin_b),
+            &throttle_url,
             Some(&namespace),
             Some(&throttle),
         )
