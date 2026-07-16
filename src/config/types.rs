@@ -5054,9 +5054,7 @@ impl CountryMmdbCache {
         &mut self,
         paths: &HashSet<PathBuf>,
     ) -> Option<CountryMmdbGenerationHandoff> {
-        let Some(generation) = self.accepted_validation_generation.take() else {
-            return None;
-        };
+        let generation = self.accepted_validation_generation.take()?;
         let matching_generation = self
             .validation_handoffs
             .get(&generation)

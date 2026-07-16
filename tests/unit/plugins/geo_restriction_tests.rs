@@ -3,8 +3,9 @@ use chrono::Utc;
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::config::types::{
-    GatewayConfig, MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES, MAX_COUNTRY_MMDB_SIZE_BYTES,
-    PluginConfig, PluginScope, default_namespace, load_validated_country_mmdb, validate_mmdb_file,
+    CURRENT_CONFIG_VERSION, GatewayConfig, MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES,
+    MAX_COUNTRY_MMDB_SIZE_BYTES, PluginConfig, PluginScope, default_namespace,
+    load_validated_country_mmdb, validate_mmdb_file,
 };
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
 use ferrum_edge::plugins::{
@@ -841,6 +842,7 @@ async fn delta_budget_counts_retained_and_rebuilt_mmdb_snapshots() {
     let second_path = write_fixture(&directory, "country-two.mmdb", &original_bytes);
     let timestamp = "2026-01-01T00:00:00Z";
     let mut config: GatewayConfig = serde_json::from_value(json!({
+        "version": CURRENT_CONFIG_VERSION,
         "proxies": [
             {
                 "id": "p1",
