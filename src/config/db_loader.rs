@@ -7435,10 +7435,8 @@ impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
         namespace: &str,
         owner: &str,
     ) -> Result<bool, anyhow::Error> {
-        let sql = self.q(
-            "UPDATE config_admission_locks SET expires_at = 0 \
-             WHERE namespace = ? AND owner = ?",
-        );
+        let sql = self.q("UPDATE config_admission_locks SET expires_at = 0 \
+             WHERE namespace = ? AND owner = ?");
         let result = sqlx::query(&sql)
             .bind(namespace)
             .bind(owner)

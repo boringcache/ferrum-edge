@@ -3321,9 +3321,7 @@ mod inner {
             };
             match result {
                 Ok(Some(document)) if document.get_str("owner").ok() == Some(owner) => {
-                    let generation = document
-                        .get_i64("generation")
-                        .map_err(anyhow::Error::new)?;
+                    let generation = document.get_i64("generation").map_err(anyhow::Error::new)?;
                     Ok(Some(u64::try_from(generation).map_err(|_| {
                         anyhow::anyhow!("namespace config admission generation is negative")
                     })?))
