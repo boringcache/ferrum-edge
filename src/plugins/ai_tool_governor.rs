@@ -1244,7 +1244,7 @@ impl AiToolGovernor {
         CorrelationMeta {
             request_id: ctx
                 .metadata
-                .get("correlation_id")
+                .get(super::REQUEST_ID_METADATA_KEY)
                 .cloned()
                 .unwrap_or_default(),
             consumer: ctx.effective_identity().map(str::to_string),

@@ -354,6 +354,18 @@ impl Plugin for PriorityOverridePlugin {
             .on_backend_path_resolved(ctx, backend_path, phase)
             .await
     }
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner.apply_websocket_handshake_response_headers(
+            ctx,
+            response_status,
+            response_headers,
+        );
+    }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();
     }

@@ -1179,8 +1179,10 @@ pub(crate) async fn handle_h3_websocket(
     // are HTTP/1.1 only). The QUIC stream becomes the WebSocket
     // transport as soon as the client sees the 200.
     let mut response_headers = HashMap::new();
-    crate::proxy::finalize_websocket_response_headers(
-        &initial_response_header_policy_plugins,
+    crate::proxy::finalize_successful_websocket_response_headers(
+        &plugins,
+        &ctx,
+        StatusCode::OK.as_u16(),
         &mut response_headers,
     );
 

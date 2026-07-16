@@ -8402,6 +8402,32 @@ pub(crate) fn finalize_websocket_response_headers(
     strip_websocket_transport_managed_response_header_map(response_headers);
 }
 
+/// Apply the successful-handshake response chain in configured plugin order.
+///
+/// Static initial-response policies and request-local WebSocket decorators
+/// share this pass so priority overrides remain authoritative across both
+/// categories. The hook contract is non-rejecting; once the backend handshake
+/// succeeds, this boundary always proceeds to a protocol-correct client
+/// handshake after transport-managed fields are stripped.
+pub(crate) fn finalize_successful_websocket_response_headers(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+) {
+    for plugin in plugins {
+        plugin.apply_websocket_handshake_response_headers(
+            ctx,
+            response_status,
+            response_headers,
+        );
+        if plugin.is_initial_response_header_policy() {
+            plugin.apply_initial_response_header_policy(response_headers);
+        }
+    }
+    strip_websocket_transport_managed_response_header_map(response_headers);
+}
+
 fn build_websocket_error_response(
     status: StatusCode,
     body: &str,
@@ -9295,9 +9321,16 @@ async fn handle_websocket_request_authenticated(
     // This matches ordinary HTTP/gRPC ordering: operator policy governs backend
     // metadata, while the gateway's selected-target cookie and mandatory
     // handshake fields are committed at the client boundary afterward.
+    let response_status = if is_h2_websocket {
+        StatusCode::OK
+    } else {
+        StatusCode::SWITCHING_PROTOCOLS
+    };
     let mut response_headers = HashMap::new();
-    finalize_websocket_response_headers(
-        &initial_response_header_policy_plugins,
+    finalize_successful_websocket_response_headers(
+        &plugins,
+        &ctx,
+        response_status.as_u16(),
         &mut response_headers,
     );
     if sticky_cookie_needed
@@ -9325,11 +9358,6 @@ async fn handle_websocket_request_authenticated(
     // HTTP/2 Extended CONNECT (RFC 8441): 200 OK — the H2 stream becomes the WebSocket
     // transport. No Upgrade/Connection/Sec-WebSocket-Accept headers (those are HTTP/1.1).
     // HTTP/1.1: 101 Switching Protocols with standard WebSocket handshake headers.
-    let response_status = if is_h2_websocket {
-        StatusCode::OK
-    } else {
-        StatusCode::SWITCHING_PROTOCOLS
-    };
     let mut ws_resp_builder = headers_mod::apply_response_headers(
         Response::builder().status(response_status),
         &response_headers,

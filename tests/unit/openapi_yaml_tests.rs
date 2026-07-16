@@ -1285,6 +1285,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     );
 
     for (plugin_name, config) in [
+        ("correlation_id", json!({})),
         ("bot_detection", json!({})),
         ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
         (
@@ -1313,6 +1314,13 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     }
 
     for (plugin_name, config) in [
+        ("correlation_id", None),
+        ("correlation_id", Some(serde_json::Value::Null)),
+        ("correlation_id", Some(json!([]))),
+        (
+            "correlation_id",
+            Some(json!({"echo_downsteam": false})),
+        ),
         ("bot_detection", None),
         ("bot_detection", Some(serde_json::Value::Null)),
         ("bot_detection", Some(json!([]))),
@@ -1635,6 +1643,61 @@ fn assert_component_validity(
         actual_valid, expected_valid,
         "unexpected {component} validation result for {instance}"
     );
+}
+
+#[test]
+fn correlation_id_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::correlation_id::CorrelationId;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for valid in [
+        json!({}),
+        json!({"header_name": "x-request-id", "echo_downstream": false}),
+        json!({"header_name": "X-Correlation-ID", "echo_downstream": true}),
+        json!({"header_name": " X-Trimmed-ID "}),
+        json!({"header_name": null, "echo_downstream": null}),
+    ] {
+        assert_component_validity(&spec, "CorrelationIdConfig", &valid, true);
+        CorrelationId::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+
+    for invalid in [
+        serde_json::Value::Null,
+        json!([]),
+        json!("config"),
+        json!(42),
+        json!(true),
+        json!({"echo_downsteam": false}),
+        json!({"header_name": "x:request-id"}),
+        json!({"header_name": 42}),
+        json!({"echo_downstream": "true"}),
+        json!({"header_name": "Connection"}),
+        json!({"header_name": " Connection "}),
+        json!({"header_name": "Content-Length"}),
+        json!({"header_name": "Host"}),
+        json!({"header_name": "Keep-Alive"}),
+        json!({"header_name": "Proxy-Authenticate"}),
+        json!({"header_name": "Proxy-Authorization"}),
+        json!({"header_name": "Proxy-Connection"}),
+        json!({"header_name": "Sec-WebSocket-Accept"}),
+        json!({"header_name": "Sec-WebSocket-Extensions"}),
+        json!({"header_name": "Sec-WebSocket-Key"}),
+        json!({"header_name": "Sec-WebSocket-Protocol"}),
+        json!({"header_name": "Sec-WebSocket-Version"}),
+        json!({"header_name": "TE"}),
+        json!({"header_name": "Trailer"}),
+        json!({"header_name": "Transfer-Encoding"}),
+        json!({"header_name": "Upgrade"}),
+    ] {
+        assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
+        assert!(
+            CorrelationId::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
 }
 
 #[tokio::test]

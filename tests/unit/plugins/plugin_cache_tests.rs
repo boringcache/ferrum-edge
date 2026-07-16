@@ -3419,6 +3419,91 @@ fn test_multiple_same_type_proxy_plugins_both_present() {
     assert_eq!(plugins[1].name(), "stdout_logging");
 }
 
+#[tokio::test]
+async fn correlation_id_priority_overrides_select_canonical_without_collapsing_instances() {
+    for internal_priority in [40, 60] {
+        let external_priority = if internal_priority == 40 { 60 } else { 40 };
+        let mut internal = make_plugin_config_with_priority(
+            "internal-correlation",
+            "correlation_id",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(internal_priority),
+        );
+        internal.config = json!({"header_name": "x-internal-request-id"});
+        let mut external = make_plugin_config_with_priority(
+            "external-correlation",
+            "correlation_id",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(external_priority),
+        );
+        external.config = json!({"header_name": "x-external-request-id"});
+        let config = make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                vec!["external-correlation", "internal-correlation"],
+            )],
+            vec![external, internal],
+        );
+        let cache = PluginCache::new(&config).expect("multi-instance correlation cache");
+        let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0].priority(), internal_priority.min(external_priority));
+
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers.insert(
+            "x-external-request-id".to_string(),
+            "priority-preserved-id".to_string(),
+        );
+        assert!(matches!(
+            run_request_received_chain(&plugins, &mut ctx).await,
+            PluginResult::Continue
+        ));
+
+        let internal_id = ctx.headers.get("x-internal-request-id").unwrap();
+        assert!(uuid::Uuid::parse_str(internal_id).is_ok());
+        assert_ne!(internal_id, "priority-preserved-id");
+        let expected_canonical = if internal_priority < external_priority {
+            internal_id.as_str()
+        } else {
+            "priority-preserved-id"
+        };
+        assert_eq!(
+            ctx.metadata
+                .get(ferrum_edge::plugins::REQUEST_ID_METADATA_KEY)
+                .map(String::as_str),
+            Some(expected_canonical)
+        );
+
+        let mut handshake_headers = HashMap::new();
+        for plugin in plugins.iter() {
+            plugin.apply_websocket_handshake_response_headers(
+                &ctx,
+                101,
+                &mut handshake_headers,
+            );
+        }
+        assert_eq!(
+            handshake_headers.get("x-internal-request-id"),
+            Some(internal_id)
+        );
+        assert_eq!(
+            handshake_headers
+                .get("x-external-request-id")
+                .map(String::as_str),
+            Some("priority-preserved-id")
+        );
+    }
+}
+
 #[test]
 fn test_proxy_scoped_plugin_removes_only_global_of_same_name() {
     // A global stdout_logging and two proxy-scoped stdout_logging instances.

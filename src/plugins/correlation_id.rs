@@ -8,15 +8,53 @@ use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::{Plugin, PluginResult, RequestContext};
+use super::{Plugin, PluginResult, REQUEST_ID_METADATA_KEY, RequestContext};
+
+const INSTANCE_METADATA_PREFIX: &str = "correlation_id.instance.";
+
+const PROTOCOL_MANAGED_HEADER_NAMES: &[&str] = &[
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "sec-websocket-accept",
+    "sec-websocket-extensions",
+    "sec-websocket-key",
+    "sec-websocket-protocol",
+    "sec-websocket-version",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 pub struct CorrelationId {
     header_name: String,
+    instance_metadata_key: String,
     echo_downstream: bool,
 }
 
 impl CorrelationId {
     pub fn new(config: &Value) -> Result<Self, String> {
+        let object = config
+            .as_object()
+            .ok_or_else(|| "correlation_id: config must be a JSON object".to_string())?;
+        let mut unknown_keys: Vec<&str> = object
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !matches!(*key, "header_name" | "echo_downstream"))
+            .collect();
+        if !unknown_keys.is_empty() {
+            unknown_keys.sort_unstable();
+            return Err(format!(
+                "correlation_id: unknown config field(s): {}",
+                unknown_keys.join(", ")
+            ));
+        }
+
         // Reject explicit non-string values for `header_name` so a misconfiguration
         // (e.g., setting an integer) does not silently fall back to the default.
         let header_name = match config.get("header_name") {
@@ -34,7 +72,13 @@ impl CorrelationId {
                         "correlation_id: 'header_name' contains characters not permitted in HTTP header names (RFC 7230 token): {trimmed:?}"
                     ));
                 }
-                trimmed.to_lowercase()
+                let lower = trimmed.to_ascii_lowercase();
+                if is_protocol_managed_header_name(&lower) {
+                    return Err(format!(
+                        "correlation_id: 'header_name' is protocol-managed and cannot be used for correlation IDs: {trimmed:?}"
+                    ));
+                }
+                lower
             }
             Some(other) => {
                 return Err(format!(
@@ -55,11 +99,29 @@ impl CorrelationId {
             }
         };
 
+        let instance_metadata_key = format!("{INSTANCE_METADATA_PREFIX}{header_name}");
         Ok(Self {
             header_name,
+            instance_metadata_key,
             echo_downstream,
         })
     }
+
+    fn publish_request_id(&self, ctx: &mut RequestContext, request_id: String) {
+        ctx.metadata
+            .insert(self.instance_metadata_key.clone(), request_id.clone());
+        ctx.metadata
+            .entry(REQUEST_ID_METADATA_KEY.to_string())
+            .or_insert(request_id);
+    }
+
+    fn request_id<'a>(&self, ctx: &'a RequestContext) -> Option<&'a String> {
+        ctx.metadata.get(&self.instance_metadata_key)
+    }
+}
+
+fn is_protocol_managed_header_name(name: &str) -> bool {
+    PROTOCOL_MANAGED_HEADER_NAMES.contains(&name)
 }
 
 /// Validate an HTTP header name per RFC 7230 §3.2.6 token grammar.
@@ -116,7 +178,11 @@ impl Plugin for CorrelationId {
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
         let id = Uuid::new_v4().to_string();
-        ctx.insert_metadata("request_id".to_string(), id);
+        let metadata = ctx.metadata.get_or_insert_with(HashMap::new);
+        metadata.insert(self.instance_metadata_key.clone(), id.clone());
+        metadata
+            .entry(REQUEST_ID_METADATA_KEY.to_string())
+            .or_insert(id);
         super::PluginResult::Continue
     }
 
@@ -145,8 +211,11 @@ impl Plugin for CorrelationId {
             id
         };
 
-        // Store in metadata for logging plugins
-        ctx.metadata.insert("request_id".to_string(), request_id);
+        // Keep each instance immutable across phase-separated execution. The
+        // first instance in configured lifecycle order also publishes the one
+        // canonical consumer-facing request ID; later trust domains cannot
+        // overwrite it.
+        self.publish_request_id(ctx, request_id);
 
         PluginResult::Continue
     }
@@ -157,7 +226,7 @@ impl Plugin for CorrelationId {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Ensure the correlation ID header is in the outgoing request
-        if let Some(request_id) = ctx.metadata.get("request_id") {
+        if let Some(request_id) = self.request_id(ctx) {
             headers.insert(self.header_name.clone(), request_id.clone());
         }
         PluginResult::Continue
@@ -170,11 +239,24 @@ impl Plugin for CorrelationId {
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if self.echo_downstream
-            && let Some(request_id) = ctx.metadata.get("request_id")
+            && let Some(request_id) = self.request_id(ctx)
         {
             response_headers.insert(self.header_name.clone(), request_id.clone());
         }
         PluginResult::Continue
+    }
+
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if self.echo_downstream
+            && let Some(request_id) = self.request_id(ctx)
+        {
+            response_headers.insert(self.header_name.clone(), request_id.clone());
+        }
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {

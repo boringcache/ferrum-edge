@@ -6,8 +6,8 @@
 use ferrum_edge::config::types::BackendScheme;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, HTTP_FAMILY_AND_STREAM_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS,
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
-    StreamTransactionSummary, TCP_ONLY_PROTOCOLS, create_plugin,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, REQUEST_ID_METADATA_KEY,
+    StreamConnectionContext, StreamTransactionSummary, TCP_ONLY_PROTOCOLS, create_plugin,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -640,6 +640,42 @@ async fn test_stream_metadata_flows_from_connect_to_disconnect() {
         &request_id,
         "Metadata should flow from connect to disconnect summary"
     );
+}
+
+#[tokio::test]
+async fn test_multiple_correlation_instances_keep_stream_ids_isolated() {
+    let first = make_plugin(
+        "correlation_id",
+        json!({"header_name": "x-internal-request-id"}),
+    )
+    .unwrap();
+    let second = make_plugin(
+        "correlation_id",
+        json!({"header_name": "x-external-request-id"}),
+    )
+    .unwrap();
+    let mut ctx = make_stream_ctx();
+
+    assert!(matches!(
+        first.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let metadata = ctx.metadata.as_ref().expect("metadata allocated");
+    let internal = metadata
+        .get("correlation_id.instance.x-internal-request-id")
+        .expect("internal instance ID");
+    let external = metadata
+        .get("correlation_id.instance.x-external-request-id")
+        .expect("external instance ID");
+    assert!(uuid::Uuid::parse_str(internal).is_ok());
+    assert!(uuid::Uuid::parse_str(external).is_ok());
+    assert_ne!(internal, external);
+    assert_eq!(metadata.get(REQUEST_ID_METADATA_KEY), Some(internal));
 }
 
 // ---- WebSocket-only frame plugins ----

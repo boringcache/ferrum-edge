@@ -201,6 +201,13 @@ pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
 /// WebSocket-only (plugins that operate on WebSocket frames, not HTTP request/response).
 pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
 
+/// Canonical metadata key for the request ID selected by the first configured
+/// correlation-ID instance in lifecycle order.
+///
+/// Later instances retain their independently resolved values in
+/// header-scoped slots and must not overwrite this consumer-facing key.
+pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
+
 /// gRPC-only (single protocol).
 pub const GRPC_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Grpc];
 
@@ -3799,6 +3806,24 @@ pub trait Plugin: Send + Sync {
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Decorate the successful WebSocket handshake response before the
+    /// frontend commits it.
+    ///
+    /// H1 Upgrade and H2/H3 Extended CONNECT bypass the ordinary
+    /// `after_proxy` response lifecycle. This deliberately non-rejecting,
+    /// synchronous hook gives request-local header decorators an equivalent
+    /// boundary without introducing backend-handshake rollback or I/O after
+    /// the upstream has already accepted the session. Protocol-managed fields
+    /// are removed after the ordered hook chain, then the frontend restores
+    /// its authoritative Upgrade/subprotocol fields.
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
     }
 
     /// Returns `true` when this plugin defines deterministic response-header

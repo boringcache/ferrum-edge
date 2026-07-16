@@ -1887,6 +1887,47 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_malformed_correlation_id_configs() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config, expected_error) in [
+        (
+            "correlation-non-object",
+            json!([]),
+            "correlation_id: config must be a JSON object",
+        ),
+        (
+            "correlation-unknown-key",
+            json!({"echo_downsteam": false}),
+            "correlation_id: unknown config field(s): echo_downsteam",
+        ),
+        (
+            "correlation-managed-header",
+            json!({"header_name": "Content-Length"}),
+            "correlation_id: 'header_name' is protocol-managed",
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "correlation_id",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(status, 400, "malformed correlation config was admitted: {body}");
+        assert!(
+            body.to_string().contains(expected_error),
+            "unexpected admin validation response: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

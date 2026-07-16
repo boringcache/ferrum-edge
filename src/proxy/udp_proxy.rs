@@ -4538,7 +4538,10 @@ backend_tls_verify_server_cert: false
             Some(crate::retry::ErrorClass::TlsError)
         );
         assert_eq!(
-            summary.metadata.get("request_id").map(String::as_str),
+            summary
+                .metadata
+                .get(crate::plugins::REQUEST_ID_METADATA_KEY)
+                .map(String::as_str),
             Some("dtls-123")
         );
         assert!(summary.duration_ms >= 0.0);
@@ -4602,7 +4605,10 @@ backend_tls_verify_server_cert: false
             Some(crate::retry::ErrorClass::ConnectionReset)
         );
         assert_eq!(
-            summary.metadata.get("request_id").map(String::as_str),
+            summary
+                .metadata
+                .get(crate::plugins::REQUEST_ID_METADATA_KEY)
+                .map(String::as_str),
             Some("stream-123")
         );
         assert!(

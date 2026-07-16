@@ -2353,7 +2353,10 @@ fn event_from_http_summary(
         currency: config.currency.clone(),
         pricing_version: config.pricing_version.clone(),
         request_id: if config.include_request_id {
-            metadata_value(metadata, &["request_id", "x-request-id", "correlation_id"])
+            metadata_value(
+                metadata,
+                &[super::REQUEST_ID_METADATA_KEY, "x-request-id", "correlation_id"],
+            )
         } else {
             None
         },
@@ -2400,7 +2403,10 @@ fn event_from_stream_summary(
         currency: config.currency.clone(),
         pricing_version: config.pricing_version.clone(),
         request_id: if config.include_request_id {
-            metadata_value(metadata, &["request_id", "x-request-id", "correlation_id"])
+            metadata_value(
+                metadata,
+                &[super::REQUEST_ID_METADATA_KEY, "x-request-id", "correlation_id"],
+            )
         } else {
             None
         },
@@ -2447,7 +2453,10 @@ fn event_from_ws_summary(
         currency: config.currency.clone(),
         pricing_version: config.pricing_version.clone(),
         request_id: if config.include_request_id {
-            metadata_value(metadata, &["request_id", "x-request-id", "correlation_id"])
+            metadata_value(
+                metadata,
+                &[super::REQUEST_ID_METADATA_KEY, "x-request-id", "correlation_id"],
+            )
         } else {
             None
         },

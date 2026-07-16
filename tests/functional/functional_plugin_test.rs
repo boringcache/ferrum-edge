@@ -1002,6 +1002,82 @@ async fn test_plugin_correlation_id() {
         custom_id,
         "Backend should receive the correlation ID header"
     );
+
+    // Two configured trust domains must retain independent values across the
+    // phase-separated request/response lifecycle. The later untrusted inbound
+    // value must never overwrite the internal UUID.
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-corrid-multi",
+        "/corrid-multi",
+        backend_port,
+        vec![
+            json!({
+                "id": "plugin-corrid-external",
+                "plugin_name": "correlation_id",
+                "scope": "proxy",
+                "proxy_id": "proxy-corrid-multi",
+                "enabled": true,
+                "priority_override": 60,
+                "config": {
+                    "header_name": "x-external-correlation-id",
+                    "echo_downstream": true
+                }
+            }),
+            json!({
+                "id": "plugin-corrid-internal",
+                "plugin_name": "correlation_id",
+                "scope": "proxy",
+                "proxy_id": "proxy-corrid-multi",
+                "enabled": true,
+                "priority_override": 40,
+                "config": {
+                    "header_name": "x-internal-request-id",
+                    "echo_downstream": true
+                }
+            }),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let attacker_id = "attacker-preserved-id";
+    let response = client
+        .get(format!("{}/corrid-multi/test", harness.proxy_base_url))
+        .header("x-external-correlation-id", attacker_id)
+        .send()
+        .await
+        .expect("multi-instance correlation request");
+    assert!(response.status().is_success());
+    let internal_id = response
+        .headers()
+        .get("x-internal-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("internal response ID")
+        .to_string();
+    assert!(uuid::Uuid::parse_str(&internal_id).is_ok());
+    assert_ne!(internal_id, attacker_id);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-external-correlation-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(attacker_id)
+    );
+    let echo_body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        echo_body["headers"]["x-internal-request-id"]
+            .as_str()
+            .unwrap_or(""),
+        internal_id
+    );
+    assert_eq!(
+        echo_body["headers"]["x-external-correlation-id"]
+            .as_str()
+            .unwrap_or(""),
+        attacker_id
+    );
 }
 
 // ============================================================================
