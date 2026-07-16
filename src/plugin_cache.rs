@@ -52,8 +52,53 @@ struct PriorityOverridePlugin {
     priority: u16,
 }
 
+/// Per-chain CORS wrapper. It avoids mutating a shared plugin instance when a
+/// proxy-group or global CORS policy participates in a multiple-instance chain
+/// for only some proxies.
+struct DeferredCorsPlugin {
+    inner: Arc<dyn Plugin>,
+}
+
+#[async_trait]
+impl Plugin for DeferredCorsPlugin {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn priority(&self) -> u16 {
+        self.inner.priority()
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        self.inner.supported_protocols()
+    }
+
+    async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        ctx.cors_state.defer_finalization = true;
+        self.inner.on_request_received(ctx).await
+    }
+
+    fn is_deferred_cors_wrapper(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        false
+    }
+}
+
 const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";
 const MESH_ROUTE_DISPATCH_FINALIZER_NAME: &str = "__mesh_route_dispatch_finalizer";
+const CORS_NAME: &str = "cors";
 
 /// Cache-internal sentinel placed immediately after the last route-dispatch
 /// instance. Individual instances stage fail-closed misses on `RequestContext`;
@@ -132,6 +177,50 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
     plugins.insert(
         last_index + 1,
         Arc::new(MeshRouteDispatchFinalizer { priority }),
+    );
+    Ok(())
+}
+
+/// Install one aggregate CORS boundary after every attached CORS instance has
+/// evaluated the request. The chain must remain contiguous so an intervening
+/// short-circuit plugin cannot bypass a later CORS policy.
+fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), String> {
+    plugins.retain(|plugin| plugin.name() != crate::plugins::cors::CORS_FINALIZER_NAME);
+    let Some(first_index) = plugins.iter().position(|plugin| plugin.name() == CORS_NAME) else {
+        return Ok(());
+    };
+    let Some(last_index) = plugins
+        .iter()
+        .rposition(|plugin| plugin.name() == CORS_NAME)
+    else {
+        return Err("cors cache invariant lost its first instance".to_string());
+    };
+    if first_index == last_index {
+        return Ok(());
+    }
+    if plugins[first_index..=last_index].iter().any(|plugin| {
+        plugin.name() != CORS_NAME
+            && plugin
+                .supported_protocols()
+                .iter()
+                .any(|protocol| crate::plugins::HTTP_GRPC_PROTOCOLS.contains(protocol))
+    }) {
+        return Err(
+            "cors instances must remain contiguous in HTTP/gRPC chains so their origin and preflight method/header policies can be intersected before any request short-circuits; remove priority overrides that interleave another HTTP/gRPC plugin"
+                .to_string(),
+        );
+    }
+    for plugin in &mut plugins[first_index..=last_index] {
+        if plugin.name() == CORS_NAME && !plugin.is_deferred_cors_wrapper() {
+            *plugin = Arc::new(DeferredCorsPlugin {
+                inner: Arc::clone(plugin),
+            });
+        }
+    }
+    let priority = plugins[last_index].priority();
+    plugins.insert(
+        last_index + 1,
+        Arc::new(crate::plugins::cors::CorsFinalizer::new(priority)),
     );
     Ok(())
 }
@@ -3036,6 +3125,9 @@ impl PluginCache {
                 }
             }
             global_plugins.sort_by_key(|p| p.priority());
+            if let Err(e) = install_cors_finalizer(&mut global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
@@ -3078,6 +3170,9 @@ impl PluginCache {
                 }
             }
             global_plugins.sort_by_key(|plugin| plugin.priority());
+            if let Err(e) = install_cors_finalizer(&mut global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
@@ -3284,6 +3379,9 @@ impl PluginCache {
             }
 
             merged.sort_by_key(|p| p.priority());
+            if let Err(e) = install_cors_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
@@ -3828,6 +3926,9 @@ impl PluginCache {
 
             // Sort by priority so execution order is deterministic
             merged.sort_by_key(|p| p.priority());
+            if let Err(e) = install_cors_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
@@ -3853,6 +3954,9 @@ impl PluginCache {
         // Sort and validate the global fallback list before committing the
         // staged registry so ordering errors reject the whole cache build.
         global_plugins.sort_by_key(|p| p.priority());
+        if let Err(e) = install_cors_finalizer(&mut global_plugins) {
+            plugin_errors.push(format!("global plugins: {e}"));
+        }
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }

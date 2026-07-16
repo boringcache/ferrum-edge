@@ -9,8 +9,8 @@ use ferrum_edge::config_sources::k8s::{
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
-    MeshConfig, MeshDestinationRule, MeshLoadBalancer, MeshOutlierDetection, MeshSimpleLb,
-    MeshTrafficPolicy, cors_plugin_config_from_mesh_policy,
+    MeshConfig, MeshCorsUnmatchedPreflights, MeshDestinationRule, MeshLoadBalancer,
+    MeshOutlierDetection, MeshSimpleLb, MeshTrafficPolicy, cors_plugin_config_from_mesh_policy,
 };
 use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
@@ -1028,6 +1028,12 @@ virtual_service_cors_policies:
         serde_json::json!(["GET", "OPTIONS"])
     );
     assert_eq!(plugin.config["max_age"], serde_json::json!(600));
+    assert_eq!(plugin.config["allowed_headers"], serde_json::json!([]));
+    assert_eq!(plugin.config["exposed_headers"], serde_json::json!([]));
+    assert_eq!(
+        plugin.config["unmatched_preflights"],
+        serde_json::json!("forward")
+    );
     assert!(
         plugin.config.get("preflight_continue").is_none(),
         "the plugin must answer preflights itself (Istio semantics)"
@@ -1065,7 +1071,8 @@ fn virtual_service_cors_policy_rides_the_mesh_block_and_matches_gateway_projecti
                         "allowHeaders": ["x-fixture"],
                         "exposeHeaders": ["x-out"],
                         "maxAge": "10m",
-                        "allowCredentials": true
+                        "allowCredentials": true,
+                        "unmatchedPreflights": "IGNORE"
                     }
                 }]
             }),
@@ -1104,6 +1111,122 @@ fn virtual_service_cors_policy_rides_the_mesh_block_and_matches_gateway_projecti
         gateway_cors.config,
         "slice-carried and gateway-projected CORS configs must be identical"
     );
+}
+
+#[test]
+fn virtual_service_cors_unmatched_modes_survive_gateway_and_mesh_projection() {
+    for (source, carried, projected) in [
+        (None, None, "forward"),
+        (
+            Some("UNSPECIFIED"),
+            Some(MeshCorsUnmatchedPreflights::Forward),
+            "forward",
+        ),
+        (
+            Some("FORWARD"),
+            Some(MeshCorsUnmatchedPreflights::Forward),
+            "forward",
+        ),
+        (
+            Some("IGNORE"),
+            Some(MeshCorsUnmatchedPreflights::Ignore),
+            "ignore",
+        ),
+    ] {
+        let mut cors_policy = serde_json::json!({
+            "allowOrigins": [{"exact": "https://app.example"}]
+        });
+        if let Some(source) = source {
+            cors_policy["unmatchedPreflights"] = serde_json::json!(source);
+        }
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-unmatched-cors",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": cors_policy
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("CORS unmatched mode translates");
+        let gateway = translated
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "cors")
+            .expect("gateway CORS plugin");
+        let mesh = translated
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh block")
+            .virtual_service_cors_policies
+            .first()
+            .expect("mesh CORS policy");
+        assert_eq!(mesh.cors.unmatched_preflights, carried);
+        assert_eq!(
+            gateway.config["unmatched_preflights"],
+            serde_json::json!(projected)
+        );
+        assert_eq!(
+            cors_plugin_config_from_mesh_policy(&mesh.cors),
+            gateway.config
+        );
+    }
+}
+
+#[test]
+fn virtual_service_cors_noncanonical_exact_origin_is_deferred_across_both_projections() {
+    for cors_policy in [
+        serde_json::json!({"allowOrigins": [{"exact": "https://example.com:443"}]}),
+        serde_json::json!({"allowOrigins": [{"exact": "HTTPS://EXAMPLE.COM"}]}),
+        serde_json::json!({"allowOrigins": [{"exact": "https://bücher.example"}]}),
+        serde_json::json!({"allowOrigin": ["https://example.com:443"]}),
+    ] {
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-noncanonical-cors",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": cors_policy
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("noncanonical exact leaves routing translated");
+        assert!(
+            translated
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+                .unwrap_or(true),
+            "noncanonical Istio exact must not ride the mesh slice"
+        );
+        assert!(
+            !translated
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "cors"),
+            "noncanonical Istio exact must not project a widened gateway CORS plugin"
+        );
+    }
 }
 
 #[test]
@@ -1391,7 +1514,7 @@ fn virtual_service_cors_policy_legacy_allow_origin_shares_the_exact_gate() {
                         "host": "svc.default.svc.cluster.local",
                         "port": {"number": 8080}
                     }}],
-                    "corsPolicy": {"allowOrigin": ["https://app.example"]}
+                    "corsPolicy": {"allowOrigin": ["*"]}
                 }]
             }),
         )],
@@ -1408,6 +1531,13 @@ fn virtual_service_cors_policy_legacy_allow_origin_shares_the_exact_gate() {
             .len(),
         1
     );
+    let plugin = valid
+        .config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.plugin_name == "cors")
+        .expect("legacy wildcard projects a CORS plugin");
+    assert_eq!(plugin.config["allowed_origins"], serde_json::json!(["*"]));
 }
 
 #[test]
@@ -1537,13 +1667,104 @@ virtual_service_cors_policies:
 }
 
 #[test]
-fn virtual_service_cors_policy_wildcard_exact_origin_defers_everywhere() {
-    // A wildcard-shaped StringMatch `exact` can never match a real Origin
-    // under Istio's literal semantics, but the cors plugin's plain-string
-    // form would read it as wildcard allow-all — a silent policy WIDENING.
-    // The shared extractor treats it as non-translatable, so BOTH the
-    // gateway-side plugin and the mesh-slice carriage defer.
-    for wildcard in ["*", "*.example.com"] {
+fn virtual_service_cors_policy_exact_star_projects_but_other_wildcards_defer() {
+    let translated_star = translate_k8s_objects(
+        &[k8s_object(
+            "VirtualService",
+            "vs-exact-star",
+            serde_json::json!({
+                "hosts": ["svc.default.svc.cluster.local"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/"}}],
+                    "route": [{"destination": {
+                        "host": "svc.default.svc.cluster.local",
+                        "port": {"number": 8080}
+                    }}],
+                    "corsPolicy": {"allowOrigins": [{"exact": "*"}]}
+                }]
+            }),
+        )],
+        k8s_options(),
+    )
+    .expect("exact star translates");
+    assert_eq!(
+        translated_star
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh block")
+            .virtual_service_cors_policies
+            .len(),
+        1
+    );
+    let star_plugin = translated_star
+        .config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.plugin_name == "cors")
+        .expect("exact star projects a gateway CORS plugin");
+    assert_eq!(
+        star_plugin.config["allowed_origins"],
+        serde_json::json!(["*"])
+    );
+    assert_eq!(
+        star_plugin.config["unmatched_preflights"],
+        serde_json::json!("forward")
+    );
+
+    // The native cors plugin cannot combine `Access-Control-Allow-Origin: *`
+    // with credentials and would silently disable the credential flag. Keep
+    // both Istio spellings deferred until the concrete request origin can be
+    // reflected safely, rather than weakening the source policy in transit.
+    for cors_policy in [
+        serde_json::json!({
+            "allowOrigins": [{"exact": "*"}],
+            "allowCredentials": true
+        }),
+        serde_json::json!({
+            "allowOrigin": ["*"],
+            "allowCredentials": true
+        }),
+    ] {
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-credentialed-star",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": cors_policy
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("credentialed exact star leaves routing translated");
+        assert!(
+            translated
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+                .unwrap_or(true),
+            "credentialed exact star must not ride the mesh slice"
+        );
+        assert!(
+            !translated
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "cors"),
+            "credentialed exact star must not project a credential-stripping cors plugin"
+        );
+    }
+
+    for wildcard in ["*.example.com", "**"] {
         let translated = translate_k8s_objects(
             &[k8s_object(
                 "VirtualService",
@@ -1570,7 +1791,7 @@ fn virtual_service_cors_policy_wildcard_exact_origin_defers_everywhere() {
                 .as_ref()
                 .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
                 .unwrap_or(true),
-            "wildcard-shaped exact `{wildcard}` must not ride the mesh slice"
+            "non-Istio wildcard exact `{wildcard}` must not ride the mesh slice"
         );
         assert!(
             !translated
@@ -1578,7 +1799,7 @@ fn virtual_service_cors_policy_wildcard_exact_origin_defers_everywhere() {
                 .plugin_configs
                 .iter()
                 .any(|plugin| plugin.plugin_name == "cors"),
-            "wildcard-shaped exact `{wildcard}` must not project a gateway cors plugin either"
+            "non-Istio wildcard exact `{wildcard}` must not project a gateway cors plugin either"
         );
     }
 }
@@ -1745,6 +1966,8 @@ fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
         "https://app.example ",
         "https://app.example/",
         "https://app.example/path",
+        "https://app.example/foo/..",
+        "https://app.example/%2e%2e",
         "https://user:pw@app.example",
         "ftp://app.example",
         "not a url",

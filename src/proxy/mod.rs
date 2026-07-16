@@ -2397,6 +2397,32 @@ pub(crate) fn request_body_requirements_before_authorize(
     requirements
 }
 
+pub(crate) fn request_body_requirements_before_before_proxy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> RequestBodyPhaseRequirements {
+    let mut requirements = RequestBodyPhaseRequirements::default();
+    for plugin in plugins {
+        if !plugin.requires_request_body_before_before_proxy()
+            || !plugin.should_buffer_request_body(ctx)
+        {
+            continue;
+        }
+        requirements.required = true;
+        requirements.needs_text |= plugin.needs_request_body_text();
+        requirements.needs_bytes |= plugin.needs_request_body_bytes();
+        requirements.needs_digests |= plugin.needs_request_body_digests();
+        if let Some(limit) = plugin.request_body_buffer_limit() {
+            requirements.plugin_limit = Some(
+                requirements
+                    .plugin_limit
+                    .map_or(limit, |current| current.min(limit)),
+            );
+        }
+    }
+    requirements
+}
+
 pub(crate) fn request_body_requirements_before_authenticate(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
@@ -3365,7 +3391,13 @@ fn reject_result_to_backend_response(
         headers: reject.headers,
         connection_error: false,
         backend_resolved_ip,
-        error_class: (reject.status_code == 413).then_some(retry::ErrorClass::RequestBodyTooLarge),
+        // Final request-body hooks run before backend dispatch. Keep their
+        // synthetic responses terminal and neutral to backend health.
+        error_class: Some(if reject.status_code == 413 {
+            retry::ErrorClass::RequestBodyTooLarge
+        } else {
+            retry::ErrorClass::DispatchPolicyRejected
+        }),
     }
 }
 
@@ -6572,6 +6604,9 @@ impl ProxyState {
     ///     500 every request through that proxy.
     ///   - `validate_plugin_references` — dangling plugin IDs / wrong
     ///     scope.
+    ///   - `validate_unique_mtls_dns_identities` — case-variant identities
+    ///     would collapse into one `ConsumerIndex` DNS key when an effective
+    ///     `mtls_auth` `san_dns` policy is enabled.
     ///   - `validate_mesh_route_dispatch_upstream_references` — dangling
     ///     `mesh_route_dispatch.destination.upstream_id` references are
     ///     observationally identical to a dangling `Proxy.upstream_id`:
@@ -6635,6 +6670,9 @@ impl ProxyState {
             errors.extend(errs);
         }
         if let Err(errs) = config.validate_plugin_references() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_unique_mtls_dns_identities() {
             errors.extend(errs);
         }
         if let Err(errs) = validate_mesh_route_dispatch_upstream_references(config) {
@@ -16111,36 +16149,26 @@ async fn handle_proxy_request_inner(
         && plugins
             .iter()
             .any(|plugin| plugin.should_buffer_request_body(&ctx));
-    let requires_request_body_before_before_proxy = requires_request_body_buffering
+    let before_proxy_body_requirements = if requires_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
-        && plugins.iter().any(|plugin| {
-            plugin.requires_request_body_before_before_proxy()
-                && plugin.should_buffer_request_body(&ctx)
-        });
-    let (needs_body_text, needs_body_bytes) = if requires_request_body_before_before_proxy {
-        let mut needs_text = false;
-        let mut needs_bytes = false;
-        for plugin in plugins.iter() {
-            if plugin.requires_request_body_before_before_proxy()
-                && plugin.should_buffer_request_body(&ctx)
-            {
-                needs_text |= plugin.needs_request_body_text();
-                needs_bytes |= plugin.needs_request_body_bytes();
-            }
-        }
-        (needs_text, needs_bytes)
+    {
+        request_body_requirements_before_before_proxy(&plugins, &ctx)
     } else {
-        (false, false)
+        RequestBodyPhaseRequirements::default()
     };
 
-    if requires_request_body_before_before_proxy {
+    if before_proxy_body_requirements.required {
+        let body_limit = effective_request_body_limit(
+            state.max_request_body_size_bytes,
+            before_proxy_body_requirements.plugin_limit,
+        );
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
                 match buffer_request_body_for_before_proxy(
                     *request,
                     &method,
                     &ctx.headers,
-                    state.max_request_body_size_bytes,
+                    body_limit,
                     proxy.backend_read_timeout_ms,
                 )
                 .await
@@ -16150,9 +16178,9 @@ async fn handle_proxy_request_inner(
                             store_request_body_metadata(
                                 &mut ctx,
                                 body,
-                                needs_body_text,
-                                needs_body_bytes,
-                                false,
+                                before_proxy_body_requirements.needs_text,
+                                before_proxy_body_requirements.needs_bytes,
+                                before_proxy_body_requirements.needs_digests,
                             );
                             // Seed bytes_sent_observed from the prebuffered
                             // body so before_proxy rejects (logged via
@@ -16200,12 +16228,19 @@ async fn handle_proxy_request_inner(
                 }
             }
             ClientRequestBody::Buffered(body) => {
+                if body_limit > 0 && body.len() > body_limit {
+                    record_request(&state, 413);
+                    return Ok(build_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                    ));
+                }
                 store_request_body_metadata(
                     &mut ctx,
                     &body,
-                    needs_body_text,
-                    needs_body_bytes,
-                    false,
+                    before_proxy_body_requirements.needs_text,
+                    before_proxy_body_requirements.needs_bytes,
+                    before_proxy_body_requirements.needs_digests,
                 );
                 ClientRequestBody::Buffered(body)
             }
@@ -16977,6 +17012,11 @@ async fn handle_proxy_request_inner(
             bodyless => bodyless,
         };
     }
+    // Build the lightweight mutable hook context before `proxy_headers` may
+    // borrow `ctx.headers`. The selected dispatch branch takes this one context;
+    // early-prepared bodies already ran their transform/final hooks above.
+    let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
+        .then(|| ctx.clone_for_final_request_body_hooks());
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
@@ -17410,10 +17450,17 @@ async fn handle_proxy_request_inner(
                 };
 
             // Store body metadata for plugins that read via ctx.metadata
+            let request_body_size_bytes = grpc_req_body.len().to_string();
             ctx.metadata.insert(
                 "request_body_size_bytes".to_string(),
-                grpc_req_body.len().to_string(),
+                request_body_size_bytes.clone(),
             );
+            if let Some(body_hook_ctx) = deferred_body_hook_ctx.as_mut() {
+                body_hook_ctx.metadata.insert(
+                    "request_body_size_bytes".to_string(),
+                    request_body_size_bytes,
+                );
+            }
 
             // Mirror pre-transform bytes into the shared request-bytes counter
             // so `TransactionSummary.bytes_sent` is populated on the gRPC
@@ -17434,11 +17481,7 @@ async fn handle_proxy_request_inner(
             );
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
-            let mut body_hook_ctx = if needs_final_request_body_context {
-                Some(ctx.clone_for_final_request_body_hooks())
-            } else {
-                None
-            };
+            let mut body_hook_ctx = deferred_body_hook_ctx.take();
             let final_body_result = run_final_request_body_hooks(
                 &plugins,
                 body_hook_ctx.as_mut(),
@@ -19854,11 +19897,7 @@ async fn handle_proxy_request_inner(
         let mut final_upstream_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
-        let mut body_hook_ctx = if needs_final_request_body_context {
-            Some(ctx.clone_for_final_request_body_hooks())
-        } else {
-            None
-        };
+        let mut body_hook_ctx = deferred_body_hook_ctx.take();
         let initial_dispatch = proxy_to_backend(
             &state,
             &proxy,
@@ -20248,11 +20287,7 @@ async fn handle_proxy_request_inner(
         }
         (result, current_cb_target_key, final_upstream_target)
     } else {
-        let mut body_hook_ctx = if needs_final_request_body_context {
-            Some(ctx.clone_for_final_request_body_hooks())
-        } else {
-            None
-        };
+        let mut body_hook_ctx = deferred_body_hook_ctx.take();
         let dispatch = proxy_to_backend(
             &state,
             &proxy,
