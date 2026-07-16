@@ -2222,8 +2222,8 @@ impl Default for EnvConfig {
             log_buffer_capacity: crate::logging::LOG_BUFFER_CAPACITY_DEFAULT,
             log_buffer_bytes: crate::logging::LOG_BUFFER_BYTES_DEFAULT,
             log_max_record_bytes: crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT,
-            log_shutdown_drain_timeout_ms:
-                crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT as u64,
+            log_shutdown_drain_timeout_ms: crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT
+                as u64,
             secret_refresh_interval_seconds:
                 crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS,
             acme_auto_renew_enabled: false,

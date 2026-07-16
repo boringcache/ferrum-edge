@@ -751,8 +751,7 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
             |logs| {
                 logs.lines().any(|line| {
                     serde_json::from_str::<Value>(line).is_ok_and(|entry| {
-                        entry["proxy_id"] == "h3-grpc-web-success"
-                            && entry["grpc_status"] == 7
+                        entry["proxy_id"] == "h3-grpc-web-success" && entry["grpc_status"] == 7
                     })
                 })
             },

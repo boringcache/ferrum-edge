@@ -339,8 +339,7 @@ async fn test_logging_clamped_settings_emit_startup_warnings() {
         assert!(
             entries.iter().any(|entry| {
                 entry["level"] == "WARN"
-                    && entry["fields"]["message"]
-                        == "logging configuration value was clamped"
+                    && entry["fields"]["message"] == "logging configuration value was clamped"
                     && entry["fields"]["variable"] == variable
                     && entry["fields"]["supplied_value"] == supplied
                     && entry["fields"]["applied_value"] == applied

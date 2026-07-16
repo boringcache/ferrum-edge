@@ -380,7 +380,10 @@ fn admission_after_shutdown_is_closed_and_counted() {
     .unwrap();
     assert!(guard.shutdown());
 
-    assert_eq!(sink.try_write_bytes(b"after shutdown\n"), EnqueueResult::Closed);
+    assert_eq!(
+        sink.try_write_bytes(b"after shutdown\n"),
+        EnqueueResult::Closed
+    );
     let snapshot = sink.snapshot();
     assert_eq!(snapshot.closed_dropped_records_total, 1);
     assert_eq!(snapshot.queued_records, 0);

@@ -388,10 +388,7 @@ impl NonBlockingSink {
             .name(thread_name)
             .spawn(move || run_worker(writer, worker_queue, worker_state))?;
         let _ = state.worker_thread.set(join.thread().clone());
-        let sink = Self {
-            queue,
-            state,
-        };
+        let sink = Self { queue, state };
         let guard = WorkerGuard {
             state: Arc::clone(&sink.state),
             join: Some(join),
@@ -552,9 +549,7 @@ impl RecordWriter {
         // serialized. Once serialization succeeds, retain only the actual
         // record length so the aggregate byte budget reflects queued memory
         // instead of pessimistically reducing record capacity until I/O ends.
-        self.sink
-            .state
-            .shrink_reservation(self.reserved_bytes, len);
+        self.sink.state.shrink_reservation(self.reserved_bytes, len);
         self.reserved_bytes = len;
         self.sink
             .state
