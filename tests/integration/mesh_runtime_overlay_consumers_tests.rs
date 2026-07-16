@@ -1,8 +1,10 @@
 //! Integration coverage for the RTDS runtime-overlay consumer dispatch.
 //!
-//! `MeshRuntimeState::record_applied_slice` is the single touch point that fans
-//! out an accepted slice's `runtime_overlay` to every consumer (fault injection,
-//! header transformer gates, tracing log levels). These tests install
+//! `MeshRuntimeState::record_applied_slice` fans an accepted slice's
+//! process-wide knobs out to header transformer gates and tracing log levels.
+//! Fault percentages are request-epoch-local and covered by fault
+//! materialization/generation tests.
+//! These tests install
 //! representative slices and assert each consumer reflects the overlay,
 //! covering the full cold-path wiring without depending on the live xDS
 //! ADS server.
@@ -14,7 +16,6 @@ use ferrum_edge::logging::{LogLevelReloader, log_level_reloader, set_log_level_r
 use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::MeshSlice;
-use ferrum_edge::plugins::fault_injection::runtime_overlay as fault_overlay;
 use ferrum_edge::plugins::request_transformer::runtime_overlay as request_gate;
 use ferrum_edge::plugins::response_transformer::runtime_overlay as response_gate;
 
@@ -53,7 +54,7 @@ fn install_slice_with_overlay(state: &MeshRuntimeState, overlay: MeshRuntimeOver
 }
 
 #[test]
-fn slice_install_fans_out_to_every_consumer() {
+fn slice_install_fans_out_to_process_wide_consumers() {
     // The consumer registry is process-global, so this test serialises
     // against any sibling that touches the same `ArcSwap` state via the
     // module-level `CONSUMER_TEST_GUARD` mutex. Reset every consumer at
@@ -61,7 +62,6 @@ fn slice_install_fans_out_to_every_consumer() {
     // corrupt assertions.
     let _guard = consumer_test_guard();
 
-    fault_overlay::reset_for_test();
     request_gate::reset_for_test();
     response_gate::reset_for_test();
 
@@ -73,10 +73,6 @@ fn slice_install_fans_out_to_every_consumer() {
     }));
 
     let mut fields = HashMap::new();
-    fields.insert(
-        "ferrum.fault_injection.consumer_e2e.abort_percent".to_string(),
-        RuntimeValue::Number(33.0),
-    );
     fields.insert(
         "ferrum.request_transformer.consumer_e2e.enabled".to_string(),
         RuntimeValue::Bool(false),
@@ -92,11 +88,6 @@ fn slice_install_fans_out_to_every_consumer() {
 
     let state = MeshRuntimeState::new();
     install_slice_with_overlay(&state, MeshRuntimeOverlay { fields });
-
-    // Fault override populated.
-    let snapshot = fault_overlay::current_overrides();
-    assert_eq!(snapshot.abort_percent("consumer_e2e"), Some(33.0));
-    assert_eq!(snapshot.delay_percent("consumer_e2e"), None);
 
     // Request gate populated.
     assert_eq!(
@@ -128,16 +119,14 @@ fn slice_install_fans_out_to_every_consumer() {
     }
 
     // Clean up.
-    fault_overlay::reset_for_test();
     request_gate::reset_for_test();
     response_gate::reset_for_test();
 }
 
 #[test]
-fn dropping_key_from_subsequent_slice_clears_the_consumer_value() {
+fn dropping_key_from_subsequent_slice_clears_transformer_value() {
     let _guard = consumer_test_guard();
 
-    fault_overlay::reset_for_test();
     request_gate::reset_for_test();
 
     let state = MeshRuntimeState::new();
@@ -145,29 +134,16 @@ fn dropping_key_from_subsequent_slice_clears_the_consumer_value() {
     // Slice 1 sets values.
     let mut fields = HashMap::new();
     fields.insert(
-        "ferrum.fault_injection.rolling.delay_percent".to_string(),
-        RuntimeValue::Number(50.0),
-    );
-    fields.insert(
         "ferrum.request_transformer.rolling.enabled".to_string(),
         RuntimeValue::Bool(false),
     );
     install_slice_with_overlay(&state, MeshRuntimeOverlay { fields });
-    assert_eq!(
-        fault_overlay::current_overrides().delay_percent("rolling"),
-        Some(50.0)
-    );
     assert_eq!(request_gate::current_gates().gate("rolling"), Some(false));
 
-    // Slice 2 has no overlay → both consumers must clear.
+    // Slice 2 has no overlay → the consumer must clear.
     install_slice_with_overlay(&state, MeshRuntimeOverlay::default());
-    assert_eq!(
-        fault_overlay::current_overrides().delay_percent("rolling"),
-        None
-    );
     assert_eq!(request_gate::current_gates().gate("rolling"), None);
 
-    fault_overlay::reset_for_test();
     request_gate::reset_for_test();
 }
 
@@ -175,13 +151,13 @@ fn dropping_key_from_subsequent_slice_clears_the_consumer_value() {
 fn rejected_slice_receive_does_not_mutate_consumer_values() {
     let _guard = consumer_test_guard();
 
-    fault_overlay::reset_for_test();
+    request_gate::reset_for_test();
 
     let state = MeshRuntimeState::new();
     let mut accepted_fields = HashMap::new();
     accepted_fields.insert(
-        "ferrum.fault_injection.stable.abort_percent".to_string(),
-        RuntimeValue::Number(10.0),
+        "ferrum.request_transformer.stable.enabled".to_string(),
+        RuntimeValue::Bool(false),
     );
     install_slice_with_overlay(
         &state,
@@ -189,15 +165,12 @@ fn rejected_slice_receive_does_not_mutate_consumer_values() {
             fields: accepted_fields,
         },
     );
-    assert_eq!(
-        fault_overlay::current_overrides().abort_percent("stable"),
-        Some(10.0)
-    );
+    assert_eq!(request_gate::current_gates().gate("stable"), Some(false));
 
     let mut rejected_fields = HashMap::new();
     rejected_fields.insert(
-        "ferrum.fault_injection.stable.abort_percent".to_string(),
-        RuntimeValue::Number(90.0),
+        "ferrum.request_transformer.stable.enabled".to_string(),
+        RuntimeValue::Bool(true),
     );
     state.install_slice(MeshSlice {
         namespace: "alpha".to_string(),
@@ -209,10 +182,10 @@ fn rejected_slice_receive_does_not_mutate_consumer_values() {
     });
 
     assert_eq!(
-        fault_overlay::current_overrides().abort_percent("stable"),
-        Some(10.0),
+        request_gate::current_gates().gate("stable"),
+        Some(false),
         "received-only slices must not update live RTDS consumers"
     );
 
-    fault_overlay::reset_for_test();
+    request_gate::reset_for_test();
 }
