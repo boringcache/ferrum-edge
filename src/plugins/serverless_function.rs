@@ -1437,9 +1437,12 @@ struct DecodedPercentLayers {
 fn decode_percent_layers(value: &str) -> DecodedPercentLayers {
     let mut decoded = value.to_string();
     for _ in 0..MAX_REDIRECT_PERCENT_DECODE_LAYERS {
-        let next = percent_decode_str(&decoded)
-            .decode_utf8_lossy()
-            .into_owned();
+        let Some(next) = strictly_decode_percent_layer(&decoded) else {
+            return DecodedPercentLayers {
+                value: decoded,
+                fully_decoded: false,
+            };
+        };
         if next == decoded {
             return DecodedPercentLayers {
                 value: decoded,
@@ -1448,13 +1451,26 @@ fn decode_percent_layers(value: &str) -> DecodedPercentLayers {
         }
         decoded = next;
     }
-    let next = percent_decode_str(&decoded)
-        .decode_utf8_lossy()
-        .into_owned();
+    let Some(next) = strictly_decode_percent_layer(&decoded) else {
+        return DecodedPercentLayers {
+            value: decoded,
+            fully_decoded: false,
+        };
+    };
     DecodedPercentLayers {
         fully_decoded: next == decoded,
         value: decoded,
     }
+}
+
+fn strictly_decode_percent_layer(value: &str) -> Option<String> {
+    if !has_valid_percent_triplets(value) {
+        return None;
+    }
+    percent_decode_str(value)
+        .decode_utf8()
+        .ok()
+        .map(|decoded| decoded.into_owned())
 }
 
 fn sanitize_function_response_headers(

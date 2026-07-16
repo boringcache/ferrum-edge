@@ -15213,9 +15213,10 @@ components:
         instead of applying form-data space conversion. Inspection is
         bounded to 16 KiB per field, 32 Link targets, eight percent-decoding
         transforms, and two nested URI-reference hops. URI userinfo, residual
-        encoding, malformed target syntax, budget overflow, or another
-        structural URI reference at the nesting boundary fails closed even for
-        root function destinations, while unrelated URL targets, non-URL
+        encoding, malformed target syntax, malformed percent triplets,
+        percent-decoded non-UTF-8 bytes, budget overflow, or another structural
+        URI reference at the nesting boundary fails closed even for root
+        function destinations, while unrelated URL targets, non-URL
         Refresh directives, quoted Link parameters, and scalar labels without
         signed components remain observable.
         Later body rewrites invalidate ranges, validators, integrity metadata,
