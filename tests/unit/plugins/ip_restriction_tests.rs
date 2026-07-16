@@ -732,10 +732,7 @@ async fn mapped_ipv6_cidr_prefix_boundaries_map_to_ipv4() {
     let mut ipv4 = create_context_with_ip("203.0.113.9");
     plugin_utils::assert_continue(all_ipv4.on_request_received(&mut ipv4).await);
     let mut ipv6 = create_context_with_ip("2001:db8::1");
-    plugin_utils::assert_reject(
-        all_ipv4.on_request_received(&mut ipv6).await,
-        Some(403),
-    );
+    plugin_utils::assert_reject(all_ipv4.on_request_received(&mut ipv6).await, Some(403));
 
     let exact_ipv4 = IpRestriction::new(&json!({
         "allow": ["::ffff:192.0.2.44/128"]
