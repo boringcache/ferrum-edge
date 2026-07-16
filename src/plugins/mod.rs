@@ -267,8 +267,10 @@ fn is_transform_invalidated_response_header(name: &str) -> bool {
 /// representation. A `226 IM Used` body is a delta whose interpretation
 /// depends on `IM` and `Delta-Base`. Rewriting either body while removing its
 /// representation metadata would leave the unchanged status incoherent. Keep
-/// both response forms untouched. All protocol paths and the provider/protocol
-/// normalization phase consult this shared gate.
+/// both response forms untouched. Inspection hooks still run; enforcing
+/// plugins whose findings require a rewrite must reject instead of reporting a
+/// redaction that cannot be applied. All protocol paths and the
+/// provider/protocol normalization phase consult this shared gate.
 pub(crate) fn response_body_rewrite_allowed(response_status: u16) -> bool {
     !matches!(response_status, 206 | 226)
 }
@@ -3297,6 +3299,18 @@ pub trait Plugin: Send + Sync {
     /// transformer in that chain so policy cannot govern different bytes than
     /// the backend receives.
     fn egresses_request_body_before_finalization(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin can execute an external side effect and
+    /// then terminate the request from `before_proxy`.
+    ///
+    /// A configured `request_deduplication` instance must have a strictly lower
+    /// effective priority so it acquires replay/in-flight ownership before the
+    /// side effect can run. This capability does not require deduplication to be
+    /// configured; it only makes an attached deduplication chain fail closed on
+    /// an unsafe ordering.
+    fn requires_prior_request_deduplication(&self) -> bool {
         false
     }
 

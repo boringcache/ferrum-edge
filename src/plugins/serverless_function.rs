@@ -1111,6 +1111,26 @@ impl FunctionDestination {
             if !decoded_fragment.fully_decoded {
                 return true;
             }
+            // Fragments are client-visible to the destination page even when
+            // they are scalar rather than URI-shaped. Compare their decoded
+            // content directly at URI-component boundaries before the nested
+            // reference check so `#secret/value` and
+            // `#leak=secret/value` cannot expose a signed query value (and the
+            // same applies to a configured signed path).
+            if self
+                .sensitive_path
+                .as_deref()
+                .is_some_and(|path| fragment_contains_component_sequence(
+                    &decoded_fragment.value,
+                    path,
+                ))
+                || self.sensitive_query_pairs.iter().any(|(_, value)| {
+                    !value.is_empty()
+                        && fragment_contains_component_sequence(&decoded_fragment.value, value)
+                })
+            {
+                return true;
+            }
             if self.nested_reference_exposes_destination(
                 nested_uri_reference(&decoded_fragment.value),
                 depth,
@@ -1279,6 +1299,33 @@ fn path_contains_segment_sequence(candidate: &str, sensitive: &str) -> bool {
             || candidate.as_bytes().get(end) == Some(&b'/');
         starts_at_boundary && ends_at_boundary
     })
+}
+
+fn fragment_contains_component_sequence(candidate: &str, sensitive: &str) -> bool {
+    let sensitive = sensitive.trim_matches('/');
+    if sensitive.is_empty() {
+        return false;
+    }
+    candidate.match_indices(sensitive).any(|(index, _)| {
+        let end = index + sensitive.len();
+        let starts_at_boundary = index == 0
+            || candidate
+                .as_bytes()
+                .get(index - 1)
+                .copied()
+                .is_some_and(is_uri_component_boundary);
+        let ends_at_boundary = end == candidate.len()
+            || candidate
+                .as_bytes()
+                .get(end)
+                .copied()
+                .is_some_and(is_uri_component_boundary);
+        starts_at_boundary && ends_at_boundary
+    })
+}
+
+fn is_uri_component_boundary(byte: u8) -> bool {
+    !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 fn nested_path_uri_reference(value: &str) -> Option<&str> {
@@ -1599,6 +1646,10 @@ impl Plugin for ServerlessFunction {
 
     fn egresses_request_body_before_finalization(&self) -> bool {
         self.forward_body
+    }
+
+    fn requires_prior_request_deduplication(&self) -> bool {
+        self.mode == InvocationMode::Terminate
     }
 
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {

@@ -88,6 +88,31 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    pub fn validate_plugin_security_composition_for_test(
+        plugins: &[Arc<dyn Plugin>],
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_plugin_security_composition(plugins)
+    }
+
+    pub fn validate_plugin_security_composition_candidate_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_plugin_security_composition_candidate(
+            config,
+            &crate::plugins::PluginHttpClient::default(),
+        )
+    }
+
+    pub fn is_security_composition_candidate_plugin_for_test(
+        plugin_name: &str,
+        custom_plugin_names: &[&str],
+    ) -> bool {
+        crate::plugin_cache::is_security_composition_candidate_plugin(
+            plugin_name,
+            custom_plugin_names,
+        )
+    }
+
     pub fn bind_authorized_backend_path_for_test(
         ctx: &mut crate::plugins::RequestContext,
         path: &str,

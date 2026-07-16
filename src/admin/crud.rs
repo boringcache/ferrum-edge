@@ -171,7 +171,7 @@ async fn validate_mtls_auth_candidate(
     }
 }
 
-pub(crate) async fn validate_hmac_request_transform_candidates(
+pub(crate) async fn validate_plugin_security_composition_candidates(
     db: &dyn DatabaseBackend,
     state: &AdminState,
     namespace: &str,
@@ -217,7 +217,7 @@ pub(crate) async fn validate_hmac_request_transform_candidates(
     }
 
     let http_client = super::plugin_validation_http_client(state);
-    crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
+    crate::plugin_cache::validate_plugin_security_composition_candidate(&candidate, &http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))
 }
 
@@ -229,7 +229,7 @@ pub(crate) async fn validate_hmac_request_transform_candidates(
 /// same graph here so admission neither rejects a valid replacement because of
 /// removed globals nor admits an invalid chain by dropping retained manual
 /// associations.
-pub(crate) async fn validate_hmac_request_transform_api_spec_replacement_candidate(
+pub(crate) async fn validate_plugin_security_composition_api_spec_replacement_candidate(
     db: &dyn DatabaseBackend,
     state: &AdminState,
     namespace: &str,
@@ -321,19 +321,19 @@ pub(crate) async fn validate_hmac_request_transform_api_spec_replacement_candida
     }
 
     let http_client = super::plugin_validation_http_client(state);
-    crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
+    crate::plugin_cache::validate_plugin_security_composition_candidate(&candidate, &http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))
 }
 
 /// Validate a wholesale namespace replacement without retaining resources that
 /// the restore will delete. Runtime plugin chains are namespace-scoped, so the
 /// normalized replacement is the complete authoritative candidate.
-pub(crate) fn validate_hmac_request_transform_restore_candidate(
+pub(crate) fn validate_plugin_security_composition_restore_candidate(
     state: &AdminState,
     replacement: &GatewayConfig,
 ) -> Result<(), AfterValidateError> {
     let http_client = super::plugin_validation_http_client(state);
-    crate::plugin_cache::validate_hmac_request_transform_candidate(replacement, &http_client)
+    crate::plugin_cache::validate_plugin_security_composition_candidate(replacement, &http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))
 }
 
@@ -2044,7 +2044,7 @@ impl AdminResource for PluginConfig {
         {
             validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
         }
-        validate_hmac_request_transform_candidates(
+        validate_plugin_security_composition_candidates(
             db,
             state,
             namespace,
@@ -2067,7 +2067,7 @@ impl AdminResource for PluginConfig {
         if existing.plugin_name == "mtls_auth" {
             validate_mtls_auth_candidate(db, namespace, None, None, Some(&existing.id)).await?;
         }
-        validate_hmac_request_transform_candidates(
+        validate_plugin_security_composition_candidates(
             db,
             state,
             namespace,
@@ -2506,7 +2506,7 @@ impl AdminResource for Proxy {
         // effective `mtls_auth` association; compatibility validation itself
         // remains stream-specific.
         validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
-        validate_hmac_request_transform_candidates(
+        validate_plugin_security_composition_candidates(
             db,
             state,
             namespace,

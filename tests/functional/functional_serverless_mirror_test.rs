@@ -65,9 +65,27 @@ async fn start_function_server(port: u16, invocations: Arc<AtomicUsize>) {
                 invocations.fetch_add(1, Ordering::SeqCst);
 
                 let request = String::from_utf8_lossy(&buf[..n]);
+                let is_governed_partial_response =
+                    request.contains(r#""path":"/fn/range-governed""#);
+                let is_governed_delta_response =
+                    request.contains(r#""path":"/fn/delta-governed""#);
                 let is_partial_response = request.contains(r#""path":"/fn/range""#);
                 let is_delta_response = request.contains(r#""path":"/fn/delta""#);
-                let response = if is_partial_response {
+                let response = if is_governed_partial_response {
+                    let body = r#"{"choices":[{"message":{"content":"contact secret@example.com"}}]}"#;
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Type: application/json\r\nContent-Range: bytes 0-66/100\r\nAccept-Ranges: bytes\r\nETag: \"partial-sensitive-v1\"\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if is_governed_delta_response {
+                    let body = r#"{"choices":[{"message":{"tool_calls":[{"type":"function","function":{"name":"filesystem.write","arguments":"{\"token\":\"sk-SECRET123\"}"}}]}}]}"#;
+                    format!(
+                        "HTTP/1.1 226 IM Used\r\nContent-Length: {}\r\nContent-Type: application/json\r\nIM: diffe\r\nDelta-Base: \"delta-sensitive-v1\"\r\nETag: \"delta-sensitive-v2\"\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if is_partial_response {
                     let body = r#"{"source":"serverless-function","message":"partial"}"#;
                     format!(
                         "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Type: application/json\r\nContent-Range: bytes 0-51/100\r\nAccept-Ranges: bytes\r\nETag: \"partial-v1\"\r\nConnection: close\r\n\r\n{}",
@@ -240,6 +258,8 @@ proxies:
       - plugin_config_id: "dedup-1"
       - plugin_config_id: "serverless-1"
       - plugin_config_id: "response-transformer-1"
+      - plugin_config_id: "tool-governor-1"
+      - plugin_config_id: "response-guard-1"
 
 consumers: []
 
@@ -272,6 +292,26 @@ plugin_configs:
           target: "body"
           key: "source"
           value: "gateway-rewritten"
+  - id: "tool-governor-1"
+    proxy_id: "serverless-proxy"
+    plugin_name: "ai_tool_governor"
+    scope: "proxy"
+    enabled: true
+    config:
+      tools:
+        filesystem.write:
+          action: "redact_args"
+          blocked_arg_patterns:
+            - name: "secret"
+              regex: "sk-[A-Za-z0-9]+"
+  - id: "response-guard-1"
+    proxy_id: "serverless-proxy"
+    plugin_name: "ai_response_guard"
+    scope: "proxy"
+    enabled: true
+    config:
+      pii_patterns: ["email"]
+      action: "redact"
 
 upstreams: []
 "#
@@ -540,6 +580,36 @@ upstreams: []
     assert!(delta_body.contains("serverless-function"));
     assert!(!delta_body.contains("gateway-rewritten"));
     assert_eq!(function_invocations.load(Ordering::SeqCst), 5);
+
+    let governed_partial = client
+        .get(format!(
+            "http://127.0.0.1:{}/fn/range-governed",
+            proxy_port
+        ))
+        .send()
+        .await
+        .expect("governed partial response request failed");
+    assert_eq!(governed_partial.status().as_u16(), 502);
+    assert!(!governed_partial.headers().contains_key("content-range"));
+    assert!(!governed_partial.headers().contains_key("etag"));
+    let governed_partial_body = governed_partial.text().await.unwrap();
+    assert!(!governed_partial_body.contains("secret@example.com"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 6);
+
+    let governed_delta = client
+        .get(format!(
+            "http://127.0.0.1:{}/fn/delta-governed",
+            proxy_port
+        ))
+        .send()
+        .await
+        .expect("governed delta response request failed");
+    assert_eq!(governed_delta.status().as_u16(), 502);
+    assert!(!governed_delta.headers().contains_key("im"));
+    assert!(!governed_delta.headers().contains_key("delta-base"));
+    let governed_delta_body = governed_delta.text().await.unwrap();
+    assert!(!governed_delta_body.contains("sk-SECRET123"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 7);
 
     let _ = gw.kill();
     let _ = gw.wait();

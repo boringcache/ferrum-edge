@@ -15169,7 +15169,9 @@ components:
         slash-delimited segment boundaries even with added prefix or descendant
         segments, not inside arbitrary substrings. Non-empty signed query values
         remain protected if copied under another parameter name or into complete
-        slash-delimited path components. Query comparison
+        slash-delimited path components, and decoded fragments are checked
+        directly at URI-component boundaries even when they are scalar rather
+        than URI-shaped. Query comparison
         percent-decodes generic URI components but preserves literal `+` characters
         instead of applying form-data space conversion. Inspection is
         bounded to 16 KiB per field, 32 Link targets, eight percent-decoding
@@ -15177,15 +15179,20 @@ components:
         encoding, malformed target syntax, budget overflow, or another
         structural URI reference at the nesting boundary fails closed even for
         root function destinations, while unrelated URL targets, non-URL
-        Refresh directives, quoted Link parameters, and scalar labels remain
-        observable.
+        Refresh directives, quoted Link parameters, and scalar labels without
+        signed components remain observable.
         Later body rewrites invalidate ranges, validators, integrity metadata,
         and content-bound signatures while unmodified responses retain them;
         206 Partial Content and 226 IM Used responses skip rewriting to preserve
-        range and delta semantics.
+        range and delta semantics. Inspection still runs, and enforcing
+        redaction-dependent plugins reject governed content when those bytes
+        cannot be safely rewritten.
         Deduplicated terminal replays preserve the final status/body but use
         sanitized headers: session/authentication fields, Retry-After,
         trace/correlation fields, and rate-limit counters are not replayed.
+        If request_deduplication is attached, every same-protocol instance must
+        have a strictly lower effective priority than terminate mode; candidate
+        admission rejects equal or reversed ordering before persistence.
         HEAD/204/304 bodies are empty. Automatic redirects are disabled;
         pre_proxy accepts only 2xx as approval, while terminate may
         intentionally return only final 2xx-5xx statuses (200-599).
@@ -15245,7 +15252,7 @@ components:
         forward_body:
           type: boolean
           default: false
-          description: "Include the lossless request body in the function payload for every HTTP method. Representation follows the active hook Content-Type: JSON is structured when valid, UTF-8 bodies are strings, and other bytes are base64 with body_encoding=base64. The plugin buffers before invocation and fails closed if bytes are unavailable or the active request headers use a non-identity Content-Encoding. Cannot be combined with a request-body transformer on the same protocol chain."
+          description: "Include the lossless request body in the function payload for every HTTP method. Representation follows the active hook Content-Type: JSON is structured when valid, UTF-8 bodies are strings, and other bytes are base64 with body_encoding=base64. The plugin buffers before invocation and fails closed if bytes are unavailable or the active request headers use a non-identity Content-Encoding. Candidate admission and runtime cache construction reject combination with a request-body transformer on the same protocol chain."
         forward_headers:
           type: array
           items:

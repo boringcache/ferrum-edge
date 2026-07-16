@@ -672,8 +672,9 @@ impl GovernorEngine {
     /// cannot rewrite the arguments in place — mid-stream SSE deltas, the
     /// request body (no request-body transform), and the post-transform final
     /// response re-check — the safe behavior is to reject rather than forward an
-    /// unredacted secret. Only the buffered response path (which has a
-    /// `transform_response_body` redaction hook) passes `false`.
+    /// unredacted secret. Only a buffered response whose status permits the
+    /// `transform_response_body` redaction hook passes `false`; range/delta
+    /// representations preserve their bytes and therefore pass `true`.
     async fn govern_calls(
         &self,
         corr: &CorrelationMeta,
@@ -2600,7 +2601,12 @@ impl Plugin for AiToolGovernor {
 
         let batch = self
             .engine
-            .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, false)
+            .govern_calls(
+                &corr,
+                &calls,
+                &ctx.plugin_http_call_ns,
+                !super::response_body_rewrite_allowed(response_status),
+            )
             .await;
         self.write_metadata(ctx, &batch);
 

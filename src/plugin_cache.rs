@@ -135,10 +135,11 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
     Ok(())
 }
 
-/// Reject request-body security compositions whose early decision would govern
-/// bytes different from those ultimately sent to the backend. This covers both
-/// HMAC integrity and plugins that egress the body during `before_proxy`.
-fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
+/// Reject security-sensitive plugin compositions whose ordering or body view
+/// cannot preserve the configured enforcement contract.
+pub(crate) fn validate_plugin_security_composition(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
         let has_hmac = plugins
             .iter()
@@ -157,7 +158,7 @@ fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> R
             ));
         }
 
-        if let Some(serverless) = plugins
+        if let Some(egress_plugin) = plugins
             .iter()
             .filter(|plugin| plugin.supported_protocols().contains(&protocol))
             .find(|plugin| plugin.egresses_request_body_before_finalization())
@@ -167,11 +168,30 @@ fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> R
                 .find(|plugin| plugin.modifies_request_body())
         {
             return Err(format!(
-                "{} with forward_body cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; the function runs before body transformation and Ferrum will not let an external decision govern bytes different from those sent to the backend",
-                serverless.name(),
+                "request-body egress plugin '{}' cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; the external decision runs before body transformation and Ferrum will not let it govern bytes different from those sent to the backend",
+                egress_plugin.name(),
                 transformer.name(),
                 protocol
             ));
+        }
+
+        for side_effecting_plugin in plugins.iter().filter(|plugin| {
+            plugin.supported_protocols().contains(&protocol)
+                && plugin.requires_prior_request_deduplication()
+        }) {
+            if let Some(deduplication) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() == "request_deduplication"
+                    && plugin.priority() >= side_effecting_plugin.priority()
+            }) {
+                return Err(format!(
+                    "{} at effective priority {} must run after every request_deduplication instance for protocol {:?}; request_deduplication priority {} would let a terminal external side effect execute before retry ownership is acquired",
+                    side_effecting_plugin.name(),
+                    side_effecting_plugin.priority(),
+                    protocol,
+                    deduplication.priority(),
+                ));
+            }
         }
     }
     Ok(())
@@ -215,6 +235,9 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn egresses_request_body_before_finalization(&self) -> bool {
         self.inner.egresses_request_body_before_finalization()
+    }
+    fn requires_prior_request_deduplication(&self) -> bool {
+        self.inner.requires_prior_request_deduplication()
     }
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.inner.requires_request_body_before_before_proxy()
@@ -762,7 +785,7 @@ type RequestBufferingMap = HashMap<String, bool>;
 type WsFrameMap = HashMap<String, bool>;
 /// Map from proxy_group plugin_config_id to its shared plugin instance.
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
-type HmacCompositionPluginMap<'a> =
+type SecurityCompositionPluginMap<'a> =
     HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1823,11 +1846,12 @@ struct ProxyGroupPluginInstance {
 }
 
 /// Built-in plugin types whose constructed instance can participate in a
-/// request-body security composition invariant. Keep this list aligned with
-/// the relevant `Plugin` capabilities. Registered custom plugins are also
-/// constructed because their capability is defined by their implementation.
-const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
+/// security composition invariant. Keep this list aligned with the relevant
+/// `Plugin` capabilities. Registered custom plugins are also constructed
+/// because their capability is defined by their implementation.
+const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "hmac_auth",
+    "request_deduplication",
     "serverless_function",
     "request_transformer",
     "compression",
@@ -1839,36 +1863,34 @@ const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "ai_request_guard",
 ];
 
-/// Validate request-body security composition against a candidate config before
-/// an admin Proxy or PluginConfig write is persisted. Runtime cache construction
-/// repeats the same check as a fail-closed backstop.
-pub(crate) fn validate_hmac_request_transform_candidate(
+pub(crate) fn is_security_composition_candidate_plugin(
+    plugin_name: &str,
+    custom_plugin_names: &[&str],
+) -> bool {
+    SECURITY_COMPOSITION_PLUGIN_NAMES.contains(&plugin_name)
+        || custom_plugin_names.contains(&plugin_name)
+}
+
+/// Validate security-sensitive plugin composition against a candidate config
+/// before an admin Proxy or PluginConfig write is persisted. Runtime cache
+/// construction repeats the same check as a fail-closed backstop.
+pub(crate) fn validate_plugin_security_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
-    if !config.plugin_configs.iter().any(|plugin| {
-        plugin.enabled
-            && (plugin.plugin_name == "hmac_auth"
-                || (plugin.plugin_name == "serverless_function"
-                    && plugin
-                        .config
-                        .get("forward_body")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)))
-    }) {
-        return Ok(());
-    }
     let mut errors = Vec::new();
     let mut global_plugins = Vec::new();
-    let mut scoped_plugins: HmacCompositionPluginMap<'_> = HashMap::new();
+    let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
     let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
 
     for plugin_config in &config.plugin_configs {
         if !plugin_config.enabled
-            || (!HMAC_COMPOSITION_PLUGIN_NAMES.contains(&plugin_config.plugin_name.as_str())
-                && !custom_plugin_names.contains(&plugin_config.plugin_name.as_str()))
+            || !is_security_composition_candidate_plugin(
+                plugin_config.plugin_name.as_str(),
+                &custom_plugin_names,
+            )
         {
             continue;
         }
@@ -1917,12 +1939,12 @@ pub(crate) fn validate_hmac_request_transform_candidate(
             remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
             merged.push(Arc::clone(plugin));
         }
-        if let Err(error) = validate_hmac_request_transform_composition(&merged) {
+        if let Err(error) = validate_plugin_security_composition(&merged) {
             errors.push(format!("proxy_id={}: {error}", proxy.id));
         }
     }
 
-    if let Err(error) = validate_hmac_request_transform_composition(&global_plugins) {
+    if let Err(error) = validate_plugin_security_composition(&global_plugins) {
         errors.push(format!("global plugins: {error}"));
     }
 
@@ -1930,7 +1952,7 @@ pub(crate) fn validate_hmac_request_transform_candidate(
         Ok(())
     } else {
         Err(format!(
-            "{} request-body security composition error(s): {}",
+            "{} plugin security composition error(s): {}",
             errors.len(),
             errors.join("; ")
         ))
@@ -2845,7 +2867,7 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
-            if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
+            if let Err(e) = validate_plugin_security_composition(&global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
             Arc::new(global_plugins)
@@ -3087,7 +3109,7 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
+            if let Err(e) = validate_plugin_security_composition(&merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
             new_map.insert(proxy.id.clone(), Arc::new(merged));
@@ -3618,7 +3640,7 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
-            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
+            if let Err(e) = validate_plugin_security_composition(&merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
 
@@ -3643,7 +3665,7 @@ impl PluginCache {
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
-        if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
+        if let Err(e) = validate_plugin_security_composition(&global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
 

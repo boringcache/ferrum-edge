@@ -4291,7 +4291,7 @@ async fn handle_batch_create(
     }
 
     if !batch.proxies.is_empty() || !batch.plugin_configs.is_empty() {
-        match crud::validate_hmac_request_transform_candidates(
+        match crud::validate_plugin_security_composition_candidates(
             db.as_ref(),
             state,
             namespace,
@@ -4306,11 +4306,11 @@ async fn handle_batch_create(
                 validation_errors.extend(errors);
             }
             Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
-                "Failed to load config for HMAC request-transform candidate validation: {}",
+                "Failed to load config for plugin security composition candidate validation: {}",
                 error
             )),
             Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-                "HMAC request-transform candidate validation returned an unexpected response"
+                "Plugin security composition candidate validation returned an unexpected response"
                     .to_string(),
             ),
         }
@@ -4921,7 +4921,7 @@ async fn handle_restore(
                 }
             }
         }
-        match crud::validate_hmac_request_transform_restore_candidate(state, &temp_config) {
+        match crud::validate_plugin_security_composition_restore_candidate(state, &temp_config) {
             Ok(()) => {}
             Err(crud::AfterValidateError::BadRequest(errors)) => {
                 validation_errors.extend(errors);
@@ -4931,14 +4931,14 @@ async fn handle_restore(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
                         "error": format!(
-                            "Restore aborted: HMAC request-transform composition could not be validated: {}. Existing config was NOT deleted.",
+                            "Restore aborted: plugin security composition could not be validated: {}. Existing config was NOT deleted.",
                             error
                         )
                     }),
                 ));
             }
             Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-                "HMAC request-transform candidate validation returned an unexpected response"
+                "Plugin security composition candidate validation returned an unexpected response"
                     .to_string(),
             ),
         }

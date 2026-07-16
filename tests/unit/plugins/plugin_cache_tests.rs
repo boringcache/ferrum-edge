@@ -17,6 +17,32 @@ use std::sync::Arc;
 
 struct LegacyAuthorizePlugin;
 
+struct CustomBodyEgressPlugin;
+
+#[async_trait::async_trait]
+impl Plugin for CustomBodyEgressPlugin {
+    fn name(&self) -> &str {
+        "custom_body_egress"
+    }
+
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        true
+    }
+}
+
+struct CustomBodyTransformerPlugin;
+
+#[async_trait::async_trait]
+impl Plugin for CustomBodyTransformerPlugin {
+    fn name(&self) -> &str {
+        "custom_body_transformer"
+    }
+
+    fn modifies_request_body(&self) -> bool {
+        true
+    }
+}
+
 #[async_trait::async_trait]
 impl Plugin for LegacyAuthorizePlugin {
     fn name(&self) -> &str {
@@ -1251,6 +1277,16 @@ fn serverless_body_egress_rejects_request_body_transform_composition() {
             ],
         );
 
+        let candidate_error =
+            ferrum_edge::_test_support::validate_plugin_security_composition_candidate_for_test(
+                &config,
+            )
+            .expect_err("candidate admission must reject body egress plus transformation");
+        assert!(
+            candidate_error.contains("request-body") || candidate_error.contains("validation"),
+            "candidate transform={transform_name}, got: {candidate_error}"
+        );
+
         let error = match PluginCache::new(&config) {
             Ok(_) => panic!("serverless body egress plus {transform_name} must fail closed"),
             Err(error) => error,
@@ -1260,6 +1296,153 @@ fn serverless_body_egress_rejects_request_body_transform_composition() {
             "transform={transform_name}, got: {error}"
         );
     }
+}
+
+#[test]
+fn custom_body_egress_enters_candidate_selection_and_shared_validation() {
+    assert!(
+        ferrum_edge::_test_support::is_security_composition_candidate_plugin_for_test(
+            "custom_body_egress",
+            &["custom_body_egress"],
+        ),
+        "registered custom plugins must enter candidate composition validation"
+    );
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(CustomBodyEgressPlugin),
+        Arc::new(CustomBodyTransformerPlugin),
+    ];
+    let error = ferrum_edge::_test_support::validate_plugin_security_composition_for_test(&plugins)
+        .expect_err("custom body egress plus transformation must fail closed");
+    assert!(error.contains("custom_body_egress"), "{error}");
+    assert!(error.contains("custom_body_transformer"), "{error}");
+}
+
+#[test]
+fn terminate_serverless_must_run_after_every_request_deduplication_instance() {
+    for serverless_priority in [2700, 2750] {
+        let mut serverless = make_plugin_config_with_json(
+            "terminal-function",
+            "serverless_function",
+            json!({
+                "provider": "azure_functions",
+                "function_url": "https://example.com/function",
+                "mode": "terminate"
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        serverless.priority_override = Some(serverless_priority);
+        let config = make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                vec!["dedup", "terminal-function"],
+            )],
+            vec![
+                make_plugin_config(
+                    "dedup",
+                    "request_deduplication",
+                    PluginScope::Proxy,
+                    Some("p1"),
+                    true,
+                ),
+                serverless,
+            ],
+        );
+
+        let candidate_error =
+            ferrum_edge::_test_support::validate_plugin_security_composition_candidate_for_test(
+                &config,
+            )
+            .unwrap_err();
+        assert!(
+            candidate_error.contains("serverless_function"),
+            "{candidate_error}"
+        );
+        assert!(
+            candidate_error.contains("request_deduplication"),
+            "{candidate_error}"
+        );
+
+        let error = PluginCache::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("unsafe serverless priority {serverless_priority} admitted"));
+        assert!(error.contains("serverless_function"), "{error}");
+        assert!(error.contains("request_deduplication"), "{error}");
+    }
+}
+
+#[test]
+fn safe_serverless_dedup_order_and_pre_proxy_override_are_admitted() {
+    let terminate_default = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["dedup", "terminal-function"],
+        )],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "terminal-function",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": "https://example.com/function",
+                    "mode": "terminate"
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    ferrum_edge::_test_support::validate_plugin_security_composition_candidate_for_test(
+        &terminate_default,
+    )
+    .expect("candidate admission accepts the default safe dedup order");
+    PluginCache::new(&terminate_default).expect("default dedup order is safe");
+
+    let mut pre_proxy = make_plugin_config_with_json(
+        "policy-function",
+        "serverless_function",
+        json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/function",
+            "mode": "pre_proxy"
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    pre_proxy.priority_override = Some(2700);
+    let pre_proxy_config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["dedup", "policy-function"],
+        )],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            pre_proxy,
+        ],
+    );
+    ferrum_edge::_test_support::validate_plugin_security_composition_candidate_for_test(
+        &pre_proxy_config,
+    )
+    .expect("candidate admission does not impose terminate-mode ordering on pre_proxy");
+    PluginCache::new(&pre_proxy_config)
+        .expect("pre_proxy serverless does not produce a terminal replay obligation");
 }
 
 #[test]

@@ -1276,6 +1276,10 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "copied-query-path-other-host",
         "literal-plus-encoded-candidate",
         "encoded-plus-literal-candidate",
+        "fragment-query-scalar",
+        "fragment-query-pair-scalar",
+        "fragment-path-scalar",
+        "fragment-double-encoded",
         "malformed",
         "userinfo",
         "benign-relative",
@@ -1286,6 +1290,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-query-value-lookalike",
         "benign-query-path-lookalike",
         "benign-plus-space-distinct",
+        "benign-fragment-lookalike",
+        "benign-fragment-label",
     ] {
         let server = MockServer::start().await;
         let function_url = match case {
@@ -1369,6 +1375,18 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "encoded-plus-literal-candidate" => {
                 "https://redirect.example/next?leak=token+part".to_string()
             }
+            "fragment-query-scalar" => {
+                "https://redirect.example/#secret/value".to_string()
+            }
+            "fragment-query-pair-scalar" => {
+                "https://redirect.example/#leak=secret/value".to_string()
+            }
+            "fragment-path-scalar" => {
+                "https://redirect.example/#signed/trigger".to_string()
+            }
+            "fragment-double-encoded" => {
+                "https://redirect.example/#secret%252Fvalue".to_string()
+            }
             "malformed" => "http://[signed%2Ftrigger?code=secret%2Fvalue".to_string(),
             "userinfo" => "https://user:password@redirect.example/next".to_string(),
             "benign-relative" => "/next".to_string(),
@@ -1388,6 +1406,12 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-plus-space-distinct" => {
                 "https://redirect.example/next?leak=token+part".to_string()
+            }
+            "benign-fragment-lookalike" => {
+                "https://redirect.example/#secret/value-extra".to_string()
+            }
+            "benign-fragment-label" => {
+                "https://redirect.example/#release-notes".to_string()
             }
             _ => unreachable!(),
         };

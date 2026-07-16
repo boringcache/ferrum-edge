@@ -98,7 +98,7 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     if let Err(found) = config.validate_plugin_references() {
         errors.extend(found);
     }
-    if let Err(found) = crate::plugin_cache::validate_hmac_request_transform_candidate(
+    if let Err(found) = crate::plugin_cache::validate_plugin_security_composition_candidate(
         config,
         &crate::plugins::PluginHttpClient::default(),
     ) {
