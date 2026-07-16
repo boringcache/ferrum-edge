@@ -141,7 +141,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .expect("POST admission guard");
     let post_persist = api_spec_source
-        .find("db.submit_api_spec_bundle(&bundle, &spec).await")
+        .find("db.submit_api_spec_bundle(&bundle, &spec)")
         .expect("POST persistence");
     assert!(post_lock < post_persist);
     let put_lock = api_spec_source[post_lock + 1..]
@@ -149,7 +149,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .map(|position| position + post_lock + 1)
         .expect("PUT admission guard");
     let put_persist = api_spec_source
-        .find("db.replace_api_spec_bundle(&bundle, &spec).await")
+        .find("db.replace_api_spec_bundle(&bundle, &spec)")
         .expect("PUT persistence");
     assert!(put_lock < put_persist);
     let delete_lock = api_spec_source[put_lock + 1..]
@@ -157,7 +157,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .map(|position| position + put_lock + 1)
         .expect("DELETE admission guard");
     let delete_persist = api_spec_source
-        .find("db.delete_api_spec(namespace, id).await")
+        .find("db.delete_api_spec(namespace, id)")
         .expect("DELETE persistence");
     let delete_validation = api_spec_source
         .find("validate_transaction_log_schema_api_spec_deletion_candidate(")

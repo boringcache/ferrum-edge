@@ -5164,7 +5164,12 @@ async fn handle_restore(
             Err(error) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Config admission unavailable: {error}")}),
+                    &json!({
+                        "error": format!(
+                            "Restore aborted: config admission unavailable: {error}. Existing config was NOT deleted."
+                        ),
+                        "failure_class": "connectivity",
+                    }),
                 ));
             }
         };
