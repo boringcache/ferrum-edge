@@ -48,7 +48,7 @@
 //! | `mirror_host` | string | **(required)** | Hostname or IP of the mirror target |
 //! | `mirror_port` | u16 | 80 (http) / 443 (https) | Port of the mirror target |
 //! | `mirror_protocol` | string | `"http"` | `"http"` or `"https"` |
-//! | `mirror_path` | string | (none) | Override the request path for the mirror. When unset, the original request path is used |
+//! | `mirror_path` | string | (none) | Override the request path for the mirror. When unset, the backend-effective authorized path is used if backend-path policy is active; otherwise the original request path is used |
 //! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
 //! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes read from a mirror response when sizing it (only consulted when the response has no `content-length`). Streaming aborts as soon as the limit is crossed; mirror task discards the bytes after sizing. |
@@ -192,7 +192,7 @@ impl RequestMirror {
         })
     }
 
-    /// Build the full mirror URL from the config and original request path/query.
+    /// Build the full mirror URL from the configured or gateway-selected path.
     fn build_mirror_url(
         &self,
         original_path: &str,
@@ -359,6 +359,10 @@ impl Plugin for RequestMirror {
         self.mirror_hostname.iter().cloned().collect()
     }
 
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        true
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -376,7 +380,11 @@ impl Plugin for RequestMirror {
             return PluginResult::Continue;
         }
 
-        let mirror_url = self.build_mirror_url(&ctx.path, &ctx.query_params);
+        // When backend-path policy is active, mirror the exact path that passed
+        // final authorization. Falling back to the ordinary client path keeps
+        // the established behavior for proxies without that policy boundary.
+        let mirror_path = ctx.authorized_backend_path().unwrap_or(&ctx.path);
+        let mirror_url = self.build_mirror_url(mirror_path, &ctx.query_params);
         let method = ctx.method.clone();
 
         // Collect headers for the mirror request. Use the proxy headers (post-transform)
