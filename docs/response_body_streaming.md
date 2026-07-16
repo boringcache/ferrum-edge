@@ -235,10 +235,14 @@ for bounded decode because stream inspectors cannot parse compressed wire bytes.
 After decoding, an SSE media type keeps SSE frame parsing unless the complete
 payload is a valid standalone JSON document; this preserves later `data:` frames
 after JSON-looking SSE preludes while still inspecting bare JSON mislabeled as
-SSE. No encoding (or an identity-only encoding list) still lets ordinary non-AI
-text stream, and a gateway-planned compression transform is not mistaken for
-already-encoded origin bytes, including when a later header hook switches
-between supported gzip and Brotli output.
+SSE. Once an encoded event stream is governed, every assembled non-empty,
+non-`[DONE]` `data:` payload must parse as JSON; one unparseable frame makes the
+decoded representation uninspectable and routes the whole response through
+`on_error` instead of inspecting only its parseable subset. No encoding (or an
+identity-only encoding list) still lets ordinary non-AI text stream, and a
+gateway-planned compression transform is not mistaken for already-encoded
+origin bytes, including when a later header hook switches between supported gzip
+and Brotli output.
 
 **Protocol coverage.** The downgrade applies on the HTTP/1.1 + HTTP/2 (reqwest),
 direct-HTTP/2, HBONE, native-HTTP/3 header-first, and HTTP/3 cross-protocol

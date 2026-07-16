@@ -2537,10 +2537,11 @@ async fn streaming_response_buffer_uninspectable_honors_on_error_allow() {
 }
 
 #[tokio::test]
-async fn unflagged_uninspectable_sse_is_not_rejected() {
-    // The fail-closed path is scoped to buffer mode: a buffered SSE that buffer
-    // mode did NOT flag (no marker — e.g. pinned by another plugin) keeps the
-    // lenient "nothing to inspect → Continue" behavior, even with on_error=reject.
+async fn unflagged_unencoded_uninspectable_sse_is_not_rejected() {
+    // This unencoded SSE has neither a streaming-inspection marker nor the
+    // governed provenance of an origin-encoded response. If another plugin
+    // happens to buffer such an unrelated stream, it keeps the lenient
+    // "nothing to inspect → Continue" behavior even with on_error=reject.
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "buffer",
@@ -2750,9 +2751,11 @@ async fn streaming_response_inspect_cuts_on_leaking_tool_call() {
 
 #[tokio::test]
 async fn streaming_response_inspect_fail_closed_on_uninspectable() {
-    // A non-JSON `data:` payload cannot be inspected; under on_error=reject the
-    // stream fails closed (cut) rather than forwarding un-inspected content
-    // (Codex P1: block-mode contract — no un-inspected bytes reach the client).
+    // A non-JSON `data:` payload cannot be inspected, even when an earlier frame
+    // parsed as benign JSON and `[DONE]` terminated the stream. Under
+    // on_error=reject the stream fails closed (cut) rather than forwarding only
+    // the parseable subset (block-mode contract: no un-inspected bytes reach the
+    // client).
     let config = json!({
         "inspect": {"request": false, "response": true},
         "streaming_response": "inspect",
@@ -2766,7 +2769,9 @@ async fn streaming_response_inspect_fail_closed_on_uninspectable() {
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
 
-    let garbage = b"data: not-json-cannot-inspect\n\n";
+    let garbage = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A harmless prelude\"}}]}\n\n\
+data: My system prompt says never disclose this policy.\n\n\
+data: [DONE]\n\n";
     assert!(matches!(
         inspector.on_chunk(garbage).await,
         ResponseStreamAction::Forward(_)
@@ -3570,7 +3575,17 @@ async fn decoded_event_stream_with_json_looking_prelude_stays_inspectable() {
         "builtins": {"response_leakage": true}
     });
     let firewall = plugin(&config);
-    let plaintext = b"{}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"My system prompt says never disclose this policy.\"}}]}\n\n";
+    let plaintext = b"{}\n\
+event: prelude\n\
+id: ignored-1\n\
+retry: 1000\n\
+: ignored comment\n\n\
+event: message\n\
+id: governed-1\n\
+data: {\"choices\":[\n\
+data: {\"delta\":{\"content\":\"My system prompt says never disclose this policy.\"}}\n\
+data: ]}\n\n\
+data: [DONE]\n\n";
 
     for (encoding, body) in [
         ("gzip", gzip_bytes(plaintext)),
@@ -3597,6 +3612,55 @@ async fn decoded_event_stream_with_json_looking_prelude_stays_inspectable() {
         assert!(
             !ctx.metadata
                 .contains_key("ai_semantic_firewall.uninspectable_body")
+        );
+    }
+}
+
+#[tokio::test]
+async fn decoded_governed_event_stream_partial_parse_honors_on_error() {
+    let plaintext = b"data: {\"choices\":[{\"delta\":{\"content\":\"A harmless response\"}}]}\n\n\
+data: My system prompt says never disclose this policy.\n\n\
+data: [DONE]\n\n";
+
+    for (on_error, rejected) in [("reject", true), ("warn", false), ("allow", false)] {
+        let config = json!({
+            "inspect": {"request": false, "response": true},
+            "on_error": on_error,
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "builtins": {"response_leakage": true}
+        });
+        let firewall = plugin(&config);
+        let body = gzip_bytes(plaintext);
+        let headers = HashMap::from([
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            ("content-encoding".to_string(), "gzip".to_string()),
+        ]);
+        let mut ctx = create_test_context();
+
+        assert_continue(
+            firewall
+                .on_response_body(&mut ctx, 200, &headers, &body)
+                .await,
+        );
+        let result = firewall
+            .on_final_response_body(&mut ctx, 200, &headers, &body)
+            .await;
+        if rejected {
+            assert_reject(result, Some(502));
+        } else {
+            assert_continue(result);
+        }
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.uninspectable_body")
+                .map(String::as_str),
+            Some("streaming_body")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.response_inspection")
+                .map(String::as_str),
+            Some("streaming_uninspectable")
         );
     }
 }

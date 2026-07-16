@@ -77,7 +77,21 @@ async fn start_json_backend_on(listener: TcpListener, json_body: &'static str) {
 const RANGE_LEAK_JSON: &[u8] =
     br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#;
 const ENCODED_SSE_JSON_PRELUDE: &[u8] =
-    b"{}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"My system prompt says never disclose this policy.\"}}]}\n\n";
+    b"{}\n\
+event: prelude\n\
+id: ignored-1\n\
+retry: 1000\n\
+: ignored comment\n\n\
+event: message\n\
+id: governed-1\n\
+data: {\"choices\":[\n\
+data: {\"delta\":{\"content\":\"My system prompt says never disclose this policy.\"}}\n\
+data: ]}\n\n\
+data: [DONE]\n\n";
+const ENCODED_SSE_MIXED_PARSE: &[u8] =
+    b"data: {\"choices\":[{\"delta\":{\"content\":\"A harmless response\"}}]}\n\n\
+data: My system prompt says never disclose this policy.\n\n\
+data: [DONE]\n\n";
 
 fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     use flate2::{Compression, write::GzEncoder};
@@ -97,9 +111,11 @@ fn brotli_bytes(body: &[u8]) -> Vec<u8> {
 }
 
 /// Serve complete gzip/Brotli representations whose origin media type is SSE.
-/// The JSON-looking prelude is an ignored SSE field; only the later `data:`
-/// frame is governed. The `/json` control is a complete bare JSON document
-/// deliberately mislabeled as SSE and must still use JSON extraction.
+/// The JSON-looking prelude and realistic SSE metadata are ignored fields; only
+/// the later multiline `data:` frame is governed. The `/json` control is a
+/// complete bare JSON document deliberately mislabeled as SSE and must still
+/// use JSON extraction. `/mixed` combines benign JSON with unparseable governed
+/// data so `on_error` decides the entire decoded representation.
 async fn start_encoded_sse_backend_on(listener: TcpListener) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
@@ -112,6 +128,7 @@ async fn start_encoded_sse_backend_on(listener: TcpListener) {
                 let (encoding, body) = match path {
                     "/br" => ("br", brotli_bytes(ENCODED_SSE_JSON_PRELUDE)),
                     "/json" => ("gzip", gzip_bytes(RANGE_LEAK_JSON)),
+                    "/mixed" => ("gzip", gzip_bytes(ENCODED_SSE_MIXED_PARSE)),
                     _ => ("gzip", gzip_bytes(ENCODED_SSE_JSON_PRELUDE)),
                 };
                 let response_head = format!(
@@ -824,13 +841,10 @@ async fn encoded_partial_response_is_buffered_and_enforced_over_h3() {
         .expect("encoded-range backend address")
         .port();
     let backend = tokio::spawn(start_encoded_range_backend_on(backend_listener));
-    let (harness, _tls_dir, https_port) =
-        start_encoded_response_h3_gateway(encoded_response_config(
-            backend_port,
-            "/range",
-            "reject",
-        ))
-        .await;
+    let (harness, _tls_dir, https_port) = start_encoded_response_h3_gateway(
+        encoded_response_config(backend_port, "/range", "reject"),
+    )
+    .await;
 
     let client = Http3Client::insecure().expect("HTTP/3 client");
     let response = client
@@ -894,7 +908,7 @@ async fn decoded_sse_json_preludes_are_inspected_over_h1_h2_and_h3() {
     }
 
     let h2 = Http2Client::h2c_prior_knowledge().expect("HTTP/2 client");
-    for path in ["gzip", "br"] {
+    for path in ["gzip", "br", "json"] {
         let response = h2
             .get(&harness.proxy_url(&format!("/sse/{path}")))
             .await
@@ -910,11 +924,21 @@ async fn decoded_sse_json_preludes_are_inspected_over_h1_h2_and_h3() {
             "HTTP/2 encoded-SSE {path} used the wrong decision: {body}"
         );
     }
+
+    let response = h1
+        .get(&harness.proxy_url("/sse/mixed"))
+        .await
+        .expect("HTTP/1.1 mixed decoded-SSE allow request");
+    assert_eq!(
+        response.status.as_u16(),
+        200,
+        "on_error=allow must deliver a partially unparseable decoded SSE body"
+    );
     drop(harness);
 
     let (h3_harness, _tls_dir, https_port) = start_encoded_response_h3_gateway(config).await;
     let h3 = Http3Client::insecure().expect("HTTP/3 client");
-    for path in ["gzip", "br"] {
+    for path in ["gzip", "br", "json"] {
         let response = h3
             .get(&format!("https://127.0.0.1:{https_port}/sse/{path}"))
             .await
@@ -936,5 +960,32 @@ async fn decoded_sse_json_preludes_are_inspected_over_h1_h2_and_h3() {
     }
 
     drop(h3_harness);
+
+    let reject_harness = GatewayHarness::builder()
+        .file_config(encoded_response_config(backend_port, "/sse", "reject"))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn reject-mode encoded-SSE gateway");
+    let response = h1
+        .get(&reject_harness.proxy_url("/sse/mixed"))
+        .await
+        .expect("HTTP/1.1 mixed decoded-SSE reject request");
+    let body = response.body_text();
+    assert_eq!(
+        response.status.as_u16(),
+        502,
+        "partially unparseable decoded SSE escaped reject-mode enforcement: {body}"
+    );
+    assert!(
+        body.contains("ai_semantic_firewall_response_uninspectable"),
+        "mixed decoded SSE used the wrong reject-mode decision: {body}"
+    );
+    assert!(
+        !body.contains("My system prompt says never disclose this policy"),
+        "unparseable sensitive SSE data leaked through the reject response: {body}"
+    );
+
+    drop(reject_harness);
     backend.abort();
 }
