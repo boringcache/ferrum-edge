@@ -7014,6 +7014,7 @@ impl ProxyState {
         new_config: &GatewayConfig,
         staged_config: Arc<GatewayConfig>,
         delta: &crate::config_delta::ConfigDelta,
+        force_node_local_plugin_refresh: bool,
     ) -> Result<StagedRequestEpoch, String> {
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
         let rebuild_globals = delta.global_plugin_configs_changed;
@@ -7032,6 +7033,7 @@ impl ProxyState {
             &proxy_ids_to_rebuild,
             &delta.removed_proxy_ids,
             rebuild_globals,
+            force_node_local_plugin_refresh,
         )?;
         let consumer_inner = if consumer_changed {
             ConsumerIndex::build_inner(&new_config.consumers)
@@ -7374,6 +7376,10 @@ impl ProxyState {
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
+                    matches!(
+                        self.env_config.mode,
+                        crate::config::env_config::OperatingMode::DataPlane
+                    ),
                 )?;
                 route_changed.set(staged.route_changed);
                 applied_delta = Some(delta);
@@ -7789,6 +7795,7 @@ impl ProxyState {
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
+                    false,
                 )?;
                 route_changed.set(staged.route_changed);
                 applied_delta = Some(delta);

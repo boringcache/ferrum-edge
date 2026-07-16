@@ -478,7 +478,7 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn dp_full_snapshot_refreshes_deployed_mmdb_without_validation_handoff() {
+async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
     let directory = TempDir::new().unwrap();
     let mmdb_path = directory.path().join("country.mmdb");
     let config = GatewayConfig {
@@ -507,7 +507,10 @@ async fn dp_full_snapshot_refreshes_deployed_mmdb_without_validation_handoff() {
         loaded_at: Utc::now(),
         ..GatewayConfig::default()
     };
-    let candidate = config.clone();
+    let mut candidate = config.clone();
+    candidate
+        .consumers
+        .push(test_consumer("unrelated-consumer", "unrelated-user"));
     let state = proxy_state_with_config_and_mode(
         config,
         ferrum_edge::config::env_config::OperatingMode::DataPlane,
@@ -538,9 +541,9 @@ async fn dp_full_snapshot_refreshes_deployed_mmdb_without_validation_handoff() {
 
     std::fs::write(&mmdb_path, country_mmdb_bytes()).unwrap();
     assert_eq!(
-        state.update_config(candidate),
+        state.update_config(candidate.clone()),
         ConfigApplyOutcome::Applied,
-        "an unchanged DP snapshot must refresh node-local plugin files without a CP handoff"
+        "a DP full snapshot with an unrelated delta must refresh node-local plugin files"
     );
 
     let plugins = state
@@ -551,11 +554,12 @@ async fn dp_full_snapshot_refreshes_deployed_mmdb_without_validation_handoff() {
         .iter()
         .find(|plugin| plugin.name() == "geo_restriction")
         .unwrap();
-    let unrelated_after = plugins
+    let unrelated_after_delta = plugins
         .iter()
         .find(|plugin| plugin.name() == "stdout_logging")
+        .cloned()
         .unwrap();
-    assert!(std::sync::Arc::ptr_eq(&unrelated_before, unrelated_after));
+    assert!(std::sync::Arc::ptr_eq(&unrelated_before, &unrelated_after_delta));
     let mut after = RequestContext::new(
         "89.160.20.112".to_string(),
         "GET".to_string(),
@@ -567,6 +571,36 @@ async fn dp_full_snapshot_refreshes_deployed_mmdb_without_validation_handoff() {
             status_code: 403,
             ..
         }
+    ));
+
+    std::fs::write(&mmdb_path, country_mmdb_with_country(b"US")).unwrap();
+    assert_eq!(
+        state.update_config(candidate),
+        ConfigApplyOutcome::Applied,
+        "an unchanged DP full snapshot must also refresh node-local plugin files"
+    );
+
+    let plugins = state
+        .plugin_cache
+        .request_view("geo-proxy", ProxyProtocol::Http)
+        .plugins();
+    let geo = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "geo_restriction")
+        .unwrap();
+    let unrelated_after_no_delta = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "stdout_logging")
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&unrelated_after_delta, unrelated_after_no_delta));
+    let mut after_replacement = RequestContext::new(
+        "89.160.20.112".to_string(),
+        "GET".to_string(),
+        "/geo".to_string(),
+    );
+    assert!(matches!(
+        geo.on_request_received(&mut after_replacement).await,
+        PluginResult::Continue
     ));
 }
 
