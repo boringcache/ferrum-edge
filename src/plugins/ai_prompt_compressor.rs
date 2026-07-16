@@ -665,10 +665,9 @@ impl AiPromptCompressor {
                             let is_text = obj.get("type").and_then(Value::as_str).ok_or(())?
                                 == "text";
                             if is_text {
-                                let text = obj
-                                    .get_mut("text")
-                                    .and_then(Value::as_str_mut)
-                                    .ok_or(())?;
+                                let Value::String(text) = obj.get_mut("text").ok_or(())? else {
+                                    return Err(());
+                                };
                                 if let Some((compressed, orig, comp)) = self.compress_text(text)? {
                                     *text = compressed;
                                     stats.original_tokens += orig;
