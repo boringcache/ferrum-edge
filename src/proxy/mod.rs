@@ -14524,12 +14524,16 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
 }
 
 /// Return the RFC 6265 cookie-name from a valid leading cookie-pair.
-/// Attributes, padded names, and malformed cookie values are rejected.
+/// Attributes and malformed cookie values are rejected.
 fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     let cookie_pair = set_cookie
         .split_once(';')
         .map_or(set_cookie, |(pair, _)| pair);
     let (name, value) = cookie_pair.split_once('=')?;
+    // RFC 6265 strips leading and trailing SP/HTAB from both sides of the
+    // cookie-pair before validating its name and value.
+    let name = name.trim_matches([' ', '\t']);
+    let value = value.trim_matches([' ', '\t']);
     if name.is_empty()
         || !name.bytes().all(|byte| {
             matches!(

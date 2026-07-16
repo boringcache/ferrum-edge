@@ -695,7 +695,7 @@ impl Plugin for StagedCookieRejectingAuth {
     ) -> PluginResult {
         ctx.metadata.insert(
             "auth.rejection_set_cookie".to_string(),
-            "session=staged; Path=/staged; HttpOnly\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged\ndomain=staged; Domain=example.com; Path=/app\ndomain=staged-other; Domain=api.example.com; Path=/app\nhost_scope=staged; Path=/\nomitted=staged\nduplicate=staged; Path=/effective\nquoted=staged; Path=\"/quoted\"\nmalformed pair=staged; Path=/\nquoted_domain=staged; Domain=\".example.com\"; Path=/\ninvalid_path=staged; Path="
+            "session=staged; Path=/staged; HttpOnly\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged\ndomain=staged; Domain=example.com; Path=/app\ndomain=staged-other; Domain=api.example.com; Path=/app\nhost_scope=staged; Path=/\nomitted=staged\nduplicate=staged; Path=/effective\nquoted=staged; Path=\"/quoted\"\nmalformed pair=staged; Path=/\nquoted_domain=staged; Domain=\".example.com\"; Path=/\ninvalid_path=staged; Path=\nvalue_space=staged; Path=/\nname_space=staged; Path=/"
                 .to_string(),
         );
         PluginResult::Reject {
@@ -727,7 +727,7 @@ impl Plugin for MixedCaseCookieRejectingAuth {
             headers: HashMap::from([
                 (
                     "Set-Cookie".to_string(),
-                    "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nshared=1; Path=/\nscoped=clear-root; Path=/\nscoped=clear-app; Path=/app\ndomain=selected; dOmAiN=.Example.COM; pAtH=/app\nhost_scope=selected; Domain=example.com; Path=/\nomitted=selected; Path=/\nduplicate=selected; Path=/ignored; PATH=/effective\nquoted=selected; Path=\"/quoted\"\nmalformed pair=selected; Path=/\nquoted_domain=selected; Domain=\".example.com\"; Path=/\ninvalid_path=selected; Path="
+                    "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nshared=1; Path=/\nscoped=clear-root; Path=/\nscoped=clear-app; Path=/app\ndomain=selected; dOmAiN=.Example.COM; pAtH=/app\nhost_scope=selected; Domain=example.com; Path=/\nomitted=selected; Path=/\nduplicate=selected; Path=/ignored; PATH=/effective\nquoted=selected; Path=\"/quoted\"\nmalformed pair=selected; Path=/\nquoted_domain=selected; Domain=\".example.com\"; Path=/\ninvalid_path=selected; Path=\nvalue_space=selected ; Path=/\n name_space =selected; Path=/"
                         .to_string(),
                 ),
                 (
@@ -1186,7 +1186,7 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
     let selected: Arc<dyn Plugin> = Arc::new(MixedCaseCookieRejectingAuth);
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
-    let expected = "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nscoped=clear-root; Path=/\nscoped=clear-app; Path=/app\ndomain=selected; dOmAiN=.Example.COM; pAtH=/app\nhost_scope=selected; Domain=example.com; Path=/\nomitted=selected; Path=/\nduplicate=selected; Path=/ignored; PATH=/effective\nquoted=selected; Path=\"/quoted\"\nmalformed pair=selected; Path=/\nquoted_domain=selected; Domain=\".example.com\"; Path=/\ninvalid_path=selected; Path=\nshared=1; Path=/\nlower_only=1; Path=/lower\nsession=selected-lower; Path=/lower; Secure; SameSite=Strict\nsession=staged; Path=/staged; HttpOnly\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged\ndomain=staged-other; Domain=api.example.com; Path=/app\nmalformed pair=staged; Path=/\nquoted_domain=staged; Domain=\".example.com\"; Path=/";
+    let expected = "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nscoped=clear-root; Path=/\nscoped=clear-app; Path=/app\ndomain=selected; dOmAiN=.Example.COM; pAtH=/app\nhost_scope=selected; Domain=example.com; Path=/\nomitted=selected; Path=/\nduplicate=selected; Path=/ignored; PATH=/effective\nquoted=selected; Path=\"/quoted\"\nmalformed pair=selected; Path=/\nquoted_domain=selected; Domain=\".example.com\"; Path=/\ninvalid_path=selected; Path=\nvalue_space=selected ; Path=/\n name_space =selected; Path=/\nshared=1; Path=/\nlower_only=1; Path=/lower\nsession=selected-lower; Path=/lower; Secure; SameSite=Strict\nsession=staged; Path=/staged; HttpOnly\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged\ndomain=staged-other; Domain=api.example.com; Path=/app\nmalformed pair=staged; Path=/\nquoted_domain=staged; Domain=\".example.com\"; Path=/";
 
     for _ in 0..32 {
         let mut ctx = RequestContext::new(
