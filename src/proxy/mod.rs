@@ -169,10 +169,11 @@ pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
 /// One-shot handoff for requester-owned auth session state that changed before
 /// authentication attempts rejected. Distinct cookie storage keys are
 /// newline-joined; a later attempt replaces an earlier candidate with the same
-/// exact name/domain/path scope. The authentication phase removes this key on
-/// every exit: it attaches the cookies only to the final rejection and discards
-/// them when a later credential succeeds. The key contains "cookie" so metadata
-/// serialization still redacts the sealed values defensively.
+/// exact name/domain/path/partitioned scope. The authentication phase removes
+/// this key on every exit: it attaches the cookies only to the final rejection
+/// and discards them when a later credential succeeds. The key contains
+/// "cookie" so metadata serialization still redacts the sealed values
+/// defensively.
 pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_set_cookie";
 
 /// Marker recorded in `ctx.metadata` for the duration of
@@ -14578,26 +14579,31 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     Some(name)
 }
 
+#[derive(Clone, Copy)]
+struct SetCookieDomain<'a> {
+    value: &'a str,
+    trailing_dot: bool,
+}
+
+impl<'a> SetCookieDomain<'a> {
+    fn same_domain(self, other: SetCookieDomain<'_>) -> bool {
+        self.trailing_dot == other.trailing_dot && self.value.eq_ignore_ascii_case(other.value)
+    }
+}
+
 /// RFC 6265 ignores one leading dot on Domain attributes and compares the
-/// resulting canonicalized domain case-insensitively. Return `None` for domain
-/// forms whose browser storage scope cannot be determined conservatively.
-fn canonical_set_cookie_domain(domain: &str) -> Option<&str> {
+/// resulting canonicalized domain case-insensitively. Ferrum accepts the full
+/// RFC 3986 reg-name character set at request admission, so apply the same
+/// validation here instead of narrowing comparable cookie scopes to LDH names.
+fn canonical_set_cookie_domain(domain: &str) -> Option<SetCookieDomain<'_>> {
     let domain = domain.strip_prefix('.').unwrap_or(domain);
-    if domain.is_empty() || domain.ends_with('.') {
+    if domain.ends_with('.') || !is_valid_reg_name(domain) {
         return None;
     }
-    for label in domain.split('.') {
-        if label.is_empty()
-            || label.starts_with('-')
-            || label.ends_with('-')
-            || !label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
-            return None;
-        }
-    }
-    Some(domain)
+    Some(SetCookieDomain {
+        value: domain,
+        trailing_dot: false,
+    })
 }
 
 fn valid_set_cookie_path(path: &str) -> bool {
@@ -14614,30 +14620,58 @@ fn default_set_cookie_path(request_path: &str) -> &str {
     }
 }
 
+fn request_cookie_default_domain(ctx: &RequestContext) -> Option<SetCookieDomain<'_>> {
+    if let Some(host) = ctx
+        .raw_header_get("host")
+        .and_then(split_request_authority)
+        .map(|(host, _)| host)
+    {
+        return Some(SetCookieDomain {
+            value: host.strip_suffix('.').unwrap_or(host),
+            trailing_dot: host.ends_with('.'),
+        });
+    }
+
+    ctx.request_authority
+        .as_deref()
+        .and_then(split_request_authority)
+        .map(|(host, _)| SetCookieDomain {
+            value: host,
+            trailing_dot: ctx.request_host_had_trailing_dot,
+        })
+}
+
 /// Return the effective RFC 6265 cookie storage key. Omitted Domain attributes
 /// use the request host, while omitted, empty, or non-absolute Path attributes
-/// use the request path's default directory.
+/// use the request path's default directory. Partitioned cookies remain
+/// independent from unpartitioned cookies with the same name/domain/path.
 fn set_cookie_storage_key<'a>(
     set_cookie: &'a str,
-    default_domain: Option<&'a str>,
+    default_domain: Option<SetCookieDomain<'a>>,
     default_path: &'a str,
-) -> Option<(&'a str, Option<&'a str>, &'a str)> {
+) -> Option<(&'a str, Option<SetCookieDomain<'a>>, &'a str, bool)> {
     let name = set_cookie_name(set_cookie)?;
     let mut domain_attribute = None;
     let mut path_attribute = None;
+    let mut partitioned = false;
 
     for attribute in set_cookie.split(';').skip(1) {
         let attribute = attribute.trim();
-        let Some((attribute_name, attribute_value)) = attribute.split_once('=') else {
-            continue;
+        let (attribute_name, attribute_value) = match attribute.split_once('=') {
+            Some((name, value)) => (name.trim(), Some(value.trim())),
+            None => (attribute, None),
         };
-        let attribute_name = attribute_name.trim();
-        let attribute_value = attribute_value.trim();
-        if attribute_name.eq_ignore_ascii_case("domain") {
+        if attribute_name.eq_ignore_ascii_case("partitioned") {
+            partitioned = true;
+        } else if attribute_name.eq_ignore_ascii_case("domain")
+            && let Some(attribute_value) = attribute_value
+        {
             if !attribute_value.is_empty() {
                 domain_attribute = Some(attribute_value);
             }
-        } else if attribute_name.eq_ignore_ascii_case("path") {
+        } else if attribute_name.eq_ignore_ascii_case("path")
+            && let Some(attribute_value) = attribute_value
+        {
             path_attribute = Some(attribute_value);
         }
     }
@@ -14654,21 +14688,21 @@ fn set_cookie_storage_key<'a>(
         Some(_) | None => default_path,
     };
 
-    Some((name, domain, path))
+    Some((name, domain, path, partitioned))
 }
 
 fn set_cookie_same_storage_key(
     existing: &str,
     candidate: &str,
-    default_domain: Option<&str>,
+    default_domain: Option<SetCookieDomain<'_>>,
     default_path: &str,
 ) -> bool {
-    let Some((existing_name, existing_domain, existing_path)) =
+    let Some((existing_name, existing_domain, existing_path, existing_partitioned)) =
         set_cookie_storage_key(existing, default_domain, default_path)
     else {
         return false;
     };
-    let Some((candidate_name, candidate_domain, candidate_path)) =
+    let Some((candidate_name, candidate_domain, candidate_path, candidate_partitioned)) =
         set_cookie_storage_key(candidate, default_domain, default_path)
     else {
         return false;
@@ -14676,9 +14710,10 @@ fn set_cookie_same_storage_key(
 
     existing_name == candidate_name
         && existing_path == candidate_path
+        && existing_partitioned == candidate_partitioned
         && match (existing_domain, candidate_domain) {
             (Some(existing_domain), Some(candidate_domain)) => {
-                existing_domain.eq_ignore_ascii_case(candidate_domain)
+                existing_domain.same_domain(candidate_domain)
             }
             (None, None) => true,
             _ => false,
@@ -14691,7 +14726,7 @@ fn set_cookie_same_storage_key(
 fn collect_later_set_cookies(
     cookies: &mut Vec<String>,
     joined: &str,
-    default_domain: Option<&str>,
+    default_domain: Option<SetCookieDomain<'_>>,
     default_path: &str,
 ) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
@@ -14708,7 +14743,7 @@ fn collect_later_set_cookies(
 fn set_cookie_conflicts(
     cookies: &[String],
     candidate: &str,
-    default_domain: Option<&str>,
+    default_domain: Option<SetCookieDomain<'_>>,
     default_path: &str,
 ) -> bool {
     cookies.iter().any(|existing| {
@@ -14720,11 +14755,7 @@ fn set_cookie_conflicts(
 /// Stage requester-owned cookies from rejecting auth attempts. This remains on
 /// the rejection path: successful authentication only removes the metadata.
 pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
-    let default_domain = ctx
-        .request_authority
-        .as_deref()
-        .and_then(split_request_authority)
-        .map(|(host, _)| host);
+    let default_domain = request_cookie_default_domain(ctx);
     let default_path = default_set_cookie_path(&ctx.path);
     let mut staged = Vec::new();
     if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
@@ -14749,11 +14780,7 @@ fn attach_auth_rejection_set_cookie(
     let Some(staged) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
         return;
     };
-    let default_domain = ctx
-        .request_authority
-        .as_deref()
-        .and_then(split_request_authority)
-        .map(|(host, _)| host);
+    let default_domain = request_cookie_default_domain(ctx);
     let default_path = default_set_cookie_path(&ctx.path);
 
     // A custom plugin can return multiple case variants because rejection
@@ -15352,9 +15379,11 @@ async fn handle_proxy_request_inner(
     // port. `is_valid_port` already bounded it to u16, so the parse is
     // infallible for any authority that got this far.
     let mut authority_port: Option<u16> = None;
+    let mut request_host_had_trailing_dot = false;
     let request_host: Option<String> = match raw_host {
         Some(h) => match split_request_authority(h) {
             Some((host, port)) => {
+                request_host_had_trailing_dot = host.ends_with('.');
                 let normalized = normalize_authority_host(host);
                 if normalized.is_empty() {
                     warn!("Rejected request: malformed Host/authority value");
@@ -15378,6 +15407,7 @@ async fn handle_proxy_request_inner(
         },
         None => None,
     };
+    ctx.request_host_had_trailing_dot = request_host_had_trailing_dot;
     let request_authority = raw_host.and_then(|authority| {
         normalize_request_authority_for_signing(
             authority,
@@ -24514,6 +24544,10 @@ fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
 fn normalize_authority_host(host: &str) -> String {
     let normalized = host.strip_suffix('.').unwrap_or(host);
     normalized.to_ascii_lowercase()
+}
+
+pub(crate) fn request_authority_host_has_trailing_dot(value: &str) -> bool {
+    split_request_authority(value).is_some_and(|(host, _)| host.ends_with('.'))
 }
 
 /// The `:authority` a multi-port Sidecar egress request sends to the peer's

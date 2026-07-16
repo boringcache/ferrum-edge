@@ -657,6 +657,14 @@ struct StagedCookieRejectingAuth;
 
 struct MixedCaseCookieRejectingAuth;
 
+struct ScopedCookieStagingAuth {
+    cookies: &'static str,
+}
+
+struct ScopedCookieSelectedAuth {
+    cookies: &'static str,
+}
+
 #[async_trait]
 impl Plugin for RejectingAuth {
     fn name(&self) -> &str {
@@ -737,6 +745,56 @@ impl Plugin for MixedCaseCookieRejectingAuth {
                 ),
                 ("X-Rejection".to_string(), "selected".to_string()),
             ]),
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for ScopedCookieStagingAuth {
+    fn name(&self) -> &str {
+        "scoped_cookie_staging_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        ctx.metadata.insert(
+            "auth.rejection_set_cookie".to_string(),
+            self.cookies.to_string(),
+        );
+        PluginResult::Reject {
+            status_code: 401,
+            body: r#"{"error":"staged rejection"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for ScopedCookieSelectedAuth {
+    fn name(&self) -> &str {
+        "scoped_cookie_selected_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"selected rejection"}"#.to_string(),
+            headers: HashMap::from([("Set-Cookie".to_string(), self.cookies.to_string())]),
         }
     }
 }
@@ -1230,6 +1288,44 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
             "the staged cookies must be consumed exactly once"
         );
     }
+}
+
+#[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "non_ldh=staged; Domain=foo_bar.example; Path=/\npartitioned_same=staged; Secure; pArTiTiOnEd; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "non_ldh=selected; Domain=foo_bar.example; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cookie-scope".to_string(),
+    );
+    ctx.request_authority = Some("example.com".to_string());
+    let mut raw_headers = hyper::HeaderMap::new();
+    raw_headers.insert(
+        hyper::header::HOST,
+        hyper::header::HeaderValue::from_static("example.com."),
+    );
+    ctx.set_raw_headers(raw_headers);
+    ctx.request_host_had_trailing_dot = true;
+    ctx.materialize_headers();
+
+    let (_, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("both auth attempts must reject");
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some(
+            "non_ldh=selected; Domain=foo_bar.example; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/"
+        )
+    );
 }
 
 #[test]
