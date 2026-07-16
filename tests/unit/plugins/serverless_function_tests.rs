@@ -1534,18 +1534,10 @@ async fn test_terminate_strips_unsafe_url_headers_for_root_function_destination(
             "content-location-invalid-percent-utf8" => {
                 ("content-location", "/content%FF".to_string(), true)
             }
-            "refresh-malformed-percent" => {
-                ("refresh", "0; url=/next%zz".to_string(), true)
-            }
-            "refresh-invalid-percent-utf8" => {
-                ("refresh", "0; url=/next%FF".to_string(), true)
-            }
-            "link-malformed-percent" => {
-                ("link", "</next%zz>; rel=\"next\"".to_string(), true)
-            }
-            "link-invalid-percent-utf8" => {
-                ("link", "</next%FF>; rel=\"next\"".to_string(), true)
-            }
+            "refresh-malformed-percent" => ("refresh", "0; url=/next%zz".to_string(), true),
+            "refresh-invalid-percent-utf8" => ("refresh", "0; url=/next%FF".to_string(), true),
+            "link-malformed-percent" => ("link", "</next%zz>; rel=\"next\"".to_string(), true),
+            "link-invalid-percent-utf8" => ("link", "</next%FF>; rel=\"next\"".to_string(), true),
             "location-percent-budget" => {
                 let mut encoded = "https://redirect.example/next".to_string();
                 for _ in 0..12 {
