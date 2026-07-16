@@ -63,6 +63,11 @@ enum LateResourceWrite<'a> {
     Delete { id: &'a str },
 }
 
+pub(crate) enum InterveningWriteRecovery {
+    Compensate,
+    KeepCurrent,
+}
+
 pub(crate) struct ApiSpecDeleteSnapshot {
     spec: crate::config::types::ApiSpec,
     upstreams: Vec<Upstream>,
@@ -205,11 +210,17 @@ impl NamespaceConfigAdmissionGuard {
         self.ensure_held()?;
         let mut lease_state_rx = self.lease_state_rx.clone();
         tokio::pin!(future);
+        let persistence_started = std::cell::Cell::new(false);
         loop {
             let valid_until_millis = *lease_state_rx.borrow_and_update();
             let elapsed_millis =
                 u64::try_from(self.lease_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             if valid_until_millis == 0 || elapsed_millis >= valid_until_millis {
+                if !persistence_started.get() {
+                    anyhow::bail!(
+                        "namespace config admission lease was lost before persistence started"
+                    );
+                }
                 let result = future.await;
                 return Ok(NamespaceConfigAdmissionCompletion::Lost {
                     result,
@@ -223,6 +234,11 @@ impl NamespaceConfigAdmissionGuard {
                 biased;
                 changed = lease_state_rx.changed() => {
                     if changed.is_err() {
+                        if !persistence_started.get() {
+                            anyhow::bail!(
+                                "namespace config admission lease monitor stopped before persistence started"
+                            );
+                        }
                         let result = future.await;
                         return Ok(NamespaceConfigAdmissionCompletion::Lost {
                             result,
@@ -233,6 +249,11 @@ impl NamespaceConfigAdmissionGuard {
                     }
                 }
                 _ = tokio::time::sleep(remaining) => {
+                    if !persistence_started.get() {
+                        anyhow::bail!(
+                            "namespace config admission lease expired before persistence started"
+                        );
+                    }
                     let result = future.await;
                     return Ok(NamespaceConfigAdmissionCompletion::Lost {
                         result,
@@ -241,7 +262,10 @@ impl NamespaceConfigAdmissionGuard {
                         ),
                     });
                 }
-                result = &mut future => {
+                result = std::future::poll_fn(|context| {
+                    persistence_started.set(true);
+                    future.as_mut().poll(context)
+                }) => {
                     return Ok(match self.ensure_held() {
                         Ok(()) => NamespaceConfigAdmissionCompletion::Held(result),
                         Err(error) => NamespaceConfigAdmissionCompletion::Lost { result, error },
@@ -487,6 +511,7 @@ async fn recover_late_resource_write<R: AdminResource>(
     db: Arc<dyn DatabaseBackend>,
     namespace: &str,
     lost_generation: u64,
+    http_client: crate::plugins::PluginHttpClient,
     action: LateResourceWrite<'_>,
     written: Option<&R>,
     previous: Option<&R>,
@@ -499,8 +524,16 @@ async fn recover_late_resource_write<R: AdminResource>(
     if matches!(
         &action,
         LateResourceWrite::Update { .. } | LateResourceWrite::Delete { .. }
-    ) && R::SKIP_LATE_RESTORATION_AFTER_INTERVENING_WRITE
-    {
+    ) && matches!(
+        R::intervening_write_recovery(
+            db.as_ref(),
+            namespace,
+            previous,
+            http_client,
+        )
+        .await?,
+        InterveningWriteRecovery::KeepCurrent
+    ) {
         return Ok(false);
     }
 
@@ -572,6 +605,158 @@ async fn recover_late_resource_write<R: AdminResource>(
         }
     }
     Ok(false)
+}
+
+async fn persist_create_to_settlement<R: AdminResource>(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: String,
+    mut guard: Option<NamespaceConfigAdmissionGuard>,
+    written: R,
+    http_client: crate::plugins::PluginHttpClient,
+) -> DbResult<()> {
+    match run_db_write_while_held(guard.as_ref(), R::db_create(db.as_ref(), &written)).await {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+            Ok(()) => {
+                let lost_generation = guard
+                    .as_ref()
+                    .map(NamespaceConfigAdmissionGuard::generation)
+                    .unwrap_or_default();
+                drop(guard.take());
+                match recover_late_resource_write(
+                    db,
+                    &namespace,
+                    lost_generation,
+                    http_client,
+                    LateResourceWrite::Create,
+                    Some(&written),
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                        "namespace config admission was lost during create; the late write was compensated: {error}"
+                    ))),
+                    Err(recovery_error) => {
+                        Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                            "namespace config admission was lost during create and recovery failed: {recovery_error}; original error: {error}"
+                        )))
+                    }
+                }
+            }
+            Err(persistence_error) => Err(persistence_error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+async fn persist_update_to_settlement<R: AdminResource>(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: String,
+    mut guard: Option<NamespaceConfigAdmissionGuard>,
+    id: String,
+    written: R,
+    previous: R,
+    http_client: crate::plugins::PluginHttpClient,
+) -> DbResult<bool> {
+    match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written)).await {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+            Ok(false) => Ok(false),
+            Ok(true) => {
+                let lost_generation = guard
+                    .as_ref()
+                    .map(NamespaceConfigAdmissionGuard::generation)
+                    .unwrap_or_default();
+                drop(guard.take());
+                match recover_late_resource_write(
+                    db,
+                    &namespace,
+                    lost_generation,
+                    http_client,
+                    LateResourceWrite::Update { id: &id },
+                    Some(&written),
+                    Some(&previous),
+                    None,
+                )
+                .await
+                {
+                    Ok(true) => Ok(true),
+                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                        "namespace config admission was lost during update; the late write was compensated: {error}"
+                    ))),
+                    Err(recovery_error) => {
+                        Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                            "namespace config admission was lost during update and recovery failed: {recovery_error}; original error: {error}"
+                        )))
+                    }
+                }
+            }
+            Err(persistence_error) => Err(persistence_error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+async fn persist_delete_to_settlement<R: AdminResource>(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: String,
+    mut guard: Option<NamespaceConfigAdmissionGuard>,
+    id: String,
+    previous: R,
+    previous_snapshot: Option<GatewayConfig>,
+    previous_api_spec: Option<ApiSpecDeleteSnapshot>,
+    http_client: crate::plugins::PluginHttpClient,
+) -> DbResult<bool> {
+    match run_db_write_while_held(
+        guard.as_ref(),
+        R::db_delete(db.as_ref(), &namespace, &id),
+    )
+    .await
+    {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+            Ok(false) => Ok(false),
+            Ok(true) => {
+                let lost_generation = guard
+                    .as_ref()
+                    .map(NamespaceConfigAdmissionGuard::generation)
+                    .unwrap_or_default();
+                drop(guard.take());
+                match recover_late_resource_write(
+                    db,
+                    &namespace,
+                    lost_generation,
+                    http_client,
+                    LateResourceWrite::Delete { id: &id },
+                    None,
+                    Some(&previous),
+                    previous_snapshot
+                        .as_ref()
+                        .map(|config| LateDeleteSnapshots {
+                            config,
+                            api_spec: previous_api_spec.as_ref(),
+                        }),
+                )
+                .await
+                {
+                    Ok(true) => Ok(true),
+                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                        "namespace config admission was lost during delete; the late write was compensated: {error}"
+                    ))),
+                    Err(recovery_error) => {
+                        Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                            "namespace config admission was lost during delete and recovery failed: {recovery_error}; original error: {error}"
+                        )))
+                    }
+                }
+            }
+            Err(persistence_error) => Err(persistence_error),
+        },
+        Err(error) => Err(error),
+    }
 }
 
 async fn validate_transaction_log_schema_graph_on_blocking_pool(
@@ -1045,7 +1230,7 @@ impl ValidationError {
     }
 }
 
-#[allow(async_fn_in_trait)]
+#[async_trait::async_trait]
 pub(crate) trait AdminResource:
     Send + Sync + Serialize + DeserializeOwned + Clone + Sized + 'static
 {
@@ -1055,7 +1240,6 @@ pub(crate) trait AdminResource:
     const NOT_FOUND_MESSAGE: &'static str;
     const ID_CONFLICT_LABEL: &'static str = Self::RESOURCE_LABEL;
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = false;
-    const SKIP_LATE_RESTORATION_AFTER_INTERVENING_WRITE: bool = false;
 
     fn id(&self) -> &str;
     fn set_id(&mut self, id: String);
@@ -1186,6 +1370,15 @@ pub(crate) trait AdminResource:
         _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
     ) -> DbResult<()> {
         Self::db_create(db, previous).await
+    }
+
+    async fn intervening_write_recovery(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        _previous: Option<&Self>,
+        _http_client: crate::plugins::PluginHttpClient,
+    ) -> DbResult<InterveningWriteRecovery> {
+        Ok(InterveningWriteRecovery::Compensate)
     }
 
     async fn late_delete_api_spec_snapshot(
@@ -1427,50 +1620,22 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         return Ok(map_after_validate_error::<R>(error));
     }
 
-    let persistence = match run_db_write_while_held(
-        namespace_config_admission_guard.as_ref(),
-        R::db_delete(db, namespace, id),
-    )
+    let persistence = match tokio::spawn(persist_delete_to_settlement(
+        db_arc.clone(),
+        namespace.to_string(),
+        namespace_config_admission_guard.take(),
+        id.to_string(),
+        existing.clone(),
+        previous_snapshot,
+        previous_api_spec,
+        super::plugin_validation_http_client(state),
+    ))
     .await
     {
-        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
-            Ok(true) => {
-                let lost_generation = namespace_config_admission_guard
-                    .as_ref()
-                    .map(NamespaceConfigAdmissionGuard::generation)
-                    .unwrap_or_default();
-                drop(namespace_config_admission_guard.take());
-                match recover_late_resource_write(
-                    db_arc.clone(),
-                    namespace,
-                    lost_generation,
-                    LateResourceWrite::Delete { id },
-                    None,
-                    Some(&existing),
-                    previous_snapshot
-                        .as_ref()
-                        .map(|config| LateDeleteSnapshots {
-                            config,
-                            api_spec: previous_api_spec.as_ref(),
-                        }),
-                )
-                .await
-                {
-                    Ok(true) => Ok(true),
-                    Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                        "namespace config admission was lost during delete; the late write was compensated: {error}"
-                    ))),
-                    Err(recovery_error) => {
-                        Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                            "namespace config admission was lost during delete and recovery failed: {recovery_error}; original error: {error}"
-                        )))
-                    }
-                }
-            }
-            other => other,
-        },
-        Err(error) => Err(error),
+        Ok(result) => result,
+        Err(error) => Err(anyhow::anyhow!(
+            "namespace delete persistence task failed: {error}"
+        )),
     };
     match persistence {
         Ok(true) => {
@@ -2380,6 +2545,7 @@ pub(crate) async fn check_credential_value_uniqueness(
 // SQL INSERT/UPDATE statements already exclude the column, but Mongo's
 // replace_one serializes the full struct.
 
+#[async_trait::async_trait]
 impl AdminResource for Upstream {
     const RESOURCE_NAME: &'static str = "upstream";
     const RESOURCE_LABEL: &'static str = "Upstream";
@@ -2636,13 +2802,13 @@ impl AdminResource for Upstream {
     }
 }
 
+#[async_trait::async_trait]
 impl AdminResource for PluginConfig {
     const RESOURCE_NAME: &'static str = "plugin config";
     const RESOURCE_LABEL: &'static str = "Plugin config";
     const VALIDATION_ERROR_LABEL: &'static str = "plugin config fields";
     const NOT_FOUND_MESSAGE: &'static str = "Plugin config not found";
     const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
-    const SKIP_LATE_RESTORATION_AFTER_INTERVENING_WRITE: bool = true;
     const ID_CONFLICT_LABEL: &'static str = "PluginConfig";
 
     fn id(&self) -> &str {
@@ -2806,6 +2972,52 @@ impl AdminResource for PluginConfig {
             }
         }
         Ok(())
+    }
+
+    async fn intervening_write_recovery(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        previous: Option<&Self>,
+        http_client: crate::plugins::PluginHttpClient,
+    ) -> DbResult<InterveningWriteRecovery> {
+        let mut candidate = db.load_namespace_snapshot(namespace).await?;
+        if validate_transaction_log_schema_graph_on_blocking_pool(
+            candidate.clone(),
+            http_client.clone(),
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(InterveningWriteRecovery::KeepCurrent);
+        }
+
+        let previous = previous.ok_or_else(|| {
+            anyhow::anyhow!("late plugin recovery is missing the prior plugin config")
+        })?;
+        if let Some(current) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|plugin| plugin.namespace == namespace && plugin.id == previous.id)
+        {
+            *current = previous.clone();
+        } else {
+            candidate.plugin_configs.push(previous.clone());
+        }
+        match validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await {
+            Ok(()) => Ok(InterveningWriteRecovery::Compensate),
+            Err(AfterValidateError::BadRequest(errors)) => anyhow::bail!(
+                "late plugin recovery could not produce a valid transaction-log schema graph: {}",
+                errors.join("; ")
+            ),
+            Err(AfterValidateError::Db(error)) => Err(error),
+            Err(AfterValidateError::Conflict(errors)) => anyhow::bail!(
+                "late plugin recovery conflicted while validating the transaction-log schema graph: {}",
+                errors.join("; ")
+            ),
+            Err(AfterValidateError::Response(_)) => anyhow::bail!(
+                "late plugin recovery received an unexpected response while validating the transaction-log schema graph"
+            ),
+        }
     }
 
     async fn late_create_compensation_safe(
@@ -3047,6 +3259,7 @@ async fn enabled_prometheus_metrics_owner_exists_inner(
     Ok(false)
 }
 
+#[async_trait::async_trait]
 impl AdminResource for Proxy {
     const RESOURCE_NAME: &'static str = "proxy";
     const RESOURCE_LABEL: &'static str = "Proxy";
@@ -3657,6 +3870,7 @@ impl AdminResource for Proxy {
     }
 }
 
+#[async_trait::async_trait]
 impl AdminResource for Consumer {
     const RESOURCE_NAME: &'static str = "consumer";
     const RESOURCE_LABEL: &'static str = "Consumer";
@@ -4035,109 +4249,56 @@ async fn handle_write<R: AdminResource>(
 
     match action {
         WriteAction::Create => {
-            let persistence = match run_db_write_while_held(
-                namespace_config_admission_guard.as_ref(),
-                R::db_create(db, &resource),
-            )
+            let persistence = match tokio::spawn(persist_create_to_settlement(
+                db_arc.clone(),
+                namespace.to_string(),
+                namespace_config_admission_guard.take(),
+                resource.clone(),
+                super::plugin_validation_http_client(state),
+            ))
             .await
             {
-                Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-                Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
-                    Ok(()) => {
-                        let lost_generation = namespace_config_admission_guard
-                            .as_ref()
-                            .map(NamespaceConfigAdmissionGuard::generation)
-                            .unwrap_or_default();
-                        drop(namespace_config_admission_guard.take());
-                        match recover_late_resource_write(
-                            db_arc.clone(),
-                            namespace,
-                            lost_generation,
-                            LateResourceWrite::Create,
-                            Some(&resource),
-                            None,
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(true) => Ok(()),
-                            Ok(false) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                                "namespace config admission was lost during create; the late write was compensated: {error}"
-                            ))),
-                            Err(recovery_error) => {
-                                Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                                    "namespace config admission was lost during create and recovery failed: {recovery_error}; original error: {error}"
-                                )))
-                            }
-                        }
-                    }
-                    Err(persistence_error) => Err(persistence_error),
-                },
-                Err(error) => Err(error),
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "namespace create persistence task failed: {error}"
+                )),
             };
             if let Err(error) = persistence {
                 return Ok(R::map_persist_db_error(&error, action));
             }
         }
-        WriteAction::Update { id } => match run_db_write_while_held(
-            namespace_config_admission_guard.as_ref(),
-            R::db_update(db, &resource),
-        )
-        .await
-        {
+        WriteAction::Update { id } => {
+            let Some(previous) = existing.clone() else {
+                return Ok(super::json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": "Update persistence is missing the prior resource"}),
+                ));
+            };
+            let persistence = match tokio::spawn(persist_update_to_settlement(
+                db_arc.clone(),
+                namespace.to_string(),
+                namespace_config_admission_guard.take(),
+                id.to_string(),
+                resource.clone(),
+                previous,
+                super::plugin_validation_http_client(state),
+            ))
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "namespace update persistence task failed: {error}"
+                )),
+            };
             // The row vanished between the precheck and the write (concurrent
             // delete). The backend recorded no change — report not-found
             // rather than a phantom success (issue #2122 DB-M4).
-            Ok(NamespaceConfigAdmissionCompletion::Held(Ok(false))) => {
-                return Ok(not_found_response::<R>());
-            }
-            Ok(NamespaceConfigAdmissionCompletion::Held(Ok(true))) => {}
-            Ok(NamespaceConfigAdmissionCompletion::Held(Err(error))) | Err(error) => {
-                return Ok(R::map_persist_db_error(&error, action));
-            }
-            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+            match persistence {
                 Ok(false) => return Ok(not_found_response::<R>()),
-                Ok(true) => {
-                    let lost_generation = namespace_config_admission_guard
-                        .as_ref()
-                        .map(NamespaceConfigAdmissionGuard::generation)
-                        .unwrap_or_default();
-                    drop(namespace_config_admission_guard.take());
-                    match recover_late_resource_write(
-                        db_arc.clone(),
-                        namespace,
-                        lost_generation,
-                        LateResourceWrite::Update { id },
-                        Some(&resource),
-                        existing.as_ref(),
-                        None,
-                    )
-                    .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            return Ok(R::map_persist_db_error(
-                                &mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                                    "namespace config admission was lost during update; the late write was compensated: {error}"
-                                )),
-                                action,
-                            ));
-                        }
-                        Err(recovery_error) => {
-                            return Ok(R::map_persist_db_error(
-                                &mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                                    "namespace config admission was lost during update and recovery failed: {recovery_error}; original error: {error}"
-                                )),
-                                action,
-                            ));
-                        }
-                    }
-                }
-                Err(persistence_error) => {
-                    return Ok(R::map_persist_db_error(&persistence_error, action));
-                }
-            },
-        },
+                Ok(true) => {}
+                Err(error) => return Ok(R::map_persist_db_error(&error, action)),
+            }
+        }
     }
 
     if let Err(error) =
