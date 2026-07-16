@@ -3222,10 +3222,15 @@ paths:
         all existing resources, and imports the provided configuration. If any
         import (or the delete) step fails, Ferrum clears the partial state and
         reapplies the snapshot. One persistent namespace-scoped datastore guard
-        spans that compensating clear and every replay batch, so other
+        normally spans that compensating clear and every replay batch, so other
         DNS-sensitive writers cannot interleave with the rollback-only raw
-        replay. Requires `?confirm=true` query parameter to prevent accidental
-        invocation.
+        replay. If a successful clear settles after its namespace lease expires
+        and another writer commits under the next generation, recovery keeps
+        current resources authoritative for matching IDs, validates the combined
+        transaction-log schema graph, and inserts only missing snapshot resources.
+        It never clears the intervening write; an invalid combined graph is
+        rejected before replay. Requires `?confirm=true` query parameter to
+        prevent accidental invocation.
 
         The recovery snapshot uses a **non-validating raw load** from the
         primary, so an already-invalid-but-present namespace (the case an
@@ -3283,11 +3288,14 @@ paths:
         "500":
           description: >-
             Restore failed (import, delete, or preparation). The prior
-            configuration was reapplied, or the response warns that the
-            best-effort rollback was incomplete. Also returned when a stored
-            row/document cannot be decoded for the pre-delete rollback snapshot;
-            that fail-safe response has `failure_class: data_integrity` and no
-            delete is attempted.
+            configuration was reapplied, additively reconciled with an
+            intervening post-expiry write, or the response warns that the
+            best-effort rollback was incomplete. Additive reconciliation rejects
+            an invalid combined transaction-log schema graph before replaying any
+            snapshot resources. Also returned when a stored row/document cannot
+            be decoded for the pre-delete rollback snapshot; that fail-safe
+            response has `failure_class: data_integrity` and no delete is
+            attempted.
           content:
             application/json:
               schema:
@@ -3306,13 +3314,16 @@ paths:
                     enum: [completed, incomplete, not_needed, unknown_outcome]
                     description: >-
                       Outcome of the best-effort rollback. `completed` — prior
-                      config reapplied; `incomplete` — reapply failed (see
-                      `rollback_errors`); `not_needed` — the clear failed
-                      atomically (SQL / replica-set MongoDB), so nothing was
-                      deleted and the prior config was retained without any
-                      compensating re-import; `unknown_outcome` — an ambiguous
-                      MongoDB commit result could not be resolved by authoritative
-                      post-state counts, so manual recovery is required.
+                      config reapplied, or a valid late-clear union retained both
+                      intervening and missing prior resources; `incomplete` —
+                      reapply failed or an invalid late-clear union was rejected
+                      before replay (see `rollback_errors`); `not_needed` — the
+                      clear failed atomically (SQL / replica-set MongoDB), so
+                      nothing was deleted and the prior config was retained
+                      without any compensating re-import; `unknown_outcome` — an
+                      ambiguous MongoDB commit result could not be resolved by
+                      authoritative post-state counts, so manual recovery is
+                      required.
                   failure_class:
                     type: string
                     enum: [data_integrity]

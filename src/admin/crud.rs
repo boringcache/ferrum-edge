@@ -866,7 +866,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
     }
 }
 
-async fn validate_transaction_log_schema_graph_on_blocking_pool(
+pub(super) async fn validate_transaction_log_schema_graph_on_blocking_pool(
     candidate: GatewayConfig,
     http_client: crate::plugins::PluginHttpClient,
 ) -> Result<(), AfterValidateError> {

@@ -1454,7 +1454,7 @@ mod inner {
         }
 
         async fn lease_server_time(&self) -> Result<BsonDateTime, anyhow::Error> {
-            let response = self.db().run_command(doc! { "hello": 1 }).await?;
+            let response = self.lease_db().run_command(doc! { "hello": 1 }).await?;
             response
                 .get_datetime("localTime")
                 .cloned()
@@ -2171,6 +2171,18 @@ mod inner {
             }
         }
 
+        /// Snapshot of the dedicated lease `Database` handle. Lease acquisition,
+        /// renewal, release, and supporting server-time reads must not queue
+        /// behind ordinary datastore traffic.
+        fn lease_db(&self) -> MongoDatabaseHandle {
+            let connection = self.connection();
+            let db = connection.lease_client.database(connection.db.name());
+            MongoDatabaseHandle {
+                db,
+                _connection: connection,
+            }
+        }
+
         fn collection(&self, name: &str) -> MongoCollectionHandle {
             let connection = self.connection();
             MongoCollectionHandle {
@@ -2212,13 +2224,10 @@ mod inner {
         }
 
         fn config_admission_locks(&self) -> MongoCollectionHandle {
-            let connection = self.connection();
+            let lease_db = self.lease_db();
             MongoCollectionHandle {
-                collection: connection
-                    .lease_client
-                    .database(connection.db.name())
-                    .collection("config_admission_locks"),
-                _connection: connection,
+                collection: lease_db.collection("config_admission_locks"),
+                _connection: lease_db._connection,
             }
         }
 

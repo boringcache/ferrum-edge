@@ -3791,7 +3791,29 @@ fn snapshot_resources_missing_after_intervening_write(
     }
 }
 
+fn intervening_clear_recovery_candidate(
+    snapshot: &RestorePayload,
+    current: &GatewayConfig,
+) -> (GatewayConfig, RestorePayload) {
+    let missing = snapshot_resources_missing_after_intervening_write(snapshot, current);
+    let mut candidate = current.clone();
+    candidate.proxies.extend(missing.proxies.iter().cloned());
+    candidate.consumers.extend(missing.consumers.iter().cloned());
+    candidate.plugin_configs.extend(missing.plugin_configs.iter().cloned());
+    candidate.upstreams.extend(missing.upstreams.iter().cloned());
+    (candidate, missing)
+}
+
+#[doc(hidden)]
+pub(crate) fn intervening_clear_recovery_candidate_for_test(
+    snapshot: GatewayConfig,
+    current: GatewayConfig,
+) -> GatewayConfig {
+    intervening_clear_recovery_candidate(&restore_payload_from_config(snapshot), &current).0
+}
+
 async fn restore_snapshot_after_intervening_clear(
+    state: &AdminState,
     db: &dyn DatabaseBackend,
     namespace: &str,
     snapshot: &RestorePayload,
@@ -3801,7 +3823,32 @@ async fn restore_snapshot_after_intervening_clear(
         .load_namespace_snapshot(namespace)
         .await
         .map_err(|error| vec![format!("failed to load intervening resources: {error}")])?;
-    let missing = snapshot_resources_missing_after_intervening_write(snapshot, &current);
+    let (candidate, missing) = intervening_clear_recovery_candidate(snapshot, &current);
+    match crud::validate_transaction_log_schema_graph_on_blocking_pool(
+        candidate,
+        plugin_validation_http_client(state),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crud::AfterValidateError::BadRequest(errors))
+        | Err(crud::AfterValidateError::Conflict(errors)) => {
+            return Err(vec![format!(
+                "additive rollback would leave an invalid transaction-log schema graph: {}",
+                errors.join("; ")
+            )]);
+        }
+        Err(crud::AfterValidateError::Db(error)) => {
+            return Err(vec![format!(
+                "failed to validate the additive rollback graph: {error}"
+            )]);
+        }
+        Err(crud::AfterValidateError::Response(_)) => {
+            return Err(vec![
+                "additive rollback graph validation returned an HTTP response".to_string(),
+            ]);
+        }
+    }
     let mode = BatchConfigWriteMode::RestoreRollbackReplay {
         guard_owner: guard_owner.to_string(),
     };
@@ -3916,7 +3963,8 @@ async fn finish_failed_restore(
 
 /// Recover a clear that completed after namespace admission expired without
 /// deleting resources committed by the intervening lease owner. Current IDs
-/// win and only snapshot resources that are still absent are replayed.
+/// win, the combined transaction-log schema graph is validated, and only
+/// snapshot resources that are still absent are replayed.
 async fn finish_failed_restore_after_intervening_clear(
     state: &AdminState,
     db: Arc<dyn DatabaseBackend>,
@@ -3930,6 +3978,7 @@ async fn finish_failed_restore_after_intervening_clear(
     let operation = guard.operation();
     let (mut rollback_status, mut rollback_errors) = match operation
         .run_mutation(restore_snapshot_after_intervening_clear(
+            state,
             db.as_ref(),
             namespace,
             &snapshot.payload,

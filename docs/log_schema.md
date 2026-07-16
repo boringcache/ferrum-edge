@@ -124,6 +124,12 @@ through persistence. The process-local admission guard remains as a cheap first
 tier, while the SQL/MongoDB lease also serializes writable gateway instances
 that share persistence. Concurrent requests therefore cannot both validate
 against snapshots that omit the other request's committed graph change.
+If a write settles after its lease expires, Ferrum reacquires admission and
+validates the authoritative graph before accepting or compensating that result.
+Late restore clears use an additive, current-ID-wins recovery: the combined
+current and pre-restore graph is validated before any missing snapshot resource
+is replayed, so an intervening writer is neither erased nor combined into an
+invalid schema graph.
 
 Batch and restore payloads use the same definition-first graph pass, so a
 payload can list referrers before definitions. Each namespace is validated in

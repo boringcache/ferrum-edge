@@ -604,3 +604,182 @@ fn test_redact_array_hmac_secrets() {
     assert_eq!(arr[0]["secret"], "[REDACTED]");
     assert_eq!(arr[1]["secret"], "[REDACTED]");
 }
+
+fn recovery_plugin(
+    id: &str,
+    plugin_name: &str,
+    config: serde_json::Value,
+) -> ferrum_edge::config::types::PluginConfig {
+    ferrum_edge::config::types::PluginConfig {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: plugin_name.to_string(),
+        config,
+        scope: ferrum_edge::config::types::PluginScope::Global,
+        enabled: true,
+        proxy_id: None,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+#[test]
+fn intervening_clear_recovery_preserves_both_valid_schema_graphs() {
+    let mut snapshot = ferrum_edge::config::types::GatewayConfig::default();
+    snapshot.plugin_configs = vec![
+        recovery_plugin(
+            "snapshot-schema",
+            "transaction_log_schema",
+            json!({"schemas": {"snapshot": {"summary_type": "both"}}}),
+        ),
+        recovery_plugin(
+            "snapshot-logger",
+            "stdout_logging",
+            json!({"schema_ref": "snapshot"}),
+        ),
+    ];
+    let mut current = ferrum_edge::config::types::GatewayConfig::default();
+    current.plugin_configs = vec![
+        recovery_plugin(
+            "intervening-schema",
+            "transaction_log_schema",
+            json!({"schemas": {"intervening": {"summary_type": "both"}}}),
+        ),
+        recovery_plugin(
+            "intervening-logger",
+            "stdout_logging",
+            json!({"schema_ref": "intervening"}),
+        ),
+    ];
+
+    let candidate = ferrum_edge::_test_support::intervening_clear_recovery_candidate_for_test(
+        snapshot, current,
+    );
+    let ids = candidate
+        .plugin_configs
+        .iter()
+        .map(|plugin| plugin.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 4);
+    assert!(ids.contains("snapshot-schema"));
+    assert!(ids.contains("snapshot-logger"));
+    assert!(ids.contains("intervening-schema"));
+    assert!(ids.contains("intervening-logger"));
+    ferrum_edge::_test_support::validate_transaction_log_schema_graph_for_test(&candidate)
+        .expect("the additive recovery union must retain a valid schema graph");
+}
+
+#[test]
+fn intervening_clear_recovery_keeps_current_ids_and_rejects_invalid_union() {
+    let mut snapshot = ferrum_edge::config::types::GatewayConfig::default();
+    snapshot.plugin_configs = vec![
+        recovery_plugin(
+            "same-id",
+            "transaction_log_schema",
+            json!({"schemas": {"snapshot-only": {"summary_type": "both"}}}),
+        ),
+        recovery_plugin(
+            "snapshot-schema",
+            "transaction_log_schema",
+            json!({"schemas": {"duplicate": {"summary_type": "both"}}}),
+        ),
+    ];
+    let mut current = ferrum_edge::config::types::GatewayConfig::default();
+    current.plugin_configs = vec![
+        recovery_plugin(
+            "same-id",
+            "transaction_log_schema",
+            json!({"schemas": {"current-wins": {"summary_type": "both"}}}),
+        ),
+        recovery_plugin(
+            "intervening-schema",
+            "transaction_log_schema",
+            json!({"schemas": {"duplicate": {"summary_type": "both"}}}),
+        ),
+    ];
+
+    let candidate = ferrum_edge::_test_support::intervening_clear_recovery_candidate_for_test(
+        snapshot, current,
+    );
+    let same_id = candidate
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == "same-id")
+        .expect("the current same-id resource must survive");
+    assert!(same_id.config["schemas"].get("current-wins").is_some());
+    assert!(same_id.config["schemas"].get("snapshot-only").is_none());
+
+    let errors = ferrum_edge::_test_support::validate_transaction_log_schema_graph_for_test(
+        &candidate,
+    )
+    .expect_err("duplicate names across the recovery union must fail closed");
+    assert!(errors.iter().any(|error| error.contains("duplicate")));
+}
+
+#[test]
+fn late_api_spec_post_compensation_preserves_intervening_proxy_plugins() {
+    let api_spec_source = include_str!("../../../src/admin/api_specs/handlers.rs");
+    assert!(api_spec_source.contains("late_api_spec_create_compensation_safe("));
+    assert!(
+        api_spec_source.contains("current_proxy.plugins.len() != expected_associations.len()")
+    );
+    assert!(
+        api_spec_source
+            .contains("plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str())")
+    );
+}
+
+#[test]
+fn late_api_spec_put_reconciles_the_current_schema_graph() {
+    let api_spec_source = include_str!("../../../src/admin/api_specs/handlers.rs");
+    assert!(api_spec_source.contains("current_transaction_log_schema_graph_is_valid("));
+    assert!(api_spec_source.contains(
+        "validate_transaction_log_schema_api_spec_replacement_candidate("
+    ));
+    let put_compensation = api_spec_source
+        .rfind("compensate_late_api_spec_replace(")
+        .expect("PUT must provide late-write graph reconciliation");
+    assert!(api_spec_source[put_compensation..].contains("true,"));
+}
+
+#[test]
+fn ambiguous_namespace_admission_acquisition_has_owned_cleanup() {
+    let crud_source = include_str!("../../../src/admin/crud.rs");
+    assert!(crud_source.contains("struct PendingNamespaceConfigAdmissionClaim"));
+    assert!(
+        crud_source.contains("let (result_tx, result_rx) = tokio::sync::oneshot::channel()")
+    );
+    assert!(crud_source.contains("an ambiguous namespace config admission acquisition"));
+    assert!(crud_source.contains("a cancelled namespace config admission acquisition"));
+}
+
+#[test]
+fn mongo_namespace_admission_uses_the_dedicated_lease_client() {
+    let mongo_source = include_str!("../../../src/config/mongo_store.rs");
+    assert!(mongo_source.contains("fn lease_db(&self) -> MongoDatabaseHandle"));
+    assert!(mongo_source.contains("self.lease_db().run_command(doc! { \"hello\": 1 })"));
+    assert!(mongo_source.contains("let lease_db = self.lease_db();"));
+}
+
+#[test]
+fn late_restore_clear_validates_the_union_before_additive_replay() {
+    let restore_source = include_str!("../../../src/admin/mod.rs");
+    let recovery_start = restore_source
+        .find("async fn restore_snapshot_after_intervening_clear(")
+        .expect("restore must have an additive late-clear recovery path");
+    let recovery_end = restore_source[recovery_start..]
+        .find("/// Finalize a failed restore")
+        .map(|offset| recovery_start + offset)
+        .expect("additive recovery helper must have a bounded source region");
+    let recovery = &restore_source[recovery_start..recovery_end];
+    let graph_validation = recovery
+        .find("validate_transaction_log_schema_graph_on_blocking_pool(")
+        .expect("the merged durable graph must be validated");
+    let persistence = recovery
+        .find("persist_payload_resources(")
+        .expect("missing snapshot resources must be replayed");
+    assert!(graph_validation < persistence);
+    assert!(restore_source.contains("finish_failed_restore_after_intervening_clear("));
+}

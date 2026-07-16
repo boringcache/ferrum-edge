@@ -316,6 +316,13 @@ pub mod _test_support {
         )
     }
 
+    pub fn intervening_clear_recovery_candidate_for_test(
+        snapshot: crate::config::types::GatewayConfig,
+        current: crate::config::types::GatewayConfig,
+    ) -> crate::config::types::GatewayConfig {
+        crate::admin::intervening_clear_recovery_candidate_for_test(snapshot, current)
+    }
+
     pub fn collect_rejecting_runtime_config_errors_for_test(
         config: &crate::config::types::GatewayConfig,
     ) -> Vec<String> {
