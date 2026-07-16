@@ -217,9 +217,18 @@ impl ServerlessFunction {
             ));
         }
         if let Some((key, _)) = config_object.iter().find(|(_, value)| value.is_null()) {
-            return Err(format!(
-                "serverless_function: '{key}' must not be null; omit the field to use its default"
-            ));
+            let is_required = key == "provider"
+                || (key == "function_url"
+                    && matches!(
+                        config_object.get("provider").and_then(Value::as_str),
+                        Some("azure_functions") | Some("gcp_cloud_functions")
+                    ));
+            let detail = if is_required {
+                "is required and must not be null"
+            } else {
+                "must not be null; omit the field instead"
+            };
+            return Err(format!("serverless_function: '{key}' {detail}"));
         }
 
         let provider = match config.get("provider").and_then(Value::as_str) {
@@ -1493,19 +1502,29 @@ impl UrlValuedResponseHeader {
     }
 }
 
+fn is_refresh_delay_separator(character: char) -> bool {
+    matches!(character, ';' | ',') || character.is_ascii_whitespace()
+}
+
 fn refresh_uri_reference(value: &str) -> Result<Option<&str>, ()> {
-    let Some((_, directive)) = value.split_once(';') else {
+    let value = value.trim_start_matches(|character: char| character.is_ascii_whitespace());
+    let Some(separator) = value.find(is_refresh_delay_separator) else {
         return Ok(None);
     };
-    let directive = directive.trim();
+    // The browser Refresh algorithm accepts semicolon, comma, or ASCII
+    // whitespace after the leading delay. Consume a repeated separator run
+    // conservatively so it cannot hide a client-visible destination.
+    let directive = value[separator..]
+        .trim_start_matches(is_refresh_delay_separator)
+        .trim();
+    if directive.is_empty() {
+        return Ok(None);
+    }
     if !has_ascii_case_insensitive_prefix(directive, "url") {
-        // Some Refresh consumers accept a bare URI after the semicolon even
+        // Refresh consumers accept a bare URI after the delay separator even
         // without `url=`. Any non-empty scalar is also a valid relative URI
         // reference, so inspect it as a target; benign extensions still pass
         // when they do not expose the signed destination.
-        if directive.is_empty() {
-            return Err(());
-        }
         return Ok(Some(directive));
     }
     let after_name = &directive["url".len()..];

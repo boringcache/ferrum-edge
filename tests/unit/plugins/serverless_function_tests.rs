@@ -150,7 +150,7 @@ fn test_unknown_fields_are_rejected_deterministically() {
 }
 
 #[test]
-fn test_explicit_null_is_rejected_instead_of_defaulted() {
+fn test_explicit_null_diagnostics_distinguish_required_and_optional_fields() {
     for field in [
         "provider",
         "function_url",
@@ -183,6 +183,25 @@ fn test_explicit_null_is_rejected_instead_of_defaulted() {
             err.contains("must not be null"),
             "field={field}, got: {err}"
         );
+        if matches!(field, "provider" | "function_url") {
+            assert!(
+                err.contains("is required"),
+                "required field={field}, got: {err}"
+            );
+            assert!(
+                !err.contains("omit the field"),
+                "required field received optional guidance: field={field}, got: {err}"
+            );
+        } else {
+            assert!(
+                err.contains("omit the field instead"),
+                "optional field={field}, got: {err}"
+            );
+            assert!(
+                !err.contains("is required"),
+                "optional field received required guidance: field={field}, got: {err}"
+            );
+        }
     }
 }
 
@@ -1729,6 +1748,10 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
         "content-location-relative",
         "content-location-encoded",
         "refresh-absolute",
+        "refresh-comma-absolute",
+        "refresh-whitespace-url",
+        "refresh-whitespace-bare-absolute",
+        "refresh-repeated-separators",
         "refresh-relative",
         "refresh-encoded",
         "refresh-bare-absolute",
@@ -1746,8 +1769,11 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
         "link-query-trailing-slash",
         "benign-content-location",
         "benign-refresh",
+        "benign-refresh-comma",
         "benign-refresh-bare-target",
+        "benign-refresh-whitespace-bare-target",
         "benign-refresh-delay-only",
+        "benign-refresh-separator-only",
         "benign-refresh-non-url-directive",
         "benign-link-multiple-targets",
         "benign-link-label",
@@ -1776,6 +1802,20 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
             "refresh-absolute" => {
                 ("refresh", format!("0; URL=\"{function_url}\""), true)
             }
+            "refresh-comma-absolute" => {
+                ("refresh", format!("0, url={function_url}"), true)
+            }
+            "refresh-whitespace-url" => {
+                ("refresh", format!("0 \t url={function_url}"), true)
+            }
+            "refresh-whitespace-bare-absolute" => {
+                ("refresh", format!("0\t{function_url}"), true)
+            }
+            "refresh-repeated-separators" => (
+                "refresh",
+                format!("0 \t, ; \t url={function_url}"),
+                true,
+            ),
             "refresh-relative" => (
                 "refresh",
                 "0;url=/signed%2Ftrigger?code=secret%2Fvalue".to_string(),
@@ -1848,12 +1888,21 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
             "benign-refresh" => {
                 ("refresh", "5; URL = '/safe?other=1'".to_string(), false)
             }
+            "benign-refresh-comma" => {
+                ("refresh", "5, url=/safe?other=1".to_string(), false)
+            }
             "benign-refresh-bare-target" => (
                 "refresh",
                 "5; https://redirect.example/safe?other=1".to_string(),
                 false,
             ),
+            "benign-refresh-whitespace-bare-target" => (
+                "refresh",
+                "5 https://redirect.example/safe?other=1".to_string(),
+                false,
+            ),
             "benign-refresh-delay-only" => ("refresh", "5".to_string(), false),
+            "benign-refresh-separator-only" => ("refresh", "5 \t, ;".to_string(), false),
             "benign-refresh-non-url-directive" => {
                 ("refresh", "not-a-delay; token=value".to_string(), false)
             }

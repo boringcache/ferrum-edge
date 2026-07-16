@@ -15450,7 +15450,8 @@ components:
         applicable end-to-end response headers, preserving repeated Set-Cookie,
         while stripping hop-by-hop, Connection-listed, transport-managed,
         provider-control, and credential-bearing fields. URL-valued Location,
-        Content-Location, Refresh (url= and bare URI forms), and every Link target are removed
+        Content-Location, Refresh (url= and bare URI forms after semicolon,
+        comma, or ASCII-whitespace delay separators), and every Link target are removed
         when a relative, absolute, encoded, or nested target exposes the
         configured signed function path/query. Complete signed paths match at
         slash-delimited segment boundaries even with added prefix or descendant
