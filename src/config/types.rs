@@ -5018,11 +5018,14 @@ impl CountryMmdbCache {
         path: &str,
         size: u64,
     ) -> Result<(), CountryMmdbLoadError> {
-        let handoff = self.validation_handoffs.get_mut(&generation).ok_or_else(|| {
-            CountryMmdbLoadError::Invalid(
-                "MaxMind database validation generation is no longer active".to_string(),
-            )
-        })?;
+        let handoff = self
+            .validation_handoffs
+            .get_mut(&generation)
+            .ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(
+                    "MaxMind database validation generation is no longer active".to_string(),
+                )
+            })?;
         handoff.aggregate_budget.admit(path, size)
     }
 
@@ -5184,12 +5187,11 @@ impl CountryMmdbLoadSession {
             return Ok(Arc::clone(snapshot));
         }
 
-        let loaded = load_validated_country_mmdb_inner(
-            path,
-            None,
-            Some(&mut state.aggregate_budget),
-        )?;
-        Ok(Arc::clone(state.snapshots.entry(path_key).or_insert(loaded)))
+        let loaded =
+            load_validated_country_mmdb_inner(path, None, Some(&mut state.aggregate_budget))?;
+        Ok(Arc::clone(
+            state.snapshots.entry(path_key).or_insert(loaded),
+        ))
     }
 }
 

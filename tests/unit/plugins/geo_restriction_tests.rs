@@ -905,12 +905,7 @@ async fn delta_budget_counts_retained_and_rebuilt_mmdb_snapshots() {
     std::fs::write(&second_path, replacement).unwrap();
     config.plugin_configs[1].updated_at = "2026-01-01T00:00:01Z".parse().unwrap();
     cache
-        .apply_delta(
-            &config,
-            &HashSet::from(["p2".to_string()]),
-            &[],
-            false,
-        )
+        .apply_delta(&config, &HashSet::from(["p2".to_string()]), &[], false)
         .unwrap();
 
     assert_eq!(
@@ -1046,8 +1041,7 @@ fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
     assert!(config_source.contains("MAX_COUNTRY_MMDB_SIZE_BYTES"));
     assert!(config_source.contains("MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES"));
     assert!(config_source.contains("aggregate_budget.admit(path, metadata.len())"));
-    assert!(config_source
-        .contains("verify_country_mmdb_path_still_matches(path, &file_version)"));
+    assert!(config_source.contains("verify_country_mmdb_path_still_matches(path, &file_version)"));
     assert_eq!(
         MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES,
         MAX_COUNTRY_MMDB_SIZE_BYTES

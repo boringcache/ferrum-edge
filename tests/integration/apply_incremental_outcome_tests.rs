@@ -30,8 +30,7 @@ use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use tempfile::TempDir;
 
-const COUNTRY_MMDB_B64: &str =
-    include_str!("../fixtures/maxmind/GeoIP2-Country-Test.mmdb.b64");
+const COUNTRY_MMDB_B64: &str = include_str!("../fixtures/maxmind/GeoIP2-Country-Test.mmdb.b64");
 
 fn country_mmdb_bytes() -> Vec<u8> {
     let encoded: String = COUNTRY_MMDB_B64.lines().collect();
@@ -456,10 +455,7 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
         .iter()
         .find(|plugin| plugin.name() == "stdout_logging")
         .unwrap();
-    assert!(std::sync::Arc::ptr_eq(
-        &unrelated_before,
-        unrelated_after
-    ));
+    assert!(std::sync::Arc::ptr_eq(&unrelated_before, unrelated_after));
     let mut after = RequestContext::new(
         "89.160.20.112".to_string(),
         "GET".to_string(),

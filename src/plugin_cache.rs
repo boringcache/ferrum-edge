@@ -171,9 +171,7 @@ impl Plugin for PriorityOverridePlugin {
     fn name(&self) -> &str {
         self.inner.name()
     }
-    fn country_mmdb_snapshot(
-        &self,
-    ) -> Option<&crate::config::types::CountryMmdbSnapshot> {
+    fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
         self.inner.country_mmdb_snapshot()
     }
     fn priority(&self) -> u16 {
@@ -2950,8 +2948,7 @@ impl PluginCache {
         let mut global_plugins_changed = rebuild_globals || rebuild_adaptive_globals;
         let mut adaptive_concurrency_instances =
             retained_adaptive_concurrency_states(&current.adaptive_concurrency_instances, config);
-        let force_country_mmdb_refresh =
-            country_mmdb_load_session.claimed_validation_generation();
+        let force_country_mmdb_refresh = country_mmdb_load_session.claimed_validation_generation();
         let active_country_mmdb_configs: HashMap<CountryMmdbPluginId, &PluginConfig> = config
             .plugin_configs
             .iter()
@@ -2992,24 +2989,23 @@ impl PluginCache {
         };
         let forced_country_mmdb_instances =
             force_country_mmdb_refresh.then_some(&forced_country_mmdb_instances);
-        let country_mmdb_replacements: HashMap<usize, Arc<dyn Plugin>> = if let Some(forced) =
-            forced_country_mmdb_instances
-        {
-            current
-                .country_mmdb_instances
-                .iter()
-                .filter_map(|(id, plugin)| {
-                    forced.get(id).map(|replacement| {
-                        (
-                            Arc::as_ptr(plugin) as *const () as usize,
-                            Arc::clone(replacement),
-                        )
+        let country_mmdb_replacements: HashMap<usize, Arc<dyn Plugin>> =
+            if let Some(forced) = forced_country_mmdb_instances {
+                current
+                    .country_mmdb_instances
+                    .iter()
+                    .filter_map(|(id, plugin)| {
+                        forced.get(id).map(|replacement| {
+                            (
+                                Arc::as_ptr(plugin) as *const () as usize,
+                                Arc::clone(replacement),
+                            )
+                        })
                     })
-                })
-                .collect()
-        } else {
-            HashMap::new()
-        };
+                    .collect()
+            } else {
+                HashMap::new()
+            };
 
         // Rebuild globals if any global plugin config changed
         let mut new_globals = if rebuild_globals {
@@ -3428,16 +3424,16 @@ impl PluginCache {
             ));
         }
 
-        let country_mmdb_snapshot_bytes =
-            match country_mmdb_snapshot_bytes(&new_map, &new_globals) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    if rebuild_globals {
-                        crate::plugins::utils::log_schema::registry::abort_reload();
-                    }
-                    return Err(format!("Config reload rejected: {error}"));
+        let country_mmdb_snapshot_bytes = match country_mmdb_snapshot_bytes(&new_map, &new_globals)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if rebuild_globals {
+                    crate::plugins::utils::log_schema::registry::abort_reload();
                 }
-            };
+                return Err(format!("Config reload rejected: {error}"));
+            }
+        };
 
         if let Err(error) = start_background_tasks(&new_map, &new_globals) {
             if rebuild_globals {
