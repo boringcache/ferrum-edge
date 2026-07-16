@@ -1509,8 +1509,7 @@ async fn api_spec_post_and_exact_put_validate_against_prospective_schema_graph()
         .expect("created API spec returns id");
 
     spec["info"]["version"] = json!("2.0.0");
-    spec["x-ferrum-plugins"][0]["config"]["filter"] =
-        json!({"status_code_min": 500});
+    spec["x-ferrum-plugins"][0]["config"]["filter"] = json!({"status_code_min": 500});
     let (put_status, put_body) = client
         .put_json(&format!("/api-specs/{spec_id}"), &spec)
         .await;

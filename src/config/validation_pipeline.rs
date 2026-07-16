@@ -441,10 +441,7 @@ impl<'a> ValidationPipeline<'a> {
                                         crate::plugins::PluginFailurePolicy::OptionalFailOpen,
                                     )
                                 {
-                                    warn!(
-                                        "Optional plugin config validation warning: {}",
-                                        message
-                                    );
+                                    warn!("Optional plugin config validation warning: {}", message);
                                 } else {
                                     errors.push(message);
                                 }

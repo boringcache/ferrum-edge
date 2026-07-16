@@ -294,11 +294,9 @@ fn schema_ref_opt_in_cannot_bypass_policy_only_egress_validation() {
         ..GatewayConfig::default()
     };
 
-    let errors = ferrum_edge::_test_support::collect_plugin_config_errors_for_test(
-        &mut config,
-        &policy,
-    )
-    .expect("collect validation should return policy errors");
+    let errors =
+        ferrum_edge::_test_support::collect_plugin_config_errors_for_test(&mut config, &policy)
+            .expect("collect validation should return policy errors");
     assert!(
         errors
             .iter()

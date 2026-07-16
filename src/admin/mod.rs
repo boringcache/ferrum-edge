@@ -4189,10 +4189,9 @@ async fn handle_batch_create(
                     plugin_config.id, err
                 ));
             }
-        } else if let Err(err) = validate_plugin_config_definition(
-            plugin_config,
-            plugin_validation_http_client(state),
-        ) {
+        } else if let Err(err) =
+            validate_plugin_config_definition(plugin_config, plugin_validation_http_client(state))
+        {
             validation_errors.push(format!(
                 "PluginConfig '{}': invalid config: {}",
                 plugin_config.id, err

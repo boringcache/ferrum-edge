@@ -1310,24 +1310,23 @@ async fn validate_bundle(
                 plugin.plugin_name, known_plugins
             ));
         } else if plugin.enabled {
-            let validation = if crate::plugins::transaction_log_schema::participates_in_config_graph(
-                plugin,
-            ) {
-                // Full construction must run only after the prospective
-                // namespace's schema definitions have been staged below.
-                // Keep policy-only admission active in this preliminary pass.
-                crate::plugins::validate_plugin_config_policy_only(
-                    &plugin.plugin_name,
-                    &plugin.config,
-                    &state.backend_allow_ips,
-                )
-            } else {
-                crate::plugins::validate_plugin_config_with_policy(
-                    &plugin.plugin_name,
-                    &plugin.config,
-                    &state.backend_allow_ips,
-                )
-            };
+            let validation =
+                if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin) {
+                    // Full construction must run only after the prospective
+                    // namespace's schema definitions have been staged below.
+                    // Keep policy-only admission active in this preliminary pass.
+                    crate::plugins::validate_plugin_config_policy_only(
+                        &plugin.plugin_name,
+                        &plugin.config,
+                        &state.backend_allow_ips,
+                    )
+                } else {
+                    crate::plugins::validate_plugin_config_with_policy(
+                        &plugin.plugin_name,
+                        &plugin.config,
+                        &state.backend_allow_ips,
+                    )
+                };
             if let Err(error) = validation {
                 plugin_errors.push(error);
             }
