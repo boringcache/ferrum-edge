@@ -83,13 +83,14 @@ savings are approximations.
 
 The scan ceiling is only the outer bound. Before token allocation or scoring,
 the plugin rejects compression work for a body containing more than 524,288
-eligible prompt bytes, 32,768 whitespace-delimited units, or 256 rewritable
-text fields. Scoring uses linear-time partial selection rather than sorting all
-candidates, JSON output is capped at the smaller configured limit (with at most
-65,536 bytes of lexical growth), and a process-wide eight-job admission budget
-prevents concurrent compressors from multiplying intermediate allocations.
-Admitted jobs run on Tokio's blocking worker pool instead of request executors;
-over-budget work passes through unchanged.
+eligible prompt bytes, 32,768 whitespace-delimited units or emitted tokenizer
+entries, 256 rewritable text fields, or 1,024 configured preserve markers.
+Scoring uses linear-time partial selection rather than sorting all candidates,
+JSON output is capped at the smaller configured limit (with at most 65,536
+bytes of lexical growth), and a process-wide eight-job admission budget prevents
+concurrent compressors from multiplying intermediate allocations. Admitted jobs
+run on Tokio's blocking worker pool instead of request executors; saturated or
+over-budget work passes through unchanged without joining a waiter queue.
 
 An empty config object (`{}`) is valid and applies the defaults: on standard
 OpenAI Chat/Text Completions paths, compress `user` content longer than ~200

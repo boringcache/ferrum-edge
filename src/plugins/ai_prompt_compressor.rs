@@ -57,6 +57,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -80,6 +81,8 @@ const MAX_TARGET_TEXT_BYTES: usize = 524_288;
 const MAX_TOKEN_UNITS: usize = 32_768;
 /// Maximum independently rewritable text fields in one request body.
 const MAX_TARGET_FIELDS: usize = 256;
+/// Maximum preserve markers admitted across eligible text in one body.
+const MAX_PRESERVE_MARKERS: usize = 1_024;
 /// Maximum lexical growth allowed while reserializing the complete JSON body.
 const MAX_JSON_OUTPUT_GROWTH_BYTES: usize = 65_536;
 /// Maximum simultaneous statistical compression jobs across all plugin instances.
@@ -163,6 +166,8 @@ struct WorkEstimate {
     target_fields: usize,
     target_text_bytes: usize,
     token_units: usize,
+    emitted_tokens: usize,
+    preserve_markers: usize,
 }
 
 impl CompressionStats {
@@ -322,7 +327,7 @@ impl AiPromptCompressor {
         // JSON parsing, token scoring, and serialization are CPU work. Keep
         // them off Tokio request executors and admit a process-wide bounded
         // number of jobs before cloning the already-buffered input.
-        let permit = Arc::clone(&COMPRESSION_BUDGET).acquire_owned().await.ok()?;
+        let permit = Arc::clone(&COMPRESSION_BUDGET).try_acquire_owned().ok()?;
         let worker = self.clone();
         let body = body.to_vec();
         let request_path = request_path.map(str::to_owned);
@@ -365,7 +370,7 @@ impl AiPromptCompressor {
         if body.len() > self.max_scan_bytes || body.len() > HARD_MAX_SCAN_BYTES {
             return None;
         }
-        let permit = Arc::clone(&COMPRESSION_BUDGET).acquire_owned().await.ok()?;
+        let permit = Arc::clone(&COMPRESSION_BUDGET).try_acquire_owned().ok()?;
         let body = body.to_vec();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -429,13 +434,25 @@ impl AiPromptCompressor {
                     let role = message.get("role")?.as_str()?;
                     let eligible = self.role_is_eligible(role);
                     if let Some(content) = message.get("content") {
-                        measure_content(content, eligible, true, &mut estimate)?;
+                        measure_content(
+                            content,
+                            eligible,
+                            true,
+                            self.preserve_tags.as_ref(),
+                            &mut estimate,
+                        )?;
                     }
                 }
             }
             RequestFamily::TextCompletions => {
                 let prompt = json.get("prompt")?;
-                measure_content(prompt, self.compress_prompt_field, false, &mut estimate)?;
+                measure_content(
+                    prompt,
+                    self.compress_prompt_field,
+                    false,
+                    self.preserve_tags.as_ref(),
+                    &mut estimate,
+                )?;
             }
         }
         Some(estimate)
@@ -690,12 +707,13 @@ fn measure_content(
     content: &Value,
     eligible: bool,
     allow_multimodal: bool,
+    preserve_tags: Option<&(String, String)>,
     estimate: &mut WorkEstimate,
 ) -> Option<()> {
     match content {
         Value::String(text) => {
             if eligible {
-                account_text(text, estimate)?;
+                account_text(text, preserve_tags, estimate)?;
             }
         }
         Value::Array(parts) => {
@@ -703,7 +721,7 @@ fn measure_content(
                 match part {
                     Value::String(text) if !allow_multimodal => {
                         if eligible {
-                            account_text(text, estimate)?;
+                            account_text(text, preserve_tags, estimate)?;
                         }
                     }
                     Value::Object(object) if allow_multimodal => {
@@ -711,7 +729,7 @@ fn measure_content(
                         if part_type == "text" {
                             let text = object.get("text")?.as_str()?;
                             if eligible {
-                                account_text(text, estimate)?;
+                                account_text(text, preserve_tags, estimate)?;
                             }
                         }
                     }
@@ -725,16 +743,61 @@ fn measure_content(
     Some(())
 }
 
-fn account_text(text: &str, estimate: &mut WorkEstimate) -> Option<()> {
+fn account_text(
+    text: &str,
+    preserve_tags: Option<&(String, String)>,
+    estimate: &mut WorkEstimate,
+) -> Option<()> {
     estimate.target_fields = estimate.target_fields.checked_add(1)?;
     estimate.target_text_bytes = estimate.target_text_bytes.checked_add(text.len())?;
+    if estimate.target_fields > MAX_TARGET_FIELDS
+        || estimate.target_text_bytes > MAX_TARGET_TEXT_BYTES
+    {
+        return None;
+    }
     estimate.token_units = estimate
         .token_units
         .checked_add(count_token_units(text, MAX_TOKEN_UNITS)?)?;
-    (estimate.target_fields <= MAX_TARGET_FIELDS
-        && estimate.target_text_bytes <= MAX_TARGET_TEXT_BYTES
-        && estimate.token_units <= MAX_TOKEN_UNITS)
+    let remaining_tokens = MAX_TOKEN_UNITS.checked_sub(estimate.emitted_tokens)?;
+    estimate.emitted_tokens = estimate
+        .emitted_tokens
+        .checked_add(count_emitted_tokens(text, remaining_tokens)?)?;
+    if let Some(tags) = preserve_tags {
+        let remaining = MAX_PRESERVE_MARKERS.checked_sub(estimate.preserve_markers)?;
+        estimate.preserve_markers = estimate
+            .preserve_markers
+            .checked_add(count_preserve_markers(text, tags, remaining)?)?;
+    }
+    let segmented_tokens = estimate
+        .emitted_tokens
+        .checked_add(estimate.preserve_markers)?;
+    (estimate.token_units <= MAX_TOKEN_UNITS
+        && segmented_tokens <= MAX_TOKEN_UNITS
+        && estimate.preserve_markers <= MAX_PRESERVE_MARKERS)
         .then_some(())
+}
+
+fn count_preserve_markers(text: &str, tags: &(String, String), limit: usize) -> Option<usize> {
+    let (open, close) = tags;
+    let mut count = 0usize;
+    let mut cursor = 0usize;
+    while let Some(relative) = text[cursor..].find('<') {
+        let marker_start = cursor + relative;
+        let marker_len = if text[marker_start..].starts_with(open.as_str()) {
+            open.len()
+        } else if text[marker_start..].starts_with(close.as_str()) {
+            close.len()
+        } else {
+            cursor = marker_start + 1;
+            continue;
+        };
+        count = count.checked_add(1)?;
+        if count > limit {
+            return None;
+        }
+        cursor = marker_start + marker_len;
+    }
+    Some(count)
 }
 
 fn count_token_units(text: &str, limit: usize) -> Option<usize> {
@@ -752,6 +815,35 @@ fn count_token_units(text: &str, limit: usize) -> Option<usize> {
         }
     }
     Some(units)
+}
+
+fn count_emitted_tokens(text: &str, limit: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut count = 0usize;
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            break;
+        }
+
+        let start = cursor;
+        cursor = if bytes[start] == b'`' {
+            scan_backtick_span(bytes, start)
+        } else if starts_with_http_url(&text[start..]) {
+            scan_to_whitespace(bytes, start)
+        } else {
+            scan_to_whitespace_or_backtick(bytes, start)
+        };
+
+        count = count.checked_add(1)?;
+        if count > limit {
+            return None;
+        }
+    }
+    Some(count)
 }
 
 fn strip_all_markers(text: &str, open: &str, close: &str) -> String {
@@ -1134,6 +1226,35 @@ struct Token<'a> {
     leading_newline: bool,
 }
 
+#[derive(Clone, Copy)]
+struct FoldedCore<'a>(&'a str);
+
+impl PartialEq for FoldedCore<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        folded_core_chars(self.0).eq(folded_core_chars(other.0))
+    }
+}
+
+impl Eq for FoldedCore<'_> {}
+
+impl Hash for FoldedCore<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for character in folded_core_chars(self.0) {
+            character.hash(state);
+        }
+    }
+}
+
+fn folded_core_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().flat_map(char::to_lowercase).map(|character| {
+        if matches!(character, '\u{2019}' | '\u{02bc}') {
+            '\''
+        } else {
+            character
+        }
+    })
+}
+
 /// Append `seg` to `out`, inserting a single separating space only when needed
 /// to avoid gluing two non-whitespace characters at the boundary. `seg`'s own
 /// internal whitespace is preserved exactly, so this is safe for verbatim
@@ -1159,10 +1280,10 @@ fn statistical_compress(text: &str, ratio: f64) -> Option<String> {
     }
 
     // In-document frequency of each candidate word (rarer => more important).
-    let mut freq: HashMap<&str, u32> = HashMap::new();
+    let mut freq: HashMap<FoldedCore<'_>, u32> = HashMap::new();
     for token in &tokens {
         if !token.verbatim {
-            *freq.entry(token.core).or_insert(0) += 1;
+            *freq.entry(FoldedCore(token.core)).or_insert(0) += 1;
         }
     }
 
@@ -1220,14 +1341,14 @@ fn statistical_compress(text: &str, ratio: f64) -> Option<String> {
 }
 
 /// Compute an importance score for a candidate word. Higher = more likely kept.
-fn word_score(token: &Token<'_>, freq: &HashMap<&str, u32>) -> f32 {
+fn word_score(token: &Token<'_>, freq: &HashMap<FoldedCore<'_>, u32>) -> f32 {
     let mut score = if is_stopword(token.core) { 0.0 } else { 1.0 };
     // Longer words tend to carry more meaning (capped so one long word can't
     // dominate).
     let len = token.core.chars().count().min(12) as f32;
     score += len * 0.1;
     // Rarity: a word appearing once scores higher than a frequently repeated one.
-    let count = freq.get(token.core).copied().unwrap_or(1);
+    let count = freq.get(&FoldedCore(token.core)).copied().unwrap_or(1);
     score += 1.0 / count as f32;
     // Proper-noun / entity signal: an original-case leading capital.
     if token
@@ -1247,7 +1368,7 @@ fn word_score(token: &Token<'_>, freq: &HashMap<&str, u32>) -> f32 {
 /// safe because multi-byte sequences never contain ASCII bytes.
 fn tokenize(text: &str) -> Option<Vec<Token<'_>>> {
     let bytes = text.as_bytes();
-    let capacity = count_token_units(text, MAX_TOKEN_UNITS)?;
+    let capacity = count_emitted_tokens(text, MAX_TOKEN_UNITS)?;
     let mut tokens = Vec::with_capacity(capacity);
     let mut i = 0usize;
     while i < bytes.len() {
@@ -1271,24 +1392,20 @@ fn tokenize(text: &str) -> Option<Vec<Token<'_>>> {
         // code-like content to lossy prose scoring.
         if bytes[start] == b'`' {
             let end = scan_backtick_span(bytes, start);
-            push_verbatim(&mut tokens, &text[start..end], had_newline);
+            push_verbatim(&mut tokens, &text[start..end], had_newline)?;
             i = end;
             continue;
         }
         // URL: keep intact so paths/query strings are never mangled.
         if starts_with_http_url(rest) {
             let end = scan_to_whitespace(bytes, start);
-            push_verbatim(&mut tokens, &text[start..end], had_newline);
+            push_verbatim(&mut tokens, &text[start..end], had_newline)?;
             i = end;
             continue;
         }
 
         // Ordinary whitespace-delimited unit.
-        let whitespace_end = scan_to_whitespace(bytes, start);
-        let end = text[start..whitespace_end]
-            .find('`')
-            .filter(|relative| *relative > 0)
-            .map_or(whitespace_end, |relative| start + relative);
+        let end = scan_to_whitespace_or_backtick(bytes, start);
         let unit = &text[start..end];
         i = end;
 
@@ -1299,14 +1416,17 @@ fn tokenize(text: &str) -> Option<Vec<Token<'_>>> {
         // leading-scheme fast path above misses; such a token stays verbatim so
         // links are never scored and dropped.
         if core.is_empty() || is_protected_word(core) || contains_url(unit) {
-            push_verbatim(&mut tokens, unit, had_newline);
+            push_verbatim(&mut tokens, unit, had_newline)?;
         } else {
-            tokens.push(Token {
-                text: unit,
-                core,
-                verbatim: false,
-                leading_newline: had_newline,
-            });
+            push_token(
+                &mut tokens,
+                Token {
+                    text: unit,
+                    core,
+                    verbatim: false,
+                    leading_newline: had_newline,
+                },
+            )?;
         }
     }
     Some(tokens)
@@ -1345,13 +1465,32 @@ fn scan_to_whitespace(bytes: &[u8], start: usize) -> usize {
     j
 }
 
-fn push_verbatim<'a>(tokens: &mut Vec<Token<'a>>, text: &'a str, leading_newline: bool) {
-    tokens.push(Token {
-        text,
-        core: "",
-        verbatim: true,
-        leading_newline,
-    });
+fn scan_to_whitespace_or_backtick(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < bytes.len() && !bytes[end].is_ascii_whitespace() && bytes[end] != b'`' {
+        end += 1;
+    }
+    end
+}
+
+fn push_verbatim<'a>(tokens: &mut Vec<Token<'a>>, text: &'a str, leading_newline: bool) -> Option<()> {
+    push_token(
+        tokens,
+        Token {
+            text,
+            core: "",
+            verbatim: true,
+            leading_newline,
+        },
+    )
+}
+
+fn push_token<'a>(tokens: &mut Vec<Token<'a>>, token: Token<'a>) -> Option<()> {
+    if tokens.len() >= MAX_TOKEN_UNITS {
+        return None;
+    }
+    tokens.push(token);
+    Some(())
 }
 
 /// True when `s` embeds an `http(s)://` URL, including when it is wrapped in

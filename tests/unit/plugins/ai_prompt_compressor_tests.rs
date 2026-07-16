@@ -503,6 +503,18 @@ async fn common_identifiers_and_unicode_numbers_are_verbatim_property() {
 }
 
 #[tokio::test]
+async fn frequency_scoring_is_case_insensitive_without_token_copies() {
+    let plugin = compressor(1, 0.25);
+    let body = chat_body("user", "account Account account extraordinarily");
+    let out = transform(&plugin, &body)
+        .await
+        .expect("repeated variants should compress");
+    let compressed = first_message_content(&out);
+
+    assert_eq!(compressed, "extraordinarily");
+}
+
+#[tokio::test]
 async fn multimodal_text_parts_compressed() {
     let plugin = compressor(5, 0.4);
     let long = long_prompt_text();
@@ -701,6 +713,14 @@ async fn adversarial_token_and_field_budgets_pass_through() {
         "token-unit budget must be checked before token allocation"
     );
 
+    let too_many_split_tokens = "a`x`".repeat(32_769);
+    assert!(
+        transform(&plugin, &chat_body("user", &too_many_split_tokens))
+            .await
+            .is_none(),
+        "backtick splitting must not bypass the emitted-token budget"
+    );
+
     let too_many_parts: Vec<Value> = (0..257)
         .map(|index| json!({"type": "text", "text": format!("field {index} ordinary prose")}))
         .collect();
@@ -719,6 +739,20 @@ async fn adversarial_token_and_field_budgets_pass_through() {
             .await
             .is_none(),
         "eligible prompt bytes have a separate hard ceiling"
+    );
+
+    let marker_plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "x",
+        "min_content_tokens": 1,
+        "target_ratio": 0.5
+    }))
+    .unwrap();
+    let too_many_markers = "a</x>".repeat(1_025);
+    assert!(
+        transform(&marker_plugin, &chat_body("user", &too_many_markers))
+            .await
+            .is_none(),
+        "preserve-marker segmentation must be rejected before repeated compression"
     );
 }
 

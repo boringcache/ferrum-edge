@@ -16445,7 +16445,7 @@ components:
           minimum: 1
           maximum: 1048576
           default: 1048576
-          description: "Skip compression when the request body exceeds this size. The immutable hard maximum is 1048576 bytes; eligible prompt text is additionally capped at 524288 bytes, 32768 whitespace-delimited units, and 256 rewritable fields per body."
+          description: "Skip compression when the request body exceeds this size. The immutable hard maximum is 1048576 bytes; eligible prompt text is additionally capped at 524288 bytes, 32768 whitespace-delimited units or emitted tokenizer entries, 256 rewritable fields, and 1024 preserve markers per body."
         preserve_tag:
           type: string
           minLength: 1
