@@ -3270,7 +3270,8 @@ async fn finish_failed_restore(
     guard_owner: &str,
 ) -> Response<Full<Bytes>> {
     let (mut rollback_status, mut rollback_errors) =
-        match rollback_failed_restore(db.as_ref(), namespace, &snapshot.payload, guard_owner).await {
+        match rollback_failed_restore(db.as_ref(), namespace, &snapshot.payload, guard_owner).await
+        {
             Ok(()) => ("completed", None),
             Err(errors) => {
                 error!(
@@ -3291,9 +3292,9 @@ async fn finish_failed_restore(
             "Restore: rollback guard could not be released"
         );
         rollback_status = "incomplete";
-        rollback_errors
-            .get_or_insert_with(Vec::new)
-            .push(format!("failed to release restore admission guard: {error}"));
+        rollback_errors.get_or_insert_with(Vec::new).push(format!(
+            "failed to release restore admission guard: {error}"
+        ));
     }
 
     let event = audit::AuditEvent::new(
@@ -3487,11 +3488,11 @@ async fn handle_update_credentials(
     }
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |guard_owner| async move {
         let mode = BatchConfigWriteMode::GuardedAdmission { guard_owner };
-        let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await
-        {
-            Ok(consumer) => consumer,
-            Err(resp) => return *resp,
-        };
+        let mut consumer =
+            match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+                Ok(consumer) => consumer,
+                Err(resp) => return *resp,
+            };
         let before = consumer.clone();
         consumer
             .credentials
@@ -3571,20 +3572,16 @@ async fn handle_delete_credentials(
 
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |guard_owner| async move {
         let mode = BatchConfigWriteMode::GuardedAdmission { guard_owner };
-        let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await
-        {
-            Ok(consumer) => consumer,
-            Err(resp) => return *resp,
-        };
+        let mut consumer =
+            match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+                Ok(consumer) => consumer,
+                Err(resp) => return *resp,
+            };
         let before = consumer.clone();
         consumer.credentials.remove(cred_type);
-        let response = persist_consumer_update(
-            db.as_ref(),
-            consumer.clone(),
-            StatusCode::NO_CONTENT,
-            &mode,
-        )
-        .await;
+        let response =
+            persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::NO_CONTENT, &mode)
+                .await;
         if response.status().is_success() {
             let event = audit::AuditEvent::new(
                 actor,
@@ -3650,11 +3647,11 @@ async fn handle_append_credential(
     }
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |guard_owner| async move {
         let mode = BatchConfigWriteMode::GuardedAdmission { guard_owner };
-        let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await
-        {
-            Ok(consumer) => consumer,
-            Err(resp) => return *resp,
-        };
+        let mut consumer =
+            match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+                Ok(consumer) => consumer,
+                Err(resp) => return *resp,
+            };
         let before = consumer.clone();
         let new_value = match consumer.credentials.get(cred_type) {
             Some(Value::Array(arr)) => {
@@ -3768,11 +3765,11 @@ async fn handle_delete_credential_by_index(
 
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |guard_owner| async move {
         let mode = BatchConfigWriteMode::GuardedAdmission { guard_owner };
-        let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await
-        {
-            Ok(consumer) => consumer,
-            Err(resp) => return *resp,
-        };
+        let mut consumer =
+            match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+                Ok(consumer) => consumer,
+                Err(resp) => return *resp,
+            };
         let before = consumer.clone();
         let cred_value = match consumer.credentials.get_mut(cred_type) {
             Some(value) => value,
@@ -5157,10 +5154,7 @@ async fn handle_restore(
 
     // Phase 3: Delete all existing resources in the namespace (safe: payload is
     // validated and the prior state has been snapshotted from the primary above).
-    if let Err(e) = db
-        .delete_all_resources(namespace, &restore_mode)
-        .await
-    {
+    if let Err(e) = db.delete_all_resources(namespace, &restore_mode).await {
         error!("Restore: failed to delete existing resources: {}", e);
         if e.mode().is_atomic() {
             if e.has_unknown_commit_result() {
@@ -5235,13 +5229,8 @@ async fn handle_restore(
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
-    let (created, errors) = persist_payload_resources(
-        db.as_ref(),
-        &payload,
-        false,
-        &restore_mode,
-    )
-    .await;
+    let (created, errors) =
+        persist_payload_resources(db.as_ref(), &payload, false, &restore_mode).await;
 
     info!(
         "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
@@ -5263,18 +5252,16 @@ async fn handle_restore(
             namespace,
             errors.join("; ")
         );
-        return Ok(
-            finish_failed_restore(
-                state,
-                db.clone(),
-                actor,
-                namespace,
-                errors,
-                &snapshot,
-                &restore_guard_owner,
-            )
-            .await,
-        );
+        return Ok(finish_failed_restore(
+            state,
+            db.clone(),
+            actor,
+            namespace,
+            errors,
+            &snapshot,
+            &restore_guard_owner,
+        )
+        .await);
     }
 
     if let Err(error) = db

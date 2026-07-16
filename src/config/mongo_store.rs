@@ -400,15 +400,11 @@ mod inner {
             | mongodb::error::ErrorKind::ConnectionPoolCleared { .. }
             | mongodb::error::ErrorKind::InvalidResponse { .. }
             | mongodb::error::ErrorKind::Shutdown => true,
-            mongodb::error::ErrorKind::Write(
-                mongodb::error::WriteFailure::WriteConcernError(_),
-            ) => true,
-            mongodb::error::ErrorKind::InsertMany(error) => {
-                error.write_concern_error.is_some()
-            }
-            mongodb::error::ErrorKind::BulkWrite(error) => {
-                !error.write_concern_errors.is_empty()
-            }
+            mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteConcernError(
+                _,
+            )) => true,
+            mongodb::error::ErrorKind::InsertMany(error) => error.write_concern_error.is_some(),
+            mongodb::error::ErrorKind::BulkWrite(error) => !error.write_concern_errors.is_empty(),
             _ => false,
         }
     }
@@ -1688,25 +1684,25 @@ mod inner {
             let lock_id = lock_id.to_string();
             let (connection, connection_generation_guard, persistent_outcome_uncertain) =
                 if guard_owner.is_some() {
-                let persistent_pin = self.persistent_admission_pins.get(&owner).ok_or_else(|| {
+                    let persistent_pin = self.persistent_admission_pins.get(&owner).ok_or_else(|| {
                     anyhow::anyhow!(
                         "MongoDB {label} guard '{lock_id}' is not active in this admin process"
                     )
                 })?;
-                if persistent_pin.namespace != lock_id {
-                    anyhow::bail!(
-                        "MongoDB {label} guard '{lock_id}' belongs to a different namespace"
-                    );
-                }
-                (
-                    persistent_pin.pin.connection.clone(),
-                    None,
-                    Some(persistent_pin.uncertain_outcome.clone()),
-                )
-            } else {
-                let generation_guard = self.connection_generation.clone().read_owned().await;
-                (self.connection(), Some(generation_guard), None)
-            };
+                    if persistent_pin.namespace != lock_id {
+                        anyhow::bail!(
+                            "MongoDB {label} guard '{lock_id}' belongs to a different namespace"
+                        );
+                    }
+                    (
+                        persistent_pin.pin.connection.clone(),
+                        None,
+                        Some(persistent_pin.uncertain_outcome.clone()),
+                    )
+                } else {
+                    let generation_guard = self.connection_generation.clone().read_owned().await;
+                    (self.connection(), Some(generation_guard), None)
+                };
             let collection = connection
                 .lease_client
                 .database(connection.db.name())
@@ -5481,182 +5477,204 @@ mod inner {
             let composite_id = consumer_doc_id(&consumer.namespace, &consumer.id);
             let matched = mtls_lease
                 .run_mutation(async {
-            let matched = if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                let matched = session
-                    .start_transaction()
-                    .and_run(
-                        (
-                            self,
-                            doc,
-                            consumer.namespace.clone(),
-                            consumer.id.clone(),
-                            composite_id,
-                            new_identity_values,
-                        ),
-                        |s, (this, doc, namespace, id, composite_id, new_identity_values)| {
-                            Box::pin(async move {
-                                // Read the previous consumer in-session to diff
-                                // the identity keyspace (id ∪ username ∪
-                                // custom_id).
-                                let previous = this
-                                    .consumers()
-                                    .find_one(doc! { "_id": composite_id.as_str() })
-                                    .session(&mut *s)
-                                    .await?;
-                                let Some(previous) = previous else {
-                                    // Phantom update: no writes performed, no
-                                    // config-change record (DB-M4).
-                                    return Ok(false);
-                                };
-                                let previous_consumer = doc_to_consumer(previous)
-                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
-                                let old_values = consumer_identity_values(&previous_consumer);
-                                let replace_result = this
-                                    .consumers()
-                                    .replace_one(doc! { "_id": composite_id.as_str() }, doc.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                if replace_result.matched_count == 0 {
-                                    return Ok(false);
-                                }
-                                let added: Vec<String> = new_identity_values
-                                    .iter()
-                                    .filter(|value| !old_values.contains(value))
-                                    .cloned()
-                                    .collect();
-                                let removed: Vec<String> = old_values
-                                    .iter()
-                                    .filter(|value| !new_identity_values.contains(value))
-                                    .cloned()
-                                    .collect();
-                                this.insert_consumer_identity_docs_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    id.as_str(),
+                    let matched = if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        let matched =
+                            session
+                                .start_transaction()
+                                .and_run(
+                                    (
+                                        self,
+                                        doc,
+                                        consumer.namespace.clone(),
+                                        consumer.id.clone(),
+                                        composite_id,
+                                        new_identity_values,
+                                    ),
+                                    |s,
+                                     (
+                                        this,
+                                        doc,
+                                        namespace,
+                                        id,
+                                        composite_id,
+                                        new_identity_values,
+                                    )| {
+                                        Box::pin(async move {
+                                            // Read the previous consumer in-session to diff
+                                            // the identity keyspace (id ∪ username ∪
+                                            // custom_id).
+                                            let previous = this
+                                                .consumers()
+                                                .find_one(doc! { "_id": composite_id.as_str() })
+                                                .session(&mut *s)
+                                                .await?;
+                                            let Some(previous) = previous else {
+                                                // Phantom update: no writes performed, no
+                                                // config-change record (DB-M4).
+                                                return Ok(false);
+                                            };
+                                            let previous_consumer = doc_to_consumer(previous)
+                                                .map_err(|e| {
+                                                    mongodb::error::Error::custom(e.to_string())
+                                                })?;
+                                            let old_values =
+                                                consumer_identity_values(&previous_consumer);
+                                            let replace_result = this
+                                                .consumers()
+                                                .replace_one(
+                                                    doc! { "_id": composite_id.as_str() },
+                                                    doc.clone(),
+                                                )
+                                                .session(&mut *s)
+                                                .await?;
+                                            if replace_result.matched_count == 0 {
+                                                return Ok(false);
+                                            }
+                                            let added: Vec<String> = new_identity_values
+                                                .iter()
+                                                .filter(|value| !old_values.contains(value))
+                                                .cloned()
+                                                .collect();
+                                            let removed: Vec<String> = old_values
+                                                .iter()
+                                                .filter(|value| {
+                                                    !new_identity_values.contains(value)
+                                                })
+                                                .cloned()
+                                                .collect();
+                                            this.insert_consumer_identity_docs_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                id.as_str(),
+                                                &added,
+                                            )
+                                            .await?;
+                                            this.delete_consumer_identity_values_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                id.as_str(),
+                                                &removed,
+                                            )
+                                            .await?;
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "consumer",
+                                                id.as_str(),
+                                                "upsert",
+                                            )
+                                            .await?;
+                                            Ok(true)
+                                        })
+                                    },
+                                )
+                                .await
+                                .map_err(anyhow::Error::new)
+                                .context("update_consumer transaction failed")?;
+                        if matched {
+                            self.compact_config_changes_best_effort(&consumer.namespace)
+                                .await;
+                        }
+                        matched
+                    } else {
+                        let previous_doc = self
+                            .consumers()
+                            .find_one(doc! { "_id": &composite_id })
+                            .await?;
+                        let Some(previous_doc) = previous_doc else {
+                            return Ok(false);
+                        };
+                        let previous_consumer = doc_to_consumer(previous_doc.clone())?;
+                        let old_values = consumer_identity_values(&previous_consumer);
+                        let added: Vec<String> = new_identity_values
+                            .iter()
+                            .filter(|value| !old_values.contains(value))
+                            .cloned()
+                            .collect();
+                        let removed: Vec<String> = old_values
+                            .iter()
+                            .filter(|value| !new_identity_values.contains(value))
+                            .cloned()
+                            .collect();
+                        // Standalone: reserve the ADDED identity values first, then
+                        // replace the consumer, then release the removed values. A
+                        // duplicate key on the reservation (another consumer owns one
+                        // of the values) bails before the consumer is touched.
+                        self.reserve_consumer_identity_docs_standalone(
+                            &consumer.namespace,
+                            &consumer.id,
+                            &added,
+                        )
+                        .await?;
+                        let replace_result = match self
+                            .consumers()
+                            .replace_one(doc! { "_id": &composite_id }, doc)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(err) => {
+                                self.release_consumer_identity_values_best_effort(
+                                    &consumer.namespace,
+                                    &consumer.id,
                                     &added,
                                 )
-                                .await?;
-                                this.delete_consumer_identity_values_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    id.as_str(),
-                                    &removed,
-                                )
-                                .await?;
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
+                                .await;
+                                return Err(err.into());
+                            }
+                        };
+                        if replace_result.matched_count == 0 {
+                            // Phantom update (concurrent delete): release the
+                            // reservations, no config-change record (DB-M4).
+                            self.release_consumer_identity_values_best_effort(
+                                &consumer.namespace,
+                                &consumer.id,
+                                &added,
+                            )
+                            .await;
+                            return Ok(false);
+                        }
+                        if let Err(err) = self
+                            .record_config_change(
+                                &consumer.namespace,
+                                "consumer",
+                                &consumer.id,
+                                "upsert",
+                            )
+                            .await
+                        {
+                            let rollback_confirmed = self
+                                .rollback_standalone_updated_document(
+                                    "consumers",
                                     "consumer",
-                                    id.as_str(),
-                                    "upsert",
+                                    &composite_id,
+                                    Some(previous_doc),
+                                    &err,
                                 )
-                                .await?;
-                                Ok(true)
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("update_consumer transaction failed")?;
-                if matched {
-                    self.compact_config_changes_best_effort(&consumer.namespace)
-                        .await;
-                }
-                matched
-            } else {
-                let previous_doc = self
-                    .consumers()
-                    .find_one(doc! { "_id": &composite_id })
-                    .await?;
-                let Some(previous_doc) = previous_doc else {
-                    return Ok(false);
-                };
-                let previous_consumer = doc_to_consumer(previous_doc.clone())?;
-                let old_values = consumer_identity_values(&previous_consumer);
-                let added: Vec<String> = new_identity_values
-                    .iter()
-                    .filter(|value| !old_values.contains(value))
-                    .cloned()
-                    .collect();
-                let removed: Vec<String> = old_values
-                    .iter()
-                    .filter(|value| !new_identity_values.contains(value))
-                    .cloned()
-                    .collect();
-                // Standalone: reserve the ADDED identity values first, then
-                // replace the consumer, then release the removed values. A
-                // duplicate key on the reservation (another consumer owns one
-                // of the values) bails before the consumer is touched.
-                self.reserve_consumer_identity_docs_standalone(
-                    &consumer.namespace,
-                    &consumer.id,
-                    &added,
-                )
-                .await?;
-                let replace_result = match self
-                    .consumers()
-                    .replace_one(doc! { "_id": &composite_id }, doc)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(err) => {
+                                .await;
+                            if rollback_confirmed {
+                                self.release_consumer_identity_values_best_effort(
+                                    &consumer.namespace,
+                                    &consumer.id,
+                                    &added,
+                                )
+                                .await;
+                            }
+                            return Err(err);
+                        }
+                        // Removed values are released last so a change-record failure
+                        // (which restores the previous consumer) never leaves the
+                        // restored identities unreserved.
                         self.release_consumer_identity_values_best_effort(
                             &consumer.namespace,
                             &consumer.id,
-                            &added,
+                            &removed,
                         )
                         .await;
-                        return Err(err.into());
-                    }
-                };
-                if replace_result.matched_count == 0 {
-                    // Phantom update (concurrent delete): release the
-                    // reservations, no config-change record (DB-M4).
-                    self.release_consumer_identity_values_best_effort(
-                        &consumer.namespace,
-                        &consumer.id,
-                        &added,
-                    )
-                    .await;
-                    return Ok(false);
-                }
-                if let Err(err) = self
-                    .record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
-                    .await
-                {
-                    let rollback_confirmed = self
-                        .rollback_standalone_updated_document(
-                            "consumers",
-                            "consumer",
-                            &composite_id,
-                            Some(previous_doc),
-                            &err,
-                        )
-                        .await;
-                    if rollback_confirmed {
-                        self.release_consumer_identity_values_best_effort(
-                            &consumer.namespace,
-                            &consumer.id,
-                            &added,
-                        )
-                        .await;
-                    }
-                    return Err(err);
-                }
-                // Removed values are released last so a change-record failure
-                // (which restores the previous consumer) never leaves the
-                // restored identities unreserved.
-                self.release_consumer_identity_values_best_effort(
-                    &consumer.namespace,
-                    &consumer.id,
-                    &removed,
-                )
-                .await;
-                true
-            };
-            Ok(matched)
+                        true
+                    };
+                    Ok(matched)
                 })
                 .await?;
             mtls_lease.release().await?;
@@ -5674,78 +5692,78 @@ mod inner {
             let composite_id = consumer_doc_id(namespace, id);
             let deleted = mtls_lease
                 .run_mutation(async {
-            let deleted = if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                let deleted = session
-                    .start_transaction()
-                    .and_run(
-                        (self, id.to_string(), namespace.to_string(), composite_id),
-                        |s, (this, id, namespace, composite_id)| {
-                            Box::pin(async move {
-                                let result = this
-                                    .consumers()
-                                    .delete_one(doc! { "_id": composite_id.as_str() })
-                                    .session(&mut *s)
-                                    .await?;
-                                if result.deleted_count > 0 {
-                                    // Release the consumer's identity
-                                    // reservations in the same transaction.
-                                    this.consumer_identity_index()
-                                        .delete_many(doc! {
-                                            "namespace": namespace.as_str(),
-                                            "consumer_id": id.as_str(),
-                                        })
-                                        .session(&mut *s)
-                                        .await?;
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        "consumer",
-                                        id.as_str(),
-                                        "delete",
-                                    )
-                                    .await?;
-                                }
-                                Ok(result.deleted_count > 0)
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("delete_consumer transaction failed")?;
-                if deleted {
-                    self.compact_config_changes_best_effort(namespace).await;
-                }
-                deleted
-            } else {
-                let result = self
-                    .consumers()
-                    .delete_one(doc! { "_id": &composite_id })
-                    .await?;
-                if result.deleted_count > 0 {
-                    // Delete the consumer first, then its identity
-                    // reservations. Best-effort: a failure here leaves
-                    // orphaned reservations that 409 future claims of the
-                    // same values until repaired, but the consumer delete
-                    // itself already succeeded.
-                    if let Err(err) = self
-                        .consumer_identity_index()
-                        .delete_many(doc! { "namespace": namespace, "consumer_id": id })
-                        .await
-                    {
-                        warn!(
-                            "MongoDB standalone consumer identity index cleanup failed for \
+                    let deleted = if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        let deleted = session
+                            .start_transaction()
+                            .and_run(
+                                (self, id.to_string(), namespace.to_string(), composite_id),
+                                |s, (this, id, namespace, composite_id)| {
+                                    Box::pin(async move {
+                                        let result = this
+                                            .consumers()
+                                            .delete_one(doc! { "_id": composite_id.as_str() })
+                                            .session(&mut *s)
+                                            .await?;
+                                        if result.deleted_count > 0 {
+                                            // Release the consumer's identity
+                                            // reservations in the same transaction.
+                                            this.consumer_identity_index()
+                                                .delete_many(doc! {
+                                                    "namespace": namespace.as_str(),
+                                                    "consumer_id": id.as_str(),
+                                                })
+                                                .session(&mut *s)
+                                                .await?;
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "consumer",
+                                                id.as_str(),
+                                                "delete",
+                                            )
+                                            .await?;
+                                        }
+                                        Ok(result.deleted_count > 0)
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(anyhow::Error::new)
+                            .context("delete_consumer transaction failed")?;
+                        if deleted {
+                            self.compact_config_changes_best_effort(namespace).await;
+                        }
+                        deleted
+                    } else {
+                        let result = self
+                            .consumers()
+                            .delete_one(doc! { "_id": &composite_id })
+                            .await?;
+                        if result.deleted_count > 0 {
+                            // Delete the consumer first, then its identity
+                            // reservations. Best-effort: a failure here leaves
+                            // orphaned reservations that 409 future claims of the
+                            // same values until repaired, but the consumer delete
+                            // itself already succeeded.
+                            if let Err(err) = self
+                                .consumer_identity_index()
+                                .delete_many(doc! { "namespace": namespace, "consumer_id": id })
+                                .await
+                            {
+                                warn!(
+                                    "MongoDB standalone consumer identity index cleanup failed for \
                              consumer '{}' in namespace '{}': {}",
-                            id, namespace, err
-                        );
-                    }
-                    self.record_config_change(namespace, "consumer", id, "delete")
-                        .await?;
-                }
-                result.deleted_count > 0
-            };
-            Ok(deleted)
+                                    id, namespace, err
+                                );
+                            }
+                            self.record_config_change(namespace, "consumer", id, "delete")
+                                .await?;
+                        }
+                        result.deleted_count > 0
+                    };
+                    Ok(deleted)
                 })
                 .await?;
             mtls_lease.release().await?;
@@ -5817,84 +5835,84 @@ mod inner {
             let doc = plugin_config_to_doc(pc)?;
             mtls_lease
                 .run_mutation(async {
-            if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                let proxy_id = if pc.scope == PluginScope::Proxy {
-                    pc.proxy_id.clone()
-                } else {
-                    None
-                };
-                session
-                    .start_transaction()
-                    .and_run(
-                        (self, doc, pc.namespace.clone(), pc.id.clone(), proxy_id),
-                        |s, (this, doc, namespace, id, proxy_id)| {
-                            Box::pin(async move {
-                                this.plugin_configs()
-                                    .insert_one(doc.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "plugin_config",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
-                                if let Some(proxy_id) = proxy_id.as_deref() {
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        "proxy",
-                                        proxy_id,
-                                        "upsert",
-                                    )
-                                    .await?;
-                                }
-                                Ok(())
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("create_plugin_config transaction failed")?;
-                self.compact_config_changes_best_effort(&pc.namespace).await;
-            } else {
-                self.plugin_configs().insert_one(doc).await?;
-                if let Err(err) = self
-                    .record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
-                    .await
-                {
-                    self.rollback_standalone_created_document(
-                        "plugin_configs",
-                        &pc.namespace,
-                        "plugin_config",
-                        &pc.id,
-                        &err,
-                    )
-                    .await;
-                    return Err(err);
-                }
-                if pc.scope == PluginScope::Proxy
-                    && let Some(proxy_id) = pc.proxy_id.as_deref()
-                    && let Err(err) = self
-                        .record_config_change(&pc.namespace, "proxy", proxy_id, "upsert")
-                        .await
-                {
-                    self.rollback_standalone_created_document(
-                        "plugin_configs",
-                        &pc.namespace,
-                        "plugin_config",
-                        &pc.id,
-                        &err,
-                    )
-                    .await;
-                    return Err(err);
-                }
-            }
-            Ok(())
+                    if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        let proxy_id = if pc.scope == PluginScope::Proxy {
+                            pc.proxy_id.clone()
+                        } else {
+                            None
+                        };
+                        session
+                            .start_transaction()
+                            .and_run(
+                                (self, doc, pc.namespace.clone(), pc.id.clone(), proxy_id),
+                                |s, (this, doc, namespace, id, proxy_id)| {
+                                    Box::pin(async move {
+                                        this.plugin_configs()
+                                            .insert_one(doc.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            "plugin_config",
+                                            id.as_str(),
+                                            "upsert",
+                                        )
+                                        .await?;
+                                        if let Some(proxy_id) = proxy_id.as_deref() {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "proxy",
+                                                proxy_id,
+                                                "upsert",
+                                            )
+                                            .await?;
+                                        }
+                                        Ok(())
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(anyhow::Error::new)
+                            .context("create_plugin_config transaction failed")?;
+                        self.compact_config_changes_best_effort(&pc.namespace).await;
+                    } else {
+                        self.plugin_configs().insert_one(doc).await?;
+                        if let Err(err) = self
+                            .record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
+                            .await
+                        {
+                            self.rollback_standalone_created_document(
+                                "plugin_configs",
+                                &pc.namespace,
+                                "plugin_config",
+                                &pc.id,
+                                &err,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                        if pc.scope == PluginScope::Proxy
+                            && let Some(proxy_id) = pc.proxy_id.as_deref()
+                            && let Err(err) = self
+                                .record_config_change(&pc.namespace, "proxy", proxy_id, "upsert")
+                                .await
+                        {
+                            self.rollback_standalone_created_document(
+                                "plugin_configs",
+                                &pc.namespace,
+                                "plugin_config",
+                                &pc.id,
+                                &err,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    }
+                    Ok(())
                 })
                 .await?;
             mtls_lease.release().await?;
@@ -5945,100 +5963,110 @@ mod inner {
             }
             let matched = mtls_lease
                 .run_mutation(async {
-            if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                let proxy_id = if pc.scope == PluginScope::Proxy {
-                    pc.proxy_id.clone()
-                } else {
-                    None
-                };
-                let matched = session
-                    .start_transaction()
-                    .and_run(
-                        (self, doc, pc.namespace.clone(), pc.id.clone(), proxy_id),
-                        |s, (this, doc, namespace, id, proxy_id)| {
-                            Box::pin(async move {
-                                let replace_result = this
-                                    .plugin_configs()
-                                    .replace_one(
-                                        doc! {
-                                            "_id": id.as_str(),
-                                            "namespace": namespace.as_str(),
-                                        },
-                                        doc.clone(),
-                                    )
-                                    .session(&mut *s)
-                                    .await?;
-                                if replace_result.matched_count == 0 {
-                                    // Phantom update: no config-change record
-                                    // (DB-M4).
-                                    return Ok(false);
-                                }
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "plugin_config",
-                                    id.as_str(),
+                    if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        let proxy_id = if pc.scope == PluginScope::Proxy {
+                            pc.proxy_id.clone()
+                        } else {
+                            None
+                        };
+                        let matched = session
+                            .start_transaction()
+                            .and_run(
+                                (self, doc, pc.namespace.clone(), pc.id.clone(), proxy_id),
+                                |s, (this, doc, namespace, id, proxy_id)| {
+                                    Box::pin(async move {
+                                        let replace_result = this
+                                            .plugin_configs()
+                                            .replace_one(
+                                                doc! {
+                                                    "_id": id.as_str(),
+                                                    "namespace": namespace.as_str(),
+                                                },
+                                                doc.clone(),
+                                            )
+                                            .session(&mut *s)
+                                            .await?;
+                                        if replace_result.matched_count == 0 {
+                                            // Phantom update: no config-change record
+                                            // (DB-M4).
+                                            return Ok(false);
+                                        }
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            "plugin_config",
+                                            id.as_str(),
+                                            "upsert",
+                                        )
+                                        .await?;
+                                        if let Some(proxy_id) = proxy_id.as_deref() {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "proxy",
+                                                proxy_id,
+                                                "upsert",
+                                            )
+                                            .await?;
+                                        }
+                                        Ok(true)
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(anyhow::Error::new)
+                            .context("update_plugin_config transaction failed")?;
+                        if matched {
+                            self.compact_config_changes_best_effort(&pc.namespace).await;
+                        }
+                        return Ok(matched);
+                    } else {
+                        let replace_result = self
+                            .plugin_configs()
+                            .replace_one(doc! { "_id": &pc.id, "namespace": &pc.namespace }, doc)
+                            .await?;
+                        if replace_result.matched_count == 0 {
+                            // Phantom update (concurrent delete): no config-change
+                            // record (DB-M4).
+                            return Ok(false);
+                        }
+                        let change_result: Result<(), anyhow::Error> = async {
+                            self.record_config_change(
+                                &pc.namespace,
+                                "plugin_config",
+                                &pc.id,
+                                "upsert",
+                            )
+                            .await?;
+                            if pc.scope == PluginScope::Proxy
+                                && let Some(proxy_id) = pc.proxy_id.as_deref()
+                            {
+                                self.record_config_change(
+                                    &pc.namespace,
+                                    "proxy",
+                                    proxy_id,
                                     "upsert",
                                 )
                                 .await?;
-                                if let Some(proxy_id) = proxy_id.as_deref() {
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        "proxy",
-                                        proxy_id,
-                                        "upsert",
-                                    )
-                                    .await?;
-                                }
-                                Ok(true)
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("update_plugin_config transaction failed")?;
-                if matched {
-                    self.compact_config_changes_best_effort(&pc.namespace).await;
-                }
-                return Ok(matched);
-            } else {
-                let replace_result = self
-                    .plugin_configs()
-                    .replace_one(doc! { "_id": &pc.id, "namespace": &pc.namespace }, doc)
-                    .await?;
-                if replace_result.matched_count == 0 {
-                    // Phantom update (concurrent delete): no config-change
-                    // record (DB-M4).
-                    return Ok(false);
-                }
-                let change_result: Result<(), anyhow::Error> = async {
-                    self.record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
-                        .await?;
-                    if pc.scope == PluginScope::Proxy
-                        && let Some(proxy_id) = pc.proxy_id.as_deref()
-                    {
-                        self.record_config_change(&pc.namespace, "proxy", proxy_id, "upsert")
-                            .await?;
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(err) = change_result {
+                            self.rollback_standalone_updated_document(
+                                "plugin_configs",
+                                "plugin_config",
+                                &pc.id,
+                                existing_doc,
+                                &err,
+                            )
+                            .await;
+                            return Err(err);
+                        }
                     }
-                    Ok(())
-                }
-                .await;
-                if let Err(err) = change_result {
-                    self.rollback_standalone_updated_document(
-                        "plugin_configs",
-                        "plugin_config",
-                        &pc.id,
-                        existing_doc,
-                        &err,
-                    )
-                    .await;
-                    return Err(err);
-                }
-            }
-            Ok(true)
+                    Ok(true)
                 })
                 .await?;
             mtls_lease.release().await?;
@@ -6088,21 +6116,21 @@ mod inner {
             }
             let deleted = mtls_lease
                 .run_mutation(async {
-            let deleted = if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                let deleted = session
-                    .start_transaction()
-                    .and_run(
-                        (
-                            self,
-                            id.to_string(),
-                            namespace.clone(),
-                            affected_proxy_ids.clone(),
-                        ),
-                        |s, (this, id, namespace, affected_proxy_ids)| {
-                            Box::pin(async move {
-                                this.proxies()
+                    let deleted = if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        let deleted = session
+                            .start_transaction()
+                            .and_run(
+                                (
+                                    self,
+                                    id.to_string(),
+                                    namespace.clone(),
+                                    affected_proxy_ids.clone(),
+                                ),
+                                |s, (this, id, namespace, affected_proxy_ids)| {
+                                    Box::pin(async move {
+                                        this.proxies()
                                     .update_many(
                                         doc! { "plugins.plugin_config_id": id.as_str() },
                                         doc! {
@@ -6114,70 +6142,70 @@ mod inner {
                                     )
                                     .session(&mut *s)
                                     .await?;
-                                let result = this
-                                    .plugin_configs()
-                                    .delete_one(doc! {
-                                        "_id": id.as_str(),
-                                        "namespace": namespace.as_str(),
+                                        let result = this
+                                            .plugin_configs()
+                                            .delete_one(doc! {
+                                                "_id": id.as_str(),
+                                                "namespace": namespace.as_str(),
+                                            })
+                                            .session(&mut *s)
+                                            .await?;
+                                        if result.deleted_count > 0 {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "plugin_config",
+                                                id.as_str(),
+                                                "delete",
+                                            )
+                                            .await?;
+                                            for proxy_id in affected_proxy_ids.iter() {
+                                                this.record_config_change_in_session(
+                                                    &mut *s,
+                                                    namespace.as_str(),
+                                                    "proxy",
+                                                    proxy_id.as_str(),
+                                                    "upsert",
+                                                )
+                                                .await?;
+                                            }
+                                        }
+                                        Ok(result.deleted_count > 0)
                                     })
-                                    .session(&mut *s)
-                                    .await?;
-                                if result.deleted_count > 0 {
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        "plugin_config",
-                                        id.as_str(),
-                                        "delete",
-                                    )
-                                    .await?;
-                                    for proxy_id in affected_proxy_ids.iter() {
-                                        this.record_config_change_in_session(
-                                            &mut *s,
-                                            namespace.as_str(),
-                                            "proxy",
-                                            proxy_id.as_str(),
-                                            "upsert",
-                                        )
-                                        .await?;
-                                    }
-                                }
-                                Ok(result.deleted_count > 0)
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("delete_plugin_config transaction failed")?;
-                if deleted {
-                    self.compact_config_changes_best_effort(&namespace).await;
-                }
-                deleted
-            } else {
-                self.proxies()
-                    .update_many(
-                        doc! { "plugins.plugin_config_id": id },
-                        doc! {
-                            "$pull": { "plugins": { "plugin_config_id": id } },
-                            "$set": { "updated_at": Utc::now().to_rfc3339() },
-                        },
-                    )
-                    .await?;
-                let result = self
-                    .plugin_configs()
-                    .delete_one(doc! { "_id": id, "namespace": &namespace })
-                    .await?;
-                if result.deleted_count > 0 {
-                    self.record_config_change(&namespace, "plugin_config", id, "delete")
-                        .await?;
-                    for proxy_id in affected_proxy_ids {
-                        self.record_config_change(&namespace, "proxy", &proxy_id, "upsert")
+                                },
+                            )
+                            .await
+                            .map_err(anyhow::Error::new)
+                            .context("delete_plugin_config transaction failed")?;
+                        if deleted {
+                            self.compact_config_changes_best_effort(&namespace).await;
+                        }
+                        deleted
+                    } else {
+                        self.proxies()
+                            .update_many(
+                                doc! { "plugins.plugin_config_id": id },
+                                doc! {
+                                    "$pull": { "plugins": { "plugin_config_id": id } },
+                                    "$set": { "updated_at": Utc::now().to_rfc3339() },
+                                },
+                            )
                             .await?;
-                    }
-                }
-                result.deleted_count > 0
-            };
-            Ok(deleted)
+                        let result = self
+                            .plugin_configs()
+                            .delete_one(doc! { "_id": id, "namespace": &namespace })
+                            .await?;
+                        if result.deleted_count > 0 {
+                            self.record_config_change(&namespace, "plugin_config", id, "delete")
+                                .await?;
+                            for proxy_id in affected_proxy_ids {
+                                self.record_config_change(&namespace, "proxy", &proxy_id, "upsert")
+                                    .await?;
+                            }
+                        }
+                        result.deleted_count > 0
+                    };
+                    Ok(deleted)
                 })
                 .await?;
             mtls_lease.release().await?;
@@ -6647,88 +6675,98 @@ mod inner {
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
             let deleted_namespace = mtls_lease
                 .run_mutation(async {
-            let deleted_namespace = if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                session
-                    .start_transaction()
-                    .and_run(
-                        (self, namespace.to_string(), upstream_id.to_string()),
-                        |s, (this, namespace, upstream_id)| {
-                            Box::pin(async move {
-                                let count = this
-                                    .proxies()
-                                    .count_documents(doc! { "upstream_id": upstream_id.as_str() })
-                                    .session(&mut *s)
-                                    .await?;
-                                let mut deleted_namespace = None;
-                                if count == 0 {
-                                    let dispatch_ref = this
-                                        .find_mesh_route_dispatch_upstream_ref_opt_session(
-                                            Some(&mut *s),
-                                            upstream_id,
-                                        )
-                                        .await
-                                        .map_err(|e| {
-                                            mongodb::error::Error::custom(e.to_string())
-                                        })?;
-                                    if dispatch_ref.is_none() {
-                                        let result = this
-                                            .upstreams()
-                                            .delete_one(doc! {
-                                                "_id": upstream_id.as_str(),
-                                                "namespace": namespace.as_str(),
-                                            })
+                    let deleted_namespace = if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        session
+                            .start_transaction()
+                            .and_run(
+                                (self, namespace.to_string(), upstream_id.to_string()),
+                                |s, (this, namespace, upstream_id)| {
+                                    Box::pin(async move {
+                                        let count = this
+                                            .proxies()
+                                            .count_documents(
+                                                doc! { "upstream_id": upstream_id.as_str() },
+                                            )
                                             .session(&mut *s)
                                             .await?;
-                                        if result.deleted_count > 0 {
-                                            this.record_config_change_in_session(
-                                                &mut *s,
-                                                namespace.as_str(),
-                                                "upstream",
-                                                upstream_id.as_str(),
-                                                "delete",
-                                            )
-                                            .await?;
-                                            deleted_namespace = Some(namespace.clone());
+                                        let mut deleted_namespace = None;
+                                        if count == 0 {
+                                            let dispatch_ref = this
+                                                .find_mesh_route_dispatch_upstream_ref_opt_session(
+                                                    Some(&mut *s),
+                                                    upstream_id,
+                                                )
+                                                .await
+                                                .map_err(|e| {
+                                                    mongodb::error::Error::custom(e.to_string())
+                                                })?;
+                                            if dispatch_ref.is_none() {
+                                                let result = this
+                                                    .upstreams()
+                                                    .delete_one(doc! {
+                                                        "_id": upstream_id.as_str(),
+                                                        "namespace": namespace.as_str(),
+                                                    })
+                                                    .session(&mut *s)
+                                                    .await?;
+                                                if result.deleted_count > 0 {
+                                                    this.record_config_change_in_session(
+                                                        &mut *s,
+                                                        namespace.as_str(),
+                                                        "upstream",
+                                                        upstream_id.as_str(),
+                                                        "delete",
+                                                    )
+                                                    .await?;
+                                                    deleted_namespace = Some(namespace.clone());
+                                                }
+                                            }
                                         }
-                                    }
-                                }
-                                Ok(deleted_namespace)
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("cleanup_orphaned_upstream transaction failed")?
-            } else {
-                let count = self
-                    .proxies()
-                    .count_documents(doc! { "upstream_id": upstream_id })
-                    .await?;
-                let dispatch_ref = if count == 0 {
-                    self.find_mesh_route_dispatch_upstream_ref_opt_session(None, upstream_id)
-                        .await?
-                } else {
-                    None
-                };
-                if count == 0 && dispatch_ref.is_none() {
-                    let result = self
-                        .upstreams()
-                        .delete_one(doc! { "_id": upstream_id, "namespace": namespace })
-                        .await?;
-                    if result.deleted_count > 0 {
-                        self.record_config_change(namespace, "upstream", upstream_id, "delete")
-                            .await?;
-                        Some(namespace.to_string())
+                                        Ok(deleted_namespace)
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(anyhow::Error::new)
+                            .context("cleanup_orphaned_upstream transaction failed")?
                     } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
-            Ok(deleted_namespace)
+                        let count = self
+                            .proxies()
+                            .count_documents(doc! { "upstream_id": upstream_id })
+                            .await?;
+                        let dispatch_ref = if count == 0 {
+                            self.find_mesh_route_dispatch_upstream_ref_opt_session(
+                                None,
+                                upstream_id,
+                            )
+                            .await?
+                        } else {
+                            None
+                        };
+                        if count == 0 && dispatch_ref.is_none() {
+                            let result = self
+                                .upstreams()
+                                .delete_one(doc! { "_id": upstream_id, "namespace": namespace })
+                                .await?;
+                            if result.deleted_count > 0 {
+                                self.record_config_change(
+                                    namespace,
+                                    "upstream",
+                                    upstream_id,
+                                    "delete",
+                                )
+                                .await?;
+                                Some(namespace.to_string())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    Ok(deleted_namespace)
                 })
                 .await?;
             mtls_lease.release().await?;
@@ -7040,84 +7078,84 @@ mod inner {
             }
             let docs: Vec<Document> = proxies.iter().map(proxy_to_doc).collect::<Result<_, _>>()?;
             let count = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
-            let count = if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                let changes: Vec<(String, String)> = proxies
-                    .iter()
-                    .map(|proxy| (proxy.namespace.clone(), proxy.id.clone()))
-                    .collect();
-                let count = session
-                    .start_transaction()
-                    .and_run((self, docs, changes), |s, (this, docs, changes)| {
-                        Box::pin(async move {
-                            let result = this
-                                .proxies()
-                                .insert_many(docs.clone())
-                                .ordered(false)
-                                .session(&mut *s)
-                                .await?;
-                            for (namespace, id) in changes.iter() {
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "proxy",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
-                            }
-                            Ok(result.inserted_ids.len())
+                let count = if self.replica_set_configured() {
+                    let connection = self.connection();
+                    let mut session = connection.client.start_session().await?;
+                    let changes: Vec<(String, String)> = proxies
+                        .iter()
+                        .map(|proxy| (proxy.namespace.clone(), proxy.id.clone()))
+                        .collect();
+                    let count = session
+                        .start_transaction()
+                        .and_run((self, docs, changes), |s, (this, docs, changes)| {
+                            Box::pin(async move {
+                                let result = this
+                                    .proxies()
+                                    .insert_many(docs.clone())
+                                    .ordered(false)
+                                    .session(&mut *s)
+                                    .await?;
+                                for (namespace, id) in changes.iter() {
+                                    this.record_config_change_in_session(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                        "proxy",
+                                        id.as_str(),
+                                        "upsert",
+                                    )
+                                    .await?;
+                                }
+                                Ok(result.inserted_ids.len())
+                            })
                         })
-                    })
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("batch_create_proxies transaction failed")?;
-                let namespaces: HashSet<String> = proxies
-                    .iter()
-                    .map(|proxy| proxy.namespace.clone())
-                    .collect();
-                for namespace in namespaces {
-                    self.compact_config_changes_best_effort(&namespace).await;
-                }
-                count
-            } else {
-                let ids: Vec<&str> = proxies.iter().map(|proxy| proxy.id.as_str()).collect();
-                let result = match self.proxies().insert_many(docs).ordered(false).await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        let rollback_ids =
-                            Self::rollback_ids_for_unordered_insert_error(&ids, &err);
-                        let err = anyhow::Error::new(err);
-                        self.rollback_standalone_created_documents(
-                            "proxies",
-                            "proxy",
-                            &rollback_ids,
-                            &err,
-                        )
-                        .await;
+                        .await
+                        .map_err(anyhow::Error::new)
+                        .context("batch_create_proxies transaction failed")?;
+                    let namespaces: HashSet<String> = proxies
+                        .iter()
+                        .map(|proxy| proxy.namespace.clone())
+                        .collect();
+                    for namespace in namespaces {
+                        self.compact_config_changes_best_effort(&namespace).await;
+                    }
+                    count
+                } else {
+                    let ids: Vec<&str> = proxies.iter().map(|proxy| proxy.id.as_str()).collect();
+                    let result = match self.proxies().insert_many(docs).ordered(false).await {
+                        Ok(result) => result,
+                        Err(err) => {
+                            let rollback_ids =
+                                Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                            let err = anyhow::Error::new(err);
+                            self.rollback_standalone_created_documents(
+                                "proxies",
+                                "proxy",
+                                &rollback_ids,
+                                &err,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    };
+                    let changes: Vec<ConfigChangeWrite<'_>> = proxies
+                        .iter()
+                        .map(|proxy| ConfigChangeWrite {
+                            namespace: &proxy.namespace,
+                            resource_type: "proxy",
+                            resource_id: &proxy.id,
+                            operation: "upsert",
+                        })
+                        .collect();
+                    if let Err(err) = self.record_config_changes_batch(&changes).await {
+                        self.rollback_standalone_created_documents("proxies", "proxy", &ids, &err)
+                            .await;
                         return Err(err);
                     }
+                    result.inserted_ids.len()
                 };
-                let changes: Vec<ConfigChangeWrite<'_>> = proxies
-                    .iter()
-                    .map(|proxy| ConfigChangeWrite {
-                        namespace: &proxy.namespace,
-                        resource_type: "proxy",
-                        resource_id: &proxy.id,
-                        operation: "upsert",
-                    })
-                    .collect();
-                if let Err(err) = self.record_config_changes_batch(&changes).await {
-                    self.rollback_standalone_created_documents("proxies", "proxy", &ids, &err)
-                        .await;
-                    return Err(err);
-                }
-                result.inserted_ids.len()
-            };
-            Ok(count)
-                })
-                .await?;
+                Ok(count)
+            })
+            .await?;
             Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
             Ok(count)
         }
@@ -7361,89 +7399,90 @@ mod inner {
                 .map(plugin_config_to_doc)
                 .collect::<Result<_, _>>()?;
             let count = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
-            let count = if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                let changes: Vec<(String, String)> = configs
-                    .iter()
-                    .map(|config| (config.namespace.clone(), config.id.clone()))
-                    .collect();
-                let count = session
-                    .start_transaction()
-                    .and_run((self, docs, changes), |s, (this, docs, changes)| {
-                        Box::pin(async move {
-                            let result = this
-                                .plugin_configs()
-                                .insert_many(docs.clone())
-                                .ordered(false)
-                                .session(&mut *s)
-                                .await?;
-                            for (namespace, id) in changes.iter() {
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "plugin_config",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
-                            }
-                            Ok(result.inserted_ids.len())
+                let count = if self.replica_set_configured() {
+                    let connection = self.connection();
+                    let mut session = connection.client.start_session().await?;
+                    let changes: Vec<(String, String)> = configs
+                        .iter()
+                        .map(|config| (config.namespace.clone(), config.id.clone()))
+                        .collect();
+                    let count = session
+                        .start_transaction()
+                        .and_run((self, docs, changes), |s, (this, docs, changes)| {
+                            Box::pin(async move {
+                                let result = this
+                                    .plugin_configs()
+                                    .insert_many(docs.clone())
+                                    .ordered(false)
+                                    .session(&mut *s)
+                                    .await?;
+                                for (namespace, id) in changes.iter() {
+                                    this.record_config_change_in_session(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                        "plugin_config",
+                                        id.as_str(),
+                                        "upsert",
+                                    )
+                                    .await?;
+                                }
+                                Ok(result.inserted_ids.len())
+                            })
                         })
-                    })
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("batch_create_plugin_configs transaction failed")?;
-                let namespaces: HashSet<String> = configs
-                    .iter()
-                    .map(|config| config.namespace.clone())
-                    .collect();
-                for namespace in namespaces {
-                    self.compact_config_changes_best_effort(&namespace).await;
-                }
-                count
-            } else {
-                let ids: Vec<&str> = configs.iter().map(|config| config.id.as_str()).collect();
-                let result = match self.plugin_configs().insert_many(docs).ordered(false).await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        let rollback_ids =
-                            Self::rollback_ids_for_unordered_insert_error(&ids, &err);
-                        let err = anyhow::Error::new(err);
+                        .await
+                        .map_err(anyhow::Error::new)
+                        .context("batch_create_plugin_configs transaction failed")?;
+                    let namespaces: HashSet<String> = configs
+                        .iter()
+                        .map(|config| config.namespace.clone())
+                        .collect();
+                    for namespace in namespaces {
+                        self.compact_config_changes_best_effort(&namespace).await;
+                    }
+                    count
+                } else {
+                    let ids: Vec<&str> = configs.iter().map(|config| config.id.as_str()).collect();
+                    let result = match self.plugin_configs().insert_many(docs).ordered(false).await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            let rollback_ids =
+                                Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                            let err = anyhow::Error::new(err);
+                            self.rollback_standalone_created_documents(
+                                "plugin_configs",
+                                "plugin_config",
+                                &rollback_ids,
+                                &err,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    };
+                    let changes: Vec<ConfigChangeWrite<'_>> = configs
+                        .iter()
+                        .map(|config| ConfigChangeWrite {
+                            namespace: &config.namespace,
+                            resource_type: "plugin_config",
+                            resource_id: &config.id,
+                            operation: "upsert",
+                        })
+                        .collect();
+                    if let Err(err) = self.record_config_changes_batch(&changes).await {
                         self.rollback_standalone_created_documents(
                             "plugin_configs",
                             "plugin_config",
-                            &rollback_ids,
+                            &ids,
                             &err,
                         )
                         .await;
                         return Err(err);
                     }
+                    result.inserted_ids.len()
                 };
-                let changes: Vec<ConfigChangeWrite<'_>> = configs
-                    .iter()
-                    .map(|config| ConfigChangeWrite {
-                        namespace: &config.namespace,
-                        resource_type: "plugin_config",
-                        resource_id: &config.id,
-                        operation: "upsert",
-                    })
-                    .collect();
-                if let Err(err) = self.record_config_changes_batch(&changes).await {
-                    self.rollback_standalone_created_documents(
-                        "plugin_configs",
-                        "plugin_config",
-                        &ids,
-                        &err,
-                    )
-                    .await;
-                    return Err(err);
-                }
-                result.inserted_ids.len()
-            };
-            Ok(count)
-                })
-                .await?;
+                Ok(count)
+            })
+            .await?;
             Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
             Ok(count)
         }
@@ -7462,94 +7501,97 @@ mod inner {
                 .collect::<Result<_, _>>()?;
             let mut mtls_leases = self
                 .acquire_mtls_dns_admission_leases_for_mode(
-                    upstreams
-                        .iter()
-                        .map(|upstream| upstream.namespace.as_str()),
+                    upstreams.iter().map(|upstream| upstream.namespace.as_str()),
                     mode,
                 )
                 .await?;
             let count = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
-            let count = if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                let changes: Vec<(String, String)> = upstreams
-                    .iter()
-                    .map(|upstream| (upstream.namespace.clone(), upstream.id.clone()))
-                    .collect();
-                let count = session
-                    .start_transaction()
-                    .and_run((self, docs, changes), |s, (this, docs, changes)| {
-                        Box::pin(async move {
-                            let result = this
-                                .upstreams()
-                                .insert_many(docs.clone())
-                                .ordered(false)
-                                .session(&mut *s)
-                                .await?;
-                            for (namespace, id) in changes.iter() {
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "upstream",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
-                            }
-                            Ok(result.inserted_ids.len())
+                let count = if self.replica_set_configured() {
+                    let connection = self.connection();
+                    let mut session = connection.client.start_session().await?;
+                    let changes: Vec<(String, String)> = upstreams
+                        .iter()
+                        .map(|upstream| (upstream.namespace.clone(), upstream.id.clone()))
+                        .collect();
+                    let count = session
+                        .start_transaction()
+                        .and_run((self, docs, changes), |s, (this, docs, changes)| {
+                            Box::pin(async move {
+                                let result = this
+                                    .upstreams()
+                                    .insert_many(docs.clone())
+                                    .ordered(false)
+                                    .session(&mut *s)
+                                    .await?;
+                                for (namespace, id) in changes.iter() {
+                                    this.record_config_change_in_session(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                        "upstream",
+                                        id.as_str(),
+                                        "upsert",
+                                    )
+                                    .await?;
+                                }
+                                Ok(result.inserted_ids.len())
+                            })
                         })
-                    })
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("batch_create_upstreams transaction failed")?;
-                let namespaces: HashSet<String> = upstreams
-                    .iter()
-                    .map(|upstream| upstream.namespace.clone())
-                    .collect();
-                for namespace in namespaces {
-                    self.compact_config_changes_best_effort(&namespace).await;
-                }
-                count
-            } else {
-                let ids: Vec<&str> = upstreams
-                    .iter()
-                    .map(|upstream| upstream.id.as_str())
-                    .collect();
-                let result = match self.upstreams().insert_many(docs).ordered(false).await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        let rollback_ids =
-                            Self::rollback_ids_for_unordered_insert_error(&ids, &err);
-                        let err = anyhow::Error::new(err);
+                        .await
+                        .map_err(anyhow::Error::new)
+                        .context("batch_create_upstreams transaction failed")?;
+                    let namespaces: HashSet<String> = upstreams
+                        .iter()
+                        .map(|upstream| upstream.namespace.clone())
+                        .collect();
+                    for namespace in namespaces {
+                        self.compact_config_changes_best_effort(&namespace).await;
+                    }
+                    count
+                } else {
+                    let ids: Vec<&str> = upstreams
+                        .iter()
+                        .map(|upstream| upstream.id.as_str())
+                        .collect();
+                    let result = match self.upstreams().insert_many(docs).ordered(false).await {
+                        Ok(result) => result,
+                        Err(err) => {
+                            let rollback_ids =
+                                Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                            let err = anyhow::Error::new(err);
+                            self.rollback_standalone_created_documents(
+                                "upstreams",
+                                "upstream",
+                                &rollback_ids,
+                                &err,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    };
+                    let changes: Vec<ConfigChangeWrite<'_>> = upstreams
+                        .iter()
+                        .map(|upstream| ConfigChangeWrite {
+                            namespace: &upstream.namespace,
+                            resource_type: "upstream",
+                            resource_id: &upstream.id,
+                            operation: "upsert",
+                        })
+                        .collect();
+                    if let Err(err) = self.record_config_changes_batch(&changes).await {
                         self.rollback_standalone_created_documents(
                             "upstreams",
                             "upstream",
-                            &rollback_ids,
+                            &ids,
                             &err,
                         )
                         .await;
                         return Err(err);
                     }
+                    result.inserted_ids.len()
                 };
-                let changes: Vec<ConfigChangeWrite<'_>> = upstreams
-                    .iter()
-                    .map(|upstream| ConfigChangeWrite {
-                        namespace: &upstream.namespace,
-                        resource_type: "upstream",
-                        resource_id: &upstream.id,
-                        operation: "upsert",
-                    })
-                    .collect();
-                if let Err(err) = self.record_config_changes_batch(&changes).await {
-                    self.rollback_standalone_created_documents("upstreams", "upstream", &ids, &err)
-                        .await;
-                    return Err(err);
-                }
-                result.inserted_ids.len()
-            };
-            Ok(count)
-                })
-                .await?;
+                Ok(count)
+            })
+            .await?;
             Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
             Ok(count)
         }
@@ -7582,182 +7624,177 @@ mod inner {
             let ns_filter = doc! { "namespace": namespace };
             let mutation_result = mtls_lease
                 .run_mutation(async {
-            if mode.is_atomic() {
-                let connection = self.connection();
-                let mut session = connection
-                    .client
-                    .start_session()
-                    .await?;
-                session
-                    .start_transaction()
-                    .and_run(
-                        (self, namespace.to_string(), ns_filter.clone()),
-                        |s, (this, namespace, ns_filter)| {
-                            Box::pin(async move {
-                                let proxy_ids = this
-                                    .load_collection_ids_filtered_in_session(
-                                        &mut *s,
-                                        "proxies",
-                                        ns_filter.clone(),
-                                    )
-                                    .await
-                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
-                                // Consumers project the plain `id` field —
-                                // their `_id` is the composite
-                                // "{namespace}:{id}" and change-log records
-                                // carry plain resource ids.
-                                let consumer_ids = this
-                                    .load_consumer_plain_ids_filtered_in_session(
-                                        &mut *s,
-                                        ns_filter.clone(),
-                                    )
-                                    .await
-                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
-                                let plugin_config_ids = this
-                                    .load_collection_ids_filtered_in_session(
-                                        &mut *s,
-                                        "plugin_configs",
-                                        ns_filter.clone(),
-                                    )
-                                    .await
-                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
-                                let upstream_ids = this
-                                    .load_collection_ids_filtered_in_session(
-                                        &mut *s,
-                                        "upstreams",
-                                        ns_filter.clone(),
-                                    )
-                                    .await
-                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
-                                this.plugin_configs()
-                                    .delete_many(ns_filter.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                this.proxies()
-                                    .delete_many(ns_filter.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                this.consumers()
-                                    .delete_many(ns_filter.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                // Namespace wipe releases every consumer
-                                // identity reservation in the namespace.
-                                this.consumer_identity_index()
-                                    .delete_many(ns_filter.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                this.upstreams()
-                                    .delete_many(ns_filter.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                this.api_specs()
-                                    .delete_many(ns_filter.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                for id in &proxy_ids {
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        "proxy",
-                                        id.as_str(),
-                                        "delete",
-                                    )
-                                    .await?;
-                                }
-                                for id in &consumer_ids {
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        "consumer",
-                                        id.as_str(),
-                                        "delete",
-                                    )
-                                    .await?;
-                                }
-                                for id in &plugin_config_ids {
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        "plugin_config",
-                                        id.as_str(),
-                                        "delete",
-                                    )
-                                    .await?;
-                                }
-                                for id in &upstream_ids {
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        "upstream",
-                                        id.as_str(),
-                                        "delete",
-                                    )
-                                    .await?;
-                                }
-                                Ok(())
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("delete_all_resources transaction failed")?;
-                self.compact_config_changes_best_effort(namespace).await;
-            } else {
-                let proxy_ids = self
-                    .load_collection_ids_filtered("proxies", ns_filter.clone())
-                    .await?;
-                // Plain `id` field — consumer `_id` is the composite
-                // "{namespace}:{id}" and change-log records carry plain ids.
-                let consumer_ids = self
-                    .load_consumer_plain_ids_filtered(ns_filter.clone())
-                    .await?;
-                let plugin_config_ids = self
-                    .load_collection_ids_filtered("plugin_configs", ns_filter.clone())
-                    .await?;
-                let upstream_ids = self
-                    .load_collection_ids_filtered("upstreams", ns_filter.clone())
-                    .await?;
-                self.plugin_configs()
-                    .delete_many(ns_filter.clone())
-                    .await?;
-                self.proxies()
-                    .delete_many(ns_filter.clone())
-                    .await?;
-                self.consumers()
-                    .delete_many(ns_filter.clone())
-                    .await?;
-                // Namespace wipe releases every consumer identity reservation
-                // in the namespace.
-                self.consumer_identity_index()
-                    .delete_many(ns_filter.clone())
-                    .await?;
-                self.upstreams()
-                    .delete_many(ns_filter.clone())
-                    .await?;
-                // Clear api_specs so restore doesn't leave orphaned spec metadata
-                // pointing to proxies that no longer exist.
-                self.api_specs()
-                    .delete_many(ns_filter)
-                    .await?;
-                for id in proxy_ids {
-                    self.record_config_change(namespace, "proxy", &id, "delete")
-                        .await?;
-                }
-                for id in consumer_ids {
-                    self.record_config_change(namespace, "consumer", &id, "delete")
-                        .await?;
-                }
-                for id in plugin_config_ids {
-                    self.record_config_change(namespace, "plugin_config", &id, "delete")
-                        .await?;
-                }
-                for id in upstream_ids {
-                    self.record_config_change(namespace, "upstream", &id, "delete")
-                        .await?;
-                }
-            }
-            Ok(mode)
+                    if mode.is_atomic() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        session
+                            .start_transaction()
+                            .and_run(
+                                (self, namespace.to_string(), ns_filter.clone()),
+                                |s, (this, namespace, ns_filter)| {
+                                    Box::pin(async move {
+                                        let proxy_ids = this
+                                            .load_collection_ids_filtered_in_session(
+                                                &mut *s,
+                                                "proxies",
+                                                ns_filter.clone(),
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                mongodb::error::Error::custom(e.to_string())
+                                            })?;
+                                        // Consumers project the plain `id` field —
+                                        // their `_id` is the composite
+                                        // "{namespace}:{id}" and change-log records
+                                        // carry plain resource ids.
+                                        let consumer_ids = this
+                                            .load_consumer_plain_ids_filtered_in_session(
+                                                &mut *s,
+                                                ns_filter.clone(),
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                mongodb::error::Error::custom(e.to_string())
+                                            })?;
+                                        let plugin_config_ids = this
+                                            .load_collection_ids_filtered_in_session(
+                                                &mut *s,
+                                                "plugin_configs",
+                                                ns_filter.clone(),
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                mongodb::error::Error::custom(e.to_string())
+                                            })?;
+                                        let upstream_ids = this
+                                            .load_collection_ids_filtered_in_session(
+                                                &mut *s,
+                                                "upstreams",
+                                                ns_filter.clone(),
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                mongodb::error::Error::custom(e.to_string())
+                                            })?;
+                                        this.plugin_configs()
+                                            .delete_many(ns_filter.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        this.proxies()
+                                            .delete_many(ns_filter.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        this.consumers()
+                                            .delete_many(ns_filter.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        // Namespace wipe releases every consumer
+                                        // identity reservation in the namespace.
+                                        this.consumer_identity_index()
+                                            .delete_many(ns_filter.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        this.upstreams()
+                                            .delete_many(ns_filter.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        this.api_specs()
+                                            .delete_many(ns_filter.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        for id in &proxy_ids {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "proxy",
+                                                id.as_str(),
+                                                "delete",
+                                            )
+                                            .await?;
+                                        }
+                                        for id in &consumer_ids {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "consumer",
+                                                id.as_str(),
+                                                "delete",
+                                            )
+                                            .await?;
+                                        }
+                                        for id in &plugin_config_ids {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "plugin_config",
+                                                id.as_str(),
+                                                "delete",
+                                            )
+                                            .await?;
+                                        }
+                                        for id in &upstream_ids {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "upstream",
+                                                id.as_str(),
+                                                "delete",
+                                            )
+                                            .await?;
+                                        }
+                                        Ok(())
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(anyhow::Error::new)
+                            .context("delete_all_resources transaction failed")?;
+                        self.compact_config_changes_best_effort(namespace).await;
+                    } else {
+                        let proxy_ids = self
+                            .load_collection_ids_filtered("proxies", ns_filter.clone())
+                            .await?;
+                        // Plain `id` field — consumer `_id` is the composite
+                        // "{namespace}:{id}" and change-log records carry plain ids.
+                        let consumer_ids = self
+                            .load_consumer_plain_ids_filtered(ns_filter.clone())
+                            .await?;
+                        let plugin_config_ids = self
+                            .load_collection_ids_filtered("plugin_configs", ns_filter.clone())
+                            .await?;
+                        let upstream_ids = self
+                            .load_collection_ids_filtered("upstreams", ns_filter.clone())
+                            .await?;
+                        self.plugin_configs().delete_many(ns_filter.clone()).await?;
+                        self.proxies().delete_many(ns_filter.clone()).await?;
+                        self.consumers().delete_many(ns_filter.clone()).await?;
+                        // Namespace wipe releases every consumer identity reservation
+                        // in the namespace.
+                        self.consumer_identity_index()
+                            .delete_many(ns_filter.clone())
+                            .await?;
+                        self.upstreams().delete_many(ns_filter.clone()).await?;
+                        // Clear api_specs so restore doesn't leave orphaned spec metadata
+                        // pointing to proxies that no longer exist.
+                        self.api_specs().delete_many(ns_filter).await?;
+                        for id in proxy_ids {
+                            self.record_config_change(namespace, "proxy", &id, "delete")
+                                .await?;
+                        }
+                        for id in consumer_ids {
+                            self.record_config_change(namespace, "consumer", &id, "delete")
+                                .await?;
+                        }
+                        for id in plugin_config_ids {
+                            self.record_config_change(namespace, "plugin_config", &id, "delete")
+                                .await?;
+                        }
+                        for id in upstream_ids {
+                            self.record_config_change(namespace, "upstream", &id, "delete")
+                                .await?;
+                        }
+                    }
+                    Ok(mode)
                 })
                 .await;
             let mode = match mutation_result {
@@ -8551,176 +8588,188 @@ mod inner {
             }
 
             Self::run_mtls_dns_mutations(&mut mtls_leases, async {
-            let use_replica_set = self.replica_set_configured();
-            let mut orphaned_proxy_group_plugin_deletes = Vec::new();
-            if use_replica_set {
-                // With a replica set: use a multi-document transaction.
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                let prepared_docs = prepare_api_spec_bundle_docs(bundle, spec)?;
-                let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
-                if let Some(u) = &bundle.upstream {
-                    upsert_changes.push((u.namespace.clone(), "upstream", u.id.clone()));
-                }
-                upsert_changes.push((
-                    bundle.proxy.namespace.clone(),
-                    "proxy",
-                    bundle.proxy.id.clone(),
-                ));
-                for pc in &bundle.plugins {
-                    upsert_changes.push((pc.namespace.clone(), "plugin_config", pc.id.clone()));
-                }
-                orphaned_proxy_group_plugin_deletes = session
-                    .start_transaction()
-                    .and_run(
-                        (self, prepared_docs, upsert_changes, spec.namespace.clone()),
-                        |s, (this, prepared_docs, upsert_changes, namespace)| {
-                            Box::pin(async move {
-                                if let Some((_, doc)) = &prepared_docs.upstream {
-                                    this.upstreams()
-                                        .insert_one(doc.clone())
-                                        .session(&mut *s)
-                                        .await?;
-                                }
-                                this.proxies()
-                                    .insert_one(prepared_docs.proxy.1.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                for (_, doc) in &prepared_docs.plugins {
-                                    this.plugin_configs()
-                                        .insert_one(doc.clone())
-                                        .session(&mut *s)
-                                        .await?;
-                                }
-                                this.api_specs()
-                                    .insert_one(prepared_docs.spec.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                let orphaned = this
-                                    .cleanup_orphaned_proxy_group_plugins_opt_session(
-                                        namespace.as_str(),
-                                        Some(&mut *s),
-                                    )
-                                    .await
-                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
-                                for change in upsert_changes.iter() {
-                                    let (namespace, resource_type, resource_id) = change;
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        resource_type,
-                                        resource_id.as_str(),
-                                        "upsert",
-                                    )
-                                    .await?;
-                                }
-                                for (plugin_id, namespace) in &orphaned {
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        "plugin_config",
-                                        plugin_id.as_str(),
-                                        "delete",
-                                    )
-                                    .await?;
-                                }
-                                Ok(orphaned)
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("submit_api_spec_bundle transaction failed")?;
-            } else {
-                // No replica set: best-effort with compensating rollback on failure.
-                // Track inserted document IDs for cleanup.
-                let mut inserted_upstream: Option<String> = None;
-                let mut inserted_proxy: Option<String> = None;
-                let mut inserted_plugins: Vec<String> = Vec::new();
-                let mut inserted_spec: bool = false;
-
-                let result: Result<(), anyhow::Error> = async {
+                let use_replica_set = self.replica_set_configured();
+                let mut orphaned_proxy_group_plugin_deletes = Vec::new();
+                if use_replica_set {
+                    // With a replica set: use a multi-document transaction.
+                    let connection = self.connection();
+                    let mut session = connection.client.start_session().await?;
+                    let prepared_docs = prepare_api_spec_bundle_docs(bundle, spec)?;
+                    let mut upsert_changes: Vec<(String, &'static str, String)> = Vec::new();
                     if let Some(u) = &bundle.upstream {
-                        let mut doc = upstream_to_doc(u)?;
-                        doc.insert("api_spec_id", spec.id.as_str());
-                        self.upstreams().insert_one(doc).await?;
-                        inserted_upstream = Some(u.id.clone());
+                        upsert_changes.push((u.namespace.clone(), "upstream", u.id.clone()));
                     }
-
-                    for pc in &bundle.plugins {
-                        let mut doc = plugin_config_to_doc(pc)?;
-                        doc.insert("api_spec_id", spec.id.as_str());
-                        self.plugin_configs().insert_one(doc).await?;
-                        inserted_plugins.push(pc.id.clone());
-                    }
-
-                    {
-                        let mut doc = proxy_to_doc(&bundle.proxy)?;
-                        doc.insert("api_spec_id", spec.id.as_str());
-                        self.proxies().insert_one(doc).await?;
-                        inserted_proxy = Some(bundle.proxy.id.clone());
-                    }
-
-                    let spec_doc = api_spec_to_doc(spec)?;
-                    self.api_specs().insert_one(spec_doc).await?;
-                    inserted_spec = true;
-
-                    if let Some(u) = &bundle.upstream {
-                        self.record_config_change(&u.namespace, "upstream", &u.id, "upsert")
-                            .await?;
-                    }
-                    self.record_config_change(
-                        &bundle.proxy.namespace,
+                    upsert_changes.push((
+                        bundle.proxy.namespace.clone(),
                         "proxy",
-                        &bundle.proxy.id,
-                        "upsert",
-                    )
-                    .await?;
+                        bundle.proxy.id.clone(),
+                    ));
                     for pc in &bundle.plugins {
-                        self.record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
-                            .await?;
+                        upsert_changes.push((pc.namespace.clone(), "plugin_config", pc.id.clone()));
                     }
-                    for (plugin_id, namespace) in &orphaned_proxy_group_plugin_deletes {
-                        self.record_config_change(namespace, "plugin_config", plugin_id, "delete")
+                    orphaned_proxy_group_plugin_deletes = session
+                        .start_transaction()
+                        .and_run(
+                            (self, prepared_docs, upsert_changes, spec.namespace.clone()),
+                            |s, (this, prepared_docs, upsert_changes, namespace)| {
+                                Box::pin(async move {
+                                    if let Some((_, doc)) = &prepared_docs.upstream {
+                                        this.upstreams()
+                                            .insert_one(doc.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                    }
+                                    this.proxies()
+                                        .insert_one(prepared_docs.proxy.1.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                    for (_, doc) in &prepared_docs.plugins {
+                                        this.plugin_configs()
+                                            .insert_one(doc.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                    }
+                                    this.api_specs()
+                                        .insert_one(prepared_docs.spec.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                    let orphaned = this
+                                        .cleanup_orphaned_proxy_group_plugins_opt_session(
+                                            namespace.as_str(),
+                                            Some(&mut *s),
+                                        )
+                                        .await
+                                        .map_err(|e| {
+                                            mongodb::error::Error::custom(e.to_string())
+                                        })?;
+                                    for change in upsert_changes.iter() {
+                                        let (namespace, resource_type, resource_id) = change;
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            resource_type,
+                                            resource_id.as_str(),
+                                            "upsert",
+                                        )
+                                        .await?;
+                                    }
+                                    for (plugin_id, namespace) in &orphaned {
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            "plugin_config",
+                                            plugin_id.as_str(),
+                                            "delete",
+                                        )
+                                        .await?;
+                                    }
+                                    Ok(orphaned)
+                                })
+                            },
+                        )
+                        .await
+                        .map_err(anyhow::Error::new)
+                        .context("submit_api_spec_bundle transaction failed")?;
+                } else {
+                    // No replica set: best-effort with compensating rollback on failure.
+                    // Track inserted document IDs for cleanup.
+                    let mut inserted_upstream: Option<String> = None;
+                    let mut inserted_proxy: Option<String> = None;
+                    let mut inserted_plugins: Vec<String> = Vec::new();
+                    let mut inserted_spec: bool = false;
+
+                    let result: Result<(), anyhow::Error> = async {
+                        if let Some(u) = &bundle.upstream {
+                            let mut doc = upstream_to_doc(u)?;
+                            doc.insert("api_spec_id", spec.id.as_str());
+                            self.upstreams().insert_one(doc).await?;
+                            inserted_upstream = Some(u.id.clone());
+                        }
+
+                        for pc in &bundle.plugins {
+                            let mut doc = plugin_config_to_doc(pc)?;
+                            doc.insert("api_spec_id", spec.id.as_str());
+                            self.plugin_configs().insert_one(doc).await?;
+                            inserted_plugins.push(pc.id.clone());
+                        }
+
+                        {
+                            let mut doc = proxy_to_doc(&bundle.proxy)?;
+                            doc.insert("api_spec_id", spec.id.as_str());
+                            self.proxies().insert_one(doc).await?;
+                            inserted_proxy = Some(bundle.proxy.id.clone());
+                        }
+
+                        let spec_doc = api_spec_to_doc(spec)?;
+                        self.api_specs().insert_one(spec_doc).await?;
+                        inserted_spec = true;
+
+                        if let Some(u) = &bundle.upstream {
+                            self.record_config_change(&u.namespace, "upstream", &u.id, "upsert")
+                                .await?;
+                        }
+                        self.record_config_change(
+                            &bundle.proxy.namespace,
+                            "proxy",
+                            &bundle.proxy.id,
+                            "upsert",
+                        )
+                        .await?;
+                        for pc in &bundle.plugins {
+                            self.record_config_change(
+                                &pc.namespace,
+                                "plugin_config",
+                                &pc.id,
+                                "upsert",
+                            )
                             .await?;
+                        }
+                        for (plugin_id, namespace) in &orphaned_proxy_group_plugin_deletes {
+                            self.record_config_change(
+                                namespace,
+                                "plugin_config",
+                                plugin_id,
+                                "delete",
+                            )
+                            .await?;
+                        }
+
+                        Ok(())
                     }
-
-                    Ok(())
-                }
-                .await;
-
-                if let Err(e) = result {
-                    // Compensating deletes — best-effort, log failures as warnings.
-                    self.compensate_bundle_insert(
-                        &inserted_upstream,
-                        &inserted_proxy,
-                        &inserted_plugins,
-                        inserted_spec.then_some(spec.id.as_str()),
-                    )
                     .await;
-                    return Err(e);
+
+                    if let Err(e) = result {
+                        // Compensating deletes — best-effort, log failures as warnings.
+                        self.compensate_bundle_insert(
+                            &inserted_upstream,
+                            &inserted_proxy,
+                            &inserted_plugins,
+                            inserted_spec.then_some(spec.id.as_str()),
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
 
-            let mut namespaces_to_compact = HashSet::new();
-            if let Some(u) = &bundle.upstream {
-                namespaces_to_compact.insert(u.namespace.clone());
-            }
-            namespaces_to_compact.insert(bundle.proxy.namespace.clone());
-            namespaces_to_compact.extend(bundle.plugins.iter().map(|pc| pc.namespace.clone()));
-            namespaces_to_compact.extend(
-                orphaned_proxy_group_plugin_deletes
-                    .iter()
-                    .map(|(_, namespace)| namespace.clone()),
-            );
-            for namespace in namespaces_to_compact {
-                self.compact_config_changes_best_effort(&namespace).await;
-            }
+                let mut namespaces_to_compact = HashSet::new();
+                if let Some(u) = &bundle.upstream {
+                    namespaces_to_compact.insert(u.namespace.clone());
+                }
+                namespaces_to_compact.insert(bundle.proxy.namespace.clone());
+                namespaces_to_compact.extend(bundle.plugins.iter().map(|pc| pc.namespace.clone()));
+                namespaces_to_compact.extend(
+                    orphaned_proxy_group_plugin_deletes
+                        .iter()
+                        .map(|(_, namespace)| namespace.clone()),
+                );
+                for namespace in namespaces_to_compact {
+                    self.compact_config_changes_best_effort(&namespace).await;
+                }
 
-            Ok(())
-                })
-                .await?;
+                Ok(())
+            })
+            .await?;
             Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
             Ok(())
         }

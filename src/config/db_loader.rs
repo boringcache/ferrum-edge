@@ -2878,12 +2878,8 @@ impl DatabaseStore {
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
         let mut tx = self.pool().begin().await?;
-        self.lock_mtls_dns_admission_for_owner_tx(
-            &mut tx,
-            &consumer.namespace,
-            guard_owner,
-        )
-        .await?;
+        self.lock_mtls_dns_admission_for_owner_tx(&mut tx, &consumer.namespace, guard_owner)
+            .await?;
         // Existence read inside the transaction is the not-found authority —
         // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
         // (sqlx's default) counts *changed* rows, so an update writing

@@ -807,10 +807,9 @@ async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_bat
         .await
         .unwrap()
         .unwrap();
-    guarded_consumer.credentials.insert(
-        "keyauth".to_string(),
-        json!([{ "key": "guarded-key" }]),
-    );
+    guarded_consumer
+        .credentials
+        .insert("keyauth".to_string(), json!([{ "key": "guarded-key" }]));
     DatabaseBackend::update_consumer(&store_a, &guarded_consumer, &guarded_mode)
         .await
         .expect("the pre-read guard owner must be able to persist the credential update");
