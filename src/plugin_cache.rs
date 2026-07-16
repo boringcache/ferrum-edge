@@ -2835,6 +2835,13 @@ pub struct PluginCache {
     http_client: PluginHttpClient,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum CountryMmdbLoadMode {
+    Standard,
+    NodeLocalRefresh,
+    PreloadedOnly,
+}
+
 fn validate_prometheus_metrics_ownership(config: &GatewayConfig) -> Result<(), String> {
     let mut enabled = config
         .plugin_configs
@@ -3022,10 +3029,10 @@ impl PluginCache {
     ///
     /// Also rebuilds global plugins if `rebuild_globals` is true (i.e., a
     /// global-scoped plugin config was added/modified/removed).
-    /// `force_node_local_refresh` additionally rebuilds every active country
-    /// MMDB instance for DP full snapshots whose CP source cannot hand off
-    /// node-local validation snapshots. `require_country_mmdb_preload` forbids
-    /// synchronous MMDB loading during an incremental async cache stage.
+    /// `CountryMmdbLoadMode::NodeLocalRefresh` additionally rebuilds every
+    /// active country MMDB instance for DP full snapshots whose CP source
+    /// cannot hand off node-local validation snapshots. `PreloadedOnly`
+    /// forbids synchronous MMDB loading during an incremental async cache stage.
     /// Returns `Err` if any enabled plugin config cannot be resolved or fails
     /// validation during incremental update, matching the behavior of `rebuild()`.
     pub(crate) fn build_delta_inner(
@@ -3035,17 +3042,18 @@ impl PluginCache {
         proxy_ids_to_rebuild: &HashSet<String>,
         removed_proxy_ids: &[String],
         rebuild_globals: bool,
-        force_node_local_refresh: bool,
-        require_country_mmdb_preload: bool,
+        country_mmdb_load_mode: CountryMmdbLoadMode,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
-        let country_mmdb_load_session = if force_node_local_refresh && !paths.is_empty() {
-            CountryMmdbLoadSession::for_node_local_refresh(&paths)?
-        } else if require_country_mmdb_preload {
-            CountryMmdbLoadSession::claim_preloaded(&paths)?
-        } else {
-            CountryMmdbLoadSession::claim(&paths)?
+        let country_mmdb_load_session = match country_mmdb_load_mode {
+            CountryMmdbLoadMode::NodeLocalRefresh if !paths.is_empty() => {
+                CountryMmdbLoadSession::for_node_local_refresh(&paths)?
+            }
+            CountryMmdbLoadMode::PreloadedOnly => CountryMmdbLoadSession::claim_preloaded(&paths)?,
+            CountryMmdbLoadMode::Standard | CountryMmdbLoadMode::NodeLocalRefresh => {
+                CountryMmdbLoadSession::claim(&paths)?
+            }
         };
         self.build_delta_inner_with_country_mmdb_session(
             current,
@@ -3705,8 +3713,7 @@ impl PluginCache {
             proxy_ids_to_rebuild,
             removed_proxy_ids,
             rebuild_globals,
-            false,
-            false,
+            CountryMmdbLoadMode::Standard,
         )?;
 
         // Single atomic swap — readers see old or new, never a partial state.

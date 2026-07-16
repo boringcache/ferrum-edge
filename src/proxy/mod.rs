@@ -7029,8 +7029,7 @@ impl ProxyState {
         new_config: &GatewayConfig,
         staged_config: Arc<GatewayConfig>,
         delta: &crate::config_delta::ConfigDelta,
-        force_node_local_plugin_refresh: bool,
-        require_country_mmdb_preload: bool,
+        country_mmdb_load_mode: crate::plugin_cache::CountryMmdbLoadMode,
     ) -> Result<StagedRequestEpoch, String> {
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
         let rebuild_globals = delta.global_plugin_configs_changed;
@@ -7049,8 +7048,7 @@ impl ProxyState {
             &proxy_ids_to_rebuild,
             &delta.removed_proxy_ids,
             rebuild_globals,
-            force_node_local_plugin_refresh,
-            require_country_mmdb_preload,
+            country_mmdb_load_mode,
         )?;
         let consumer_inner = if consumer_changed {
             ConsumerIndex::build_inner(&new_config.consumers)
@@ -7388,16 +7386,20 @@ impl ProxyState {
                         lb_changed: false,
                     }));
                 }
+                let country_mmdb_load_mode = if matches!(
+                    self.env_config.mode,
+                    crate::config::env_config::OperatingMode::DataPlane
+                ) {
+                    crate::plugin_cache::CountryMmdbLoadMode::NodeLocalRefresh
+                } else {
+                    crate::plugin_cache::CountryMmdbLoadMode::Standard
+                };
                 let staged = self.stage_incremental_request_epoch(
                     current,
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
-                    matches!(
-                        self.env_config.mode,
-                        crate::config::env_config::OperatingMode::DataPlane
-                    ),
-                    false,
+                    country_mmdb_load_mode,
                 )?;
                 route_changed.set(staged.route_changed);
                 applied_delta = Some(delta);
@@ -7862,8 +7864,7 @@ impl ProxyState {
                     &new_config,
                     Arc::clone(&staged_config),
                     &delta,
-                    false,
-                    true,
+                    crate::plugin_cache::CountryMmdbLoadMode::PreloadedOnly,
                 )?;
                 route_changed.set(staged.route_changed);
                 applied_delta = Some(delta);
