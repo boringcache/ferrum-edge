@@ -639,6 +639,12 @@ pub struct RequestContext {
     pub direct_client_ip: String,
     pub method: String,
     pub path: String,
+    /// Canonical client-request authority for authentication mechanisms that
+    /// bind signatures to the selected virtual host. Hostnames are
+    /// ASCII-lowercased with a trailing DNS dot removed; an explicit
+    /// non-default port is retained. HTTP frontends populate this after
+    /// Host/`:authority` validation and before authentication.
+    pub request_authority: Option<String>,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
@@ -840,11 +846,21 @@ pub struct RequestContext {
     /// Set by the plugin in `before_proxy`; collected before building
     /// `TransactionSummary` so all logging plugins receive mirror results.
     pub mirror_result_rx: Option<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
+    /// One-shot HMAC work staged before request-body collection and consumed
+    /// at authentication. This is private rather than transaction metadata so
+    /// credential/signature/Consumer secret data cannot be forwarded or
+    /// logged. Its custom `Clone` intentionally clears the staged value.
+    hmac_prebuffer_state: hmac_auth::HmacPrebufferState,
     /// Binary-safe request body bytes, populated when a plugin requires the
     /// body before `before_proxy` (e.g., `request_mirror`). Unlike the
     /// `"request_body"` metadata key (UTF-8 only), this preserves non-UTF-8
     /// payloads such as gRPC protobuf.
     pub request_body_bytes: Option<bytes::Bytes>,
+    /// Precomputed body hashes for integrity-verifying authentication plugins.
+    /// Keeping fixed-size hashes avoids retaining a second full body while the
+    /// sole buffered representation continues to the backend.
+    pub request_body_sha256: Option<[u8; 32]>,
+    pub request_body_sha512: Option<[u8; 64]>,
     /// Shared counter for request body bytes received from the client,
     /// populated by proxy body handlers and read by the summary builders.
     ///
@@ -1031,6 +1047,7 @@ impl RequestContext {
             client_ip,
             method,
             path,
+            request_authority: None,
             frontend_listen_port: None,
             frontend_sni_hostname: None,
             lb_generation: 1,
@@ -1079,7 +1096,10 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
+            hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
+            request_body_sha256: None,
+            request_body_sha512: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
             mesh_route_dispatch_reject_unmatched: false,
@@ -1165,6 +1185,7 @@ impl RequestContext {
             direct_client_ip: self.direct_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
+            request_authority: self.request_authority.clone(),
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             lb_generation: self.lb_generation,
@@ -1227,7 +1248,10 @@ impl RequestContext {
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
             mirror_result_rx: None,
+            hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
+            request_body_sha256: None,
+            request_body_sha512: None,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
             mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
@@ -3154,13 +3178,28 @@ pub trait Plugin: Send + Sync {
     ///
     /// This is even narrower than `requires_request_body_before_before_proxy()`:
     /// it forces request body buffering BEFORE the authenticate phase runs, so
-    /// auth plugins can verify body integrity (e.g., HMAC signing string that
-    /// covers a `Digest:` header per RFC 9421 / RFC 3230).
+    /// auth plugins can verify body integrity (e.g., a Ferrum HMAC signing
+    /// string that covers RFC 9530 `Content-Digest` or legacy `Digest`).
     ///
     /// Override this only for auth plugins that perform body integrity checks
     /// at authentication time (e.g., `hmac_auth`).
     fn requires_request_body_before_authenticate(&self) -> bool {
         false
+    }
+
+    /// Return whether this request should be buffered before authentication
+    /// after credential checks that do not require body bytes.
+    ///
+    /// The default preserves the ordinary request-time buffering predicate.
+    /// Body-authentication plugins can override this to reject malformed,
+    /// expired, or unknown credentials without first collecting an attacker-
+    /// controlled request body.
+    fn should_buffer_request_body_before_authenticate(
+        &self,
+        ctx: &RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> bool {
+        self.should_buffer_request_body(ctx)
     }
 
     /// Returns `true` if this plugin needs the raw request body to be available
@@ -3181,6 +3220,12 @@ pub trait Plugin: Send + Sync {
     /// that would otherwise run on every buffered request. Only override
     /// this for plugins that handle non-UTF-8 payloads (e.g., gRPC protobuf).
     fn needs_request_body_bytes(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when the plugin needs SHA-256 and SHA-512 snapshots of
+    /// the body but does not need to retain the body itself.
+    fn needs_request_body_digests(&self) -> bool {
         false
     }
 

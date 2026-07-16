@@ -6455,7 +6455,7 @@ components:
               items:
                 $ref: "#/components/schemas/HmacAuthCredential"
               minItems: 1
-              description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username in Authorization header; all secrets tried.
+              description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username within the matched proxy namespace; all secrets tried.
             mtls_auth:
               type: array
               items:
@@ -6559,16 +6559,21 @@ components:
     HmacAuthCredential:
       type: object
       required: [secret]
+      additionalProperties: false
       properties:
         secret:
           type: string
+          minLength: 32
           writeOnly: true
           description: >-
-            Shared secret for HMAC signature computation and verification.
+            Shared secret for HMAC signature computation and verification. Must
+            contain at least 32 non-whitespace characters and must not be
+            shared by different Consumers within one namespace. Separate
+            namespaces may reuse the same secret.
       description: >-
         HMAC auth credential for the `hmac_auth` plugin. Consumer is looked up
-        by username in the Authorization header; all secrets are tried until one
-        verifies the signature.
+        by username within the matched proxy namespace; all secrets are tried
+        until one verifies the namespace-bound signature.
 
     MtlsAuthCredential:
       type: object
@@ -11939,7 +11944,17 @@ components:
 
     HmacAuthConfig:
       type: object
-      description: "Plugin: hmac_auth — HMAC signature verification with mandatory request-body integrity protection (RFC 9421 / RFC 3230). Requests must include a Digest or Content-Digest header that matches the request body; the digest header value and the raw query string are folded into the HMAC signing string (METHOD\\nPATH\\nQUERY\\nDATE\\nDIGEST), so altering query parameters or the body invalidates the signature. Note: the signed Date header provides a bounded freshness window (now ± clock_skew_seconds), not single-use replay prevention — there is no nonce store, so a captured valid request can be replayed within the window. Consumer credentials store the shared secret."
+      description: >-
+        Plugin: hmac_auth — Ferrum-specific versioned HMAC authorization with
+        mandatory request-body integrity protection. RFC 9530 defines
+        Content-Digest; this is not RFC 9421 HTTP Message Signatures. Requests
+        must include Digest or Content-Digest matching the original body.
+        Version 1 signs the matched proxy namespace, credential identity,
+        normalized authority, method, path, raw query, Date, and literal digest
+        value. HBONE CONNECT and
+        request-body-transformer compositions fail closed. The
+        pre-authentication body path has a 10 MiB hard ceiling. Date provides a
+        bounded freshness window, not single-use replay prevention.
       properties:
         clock_skew_seconds:
           type: integer

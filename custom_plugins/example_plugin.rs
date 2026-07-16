@@ -5,6 +5,8 @@
 //!
 //! This plugin adds a custom `X-Custom-Gateway` header to every request
 //! before it is proxied to the backend, and echoes it back in the response.
+//! An optional `request_body_prefix` demonstrates request-body transformation
+//! capability metadata used by core composition validation.
 //!
 //! The `create_plugin` function at the bottom is the only required entry
 //! point — the build script discovers this file automatically.
@@ -18,10 +20,19 @@ use crate::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext, Tra
 
 pub struct ExamplePlugin {
     header_value: String,
+    request_body_prefix: Option<Vec<u8>>,
 }
 
 impl ExamplePlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
+        let request_body_prefix = match config.get("request_body_prefix") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(prefix)) if prefix.is_empty() => {
+                return Err("request_body_prefix must not be empty".to_string());
+            }
+            Some(Value::String(prefix)) => Some(prefix.as_bytes().to_vec()),
+            Some(_) => return Err("request_body_prefix must be a string".to_string()),
+        };
         Ok(Self {
             // Read configuration from the plugin's JSON config.
             // In the gateway config, this would look like:
@@ -30,6 +41,7 @@ impl ExamplePlugin {
                 .as_str()
                 .unwrap_or("ferrum-custom")
                 .to_string(),
+            request_body_prefix,
         })
     }
 }
@@ -62,6 +74,10 @@ impl Plugin for ExamplePlugin {
         true
     }
 
+    fn modifies_request_body(&self) -> bool {
+        self.request_body_prefix.is_some()
+    }
+
     /// Called when a request is first received (before routing).
     /// Return `PluginResult::Reject` to short-circuit with an error response.
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
@@ -78,6 +94,19 @@ impl Plugin for ExamplePlugin {
     ) -> PluginResult {
         headers.insert("x-custom-gateway".to_string(), self.header_value.clone());
         PluginResult::Continue
+    }
+
+    async fn transform_request_body(
+        &self,
+        body: &[u8],
+        _content_type: Option<&str>,
+        _request_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        let prefix = self.request_body_prefix.as_ref()?;
+        let mut transformed = Vec::with_capacity(prefix.len() + body.len());
+        transformed.extend_from_slice(prefix);
+        transformed.extend_from_slice(body);
+        Some(transformed)
     }
 
     /// Called after the backend response is received.

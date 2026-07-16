@@ -2264,7 +2264,12 @@ async fn buffer_request_body_for_before_proxy(
     max_request_body_size_bytes: usize,
     request_body_read_timeout_ms: u64,
 ) -> Result<ClientRequestBody, RequestBodyBufferError> {
-    if !request_may_have_body(method, headers) {
+    // Keep the existing no-collection fast path only when the method/header
+    // classification and the protocol body state agree that the request is
+    // empty. In particular, an H2 GET/HEAD/OPTIONS request can omit
+    // Content-Length while keeping the stream open for DATA, so method/header
+    // heuristics alone must not infer an empty body.
+    if !request_may_have_body(method, headers) && hyper::body::Body::is_end_stream(request.body()) {
         return Ok(ClientRequestBody::Streaming(Box::new(request)));
     }
 
@@ -2317,6 +2322,7 @@ pub(crate) fn store_request_body_metadata(
     body: &[u8],
     needs_body_text: bool,
     needs_body_bytes: bool,
+    needs_body_digests: bool,
 ) {
     ctx.metadata.insert(
         "request_body_size_bytes".to_string(),
@@ -2336,6 +2342,13 @@ pub(crate) fn store_request_body_metadata(
     if needs_body_bytes && ctx.request_body_bytes.is_none() {
         ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
     }
+    if needs_body_digests
+        && (ctx.request_body_sha256.is_none() || ctx.request_body_sha512.is_none())
+    {
+        use sha2::{Digest, Sha256, Sha512};
+        ctx.request_body_sha256 = Some(Sha256::digest(body).into());
+        ctx.request_body_sha512 = Some(Sha512::digest(body).into());
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2343,6 +2356,7 @@ pub(crate) struct RequestBodyPhaseRequirements {
     pub required: bool,
     pub needs_text: bool,
     pub needs_bytes: bool,
+    pub needs_digests: bool,
     pub plugin_limit: Option<usize>,
 }
 
@@ -2360,6 +2374,7 @@ pub(crate) fn request_body_requirements_before_authorize(
         requirements.required = true;
         requirements.needs_text |= plugin.needs_request_body_text();
         requirements.needs_bytes |= plugin.needs_request_body_bytes();
+        requirements.needs_digests |= plugin.needs_request_body_digests();
         if let Some(limit) = plugin.request_body_buffer_limit() {
             requirements.plugin_limit = Some(
                 requirements
@@ -2374,17 +2389,26 @@ pub(crate) fn request_body_requirements_before_authorize(
 pub(crate) fn request_body_requirements_before_authenticate(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
+    consumer_index: &ConsumerIndex,
 ) -> RequestBodyPhaseRequirements {
     let mut requirements = RequestBodyPhaseRequirements::default();
     for plugin in plugins {
         if !plugin.requires_request_body_before_authenticate()
-            || !plugin.should_buffer_request_body(ctx)
+            || !plugin.should_buffer_request_body_before_authenticate(ctx, consumer_index)
         {
             continue;
         }
         requirements.required = true;
         requirements.needs_text |= plugin.needs_request_body_text();
         requirements.needs_bytes |= plugin.needs_request_body_bytes();
+        requirements.needs_digests |= plugin.needs_request_body_digests();
+        if let Some(limit) = plugin.request_body_buffer_limit() {
+            requirements.plugin_limit = Some(
+                requirements
+                    .plugin_limit
+                    .map_or(limit, |current| current.min(limit)),
+            );
+        }
     }
     requirements
 }
@@ -7072,6 +7096,13 @@ impl ProxyState {
         new_config.normalize_fields();
         // Resolve upstream TLS into each proxy's resolved_tls before applying.
         new_config.resolve_upstream_tls();
+        // Full snapshots can arrive from sources that bypass the SQL/Mongo
+        // loaders, notably CP-to-DP config sync. Quarantine malformed, weak,
+        // or cross-Consumer duplicate HMAC credentials at the common swap
+        // boundary so none can reach the runtime ConsumerIndex.
+        for message in new_config.quarantine_invalid_hmac_credentials() {
+            error!("Config reload: {}", message);
+        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -7673,6 +7704,15 @@ impl ProxyState {
         // canonicalized fields.
         new_config.normalize_fields();
         new_config.resolve_upstream_tls();
+        // Fail-closed hmac_auth secret policy for point-loaded consumer rows:
+        // full snapshots quarantine weak/duplicate HMAC secrets in
+        // `update_config`, but deltas from non-database or older control-plane
+        // sources can still merge raw consumer rows through this separate
+        // path. Storage constraints backstop normal admin races; this boundary
+        // retains defense in depth for out-of-band data.
+        for message in new_config.quarantine_invalid_hmac_credentials() {
+            error!("Incremental config: {}", message);
+        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -14859,6 +14899,13 @@ async fn handle_proxy_request_inner(
         },
         None => None,
     };
+    let request_authority = raw_host.and_then(|authority| {
+        normalize_request_authority_for_signing(
+            authority,
+            Some(if is_tls { "https" } else { "http" }),
+        )
+    });
+    ctx.request_authority = request_authority;
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
@@ -15369,11 +15416,12 @@ async fn handle_proxy_request_inner(
     // WebSocket Extended CONNECT is also excluded: DATA frames after the 200
     // response are WebSocket bytes, not an HTTP request body to drain before
     // authentication.
+    let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
     let authenticate_body_requirements = if !is_hbone_connect_any
         && allows_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
     {
-        request_body_requirements_before_authenticate(&plugins, &ctx)
+        request_body_requirements_before_authenticate(&plugins, &ctx, &consumer_index)
     } else {
         RequestBodyPhaseRequirements::default()
     };
@@ -15385,21 +15433,43 @@ async fn handle_proxy_request_inner(
                     *request,
                     &method,
                     &ctx.headers,
-                    state.max_request_body_size_bytes,
+                    effective_request_body_limit(
+                        state.max_request_body_size_bytes,
+                        authenticate_body_requirements.plugin_limit,
+                    ),
                     proxy.backend_read_timeout_ms,
                 )
                 .await
                 {
                     Ok(buffered) => {
-                        if let ClientRequestBody::Buffered(body) = &buffered {
-                            store_request_body_metadata(
-                                &mut ctx,
-                                body,
-                                authenticate_body_requirements.needs_text,
-                                authenticate_body_requirements.needs_bytes,
-                            );
-                            ctx.bytes_sent_observed
-                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                        match &buffered {
+                            ClientRequestBody::Buffered(body) => {
+                                store_request_body_metadata(
+                                    &mut ctx,
+                                    body,
+                                    authenticate_body_requirements.needs_text,
+                                    authenticate_body_requirements.needs_bytes,
+                                    authenticate_body_requirements.needs_digests,
+                                );
+                                ctx.bytes_sent_observed.fetch_max(
+                                    body.len() as u64,
+                                    std::sync::atomic::Ordering::Release,
+                                );
+                            }
+                            ClientRequestBody::Streaming(_) => {
+                                // The buffering helper returns Streaming only
+                                // when Incoming already reports END_STREAM, so
+                                // seeding empty-body digests cannot race later
+                                // H2 DATA. Retain the original empty stream for
+                                // zero-copy backend forwarding.
+                                store_request_body_metadata(
+                                    &mut ctx,
+                                    &[],
+                                    false,
+                                    false,
+                                    authenticate_body_requirements.needs_digests,
+                                );
+                            }
                         }
                         buffered
                     }
@@ -15446,7 +15516,6 @@ async fn handle_proxy_request_inner(
 
     {
         let auth_phase_start = Instant::now();
-        let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
         if let Some((status_code, body, headers)) = run_authentication_phase(
             proxy.auth_mode.clone(),
             &auth_plugins,
@@ -15517,6 +15586,7 @@ async fn handle_proxy_request_inner(
                                 body,
                                 authorize_body_requirements.needs_text,
                                 authorize_body_requirements.needs_bytes,
+                                authorize_body_requirements.needs_digests,
                             );
                             ctx.bytes_sent_observed
                                 .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
@@ -15570,6 +15640,7 @@ async fn handle_proxy_request_inner(
                     &body,
                     authorize_body_requirements.needs_text,
                     authorize_body_requirements.needs_bytes,
+                    authorize_body_requirements.needs_digests,
                 );
                 ClientRequestBody::Buffered(body)
             }
@@ -15668,6 +15739,7 @@ async fn handle_proxy_request_inner(
                                 body,
                                 needs_body_text,
                                 needs_body_bytes,
+                                false,
                             );
                             // Seed bytes_sent_observed from the prebuffered
                             // body so before_proxy rejects (logged via
@@ -15715,7 +15787,13 @@ async fn handle_proxy_request_inner(
                 }
             }
             ClientRequestBody::Buffered(body) => {
-                store_request_body_metadata(&mut ctx, &body, needs_body_text, needs_body_bytes);
+                store_request_body_metadata(
+                    &mut ctx,
+                    &body,
+                    needs_body_text,
+                    needs_body_bytes,
+                    false,
+                );
                 ClientRequestBody::Buffered(body)
             }
         };
@@ -23680,6 +23758,16 @@ fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Opt
     })
 }
 
+/// Canonicalize a validated Host/`:authority` value for request signatures.
+/// Default ports are omitted so equivalent HTTP authorities have one signing
+/// representation; non-default ports and bracketed IPv6 literals are retained.
+pub(crate) fn normalize_request_authority_for_signing(
+    value: &str,
+    scheme: Option<&str>,
+) -> Option<String> {
+    normalize_authority_for_consistency(value, scheme).filter(|authority| !authority.is_empty())
+}
+
 /// Validate HTTP/2 and HTTP/3 `Host`/`:authority` consistency before routing.
 ///
 /// RFC 9113 states that `Host` and `:authority` are not permitted to disagree;
@@ -27837,6 +27925,26 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_signature_authority_normalization_preserves_identity() {
+        assert_eq!(
+            super::normalize_request_authority_for_signing("EXAMPLE.COM:80", Some("http")),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            super::normalize_request_authority_for_signing("EXAMPLE.COM:8443", Some("https")),
+            Some("example.com:8443".to_string())
+        );
+        assert_eq!(
+            super::normalize_request_authority_for_signing("[2001:DB8::1]:443", Some("https")),
+            Some("[2001:db8::1]".to_string())
+        );
+        assert_eq!(
+            super::normalize_request_authority_for_signing("bad:port", Some("http")),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn stalled_buffered_probe_times_out_and_releases_slot_neutral() {
         use crate::circuit_breaker::CircuitBreaker;

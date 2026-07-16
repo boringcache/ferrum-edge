@@ -135,6 +135,35 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
     Ok(())
 }
 
+/// HMAC authenticates the exact client-visible request body and digest. A later
+/// body transform would make the backend-visible bytes disagree with the
+/// signed `Digest`/`Content-Digest` and `Authorization` fields. Reject that
+/// composition at cache build time instead of forwarding stale integrity
+/// metadata or silently weakening authentication.
+fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
+    for protocol in ALL_PROXY_PROTOCOLS {
+        if !plugins
+            .iter()
+            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+            .any(|plugin| plugin.name() == "hmac_auth")
+        {
+            continue;
+        }
+        if let Some(transformer) = plugins
+            .iter()
+            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+            .find(|plugin| plugin.modifies_request_body())
+        {
+            return Err(format!(
+                "hmac_auth cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; HMAC authenticates the client-to-gateway representation and Ferrum will not forward stale signed digest metadata",
+                transformer.name(),
+                protocol
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Plugin for PriorityOverridePlugin {
     fn name(&self) -> &str {
@@ -177,6 +206,14 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_request_body_before_authenticate(&self) -> bool {
         self.inner.requires_request_body_before_authenticate()
     }
+    fn should_buffer_request_body_before_authenticate(
+        &self,
+        ctx: &RequestContext,
+        consumer_index: &crate::consumer_index::ConsumerIndex,
+    ) -> bool {
+        self.inner
+            .should_buffer_request_body_before_authenticate(ctx, consumer_index)
+    }
     fn requires_request_body_before_authorize(&self) -> bool {
         self.inner.requires_request_body_before_authorize()
     }
@@ -185,6 +222,9 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn needs_request_body_bytes(&self) -> bool {
         self.inner.needs_request_body_bytes()
+    }
+    fn needs_request_body_digests(&self) -> bool {
+        self.inner.needs_request_body_digests()
     }
     fn needs_request_body_text(&self) -> bool {
         self.inner.needs_request_body_text()
@@ -679,6 +719,8 @@ type RequestBufferingMap = HashMap<String, bool>;
 type WsFrameMap = HashMap<String, bool>;
 /// Map from proxy_group plugin_config_id to its shared plugin instance.
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
+type HmacCompositionPluginMap<'a> =
+    HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AdaptiveConcurrencyPolicyId {
@@ -1737,6 +1779,116 @@ struct ProxyGroupPluginInstance {
     config: PluginConfig,
 }
 
+/// Built-in plugin types whose constructed instance can participate in the
+/// HMAC request-body composition invariant. Keep this list aligned with
+/// `Plugin::modifies_request_body()` implementations. Registered custom
+/// plugins are also constructed because their capability is defined by their
+/// `Plugin` implementation rather than a core allowlist.
+const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
+    "hmac_auth",
+    "request_transformer",
+    "compression",
+    "grpc_web",
+    "ai_prompt_shield",
+    "ai_stream_router",
+    "mcp_gateway",
+    "ai_prompt_compressor",
+    "ai_request_guard",
+];
+
+/// Validate the HMAC/request-body-transform invariant against a candidate
+/// config before an admin Proxy or PluginConfig write is persisted. Runtime
+/// cache construction repeats the same check as a fail-closed backstop.
+pub(crate) fn validate_hmac_request_transform_candidate(
+    config: &GatewayConfig,
+    http_client: &PluginHttpClient,
+) -> Result<(), String> {
+    if !config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.enabled && plugin.plugin_name == "hmac_auth")
+    {
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    let mut global_plugins = Vec::new();
+    let mut scoped_plugins: HmacCompositionPluginMap<'_> = HashMap::new();
+    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
+    let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+    let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+
+    for plugin_config in &config.plugin_configs {
+        if !plugin_config.enabled
+            || (!HMAC_COMPOSITION_PLUGIN_NAMES.contains(&plugin_config.plugin_name.as_str())
+                && !custom_plugin_names.contains(&plugin_config.plugin_name.as_str()))
+        {
+            continue;
+        }
+        match try_create_plugin(
+            plugin_config,
+            config,
+            http_client,
+            &current_adaptive_states,
+            &mut staged_adaptive_states,
+        ) {
+            Ok(Some(plugin)) if plugin_config.scope == PluginScope::Global => {
+                global_plugins.push(plugin);
+            }
+            Ok(Some(plugin)) => {
+                scoped_plugins.insert(
+                    (plugin_config.namespace.as_str(), plugin_config.id.as_str()),
+                    (plugin_config, plugin),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => errors.push(error),
+        }
+    }
+
+    for proxy in &config.proxies {
+        let mut merged = global_plugins.clone();
+        let global_ptrs: HashSet<usize> = merged
+            .iter()
+            .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
+            .collect();
+        for association in &proxy.plugins {
+            let Some((plugin_config, plugin)) = scoped_plugins.get(&(
+                proxy.namespace.as_str(),
+                association.plugin_config_id.as_str(),
+            )) else {
+                continue;
+            };
+            let applies = match plugin_config.scope {
+                PluginScope::Proxy => plugin_config.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                PluginScope::ProxyGroup => plugin_config.proxy_id.is_none(),
+                PluginScope::Global => false,
+            };
+            if !applies {
+                continue;
+            }
+            remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
+            merged.push(Arc::clone(plugin));
+        }
+        if let Err(error) = validate_hmac_request_transform_composition(&merged) {
+            errors.push(format!("proxy_id={}: {error}", proxy.id));
+        }
+    }
+
+    if let Err(error) = validate_hmac_request_transform_composition(&global_plugins) {
+        errors.push(format!("global plugins: {error}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} HMAC request-transform composition error(s): {}",
+            errors.len(),
+            errors.join("; ")
+        ))
+    }
+}
+
 fn remove_shadowed_global_plugin(
     plugins: &mut Vec<Arc<dyn Plugin>>,
     global_ptrs: &HashSet<usize>,
@@ -2608,6 +2760,9 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
+            if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
             Arc::new(global_plugins)
         } else if rebuild_adaptive_globals {
             // Route compatibility can require a fresh global adaptive view
@@ -2845,6 +3000,9 @@ impl PluginCache {
 
             merged.sort_by_key(|p| p.priority());
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
+            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
             new_map.insert(proxy.id.clone(), Arc::new(merged));
@@ -3375,6 +3533,9 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
+            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
 
             // Pre-compute whether any plugin requires response body buffering
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());
@@ -3395,6 +3556,9 @@ impl PluginCache {
         // staged registry so ordering errors reject the whole cache build.
         global_plugins.sort_by_key(|p| p.priority());
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
+            plugin_errors.push(format!("global plugins: {e}"));
+        }
+        if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
 

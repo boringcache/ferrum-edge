@@ -1073,12 +1073,19 @@ fn test_direct_http2_pool_dispatch_disabled_by_body_limits() {
 #[test]
 fn test_request_may_have_body_uses_method_and_body_headers() {
     let no_headers = HashMap::new();
-    assert!(!request_may_have_body("GET", &no_headers));
-    assert!(request_may_have_body("POST", &no_headers));
-    assert!(request_may_have_body(
-        "GET",
-        &HashMap::from([("content-length".to_string(), "0".to_string())])
-    ));
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        assert!(!request_may_have_body(method, &no_headers));
+    }
+    for method in ["DELETE", "PATCH", "POST", "PUT"] {
+        assert!(request_may_have_body(method, &no_headers));
+    }
+
+    let content_length_zero = HashMap::from([("content-length".to_string(), "0".to_string())]);
+    let chunked = HashMap::from([("transfer-encoding".to_string(), "chunked".to_string())]);
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        assert!(request_may_have_body(method, &content_length_zero));
+        assert!(request_may_have_body(method, &chunked));
+    }
 }
 
 #[tokio::test]
