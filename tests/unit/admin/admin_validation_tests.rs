@@ -57,6 +57,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("release_namespace_config_admission_lease("));
     assert!(crud_source.contains("guard.ensure_held()"));
     assert!(crud_source.contains("guard.run_while_held(future).await?"));
+    assert!(crud_source.contains("run_to_completion_while_held"));
+    assert!(crud_source.contains("NamespaceConfigAdmissionCompletion::Lost"));
     assert!(crud_source.contains("task.abort();"));
     assert!(crud_source.contains("tokio::time::timeout("));
     assert!(crud_source.contains("drop(local);"));
@@ -99,9 +101,17 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "credential, batch, and restore mutations must share namespace admission"
     );
     assert!(
-        batch_source.matches(".run_while_held(").count() >= 3,
+        batch_source.matches(".run_while_held(").count() >= 1,
         "credential persistence must remain fenced after async validation"
     );
+    assert!(
+        batch_source
+            .matches(".run_to_completion_while_held(")
+            .count()
+            >= 4,
+        "batch and restore persistence must preserve concrete outcomes across lease loss"
+    );
+    assert!(batch_source.contains("rollback_failed_batch_create("));
     let sql_store_source = include_str!("../../../src/config/db_loader.rs");
     assert!(sql_store_source.contains("config_admission_locks"));
     assert!(sql_store_source.contains("config_admission_lease_now_sql"));

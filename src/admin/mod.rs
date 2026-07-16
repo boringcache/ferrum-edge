@@ -3200,6 +3200,119 @@ async fn persist_payload_resources(
     (counts, errors)
 }
 
+/// Remove only resources that a failed batch could have inserted. Pre-existing
+/// IDs from the raw primary snapshot are never deleted, and API specs are not
+/// touched because batch create cannot mutate them.
+async fn rollback_failed_batch_create(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    batch: &RestorePayload,
+    snapshot: &RestorePayload,
+) -> Result<(), Vec<String>> {
+    let prior_proxy_ids: HashSet<&str> = snapshot
+        .proxies
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect();
+    let prior_consumer_ids: HashSet<&str> = snapshot
+        .consumers
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect();
+    let prior_plugin_config_ids: HashSet<&str> = snapshot
+        .plugin_configs
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect();
+    let prior_upstream_ids: HashSet<&str> = snapshot
+        .upstreams
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect();
+    let mut errors = Vec::new();
+
+    // Remove dependants before their plugin/upstream dependencies.
+    for proxy in &batch.proxies {
+        if !prior_proxy_ids.contains(proxy.id.as_str()) {
+            match db.get_proxy(namespace, &proxy.id).await {
+                Ok(Some(current)) if current.updated_at == proxy.updated_at => {
+                    if let Err(error) = db.delete_proxy(namespace, &proxy.id).await {
+                        errors.push(format!("proxy '{}': {}", proxy.id, error));
+                    }
+                }
+                Ok(Some(_)) => errors.push(format!(
+                    "proxy '{}' changed after admission loss and was not deleted",
+                    proxy.id
+                )),
+                Ok(None) => {}
+                Err(error) => errors.push(format!("proxy '{}': {}", proxy.id, error)),
+            }
+        }
+    }
+    for plugin_config in &batch.plugin_configs {
+        if !prior_plugin_config_ids.contains(plugin_config.id.as_str()) {
+            match db.get_plugin_config(namespace, &plugin_config.id).await {
+                Ok(Some(current)) if current.updated_at == plugin_config.updated_at => {
+                    if let Err(error) = db
+                        .delete_plugin_config(namespace, &plugin_config.id)
+                        .await
+                    {
+                        errors.push(format!("plugin_config '{}': {}", plugin_config.id, error));
+                    }
+                }
+                Ok(Some(_)) => errors.push(format!(
+                    "plugin_config '{}' changed after admission loss and was not deleted",
+                    plugin_config.id
+                )),
+                Ok(None) => {}
+                Err(error) => {
+                    errors.push(format!("plugin_config '{}': {}", plugin_config.id, error));
+                }
+            }
+        }
+    }
+    for consumer in &batch.consumers {
+        if !prior_consumer_ids.contains(consumer.id.as_str()) {
+            match db.get_consumer(namespace, &consumer.id).await {
+                Ok(Some(current)) if current.updated_at == consumer.updated_at => {
+                    if let Err(error) = db.delete_consumer(namespace, &consumer.id).await {
+                        errors.push(format!("consumer '{}': {}", consumer.id, error));
+                    }
+                }
+                Ok(Some(_)) => errors.push(format!(
+                    "consumer '{}' changed after admission loss and was not deleted",
+                    consumer.id
+                )),
+                Ok(None) => {}
+                Err(error) => errors.push(format!("consumer '{}': {}", consumer.id, error)),
+            }
+        }
+    }
+    for upstream in &batch.upstreams {
+        if !prior_upstream_ids.contains(upstream.id.as_str()) {
+            match db.get_upstream(namespace, &upstream.id).await {
+                Ok(Some(current)) if current.updated_at == upstream.updated_at => {
+                    if let Err(error) = db.delete_upstream(namespace, &upstream.id).await {
+                        errors.push(format!("upstream '{}': {}", upstream.id, error));
+                    }
+                }
+                Ok(Some(_)) => errors.push(format!(
+                    "upstream '{}' changed after admission loss and was not deleted",
+                    upstream.id
+                )),
+                Ok(None) => {}
+                Err(error) => errors.push(format!("upstream '{}': {}", upstream.id, error)),
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 async fn rollback_failed_restore(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -4704,8 +4817,25 @@ async fn handle_batch_create(
         ));
     }
 
-    let (created, errors) = match _namespace_config_admission_guard
-        .run_while_held(persist_payload_resources(db.as_ref(), &batch, true))
+    // Batch persistence spans independently committed resource groups (and
+    // bounded chunks within a group). Capture the pre-batch IDs so lease loss
+    // can remove only resources this request may have inserted.
+    let batch_rollback_snapshot = match db.load_namespace_snapshot(namespace).await {
+        Ok(config) => restore_payload_from_config(config),
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": format!(
+                        "Batch aborted: prior config could not be snapshotted for admission recovery: {error}"
+                    )
+                }),
+            ));
+        }
+    };
+
+    let persistence = match _namespace_config_admission_guard
+        .run_to_completion_while_held(persist_payload_resources(db.as_ref(), &batch, true))
         .await
     {
         Ok(result) => result,
@@ -4713,6 +4843,85 @@ async fn handle_batch_create(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": format!("Config admission unavailable: {error}")}),
+            ));
+        }
+    };
+    let (created, errors) = match persistence {
+        crud::NamespaceConfigAdmissionCompletion::Held(result) => result,
+        crud::NamespaceConfigAdmissionCompletion::Lost {
+            result: (created, errors),
+            error,
+        } => {
+            error!(
+                namespace = %namespace,
+                %error,
+                "Batch: namespace admission was lost during persistence; reacquiring for rollback"
+            );
+            drop(_namespace_config_admission_guard);
+            let rollback_guard =
+                match crud::lock_namespace_config_admission(db.clone(), namespace).await {
+                    Ok(guard) => guard,
+                    Err(rollback_error) => {
+                        return Ok(json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({
+                                "error": format!(
+                                    "Config admission was lost during batch persistence and could not be reacquired for rollback: {rollback_error}"
+                                ),
+                                "admission_error": error.to_string(),
+                                "persistence_errors": errors,
+                                "created": {
+                                    "proxies": created.proxies,
+                                    "consumers": created.consumers,
+                                    "plugin_configs": created.plugin_configs,
+                                    "upstreams": created.upstreams,
+                                },
+                                "rollback": "not_started",
+                            }),
+                        ));
+                    }
+                };
+            let rollback = rollback_guard
+                .run_to_completion_while_held(rollback_failed_batch_create(
+                    db.as_ref(),
+                    namespace,
+                    &batch,
+                    &batch_rollback_snapshot,
+                ))
+                .await;
+            let (rollback_status, rollback_errors, rollback_admission_error) = match rollback {
+                Ok(crud::NamespaceConfigAdmissionCompletion::Held(Ok(()))) => {
+                    ("completed", None, None)
+                }
+                Ok(crud::NamespaceConfigAdmissionCompletion::Held(Err(errors))) => {
+                    ("incomplete", Some(errors), None)
+                }
+                Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
+                    result: Ok(()),
+                    error,
+                }) => ("completed", None, Some(error.to_string())),
+                Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
+                    result: Err(errors),
+                    error,
+                }) => ("incomplete", Some(errors), Some(error.to_string())),
+                Err(error) => ("not_started", None, Some(error.to_string())),
+            };
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Config admission was lost during batch persistence",
+                    "admission_error": error.to_string(),
+                    "persistence_errors": errors,
+                    "created": {
+                        "proxies": created.proxies,
+                        "consumers": created.consumers,
+                        "plugin_configs": created.plugin_configs,
+                        "upstreams": created.upstreams,
+                    },
+                    "rollback": rollback_status,
+                    "rollback_errors": rollback_errors,
+                    "rollback_admission_error": rollback_admission_error,
+                }),
             ));
         }
     };
@@ -4950,7 +5159,7 @@ async fn handle_restore(
             }),
         ));
     }
-    let _namespace_config_admission_guard =
+    let mut namespace_config_admission_guard =
         match crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(error) => {
@@ -5187,8 +5396,8 @@ async fn handle_restore(
 
     // Phase 3: Delete all existing resources in the namespace (safe: payload is
     // validated and the prior state has been snapshotted from the primary above).
-    let delete_result = match _namespace_config_admission_guard
-        .run_while_held(db.delete_all_resources(namespace))
+    let delete_completion = match namespace_config_admission_guard
+        .run_to_completion_while_held(db.delete_all_resources(namespace))
         .await
     {
         Ok(result) => result,
@@ -5199,6 +5408,70 @@ async fn handle_restore(
             ));
         }
     };
+    let (delete_result, delete_admission_error) = match delete_completion {
+        crud::NamespaceConfigAdmissionCompletion::Held(result) => (result, None),
+        crud::NamespaceConfigAdmissionCompletion::Lost { result, error } => {
+            (result, Some(error))
+        }
+    };
+    if let Some(error) = delete_admission_error {
+        error!(
+            namespace = %namespace,
+            %error,
+            "Restore: namespace admission was lost during clear; reacquiring for recovery"
+        );
+        drop(namespace_config_admission_guard);
+        namespace_config_admission_guard =
+            match crud::lock_namespace_config_admission(db.clone(), namespace).await {
+                Ok(guard) => guard,
+                Err(recovery_error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was lost during restore clear and could not be reacquired for recovery: {recovery_error}"
+                            ),
+                            "restore_errors": [error.to_string()],
+                        }),
+                    ));
+                }
+            };
+        if delete_result.is_ok() {
+            let rollback = finish_failed_restore(
+                state,
+                db.clone(),
+                actor,
+                namespace,
+                vec![format!(
+                    "namespace admission was lost during restore clear: {error}"
+                )],
+                &snapshot,
+            );
+            return Ok(match namespace_config_admission_guard
+                .run_to_completion_while_held(rollback)
+                .await
+            {
+                Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
+                Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
+                    error!(
+                        namespace = %namespace,
+                        %error,
+                        "Restore: admission was lost again after clear recovery completed"
+                    );
+                    result
+                }
+                Err(rollback_error) => json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Config admission was unavailable before restore clear recovery: {rollback_error}"
+                        ),
+                        "restore_errors": [error.to_string()],
+                    }),
+                ),
+            });
+        }
+    }
     if let Err(e) = delete_result {
         error!("Restore: failed to delete existing resources: {}", e);
         if e.mode().is_atomic() {
@@ -5280,18 +5553,34 @@ async fn handle_restore(
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
-    let (created, errors) = match _namespace_config_admission_guard
-        .run_while_held(persist_payload_resources(db.as_ref(), &payload, false))
+    let import_completion = match namespace_config_admission_guard
+        .run_to_completion_while_held(persist_payload_resources(db.as_ref(), &payload, false))
         .await
     {
         Ok(result) => result,
         Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Config admission unavailable: {error}")}),
+            ));
+        }
+    };
+    let (created, errors) = match import_completion {
+        crud::NamespaceConfigAdmissionCompletion::Held(result) => result,
+        crud::NamespaceConfigAdmissionCompletion::Lost {
+            result: (_, mut errors),
+            error,
+        } => {
             error!(
                 namespace = %namespace,
                 %error,
                 "Restore: namespace admission was lost during import; reacquiring for rollback"
             );
-            drop(_namespace_config_admission_guard);
+            errors.insert(
+                0,
+                format!("namespace admission was lost during restore import: {error}"),
+            );
+            drop(namespace_config_admission_guard);
             let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
                 .await
             {
@@ -5303,30 +5592,32 @@ async fn handle_restore(
                             "error": format!(
                                 "Config admission was lost during restore and could not be reacquired for rollback: {rollback_error}"
                             ),
-                            "restore_errors": [error.to_string()],
+                            "restore_errors": errors,
                         }),
                     ));
                 }
             };
-            let rollback = finish_failed_restore(
-                state,
-                db.clone(),
-                actor,
-                namespace,
-                vec![format!(
-                    "namespace admission was lost during restore import: {error}"
-                )],
-                &snapshot,
-            );
-            return Ok(match rollback_guard.run_while_held(rollback).await {
-                Ok(response) => response,
+            let rollback =
+                finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot);
+            return Ok(match rollback_guard
+                .run_to_completion_while_held(rollback)
+                .await
+            {
+                Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
+                Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
+                    error!(
+                        namespace = %namespace,
+                        %error,
+                        "Restore: admission was lost again after import rollback completed"
+                    );
+                    result
+                }
                 Err(rollback_error) => json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({
                         "error": format!(
-                            "Config admission was lost while rolling back a cancelled restore: {rollback_error}"
+                            "Config admission was unavailable before restore import rollback: {rollback_error}"
                         ),
-                        "restore_errors": [error.to_string()],
                     }),
                 ),
             });
@@ -5356,11 +5647,19 @@ async fn handle_restore(
         let rollback =
             finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot);
         return Ok(
-            match _namespace_config_admission_guard
-                .run_while_held(rollback)
+            match namespace_config_admission_guard
+                .run_to_completion_while_held(rollback)
                 .await
             {
-                Ok(response) => response,
+                Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
+                Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
+                    error!(
+                        namespace = %namespace,
+                        %error,
+                        "Restore: admission was lost after failed-import rollback completed"
+                    );
+                    result
+                }
                 Err(error) => json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     &json!({"error": format!("Config admission unavailable during restore rollback: {error}")}),

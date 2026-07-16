@@ -141,6 +141,14 @@ pub(crate) struct NamespaceConfigAdmissionGuard {
     lease_state_rx: tokio::sync::watch::Receiver<u64>,
 }
 
+pub(crate) enum NamespaceConfigAdmissionCompletion<T> {
+    Held(T),
+    Lost {
+        result: T,
+        error: anyhow::Error,
+    },
+}
+
 impl NamespaceConfigAdmissionGuard {
     pub(crate) fn ensure_held(&self) -> Result<(), anyhow::Error> {
         let elapsed_millis =
@@ -182,6 +190,66 @@ impl NamespaceConfigAdmissionGuard {
                 result = &mut future => {
                     self.ensure_held()?;
                     return Ok(result);
+                }
+            }
+        }
+    }
+
+    /// Run a persistence operation that is not cancellation-safe to a concrete
+    /// result while still observing the admission lease. If ownership is lost,
+    /// the caller receives both the completed result and the lease error so it
+    /// can verify or compensate under a newly acquired lease.
+    pub(crate) async fn run_to_completion_while_held<F, T>(
+        &self,
+        future: F,
+    ) -> Result<NamespaceConfigAdmissionCompletion<T>, anyhow::Error>
+    where
+        F: Future<Output = T>,
+    {
+        self.ensure_held()?;
+        let mut lease_state_rx = self.lease_state_rx.clone();
+        tokio::pin!(future);
+        loop {
+            let valid_until_millis = *lease_state_rx.borrow_and_update();
+            let elapsed_millis =
+                u64::try_from(self.lease_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if valid_until_millis == 0 || elapsed_millis >= valid_until_millis {
+                let result = future.await;
+                return Ok(NamespaceConfigAdmissionCompletion::Lost {
+                    result,
+                    error: anyhow::anyhow!(
+                        "namespace config admission lease was lost during persistence"
+                    ),
+                });
+            }
+            let remaining = Duration::from_millis(valid_until_millis - elapsed_millis);
+            tokio::select! {
+                biased;
+                changed = lease_state_rx.changed() => {
+                    if changed.is_err() {
+                        let result = future.await;
+                        return Ok(NamespaceConfigAdmissionCompletion::Lost {
+                            result,
+                            error: anyhow::anyhow!(
+                                "namespace config admission lease monitor stopped during persistence"
+                            ),
+                        });
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    let result = future.await;
+                    return Ok(NamespaceConfigAdmissionCompletion::Lost {
+                        result,
+                        error: anyhow::anyhow!(
+                            "namespace config admission lease expired during persistence"
+                        ),
+                    });
+                }
+                result = &mut future => {
+                    return Ok(match self.ensure_held() {
+                        Ok(()) => NamespaceConfigAdmissionCompletion::Held(result),
+                        Err(error) => NamespaceConfigAdmissionCompletion::Lost { result, error },
+                    });
                 }
             }
         }
