@@ -210,13 +210,13 @@ impl NamespaceConfigAdmissionGuard {
         self.ensure_held()?;
         let mut lease_state_rx = self.lease_state_rx.clone();
         tokio::pin!(future);
-        let persistence_started = std::cell::Cell::new(false);
+        let persistence_started = AtomicBool::new(false);
         loop {
             let valid_until_millis = *lease_state_rx.borrow_and_update();
             let elapsed_millis =
                 u64::try_from(self.lease_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             if valid_until_millis == 0 || elapsed_millis >= valid_until_millis {
-                if !persistence_started.get() {
+                if !persistence_started.load(Ordering::Acquire) {
                     anyhow::bail!(
                         "namespace config admission lease was lost before persistence started"
                     );
@@ -234,7 +234,7 @@ impl NamespaceConfigAdmissionGuard {
                 biased;
                 changed = lease_state_rx.changed() => {
                     if changed.is_err() {
-                        if !persistence_started.get() {
+                        if !persistence_started.load(Ordering::Acquire) {
                             anyhow::bail!(
                                 "namespace config admission lease monitor stopped before persistence started"
                             );
@@ -249,7 +249,7 @@ impl NamespaceConfigAdmissionGuard {
                     }
                 }
                 _ = tokio::time::sleep(remaining) => {
-                    if !persistence_started.get() {
+                    if !persistence_started.load(Ordering::Acquire) {
                         anyhow::bail!(
                             "namespace config admission lease expired before persistence started"
                         );
@@ -263,7 +263,7 @@ impl NamespaceConfigAdmissionGuard {
                     });
                 }
                 result = std::future::poll_fn(|context| {
-                    persistence_started.set(true);
+                    persistence_started.store(true, Ordering::Release);
                     future.as_mut().poll(context)
                 }) => {
                     return Ok(match self.ensure_held() {
