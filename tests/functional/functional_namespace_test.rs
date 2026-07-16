@@ -750,19 +750,21 @@ async fn run_mtls_dns_cross_process_admission_suite(backend: Backend) {
     rotated_consumer["credentials"] = serde_json::json!({
         "mtls_auth": [{"identity": "api.example.com"}]
     });
+    let association_url = format!("{}/proxies/{}", harness.admin_a, proxy_id);
+    let rotation_url = format!("{}/consumers/{}", harness.admin_b, rotating_id);
 
     let (association_response, rotation_response) = tokio::join!(
         admin_request(
             &client,
             reqwest::Method::PUT,
-            &format!("{}/proxies/{}", harness.admin_a, proxy_id),
+            &association_url,
             Some(&namespace),
             Some(&associated_proxy),
         ),
         admin_request(
             &client,
             reqwest::Method::PUT,
-            &format!("{}/consumers/{}", harness.admin_b, rotating_id),
+            &rotation_url,
             Some(&namespace),
             Some(&rotated_consumer),
         )
@@ -775,7 +777,10 @@ async fn run_mtls_dns_cross_process_admission_suite(backend: Backend) {
         backend.db_type()
     );
     assert_eq!(
-        statuses.iter().filter(|status| status.as_u16() == 409).count(),
+        statuses
+            .iter()
+            .filter(|status| status.as_u16() == 409)
+            .count(),
         1,
         "{} loser must fail closed with 409: {statuses:?}",
         backend.db_type()

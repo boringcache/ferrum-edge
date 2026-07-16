@@ -11,8 +11,8 @@
 use ferrum_edge::_test_support::{
     mongo_migration_lease_acquire_filter_classic, mongo_migration_lease_acquire_update_classic,
     mongo_migration_lease_duration_millis, mongo_migration_lease_renew_update_classic,
-    mongo_mtls_dns_admission_lock_filter, mongo_mtls_dns_admission_lock_update,
-    mongo_pipeline_update_unsupported,
+    mongo_mtls_dns_admission_drop_must_retain, mongo_mtls_dns_admission_lock_filter,
+    mongo_mtls_dns_admission_lock_update, mongo_pipeline_update_unsupported,
 };
 
 const OWNER: &str = "test-owner-uuid";
@@ -89,8 +89,27 @@ fn mtls_dns_admission_lock_has_no_expiry_takeover_path() {
     assert_eq!(set.get_str("owner").unwrap(), OWNER);
     assert!(set.get("expires_at").is_none());
     assert!(
-        update.get_document("$unset").unwrap().contains_key("expires_at"),
+        update
+            .get_document("$unset")
+            .unwrap()
+            .contains_key("expires_at"),
         "admission lock must erase any expiry field: {update:?}"
+    );
+}
+
+#[test]
+fn mtls_dns_admission_drop_retains_only_uncertain_mutations() {
+    assert!(
+        mongo_mtls_dns_admission_drop_must_retain(true, false),
+        "a dispatched mutation without a settled outcome must keep the durable fence"
+    );
+    assert!(
+        !mongo_mtls_dns_admission_drop_must_retain(false, false),
+        "pre-mutation validation cancellation may clean up its unused fence"
+    );
+    assert!(
+        !mongo_mtls_dns_admission_drop_must_retain(true, true),
+        "an explicit settled release may retry owner-qualified cleanup"
     );
 }
 

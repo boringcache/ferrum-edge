@@ -888,13 +888,11 @@ impl DatabaseStore {
             // SQLite has no SELECT ... FOR UPDATE. This write takes the
             // database writer lock inside the same transaction that will
             // persist and validate the candidate.
-            sqlx::query(
-                "UPDATE mtls_dns_admission_locks SET updated_at = ? WHERE namespace = ?",
-            )
-            .bind(now)
-            .bind(namespace)
-            .execute(&mut **tx)
-            .await?;
+            sqlx::query("UPDATE mtls_dns_admission_locks SET updated_at = ? WHERE namespace = ?")
+                .bind(now)
+                .bind(namespace)
+                .execute(&mut **tx)
+                .await?;
             sqlx::query_scalar::<_, Option<String>>(
                 "SELECT restore_owner FROM mtls_dns_admission_locks WHERE namespace = ?",
             )
@@ -2512,8 +2510,7 @@ impl DatabaseStore {
     pub async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
-        self.lock_mtls_dns_admission_tx(&mut tx, namespace)
-            .await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
 
         // Look up the proxy's current upstream_id before deleting so we can
         // cascade-delete that upstream if it becomes orphaned. Also capture the
@@ -2931,8 +2928,7 @@ impl DatabaseStore {
     pub async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
-        self.lock_mtls_dns_admission_tx(&mut tx, namespace)
-            .await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         // Scope the existence check to the caller's namespace (issue #2122):
         // consumer ids are only unique per namespace.
         let existing: Option<AnyRow> =
@@ -3106,8 +3102,7 @@ impl DatabaseStore {
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
-        self.lock_mtls_dns_admission_tx(&mut tx, namespace)
-            .await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         // Scope the existence check to the caller's namespace (issue #2122) so
         // a tenant cannot delete a same-id plugin config in another namespace.
         let existing: Option<AnyRow> =
@@ -4920,7 +4915,8 @@ impl DatabaseStore {
         proxies: &[Proxy],
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
-        self.batch_create_proxies_internal(proxies, true, mode).await
+        self.batch_create_proxies_internal(proxies, true, mode)
+            .await
     }
 
     pub async fn batch_create_proxies_without_plugins(
@@ -4960,8 +4956,10 @@ impl DatabaseStore {
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let mut admission_namespaces: Vec<&str> =
-            proxies.iter().map(|proxy| proxy.namespace.as_str()).collect();
+        let mut admission_namespaces: Vec<&str> = proxies
+            .iter()
+            .map(|proxy| proxy.namespace.as_str())
+            .collect();
         admission_namespaces.sort_unstable();
         admission_namespaces.dedup();
         for namespace in &admission_namespaces {
@@ -5148,12 +5146,8 @@ impl DatabaseStore {
             admission_namespaces.sort_unstable();
             admission_namespaces.dedup();
             for namespace in &admission_namespaces {
-                self.lock_mtls_dns_admission_for_owner_tx(
-                    &mut tx,
-                    namespace,
-                    mode.guard_owner(),
-                )
-                .await?;
+                self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
+                    .await?;
             }
             let mut seen = HashSet::new();
             let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
@@ -5305,9 +5299,7 @@ impl DatabaseStore {
         }
         let mut total = 0usize;
         for chunk in configs.chunks(Self::BATCH_CHUNK_SIZE) {
-            total += self
-                .batch_create_plugin_configs_chunk(chunk, mode)
-                .await?;
+            total += self.batch_create_plugin_configs_chunk(chunk, mode).await?;
         }
         self.check_slow_query("batch_create_plugin_configs", start);
         Ok(total)
@@ -7298,8 +7290,7 @@ impl DatabaseStore {
     /// have no FK to proxies, so they are cleaned up manually by api_spec_id.
     pub async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        self.lock_mtls_dns_admission_tx(&mut tx, namespace)
-            .await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
 
         // Find the proxy_id for this spec.

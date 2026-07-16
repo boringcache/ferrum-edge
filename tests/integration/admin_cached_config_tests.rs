@@ -2684,19 +2684,17 @@ async fn restore_rollback_replays_preexisting_ambiguous_mtls_dns_snapshot() {
         "raw ambiguous snapshot must remain rollback-capable: {body:?}"
     );
 
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, credentials FROM consumers WHERE namespace = ? ORDER BY id",
-    )
-    .bind("ferrum")
-    .fetch_all(&pool)
-    .await
-    .expect("Failed to inspect replayed consumers");
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, credentials FROM consumers WHERE namespace = ? ORDER BY id")
+            .bind("ferrum")
+            .fetch_all(&pool)
+            .await
+            .expect("Failed to inspect replayed consumers");
     assert_eq!(rows.len(), 2);
     let restored_identities: Vec<String> = rows
         .iter()
         .map(|(_, credentials)| {
-            serde_json::from_str::<Value>(credentials)
-                .unwrap()["mtls_auth"][0]["identity"]
+            serde_json::from_str::<Value>(credentials).unwrap()["mtls_auth"][0]["identity"]
                 .as_str()
                 .unwrap()
                 .to_string()
@@ -2704,21 +2702,20 @@ async fn restore_rollback_replays_preexisting_ambiguous_mtls_dns_snapshot() {
         .collect();
     assert_eq!(
         restored_identities,
-        vec![
-            "api.example.com".to_string(),
-            "API.Example.COM".to_string(),
-        ],
+        vec!["api.example.com".to_string(), "API.Example.COM".to_string(),],
         "rollback must replay the exact prior credential casing"
     );
-    let plugin_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM plugin_configs WHERE namespace = ? AND id = ?",
-    )
-    .bind("ferrum")
-    .bind("restore-dns-policy")
-    .fetch_one(&pool)
-    .await
-    .expect("Failed to inspect replayed mTLS policy");
-    assert_eq!(plugin_count, 1, "rollback must restore the active DNS policy");
+    let plugin_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM plugin_configs WHERE namespace = ? AND id = ?")
+            .bind("ferrum")
+            .bind("restore-dns-policy")
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to inspect replayed mTLS policy");
+    assert_eq!(
+        plugin_count, 1,
+        "rollback must restore the active DNS policy"
+    );
     let failed_proxy_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM proxies WHERE namespace = ? AND id = ?")
             .bind("ferrum")

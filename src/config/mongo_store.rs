@@ -44,8 +44,8 @@ mod inner {
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
         DeleteAllResourcesError, DeleteMode, IncrementalResult, MtlsDnsIdentityConflict,
-        NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR,
-        PaginatedResult, SnapshotDataIntegrityError, SortOrder,
+        NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+        SnapshotDataIntegrityError, SortOrder,
     };
     use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
     use crate::config::types::{
@@ -58,6 +58,7 @@ mod inner {
     use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
+    use dashmap::DashMap;
     use mongodb::bson::{
         Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
     };
@@ -353,6 +354,44 @@ mod inner {
         UntilExplicitRelease,
     }
 
+    /// Whether dropping a durable admission guard may remove its lock.
+    ///
+    /// A guard starts before any protected write exists, so cancellation while
+    /// validating may clean up. Once a MongoDB mutation has been dispatched,
+    /// an error or cancelled future cannot prove whether the server committed
+    /// it; that state must retain both the datastore fence and the connection
+    /// generation pin. Only an explicit `release()` call declares the outcome
+    /// settled and authorizes owner-qualified cleanup (including a Drop retry).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DurableAdmissionMutationState {
+        NotStarted,
+        InFlightOrUncertain,
+        Settled,
+    }
+
+    fn durable_admission_drop_must_retain(
+        mode: MongoLockMode,
+        state: DurableAdmissionMutationState,
+    ) -> bool {
+        mode == MongoLockMode::UntilExplicitRelease
+            && state == DurableAdmissionMutationState::InFlightOrUncertain
+    }
+
+    /// A connection bundle paired with the read side of the store's
+    /// generation barrier. Keeping this value alive prevents reconnect or
+    /// failover from swapping the bundle out from under a protected mutation.
+    struct MongoAdmissionConnectionPin {
+        connection: Arc<MongoConnectionBundle>,
+        _generation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    }
+
+    /// Store-held pin for one complete restore rollback. Individual replay
+    /// batches borrow the same durable owner and exact connection bundle.
+    struct MongoPersistentRestorePin {
+        namespace: String,
+        pin: MongoAdmissionConnectionPin,
+    }
+
     struct MongoLockGuard {
         // Collection handle bound to the reusable DEDICATED lease client/pool,
         // deliberately separate from the store's work pool so acquire, renew,
@@ -369,9 +408,18 @@ mod inner {
         renew_task: Option<tokio::task::JoinHandle<()>>,
         valid: Arc<AtomicBool>,
         released: bool,
+        mutation_state: DurableAdmissionMutationState,
         // A replay operation borrows the outer rollback guard and must never
         // delete it when the individual batch finishes.
         delete_on_release: bool,
+        // Read side of the connection-generation barrier. Ordinary admission
+        // guards own it directly. Whole-rollback guards transfer it into
+        // `MongoStore::persistent_restore_pins` between replay batches.
+        connection_generation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        // If an in-flight mutation future is cancelled or errors, Drop moves
+        // the generation pin here instead of releasing it. That keeps this
+        // process from reconnecting around the fail-closed datastore fence.
+        retained_admission_pins: Arc<DashMap<String, MongoAdmissionConnectionPin>>,
         // Keeps the live connection bundle — and the generated TLS PEM temp
         // files it owns — alive for as long as the reusable lease client may
         // open new sockets, including the best-effort Drop cleanup task.
@@ -379,15 +427,42 @@ mod inner {
     }
 
     impl MongoLockGuard {
-        fn into_persistent_owner(mut self) -> String {
+        fn mark_mutation_started(&mut self) {
+            if self.mode == MongoLockMode::UntilExplicitRelease && self.delete_on_release {
+                self.mutation_state = DurableAdmissionMutationState::InFlightOrUncertain;
+            }
+        }
+
+        fn into_persistent_owner(
+            mut self,
+        ) -> Result<(String, MongoAdmissionConnectionPin), anyhow::Error> {
+            let generation_guard = self.connection_generation_guard.take().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MongoDB {} guard '{}' has no connection-generation pin",
+                    self.label,
+                    self.lock_id
+                )
+            })?;
             self.released = true;
-            self.owner.clone()
+            Ok((
+                self.owner.clone(),
+                MongoAdmissionConnectionPin {
+                    connection: self._connection.clone(),
+                    _generation_guard: generation_guard,
+                },
+            ))
         }
 
         async fn release(&mut self) -> Result<(), anyhow::Error> {
             if !self.delete_on_release {
                 self.released = true;
                 return Ok(());
+            }
+            if self.mode == MongoLockMode::UntilExplicitRelease {
+                // Calling release is the only declaration that the protected
+                // mutation has a settled outcome. A failed cleanup can now be
+                // retried safely without reopening an uncertain-write race.
+                self.mutation_state = DurableAdmissionMutationState::Settled;
             }
             if let Some(stop_tx) = self.stop_tx.take() {
                 let _ = stop_tx.send(true);
@@ -462,6 +537,23 @@ mod inner {
             if self.released || !self.delete_on_release {
                 return;
             }
+            if durable_admission_drop_must_retain(self.mode, self.mutation_state) {
+                let retained_key = format!("{}:{}", self.lock_id, self.owner);
+                if let Some(generation_guard) = self.connection_generation_guard.take() {
+                    let _ = self.retained_admission_pins.insert(
+                        retained_key,
+                        MongoAdmissionConnectionPin {
+                            connection: self._connection.clone(),
+                            _generation_guard: generation_guard,
+                        },
+                    );
+                }
+                error!(
+                    "Retaining MongoDB {} lock '{}' and its connection generation because the protected mutation outcome is uncertain; verify the write outcome and restart this admin process before manually removing the owner-qualified lock",
+                    self.label, self.lock_id
+                );
+                return;
+            }
             if let Some(stop_tx) = self.stop_tx.take() {
                 let _ = stop_tx.send(true);
             }
@@ -475,22 +567,49 @@ mod inner {
             // best-effort cleanup so the dedicated lease client can still open
             // a socket even if the store's bundle was already swapped/dropped.
             let connection = self._connection.clone();
+            let connection_generation_guard = self.connection_generation_guard.take();
+            let retained_admission_pins = self.retained_admission_pins.clone();
+            let retain_pin_on_cleanup_error = self.mode == MongoLockMode::UntilExplicitRelease
+                && self.mutation_state == DurableAdmissionMutationState::Settled;
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let _cleanup_task = runtime.spawn(async move {
                     let _connection = connection;
+                    let mut connection_generation_guard = connection_generation_guard;
                     if let Some(renew_task) = renew_task {
                         let _ = renew_task.await;
                     }
                     let delete = collection.delete_one(doc! {
-                        "_id": lock_id,
-                        "owner": owner,
+                        "_id": &lock_id,
+                        "owner": &owner,
                     });
-                    if majority {
-                        let _ = delete.write_concern(WriteConcern::majority()).await;
+                    let cleanup_result = if majority {
+                        delete.write_concern(WriteConcern::majority()).await
                     } else {
-                        let _ = delete.await;
+                        delete.await
+                    };
+                    if cleanup_result.is_err()
+                        && retain_pin_on_cleanup_error
+                        && let Some(generation_guard) = connection_generation_guard.take()
+                    {
+                        let _ = retained_admission_pins.insert(
+                            format!("{lock_id}:{owner}"),
+                            MongoAdmissionConnectionPin {
+                                connection: _connection,
+                                _generation_guard: generation_guard,
+                            },
+                        );
                     }
                 });
+            } else if retain_pin_on_cleanup_error
+                && let Some(generation_guard) = connection_generation_guard
+            {
+                let _ = retained_admission_pins.insert(
+                    format!("{}:{}", self.lock_id, self.owner),
+                    MongoAdmissionConnectionPin {
+                        connection,
+                        _generation_guard: generation_guard,
+                    },
+                );
             }
         }
     }
@@ -623,6 +742,20 @@ mod inner {
         // client can still open sockets, then removes them when the final old
         // bundle reference is dropped.
         connection: Arc<ArcSwap<MongoConnectionBundle>>,
+        // Admission operations hold the read side from lock acquisition
+        // through validation, mutation, and owner-qualified release. A
+        // reconnect must take the write side before swapping `connection`, so
+        // one protected operation can never straddle MongoDB generations.
+        connection_generation: Arc<tokio::sync::RwLock<()>>,
+        // Whole-rollback guards outlive an individual trait call. Their owner
+        // token indexes the exact connection bundle and generation pin that
+        // every clear/replay batch must borrow until explicit release.
+        persistent_restore_pins: Arc<DashMap<String, MongoPersistentRestorePin>>,
+        // An uncertain mutation deliberately leaks neither availability nor
+        // safety silently: retain its connection pin for this process's
+        // lifetime, log operator recovery guidance, and leave the durable
+        // owner-qualified fence in MongoDB.
+        retained_admission_pins: Arc<DashMap<String, MongoAdmissionConnectionPin>>,
         // Settings captured at startup so failover rebuilds use identical
         // ClientOptions for every non-URL field.
         conn_settings: MongoConnSettings,
@@ -705,6 +838,9 @@ mod inner {
 
             Ok(Self {
                 connection: Arc::new(ArcSwap::from_pointee(connection)),
+                connection_generation: Arc::new(tokio::sync::RwLock::new(())),
+                persistent_restore_pins: Arc::new(DashMap::new()),
+                retained_admission_pins: Arc::new(DashMap::new()),
                 conn_settings,
                 db_type_str: "mongodb".to_string(),
                 slow_query_threshold_ms: None,
@@ -1138,6 +1274,27 @@ mod inner {
             self.connection.load_full()
         }
 
+        fn install_reconnected_bundle(
+            &self,
+            new_connection: MongoConnectionBundle,
+            replica_set_configured: bool,
+        ) -> Result<(), anyhow::Error> {
+            // Never swap generations while an admission guard is validating,
+            // mutating, cleaning up, or spanning a restore rollback. In
+            // particular, an uncertain write retains a read pin indefinitely;
+            // reconnect must fail fast rather than wait forever or route later
+            // writes around its fail-closed fence.
+            let _generation_guard = self.connection_generation.try_write().map_err(|_| {
+                anyhow::anyhow!(
+                    "MongoDB reconnect deferred while an mTLS DNS admission operation pins the current connection generation"
+                )
+            })?;
+            let _old_connection = self.connection.swap(Arc::new(new_connection));
+            self.replica_set_configured
+                .store(replica_set_configured, Ordering::Release);
+            Ok(())
+        }
+
         /// Aggregation-pipeline update that takes or holds the migration lease
         /// using MongoDB SERVER time (`$$NOW`). Clock skew on the connecting
         /// client can never enter the expiry comparison: the server both
@@ -1277,10 +1434,7 @@ mod inner {
         /// Deliberately absent: any expiry/takeover clause. A retry may match
         /// its own owner after an uncertain response, but another owner can
         /// only observe duplicate-key contention on the fixed namespace `_id`.
-        pub(crate) fn mtls_dns_admission_lock_filter(
-            namespace: &str,
-            owner: &str,
-        ) -> Document {
+        pub(crate) fn mtls_dns_admission_lock_filter(namespace: &str, owner: &str) -> Document {
             doc! {
                 "_id": namespace,
                 "$or": [
@@ -1305,6 +1459,20 @@ mod inner {
                 "$unset": { "expires_at": "" },
                 "$setOnInsert": { "created_at": client_now },
             }
+        }
+
+        pub(crate) fn mtls_dns_admission_drop_must_retain_for_test(
+            mutation_started: bool,
+            outcome_settled: bool,
+        ) -> bool {
+            let state = if outcome_settled {
+                DurableAdmissionMutationState::Settled
+            } else if mutation_started {
+                DurableAdmissionMutationState::InFlightOrUncertain
+            } else {
+                DurableAdmissionMutationState::NotStarted
+            };
+            durable_admission_drop_must_retain(MongoLockMode::UntilExplicitRelease, state)
         }
 
         async fn acquire_migration_lease(&self) -> Result<MongoLockGuard, anyhow::Error> {
@@ -1379,6 +1547,12 @@ mod inner {
             Ok(())
         }
 
+        fn mark_mtls_dns_mutations_started(leases: &mut [MongoLockGuard]) {
+            for lease in leases {
+                lease.mark_mutation_started();
+            }
+        }
+
         async fn validate_mtls_dns_candidate<F>(
             &self,
             namespace: &str,
@@ -1410,15 +1584,30 @@ mod inner {
             // automatic crash recovery for fail-closed uniqueness. Acquisition
             // is bounded so an orphan produces an actionable error instead of
             // hanging an admin request forever.
-            let connection = self.connection();
-            let collection = connection
-                .lease_client
-                .database(connection.db.name())
-                .collection::<Document>(collection_name);
             let owner = guard_owner
                 .map(str::to_string)
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             let lock_id = lock_id.to_string();
+            let (connection, connection_generation_guard) = if guard_owner.is_some() {
+                let persistent_pin = self.persistent_restore_pins.get(&owner).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "MongoDB {label} rollback guard '{lock_id}' is not active in this admin process"
+                    )
+                })?;
+                if persistent_pin.namespace != lock_id {
+                    anyhow::bail!(
+                        "MongoDB {label} rollback guard '{lock_id}' belongs to a different namespace"
+                    );
+                }
+                (persistent_pin.pin.connection.clone(), None)
+            } else {
+                let generation_guard = self.connection_generation.clone().read_owned().await;
+                (self.connection(), Some(generation_guard))
+            };
+            let collection = connection
+                .lease_client
+                .database(connection.db.name())
+                .collection::<Document>(collection_name);
 
             if guard_owner.is_some() {
                 let client_now = BsonDateTime::now();
@@ -1449,7 +1638,10 @@ mod inner {
                     renew_task: None,
                     valid: Arc::new(AtomicBool::new(true)),
                     released: false,
+                    mutation_state: DurableAdmissionMutationState::NotStarted,
                     delete_on_release: false,
+                    connection_generation_guard,
+                    retained_admission_pins: self.retained_admission_pins.clone(),
                     _connection: connection,
                 });
             }
@@ -1481,7 +1673,10 @@ mod inner {
                             renew_task: None,
                             valid: Arc::new(AtomicBool::new(true)),
                             released: false,
+                            mutation_state: DurableAdmissionMutationState::NotStarted,
                             delete_on_release: true,
+                            connection_generation_guard,
+                            retained_admission_pins: self.retained_admission_pins.clone(),
                             _connection: connection,
                         });
                     }
@@ -1544,11 +1739,7 @@ mod inner {
                         let client_now = BsonDateTime::now();
                         collection
                             .find_one_and_update(
-                                Self::lease_acquire_filter_classic(
-                                    &lock_id,
-                                    &owner,
-                                    client_now,
-                                ),
+                                Self::lease_acquire_filter_classic(&lock_id, &owner, client_now),
                                 Self::migration_lease_acquire_update_classic(&owner, client_now),
                             )
                             .upsert(true)
@@ -1663,15 +1854,13 @@ mod inner {
                                     renew_valid.store(false, Ordering::Release);
                                     error!(
                                         "MongoDB {} lease expired after renewal failures: {}",
-                                        renew_label,
-                                        error
+                                        renew_label, error
                                     );
                                     return;
                                 }
                                 debug!(
                                     "MongoDB {} lease renewal failed; retrying before expiry: {}",
-                                    renew_label,
-                                    error
+                                    renew_label, error
                                 );
                                 tokio::select! {
                                     changed = stop_rx.changed() => {
@@ -1697,7 +1886,10 @@ mod inner {
                 renew_task: Some(renew_task),
                 valid,
                 released: false,
+                mutation_state: DurableAdmissionMutationState::NotStarted,
                 delete_on_release: true,
+                connection_generation_guard: None,
+                retained_admission_pins: self.retained_admission_pins.clone(),
                 _connection: connection,
             })
         }
@@ -4116,6 +4308,7 @@ mod inner {
             .await?;
             let doc = proxy_to_doc(proxy)?;
             let guard_params = ProxyWriteGuardParams::from_proxy(proxy);
+            mtls_lease.mark_mutation_started();
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -4276,6 +4469,7 @@ mod inner {
             // the method cannot succeed with an untagged spec-owned proxy.
             let mut doc = proxy_to_doc(proxy)?;
             let guard_params = ProxyWriteGuardParams::from_proxy(proxy);
+            mtls_lease.mark_mutation_started();
 
             let use_replica_set = self.replica_set_configured.load(Ordering::Acquire);
             if use_replica_set {
@@ -4526,6 +4720,7 @@ mod inner {
                     .retain(|plugin| plugin.proxy_id.as_deref() != Some(id));
             })
             .await?;
+            mtls_lease.mark_mutation_started();
             if self.replica_set_configured.load(Ordering::Acquire) {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5029,6 +5224,7 @@ mod inner {
             .await?;
             let doc = consumer_to_doc(consumer)?;
             let identity_values = consumer_identity_values(consumer);
+            mtls_lease.mark_mutation_started();
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5147,6 +5343,7 @@ mod inner {
             let doc = consumer_to_doc(consumer)?;
             let new_identity_values = consumer_identity_values(consumer);
             let composite_id = consumer_doc_id(&consumer.namespace, &consumer.id);
+            mtls_lease.mark_mutation_started();
             let matched = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5338,6 +5535,7 @@ mod inner {
             })
             .await?;
             let composite_id = consumer_doc_id(namespace, id);
+            mtls_lease.mark_mutation_started();
             let deleted = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5461,9 +5659,7 @@ mod inner {
 
         async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
-            let mut mtls_lease = self
-                .acquire_mtls_dns_admission_lease(&pc.namespace)
-                .await?;
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(&pc.namespace).await?;
             self.validate_mtls_dns_candidate(&pc.namespace, |candidate| {
                 if let Some(existing) = candidate
                     .plugin_configs
@@ -5477,6 +5673,7 @@ mod inner {
             })
             .await?;
             let doc = plugin_config_to_doc(pc)?;
+            mtls_lease.mark_mutation_started();
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5562,9 +5759,7 @@ mod inner {
 
         async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
-            let mut mtls_lease = self
-                .acquire_mtls_dns_admission_lease(&pc.namespace)
-                .await?;
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(&pc.namespace).await?;
             self.validate_mtls_dns_candidate(&pc.namespace, |candidate| {
                 if let Some(existing) = candidate
                     .plugin_configs
@@ -5603,6 +5798,7 @@ mod inner {
             if let Some(sid) = existing_spec_id {
                 doc.insert("api_spec_id", sid);
             }
+            mtls_lease.mark_mutation_started();
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5746,6 +5942,7 @@ mod inner {
                     affected_proxy_ids.push(proxy_id.to_string());
                 }
             }
+            mtls_lease.mark_mutation_started();
             let deleted = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -6652,6 +6849,7 @@ mod inner {
                 }
             }
             let docs: Vec<Document> = proxies.iter().map(proxy_to_doc).collect::<Result<_, _>>()?;
+            Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -6801,6 +6999,7 @@ mod inner {
                     )
                 })
                 .collect();
+            Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -6967,6 +7166,7 @@ mod inner {
                 .iter()
                 .map(plugin_config_to_doc)
                 .collect::<Result<_, _>>()?;
+            Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -7149,21 +7349,29 @@ mod inner {
             namespace: &str,
             write_mode: &BatchConfigWriteMode,
         ) -> Result<DeleteMode, DeleteAllResourcesError> {
-            // Capture the topology-dependent mode exactly once. This same value
-            // selects the implementation branch and is returned on success or
-            // carried by an error, so a concurrent reconnect cannot make the
-            // caller classify a different mode than the one that actually ran.
+            let mut mtls_lease = self
+                .acquire_mtls_dns_admission_lease_for_mode(namespace, write_mode)
+                .await
+                .map_err(|source| {
+                    let mode = if self.replica_set_configured() {
+                        DeleteMode::Atomic
+                    } else {
+                        DeleteMode::NonAtomic
+                    };
+                    DeleteAllResourcesError::new(mode, source)
+                })?;
+            // Capture topology only after the guard pins its connection
+            // generation. This value selects the implementation branch and is
+            // returned on success or carried by an error, so reconnect cannot
+            // make the request classify a different bundle than it mutates.
             let mode = if self.replica_set_configured() {
                 DeleteMode::Atomic
             } else {
                 DeleteMode::NonAtomic
             };
             let delete_error = |source: anyhow::Error| DeleteAllResourcesError::new(mode, source);
-            let mut mtls_lease = self
-                .acquire_mtls_dns_admission_lease_for_mode(namespace, write_mode)
-                .await
-                .map_err(&delete_error)?;
             let ns_filter = doc! { "namespace": namespace };
+            mtls_lease.mark_mutation_started();
             if mode.is_atomic() {
                 let connection = self.connection();
                 let mut session = connection
@@ -7371,7 +7579,15 @@ mod inner {
             namespace: &str,
         ) -> Result<String, anyhow::Error> {
             let guard = self.acquire_mtls_dns_admission_lease(namespace).await?;
-            Ok(guard.into_persistent_owner())
+            let (owner, pin) = guard.into_persistent_owner()?;
+            let _ = self.persistent_restore_pins.insert(
+                owner.clone(),
+                MongoPersistentRestorePin {
+                    namespace: namespace.to_string(),
+                    pin,
+                },
+            );
+            Ok(owner)
         }
 
         async fn release_restore_rollback_guard(
@@ -7379,7 +7595,22 @@ mod inner {
             namespace: &str,
             guard_owner: &str,
         ) -> Result<(), anyhow::Error> {
-            let connection = self.connection();
+            let connection = {
+                let persistent_pin = self
+                    .persistent_restore_pins
+                    .get(guard_owner)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "MongoDB mTLS DNS restore rollback guard is not active in this admin process for namespace '{namespace}'"
+                        )
+                    })?;
+                if persistent_pin.namespace != namespace {
+                    anyhow::bail!(
+                        "MongoDB mTLS DNS restore rollback guard belongs to a different namespace than '{namespace}'"
+                    );
+                }
+                persistent_pin.pin.connection.clone()
+            };
             let result = connection
                 .lease_client
                 .database(connection.db.name())
@@ -7392,6 +7623,7 @@ mod inner {
                     "MongoDB mTLS DNS restore rollback guard ownership was lost for namespace '{namespace}'"
                 );
             }
+            let _ = self.persistent_restore_pins.remove(guard_owner);
             Ok(())
         }
 
@@ -7423,9 +7655,7 @@ mod inner {
             // generated TLS files are owned by the same bundle as the driver
             // client, so old files are deleted only after the final old bundle
             // reference is dropped.
-            let _old_connection = self.connection.swap(Arc::new(new_connection));
-            self.replica_set_configured
-                .store(replica_set_configured, Ordering::Release);
+            self.install_reconnected_bundle(new_connection, replica_set_configured)?;
 
             info!(
                 "MongoDB client reconnected to {} (replica_set={})",
@@ -8048,12 +8278,22 @@ mod inner {
                 .acquire_mtls_dns_admission_leases(
                     std::iter::once(spec.namespace.as_str())
                         .chain(std::iter::once(bundle.proxy.namespace.as_str()))
-                        .chain(bundle.plugins.iter().map(|plugin| plugin.namespace.as_str())),
+                        .chain(
+                            bundle
+                                .plugins
+                                .iter()
+                                .map(|plugin| plugin.namespace.as_str()),
+                        ),
                 )
                 .await?;
             let namespaces: HashSet<&str> = std::iter::once(spec.namespace.as_str())
                 .chain(std::iter::once(bundle.proxy.namespace.as_str()))
-                .chain(bundle.plugins.iter().map(|plugin| plugin.namespace.as_str()))
+                .chain(
+                    bundle
+                        .plugins
+                        .iter()
+                        .map(|plugin| plugin.namespace.as_str()),
+                )
                 .collect();
             for namespace in namespaces {
                 self.validate_mtls_dns_candidate(namespace, |candidate| {
@@ -8071,6 +8311,7 @@ mod inner {
                 .await?;
             }
 
+            Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
             let use_replica_set = self.replica_set_configured();
             let mut orphaned_proxy_group_plugin_deletes = Vec::new();
             if use_replica_set {
@@ -8265,7 +8506,12 @@ mod inner {
                 .acquire_mtls_dns_admission_leases(
                     std::iter::once(spec.namespace.as_str())
                         .chain(std::iter::once(bundle.proxy.namespace.as_str()))
-                        .chain(bundle.plugins.iter().map(|plugin| plugin.namespace.as_str())),
+                        .chain(
+                            bundle
+                                .plugins
+                                .iter()
+                                .map(|plugin| plugin.namespace.as_str()),
+                        ),
                 )
                 .await?;
 
@@ -8298,6 +8544,7 @@ mod inner {
                     == Some(desired_resource_hash.as_str())
             {
                 // Only update metadata fields on the spec doc.
+                Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
                 self.api_specs()
                     .replace_one(
                         doc! { "_id": &spec.id, "namespace": &spec.namespace },
@@ -8445,6 +8692,7 @@ mod inner {
                 .await?;
             }
 
+            Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
             let use_replica_set = self.replica_set_configured();
             let mut old_plugin_configs_deleted_for_changes = true;
             let mut old_upstreams_deleted_for_changes = true;
@@ -9151,6 +9399,7 @@ mod inner {
                 )
             };
             let mut orphaned_proxy_group_plugin_deletes = Vec::new();
+            mtls_lease.mark_mutation_started();
             if use_replica_set {
                 // With a replica set: use a multi-document transaction so that a
                 // partial failure does not leave orphaned proxy/upstream/plugin rows.
@@ -10910,10 +11159,12 @@ mod inner {
             let lease_client = mongodb::Client::with_options(opts)
                 .expect("lease Client::with_options should accept empty hosts");
             let db = client.database(&settings.database_name);
-            let connection =
-                MongoConnectionBundle::new(client, db, lease_client, Vec::new());
+            let connection = MongoConnectionBundle::new(client, db, lease_client, Vec::new());
             MongoStore {
                 connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
+                connection_generation: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+                persistent_restore_pins: std::sync::Arc::new(DashMap::new()),
+                retained_admission_pins: std::sync::Arc::new(DashMap::new()),
                 conn_settings: settings,
                 db_type_str: "mongodb".to_string(),
                 slow_query_threshold_ms: None,
@@ -10984,44 +11235,41 @@ mod inner {
             );
         }
 
-        /// White-box check that successful `reconnect()` actually replaces
-        /// the underlying `Client` and `Database` handles. Earlier code held
-        /// `client: Client` and `db: Database` directly and the trait's
-        /// `&self` receiver made replacement impossible — every "reconnect"
-        /// just pinged the old client, so a genuinely-down standalone
-        /// MongoDB deployment would never recover.
+        /// White-box check that successful `reconnect()` replaces the bundle,
+        /// but cannot do so while admission pins the current generation.
         ///
         /// We can't run a real reconnect without a live MongoDB, so this
-        /// test simulates a successful rebuild by directly swapping new
-        /// Client + Database handles into the ArcSwap fields and verifies
-        /// `db()` returns the new handle. If somebody re-introduces a
-        /// `client: Client` / `db: Database` field (or makes `db()` return
-        /// the original startup handle), this test fails to compile or
-        /// returns the wrong namespace.
+        /// test simulates a successful rebuild through the same install helper
+        /// as `reconnect()`. This pins the security boundary as well as the
+        /// accessor: validation and mutation must not straddle generations.
         #[tokio::test(flavor = "current_thread")]
-        async fn db_accessor_reflects_swapped_handle() {
+        async fn admission_pin_blocks_swap_then_accessor_reflects_new_bundle() {
             let store = make_test_store(vec![]);
 
-            // Build a "fresh" client+db pretending failover succeeded.
-            let opts = mongodb::options::ClientOptions::builder()
-                .hosts(vec![])
-                .build();
-            let new_client = mongodb::Client::with_options(opts.clone()).unwrap();
-            let new_lease_client = mongodb::Client::with_options(opts).unwrap();
-            let new_db = new_client.database("after_failover");
+            let connection_bundle = |database_name: &str| {
+                let opts = mongodb::options::ClientOptions::builder()
+                    .hosts(vec![])
+                    .build();
+                let client = mongodb::Client::with_options(opts.clone()).unwrap();
+                let lease_client = mongodb::Client::with_options(opts).unwrap();
+                let db = client.database(database_name);
+                MongoConnectionBundle::new(client, db, lease_client, Vec::new())
+            };
 
             // Confirm the accessor sees the original namespace before the swap.
             assert_eq!(store.db().name(), "test");
 
-            // Swap in the new bundle (mirrors what `reconnect()` does on success).
+            let admission_pin = store.connection_generation.clone().read_owned().await;
+            let blocked = store
+                .install_reconnected_bundle(connection_bundle("blocked_failover"), false)
+                .expect_err("an admission pin must block reconnect/failover bundle replacement");
+            assert!(blocked.to_string().contains("admission operation pins"));
+            assert_eq!(store.db().name(), "test");
+            drop(admission_pin);
+
             store
-                .connection
-                .store(std::sync::Arc::new(MongoConnectionBundle::new(
-                    new_client,
-                    new_db,
-                    new_lease_client,
-                    Vec::new(),
-                )));
+                .install_reconnected_bundle(connection_bundle("after_failover"), false)
+                .expect("the bundle may swap after the admission generation pin is released");
 
             // Accessor must now return the swapped handle. If it kept a
             // captured copy of the original `db` field (the pre-fix bug),

@@ -600,20 +600,14 @@ async fn independent_sqlite_stores_serialize_mtls_dns_consumer_admission() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("mtls_dns_cross_process_consumers.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let store_a = DatabaseStore::connect_with_pool_config(
-        "sqlite",
-        &db_url,
-        DbPoolConfig::default(),
-    )
-    .await
-    .unwrap();
-    let store_b = DatabaseStore::connect_with_pool_config(
-        "sqlite",
-        &db_url,
-        DbPoolConfig::default(),
-    )
-    .await
-    .unwrap();
+    let store_a =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    let store_b =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
 
     let now = chrono::Utc::now();
     store_a
@@ -672,22 +666,18 @@ async fn independent_sqlite_stores_serialize_mtls_dns_consumer_admission() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independent_sqlite_stores_atomically_serialize_policy_association_and_identity_update() {
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("mtls_dns_cross_process_association.db");
+    let db_path = temp_dir
+        .path()
+        .join("mtls_dns_cross_process_association.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let store_a = DatabaseStore::connect_with_pool_config(
-        "sqlite",
-        &db_url,
-        DbPoolConfig::default(),
-    )
-    .await
-    .unwrap();
-    let store_b = DatabaseStore::connect_with_pool_config(
-        "sqlite",
-        &db_url,
-        DbPoolConfig::default(),
-    )
-    .await
-    .unwrap();
+    let store_a =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    let store_b =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
 
     let mut owner = make_consumer("owner", "alice");
     owner.credentials.insert(
@@ -780,20 +770,14 @@ async fn restore_rollback_guard_blocks_other_sqlite_admin_writers_across_batches
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("mtls_dns_restore_guard.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let store_a = DatabaseStore::connect_with_pool_config(
-        "sqlite",
-        &db_url,
-        DbPoolConfig::default(),
-    )
-    .await
-    .unwrap();
-    let store_b = DatabaseStore::connect_with_pool_config(
-        "sqlite",
-        &db_url,
-        DbPoolConfig::default(),
-    )
-    .await
-    .unwrap();
+    let store_a =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    let store_b =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
 
     let guard_owner = store_a
         .acquire_restore_rollback_guard("ferrum")

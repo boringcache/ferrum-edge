@@ -14,8 +14,7 @@ use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{
-    DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
-    is_mtls_dns_identity_conflict,
+    DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_identity_conflict,
 };
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
@@ -474,9 +473,7 @@ pub(crate) trait AdminResource:
         // Surface the constraint message (it names the conflicting key);
         // everything else stays a redacted 500.
         let message = error.to_string();
-        if is_mtls_dns_identity_conflict(error)
-            || super::is_unique_constraint_violation(&message)
-        {
+        if is_mtls_dns_identity_conflict(error) || super::is_unique_constraint_violation(&message) {
             super::json_response(StatusCode::CONFLICT, &json!({ "error": message }))
         } else {
             super::json_response(
@@ -488,10 +485,7 @@ pub(crate) trait AdminResource:
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
         if is_mtls_dns_identity_conflict(error) {
-            super::json_response(
-                StatusCode::CONFLICT,
-                &json!({"error": error.to_string()}),
-            )
+            super::json_response(StatusCode::CONFLICT, &json!({"error": error.to_string()}))
         } else {
             super::json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2361,9 +2355,7 @@ impl AdminResource for Proxy {
                 &json!({"error": PROXY_ROUTE_CONFLICT_ERROR}),
             );
         }
-        if is_mtls_dns_identity_conflict(error)
-            || super::is_unique_constraint_violation(&message)
-        {
+        if is_mtls_dns_identity_conflict(error) || super::is_unique_constraint_violation(&message) {
             return super::json_response(StatusCode::CONFLICT, &json!({ "error": message }));
         }
 

@@ -3202,7 +3202,9 @@ async fn rollback_failed_restore(
     };
     let mut errors = Vec::new();
     if let Err(error) = db.delete_all_resources(namespace, &mode).await {
-        errors.push(format!("failed to clear partially imported config: {error}"));
+        errors.push(format!(
+            "failed to clear partially imported config: {error}"
+        ));
     } else {
         let (_, persist_errors) = persist_payload_resources(db, snapshot, false, &mode).await;
         errors.extend(persist_errors);
@@ -4597,13 +4599,9 @@ async fn handle_batch_create(
         ));
     }
 
-    let (created, errors) = persist_payload_resources(
-        db.as_ref(),
-        &batch,
-        true,
-        &BatchConfigWriteMode::Admission,
-    )
-    .await;
+    let (created, errors) =
+        persist_payload_resources(db.as_ref(), &batch, true, &BatchConfigWriteMode::Admission)
+            .await;
 
     let mut response = json!({
         "created": {

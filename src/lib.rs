@@ -797,6 +797,16 @@ pub mod _test_support {
         )
     }
 
+    pub fn mongo_mtls_dns_admission_drop_must_retain(
+        mutation_started: bool,
+        outcome_settled: bool,
+    ) -> bool {
+        crate::config::mongo_store::MongoStore::mtls_dns_admission_drop_must_retain_for_test(
+            mutation_started,
+            outcome_settled,
+        )
+    }
+
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
     }

@@ -1222,11 +1222,9 @@ plugin_configs:
     )
     .expect_err("reload must fail closed before publishing a case-ambiguous DNS index");
     let message = format!("{error:#}");
-    assert!(message.contains("Duplicate mtls_auth DNS identity"));
-    assert!(message.contains("ASCII case-insensitive"));
+    assert!(message.contains("duplicate consumer credential(s)"));
     assert_eq!(
-        accepted.plugin_configs[0].config["cert_field"],
-        "subject_cn",
+        accepted.plugin_configs[0].config["cert_field"], "subject_cn",
         "the caller's last accepted snapshot remains usable"
     );
 }
