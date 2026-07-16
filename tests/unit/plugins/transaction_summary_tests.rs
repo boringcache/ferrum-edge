@@ -104,7 +104,10 @@ fn test_summary_exposes_normalized_terminal_grpc_status() {
 
     summary.metadata.remove("grpc_status");
     let value = serde_json::to_value(&summary).unwrap();
-    assert_eq!(value["grpc_status"], 2, "missing terminal status is UNKNOWN");
+    assert_eq!(
+        value["grpc_status"], 2,
+        "missing terminal status is UNKNOWN"
+    );
 }
 
 // ── Field value correctness ─────────────────────────────────────────────

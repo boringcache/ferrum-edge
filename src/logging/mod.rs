@@ -112,12 +112,9 @@ pub fn access_log_writer() -> Option<&'static NonBlockingSink> {
 /// Distinct retained producer-loss counter handles for stdout/access records
 /// and stderr diagnostics, respectively.
 pub fn process_error_counters() -> Option<(ErrorCounter, ErrorCounter)> {
-    PROCESS_LOG_SINKS.get().map(|sinks| {
-        (
-            sinks.stdout_errors.clone(),
-            sinks.stderr_errors.clone(),
-        )
-    })
+    PROCESS_LOG_SINKS
+        .get()
+        .map(|sinks| (sinks.stdout_errors.clone(), sinks.stderr_errors.clone()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,7 +208,10 @@ pub fn render_prometheus() -> String {
         ));
         for (reason, value) in [
             ("saturation", error_counter.saturation_dropped_records()),
-            ("record_too_large", error_counter.oversized_dropped_records()),
+            (
+                "record_too_large",
+                error_counter.oversized_dropped_records(),
+            ),
             ("closed", error_counter.closed_dropped_records()),
         ] {
             output.push_str(&format!(

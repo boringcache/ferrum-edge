@@ -288,10 +288,7 @@ fn saturation_is_non_blocking_and_stdout_stderr_counters_are_independent() {
     started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(stdout.try_write_bytes(b"two\n"), EnqueueResult::Queued);
     let started = Instant::now();
-    assert_eq!(
-        stdout.try_write_bytes(b"three\n"),
-        EnqueueResult::Saturated
-    );
+    assert_eq!(stdout.try_write_bytes(b"three\n"), EnqueueResult::Saturated);
     assert!(started.elapsed() < Duration::from_millis(50));
     assert_eq!(stdout_errors.saturation_dropped_records(), 1);
     assert_eq!(stderr_errors.dropped_records(), 0);

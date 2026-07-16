@@ -285,8 +285,14 @@ async fn test_metrics_gated_and_live_minimal() {
         .json()
         .await
         .expect("health JSON");
-    assert!(auth_health["logging"]["stdout"].is_object(), "{auth_health}");
-    assert!(auth_health["logging"]["stderr"].is_object(), "{auth_health}");
+    assert!(
+        auth_health["logging"]["stdout"].is_object(),
+        "{auth_health}"
+    );
+    assert!(
+        auth_health["logging"]["stderr"].is_object(),
+        "{auth_health}"
+    );
 
     // /live is always unauthenticated and minimal.
     let resp = client

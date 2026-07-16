@@ -514,10 +514,7 @@ async fn test_logging_rejected_request_has_rejection_phase() {
                     "key_auth",
                     json!({"key_location": "header:X-Api-Key", "hide_credentials": false}),
                 ),
-                (
-                    "stdout_logging",
-                    json!({"filter": {"errors_only": true}}),
-                ),
+                ("stdout_logging", json!({"filter": {"errors_only": true}})),
             ],
         )
         .await

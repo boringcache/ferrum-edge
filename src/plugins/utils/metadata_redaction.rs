@@ -23,8 +23,8 @@
 //! credential/session/auth context redact. This keeps usage metrics like
 //! `ai_total_tokens` visible while still protecting real token secrets.
 
-use serde::{Serialize, Serializer};
 use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 

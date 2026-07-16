@@ -69,7 +69,10 @@ async fn test_stdout_logging_plugin_logging() {
 #[test]
 fn test_stdout_logging_rejects_unknown_outer_and_nested_keys() {
     for (config, path) in [
-        (json!({"filters": {"errors_only": true}}), "stdout_logging.filters"),
+        (
+            json!({"filters": {"errors_only": true}}),
+            "stdout_logging.filters",
+        ),
         (json!({"log_level": "info"}), "stdout_logging.log_level"),
         (
             json!({"filter": {"error_only": true}}),
@@ -119,7 +122,10 @@ fn test_shared_validation_preserves_null_defaults() {
 #[test]
 fn test_shared_validation_rejects_unknown_stdout_logging_keys() {
     for (config, path) in [
-        (json!({"include_metadata": false}), "stdout_logging.include_metadata"),
+        (
+            json!({"include_metadata": false}),
+            "stdout_logging.include_metadata",
+        ),
         (
             json!({"filter": {"error_only": true}}),
             "stdout_logging.filter.error_only",

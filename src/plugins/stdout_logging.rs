@@ -47,7 +47,11 @@ impl StdoutLogging {
             return Err("stdout_logging: config must be an object".to_string());
         }
         if let Some(config) = config.as_object() {
-            reject_unknown_keys(config, "stdout_logging", &["filter", "schema", "schema_ref"])?;
+            reject_unknown_keys(
+                config,
+                "stdout_logging",
+                &["filter", "schema", "schema_ref"],
+            )?;
         }
         let filter = match config.get("filter") {
             Some(Value::Null) | None => None,

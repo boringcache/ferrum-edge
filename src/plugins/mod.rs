@@ -2765,7 +2765,10 @@ impl Serialize for TransactionSummary {
             "latency_plugin_external_io_ms",
             &self.latency_plugin_external_io_ms,
         )?;
-        map.serialize_entry("latency_gateway_overhead_ms", &self.latency_gateway_overhead_ms)?;
+        map.serialize_entry(
+            "latency_gateway_overhead_ms",
+            &self.latency_gateway_overhead_ms,
+        )?;
         map.serialize_entry("request_user_agent", &self.request_user_agent)?;
         if self.response_streamed {
             map.serialize_entry("response_streamed", &true)?;

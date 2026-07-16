@@ -160,11 +160,7 @@ fn grpc_file_config(port: u16, overrides: Value) -> String {
     grpc_file_config_with_log_config(port, overrides, json!({}))
 }
 
-fn grpc_file_config_with_log_config(
-    port: u16,
-    overrides: Value,
-    log_config: Value,
-) -> String {
+fn grpc_file_config_with_log_config(port: u16, overrides: Value, log_config: Value) -> String {
     let mut proxy = json!({
         "id": "grpc-scripted",
         "listen_path": "/grpc",

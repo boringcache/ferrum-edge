@@ -284,30 +284,20 @@ fn init_logging() -> Result<LoggingGuards, String> {
         max_record_bytes,
         1_073_741_824,
     )?;
-    let shutdown_timeout_ms = resolve_logging_usize(
-        "FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS",
-        2_000,
-        100,
-        30_000,
-    )?;
+    let shutdown_timeout_ms =
+        resolve_logging_usize("FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS", 2_000, 100, 30_000)?;
     let options = logging::NonBlockingOptions {
         record_capacity: log_buffer_capacity,
         byte_capacity: log_buffer_bytes,
         max_record_bytes,
         shutdown_timeout: std::time::Duration::from_millis(shutdown_timeout_ms as u64),
     };
-    let (stdout_writer, stdout_guard) = logging::NonBlockingSink::spawn(
-        logging::SinkName::Stdout,
-        std::io::stdout(),
-        options,
-    )
-    .map_err(|error| format!("failed to start stdout logging worker: {error}"))?;
-    let (stderr_writer, stderr_guard) = logging::NonBlockingSink::spawn(
-        logging::SinkName::Stderr,
-        std::io::stderr(),
-        options,
-    )
-    .map_err(|error| format!("failed to start stderr logging worker: {error}"))?;
+    let (stdout_writer, stdout_guard) =
+        logging::NonBlockingSink::spawn(logging::SinkName::Stdout, std::io::stdout(), options)
+            .map_err(|error| format!("failed to start stdout logging worker: {error}"))?;
+    let (stderr_writer, stderr_guard) =
+        logging::NonBlockingSink::spawn(logging::SinkName::Stderr, std::io::stderr(), options)
+            .map_err(|error| format!("failed to start stderr logging worker: {error}"))?;
     stdout_writer.set_failure_fallback(stderr_writer.clone())?;
     // Hand the access-log sink (the `stdout_logging` plugin) a clone of the
     // non-blocking stdout writer so per-transaction JSON lines go through the

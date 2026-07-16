@@ -234,8 +234,7 @@ impl SinkState {
         let failure = SinkFailure {
             operation,
             error_kind,
-            occurred_at: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
         let mut last = match self.last_failure.lock() {
             Ok(guard) => guard,
@@ -607,14 +606,11 @@ impl WorkerGuard {
         }
 
         let incomplete = self.state.outstanding_records.load(Ordering::Acquire) as u64;
-        self.state
-            .shutdown_timeouts
-            .fetch_add(1, Ordering::Relaxed);
+        self.state.shutdown_timeouts.fetch_add(1, Ordering::Relaxed);
         self.state
             .shutdown_incomplete_records
             .fetch_add(incomplete, Ordering::Relaxed);
-        self.state
-            .record_failure("shutdown", "drain_timeout");
+        self.state.record_failure("shutdown", "drain_timeout");
         false
     }
 }

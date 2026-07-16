@@ -228,7 +228,10 @@ fn test_disabled_unknown_plugin_name_remains_invalid() {
 fn test_admin_stdout_logging_validation_rejects_unknown_paths() {
     let now = chrono::Utc::now();
     for (config, path) in [
-        (json!({"filters": {"errors_only": true}}), "stdout_logging.filters"),
+        (
+            json!({"filters": {"errors_only": true}}),
+            "stdout_logging.filters",
+        ),
         (
             json!({"filter": {"error_only": true}}),
             "stdout_logging.filter.error_only",
@@ -247,10 +250,9 @@ fn test_admin_stdout_logging_validation_rejects_unknown_paths() {
             created_at: now,
             updated_at: now,
         };
-        let error = ferrum_edge::_test_support::validate_admin_plugin_config_for_test(
-            &plugin_config,
-        )
-        .expect_err("admin validation must reject unknown keys");
+        let error =
+            ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config)
+                .expect_err("admin validation must reject unknown keys");
         assert!(error.contains(path), "expected {path} in {error}");
     }
 }
