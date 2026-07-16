@@ -54,7 +54,7 @@ mod inner {
         Upstream,
     };
     use crate::config::validation_pipeline::{
-        ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
+        ValidationAction, collect_rejecting_runtime_config_errors,
         validate_plugin_file_dependencies_off_thread,
     };
     use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
