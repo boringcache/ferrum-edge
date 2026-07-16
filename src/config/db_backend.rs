@@ -40,6 +40,9 @@ pub fn is_mtls_dns_admission_unavailable(error: &anyhow::Error) -> bool {
     error.is::<MtlsDnsAdmissionUnavailable>()
 }
 
+// External tests reach this through the lib target's `_test_support` shim;
+// the bin target recompiles this module without that caller.
+#[allow(dead_code)]
 pub(crate) fn mark_mtls_dns_admission_unavailable(error: anyhow::Error) -> anyhow::Error {
     error.context(MtlsDnsAdmissionUnavailable)
 }
@@ -333,9 +336,10 @@ pub enum AtomicClearVerification {
 }
 
 impl AtomicClearVerification {
-    /// Whether an unknown commit result remains unresolved after verification.
-    pub fn is_still_unknown(self) -> bool {
-        matches!(self, Self::PriorCountsStillVisible | Self::UnknownOutcome)
+    /// Whether the namespace guard must remain retained after verification.
+    /// Fail closed for every result except a definitively committed clear.
+    pub fn requires_guard_retention(self) -> bool {
+        !matches!(self, Self::ClearCommitted)
     }
 }
 

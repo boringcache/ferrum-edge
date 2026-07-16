@@ -59,15 +59,17 @@ fn delayed_unknown_clear_cannot_admit_a_post_verification_write() {
         AtomicClearVerification::PriorCountsStillVisible
     );
     assert!(
-        verification.is_still_unknown(),
+        verification.requires_guard_retention(),
         "the namespace guard must remain held while the delayed clear can still commit"
     );
 
     // A retained guard rejects the hypothetical writer that arrives after
     // verification. If that writer were admitted, the delayed clear below
     // could erase a successful response.
-    let guard_released =
-        admin_mtls_dns_admission_drop_should_release(true, !verification.is_still_unknown());
+    let guard_released = admin_mtls_dns_admission_drop_should_release(
+        true,
+        !verification.requires_guard_retention(),
+    );
     assert!(!guard_released);
 
     let mut visible_post_verification_writes = u8::from(guard_released);

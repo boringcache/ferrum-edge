@@ -36,9 +36,9 @@ use crate::admin::backup::{
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
-    AtomicClearVerification, BatchConfigWriteMode, DatabaseBackend,
-    MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, NamespaceResourceCounts, SnapshotDataIntegrityError,
-    classify_atomic_clear_verification, is_mtls_dns_admission_unavailable,
+    BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
+    NamespaceResourceCounts, SnapshotDataIntegrityError, classify_atomic_clear_verification,
+    is_mtls_dns_admission_unavailable,
 };
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
@@ -3054,6 +3054,9 @@ pub(crate) fn mtls_dns_admission_unavailable_response() -> Response<Full<Bytes>>
     response
 }
 
+// External tests reach this through the lib target's `_test_support` shim;
+// the bin target recompiles this module without that caller.
+#[allow(dead_code)]
 pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
     mutation_started: bool,
     outcome_settled: bool,
@@ -5442,37 +5445,32 @@ async fn handle_restore(
                         "Restore: failed to verify ambiguous atomic clear outcome"
                     );
                 }
-                return Ok(
-                    match classify_atomic_clear_verification(
-                        snapshot.resource_counts(),
-                        verification,
-                    ) {
-                        AtomicClearVerification::ClearCommitted => {
-                            finish_failed_restore(
-                                state,
-                                db.clone(),
-                                actor,
-                                namespace,
-                                vec![format!("failed to clear existing config: {}", e)],
-                                &snapshot,
-                                &mut restore_guard,
-                            )
-                            .await
-                        }
-                        AtomicClearVerification::PriorCountsStillVisible
-                        | AtomicClearVerification::UnknownOutcome => {
-                            finish_unknown_atomic_delete_failure(
-                                state,
-                                db.clone(),
-                                actor,
-                                namespace,
-                                e.to_string(),
-                                &restore_guard,
-                            )
-                            .await
-                        }
-                    },
+                let clear_verification = classify_atomic_clear_verification(
+                    snapshot.resource_counts(),
+                    verification,
                 );
+                return Ok(if clear_verification.requires_guard_retention() {
+                    finish_unknown_atomic_delete_failure(
+                        state,
+                        db.clone(),
+                        actor,
+                        namespace,
+                        e.to_string(),
+                        &restore_guard,
+                    )
+                    .await
+                } else {
+                    finish_failed_restore(
+                        state,
+                        db.clone(),
+                        actor,
+                        namespace,
+                        vec![format!("failed to clear existing config: {}", e)],
+                        &snapshot,
+                        &mut restore_guard,
+                    )
+                    .await
+                });
             }
             // A definitive atomic abort retains the prior config, including
             // api_specs. Preserve the short-circuit and do not re-clear it.
