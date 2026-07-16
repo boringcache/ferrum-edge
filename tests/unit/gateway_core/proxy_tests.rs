@@ -2,12 +2,10 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, UpstreamTarget,
 };
+use ferrum_edge::proxy::client_ip::{TrustedProxies, trusted_forwarded_request_is_https};
 use ferrum_edge::proxy::{
     build_backend_effective_path, build_backend_url, build_backend_url_with_target,
     retry_target_preserves_backend_path,
-};
-use ferrum_edge::proxy::client_ip::{
-    TrustedProxies, trusted_forwarded_request_is_https,
 };
 use ferrum_edge::router_cache::RouterCache;
 use std::collections::HashMap;
@@ -1326,10 +1324,7 @@ async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
 #[tokio::test]
 async fn test_auth_rejection_cookie_storage_key_treats_matching_ip_domain_as_host_only() {
     for (authority, selected_cookie) in [
-        (
-            "127.0.0.1",
-            "session=selected; Domain=127.0.0.1; Path=/",
-        ),
+        ("127.0.0.1", "session=selected; Domain=127.0.0.1; Path=/"),
         (
             "[::1]",
             "session=selected; Domain=[0:0:0:0:0:0:0:1]; Path=/",
@@ -1552,11 +1547,7 @@ async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination()
         "GET".to_string(),
         "/cookie-scope".to_string(),
     );
-    ctx.request_is_secure = trusted_forwarded_request_is_https(
-        &socket_peer,
-        ["https"],
-        &trusted,
-    );
+    ctx.request_is_secure = trusted_forwarded_request_is_https(&socket_peer, ["https"], &trusted);
 
     let (_, _, headers) =
         run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
