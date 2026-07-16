@@ -991,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn lb_only_target_update_resets_adaptive_concurrency_key_space() {
+    fn lb_only_overlapping_target_replacements_do_not_wait_for_retired_permits() {
         let mut protected_proxy = proxy("p1", "/one", vec!["adaptive"]);
         protected_proxy.upstream_id = Some("u1".to_string());
         let adaptive = plugin_config(
@@ -1001,7 +1001,8 @@ mod tests {
                 "max_tracked_keys": 1,
                 "min_limit": 1,
                 "initial_limit": 1,
-                "max_limit": 1
+                "max_limit": 1,
+                "expose_headers": true
             }),
         );
         let initial = config(
@@ -1056,13 +1057,6 @@ mod tests {
         let replacement_epoch = store.load();
         let replacement_target =
             replacement_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
-        match acquire(&replacement_epoch, &replacement_target) {
-            BackendAdmissionDecision::Reject { status_code, .. } => {
-                assert_eq!(status_code, 503)
-            }
-            _ => panic!("replacement target must wait for the retired permit to drain"),
-        }
-        drop(old_target_permit);
         match acquire(&initial_epoch, &first_target) {
             BackendAdmissionDecision::Reject { status_code, .. } => {
                 assert_eq!(status_code, 503)
@@ -1074,12 +1068,81 @@ mod tests {
             _ => panic!("replacement target should be admitted"),
         };
         match acquire(&replacement_epoch, &replacement_target) {
-            BackendAdmissionDecision::Reject { status_code, .. } => {
-                assert_eq!(status_code, 503)
+            BackendAdmissionDecision::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 503);
+                assert_eq!(
+                    headers
+                        .get("x-adaptive-concurrency-limit")
+                        .map(String::as_str),
+                    Some("1")
+                );
+                assert_eq!(
+                    headers
+                        .get("x-adaptive-concurrency-inflight")
+                        .map(String::as_str),
+                    Some("1")
+                );
             }
             _ => panic!("replacement target should remain adaptively limited"),
         }
+
+        store
+            .update_load_balancer(
+                |current| {
+                    Some(LoadBalancerCache::build_update_targets_inner(
+                        &current.load_balancer,
+                        "u1",
+                        vec![target("c.local", 82)],
+                        LoadBalancerAlgorithm::RoundRobin,
+                        None,
+                    ))
+                },
+                |_| {},
+            )
+            .unwrap_or_else(|error| panic!("second LB update should succeed: {error}"))
+            .expect("second LB update should publish");
+
+        let newest_epoch = store.load();
+        let newest_target = newest_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+        match acquire(&replacement_epoch, &replacement_target) {
+            BackendAdmissionDecision::Reject { status_code, .. } => {
+                assert_eq!(status_code, 503)
+            }
+            _ => panic!("the middle load-balancer view must stay retired"),
+        }
+        let newest = match acquire(&newest_epoch, &newest_target) {
+            BackendAdmissionDecision::Admit(permit) => permit,
+            _ => panic!("newest target should admit independently"),
+        };
+        match acquire(&newest_epoch, &newest_target) {
+            BackendAdmissionDecision::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 503);
+                assert_eq!(
+                    headers
+                        .get("x-adaptive-concurrency-limit")
+                        .map(String::as_str),
+                    Some("1")
+                );
+                assert_eq!(
+                    headers
+                        .get("x-adaptive-concurrency-inflight")
+                        .map(String::as_str),
+                    Some("1")
+                );
+            }
+            _ => panic!("newest target should enforce its independent limit"),
+        }
+        drop(newest);
         drop(held);
+        drop(old_target_permit);
     }
 
     #[test]
@@ -1230,7 +1293,8 @@ impl RequestEpochStore {
         // generations. Stage the validated replacements, publish the one
         // request epoch, then retire stale feedback/bounds. Compatible old and
         // new plugin objects can both admit during this handoff because their
-        // target counters are shared; structural replacements remain draining.
+        // target counters are shared; structural replacements publish an
+        // independent accounting space at commit.
         next.plugin_cache.prepare_adaptive_concurrency_generations();
         next.plugin_cache
             .prepare_adaptive_concurrency_lb_generation(

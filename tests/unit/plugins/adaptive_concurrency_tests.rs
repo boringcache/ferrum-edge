@@ -998,9 +998,9 @@ async fn adaptive_concurrency_global_route_refresh_preserves_unrelated_global_st
             ..
         }
     ));
-    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    let replacement_adaptive = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    drop(replacement_adaptive);
     drop(held);
-    drop(expect_admitted(acquire_from_cache(&cache, &reloaded)));
 }
 
 #[test]
@@ -1156,12 +1156,49 @@ fn adaptive_concurrency_structural_config_change_does_not_wait_for_old_permits()
         .rebuild(&reloaded)
         .expect("valid key-space change should publish");
 
-    // The replacement has an independent limiter. A long-lived permit from
-    // the retired key space must not pin all replacement traffic in a drain.
+    // The replacement has an independent tracking space. A long-lived permit
+    // from the retired space must not pin the structural handoff.
     let new_generation = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    assert_rejected(acquire_from_plugin(
+        &old_view,
+        &config.proxies[0],
+        None,
+    ));
     drop(new_generation);
     drop(held);
     drop(old_view);
+}
+
+#[test]
+fn adaptive_concurrency_lower_key_cap_uses_independent_tracking_space() {
+    let config = cache_config(
+        "proxy",
+        json!({
+            "max_tracked_keys": 2,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    let old_view = adaptive_plugin_from_cache(&cache);
+    let retired_permit = expect_admitted(acquire_from_cache(&cache, &config));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[0].config["max_tracked_keys"] = json!(1);
+    cache
+        .rebuild(&reloaded)
+        .expect("lower key cap should publish an independent tracking space");
+
+    let replacement = expect_admitted(acquire_from_cache(&cache, &reloaded));
+    assert_rejected(acquire_from_cache(&cache, &reloaded));
+    assert_rejected(acquire_from_plugin(
+        &old_view,
+        &config.proxies[0],
+        None,
+    ));
+    drop(replacement);
+    drop(retired_permit);
 }
 
 #[test]
@@ -1225,6 +1262,7 @@ fn adaptive_concurrency_overlapping_structural_reloads_remain_independent() {
         }),
     );
     let cache = PluginCache::new(&config).expect("initial cache should build");
+    let oldest_view = adaptive_plugin_from_cache(&cache);
     let retired_permit = expect_admitted(acquire_from_cache(&cache, &config));
 
     let mut first_reload = config.clone();
@@ -1232,6 +1270,7 @@ fn adaptive_concurrency_overlapping_structural_reloads_remain_independent() {
     cache
         .rebuild(&first_reload)
         .expect("first structural generation should publish");
+    let middle_view = adaptive_plugin_from_cache(&cache);
     let middle_permit = expect_admitted(acquire_from_cache(&cache, &first_reload));
 
     let mut newest_reload = first_reload.clone();
@@ -1240,6 +1279,16 @@ fn adaptive_concurrency_overlapping_structural_reloads_remain_independent() {
         .rebuild(&newest_reload)
         .expect("overlapping structural generation should publish");
     let newest_permit = expect_admitted(acquire_from_cache(&cache, &newest_reload));
+    assert_rejected(acquire_from_plugin(
+        &oldest_view,
+        &config.proxies[0],
+        None,
+    ));
+    assert_rejected(acquire_from_plugin(
+        &middle_view,
+        &first_reload.proxies[0],
+        None,
+    ));
     assert_rejected(acquire_from_cache(&cache, &newest_reload));
     drop(newest_permit);
     drop(middle_permit);
@@ -1258,7 +1307,7 @@ fn adaptive_concurrency_direct_target_reload_reclaims_retired_key_capacity() {
         }),
     );
     let cache = PluginCache::new(&config).expect("initial cache should build");
-    drop(expect_admitted(acquire_from_cache(&cache, &config)));
+    let retired_permit = expect_admitted(acquire_from_cache(&cache, &config));
 
     let mut reloaded = config.clone();
     reloaded.proxies[0].backend_host = "replacement.local".to_string();
@@ -1274,6 +1323,7 @@ fn adaptive_concurrency_direct_target_reload_reclaims_retired_key_capacity() {
     let held = expect_admitted(acquire_from_cache(&cache, &reloaded));
     assert_rejected(acquire_from_cache(&cache, &reloaded));
     drop(held);
+    drop(retired_permit);
 }
 
 #[test]
@@ -1284,7 +1334,8 @@ fn adaptive_concurrency_upstream_target_reload_reclaims_retired_key_capacity() {
             "max_tracked_keys": 1,
             "min_limit": 1,
             "initial_limit": 1,
-            "max_limit": 1
+            "max_limit": 1,
+            "expose_headers": true
         }),
     );
     config.proxies[0].upstream_id = Some("upstream-1".to_string());
@@ -1299,11 +1350,11 @@ fn adaptive_concurrency_upstream_target_reload_reclaims_retired_key_capacity() {
     let cache = PluginCache::new(&config).expect("initial cache should build");
     let first_target = config.upstreams[0].targets[0].clone();
     let plugin = adaptive_plugin_from_cache(&cache);
-    drop(expect_admitted(acquire_from_plugin(
+    let retired_permit = expect_admitted(acquire_from_plugin(
         &plugin,
         &config.proxies[0],
         Some(&first_target),
-    )));
+    ));
 
     let mut reloaded = config.clone();
     reloaded.upstreams[0].targets[0].host = "replacement.local".to_string();
@@ -1318,12 +1369,34 @@ fn adaptive_concurrency_upstream_target_reload_reclaims_retired_key_capacity() {
         &reloaded.proxies[0],
         Some(replacement_target),
     ));
-    assert_rejected(acquire_from_plugin(
+    match acquire_from_plugin(
         &replacement_plugin,
         &reloaded.proxies[0],
         Some(replacement_target),
-    ));
+    ) {
+        BackendAdmissionDecision::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert_eq!(
+                headers
+                    .get("x-adaptive-concurrency-limit")
+                    .map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                headers
+                    .get("x-adaptive-concurrency-inflight")
+                    .map(String::as_str),
+                Some("1")
+            );
+        }
+        _ => panic!("replacement target should enforce its independent limit"),
+    }
     drop(held);
+    drop(retired_permit);
 }
 
 #[test]
@@ -1450,7 +1523,7 @@ fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
             "min_limit": 1,
             "initial_limit": 2,
             "max_limit": 2,
-            "shadow_mode": true
+            "shadow_mode": false
         }),
     );
     config.proxies[0].upstream_id = Some("upstream-1".to_string());
@@ -1491,17 +1564,24 @@ fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
         .expect("effective upstream port lane change should publish");
 
     let second_target = &reloaded.upstreams[0].targets[1];
+    let first_replacement = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &reloaded.proxies[0],
+        Some(second_target),
+    ));
+    let second_replacement = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &reloaded.proxies[0],
+        Some(second_target),
+    ));
     assert_rejected(acquire_from_plugin(
         &adaptive_plugin_from_cache(&cache),
         &reloaded.proxies[0],
         Some(second_target),
     ));
+    drop(first_replacement);
+    drop(second_replacement);
     drop(held);
-    drop(expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
-        &reloaded.proxies[0],
-        Some(second_target),
-    )));
 }
 
 #[test]
@@ -1862,7 +1942,7 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
             "min_limit": 1,
             "initial_limit": 2,
             "max_limit": 2,
-            "shadow_mode": true
+            "shadow_mode": false
         }),
     );
     config.plugin_configs.push(
@@ -1927,17 +2007,24 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
             false,
         )
         .expect("changed TLS identity should publish");
+    let first_replacement = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_proxy,
+        None,
+    ));
+    let second_replacement = expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_proxy,
+        None,
+    ));
     assert_rejected(acquire_from_plugin(
         &adaptive_plugin_from_cache(&cache),
         &effective_proxy,
         None,
     ));
+    drop(first_replacement);
+    drop(second_replacement);
     drop(held);
-    drop(expect_admitted(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
-        &effective_proxy,
-        None,
-    )));
 }
 
 #[test]
@@ -2101,12 +2188,6 @@ fn adaptive_concurrency_route_priority_change_resets_winning_destination() {
 
     let mut first_effective_proxy = reloaded.proxies[0].clone();
     first_effective_proxy.backend_host = "first.local".to_string();
-    assert_rejected(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
-        &first_effective_proxy,
-        None,
-    ));
-    drop(held);
     let replacement = expect_admitted(acquire_from_plugin(
         &adaptive_plugin_from_cache(&cache),
         &first_effective_proxy,
@@ -2118,6 +2199,7 @@ fn adaptive_concurrency_route_priority_change_resets_winning_destination() {
         None,
     ));
     drop(replacement);
+    drop(held);
 }
 
 #[test]
@@ -2181,12 +2263,6 @@ fn adaptive_concurrency_route_association_order_resets_winning_destination() {
 
     let mut first_effective_proxy = reloaded.proxies[0].clone();
     first_effective_proxy.backend_host = "first.local".to_string();
-    assert_rejected(acquire_from_plugin(
-        &adaptive_plugin_from_cache(&cache),
-        &first_effective_proxy,
-        None,
-    ));
-    drop(held);
     let replacement = expect_admitted(acquire_from_plugin(
         &adaptive_plugin_from_cache(&cache),
         &first_effective_proxy,
@@ -2198,6 +2274,7 @@ fn adaptive_concurrency_route_association_order_resets_winning_destination() {
         None,
     ));
     drop(replacement);
+    drop(held);
 }
 
 #[test]

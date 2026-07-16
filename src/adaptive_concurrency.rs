@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -275,12 +275,12 @@ struct AdaptiveConcurrencyPolicyLifecycle {
     /// Replacement load-balancer generation staged around request-epoch
     /// publication.
     pending_lb_generation: AtomicU64,
-    pending_lb_requires_drain: AtomicBool,
+    pending_lb_requires_reset: AtomicBool,
     /// Validated replacement generation staged around the cache's atomic
     /// publication. Compatible old/new plugins can both admit during this
     /// handoff because they share the same target counters.
     pending_generation: AtomicU64,
-    pending_requires_drain: AtomicBool,
+    pending_requires_reset: AtomicBool,
     /// Latest committed admission configuration. A request pinned to an older
     /// compatible plugin view must use these bounds instead of reviving its
     /// retired minimum, initial limit, key cap, or shadow-mode setting.
@@ -295,9 +295,9 @@ struct AdaptiveConcurrencyPolicyLifecycle {
     /// Brief commit barrier preventing feedback from crossing the generation
     /// cutover while admission continues against generation-local bounds.
     feedback_blocked: AtomicBool,
-    /// Structural policy, route, or load-balancer changes drain older permits
-    /// and exclusively reset the retired target-key space before admitting
-    /// under the replacement definition.
+    /// Brief structural reset barrier. Replacement generations rotate to a
+    /// fresh target-tracking space while retired permits finish against the
+    /// detached space they acquired from; they never hold this barrier open.
     transition: AdaptiveConcurrencyPolicyTransition,
 }
 
@@ -315,9 +315,9 @@ impl AdaptiveConcurrencyPolicyLifecycle {
             active_lb_generation: AtomicU64::new(1),
             minimum_lb_admission_generation: AtomicU64::new(1),
             pending_lb_generation: AtomicU64::new(0),
-            pending_lb_requires_drain: AtomicBool::new(false),
+            pending_lb_requires_reset: AtomicBool::new(false),
             pending_generation: AtomicU64::new(0),
-            pending_requires_drain: AtomicBool::new(false),
+            pending_requires_reset: AtomicBool::new(false),
             active_config: ArcSwapOption::empty(),
             total_in_flight: AtomicU64::new(0),
             feedback_in_progress: AtomicU64::new(0),
@@ -339,36 +339,51 @@ impl Drop for AdaptiveConcurrencyFeedbackGuard<'_> {
     }
 }
 
-pub struct AdaptiveConcurrencyLimiter {
+struct AdaptiveConcurrencyTrackingSpace {
     inner: DashMap<AdaptiveConcurrencyKey, Arc<AdaptiveConcurrencyState>>,
-    /// Per-proxy scope cache for `proxy` scoping, keyed by `proxy.id` (unique and
-    /// stable per proxy). Bounded by the number of proxies using this plugin
-    /// instance and rebuilt with the plugin on reload, so it needs no eviction.
-    /// `upstream` scoping is intentionally not cached here — see `resolve_scope`.
+    /// Per-proxy scope cache for `proxy` scoping, keyed by stable `proxy.id`.
+    /// `upstream` scoping is intentionally not cached.
     scope_cache: DashMap<Box<str>, Arc<str>>,
+    tracked_keys: AtomicUsize,
+}
+
+impl AdaptiveConcurrencyTrackingSpace {
+    fn new(shards: usize) -> Self {
+        Self {
+            inner: DashMap::with_shard_amount(shards),
+            scope_cache: DashMap::with_shard_amount(shards),
+            tracked_keys: AtomicUsize::new(0),
+        }
+    }
+}
+
+pub struct AdaptiveConcurrencyLimiter {
+    /// Compatible generations retain this accounting domain. Structural policy
+    /// or load-balancer generations atomically publish a fresh domain, while
+    /// retired permits keep their target state alive directly until they finish.
+    tracking_space: ArcSwap<AdaptiveConcurrencyTrackingSpace>,
+    shard_amount: usize,
     /// Shared scope for `key_by = backend_target` (a single constant string).
     backend_scope: Arc<str>,
-    tracked_keys: AtomicUsize,
     policy: Arc<AdaptiveConcurrencyPolicyLifecycle>,
 }
 
 impl AdaptiveConcurrencyLimiter {
     pub fn new(shards: usize) -> Self {
         Self {
-            inner: DashMap::with_shard_amount(shards),
-            // `scope_cache.get()` runs on the backend-dispatch hot path for
-            // proxy scoping, so honor the operator's configured shard count
-            // (pool_shard_amount) like `inner` rather than DashMap's default,
-            // keeping per-shard lock contention bounded under load.
-            scope_cache: DashMap::with_shard_amount(shards),
+            // Both maps are on backend admission, so fresh structural spaces
+            // preserve the operator-configured shard count.
+            tracking_space: ArcSwap::from_pointee(AdaptiveConcurrencyTrackingSpace::new(
+                shards,
+            )),
+            shard_amount: shards,
             backend_scope: Arc::from("backend"),
-            tracked_keys: AtomicUsize::new(0),
             policy: Arc::new(AdaptiveConcurrencyPolicyLifecycle::new()),
         }
     }
 
     pub fn tracked_keys_count(&self) -> usize {
-        self.inner.len()
+        self.tracking_space.load().inner.len()
     }
 
     // Public convenience entrypoint used by the library's external tests and
@@ -395,33 +410,44 @@ impl AdaptiveConcurrencyLimiter {
         lb_generation: u64,
     ) -> Result<Arc<AdaptiveConcurrencyPermit>, AdaptiveConcurrencyLimitExceeded> {
         'admission: loop {
+            // Pin one target/accounting domain before reserving the policy
+            // slot. Structural publication can then detach this entire space
+            // without an old admission repopulating the replacement map.
+            let tracking_space = self.tracking_space.load();
             let (config, config_generation) =
                 self.admission_config(generation, Arc::clone(&request_config));
             self.reserve_policy_slot(generation, lb_generation, &config)?;
-            let key = build_key(self.resolve_scope(proxy, config.key_by), proxy, target);
-            let state = match self.inner.entry(key) {
+            let key = build_key(
+                self.resolve_scope(&tracking_space, proxy, config.key_by),
+                proxy,
+                target,
+            );
+            let state = match tracking_space.inner.entry(key) {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
-                Entry::Vacant(entry) => match self.reserve_key_slot(config.max_tracked_keys) {
-                    Ok(()) => {
-                        let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
-                        entry.insert(Arc::clone(&state));
-                        state
+                Entry::Vacant(entry) => {
+                    match self.reserve_key_slot(&tracking_space, config.max_tracked_keys) {
+                        Ok(()) => {
+                            let state =
+                                Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
+                            entry.insert(Arc::clone(&state));
+                            state
+                        }
+                        Err(_) => {
+                            // Key-cardinality cap reached. Fail OPEN with a per-request,
+                            // untracked state rather than rejecting: `max_tracked_keys`
+                            // only bounds the limiter's own memory, so a target beyond
+                            // the cap must still be admitted (never black-holed by a
+                            // blanket 503), and `shadow_mode` must never reject at all.
+                            // This state is NOT inserted into the map (memory stays
+                            // bounded) and dies with the permit, so overflow targets run
+                            // without adaptive limiting until the policy is removed and
+                            // recreated (or a structural key-space change resets it).
+                            // Starting at `in_flight = 0` it always admits below.
+                            drop(entry);
+                            Arc::new(AdaptiveConcurrencyState::new(config.initial_limit))
+                        }
                     }
-                    Err(_) => {
-                        // Key-cardinality cap reached. Fail OPEN with a per-request,
-                        // untracked state rather than rejecting: `max_tracked_keys`
-                        // only bounds the limiter's own memory, so a target beyond
-                        // the cap must still be admitted (never black-holed by a
-                        // blanket 503), and `shadow_mode` must never reject at all.
-                        // This state is NOT inserted into the map (memory stays
-                        // bounded) and dies with the permit, so overflow targets run
-                        // without adaptive limiting until the policy is removed and
-                        // recreated (or a structural key-space change resets it).
-                        // Starting at `in_flight = 0` it always admits below.
-                        drop(entry);
-                        Arc::new(AdaptiveConcurrencyState::new(config.initial_limit))
-                    }
-                },
+                }
             };
 
             loop {
@@ -435,7 +461,16 @@ impl AdaptiveConcurrencyLimiter {
                     .max(config.min_limit)
                     .min(config.max_limit);
                 if current >= limit && !config.shadow_mode {
-                    if !self.admission_config_current(config_generation) {
+                    let generation_admitted =
+                        self.policy_generation_admitted(generation, lb_generation);
+                    let tracking_space_current =
+                        self.tracking_space_is_current(&tracking_space);
+                    let config_current = self.admission_config_current(config_generation);
+                    if !generation_admitted || !tracking_space_current {
+                        self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
+                        return Err(self.policy_transition_rejection(&config));
+                    }
+                    if !config_current {
                         self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
                         self.clamp_to_active_config(&state);
                         continue 'admission;
@@ -458,15 +493,17 @@ impl AdaptiveConcurrencyLimiter {
                     Ok(_) => {
                         // A cache activation may race this cold target lookup/CAS.
                         // Roll back instead of returning a permit owned by a
-                        // retired policy generation, crossing a structural drain,
+                        // retired policy generation, crossing a structural reset,
                         // or applying an admission config superseded by commit.
                         let generation_admitted =
                             self.policy_generation_admitted(generation, lb_generation);
+                        let tracking_space_current =
+                            self.tracking_space_is_current(&tracking_space);
                         let config_current = self.admission_config_current(config_generation);
-                        if !generation_admitted || !config_current {
+                        if !generation_admitted || !tracking_space_current || !config_current {
                             state.in_flight.fetch_sub(1, Ordering::AcqRel);
                             self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
-                            if generation_admitted && !config_current {
+                            if generation_admitted && tracking_space_current && !config_current {
                                 self.clamp_to_active_config(&state);
                                 continue 'admission;
                             }
@@ -522,6 +559,20 @@ impl AdaptiveConcurrencyLimiter {
         }
     }
 
+    fn tracking_space_is_current(
+        &self,
+        tracking_space: &Arc<AdaptiveConcurrencyTrackingSpace>,
+    ) -> bool {
+        let current = self.tracking_space.load();
+        Arc::ptr_eq(tracking_space, &current)
+    }
+
+    fn reset_tracking_space(&self) {
+        self.tracking_space.store(Arc::new(
+            AdaptiveConcurrencyTrackingSpace::new(self.shard_amount),
+        ));
+    }
+
     fn reserve_policy_slot(
         &self,
         generation: u64,
@@ -552,9 +603,7 @@ impl AdaptiveConcurrencyLimiter {
                     // the replacement policy visible to competing acquirers.
                     // The reset epoch remains exclusively owned across the
                     // clears, so a newer writer cannot publish over them.
-                    self.inner.clear();
-                    self.scope_cache.clear();
-                    self.tracked_keys.store(0, Ordering::Release);
+                    self.reset_tracking_space();
                     if !self.policy.transition.finish_reset(reset, false) {
                         // Epoch exhaustion or an invariant violation stays
                         // fail-closed; retrying can never reopen another epoch.
@@ -588,7 +637,7 @@ impl AdaptiveConcurrencyLimiter {
         let config_current = (generation >= minimum && generation <= active)
             || (self.policy.pending_generation.load(Ordering::Acquire) == generation
                 && generation != 0
-                && !self.policy.pending_requires_drain.load(Ordering::Acquire));
+                && !self.policy.pending_requires_reset.load(Ordering::Acquire));
         if !config_current {
             return false;
         }
@@ -603,7 +652,7 @@ impl AdaptiveConcurrencyLimiter {
                 && lb_generation != 0
                 && !self
                     .policy
-                    .pending_lb_requires_drain
+                    .pending_lb_requires_reset
                     .load(Ordering::Acquire))
     }
 
@@ -623,13 +672,13 @@ impl AdaptiveConcurrencyLimiter {
     /// Stage a fully validated generation immediately before its plugin-cache
     /// snapshot is published. The active generation remains authorized until
     /// the snapshot store, avoiding a fail-closed gap for compatible reloads.
-    pub(crate) fn prepare_policy_generation(&self, generation: u64, drain_older_generation: bool) {
+    pub(crate) fn prepare_policy_generation(&self, generation: u64, reset_tracking_space: bool) {
         if generation <= self.policy.active_generation.load(Ordering::Acquire) {
             return;
         }
         self.policy
-            .pending_requires_drain
-            .store(drain_older_generation, Ordering::Release);
+            .pending_requires_reset
+            .store(reset_tracking_space, Ordering::Release);
         self.policy
             .pending_generation
             .store(generation, Ordering::Release);
@@ -642,7 +691,7 @@ impl AdaptiveConcurrencyLimiter {
         &self,
         generation: u64,
         config: Arc<AdaptiveConcurrencyConfig>,
-        drain_older_generation: bool,
+        reset_tracking_space: bool,
     ) {
         // Poison only means an earlier cold writer panicked. The atomic
         // lifecycle remains fail-closed, so recover the guard and inspect the
@@ -672,7 +721,7 @@ impl AdaptiveConcurrencyLimiter {
             }
         }
 
-        let structural_reset = if drain_older_generation {
+        let structural_reset = if reset_tracking_space {
             // Exclusively block admission before retiring the older key-space
             // generations. The epoch claim waits for an in-progress drain
             // completer rather than stealing its RESETTING state.
@@ -722,40 +771,37 @@ impl AdaptiveConcurrencyLimiter {
             .is_ok()
         {
             self.policy
-                .pending_requires_drain
+                .pending_requires_reset
                 .store(false, Ordering::Release);
         }
 
         // Learned state and in-flight accounting survive compatible config
         // changes, but the replacement bounds become authoritative at commit.
-        for entry in &self.inner {
+        let tracking_space = self.tracking_space.load();
+        for entry in &tracking_space.inner {
             clamp_limit(&entry.value().limit, config.min_limit, config.max_limit);
         }
         if let Some(reset) = structural_reset {
-            let drain = self.policy.total_in_flight.load(Ordering::Acquire) != 0;
-            if !drain {
-                self.inner.clear();
-                self.scope_cache.clear();
-                self.tracked_keys.store(0, Ordering::Release);
-            }
-            // Release publishes the completed clear, or the generation/floor
-            // commit that requests must observe before completing the drain.
-            let _ = self.policy.transition.finish_reset(reset, drain);
+            self.reset_tracking_space();
+            // Retired permits own their detached target states directly. The
+            // replacement can therefore reopen immediately without waiting
+            // for those permits, while retired generation views stay rejected.
+            let _ = self.policy.transition.finish_reset(reset, false);
         }
         self.policy.feedback_blocked.store(false, Ordering::Release);
     }
 
     /// Stage the load-balancer generation that will be published in the next
     /// request epoch. Policies whose referenced upstream endpoint sets changed
-    /// drain their old target-key space; unrelated policies keep old pinned
-    /// request views compatible with the replacement snapshot.
-    pub(crate) fn prepare_lb_generation(&self, generation: u64, drain_older_generation: bool) {
+    /// require a fresh target space; unrelated policies keep old pinned request
+    /// views compatible with the replacement snapshot.
+    pub(crate) fn prepare_lb_generation(&self, generation: u64, reset_tracking_space: bool) {
         if generation <= self.policy.active_lb_generation.load(Ordering::Acquire) {
             return;
         }
         self.policy
-            .pending_lb_requires_drain
-            .store(drain_older_generation, Ordering::Release);
+            .pending_lb_requires_reset
+            .store(reset_tracking_space, Ordering::Release);
         self.policy
             .pending_lb_generation
             .store(generation, Ordering::Release);
@@ -763,9 +809,9 @@ impl AdaptiveConcurrencyLimiter {
 
     /// Commit a staged load-balancer generation after request-epoch
     /// publication. An affected target-set change advances the admission floor
-    /// before clearing the retired key space, so an old pinned request cannot
-    /// recreate an endpoint after the drain completes.
-    pub(crate) fn commit_lb_generation(&self, generation: u64, drain_older_generation: bool) {
+    /// and atomically rotates the target space, so old permits cannot pin the
+    /// replacement and old pinned requests cannot repopulate it.
+    pub(crate) fn commit_lb_generation(&self, generation: u64, reset_tracking_space: bool) {
         let _commit_guard = self
             .policy
             .commit_lock
@@ -787,7 +833,7 @@ impl AdaptiveConcurrencyLimiter {
             }
         }
 
-        let structural_reset = if drain_older_generation {
+        let structural_reset = if reset_tracking_space {
             let reset = self.policy.transition.begin_structural_reset();
             self.policy
                 .minimum_lb_admission_generation
@@ -819,27 +865,25 @@ impl AdaptiveConcurrencyLimiter {
             .is_ok()
         {
             self.policy
-                .pending_lb_requires_drain
+                .pending_lb_requires_reset
                 .store(false, Ordering::Release);
         }
 
         if let Some(reset) = structural_reset {
-            let drain = self.policy.total_in_flight.load(Ordering::Acquire) != 0;
-            if !drain {
-                self.inner.clear();
-                self.scope_cache.clear();
-                self.tracked_keys.store(0, Ordering::Release);
-            }
-            let _ = self.policy.transition.finish_reset(reset, drain);
+            self.reset_tracking_space();
+            // An old service-discovery permit remains attached to the retired
+            // space and cannot pin or repopulate the replacement target map.
+            let _ = self.policy.transition.finish_reset(reset, false);
         }
         self.policy.feedback_blocked.store(false, Ordering::Release);
     }
 
     fn reserve_key_slot(
         &self,
+        tracking_space: &AdaptiveConcurrencyTrackingSpace,
         max_tracked_keys: usize,
     ) -> Result<(), AdaptiveConcurrencyLimitExceeded> {
-        let mut current = self.tracked_keys.load(Ordering::Acquire);
+        let mut current = tracking_space.tracked_keys.load(Ordering::Acquire);
         loop {
             if current >= max_tracked_keys {
                 return Err(AdaptiveConcurrencyLimitExceeded {
@@ -850,7 +894,7 @@ impl AdaptiveConcurrencyLimiter {
                     expose_headers: false,
                 });
             }
-            match self.tracked_keys.compare_exchange_weak(
+            match tracking_space.tracked_keys.compare_exchange_weak(
                 current,
                 current + 1,
                 Ordering::AcqRel,
@@ -869,8 +913,14 @@ impl AdaptiveConcurrencyLimiter {
         target: Option<&UpstreamTarget>,
         key_by: AdaptiveConcurrencyKeyBy,
     ) -> Option<AdaptiveConcurrencySnapshot> {
-        let key = build_key(self.resolve_scope(proxy, key_by), proxy, target);
-        self.inner
+        let tracking_space = self.tracking_space.load();
+        let key = build_key(
+            self.resolve_scope(&tracking_space, proxy, key_by),
+            proxy,
+            target,
+        );
+        tracking_space
+            .inner
             .get(&key)
             .map(|entry| AdaptiveConcurrencySnapshot::from_state(key, entry.value()))
     }
@@ -886,7 +936,12 @@ impl AdaptiveConcurrencyLimiter {
     /// (and keying by `upstream_id` alone could collide across namespaces). The
     /// string is short, and the admission path already allocates the full key in
     /// `build_key`.
-    fn resolve_scope(&self, proxy: &Proxy, key_by: AdaptiveConcurrencyKeyBy) -> Arc<str> {
+    fn resolve_scope(
+        &self,
+        tracking_space: &AdaptiveConcurrencyTrackingSpace,
+        proxy: &Proxy,
+        key_by: AdaptiveConcurrencyKeyBy,
+    ) -> Arc<str> {
         match key_by {
             AdaptiveConcurrencyKeyBy::Backend => Arc::clone(&self.backend_scope),
             AdaptiveConcurrencyKeyBy::Upstream => Arc::from(adaptive_concurrency_scope(
@@ -895,7 +950,7 @@ impl AdaptiveConcurrencyLimiter {
                 proxy.upstream_id.as_deref(),
             )),
             AdaptiveConcurrencyKeyBy::Proxy => {
-                if let Some(cached) = self.scope_cache.get(proxy.id.as_str()) {
+                if let Some(cached) = tracking_space.scope_cache.get(proxy.id.as_str()) {
                     return Arc::clone(cached.value());
                 }
                 let scope: Arc<str> = Arc::from(adaptive_concurrency_scope(
@@ -903,7 +958,8 @@ impl AdaptiveConcurrencyLimiter {
                     proxy,
                     proxy.upstream_id.as_deref(),
                 ));
-                self.scope_cache
+                tracking_space
+                    .scope_cache
                     .insert(proxy.id.as_str().into(), Arc::clone(&scope));
                 scope
             }
@@ -942,7 +998,7 @@ pub struct AdaptiveConcurrencyLimitExceeded {
     pub current_in_flight: u64,
     pub limit: u64,
     /// Whether a genuine per-target limit rejection should expose its target
-    /// values. Policy-wide generation/drain transitions always set this false;
+    /// values. Policy-wide generation/reset transitions always set this false;
     /// a request pinned to an older compatible plugin view otherwise uses the
     /// active configuration's header policy.
     pub expose_headers: bool,
