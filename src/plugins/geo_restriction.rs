@@ -542,6 +542,7 @@ impl Plugin for GeoRestriction {
             && matches!(&result, PluginResult::Continue)
             && let Some(code) = country
         {
+            ctx.set_backend_geo_country(code.bytes());
             ctx.headers
                 .insert(GEO_COUNTRY_HEADER.to_string(), code.into_string());
         }

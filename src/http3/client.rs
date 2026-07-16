@@ -2235,10 +2235,11 @@ impl Http3ConnectionPool {
                 // Client request trailers are read AFTER the initial headers were
                 // stripped/sanitized, so a malicious client can smuggle hop-by-hop
                 // fields (`connection`, `te`, ...) or reserved gateway metadata
-                // (`x-consumer-*`, `x-path-param-*`) here that the gateway removed
-                // from the initial header block. Apply the same backend-request strip
-                // + reserved-name filter before forwarding. HTTP/3 header names are
-                // always lowercase, so exact lowercase comparisons suffice.
+                // (`x-consumer-*`, `x-geo-country`, `x-path-param-*`) here that
+                // the gateway removed from the initial header block. Apply the
+                // same backend-request strip + reserved-name filter before
+                // forwarding. HTTP/3 header names are always lowercase, so exact
+                // lowercase comparisons suffice.
                 let strip: Vec<http::header::HeaderName> = trailers
                     .keys()
                     .filter(|n| {
@@ -2246,6 +2247,7 @@ impl Http3ConnectionPool {
                         is_backend_request_strip_header(s)
                             || s == "x-consumer-username"
                             || s == "x-consumer-custom-id"
+                            || s == "x-geo-country"
                             || s.starts_with("x-path-param-")
                     })
                     .cloned()

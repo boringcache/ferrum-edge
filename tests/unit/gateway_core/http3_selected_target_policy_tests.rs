@@ -609,15 +609,15 @@ fn h3_grpc_web_early_plugin_rejects_use_client_wire_shape() {
 }
 
 #[test]
-fn h3_deferred_hooks_cannot_spoof_backend_consumer_identity() {
+fn h3_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
     let source = include_str!("../../../src/http3/server.rs");
     let routing_hook = source
         .rfind("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
         .expect("H3 deferred routing-header hook must remain present");
     let after_routing_hook = &source[routing_hook..];
     let refresh = after_routing_hook
-        .find("refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers)")
-        .expect("H3 must refresh identity after deferred routing hooks");
+        .find("refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers)")
+        .expect("H3 must refresh gateway assertions after deferred routing hooks");
     let baggage_strip = after_routing_hook
         .find("strip_egress_baggage_in_map(")
         .expect("H3 must reapply egress baggage policy after deferred routing hooks");
@@ -626,7 +626,7 @@ fn h3_deferred_hooks_cannot_spoof_backend_consumer_identity() {
         .expect("H3 remaining deferred hook pass must remain present");
     assert!(
         refresh < baggage_strip && baggage_strip < remaining_hook,
-        "H3 must restore gateway identity and baggage policy before final enforcement"
+        "H3 must restore gateway assertions and baggage policy before final enforcement"
     );
     assert!(
         !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
@@ -636,12 +636,22 @@ fn h3_deferred_hooks_cannot_spoof_backend_consumer_identity() {
     let remaining_hook = routing_hook + remaining_hook;
     assert!(
         source[remaining_hook..]
-            .contains("refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers)"),
-        "H3 must restore gateway identity after every deferred hook pass"
+            .contains("refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers)"),
+        "H3 must restore gateway assertions after every deferred hook pass"
     );
     assert!(
         source[remaining_hook..].contains("strip_egress_baggage_in_map("),
         "H3 must restore egress baggage policy after every deferred hook pass"
+    );
+
+    let websocket = include_str!("../../../src/http3/websocket.rs");
+    assert!(websocket.contains("\"x-geo-country\","));
+    assert!(websocket.contains("if let Some(country) = ctx.backend_geo_country()"));
+
+    let h3_client = include_str!("../../../src/http3/client.rs");
+    assert!(
+        h3_client.contains("|| s == \"x-geo-country\""),
+        "H3 client trailers must not reintroduce a reserved geo assertion"
     );
 }
 

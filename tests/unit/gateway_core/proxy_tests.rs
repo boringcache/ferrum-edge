@@ -534,15 +534,15 @@ fn test_backend_path_bound_retries_preflight_before_backoff() {
 }
 
 #[test]
-fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
+fn test_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let routing_hook = source
         .rfind("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
         .expect("deferred routing-header hook must remain present");
     let after_routing_hook = &source[routing_hook..];
     let refresh = after_routing_hook
-        .find("refresh_effective_backend_consumer_identity_headers(")
-        .expect("identity headers must be refreshed after deferred routing hooks");
+        .find("refresh_effective_backend_gateway_assertion_headers(")
+        .expect("gateway assertions must be refreshed after deferred routing hooks");
     let baggage_strip = after_routing_hook
         .find("hbone_proxy::strip_egress_baggage_in_proxy_headers(")
         .expect("egress baggage policy must run after deferred routing hooks");
@@ -551,7 +551,7 @@ fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
         .expect("remaining deferred hook pass must remain present");
     assert!(
         refresh < baggage_strip && baggage_strip < remaining_hook,
-        "gateway identity and baggage policy must be restored before final enforcement"
+        "gateway assertions and baggage policy must be restored before final enforcement"
     );
     assert!(
         !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
@@ -560,8 +560,9 @@ fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
 
     let remaining_hook = routing_hook + remaining_hook;
     assert!(
-        source[remaining_hook..].contains("refresh_effective_backend_consumer_identity_headers("),
-        "gateway identity must be restored after every deferred hook pass"
+        source[remaining_hook..]
+            .contains("refresh_effective_backend_gateway_assertion_headers("),
+        "gateway assertions must be restored after every deferred hook pass"
     );
     assert!(
         source[remaining_hook..].contains("hbone_proxy::strip_egress_baggage_in_proxy_headers("),
@@ -569,8 +570,14 @@ fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
     );
     assert!(
         source.contains("name.eq_ignore_ascii_case(\"x-consumer-username\")")
-            && source.contains("name.eq_ignore_ascii_case(\"x-consumer-custom-id\")"),
-        "the shared scrub must reject case variants of reserved identity headers"
+            && source.contains("name.eq_ignore_ascii_case(\"x-consumer-custom-id\")")
+            && source.contains("name.eq_ignore_ascii_case(\"x-geo-country\")"),
+        "the shared scrub must reject case variants of every reserved assertion header"
+    );
+    assert!(
+        source.contains("if let Some(country) = ctx.backend_geo_country()")
+            && source.contains("\"x-geo-country\","),
+        "the H1/H2 WebSocket boundary must restore the private GeoIP assertion"
     );
 }
 

@@ -8498,11 +8498,18 @@ async fn handle_websocket_request_authenticated(
             custom_id.to_string(),
         );
     }
+    if let Some(country) = ctx.backend_geo_country() {
+        push_forwardable_header_override(
+            &mut client_headers,
+            "x-geo-country",
+            country.to_string(),
+        );
+    }
 
     // Egress baggage strip — see `FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`.
     // The WebSocket handshake gets the same sanitized `proxy_headers` as the
     // HTTP/gRPC dispatch paths. Keep applying the vector helper here because
-    // this function may append identity headers before backend dial.
+    // this function may append gateway assertions before backend dial.
     hbone_proxy::strip_egress_baggage_in_vec(
         &mut client_headers,
         &state.mesh_egress_strip_baggage_keys,
@@ -9641,6 +9648,7 @@ fn is_websocket_backend_strip_header(name: &str) -> bool {
             | "sec-websocket-extensions"
             | "x-consumer-username"
             | "x-consumer-custom-id"
+            | "x-geo-country"
     )
 }
 
@@ -9653,16 +9661,17 @@ fn push_forwardable_header_override(
     headers.push((name.to_string(), value));
 }
 
-fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, String>) {
+fn sanitize_reserved_gateway_assertion_headers(headers: &mut HashMap<String, String>) {
     headers.retain(|name, _| {
         !name.eq_ignore_ascii_case("x-consumer-username")
             && !name.eq_ignore_ascii_case("x-consumer-custom-id")
+            && !name.eq_ignore_ascii_case("x-geo-country")
     });
 }
 
-/// Remove plugin-controlled consumer identity headers and restore only the
-/// gateway-authenticated values for backend dispatch.
-pub(crate) fn refresh_backend_consumer_identity_headers(
+/// Remove plugin-controlled gateway assertion headers and restore only the
+/// authenticated principal and private GeoIP lookup result for dispatch.
+pub(crate) fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
@@ -9670,33 +9679,39 @@ pub(crate) fn refresh_backend_consumer_identity_headers(
     let principal_custom_id = principal_username
         .as_ref()
         .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
-    let source_has_reserved_identity = principal_username.is_none()
+    let geo_country = ctx.backend_geo_country().map(str::to_string);
+    let source_has_reserved_assertion = principal_username.is_none()
+        && geo_country.is_none()
         && headers.keys().any(|name| {
             name.eq_ignore_ascii_case("x-consumer-username")
                 || name.eq_ignore_ascii_case("x-consumer-custom-id")
+                || name.eq_ignore_ascii_case("x-geo-country")
         });
-    if principal_username.is_none() && !source_has_reserved_identity {
+    if principal_username.is_none() && geo_country.is_none() && !source_has_reserved_assertion {
         return;
     }
 
-    sanitize_reserved_consumer_identity_headers(headers);
+    sanitize_reserved_gateway_assertion_headers(headers);
     if let Some(username) = principal_username {
         headers.insert("x-consumer-username".to_string(), username);
         if let Some(custom_id) = principal_custom_id {
             headers.insert("x-consumer-custom-id".to_string(), custom_id);
         }
     }
+    if let Some(country) = geo_country {
+        headers.insert("x-geo-country".to_string(), country);
+    }
 }
 
-fn refresh_effective_backend_consumer_identity_headers(
+fn refresh_effective_backend_gateway_assertion_headers(
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
     if let Some(headers) = owned_proxy_headers.as_mut() {
-        refresh_backend_consumer_identity_headers(ctx, headers);
+        refresh_backend_gateway_assertion_headers(ctx, headers);
     } else {
         let mut headers = std::mem::take(&mut ctx.headers);
-        refresh_backend_consumer_identity_headers(ctx, &mut headers);
+        refresh_backend_gateway_assertion_headers(ctx, &mut headers);
         ctx.headers = headers;
     }
 }
@@ -16498,18 +16513,21 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // Strip plugin-controlled identity headers and inject only the gateway's
-    // authenticated values. The common no-header/no-principal path avoids
-    // materializing an owned header map.
-    let source_has_reserved_identity = owned_proxy_headers.as_ref().is_some_and(|headers| {
-        headers.keys().any(|name| {
-            name.eq_ignore_ascii_case("x-consumer-username")
-                || name.eq_ignore_ascii_case("x-consumer-custom-id")
-        })
+    // Strip plugin-controlled gateway assertions and inject only the
+    // authenticated principal and private GeoIP result. The common
+    // no-assertion path avoids materializing an owned header map.
+    let effective_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    let source_has_reserved_assertion = effective_headers.keys().any(|name| {
+        name.eq_ignore_ascii_case("x-consumer-username")
+            || name.eq_ignore_ascii_case("x-consumer-custom-id")
+            || name.eq_ignore_ascii_case("x-geo-country")
     });
-    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
+    if ctx.backend_consumer_username().is_some()
+        || ctx.backend_geo_country().is_some()
+        || source_has_reserved_assertion
+    {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        refresh_backend_consumer_identity_headers(&ctx, headers);
+        refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.
@@ -16685,9 +16703,12 @@ async fn handle_proxy_request_inner(
         ctx.path = backend_ctx_path;
         if matches!(deferred_result, PluginResult::Continue) {
             // A deferred routing function can return arbitrary headers.
-            // Restore gateway-owned identity and reapply the egress baggage
+            // Restore gateway-owned assertions and reapply the egress baggage
             // policy before those headers can reach any backend transport.
-            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            refresh_effective_backend_gateway_assertion_headers(
+                &mut ctx,
+                &mut owned_proxy_headers,
+            );
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
@@ -16738,7 +16759,10 @@ async fn handle_proxy_request_inner(
             ctx.path = backend_ctx_path;
         }
         if matches!(deferred_result, PluginResult::Continue) {
-            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            refresh_effective_backend_gateway_assertion_headers(
+                &mut ctx,
+                &mut owned_proxy_headers,
+            );
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
                 &ctx.headers,
@@ -32610,7 +32634,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_identity_headers_override_client_supplied_values() {
+    fn websocket_gateway_assertions_override_mutable_values() {
         let mut headers = vec![
             ("x-consumer-username".to_string(), "spoofed".to_string()),
             (
@@ -32621,6 +32645,7 @@ mod tests {
                 "x-consumer-custom-id".to_string(),
                 "spoofed-custom".to_string(),
             ),
+            ("X-Geo-Country".to_string(), "ATTACKER".to_string()),
             ("x-request-id".to_string(), "req-1".to_string()),
         ];
 
@@ -32633,6 +32658,11 @@ mod tests {
             &mut headers,
             "x-consumer-custom-id",
             "trusted-custom".to_string(),
+        );
+        push_forwardable_header_override(
+            &mut headers,
+            "x-geo-country",
+            "SE".to_string(),
         );
 
         let usernames: Vec<&str> = headers
@@ -32649,9 +32679,17 @@ mod tests {
                     .then_some(value.as_str())
             })
             .collect();
+        let countries: Vec<&str> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                name.eq_ignore_ascii_case("x-geo-country")
+                    .then_some(value.as_str())
+            })
+            .collect();
 
         assert_eq!(usernames, vec!["trusted-user"]);
         assert_eq!(custom_ids, vec!["trusted-custom"]);
+        assert_eq!(countries, vec!["SE"]);
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-request-id") && value == "req-1"
         }));

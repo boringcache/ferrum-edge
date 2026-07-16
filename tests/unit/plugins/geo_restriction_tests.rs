@@ -499,6 +499,15 @@ async fn authoritative_header_overwrites_spoof_only_after_successful_lookup() {
         ctx.headers.get("x-geo-country").map(String::as_str),
         Some("SE")
     );
+    assert_eq!(ctx.backend_geo_country(), Some("SE"));
+
+    ctx.headers
+        .insert("x-geo-country".to_string(), "ATTACKER".to_string());
+    assert_eq!(
+        ctx.backend_geo_country(),
+        Some("SE"),
+        "mutable plugin headers must not replace the private GeoIP assertion"
+    );
 }
 
 #[tokio::test]
@@ -613,6 +622,24 @@ fn test_validate_mmdb_file_nonexistent() {
 #[test]
 fn test_validate_mmdb_file_is_directory() {
     let result = validate_mmdb_file("geo_restriction.db_path", "/tmp");
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("not a regular file"));
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_mmdb_file_rejects_fifo_before_blocking_open() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("country.mmdb");
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a live, NUL-terminated path and the mode contains
+    // only ordinary permission bits.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+    let result = validate_mmdb_file("geo_restriction.db_path", path_text(&path));
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("not a regular file"));
 }
@@ -1017,6 +1044,7 @@ fn validate_mmdb_file_rejects_partial_corruption_after_open() {
 #[test]
 fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
     let source = include_str!("../../../src/plugins/geo_restriction.rs");
+    let plugin_context_source = include_str!("../../../src/plugins/mod.rs");
     let config_source = include_str!("../../../src/config/types.rs");
     let plugin_cache_source = include_str!("../../../src/plugin_cache.rs");
     let validation_source = include_str!("../../../src/config/validation_pipeline.rs");
@@ -1051,11 +1079,24 @@ fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
     assert!(config_source.contains("record_validation_failure"));
     assert!(config_source.contains("failures: HashMap<PathBuf, CountryMmdbLoadError>"));
     assert!(config_source.contains("live + in-flight + candidate"));
+    assert!(config_source.contains("custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)"));
+    assert!(plugin_context_source.contains("backend_geo_country: Option<[u8; 2]>"));
+    assert!(source.contains("ctx.set_backend_geo_country(code.bytes())"));
     let loader_source = config_source
         .split("fn load_validated_country_mmdb_inner(")
         .nth(1)
         .and_then(|tail| tail.split("pub fn validate_mmdb_file(").next())
         .expect("country MMDB loader source section");
+    let pre_open_metadata = loader_source
+        .find("let path_metadata_before_open = std::fs::metadata(path)")
+        .expect("non-blocking path type validation must precede open");
+    let open = loader_source
+        .find("open_country_mmdb_path(path)")
+        .expect("MMDB path open");
+    let opened_metadata = loader_source
+        .find("let metadata = file.metadata()")
+        .expect("opened-handle metadata validation");
+    assert!(pre_open_metadata < open && open < opened_metadata);
     let digest_cache_lookup = loader_source
         .find("cache.get_by_digest(&digest)")
         .expect("streamed digest cache lookup");

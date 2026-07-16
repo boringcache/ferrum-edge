@@ -777,6 +777,10 @@ pub struct RequestContext {
     /// Human-readable identity for the `X-Consumer-Username` header sent to the
     /// backend. Falls back to `authenticated_identity` when not set separately.
     pub authenticated_identity_header: Option<String>,
+    /// Authoritative GeoIP country assertion staged by `geo_restriction` for
+    /// backend dispatch. Kept outside the mutable plugin header map and public
+    /// metadata so later request hooks cannot replace or log a forged value.
+    backend_geo_country: Option<[u8; 2]>,
     /// Authentication mechanism that succeeded (e.g., `"jwt_auth"`, `"key_auth"`).
     /// `&'static str` because every `AuthMechanism::mechanism_name()` returns a
     /// compiled-in literal — zero allocation on the hot path.
@@ -1178,6 +1182,7 @@ impl RequestContext {
             identified_consumer: None,
             authenticated_identity: None,
             authenticated_identity_header: None,
+            backend_geo_country: None,
             auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
@@ -1350,6 +1355,7 @@ impl RequestContext {
             identified_consumer: self.identified_consumer.clone(),
             authenticated_identity: self.authenticated_identity.clone(),
             authenticated_identity_header: self.authenticated_identity_header.clone(),
+            backend_geo_country: self.backend_geo_country,
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
             // Omit `request_body` (the full buffered prompt): no
@@ -2009,6 +2015,21 @@ impl RequestContext {
             return None;
         }
         Some(custom_id)
+    }
+
+    /// Return the GeoIP country value to assert at the backend boundary.
+    ///
+    /// `geo_restriction` records this packed value privately when header
+    /// injection is enabled. Backend dispatch strips every mutable
+    /// `x-geo-country` value and restores only this lookup result.
+    pub fn backend_geo_country(&self) -> Option<&str> {
+        self.backend_geo_country
+            .as_ref()
+            .and_then(|country| std::str::from_utf8(country).ok())
+    }
+
+    pub(crate) fn set_backend_geo_country(&mut self, country: [u8; 2]) {
+        self.backend_geo_country = Some(country);
     }
 
     /// Whether a plugin opted this request out of gateway consumer-identity

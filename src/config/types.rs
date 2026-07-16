@@ -5424,6 +5424,24 @@ fn is_supported_mmdb_country_code(code: &str) -> bool {
         .any(|supported| supported == normalized.as_slice())
 }
 
+#[cfg(unix)]
+fn open_country_mmdb_path(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        // A regular-file path can be replaced with a FIFO/device after the
+        // pre-open metadata check. Non-blocking open makes that race safe; the
+        // opened-handle file-type/identity checks below still reject it.
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_country_mmdb_path(path: &str) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 fn verify_country_mmdb_path_still_matches(
     path: &str,
     opened_version: &CountryMmdbFileVersion,
@@ -5551,7 +5569,23 @@ fn load_validated_country_mmdb_inner(
     use sha2::{Digest as _, Sha256};
     use std::io::{Read as _, Seek as _, SeekFrom};
 
-    let mut file = std::fs::File::open(path).map_err(|e| {
+    // Reject FIFOs, devices, sockets, and directories before opening. On Unix
+    // the open itself is also non-blocking so a regular path replaced after
+    // this check cannot wedge startup/reload before the opened-handle fstat.
+    let path_metadata_before_open = std::fs::metadata(path).map_err(|e| {
+        CountryMmdbLoadError::Unavailable(format!(
+            "MaxMind database file '{path}' not accessible before open: {e}"
+        ))
+    })?;
+    if !path_metadata_before_open.is_file() {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "'{path}' exists but is not a regular file"
+        )));
+    }
+    let path_version_before_open =
+        CountryMmdbFileVersion::from_metadata(path, &path_metadata_before_open);
+
+    let mut file = open_country_mmdb_path(path).map_err(|e| {
         CountryMmdbLoadError::Unavailable(format!(
             "MaxMind database file '{path}' not accessible: {e}"
         ))
@@ -5567,6 +5601,11 @@ fn load_validated_country_mmdb_inner(
         )));
     }
     let file_version = CountryMmdbFileVersion::from_metadata(path, &metadata);
+    if file_version != path_version_before_open {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' changed before it was opened"
+        )));
+    }
 
     if metadata.len() > MAX_COUNTRY_MMDB_SIZE_BYTES {
         return Err(CountryMmdbLoadError::Invalid(format!(
