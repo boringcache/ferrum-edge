@@ -147,10 +147,20 @@ async fn spawn_h3_gateway(config: Value) -> (GatewayHarness, u16, tempfile::Temp
 }
 
 async fn request_with_retry(client: &Http3Client, url: &str, options: GetOptions) -> Http3Response {
+    request_with_retry_and_attempts(client, url, options).await.0
+}
+
+async fn request_with_retry_and_attempts(
+    client: &Http3Client,
+    url: &str,
+    options: GetOptions,
+) -> (Http3Response, u32) {
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut attempts = 0_u32;
     loop {
+        attempts += 1;
         match client.get_with_options(url, options.clone()).await {
-            Ok(response) => return response,
+            Ok(response) => return (response, attempts),
             Err(error) if Instant::now() < deadline => {
                 let _ = error;
                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -676,7 +686,7 @@ async fn streaming_h3_grpc_web_deadline_cancels_withheld_backend_headers() {
     let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
     let client = Http3Client::insecure().expect("H3 client");
     let started_at = Instant::now();
-    let response = request_with_retry(
+    let (response, request_attempts) = request_with_retry_and_attempts(
         &client,
         &format!("https://127.0.0.1:{https_port}/deadline-stall/echo.Echo/Unary"),
         GetOptions::default()
@@ -692,7 +702,16 @@ async fn streaming_h3_grpc_web_deadline_cancels_withheld_backend_headers() {
         started_at.elapsed() < Duration::from_secs(3),
         "the absolute RPC deadline must win before the five-second backend read timeout"
     );
-    assert_eq!(backend.accepted_connections(), 1);
+    let backend_connections = backend.accepted_connections();
+    assert!(
+        backend_connections >= 1,
+        "the withheld-response-header backend path must be reached"
+    );
+    assert!(
+        backend_connections <= request_attempts,
+        "streaming dispatch must dial the backend at most once per client request attempt: \
+         {backend_connections} backend connections for {request_attempts} client attempts"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
