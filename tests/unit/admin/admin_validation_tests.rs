@@ -68,6 +68,22 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(batch_source.contains("crud::validate_transaction_log_schema_candidates("));
     assert!(batch_source.contains("&batch.plugin_configs,"));
     assert!(batch_source.contains("is_enabled_config_graph_participant"));
+    let restore_validator = batch_source
+        .find("async fn validate_restore_candidate_on_blocking_pool(")
+        .expect("restore candidate validator must exist");
+    let restore_handler = batch_source
+        .find("async fn handle_restore(")
+        .expect("restore handler must exist");
+    assert!(
+        batch_source[restore_validator..restore_handler]
+            .contains("tokio::task::spawn_blocking(move ||"),
+        "restore graph construction must run off the Tokio worker"
+    );
+    assert!(
+        batch_source[restore_handler..]
+            .contains("validate_restore_candidate_on_blocking_pool("),
+        "restore must use the blocking candidate validator"
+    );
     assert!(
         batch_source
             .matches("crud::lock_namespace_config_admission(namespace).await")

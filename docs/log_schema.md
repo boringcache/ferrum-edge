@@ -136,12 +136,13 @@ spec before overlaying the replacement bundle. API-spec `DELETE` validates the
 same removal-only candidate and rejects deletion when retained referrers would
 be left dangling.
 
-Graph participation never skips backend-egress admission once a configuration
-is enabled. Disabled direct/batch configurations remain inert and defer literal
-endpoint screening until they are enabled. Enabled `schema_ref` consumers also
-receive the policy-only checks that follow prospective graph construction,
-including custom plugins and plugins that ignore an unrecognized `schema_ref`
-key. SQL, MongoDB, and control-plane runtime snapshots reject dangling/non-string
+Graph participation never bypasses backend-egress admission. Direct and batch
+writes screen literal endpoints even for disabled configurations; disabled
+configurations defer construction and graph validation until they are enabled.
+Enabled `schema_ref` consumers also receive the policy-only checks that follow
+prospective graph construction, including custom plugins and plugins that ignore
+an unrecognized `schema_ref` key. SQL, MongoDB, and control-plane runtime snapshots
+reject dangling/non-string
 references before cache publication, while unrelated constructor failures on
 optional logging sinks retain their existing fail-open warning behavior.
 

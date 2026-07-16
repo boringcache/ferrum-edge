@@ -4796,6 +4796,43 @@ async fn handle_backup(
     Ok(resp)
 }
 
+async fn validate_restore_candidate_on_blocking_pool(
+    mut candidate: GatewayConfig,
+    cert_expiry_days: u64,
+    backend_allow_ips: crate::config::BackendEgressPolicy,
+) -> Result<(GatewayConfig, Vec<String>), anyhow::Error> {
+    let (candidate, result) = tokio::task::spawn_blocking(move || {
+        let result = ValidationPipeline::new(&mut candidate)
+            .validate_all_fields_with_ip_policy(
+                cert_expiry_days,
+                &backend_allow_ips,
+                ValidationAction::Collect,
+            )
+            .validate_unique_resource_ids(ValidationAction::Collect)
+            .validate_unique_consumer_identities(ValidationAction::Collect)
+            .validate_unique_consumer_credentials(ValidationAction::Collect)
+            .validate_hosts(ValidationAction::Collect)
+            .validate_regex_listen_paths(ValidationAction::Collect)
+            .validate_listen_path_encodings(ValidationAction::Collect)
+            .validate_unique_listen_paths(ValidationAction::Collect)
+            .validate_stream_proxies(ValidationAction::Collect)
+            .validate_plugin_configs(&backend_allow_ips, ValidationAction::Collect)
+            .validate_upstream_references(ValidationAction::Collect)
+            .validate_mesh_route_dispatch_references(ValidationAction::Collect)
+            .validate_plugin_references(ValidationAction::Collect)
+            .run();
+        (candidate, result)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("restore validation task failed: {error}"))?;
+
+    let errors = match result {
+        Ok(errors) => errors,
+        Err(error) => vec![error.to_string()],
+    };
+    Ok((candidate, errors))
+}
+
 /// Restore the gateway configuration from a backup payload.
 async fn handle_restore(
     state: &AdminState,
@@ -4891,36 +4928,32 @@ async fn handle_restore(
         for u in &mut temp_config.upstreams {
             u.namespace = namespace.to_string();
         }
-        let mut validation_errors: Vec<String> = Vec::new();
-
         let cert_expiry_days = state
             .proxy_state
             .as_ref()
             .map(|ps| ps.env_config.tls_cert_expiry_warning_days)
             .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS);
-        match ValidationPipeline::new(&mut temp_config)
-            .validate_all_fields_with_ip_policy(
+        let (temp_config, mut validation_errors) =
+            match validate_restore_candidate_on_blocking_pool(
+                temp_config,
                 cert_expiry_days,
-                &state.backend_allow_ips,
-                ValidationAction::Collect,
+                state.backend_allow_ips.clone(),
             )
-            .validate_unique_resource_ids(ValidationAction::Collect)
-            .validate_unique_consumer_identities(ValidationAction::Collect)
-            .validate_unique_consumer_credentials(ValidationAction::Collect)
-            .validate_hosts(ValidationAction::Collect)
-            .validate_regex_listen_paths(ValidationAction::Collect)
-            .validate_listen_path_encodings(ValidationAction::Collect)
-            .validate_unique_listen_paths(ValidationAction::Collect)
-            .validate_stream_proxies(ValidationAction::Collect)
-            .validate_plugin_configs(&state.backend_allow_ips, ValidationAction::Collect)
-            .validate_upstream_references(ValidationAction::Collect)
-            .validate_mesh_route_dispatch_references(ValidationAction::Collect)
-            .validate_plugin_references(ValidationAction::Collect)
-            .run()
-        {
-            Ok(errs) => validation_errors.extend(errs),
-            Err(err) => validation_errors.push(err.to_string()),
-        }
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Restore aborted: payload validation could not complete: {}. Existing config was NOT deleted.",
+                                error
+                            )
+                        }),
+                    ));
+                }
+            };
         // Restore is an operator-provided admin write, so reject mesh-PROJECTED
         // upstream fields the same way direct POST/PUT does. This check is
         // intentionally NOT part of the shared `validate_all_fields` step (that
