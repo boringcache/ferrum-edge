@@ -203,17 +203,29 @@ impl Drop for NamespaceConfigAdmissionGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Some(task) = renew_task {
+                    task.abort();
                     let _ = task.await;
                 }
-                if let Err(error) = db
-                    .release_namespace_config_admission_lease(&namespace, &owner)
-                    .await
+                match tokio::time::timeout(
+                    CONFIG_ADMISSION_LEASE_RETRY_INTERVAL,
+                    db.release_namespace_config_admission_lease(&namespace, &owner),
+                )
+                .await
                 {
-                    tracing::warn!(
-                        namespace = %namespace,
-                        %error,
-                        "Failed to release namespace config admission lease; expiry will recover it"
-                    );
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            namespace = %namespace,
+                            %error,
+                            "Failed to release namespace config admission lease; expiry will recover it"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            namespace = %namespace,
+                            "Timed out releasing namespace config admission lease; expiry will recover it"
+                        );
+                    }
                 }
                 drop(local);
             });

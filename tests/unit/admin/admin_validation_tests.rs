@@ -57,6 +57,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("release_namespace_config_admission_lease("));
     assert!(crud_source.contains("guard.ensure_held()"));
     assert!(crud_source.contains("guard.run_while_held(future).await?"));
+    assert!(crud_source.contains("task.abort();"));
+    assert!(crud_source.contains("tokio::time::timeout("));
     assert!(crud_source.contains("drop(local);"));
 
     let graph_validation = crud_source
