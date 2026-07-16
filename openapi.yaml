@@ -13099,7 +13099,9 @@ components:
       required: [allowed_origins]
       description: |
         Plugin: cors — Cross-Origin Resource Sharing. Unknown keys, null values,
-        non-object configs, and an omitted origin policy are rejected.
+        non-object configs, and an omitted origin policy are rejected. Actual
+        requests evaluate origin/credentials/exposure behavior; method/header
+        allow-lists and max age govern preflight only.
       allOf:
         - if:
             not:
@@ -13166,9 +13168,11 @@ components:
             minLength: 1
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           description: >-
-            Allowed methods. Omission uses the native direct-plugin default;
-            with `unmatched_preflights`, omission/empty preserves Istio's
-            empty list.
+            Preflight-only allowed methods returned in
+            Access-Control-Allow-Methods. This list is not evaluated against
+            the actual request method. Omission uses the native direct-plugin
+            default; with `unmatched_preflights`, omission/empty preserves
+            Istio's empty list.
         allowed_headers:
           type: array
           items:
@@ -13176,9 +13180,11 @@ components:
             minLength: 1
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           description: >-
-            Allowed headers. Omission uses the native direct-plugin default;
-            with `unmatched_preflights`, omission/empty preserves Istio's
-            empty list.
+            Preflight-only allowed request headers returned in
+            Access-Control-Allow-Headers. This list is not evaluated against
+            headers on the actual request. Omission uses the native
+            direct-plugin default; with `unmatched_preflights`, omission/empty
+            preserves Istio's empty list.
         exposed_headers:
           type: array
           items:

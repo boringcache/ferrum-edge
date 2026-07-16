@@ -102,28 +102,30 @@ impl CorsRequestState {
         self.policy_count += 1;
     }
 
-    fn stage_matching_policy(&mut self, plugin: &CorsPlugin) {
+    fn stage_matching_policy(&mut self, plugin: &CorsPlugin, is_preflight: bool) {
         self.sanitize_response = true;
         self.all_wildcard &= matches!(&plugin.allowed_origins, AllowedOrigins::Wildcard);
         self.allow_credentials &= plugin.allow_credentials;
-        intersect_values(
-            &mut self.allowed_methods,
-            &mut self.allowed_method_union,
-            &plugin.allowed_methods,
-        );
-        intersect_values(
-            &mut self.allowed_headers,
-            &mut self.allowed_header_union,
-            &plugin.allowed_headers,
-        );
         intersect_only(&mut self.exposed_headers, &plugin.exposed_headers);
-        self.max_age = Some(match self.max_age.take() {
-            None => plugin.max_age,
-            Some(existing) => match (existing, plugin.max_age) {
-                (Some(left), Some(right)) => Some(left.min(right)),
-                _ => None,
-            },
-        });
+        if is_preflight {
+            intersect_values(
+                &mut self.allowed_methods,
+                &mut self.allowed_method_union,
+                &plugin.allowed_methods,
+            );
+            intersect_values(
+                &mut self.allowed_headers,
+                &mut self.allowed_header_union,
+                &plugin.allowed_headers,
+            );
+            self.max_age = Some(match self.max_age.take() {
+                None => plugin.max_age,
+                Some(existing) => match (existing, plugin.max_age) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    _ => None,
+                },
+            });
+        }
     }
 }
 
@@ -635,7 +637,7 @@ impl Plugin for CorsPlugin {
                     headers: HashMap::new(),
                 };
             }
-            ctx.cors_state.stage_matching_policy(self);
+            ctx.cors_state.stage_matching_policy(self, false);
             ctx.metadata
                 .insert("cors_origin".to_string(), origin.clone());
             return self.maybe_finalize_request(ctx);
@@ -672,7 +674,7 @@ impl Plugin for CorsPlugin {
             };
         }
 
-        ctx.cors_state.stage_matching_policy(self);
+        ctx.cors_state.stage_matching_policy(self, true);
         ctx.metadata
             .insert("cors_origin".to_string(), origin.clone());
 
@@ -791,76 +793,46 @@ fn finalize_cors_request(ctx: &mut RequestContext) -> PluginResult {
         return PluginResult::Continue;
     }
 
-    // A browser carries the requested method/header list only on preflight.
-    // For multiple policies, reject a value one instance authorizes but the
-    // aggregate intersection does not. This prevents a prior permissive
-    // instance (or a cached approval from it) from bypassing a later policy,
-    // while leaving the established single-instance native behavior intact.
-    if state.policy_count > 1 {
+    // Requested methods and headers are preflight policy. For multiple
+    // policies, reject a preflight value one instance authorizes but the
+    // aggregate intersection does not. Actual requests evaluate only the
+    // origin/credentials/exposure policy appropriate to that phase; browsers
+    // do not repeat Access-Control-Request-* on the actual request.
+    if state.policy_count > 1 && state.is_preflight {
         let methods = state
             .allowed_methods
             .as_ref()
             .map(|values| values.as_slice())
             .unwrap_or_default();
         let method_union = state.allowed_method_union.as_deref().unwrap_or_default();
-        if state.is_preflight {
-            if let Some(requested_method) = ctx.headers.get("access-control-request-method")
-                && contains_ascii_case(method_union, requested_method)
-                && !contains_ascii_case(methods, requested_method)
-            {
-                let mut body = String::with_capacity(
-                    "CORS method not allowed: ".len() + requested_method.len(),
-                );
-                body.push_str("CORS method not allowed: ");
-                body.push_str(requested_method);
-                return cors_reject(body);
-            }
-            if let Some(requested_headers) = ctx.headers.get("access-control-request-headers") {
-                let headers = state
-                    .allowed_headers
-                    .as_ref()
-                    .map(|values| values.as_slice())
-                    .unwrap_or_default();
-                let header_union = state.allowed_header_union.as_deref().unwrap_or_default();
-                for requested in requested_headers.split(',').map(str::trim) {
-                    if !requested.is_empty()
-                        && contains_ascii_case(header_union, requested)
-                        && !contains_ascii_case(headers, requested)
-                    {
-                        let mut body = String::with_capacity(
-                            "CORS header not allowed: ".len() + requested.len(),
-                        );
-                        body.push_str("CORS header not allowed: ");
-                        body.push_str(requested);
-                        return cors_reject(body);
-                    }
-                }
-            }
-        } else {
-            if contains_ascii_case(method_union, &ctx.method)
-                && !contains_ascii_case(methods, &ctx.method)
-            {
-                let mut body =
-                    String::with_capacity("CORS method not allowed: ".len() + ctx.method.len());
-                body.push_str("CORS method not allowed: ");
-                body.push_str(&ctx.method);
-                return cors_reject(body);
-            }
+        if let Some(requested_method) = ctx.headers.get("access-control-request-method")
+            && contains_ascii_case(method_union, requested_method)
+            && !contains_ascii_case(methods, requested_method)
+        {
+            let mut body = String::with_capacity(
+                "CORS method not allowed: ".len() + requested_method.len(),
+            );
+            body.push_str("CORS method not allowed: ");
+            body.push_str(requested_method);
+            return cors_reject(body);
+        }
+        if let Some(requested_headers) = ctx.headers.get("access-control-request-headers") {
             let headers = state
                 .allowed_headers
                 .as_ref()
                 .map(|values| values.as_slice())
                 .unwrap_or_default();
             let header_union = state.allowed_header_union.as_deref().unwrap_or_default();
-            for name in ctx.headers.keys() {
-                if cors_actual_header_is_policy_relevant(name)
-                    && contains_ascii_case(header_union, name)
-                    && !contains_ascii_case(headers, name)
+            for requested in requested_headers.split(',').map(str::trim) {
+                if !requested.is_empty()
+                    && contains_ascii_case(header_union, requested)
+                    && !contains_ascii_case(headers, requested)
                 {
-                    let mut body =
-                        String::with_capacity("CORS header not allowed: ".len() + name.len());
+                    let mut body = String::with_capacity(
+                        "CORS header not allowed: ".len() + requested.len(),
+                    );
                     body.push_str("CORS header not allowed: ");
-                    body.push_str(name);
+                    body.push_str(requested);
                     return cors_reject(body);
                 }
             }
@@ -887,19 +859,6 @@ fn finalize_cors_request(ctx: &mut RequestContext) -> PluginResult {
         body: String::new(),
         headers,
     }
-}
-
-fn cors_actual_header_is_policy_relevant(name: &str) -> bool {
-    !matches_ignore_ascii_case(
-        name,
-        &["accept", "accept-language", "content-language", "origin"],
-    )
-}
-
-fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
-    candidates
-        .iter()
-        .any(|candidate| value.eq_ignore_ascii_case(candidate))
 }
 
 fn finalize_cors_response(

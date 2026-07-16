@@ -574,6 +574,25 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
         .await;
     assert!(!actual_headers.contains_key("access-control-allow-origin"));
 
+    let mut matched_actual = make_cors_ctx("DELETE", "https://app.example");
+    matched_actual
+        .headers
+        .insert("authorization".to_string(), "Bearer test".to_string());
+    assert!(matches!(
+        forward.on_request_received(&mut matched_actual).await,
+        PluginResult::Continue
+    ));
+    let mut matched_actual_headers = HashMap::new();
+    let _ = forward
+        .after_proxy(&mut matched_actual, 200, &mut matched_actual_headers)
+        .await;
+    assert_eq!(
+        matched_actual_headers["access-control-allow-origin"],
+        "https://app.example"
+    );
+    assert!(!matched_actual_headers.contains_key("access-control-allow-methods"));
+    assert!(!matched_actual_headers.contains_key("access-control-allow-headers"));
+
     let ignore = CorsPlugin::new(&json!({
         "allowed_origins": ["https://app.example"],
         "allowed_methods": [],
@@ -634,6 +653,48 @@ async fn test_preflight_disallowed_method() {
         }
         _ => panic!("Expected Reject for preflight"),
     }
+}
+
+#[tokio::test]
+async fn test_actual_request_does_not_apply_preflight_method_or_header_lists() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["GET"],
+        "allowed_headers": ["X-Test"],
+        "exposed_headers": ["X-Response"],
+        "allow_credentials": true
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("DELETE", "https://app.example");
+    ctx.headers
+        .insert("authorization".to_string(), "Bearer test".to_string());
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut response_headers = HashMap::new();
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers["access-control-allow-origin"],
+        "https://app.example"
+    );
+    assert_eq!(
+        response_headers["access-control-expose-headers"],
+        "X-Response"
+    );
+    assert_eq!(
+        response_headers["access-control-allow-credentials"],
+        "true"
+    );
+    assert!(!response_headers.contains_key("access-control-allow-methods"));
+    assert!(!response_headers.contains_key("access-control-allow-headers"));
 }
 
 #[tokio::test]

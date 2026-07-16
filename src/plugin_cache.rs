@@ -197,17 +197,20 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
     if first_index == last_index {
         return Ok(());
     }
-    if plugins[first_index..=last_index]
-        .iter()
-        .any(|plugin| plugin.name() != CORS_NAME)
-    {
+    if plugins[first_index..=last_index].iter().any(|plugin| {
+        plugin.name() != CORS_NAME
+            && plugin
+                .supported_protocols()
+                .iter()
+                .any(|protocol| crate::plugins::HTTP_GRPC_PROTOCOLS.contains(protocol))
+    }) {
         return Err(
-            "cors instances must remain contiguous so their origin, method, and header policies can be intersected before any request short-circuits; remove priority overrides that interleave another plugin"
+            "cors instances must remain contiguous in HTTP/gRPC chains so their origin and preflight method/header policies can be intersected before any request short-circuits; remove priority overrides that interleave another HTTP/gRPC plugin"
                 .to_string(),
         );
     }
     for plugin in &mut plugins[first_index..=last_index] {
-        if !plugin.is_deferred_cors_wrapper() {
+        if plugin.name() == CORS_NAME && !plugin.is_deferred_cors_wrapper() {
             *plugin = Arc::new(DeferredCorsPlugin {
                 inner: Arc::clone(plugin),
             });

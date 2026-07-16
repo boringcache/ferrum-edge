@@ -207,6 +207,20 @@ async fn run_request_received_chain(
     PluginResult::Continue
 }
 
+async fn run_after_proxy_chain(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    for plugin in plugins {
+        match plugin.after_proxy(ctx, 200, response_headers).await {
+            PluginResult::Continue => {}
+            reject => return reject,
+        }
+    }
+    PluginResult::Continue
+}
+
 fn cors_config(
     id: &str,
     methods: &[&str],
@@ -229,7 +243,7 @@ fn cors_config(
 }
 
 #[tokio::test]
-async fn multiple_cors_instances_intersect_preflight_and_actual_policy() {
+async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_requests() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["permissive", "strict"])],
         vec![
@@ -344,11 +358,19 @@ async fn multiple_cors_instances_intersect_preflight_and_actual_policy() {
         .insert("origin".to_string(), "https://trusted.example".to_string());
     assert!(matches!(
         run_request_received_chain(&plugins, &mut actual).await,
-        PluginResult::Reject {
-            status_code: 403,
-            ..
-        }
+        PluginResult::Continue
     ));
+    let mut actual_response_headers = HashMap::new();
+    assert!(matches!(
+        run_after_proxy_chain(&plugins, &mut actual, &mut actual_response_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        actual_response_headers["access-control-allow-origin"],
+        "https://trusted.example"
+    );
+    assert!(!actual_response_headers.contains_key("access-control-allow-methods"));
+    assert!(!actual_response_headers.contains_key("access-control-allow-headers"));
 
     let mut actual_header = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -361,10 +383,7 @@ async fn multiple_cors_instances_intersect_preflight_and_actual_policy() {
     ]));
     assert!(matches!(
         run_request_received_chain(&plugins, &mut actual_header).await,
-        PluginResult::Reject {
-            status_code: 403,
-            ..
-        }
+        PluginResult::Continue
     ));
 
     let reversed = make_config(
@@ -450,6 +469,77 @@ async fn multiple_cors_instances_intersect_preflight_and_actual_policy() {
     }
 }
 
+#[tokio::test]
+async fn mixed_native_and_istio_empty_lists_apply_only_to_preflight() {
+    let mut native = cors_config("native", &["GET"], &["Authorization"], None);
+    native.config["exposed_headers"] = json!(["X-Shared", "X-Native"]);
+    native.config["allow_credentials"] = json!(true);
+    let mut istio = cors_config("istio", &[], &[], None);
+    istio.config["exposed_headers"] = json!(["X-Shared"]);
+    istio.config["unmatched_preflights"] = json!("forward");
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["native", "istio"])],
+        vec![native, istio],
+    );
+    let cache = PluginCache::new(&config).expect("mixed native/Istio CORS cache");
+
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        let plugins = cache.get_plugins_for_protocol("p1", protocol);
+        let mut actual = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        actual.headers.extend(HashMap::from([
+            ("origin".to_string(), "https://trusted.example".to_string()),
+            ("authorization".to_string(), "Bearer test".to_string()),
+        ]));
+        assert!(matches!(
+            run_request_received_chain(&plugins, &mut actual).await,
+            PluginResult::Continue
+        ));
+
+        let mut response_headers = HashMap::new();
+        assert!(matches!(
+            run_after_proxy_chain(&plugins, &mut actual, &mut response_headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            response_headers["access-control-allow-origin"],
+            "https://trusted.example"
+        );
+        assert_eq!(response_headers["access-control-expose-headers"], "X-Shared");
+        assert!(!response_headers.contains_key("access-control-allow-credentials"));
+        assert!(!response_headers.contains_key("access-control-allow-methods"));
+        assert!(!response_headers.contains_key("access-control-allow-headers"));
+
+        let mut preflight = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "OPTIONS".to_string(),
+            "/api".to_string(),
+        );
+        preflight.headers.extend(HashMap::from([
+            ("origin".to_string(), "https://trusted.example".to_string()),
+            (
+                "access-control-request-method".to_string(),
+                "GET".to_string(),
+            ),
+            (
+                "access-control-request-headers".to_string(),
+                "Authorization".to_string(),
+            ),
+        ]));
+        assert!(matches!(
+            run_request_received_chain(&plugins, &mut preflight).await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ));
+    }
+}
+
 #[test]
 fn multiple_cors_instances_must_remain_contiguous() {
     let config = make_config(
@@ -474,6 +564,143 @@ fn multiple_cors_instances_must_remain_contiguous() {
         err.contains("cors instances must remain contiguous"),
         "got: {err}"
     );
+}
+
+#[test]
+fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["cors-a", "udp", "cors-b"],
+        )],
+        vec![
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            make_plugin_config_with_priority(
+                "udp",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(150),
+            ),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("stream-only CORS interloper is valid");
+
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        assert_eq!(
+            cache
+                .get_plugins_for_protocol("p1", protocol)
+                .iter()
+                .map(|plugin| plugin.name())
+                .collect::<Vec<_>>(),
+            vec!["cors", "cors", "__cors_finalizer"]
+        );
+    }
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("p1", ProxyProtocol::Udp)
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["udp_rate_limiting"]
+    );
+}
+
+#[test]
+fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
+    let initial = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-a", "udp"])],
+        vec![
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            make_plugin_config_with_priority(
+                "udp",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(150),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&initial).expect("initial cache");
+    let stream_interleaved = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["cors-a", "udp", "cors-b"],
+        )],
+        vec![
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            make_plugin_config_with_priority(
+                "udp",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(150),
+            ),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+        ],
+    );
+    let stream_delta = ConfigDelta::compute(&initial, &stream_interleaved);
+    let stream_proxy_ids = stream_delta.proxy_ids_needing_plugin_rebuild(&stream_interleaved);
+    cache
+        .apply_delta(
+            &stream_interleaved,
+            &stream_proxy_ids,
+            &stream_delta.removed_proxy_ids,
+            stream_delta.global_plugin_configs_changed,
+        )
+        .expect("delta reload must ignore stream-only interloper");
+    let last_good = cache.get_plugins("p1");
+    assert_eq!(
+        last_good
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["cors", "udp_rate_limiting", "cors", "__cors_finalizer"]
+    );
+
+    let http_interleaved = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["cors-a", "ip", "cors-b"],
+        )],
+        vec![
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            make_plugin_config_with_priority(
+                "ip",
+                "ip_restriction",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(150),
+            ),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+        ],
+    );
+    let http_delta = ConfigDelta::compute(&stream_interleaved, &http_interleaved);
+    let http_proxy_ids = http_delta.proxy_ids_needing_plugin_rebuild(&http_interleaved);
+    let err = cache
+        .apply_delta(
+            &http_interleaved,
+            &http_proxy_ids,
+            &http_delta.removed_proxy_ids,
+            http_delta.global_plugin_configs_changed,
+        )
+        .err()
+        .expect("HTTP-overlapping interloper must reject delta reload");
+    assert!(
+        err.contains("cors instances must remain contiguous in HTTP/gRPC chains"),
+        "got: {err}"
+    );
+    let after_reject = cache.get_plugins("p1");
+    assert_eq!(after_reject.len(), last_good.len());
+    assert!(Arc::ptr_eq(&after_reject[0], &last_good[0]));
 }
 
 #[test]

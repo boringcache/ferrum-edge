@@ -462,12 +462,16 @@ Browser preflight (`OPTIONS`) requests must be answered before authentication. I
 
 When a proxy has multiple CORS instances, the cache keeps their equal-priority
 order stable, evaluates the whole contiguous CORS chain, and inserts one
-internal finalizer after it. The finalizer emits the intersection of origin,
-method, header, credentials, exposed-header, and max-age policy, so an earlier
+internal finalizer after it. Actual requests compose origin, credentials, and
+exposed-header policy; method/header lists and max age are preflight-only and
+are not evaluated on actual traffic. Preflights additionally intersect the
+requested-method/header policy and use the shortest max age, so an earlier
 approval cannot bypass a later restriction. A priority override that places a
-different plugin between CORS instances is rejected during cache construction;
-this preserves the phase-1 short-circuit boundary on H1, H2, H3, and the
-gRPC-Web request-policy chain.
+different HTTP/gRPC-capable plugin between CORS instances is rejected during
+cache construction; non-overlapping stream-only plugins are ignored because
+protocol filtering removes them from the CORS chain. This preserves the
+phase-1 short-circuit boundary on H1, H2, H3, and the gRPC-Web request-policy
+chain.
 
 ### Request termination runs immediately after CORS (priority 125)
 

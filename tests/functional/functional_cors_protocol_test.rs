@@ -54,15 +54,27 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
         send_h1(&harness, Method::OPTIONS, Some("DELETE"), None).await,
         send_h2(&harness, Method::OPTIONS, Some("DELETE"), None).await,
         send_h3(&harness, Method::OPTIONS, Some("DELETE"), None).await,
-        send_h1(&harness, Method::DELETE, None, None).await,
-        send_h2(&harness, Method::DELETE, None, None).await,
-        send_h3(&harness, Method::DELETE, None, None).await,
     ] {
         assert_eq!(response.status, StatusCode::FORBIDDEN);
         assert!(
             String::from_utf8_lossy(&response.body).contains("CORS method not allowed: DELETE"),
-            "later CORS policy must reject the conflicting method: {response:?}"
+            "later CORS policy must reject the conflicting preflight method: {response:?}"
         );
+    }
+
+    for response in [
+        send_h1(&harness, Method::DELETE, None, None).await,
+        send_h2(&harness, Method::DELETE, None, None).await,
+        send_h3(&harness, Method::DELETE, None, None).await,
+    ] {
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&response.body).contains("cors-protocol"),
+            "preflight-only method policy must not reject the actual request: {response:?}"
+        );
+        assert_eq!(header(&response, "access-control-allow-origin"), ORIGIN);
+        assert!(!response.headers.contains_key("access-control-allow-methods"));
+        assert!(!response.headers.contains_key("access-control-allow-headers"));
     }
 
     for response in [
@@ -93,6 +105,78 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
             String::from_utf8_lossy(&response.body)
                 .contains("CORS header not allowed: Authorization"),
             "later CORS policy must reject the conflicting header: {response:?}"
+        );
+    }
+
+    for response in [
+        send_h1_path(
+            &harness,
+            "/mixed-cors",
+            Method::GET,
+            None,
+            None,
+            ORIGIN,
+        )
+        .await,
+        send_h2_path(
+            &harness,
+            "/mixed-cors",
+            Method::GET,
+            None,
+            None,
+            ORIGIN,
+        )
+        .await,
+        send_h3_path(
+            &harness,
+            "/mixed-cors",
+            Method::GET,
+            None,
+            None,
+            ORIGIN,
+        )
+        .await,
+    ] {
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&response.body).contains("mixed-cors"));
+        assert_eq!(header(&response, "access-control-allow-origin"), ORIGIN);
+        assert!(!response.headers.contains_key("access-control-allow-methods"));
+        assert!(!response.headers.contains_key("access-control-allow-headers"));
+    }
+
+    for response in [
+        send_h1_path(
+            &harness,
+            "/mixed-cors",
+            Method::OPTIONS,
+            Some("GET"),
+            Some("Authorization"),
+            ORIGIN,
+        )
+        .await,
+        send_h2_path(
+            &harness,
+            "/mixed-cors",
+            Method::OPTIONS,
+            Some("GET"),
+            Some("Authorization"),
+            ORIGIN,
+        )
+        .await,
+        send_h3_path(
+            &harness,
+            "/mixed-cors",
+            Method::OPTIONS,
+            Some("GET"),
+            Some("Authorization"),
+            ORIGIN,
+        )
+        .await,
+    ] {
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert!(
+            String::from_utf8_lossy(&response.body).contains("CORS method not allowed: GET"),
+            "the empty Istio preflight list must narrow the native approval: {response:?}"
         );
     }
 
@@ -399,6 +483,12 @@ fn cors_config(backend_port: u16) -> String {
             backend_port,
             &["istio-ignore"],
         ),
+        cors_proxy(
+            "mixed-cors",
+            "/mixed-cors",
+            backend_port,
+            &["mixed-native", "mixed-istio"],
+        ),
         cors_proxy("istio-star", "/istio-star", backend_port, &["istio-star"]),
         cors_proxy("canonical", "/canonical", backend_port, &["canonical"]),
     ];
@@ -438,6 +528,32 @@ fn cors_config(backend_port: u16) -> String {
                     "allow_credentials": true,
                     "max_age": 600,
                     "preflight_continue": true
+                }
+            },
+            {
+                "id": "mixed-native",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "proxy_id": "mixed-cors",
+                "enabled": true,
+                "config": {
+                    "allowed_origins": [ORIGIN],
+                    "allowed_methods": ["GET"],
+                    "allowed_headers": ["Authorization"]
+                }
+            },
+            {
+                "id": "mixed-istio",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "proxy_id": "mixed-cors",
+                "enabled": true,
+                "config": {
+                    "allowed_origins": [ORIGIN],
+                    "allowed_methods": [],
+                    "allowed_headers": [],
+                    "exposed_headers": [],
+                    "unmatched_preflights": "forward"
                 }
             },
             {

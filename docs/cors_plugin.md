@@ -4,13 +4,13 @@ This document explains how to configure the Cross-Origin Resource Sharing (CORS)
 
 ## Overview
 
-The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS) at the gateway level, so backend services do not need to implement CORS themselves. It intercepts preflight `OPTIONS` requests, validates origins and methods, and injects the required `Access-Control-*` response headers on actual cross-origin HTTP and gRPC-Web requests.
+The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS) at the gateway level, so backend services do not need to implement CORS themselves. It intercepts preflight `OPTIONS` requests, validates their requested methods and headers, validates origins on actual requests, and injects the required `Access-Control-*` response headers on cross-origin HTTP and gRPC-Web responses.
 
 ### What the plugin does
 
 1. **Preflight interception** -- When a browser sends an `OPTIONS` request with `Origin` and `Access-Control-Request-Method` headers, the native direct plugin validates the origin and requested method against the configured allow-lists. If both pass, it responds with `204 No Content` and all required CORS headers. If either fails, it responds with `403 Forbidden` and a descriptive error body. The request never reaches the backend unless `preflight_continue` is enabled.
 
-2. **Origin and method enforcement** -- Non-preflight requests that carry an `Origin` header are checked against the allowed origins list. A native direct policy rejects disallowed origins with `403 Forbidden` and the body `CORS origin not allowed`; an Istio projection forwards unmatched actual requests without gateway-added CORS fields.
+2. **Actual-request origin enforcement** -- Non-preflight requests that carry an `Origin` header are checked against the allowed origins list. A native direct policy rejects disallowed origins with `403 Forbidden` and the body `CORS origin not allowed`; an Istio projection forwards unmatched actual requests without gateway-added CORS fields. `allowed_methods` and `allowed_headers` are preflight policy only: they never reject an actual request or re-authorize headers on that phase.
 
 3. **Response header injection** -- For allowed cross-origin requests that pass through to the backend, the plugin injects `Access-Control-Allow-Origin`, `Vary`, and optionally `Access-Control-Allow-Credentials` and `Access-Control-Expose-Headers` into the backend response before it reaches the client.
 
@@ -23,8 +23,8 @@ The CORS plugin is configured via the `plugin_configs` section in your YAML conf
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `allowed_origins` | `(string \| object)[]` | required | Origins permitted to make cross-origin requests. Use `"*"` only for intentional allow-all. Exact `scheme://host[:port]` values are URL-parsed and canonicalized once at config load (scheme/host case, default ports, IDNA, IPv4, and IPv6); request matching remains a direct comparison with no per-request URL parse/allocation. Native `"*.company.com"` matches subdomains. Istio-shaped objects carry exactly one of `exact` / `prefix` / `regex`; exact `*` is Istio allow-all, while prefix and regex retain literal source semantics. |
-| `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | HTTP methods returned in the `Access-Control-Allow-Methods` preflight header. Preflight requests for unlisted methods are rejected with 403. |
-| `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Request headers returned in the `Access-Control-Allow-Headers` preflight header. |
+| `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only policy returned in `Access-Control-Allow-Methods`. Native preflights for unlisted methods are rejected with 403; the list is not evaluated against an actual request's method. |
+| `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only policy returned in `Access-Control-Allow-Headers`. It is not evaluated against headers on the actual request. |
 | `exposed_headers` | `string[]` | `[]` | Response headers the browser is allowed to access via JavaScript, returned in `Access-Control-Expose-Headers`. |
 | `allow_credentials` | `bool` | `false` | When `true`, sends `Access-Control-Allow-Credentials: true`. Cannot be used with wildcard origins (see below). |
 | `max_age` | `u64` | `86400` | Number of seconds browsers should cache preflight results (`Access-Control-Max-Age`). |
@@ -219,12 +219,19 @@ These rules do not alter operator-authored native direct-plugin behavior.
 ## Multiple instances
 
 When multiple CORS instances attach to one proxy, Ferrum evaluates the complete
-contiguous chain and emits one policy: origins, methods, request headers,
-exposed headers, credentials, and max age compose restrictively (intersection,
-with the shortest max age). A permissive earlier instance cannot short-circuit
-a stricter later instance. Priority overrides that interleave another plugin
-inside the CORS chain are rejected at cache construction. The same restrictive
-composition applies when gRPC-Web requests use the gRPC request-policy chain.
+CORS execution chain and emits one phase-appropriate policy. On actual
+requests, origins, exposed headers, and credentials compose restrictively;
+method/header allow-lists and max age are neither intersected nor enforced
+because they govern preflight only. On preflight, allowed methods and request
+headers also intersect and the shortest max age wins, so an empty translated
+Istio list cannot be widened by a permissive native instance. A permissive
+earlier instance cannot short-circuit a stricter later preflight policy.
+
+Priority overrides that interleave another HTTP/gRPC-capable plugin inside the
+CORS block are rejected at cache construction. Stream-only and other plugins
+whose supported protocols do not overlap CORS are ignored by this contiguity
+check because protocol filtering removes them from every CORS execution chain.
+The same rules apply when gRPC-Web requests use the gRPC request-policy chain.
 
 ## Request Flow
 
