@@ -488,8 +488,7 @@ async fn incremental_preloads_geo_for_adaptive_route_rebuild_scope_expansion() {
     let mut p1 = test_proxy("adaptive-route-1", "/one");
     let mut p2 = test_proxy("adaptive-route-2", "/two");
     p2.plugins.push(
-        serde_json::from_value(serde_json::json!({"plugin_config_id": "geo-policy"}))
-            .unwrap(),
+        serde_json::from_value(serde_json::json!({"plugin_config_id": "geo-policy"})).unwrap(),
     );
     let config = GatewayConfig {
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),

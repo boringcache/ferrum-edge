@@ -2089,9 +2089,10 @@ async fn forward_client_datagram_to_backend(
     // being polled again; publishing only after send completion lets that first
     // response bypass the amplification guard. A failed send still leaves a
     // conservative budget based on bytes accepted from the client.
-    session
-        .last_request_size
-        .store(udp_amplification_request_size(data.len()), Ordering::Release);
+    session.last_request_size.store(
+        udp_amplification_request_size(data.len()),
+        Ordering::Release,
+    );
 
     let send_result = if let Some(ref dtls) = session.dtls_conn {
         dtls.send(data)

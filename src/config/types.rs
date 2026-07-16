@@ -5337,8 +5337,7 @@ impl Drop for CountryMmdbValidationGeneration {
         if self.committed {
             return;
         }
-        let mut cache =
-            lock_country_mmdb_cache_recovering_poison(country_mmdb_snapshot_cache());
+        let mut cache = lock_country_mmdb_cache_recovering_poison(country_mmdb_snapshot_cache());
         cache.abort_validation_generation(self.id);
     }
 }
@@ -5964,23 +5963,15 @@ mod country_mmdb_admission_tests {
 
         assert_eq!(budget.admitted_bytes, snapshot_size);
         assert_eq!(budget.admitted_snapshots.len(), 1);
-        assert!(
-            budget
-                .admit("other.mmdb", [2; 32], snapshot_size)
-                .is_err()
-        );
+        assert!(budget.admit("other.mmdb", [2; 32], snapshot_size).is_err());
     }
 
     #[test]
     fn peak_budget_diagnoses_large_live_snapshot_as_restart_required() {
         let snapshot_size = (MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES / 2) + 1;
-        let error = validate_country_mmdb_snapshot_peak(
-            "country.mmdb",
-            snapshot_size,
-            0,
-            snapshot_size,
-        )
-        .expect_err("two overlapping large snapshots exceed the peak bound");
+        let error =
+            validate_country_mmdb_snapshot_peak("country.mmdb", snapshot_size, 0, snapshot_size)
+                .expect_err("two overlapping large snapshots exceed the peak bound");
 
         assert!(error.to_string().contains("requires a gateway restart"));
     }
