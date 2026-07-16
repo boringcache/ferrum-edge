@@ -2084,6 +2084,24 @@ mod virtual_service_cors {
     }
 
     #[test]
+    fn credentialed_exact_star_is_rejected_without_weakening_source_policy() {
+        let mut credentialed = policy(vec![MeshCorsOriginMatch::Exact("*".into())]);
+        credentialed.cors.allow_credentials = Some(true);
+        let errors = validate(vec![credentialed]);
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "allow_credentials must not be true with an exact `*` origin"
+            )),
+            "{errors:?}"
+        );
+
+        let mut uncredentialed = policy(vec![MeshCorsOriginMatch::Exact("*".into())]);
+        uncredentialed.cors.allow_credentials = Some(false);
+        let errors = validate(vec![uncredentialed]);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
     fn padded_exact_origin_rejected() {
         // The cors plugin TRIMS plain-string origins, so a padded literal —
         // which Istio's exact semantics match against no real Origin — would
@@ -2208,6 +2226,25 @@ mod virtual_service_cors {
                     .iter()
                     .any(|error| error.contains("not a valid origin")),
                 "exact `{invalid}` must be rejected: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn noncanonical_exact_origin_is_rejected_to_preserve_literal_matching() {
+        for noncanonical in [
+            "https://example.com:443",
+            "HTTPS://EXAMPLE.COM",
+            "https://bücher.example",
+        ] {
+            let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
+                noncanonical.into(),
+            )])]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("must use its canonical serialization")),
+                "exact `{noncanonical}` must be rejected: {errors:?}"
             );
         }
     }

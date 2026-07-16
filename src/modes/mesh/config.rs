@@ -2206,6 +2206,8 @@ pub struct MeshCorsPolicy {
     /// Preflight cache lifetime (Istio `maxAge`, seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_seconds: Option<u64>,
+    /// Credentialed CORS is unrepresentable with an exact `*` origin because
+    /// the native plugin's wildcard response cannot safely retain credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_credentials: Option<bool>,
     /// Preserve the Istio source field's presence and value. Omission and
@@ -2691,6 +2693,17 @@ fn validate_virtual_service_cors_policies(
                 "{context}: cors.allowed_origins must declare at least one origin matcher"
             ));
         }
+        if policy.cors.allow_credentials == Some(true)
+            && policy
+                .cors
+                .allowed_origins
+                .iter()
+                .any(|origin| matches!(origin, MeshCorsOriginMatch::Exact(value) if value == "*"))
+        {
+            errors.push(format!(
+                "{context}: cors.allow_credentials must not be true with an exact `*` origin because credentialed wildcard CORS cannot be represented safely"
+            ));
+        }
         for (index, origin) in policy.cors.allowed_origins.iter().enumerate() {
             match origin {
                 MeshCorsOriginMatch::Exact(value) => {
@@ -2716,20 +2729,28 @@ fn validate_virtual_service_cors_policies(
                         errors.push(format!(
                             "{context}: cors.allowed_origins[{index}] exact matcher must not have leading/trailing whitespace — Istio exact semantics match the literal string only"
                         ));
-                    } else if trimmed != "*"
-                        && let Err(err) = crate::plugins::cors::validate_exact_origin(value)
-                    {
-                        // Synthesis projects exacts into the cors plugin's
-                        // plain `allowed_origins` form, whose construction
-                        // rejects non-origin values (paths, query/fragment,
-                        // credentials, trailing slash, non-http(s) schemes,
-                        // non-URL strings). Reject at the config boundary
-                        // instead of failing later during plugin-cache
-                        // construction on the data plane — same shared gate
-                        // the K8s translator uses to defer such policies.
-                        errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] exact matcher is not a valid origin: {err}"
-                        ));
+                    } else if trimmed != "*" {
+                        match crate::plugins::cors::canonicalize_exact_origin(value) {
+                            Err(err) => {
+                                // Synthesis projects exacts into the cors
+                                // plugin's plain `allowed_origins` form, whose
+                                // construction rejects non-origin values.
+                                errors.push(format!(
+                                    "{context}: cors.allowed_origins[{index}] exact matcher is not a valid origin: {err}"
+                                ));
+                            }
+                            Ok(canonical) if canonical != value.as_str() => {
+                                // Istio exacts are literal, but the native
+                                // plugin canonicalizes this form. Reject the
+                                // carrier value instead of authorizing the
+                                // canonical browser Origin that the source did
+                                // not literally match.
+                                errors.push(format!(
+                                    "{context}: cors.allowed_origins[{index}] exact matcher must use its canonical serialization `{canonical}` to preserve literal Istio matching"
+                                ));
+                            }
+                            Ok(_) => {}
+                        }
                     }
                 }
                 MeshCorsOriginMatch::Prefix(value) => {

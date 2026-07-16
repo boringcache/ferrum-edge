@@ -15,8 +15,6 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::{
     MeshConfigProtocol, MeshRuntimeConfig, MeshTopology, prepare_gateway_config_for_mesh,
 };
-use ferrum_edge::plugins::cors::CorsPlugin;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 
 fn runtime() -> MeshRuntimeConfig {
     MeshRuntimeConfig {
@@ -1185,56 +1183,49 @@ fn virtual_service_cors_unmatched_modes_survive_gateway_and_mesh_projection() {
     }
 }
 
-#[tokio::test]
-async fn virtual_service_cors_exact_origin_is_canonicalized_after_both_projections() {
-    let translated = translate_k8s_objects(
-        &[k8s_object(
-            "VirtualService",
-            "vs-canonical-cors",
-            serde_json::json!({
-                "hosts": ["svc.default.svc.cluster.local"],
-                "http": [{
-                    "route": [{"destination": {
-                        "host": "svc.default.svc.cluster.local",
-                        "port": {"number": 8080}
-                    }}],
-                    "corsPolicy": {
-                        "allowOrigins": [{"exact": "HTTPS://BÜCHER.EXAMPLE:443"}]
-                    }
-                }]
-            }),
-        )],
-        k8s_options(),
-    )
-    .expect("canonical CORS VirtualService translates");
-    let gateway = translated
-        .config
-        .plugin_configs
-        .iter()
-        .find(|plugin| plugin.plugin_name == "cors")
-        .expect("gateway CORS plugin");
-    let mesh = translated
-        .config
-        .mesh
-        .as_ref()
-        .expect("mesh block")
-        .virtual_service_cors_policies
-        .first()
-        .expect("mesh CORS policy");
-    let mesh_config = cors_plugin_config_from_mesh_policy(&mesh.cors);
-
-    for config in [&gateway.config, &mesh_config] {
-        let plugin = CorsPlugin::new(config).expect("projected CORS config");
-        let mut ctx =
-            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
-        ctx.headers.insert(
-            "origin".to_string(),
-            "https://xn--bcher-kva.example".to_string(),
+#[test]
+fn virtual_service_cors_noncanonical_exact_origin_is_deferred_across_both_projections() {
+    for cors_policy in [
+        serde_json::json!({"allowOrigins": [{"exact": "https://example.com:443"}]}),
+        serde_json::json!({"allowOrigins": [{"exact": "HTTPS://EXAMPLE.COM"}]}),
+        serde_json::json!({"allowOrigins": [{"exact": "https://bücher.example"}]}),
+        serde_json::json!({"allowOrigin": ["https://example.com:443"]}),
+    ] {
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-noncanonical-cors",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": cors_policy
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("noncanonical exact leaves routing translated");
+        assert!(
+            translated
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+                .unwrap_or(true),
+            "noncanonical Istio exact must not ride the mesh slice"
         );
-        assert!(matches!(
-            plugin.on_request_received(&mut ctx).await,
-            PluginResult::Continue
-        ));
+        assert!(
+            !translated
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "cors"),
+            "noncanonical Istio exact must not project a widened gateway CORS plugin"
+        );
     }
 }
 

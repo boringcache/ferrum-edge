@@ -3677,16 +3677,28 @@ fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
 ///   Origin header) — the same silent widening;
 /// - not an origin the plugin accepts (`scheme://host[:port]` only — no
 ///   path/query/fragment/credentials, http(s) scheme; the shared
-///   `plugins::cors::validate_exact_origin` admission): projecting it would
+///   `plugins::cors::canonicalize_exact_origin` admission): projecting it would
 ///   fail `CorsPlugin` construction AFTER translation instead of deferring
 ///   here, breaking the always-projectable contract documented on
-///   `cors_allowed_origins`.
+///   `cors_allowed_origins`;
+/// - non-canonical: Istio `StringMatch.exact` is literal, while the native
+///   plugin canonicalizes exact origins. Accepting a default port, case
+///   variant, IDNA spelling, or alternate IP spelling would therefore widen
+///   the source matcher to the browser-serialized origin.
 fn plain_exact_origin_translatable(exact: &str) -> bool {
     let trimmed = exact.trim();
-    !trimmed.is_empty()
-        && (trimmed == "*" || !trimmed.starts_with('*'))
-        && trimmed.len() == exact.len()
-        && (trimmed == "*" || crate::plugins::cors::validate_exact_origin(exact).is_ok())
+    if trimmed.is_empty()
+        || (trimmed != "*" && trimmed.starts_with('*'))
+        || trimmed.len() != exact.len()
+    {
+        return false;
+    }
+    if trimmed == "*" {
+        return true;
+    }
+
+    crate::plugins::cors::canonicalize_exact_origin(exact)
+        .is_ok_and(|canonical| canonical == exact)
 }
 
 /// Map one Istio `allowOrigins[]` `StringMatch` entry to the `cors` plugin's
@@ -3694,9 +3706,10 @@ fn plain_exact_origin_translatable(exact: &str) -> bool {
 /// deferred) when the entry is not an object carrying EXACTLY ONE non-empty
 /// `exact` / `prefix` / `regex` string, when a `regex` fails to compile, or
 /// when an `exact` is an unsupported wildcard shape, whitespace-padded, or not
-/// a valid `scheme://host[:port]` origin (the plugin's own exact-origin
-/// admission — see `plugins::cors::validate_exact_origin`). Exact `*` is the
-/// documented Istio allow-all value and projects to native wildcard.
+/// a valid canonical `scheme://host[:port]` origin (the plugin's own
+/// exact-origin admission — see
+/// `plugins::cors::canonicalize_exact_origin`). Exact `*` is the documented
+/// Istio allow-all value and projects to native wildcard.
 /// `regex` is compiled here (cold path) purely to gate translatability — the
 /// plugin re-compiles it at config time as the runtime matcher; an invalid
 /// pattern is never reflected into a header.
@@ -3756,7 +3769,9 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 /// origin matcher, an un-compilable `regex`, or an invalid method/header token
 /// likewise makes the policy non-translatable so it is left unprojected
 /// (deferred) rather than silently approximated or failing `CorsPlugin`
-/// construction after translation.
+/// construction after translation. Exact origins must already equal the
+/// plugin's canonical serialization so its config-path normalization cannot
+/// widen Istio's literal matcher.
 pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
     let allowed_origins = cors_allowed_origins(cors);
     let origins_ok = allowed_origins.is_some();
@@ -3988,8 +4003,9 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
             "VirtualService http[].corsPolicy is not faithfully translatable (allowOrigins[] \
              must be exact/prefix/regex StringMatch with a compilable regex, or the legacy \
              allowOrigin exact list, plus well-typed methods, headers, credentials, \
-             unmatched-preflight mode, and maxAge; credentialed exact '*' cannot be \
-             represented safely); leaving it unprojected. \
+             unmatched-preflight mode, and maxAge; exact origins must already use their \
+             canonical serialization, and credentialed exact '*' cannot be represented \
+             safely); leaving it unprojected. \
              Configure the `cors` plugin directly."
         );
         return None;

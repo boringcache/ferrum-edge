@@ -992,7 +992,7 @@ fn merge_vary_tokens(existing: Option<&str>, required: &[&str]) -> String {
     merged
 }
 
-/// `pub(crate)` like [`validate_exact_origin`]: the K8s translator's
+/// `pub(crate)` like [`canonicalize_exact_origin`]: the K8s translator's
 /// `cors_policy_translatable` and the native/file mesh source's
 /// `validate_virtual_service_cors_policies` run the same method/header-name
 /// admission the plugin applies at construction, so a policy that passes those
@@ -1029,22 +1029,14 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
     Ok(format!(".{}", suffix.to_ascii_lowercase()))
 }
 
-/// Validate one exact (plain-string, non-wildcard) allowed origin:
-/// `scheme://host[:port]` with an http(s) scheme and no path, query, fragment,
-/// or credentials. `pub(crate)` because it is the SHARED admission gate for
-/// every surface that projects Istio `StringMatch.exact` origins into this
-/// plugin's plain-string form — the K8s translator's
-/// `cors_origin_matcher_value` (defers non-translatable policies) and the
-/// native/file mesh source's `validate_virtual_service_cors_policies`
-/// (rejects the slice fail-closed) — so a value that passes those boundaries
-/// can never fail `CorsPlugin` construction later. Do not fork this predicate.
-pub(crate) fn validate_exact_origin(origin: &str) -> Result<(), String> {
-    canonicalize_exact_origin(origin).map(|_| ())
-}
-
 /// Validate and canonicalize an exact origin on the config/reload path.
 /// Request matching remains an allocation-free ASCII comparison against this
 /// browser-serialized form; no request-time URL parse is introduced.
+/// `pub(crate)` because this is the shared admission gate for the K8s Istio
+/// translator and native/file mesh validation as well as direct plugin
+/// configuration. Callers that preserve literal Istio `StringMatch.exact`
+/// semantics additionally require the returned serialization to equal the
+/// source value. Do not fork this predicate.
 pub(crate) fn canonicalize_exact_origin(origin: &str) -> Result<String, String> {
     if origin.contains(char::is_whitespace) {
         return Err(format!(
@@ -1131,7 +1123,7 @@ fn u64_config(config: &Value, key: &str, default: u64) -> Result<u64, String> {
 
 fn origin_host(origin: &str) -> Option<&str> {
     let (scheme, rest) = origin.split_once("://")?;
-    // Enforce the same http(s) scheme allow-list that `validate_exact_origin`
+    // Enforce the same http(s) scheme allow-list that `canonicalize_exact_origin`
     // applies to exact origins, so wildcard-subdomain matching is not looser
     // than exact matching. Without this, an Origin like `ftp://app.company.com`
     // would satisfy a `*.company.com` rule and be reflected into
