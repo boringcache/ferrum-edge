@@ -36,8 +36,8 @@ use crate::admin::backup::{
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
-    AtomicClearVerification, BatchConfigWriteMode, DatabaseBackend, NamespaceResourceCounts,
-    MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, SnapshotDataIntegrityError,
+    AtomicClearVerification, BatchConfigWriteMode, DatabaseBackend,
+    MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, NamespaceResourceCounts, SnapshotDataIntegrityError,
     classify_atomic_clear_verification, is_mtls_dns_admission_unavailable,
 };
 use crate::config::types::{
@@ -2935,10 +2935,7 @@ struct MtlsDnsAdmissionGuardLifecycle {
 }
 
 impl MtlsDnsAdmissionGuardLifecycle {
-    async fn acquire(
-        db: Arc<dyn DatabaseBackend>,
-        namespace: &str,
-    ) -> Result<Self, anyhow::Error> {
+    async fn acquire(db: Arc<dyn DatabaseBackend>, namespace: &str) -> Result<Self, anyhow::Error> {
         let namespace = namespace.to_string();
         let acquire_db = db.clone();
         let acquire_namespace = namespace.clone();
@@ -2957,11 +2954,7 @@ impl MtlsDnsAdmissionGuardLifecycle {
         })?
     }
 
-    fn new(
-        db: Arc<dyn DatabaseBackend>,
-        namespace: &str,
-        guard_owner: String,
-    ) -> Self {
+    fn new(db: Arc<dyn DatabaseBackend>, namespace: &str, guard_owner: String) -> Self {
         Self {
             db,
             namespace: namespace.to_string(),
@@ -2991,6 +2984,13 @@ impl MtlsDnsAdmissionGuardLifecycle {
         );
     }
 
+    fn mark_settled(&self) {
+        self.mutation_state.store(
+            MtlsDnsAdmissionMutationState::Settled as u8,
+            Ordering::Release,
+        );
+    }
+
     async fn release(&mut self) -> Result<(), anyhow::Error> {
         let result = self
             .db
@@ -3008,9 +3008,8 @@ impl Drop for MtlsDnsAdmissionGuardLifecycle {
         if !self.armed {
             return;
         }
-        let state = MtlsDnsAdmissionMutationState::from_u8(
-            self.mutation_state.load(Ordering::Acquire),
-        );
+        let state =
+            MtlsDnsAdmissionMutationState::from_u8(self.mutation_state.load(Ordering::Acquire));
         if !state.release_on_drop() {
             warn!(
                 namespace = %self.namespace,
@@ -5353,28 +5352,29 @@ async fn handle_restore(
     // Acquire one datastore owner before the authoritative rollback snapshot
     // and retain it through clear, import, and any compensating replay. This is
     // the cross-process counterpart to the in-process admission mutex above.
-    let mut restore_guard =
-        match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                warn!(
-                    namespace = %namespace,
-                    error = %error,
-                    "Restore: namespace admission guard could not be acquired"
-                );
-                if crate::config::db_loader::is_transient_database_error(&error) {
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": "Restore aborted: the pre-snapshot namespace admission guard could not be acquired because the database is unavailable. Existing config was NOT deleted; retry once the database is reachable.",
-                            "restore_errors": ["failed to acquire the pre-snapshot namespace admission guard: database unavailable"],
-                            "failure_class": "connectivity",
-                        }),
-                    ));
-                }
-                return Ok(mtls_dns_admission_unavailable_response());
+    let mut restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            warn!(
+                namespace = %namespace,
+                error = %error,
+                "Restore: namespace admission guard could not be acquired"
+            );
+            if crate::config::db_loader::is_transient_database_error(&error) {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": "Restore aborted: the pre-snapshot namespace admission guard could not be acquired because the database is unavailable. Existing config was NOT deleted; retry once the database is reachable.",
+                        "restore_errors": ["failed to acquire the pre-snapshot namespace admission guard: database unavailable"],
+                        "failure_class": "connectivity",
+                    }),
+                ));
             }
-        };
+            return Ok(mtls_dns_admission_unavailable_response());
+        }
+    };
     let restore_mode = BatchConfigWriteMode::GuardedAdmission {
         guard_owner: restore_guard.guard_owner().to_string(),
     };
@@ -5466,8 +5466,19 @@ async fn handle_restore(
                             )
                             .await
                         }
-                        AtomicClearVerification::PriorConfigIntact
-                        | AtomicClearVerification::UnknownOutcome => {
+                        AtomicClearVerification::PriorConfigIntact => {
+                            restore_guard.mark_settled();
+                            finish_atomic_delete_failure(
+                                state,
+                                db.clone(),
+                                actor,
+                                namespace,
+                                e.to_string(),
+                                &mut restore_guard,
+                            )
+                            .await
+                        }
+                        AtomicClearVerification::UnknownOutcome => {
                             finish_unknown_atomic_delete_failure(
                                 state,
                                 db.clone(),

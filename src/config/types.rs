@@ -3824,13 +3824,14 @@ impl GatewayConfig {
         // absent from its association map, including synthesized mesh relays.
         // Local associations can shadow a global on registered proxies, but
         // cannot make that global dormant for unknown proxy IDs.
-        self.plugin_configs.iter().any(|plugin| {
-            plugin.scope == PluginScope::Global && is_dns_identity_plugin(plugin)
-        }) || self
-            .effective_mtls_auth_plugins_by_proxy()
-            .into_iter()
-            .flat_map(|(_, plugins)| plugins)
-            .any(&is_dns_identity_plugin)
+        self.plugin_configs
+            .iter()
+            .any(|plugin| plugin.scope == PluginScope::Global && is_dns_identity_plugin(plugin))
+            || self
+                .effective_mtls_auth_plugins_by_proxy()
+                .into_iter()
+                .flat_map(|(_, plugins)| plugins)
+                .any(&is_dns_identity_plugin)
     }
 
     /// Canonical DNS identity owners for every currently ambiguous key.

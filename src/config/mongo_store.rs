@@ -1683,11 +1683,11 @@ mod inner {
                 return Ok(());
             }
             match candidate.validate_unique_mtls_dns_identities() {
-                Ok(()) if allow_existing_conflicts => Err(anyhow::Error::new(
-                    MtlsDnsIdentityConflict::new(vec![
+                Ok(()) if allow_existing_conflicts => {
+                    Err(anyhow::Error::new(MtlsDnsIdentityConflict::new(vec![
                         "Mutation would introduce a new mTLS DNS identity ambiguity".to_string(),
-                    ]),
-                )),
+                    ])))
+                }
                 Ok(()) => Ok(()),
                 Err(errors) => Err(anyhow::Error::new(MtlsDnsIdentityConflict::new(errors))),
             }
@@ -1887,13 +1887,15 @@ mod inner {
                 }
 
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                        "MongoDB {label} lock '{lock_id}' remained held for {} seconds; \
+                    return Err(
+                        anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
+                            "MongoDB {label} lock '{lock_id}' remained held for {} seconds; \
                          admission locks do not expire because reclaiming one could permit a \
                          stale writer, so verify the prior owner is stopped before removing the \
                          lock document",
-                        MONGO_ADMISSION_LOCK_WAIT_TIMEOUT.as_secs()
-                    )));
+                            MONGO_ADMISSION_LOCK_WAIT_TIMEOUT.as_secs()
+                        )),
+                    );
                 }
                 tokio::time::sleep(MONGO_MIGRATION_LEASE_RETRY_INTERVAL).await;
             }

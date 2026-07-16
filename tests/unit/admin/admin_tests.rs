@@ -4,8 +4,7 @@
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    admin_mtls_dns_admission_contention_response,
-    admin_mtls_dns_admission_drop_should_release,
+    admin_mtls_dns_admission_contention_response, admin_mtls_dns_admission_drop_should_release,
 };
 use ferrum_edge::admin::{
     AdminState,

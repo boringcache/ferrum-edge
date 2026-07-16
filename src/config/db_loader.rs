@@ -56,8 +56,7 @@ pub use crate::config::db_backend::{
     SortOrder, extract_db_hostname, redact_url,
 };
 
-pub(crate) const MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL: &str =
-    "INSERT INTO mtls_dns_admission_locks \
+pub(crate) const MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL: &str = "INSERT INTO mtls_dns_admission_locks \
      (namespace, updated_at) VALUES (?, ?) \
      ON DUPLICATE KEY UPDATE updated_at = mtls_dns_admission_locks.updated_at";
 
@@ -934,9 +933,11 @@ impl DatabaseStore {
                 )));
             }
             (None, Some(_)) => {
-                return Err(anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
-                    "mTLS DNS admission guard ownership was lost for namespace '{namespace}'"
-                )));
+                return Err(
+                    anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
+                        "mTLS DNS admission guard ownership was lost for namespace '{namespace}'"
+                    )),
+                );
             }
         }
 
@@ -1077,9 +1078,7 @@ impl DatabaseStore {
                 .validate_unique_mtls_dns_identities()
                 .err()
                 .unwrap_or_else(|| {
-                    vec![
-                        "Mutation would introduce a new mTLS DNS identity ambiguity".to_string(),
-                    ]
+                    vec!["Mutation would introduce a new mTLS DNS identity ambiguity".to_string()]
                 });
             return Err(anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)));
         }
@@ -2706,11 +2705,7 @@ impl DatabaseStore {
                 .await?;
         }
 
-        self.validate_mtls_dns_repair_delete_tx(
-            &mut tx,
-            namespace,
-            &prior_mtls_dns_conflicts,
-        )
+        self.validate_mtls_dns_repair_delete_tx(&mut tx, namespace, &prior_mtls_dns_conflicts)
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "proxy", id, "delete")
             .await?;
@@ -3056,11 +3051,7 @@ impl DatabaseStore {
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
-        self.validate_mtls_dns_repair_delete_tx(
-            &mut tx,
-            namespace,
-            &prior_mtls_dns_conflicts,
-        )
+        self.validate_mtls_dns_repair_delete_tx(&mut tx, namespace, &prior_mtls_dns_conflicts)
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "consumer", id, "delete")
             .await?;
@@ -3262,11 +3253,7 @@ impl DatabaseStore {
                 .bind(namespace)
                 .execute(&mut *tx)
                 .await?;
-        self.validate_mtls_dns_repair_delete_tx(
-            &mut tx,
-            namespace,
-            &prior_mtls_dns_conflicts,
-        )
+        self.validate_mtls_dns_repair_delete_tx(&mut tx, namespace, &prior_mtls_dns_conflicts)
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "plugin_config", id, "delete")
             .await?;
@@ -7531,11 +7518,7 @@ impl DatabaseStore {
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
-        self.validate_mtls_dns_repair_delete_tx(
-            &mut tx,
-            namespace,
-            &prior_mtls_dns_conflicts,
-        )
+        self.validate_mtls_dns_repair_delete_tx(&mut tx, namespace, &prior_mtls_dns_conflicts)
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "proxy", &proxy_id, "delete")
             .await?;
