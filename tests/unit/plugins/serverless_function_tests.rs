@@ -1362,8 +1362,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "valued-query-key-slash-boundaries" | "valued-query-key-slash-boundaries-path" => {
                 format!("{}/signed%2Ftrigger?%2FSIGNED%2F=1", server.uri())
             }
-            "query-value-leading-slash-path"
-            | "benign-leading-slash-scalar-suffix-lookalike" => {
+            "query-value-leading-slash-path" | "benign-leading-slash-scalar-suffix-lookalike" => {
                 format!("{}/signed%2Ftrigger?code=%2Fsigned", server.uri())
             }
             "query-value-trailing-slash"
