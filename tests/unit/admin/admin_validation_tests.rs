@@ -122,6 +122,13 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         4,
         "every credential read/modify/write endpoint must take namespace admission"
     );
+    assert!(batch_source.contains("async fn recover_late_credential_update("));
+    assert!(batch_source.contains(
+        "admission.run_mutation(db.update_consumer(&consumer, mode))"
+    ));
+    assert!(
+        batch_source.contains("late credential update compensation found no matching consumer")
+    );
     let sql_store_source = include_str!("../../../src/config/db_loader.rs");
     assert!(sql_store_source.contains("config_admission_locks"));
     assert!(sql_store_source.contains("config_admission_lease_now_sql"));
