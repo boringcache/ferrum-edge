@@ -819,6 +819,83 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_clean_completion
     );
 }
 
+/// A terminate-mode function can execute externally and then fail before a
+/// usable response is available. With `on_error: continue`, a streamed backend
+/// response has no replay body to publish, so even clean stream completion must
+/// retain the in-flight marker until TTL rather than re-executing the uncertain
+/// function side effect on an immediate retry.
+#[tokio::test]
+async fn test_streamed_fallback_retains_marker_after_uncertain_serverless_side_effect() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(600).set_body_string("invalid status"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate",
+            "on_error": "continue"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "idempotency-key".to_string(),
+        "serverless-stream-key".to_string(),
+    );
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        serverless.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    dedup
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(32))
+        .await;
+    assert_eq!(
+        dedup.tracked_keys_count(),
+        Some(1),
+        "an uncertain serverless side effect must retain the streamed fallback marker until TTL"
+    );
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert(
+        "idempotency-key".to_string(),
+        "serverless-stream-key".to_string(),
+    );
+    assert!(matches!(
+        dedup
+            .before_proxy(&mut retry_ctx, &mut retry_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
 /// An interrupted streamed SSE response — client disconnect or mid-stream error,
 /// i.e. `!body_completed` — delivered no full response to the client and is the
 /// case most likely to be retried with the same idempotency key. Releasing the

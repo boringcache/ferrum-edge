@@ -1796,18 +1796,17 @@ impl Plugin for RequestDeduplication {
         // the in-flight lock depends on how the stream ended:
         //
         // - Clean completion (`body_completed`): the full response reached the
-        //   client, so there is nothing left to protect. Release the marker
-        //   (local map + Redis lock) so the next matching key executes normally
-        //   instead of eating a stale 409 for the rest of `inflight_ttl`, and
-        //   so finished streams don't pile up non-evictable `InFlight` markers
-        //   above `max_entries`.
+        //   client, so there is normally nothing left to protect. Release the
+        //   marker unless a terminate-mode serverless invocation already
+        //   occurred and then fell through; that uncertain external side effect
+        //   has no replayable response, so its marker must remain until TTL.
         // - Client disconnect or mid-stream error (`!body_completed`): the
         //   client did NOT receive the full response and is the case most
         //   likely to be retried with the same idempotency key. Releasing here
         //   would let that retry re-execute a side-effecting backend operation
         //   with no replay/tombstone protection, so keep the local marker and
         //   Redis lock until `inflight_ttl` expires as the backstop.
-        if !outcome.body_completed {
+        if ctx.serverless_external_side_effect || !outcome.body_completed {
             return;
         }
 

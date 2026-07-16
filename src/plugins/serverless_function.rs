@@ -560,11 +560,11 @@ impl ServerlessFunction {
 
         // Forward request body
         if self.forward_body {
-            reject_encoded_request_body(ctx)?;
+            reject_encoded_request_body(proxy_headers)?;
             let empty_body = Bytes::new();
             let body = if let Some(body) = ctx.request_body_bytes.as_ref() {
                 body
-            } else if !crate::proxy::request_may_have_body(&ctx.method, &ctx.headers) {
+            } else if !crate::proxy::request_may_have_body(&ctx.method, proxy_headers) {
                 &empty_body
             } else {
                 return Err(InvocationFailure::governed_input(
@@ -572,9 +572,11 @@ impl ServerlessFunction {
                     "governed request body was unavailable before function invocation",
                 ));
             };
-            // Interpret the bytes according to the original client metadata,
-            // not a header-only transform that may have run earlier.
-            let content_type = ctx.headers.get("content-type");
+            // Interpret the bytes according to the active hook headers. On the
+            // no-clone hot path the gateway temporarily moves ctx.headers into
+            // this map, so consulting ctx.headers here would miss even the
+            // original Content-Type and Content-Encoding values.
+            let content_type = proxy_headers.get("content-type");
             if content_type.is_some_and(is_json_content_type)
                 && let Ok(json_body) = serde_json::from_slice::<Value>(body)
             {
@@ -873,8 +875,10 @@ fn encode_metadata_segment(segment: &str) -> String {
     encoded
 }
 
-fn reject_encoded_request_body(ctx: &RequestContext) -> Result<(), InvocationFailure> {
-    if let Some(encoding) = ctx.headers.get("content-encoding")
+fn reject_encoded_request_body(
+    headers: &HashMap<String, String>,
+) -> Result<(), InvocationFailure> {
+    if let Some(encoding) = headers.get("content-encoding")
         && !encoding.trim().eq_ignore_ascii_case("identity")
     {
         return Err(InvocationFailure::governed_input(
@@ -1225,11 +1229,11 @@ impl Plugin for ServerlessFunction {
 
         match self.mode {
             InvocationMode::Terminate => {
-                if status < 200 {
+                if !(200..=599).contains(&status) {
                     return self.failure_result(
                         ctx,
                         InvocationFailure::new(
-                            "informational_function_status",
+                            "invalid_function_status",
                             format!("function returned non-final status {status}"),
                         ),
                     );

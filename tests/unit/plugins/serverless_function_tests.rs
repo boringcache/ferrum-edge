@@ -994,6 +994,47 @@ async fn test_terminate_mode_returns_function_response_as_reject_binary() {
 }
 
 #[tokio::test]
+async fn test_terminate_rejects_out_of_range_function_status() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(600).set_body_string("non-final"))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "error_status_code": 502
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+
+    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("invalid_function_status"));
+            assert!(!body.contains("non-final"));
+        }
+        other => panic!("out-of-range function status must fail, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("serverless_function.standalone.status")
+            .map(String::as_str),
+        Some("600")
+    );
+}
+
+#[tokio::test]
 async fn test_pre_proxy_redirect_is_not_approval_and_is_not_followed() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1278,7 +1319,7 @@ async fn test_forward_body_is_binary_safe_for_non_post_methods() {
 }
 
 #[tokio::test]
-async fn test_forward_body_uses_original_precise_content_type_representation() {
+async fn test_forward_body_uses_active_hook_content_type_representation() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1319,9 +1360,11 @@ async fn test_forward_body_uses_original_precise_content_type_representation() {
         "application/problem+json; charset=utf-8".to_string(),
     );
     json_ctx.request_body_bytes = Some(Bytes::from_static(br#"{"trusted":true}"#));
+    let mut transformed_headers = HashMap::new();
+    transformed_headers.insert("content-type".to_string(), "text/plain".to_string());
     assert!(matches!(
         plugin
-            .before_proxy(&mut json_ctx, &mut HashMap::new())
+            .before_proxy(&mut json_ctx, &mut transformed_headers)
             .await,
         PluginResult::Continue
     ));
@@ -1329,8 +1372,8 @@ async fn test_forward_body_uses_original_precise_content_type_representation() {
     let requests = server.received_requests().await.unwrap();
     let text_payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
     let json_payload: Value = serde_json::from_slice(&requests[1].body).unwrap();
-    assert_eq!(text_payload["body"], r#"{"trusted":true}"#);
-    assert_eq!(json_payload["body"], json!({"trusted": true}));
+    assert_eq!(text_payload["body"], json!({"trusted": true}));
+    assert_eq!(json_payload["body"], r#"{"trusted":true}"#);
 }
 
 #[tokio::test]
@@ -1355,12 +1398,11 @@ async fn test_encoded_or_unavailable_body_fails_before_external_egress() {
     .unwrap();
 
     let mut encoded_ctx = create_test_context();
-    encoded_ctx
-        .headers
-        .insert("content-encoding".to_string(), "gzip".to_string());
     encoded_ctx.request_body_bytes = Some(Bytes::from_static(b"opaque"));
+    let mut active_headers = std::mem::take(&mut encoded_ctx.headers);
+    active_headers.insert("content-encoding".to_string(), "gzip".to_string());
     match plugin
-        .before_proxy(&mut encoded_ctx, &mut HashMap::new())
+        .before_proxy(&mut encoded_ctx, &mut active_headers)
         .await
     {
         PluginResult::Reject { body, .. } => {
