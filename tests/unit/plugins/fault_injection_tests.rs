@@ -1,6 +1,9 @@
 //! Tests for fault_injection plugin
 
-use ferrum_edge::_test_support::normalize_reject_response;
+use ferrum_edge::_test_support::{
+    normalize_reject_response, set_request_http_flavor_for_test,
+};
+use ferrum_edge::HttpFlavor;
 use ferrum_edge::plugins::fault_injection::FaultInjectionPlugin;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use http::StatusCode;
@@ -61,6 +64,25 @@ fn test_valid_abort_and_delay() {
         "delay": { "duration_ms": 200, "percentage": 30.0 }
     }));
     assert!(plugin.is_ok());
+}
+
+#[test]
+fn test_valid_null_unused_fault_side() {
+    for config in [
+        json!({
+            "abort": null,
+            "delay": {"duration_ms": 1, "percentage": 25.0}
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 25.0},
+            "delay": null
+        }),
+    ] {
+        assert!(
+            FaultInjectionPlugin::new(&config).is_ok(),
+            "null must represent an unused fault side: {config}"
+        );
+    }
 }
 
 #[test]
@@ -448,6 +470,7 @@ async fn test_abort_injects_grpc_status_header() {
     .unwrap();
 
     let mut ctx = make_ctx();
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
     let result = run_before_proxy_with_content_type(
         &plugin,
         &mut ctx,
@@ -507,6 +530,7 @@ async fn test_abort_omits_grpc_status_after_grpc_web_translation() {
     }))
     .unwrap();
     let mut ctx = make_ctx();
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Plain);
     ctx.headers.insert(
         "content-type".to_string(),
         "application/grpc-web+proto".to_string(),
@@ -545,13 +569,41 @@ async fn test_abort_omits_grpc_status_for_websocket_upgrade() {
         ("upgrade".to_string(), "websocket".to_string()),
         ("content-type".to_string(), "application/grpc".to_string()),
     ]);
-    ferrum_edge::_test_support::set_websocket_response_boundary_for_test(&mut ctx, true);
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::WebSocket);
 
     match plugin.before_proxy(&mut ctx, &mut headers).await {
         PluginResult::Reject { headers, .. } => {
             assert!(!headers.contains_key("grpc-status"));
         }
         _ => panic!("expected Reject"),
+    }
+}
+
+#[tokio::test]
+async fn test_abort_uses_pre_plugin_flavor_after_content_type_mutation() {
+    let plugin = FaultInjectionPlugin::new(&json!({
+        "abort": {"status_code": 503, "percentage": 100.0, "grpc_status": 14}
+    }))
+    .unwrap();
+
+    for (flavor, mutated_content_type, expected_grpc_status) in [
+        (HttpFlavor::Grpc, "text/plain", true),
+        (HttpFlavor::Grpc, "application/json", true),
+        (HttpFlavor::Plain, "application/grpc", false),
+        (HttpFlavor::WebSocket, "application/grpc", false),
+    ] {
+        let mut ctx = make_ctx();
+        set_request_http_flavor_for_test(&mut ctx, flavor);
+        let result =
+            run_before_proxy_with_content_type(&plugin, &mut ctx, mutated_content_type).await;
+        let PluginResult::Reject { headers, .. } = result else {
+            panic!("expected Reject for {flavor:?}");
+        };
+        assert_eq!(
+            headers.get("grpc-status").map(String::as_str),
+            expected_grpc_status.then_some("14"),
+            "fixed flavor {flavor:?} must win over mutated content-type {mutated_content_type}"
+        );
     }
 }
 
@@ -577,6 +629,14 @@ async fn test_fault_rejection_shaping_matches_request_protocols() {
         ("native gRPC over HTTP/3", "application/grpc+proto", true),
     ] {
         let mut ctx = make_ctx();
+        set_request_http_flavor_for_test(
+            &mut ctx,
+            if is_native_grpc {
+                HttpFlavor::Grpc
+            } else {
+                HttpFlavor::Plain
+            },
+        );
         let PluginResult::Reject {
             status_code,
             body,
@@ -723,6 +783,67 @@ async fn test_zero_overlay_disables_one_instance_without_affecting_sibling_confi
             ..
         }
     ));
+}
+
+#[test]
+fn test_zero_overlay_treats_null_fault_sides_as_absent() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::fault_injection::runtime_overlay::{
+        FaultOverlayMaterialization, materialize_config,
+    };
+
+    for (mut config, key, removed_side) in [
+        (
+            json!({
+                "abort": null,
+                "delay": {"duration_ms": 10, "percentage": 25.0},
+                "runtime_overlay_scope": "checkout"
+            }),
+            "ferrum.fault_injection.checkout.delay_percent",
+            "delay",
+        ),
+        (
+            json!({
+                "abort": {"status_code": 503, "percentage": 25.0},
+                "delay": null,
+                "runtime_overlay_scope": "checkout"
+            }),
+            "ferrum.fault_injection.checkout.abort_percent",
+            "abort",
+        ),
+    ] {
+        assert_eq!(
+            materialize_config(
+                &mut config,
+                &MeshRuntimeOverlay {
+                    fields: HashMap::from([(key.to_string(), RuntimeValue::Number(0.0))]),
+                },
+            ),
+            FaultOverlayMaterialization::Disabled,
+            "zeroing the only object side must disable despite a null sibling: {config}"
+        );
+        assert!(config.get(removed_side).is_none());
+    }
+
+    let mut both_objects = json!({
+        "abort": {"status_code": 503, "percentage": 25.0},
+        "delay": {"duration_ms": 10, "percentage": 25.0},
+        "runtime_overlay_scope": "checkout"
+    });
+    assert_eq!(
+        materialize_config(
+            &mut both_objects,
+            &MeshRuntimeOverlay {
+                fields: HashMap::from([(
+                    "ferrum.fault_injection.checkout.delay_percent".to_string(),
+                    RuntimeValue::Number(0.0),
+                )]),
+            },
+        ),
+        FaultOverlayMaterialization::Changed,
+        "an object sibling keeps the generation enabled"
+    );
+    assert!(both_objects.get("abort").is_some_and(serde_json::Value::is_object));
 }
 
 // === GAP-3E: RTDS overlay-driven percentages ===

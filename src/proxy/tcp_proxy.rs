@@ -1927,8 +1927,27 @@ async fn run_tcp_stream_connect_plugins(
 /// deliberately not treated as cancellation: request/response protocols may
 /// validly send their complete request and then half-close while continuing to
 /// wait for the response.
-async fn wait_for_tcp_peer_reset(client_stream: &TcpStream) {
-    let _ = client_stream.ready(tokio::io::Interest::ERROR).await;
+pub(crate) async fn wait_for_tcp_peer_reset(client_stream: &TcpStream) {
+    loop {
+        // Readiness may be spurious, and readiness polling itself may fail.
+        // Neither is evidence that the peer disconnected: only a concrete
+        // socket error cancels admission. A short retry interval prevents a
+        // stale readiness bit from spinning while the fault future remains
+        // cancel-safe in the surrounding `select!`.
+        let readiness = client_stream.ready(tokio::io::Interest::ERROR).await;
+        let socket_error = client_stream.take_error();
+        if tcp_fault_admission_should_cancel(&readiness, &socket_error) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+pub(crate) fn tcp_fault_admission_should_cancel(
+    _readiness: &std::io::Result<tokio::io::Ready>,
+    socket_error: &std::io::Result<Option<std::io::Error>>,
+) -> bool {
+    matches!(socket_error, Ok(Some(_)))
 }
 
 /// Maximum number of opening client bytes captured for stream first-bytes
@@ -8170,7 +8189,7 @@ mod first_bytes_peek_tests {
 
     use tokio::io::AsyncWriteExt;
 
-    use super::{peek_tcp_first_bytes, wait_for_tcp_peer_reset};
+    use super::peek_tcp_first_bytes;
 
     /// Bind a loopback listener and return it with its address.
     async fn listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
@@ -8179,79 +8198,6 @@ mod first_bytes_peek_tests {
             .expect("bind");
         let addr = l.local_addr().expect("addr");
         (l, addr)
-    }
-
-    #[tokio::test]
-    async fn reset_wait_observes_abortive_close() {
-        let (listener, addr) = listener().await;
-        let peer = tokio::spawn(async move {
-            let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
-            client.set_zero_linger().expect("set abortive close");
-        });
-        let (server, _) = listener.accept().await.expect("accept");
-
-        peer.await.expect("peer task");
-        tokio::time::timeout(Duration::from_secs(1), wait_for_tcp_peer_reset(&server))
-            .await
-            .expect("reset/error readiness must cancel admission promptly");
-    }
-
-    #[tokio::test]
-    async fn reset_wait_preserves_valid_half_close_with_unread_bytes() {
-        let (listener, addr) = listener().await;
-        let (half_closed_tx, half_closed_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let peer = tokio::spawn(async move {
-            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
-            client.write_all(b"complete-request").await.expect("write");
-            client.shutdown().await.expect("half close");
-            let _ = half_closed_tx.send(());
-            let _ = release_rx.await;
-        });
-        let (server, _) = listener.accept().await.expect("accept");
-        half_closed_rx.await.expect("half-close signal");
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(75), wait_for_tcp_peer_reset(&server))
-                .await
-                .is_err(),
-            "a valid read-half FIN must not cancel admission"
-        );
-
-        let mut queued = [0_u8; 32];
-        let queued_len = server.peek(&mut queued).await.expect("peek queued bytes");
-        assert!(queued_len > 0, "reset wait must not consume application bytes");
-
-        let _ = release_tx.send(());
-        peer.await.expect("peer task");
-    }
-
-    #[tokio::test]
-    async fn disconnect_wait_does_not_treat_queued_bytes_as_close() {
-        let (listener, addr) = listener().await;
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let peer = tokio::spawn(async move {
-            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
-            client.write_all(b"still-open").await.expect("write");
-            let _ = release_rx.await;
-            client.shutdown().await.expect("shutdown");
-        });
-        let (server, _) = listener.accept().await.expect("accept");
-
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(75),
-                wait_for_tcp_peer_reset(&server),
-            )
-            .await
-            .is_err(),
-            "ordinary readable data on an open connection must not cancel admission"
-        );
-        let mut queued = [0_u8; 32];
-        assert!(server.peek(&mut queued).await.expect("peek") > 0);
-
-        let _ = release_tx.send(());
-        peer.await.expect("peer task");
     }
 
     /// A first TCP segment shorter than `min_len` must be reassembled by further

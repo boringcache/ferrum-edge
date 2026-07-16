@@ -12619,11 +12619,10 @@ components:
                         maximum: 16
                         description: |
                           Optional gRPC status code emitted only when the
-                          matching request is detected as gRPC
-                          (`content-type: application/grpc[+...]`,
-                          excluding `application/grpc-web*`). Plain-HTTP
-                          requests on the same rule never receive a
-                          stray `grpc-status` header.
+                          immutable pre-plugin request flavor is native
+                          gRPC. Plain HTTP, WebSocket, and gRPC-Web requests
+                          never receive a stray `grpc-status` header even if
+                          an earlier hook rewrites `content-type`.
                       body:
                         type: [string, "null"]
                         description: Optional response body; empty when omitted.
@@ -14582,7 +14581,7 @@ components:
       description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; raw TCP faults run on stream connect. UDP and DTLS are not supported."
       properties:
         abort:
-          type: object
+          type: [object, "null"]
           additionalProperties: false
           properties:
             status_code:
@@ -14606,7 +14605,7 @@ components:
               description: HTTP response body returned with the abort
           required: [status_code, percentage]
         delay:
-          type: object
+          type: [object, "null"]
           additionalProperties: false
           properties:
             duration_ms:
@@ -14633,7 +14632,13 @@ components:
             back independently to the static percentage.
       anyOf:
         - required: [abort]
+          properties:
+            abort:
+              type: object
         - required: [delay]
+          properties:
+            delay:
+              type: object
 
     BodyValidatorConfig:
       type: object

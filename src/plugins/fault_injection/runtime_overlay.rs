@@ -109,7 +109,8 @@ pub enum FaultOverlayMaterialization {
     /// At least one configured percentage was replaced, or one fault side was
     /// disabled while another remains.
     Changed,
-    /// Every configured fault side was disabled by an explicit RTDS zero.
+    /// Every object-valued fault side was disabled by an explicit RTDS zero;
+    /// omitted and null sides are absent.
     Disabled,
 }
 
@@ -119,7 +120,8 @@ pub enum FaultOverlayMaterialization {
 /// then validated, built into the candidate plugin cache, and published in the
 /// same `RequestEpoch`. Missing or malformed keys leave the static percentage
 /// untouched. A valid zero removes that fault side for this generation; the
-/// caller disables the plugin when no side remains.
+/// caller disables the plugin when no object-valued side remains. Omitted and
+/// null sides both represent an absent fault kind, matching plugin validation.
 pub fn materialize_config(
     config: &mut Value,
     overlay: &MeshRuntimeOverlay,
@@ -167,7 +169,10 @@ pub fn materialize_config(
         }
     }
 
-    if changed && config_object.get("abort").is_none() && config_object.get("delay").is_none() {
+    let has_fault_side = ["abort", "delay"]
+        .into_iter()
+        .any(|side| config_object.get(side).is_some_and(Value::is_object));
+    if changed && !has_fault_side {
         FaultOverlayMaterialization::Disabled
     } else if changed {
         FaultOverlayMaterialization::Changed

@@ -1552,6 +1552,29 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         &json!({"delay": {"duration_ms": 60_001, "percentage": 1.0}}),
         false,
     );
+    for valid in [
+        json!({
+            "abort": null,
+            "delay": {"duration_ms": 1, "percentage": 1.0}
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "delay": null
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "delay": {"duration_ms": 1, "percentage": 1.0}
+        }),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &valid, true);
+    }
+    for invalid in [
+        json!({"abort": null}),
+        json!({"delay": null}),
+        json!({"abort": null, "delay": null}),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &invalid, false);
+    }
 }
 
 fn assert_component_validity(

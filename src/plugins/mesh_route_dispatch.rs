@@ -1297,9 +1297,9 @@ pub struct FaultAbortConfig {
     /// Percent of matching requests that trigger the abort. Range
     /// `(0.0, 100.0]`.
     pub percentage: f64,
-    /// Optional gRPC status code (`0..=16`) — only emitted when the
-    /// matching request is detected as gRPC. Plain-HTTP requests on the
-    /// same rule never receive a stray `grpc-status` header.
+    /// Optional gRPC status code (`0..=16`) — emitted only when the immutable
+    /// pre-plugin request flavor is native gRPC. Plain HTTP, WebSocket, and
+    /// gRPC-Web requests never receive a stray `grpc-status` header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grpc_status: Option<u32>,
     /// Optional response body. Empty when unset.
@@ -1790,7 +1790,7 @@ impl Plugin for MeshRouteDispatch {
                 // an aborted request never reaches the route override
                 // stage).
                 if let Some(fault) = rule.fault.as_ref()
-                    && let Some(result) = apply_fault_action(ctx, headers, rule, fault).await
+                    && let Some(result) = apply_fault_action(ctx, rule, fault).await
                 {
                     return result;
                 }
@@ -2108,7 +2108,6 @@ fn authority_without_port(authority: &str) -> String {
 /// second fault is stacked.
 async fn apply_fault_action(
     ctx: &mut RequestContext,
-    headers: &HashMap<String, String>,
     rule: &RouteRule,
     fault: &FaultActionConfig,
 ) -> Option<PluginResult> {
@@ -2159,7 +2158,7 @@ async fn apply_fault_action(
         // proper `application/grpc` trailers-only response. Plain HTTP
         // requests on the same rule never receive a stray header.
         if let Some(grpc_status) = abort.grpc_status
-            && is_native_grpc_request(ctx, headers)
+            && is_native_grpc_request(ctx)
         {
             reject_headers.insert("grpc-status".to_string(), grpc_status.to_string());
         }
@@ -5075,6 +5074,7 @@ mod tests {
 
         // gRPC: grpc-status header present.
         let mut ctx = ctx_with("POST", "/svc/Method");
+        ctx.set_request_http_flavor(crate::config::types::HttpFlavor::Grpc);
         let mut headers =
             HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -5093,7 +5093,7 @@ mod tests {
 
         // WebSocket takes precedence over a hostile native-gRPC media type.
         let mut ctx = ctx_with("GET", "/socket");
-        ctx.set_websocket_response_boundary(true);
+        ctx.set_request_http_flavor(crate::config::types::HttpFlavor::WebSocket);
         let mut headers =
             HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;

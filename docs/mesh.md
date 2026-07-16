@@ -2523,7 +2523,7 @@ Per-route `fault` rides on each emitted `mesh_route_dispatch` rule as a per-rule
 
 - `fault.abort.httpStatus` + `fault.abort.percentage` → rule `fault.abort` with `status_code` + `percentage`. `abort` is dropped (along with the rest of the rule's fault) when `httpStatus` is missing or the percentage is `0`; an accompanying valid `delay` still projects.
 - `fault.delay.fixedDelay` + `fault.delay.percentage` → rule `fault.delay` with `duration_ms` + `percentage`. `fixedDelay` accepts Istio's Go-style duration syntax; values outside `[1 ms, 1 min]` are rejected at translation time.
-- `fault.abort.grpcStatus` (string or numeric `0..=16`) → `fault.abort.grpc_status`. The header is only stamped on the rejection response when the matching request is detected as gRPC (`content-type: application/grpc[+...]`, excluding `application/grpc-web*`); plain HTTP on the same rule never receives a stray `grpc-status` header.
+- `fault.abort.grpcStatus` (string or numeric `0..=16`) → `fault.abort.grpc_status`. The header is only stamped when the immutable pre-plugin request flavor is native gRPC; gRPC-Web, WebSocket, and plain HTTP never receive a stray `grpc-status` header even if an earlier hook rewrites `content-type`.
 
 **Ordering:** when both delay and abort trigger on the same request, the delay runs first, then the abort fires — matching the proxy-scoped `fault_injection` plugin so the two surfaces stay semantically identical. A global / proxy-scoped `fault_injection` plugin running before this one (priority 2940 vs 2995) sets `ctx.metadata["fault_injected"]=true`, and the per-rule fault no-ops in that case so the two surfaces never stack a second delay + abort.
 
@@ -2746,7 +2746,7 @@ Fault percentages are built into immutable `fault_injection` instances from the 
 
 | Reserved key | Consumer | Effect |
 |---|---|---|
-| `ferrum.fault_injection.<scope>.abort_percent` / `.delay_percent` | `fault_injection` plugins with `runtime_overlay_scope: "<scope>"` | Replaces the static `percentage` for that fault kind for as long as the key remains in the overlay. Accepts `Number(0..=100)` or `FractionalPercent`. |
+| `ferrum.fault_injection.<scope>.abort_percent` / `.delay_percent` | `fault_injection` plugins with `runtime_overlay_scope: "<scope>"` | Replaces the static `percentage` for that fault kind for as long as the key remains in the overlay. Accepts `Number(0..=100)` or `FractionalPercent`. Zero removes that side for the generation; omitted and null sibling sides count as absent, so removing the only object side disables the instance without rejecting the generation. |
 | `ferrum.request_transformer.<scope>.enabled` / `ferrum.response_transformer.<scope>.enabled` | request/response transformer plugins with `runtime_overlay_scope: "<scope>"` | When `false`, every header / query / body rule on the plugin instance is short-circuited. Missing key falls back to `default_enabled` (defaults to `true`). |
 | `ferrum.log.level` | gateway-wide tracing `EnvFilter` | Rebuilt via `tracing_subscriber::reload`. Accepts any `RUST_LOG`-style directive. Parse failure logs a warning and keeps the last-good filter. |
 
