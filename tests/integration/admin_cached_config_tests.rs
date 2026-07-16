@@ -2631,6 +2631,137 @@ async fn test_restore_rolls_back_prior_config_after_mid_import_failure() {
     );
 }
 
+/// Rollback must faithfully replay the raw pre-restore snapshot even when it
+/// contains a legacy/out-of-band mTLS DNS ambiguity. Normal admission rejects
+/// this state, but applying that new validation to the compensating replay
+/// would first delete the namespace and then make its prior state unrecoverable.
+#[tokio::test]
+async fn restore_rollback_replays_preexisting_ambiguous_mtls_dns_snapshot() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_mtls_dns_rollback.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "consumers": [
+            {
+                "id": "restore-dns-upper",
+                "username": "restore-dns-upper",
+                "credentials": {
+                    "mtls_auth": [{"identity": "API.Example.COM"}]
+                }
+            },
+            {
+                "id": "restore-dns-lower",
+                "username": "restore-dns-lower",
+                "credentials": {
+                    "mtls_auth": [{"identity": "other.example.com"}]
+                }
+            }
+        ],
+        "plugin_configs": [{
+            "id": "restore-dns-policy",
+            "plugin_name": "mtls_auth",
+            "scope": "global",
+            "enabled": true,
+            "config": {"cert_field": "san_dns"}
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "mTLS DNS rollback seed failed: {body:?}");
+
+    // Simulate a pre-fix or out-of-band row. Exact credential uniqueness still
+    // permits this case variant; the active san_dns policy makes the resulting
+    // runtime snapshot ambiguous. The restore snapshot intentionally uses the
+    // raw, non-validating loader so it can preserve this prior durable state.
+    let ambiguous_credentials = json!({
+        "mtls_auth": [{"identity": "api.example.com"}]
+    });
+    sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
+        .bind(ambiguous_credentials.to_string())
+        .bind("ferrum")
+        .bind("restore-dns-lower")
+        .execute(&pool)
+        .await
+        .expect("Failed to inject the pre-existing DNS ambiguity");
+
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_mtls_dns BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-dns-fail' \
+         BEGIN SELECT RAISE(FAIL, 'injected restore persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install mTLS DNS restore fault trigger");
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-dns-fail",
+            "listen_path": "/new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+    assert_eq!(status, 500, "fault-injected restore unexpectedly succeeded");
+    assert_eq!(
+        body["rollback"].as_str(),
+        Some("completed"),
+        "raw ambiguous snapshot must remain rollback-capable: {body:?}"
+    );
+
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, credentials FROM consumers WHERE namespace = ? ORDER BY id")
+            .bind("ferrum")
+            .fetch_all(&pool)
+            .await
+            .expect("Failed to inspect replayed consumers");
+    assert_eq!(rows.len(), 2);
+    let restored_identities: Vec<String> = rows
+        .iter()
+        .map(|(_, credentials)| {
+            serde_json::from_str::<Value>(credentials).unwrap()["mtls_auth"][0]["identity"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        restored_identities,
+        vec!["api.example.com".to_string(), "API.Example.COM".to_string(),],
+        "rollback must replay the exact prior credential casing"
+    );
+    let plugin_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM plugin_configs WHERE namespace = ? AND id = ?")
+            .bind("ferrum")
+            .bind("restore-dns-policy")
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to inspect replayed mTLS policy");
+    assert_eq!(
+        plugin_count, 1,
+        "rollback must restore the active DNS policy"
+    );
+    let failed_proxy_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxies WHERE namespace = ? AND id = ?")
+            .bind("ferrum")
+            .bind("restore-dns-fail")
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to inspect partial restore cleanup");
+    assert_eq!(failed_proxy_count, 0);
+}
+
 /// Restore must remain usable to REPAIR a namespace whose existing config is
 /// already invalid/unloadable. The rollback snapshot is taken with a
 /// NON-VALIDATING raw load (`load_namespace_snapshot`), so an invalid-but-present

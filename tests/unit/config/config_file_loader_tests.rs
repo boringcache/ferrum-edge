@@ -1270,6 +1270,63 @@ plugin_configs: []
     assert_eq!(config2.proxies.len(), 2);
 }
 
+#[test]
+fn test_reload_rejects_case_ambiguous_mtls_dns_policy_candidate() {
+    let exact_policy = r#"
+version: "1"
+proxies: []
+consumers:
+  - id: "upper"
+    username: "alice"
+    credentials:
+      mtls_auth:
+        - identity: "API.Example.COM"
+  - id: "lower"
+    username: "bob"
+    credentials:
+      mtls_auth:
+        - identity: "api.example.com"
+plugin_configs:
+  - id: "mtls-policy"
+    plugin_name: "mtls_auth"
+    scope: "global"
+    enabled: true
+    config:
+      cert_field: "subject_cn"
+"#;
+    let dns_policy = exact_policy.replace("subject_cn", "san_dns");
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", exact_policy).unwrap();
+    let file_path = file.path().to_str().unwrap();
+
+    let accepted = reload_config_from_file(
+        file_path,
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("exact-match mTLS identities remain case-sensitive");
+    assert_eq!(
+        accepted.plugin_configs[0].config["cert_field"],
+        "subject_cn"
+    );
+
+    std::fs::write(file.path(), dns_policy).unwrap();
+    let error = reload_config_from_file(
+        file_path,
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("reload must fail closed before publishing a case-ambiguous DNS index");
+    let message = format!("{error:#}");
+    assert!(message.contains("duplicate consumer credential(s)"));
+    assert_eq!(
+        accepted.plugin_configs[0].config["cert_field"], "subject_cn",
+        "the caller's last accepted snapshot remains usable"
+    );
+}
+
 // ============================================================================
 // Error Cases
 // ============================================================================

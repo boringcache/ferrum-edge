@@ -6604,6 +6604,9 @@ impl ProxyState {
     ///     500 every request through that proxy.
     ///   - `validate_plugin_references` — dangling plugin IDs / wrong
     ///     scope.
+    ///   - `validate_unique_mtls_dns_identities` — case-variant identities
+    ///     would collapse into one `ConsumerIndex` DNS key when an effective
+    ///     `mtls_auth` `san_dns` policy is enabled.
     ///   - `validate_mesh_route_dispatch_upstream_references` — dangling
     ///     `mesh_route_dispatch.destination.upstream_id` references are
     ///     observationally identical to a dangling `Proxy.upstream_id`:
@@ -6667,6 +6670,9 @@ impl ProxyState {
             errors.extend(errs);
         }
         if let Err(errs) = config.validate_plugin_references() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_unique_mtls_dns_identities() {
             errors.extend(errs);
         }
         if let Err(errs) = validate_mesh_route_dispatch_upstream_references(config) {
