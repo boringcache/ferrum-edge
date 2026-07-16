@@ -1,8 +1,10 @@
 //! Bounded, non-blocking process log sinks with explicit loss accounting.
 //!
 //! Producers reserve both a record slot and the configured maximum record
-//! budget before formatting. A dedicated OS thread owns the blocking writer;
-//! request/runtime threads only perform atomic admission plus a fixed-queue push.
+//! budget before formatting, then shrink the byte reservation to the actual
+//! serialized length before enqueue. A dedicated OS thread owns the blocking
+//! writer; request/runtime threads only perform atomic admission plus a
+//! fixed-queue push.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -15,7 +17,6 @@ use crossbeam_queue::ArrayQueue;
 use serde::Serialize;
 use tracing_subscriber::fmt::MakeWriter;
 
-const WORKER_IDLE_POLL: Duration = Duration::from_millis(10);
 const FAILURE_NOTICE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -173,6 +174,7 @@ struct SinkState {
     last_failure: Mutex<Option<SinkFailure>>,
     fallback: OnceLock<NonBlockingSink>,
     last_failure_notice: Mutex<Option<Instant>>,
+    worker_thread: OnceLock<std::thread::Thread>,
     completion: WorkerCompletion,
 }
 
@@ -204,23 +206,63 @@ impl SinkState {
             })
             .is_ok();
         if !byte_reserved {
-            self.outstanding_records.fetch_sub(1, Ordering::Release);
+            self.release_record_slot();
             self.saturation_dropped.fetch_add(1, Ordering::Relaxed);
             return Err(EnqueueResult::Saturated);
         }
 
         if !self.accepting.load(Ordering::Acquire) {
-            self.release_reservation();
+            self.release_reservation(self.options.max_record_bytes);
             self.closed_dropped.fetch_add(1, Ordering::Relaxed);
             return Err(EnqueueResult::Closed);
         }
         Ok(())
     }
 
-    fn release_reservation(&self) {
-        self.reserved_bytes
-            .fetch_sub(self.options.max_record_bytes, Ordering::Release);
-        self.outstanding_records.fetch_sub(1, Ordering::Release);
+    fn release_reserved_bytes(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        // Every caller owns this many bytes from a successful reservation.
+        // checked_sub prevents a bookkeeping bug from wrapping the public
+        // gauge even in optimized builds.
+        let _ = self
+            .reserved_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(bytes)
+            });
+    }
+
+    fn shrink_reservation(&self, reserved: usize, actual: usize) {
+        if let Some(excess) = reserved.checked_sub(actual) {
+            self.release_reserved_bytes(excess);
+        }
+    }
+
+    fn release_reservation(&self, reserved_bytes: usize) {
+        self.release_reserved_bytes(reserved_bytes);
+        self.release_record_slot();
+    }
+
+    fn release_record_slot(&self) {
+        let became_idle = self
+            .outstanding_records
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            })
+            .is_ok_and(|previous| previous == 1);
+        // A producer can reserve and then abandon a record while shutdown is
+        // waiting. Wake the worker when that final reservation disappears so
+        // plain park() cannot strand the drain.
+        if became_idle && !self.accepting.load(Ordering::Acquire) {
+            self.wake_worker();
+        }
+    }
+
+    fn wake_worker(&self) {
+        if let Some(worker) = self.worker_thread.get() {
+            worker.unpark();
+        }
     }
 
     fn record_failure(&self, operation: &'static str, error_kind: &'static str) {
@@ -303,7 +345,6 @@ impl SinkState {
 #[derive(Clone)]
 pub struct NonBlockingSink {
     queue: Arc<ArrayQueue<Vec<u8>>>,
-    worker_thread: std::thread::Thread,
     state: Arc<SinkState>,
 }
 
@@ -337,6 +378,7 @@ impl NonBlockingSink {
             last_failure: Mutex::new(None),
             fallback: OnceLock::new(),
             last_failure_notice: Mutex::new(None),
+            worker_thread: OnceLock::new(),
             completion: WorkerCompletion::new(),
         });
         let worker_state = Arc::clone(&state);
@@ -345,9 +387,9 @@ impl NonBlockingSink {
         let join = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || run_worker(writer, worker_queue, worker_state))?;
+        let _ = state.worker_thread.set(join.thread().clone());
         let sink = Self {
             queue,
-            worker_thread: join.thread().clone(),
             state,
         };
         let guard = WorkerGuard {
@@ -444,6 +486,7 @@ pub struct RecordWriter {
     sink: NonBlockingSink,
     bytes: Vec<u8>,
     reserved: bool,
+    reserved_bytes: usize,
     oversized: bool,
     auto_submit: bool,
 }
@@ -456,6 +499,7 @@ impl RecordWriter {
             sink: sink.clone(),
             bytes: Vec::with_capacity(initial_capacity),
             reserved: true,
+            reserved_bytes: sink.state.options.max_record_bytes,
             oversized: false,
             auto_submit,
         })
@@ -466,6 +510,7 @@ impl RecordWriter {
             sink,
             bytes: Vec::new(),
             reserved: false,
+            reserved_bytes: 0,
             oversized: false,
             auto_submit: false,
         }
@@ -477,8 +522,9 @@ impl RecordWriter {
                 .state
                 .oversized_dropped
                 .fetch_add(1, Ordering::Relaxed);
-            self.sink.state.release_reservation();
+            self.sink.state.release_reservation(self.reserved_bytes);
             self.reserved = false;
+            self.reserved_bytes = 0;
         }
         self.bytes.clear();
     }
@@ -502,6 +548,14 @@ impl RecordWriter {
 
         let bytes = std::mem::take(&mut self.bytes);
         let len = bytes.len();
+        // Admission reserves max_record_bytes before attacker-shaped data is
+        // serialized. Once serialization succeeds, retain only the actual
+        // record length so the aggregate byte budget reflects queued memory
+        // instead of pessimistically reducing record capacity until I/O ends.
+        self.sink
+            .state
+            .shrink_reservation(self.reserved_bytes, len);
+        self.reserved_bytes = len;
         self.sink
             .state
             .queued_bytes
@@ -512,7 +566,7 @@ impl RecordWriter {
                     .state
                     .accepted_records
                     .fetch_add(1, Ordering::Relaxed);
-                self.sink.worker_thread.unpark();
+                self.sink.state.wake_worker();
                 EnqueueResult::Queued
             }
             Err(bytes) => {
@@ -524,11 +578,12 @@ impl RecordWriter {
                     .state
                     .saturation_dropped
                     .fetch_add(1, Ordering::Relaxed);
-                self.sink.state.release_reservation();
+                self.sink.state.release_reservation(self.reserved_bytes);
                 EnqueueResult::Saturated
             }
         };
         self.reserved = false;
+        self.reserved_bytes = 0;
         result
     }
 }
@@ -568,8 +623,9 @@ impl Drop for RecordWriter {
         if self.auto_submit {
             let _ = self.submit();
         } else {
-            self.sink.state.release_reservation();
+            self.sink.state.release_reservation(self.reserved_bytes);
             self.reserved = false;
+            self.reserved_bytes = 0;
         }
     }
 }
@@ -636,13 +692,10 @@ where
         {
             break;
         }
-        std::thread::park_timeout(WORKER_IDLE_POLL);
-    }
-
-    // Close races can leave records in the queue after the accepting flag
-    // flips. Drain every already-admitted record without waiting for producers.
-    while let Some(bytes) = queue.pop() {
-        write_record(&mut writer, bytes, &state);
+        // submit(), shutdown(), and the final abandoned reservation all unpark
+        // this worker. Thread park tokens make the queue-empty/check/park
+        // sequence safe when a wake arrives immediately before park().
+        std::thread::park();
     }
 
     if let Err(error) = writer.flush() {
@@ -662,7 +715,7 @@ fn write_record<W: Write>(writer: &mut W, bytes: Vec<u8>, state: &SinkState) {
         }
     }
     state.queued_bytes.fetch_sub(len, Ordering::Release);
-    state.release_reservation();
+    state.release_reservation(len);
 }
 
 fn io_error_kind(error: &io::Error) -> &'static str {

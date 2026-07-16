@@ -316,6 +316,43 @@ fn saturation_is_non_blocking_and_stdout_stderr_counters_are_independent() {
 }
 
 #[test]
+fn aggregate_byte_budget_rejects_before_record_slots_are_full() {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let writer = BlockingWriter {
+        started: started_tx,
+        release: Arc::clone(&release),
+    };
+    let (sink, mut guard) = NonBlockingSink::spawn(
+        SinkName::Stdout,
+        writer,
+        NonBlockingOptions {
+            record_capacity: 4,
+            byte_capacity: 96,
+            max_record_bytes: 64,
+            shutdown_timeout: Duration::from_millis(200),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(sink.try_write_bytes(&[b'a'; 32]), EnqueueResult::Queued);
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(sink.try_write_bytes(&[b'b'; 32]), EnqueueResult::Queued);
+
+    let before_rejection = sink.snapshot();
+    assert_eq!(before_rejection.queued_records, 2);
+    assert_eq!(before_rejection.reserved_bytes, 64);
+    assert!(before_rejection.queued_records < before_rejection.queue_capacity_records);
+    assert_eq!(sink.try_write_bytes(b"c"), EnqueueResult::Saturated);
+    assert_eq!(sink.snapshot().saturation_dropped_records_total, 1);
+
+    let (lock, wake) = &*release;
+    *lock.lock().unwrap() = true;
+    wake.notify_all();
+    assert!(guard.shutdown());
+}
+
+#[test]
 fn oversized_record_is_bounded_and_counted_separately() {
     let (sink, mut guard) = NonBlockingSink::spawn(
         SinkName::Stdout,
@@ -331,6 +368,23 @@ fn oversized_record_is_bounded_and_counted_separately() {
     assert_eq!(snapshot.oversized_dropped_records_total, 1);
     assert_eq!(snapshot.accepted_records_total, 0);
     assert!(guard.shutdown());
+}
+
+#[test]
+fn admission_after_shutdown_is_closed_and_counted() {
+    let (sink, mut guard) = NonBlockingSink::spawn(
+        SinkName::Stdout,
+        Vec::<u8>::new(),
+        options(2, Duration::from_millis(200)),
+    )
+    .unwrap();
+    assert!(guard.shutdown());
+
+    assert_eq!(sink.try_write_bytes(b"after shutdown\n"), EnqueueResult::Closed);
+    let snapshot = sink.snapshot();
+    assert_eq!(snapshot.closed_dropped_records_total, 1);
+    assert_eq!(snapshot.queued_records, 0);
+    assert_eq!(snapshot.reserved_bytes, 0);
 }
 
 #[test]

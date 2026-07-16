@@ -649,6 +649,16 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
             code: 0,
             message: "",
         })
+        .step(GrpcStep::AcceptRpc(MatchRpc::custom(|request| {
+            request.method == "POST"
+                && request.path == "/echo.Echo/Unary"
+                && request.header("content-type") == Some("application/grpc")
+        })))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondStatus {
+            code: 7,
+            message: "permission denied",
+        })
         .spawn()
         .expect("spawn gRPC backend");
 
@@ -669,16 +679,25 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         }],
         "consumers": [],
         "upstreams": [],
-        "plugin_configs": [{
-            "id": "grpc-web-success",
-            "plugin_name": "grpc_web",
-            "scope": "proxy",
-            "proxy_id": "h3-grpc-web-success",
-            "enabled": true,
-            "config": {},
-        }],
+        "plugin_configs": [
+            {
+                "id": "grpc-web-success",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-success",
+                "enabled": true,
+                "config": {},
+            },
+            {
+                "id": "grpc-web-errors-only",
+                "plugin_name": "stdout_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": {"filter": {"errors_only": true}},
+            },
+        ],
     });
-    let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let (gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
     let client = Http3Client::insecure().expect("H3 client");
     let response = request_with_retry(
         &client,
@@ -716,13 +735,51 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         "success status must be embedded in the gRPC-Web trailer frame"
     );
 
+    let failure = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/success/echo.Echo/Unary"),
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/grpc-web+proto")
+            .body(Bytes::from(grpc_frame(b"ping"))),
+    )
+    .await;
+    assert_grpc_web_error(&failure, "7", "application/grpc-web+proto");
+
+    let logs = gateway
+        .wait_for_log_contains(
+            |logs| {
+                logs.lines().any(|line| {
+                    serde_json::from_str::<Value>(line).is_ok_and(|entry| {
+                        entry["proxy_id"] == "h3-grpc-web-success"
+                            && entry["grpc_status"] == 7
+                    })
+                })
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+    let access_logs: Vec<Value> = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["proxy_id"] == "h3-grpc-web-success")
+        .collect();
+    assert_eq!(
+        access_logs.len(),
+        1,
+        "errors_only must exclude translated status 0 and emit translated status 7; logs:\n{logs}"
+    );
+    assert_eq!(access_logs[0]["response_status_code"], 200);
+    assert_eq!(access_logs[0]["grpc_status"], 7);
+
     backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
     let requests = backend.received_streams().await;
     assert_eq!(
         requests.len(),
-        1,
-        "exactly one native gRPC backend request expected"
+        2,
+        "exactly two native gRPC backend requests expected"
     );
     assert_eq!(requests[0].body, grpc_frame(b"ping"));
+    assert_eq!(requests[1].body, grpc_frame(b"ping"));
 }

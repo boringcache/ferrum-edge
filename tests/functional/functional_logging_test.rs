@@ -314,6 +314,44 @@ async fn test_logging_gateway_startup_logs() {
 
 #[tokio::test]
 #[ignore]
+async fn test_logging_clamped_settings_emit_startup_warnings() {
+    let mut gateway = TestGateway::builder()
+        .jwt_secret("logging-clamp-test-secret-key-12345678")
+        .jwt_issuer("ferrum-edge-logging-clamp-test")
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        .env("FERRUM_LOG_BUFFER_CAPACITY", "128000")
+        .env("FERRUM_LOG_MAX_RECORD_BYTES", "512")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway with clamped logging settings");
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    gateway.shutdown();
+    let logs = gateway.read_combined_captured_output().unwrap_or_default();
+    let entries = parse_log_lines(&logs);
+
+    for (variable, supplied, applied) in [
+        ("FERRUM_LOG_BUFFER_CAPACITY", 128_000, 65_536),
+        ("FERRUM_LOG_MAX_RECORD_BYTES", 512, 1_024),
+    ] {
+        assert!(
+            entries.iter().any(|entry| {
+                entry["level"] == "WARN"
+                    && entry["fields"]["message"]
+                        == "logging configuration value was clamped"
+                    && entry["fields"]["variable"] == variable
+                    && entry["fields"]["supplied_value"] == supplied
+                    && entry["fields"]["applied_value"] == applied
+            }),
+            "missing clamp warning for {variable}: {logs}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_logging_transaction_summary_on_proxied_request() {
     println!("\n=== Test: Transaction Summary Logging ===\n");
 

@@ -18,6 +18,22 @@ pub use non_blocking::{
     ErrorCounter, NonBlockingOptions, NonBlockingSink, SinkName, SinkSnapshot, WorkerGuard,
 };
 
+// Process-log defaults and clamp ranges are consumed before EnvConfig exists,
+// then retained on EnvConfig for diagnostics/documentation parity. Keep the
+// numeric policy here so both startup paths use one source of truth.
+pub const LOG_BUFFER_CAPACITY_DEFAULT: usize = 4_096;
+pub const LOG_BUFFER_CAPACITY_MIN: usize = 1;
+pub const LOG_BUFFER_CAPACITY_MAX: usize = 65_536;
+pub const LOG_BUFFER_BYTES_DEFAULT: usize = 32 * 1_048_576;
+pub const LOG_BUFFER_BYTES_MIN: usize = 1_024;
+pub const LOG_BUFFER_BYTES_MAX: usize = 1_073_741_824;
+pub const LOG_MAX_RECORD_BYTES_DEFAULT: usize = 65_536;
+pub const LOG_MAX_RECORD_BYTES_MIN: usize = 1_024;
+pub const LOG_MAX_RECORD_BYTES_MAX: usize = 1_048_576;
+pub const LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT: usize = 2_000;
+pub const LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MIN: usize = 100;
+pub const LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MAX: usize = 30_000;
+
 /// Stable callback that knows how to rebuild the gateway-wide tracing
 /// filter. `directive` is a `RUST_LOG`-style filter expression
 /// (`"info"`, `"ferrum_edge=trace,hyper=warn"`, etc.). Implementations must

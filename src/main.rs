@@ -258,39 +258,65 @@ impl Drop for LoggingGuards {
     }
 }
 
+struct ResolvedLoggingUsize {
+    name: &'static str,
+    applied: usize,
+    supplied: Option<usize>,
+}
+
 fn resolve_logging_usize(
-    name: &str,
+    name: &'static str,
     default: usize,
     min: usize,
     max: usize,
-) -> Result<usize, String> {
+) -> Result<ResolvedLoggingUsize, String> {
     let Some(value) = config::conf_file::resolve_ferrum_var(name) else {
-        return Ok(default);
+        return Ok(ResolvedLoggingUsize {
+            name,
+            applied: default,
+            supplied: None,
+        });
     };
-    value
+    let supplied = value
         .parse::<usize>()
-        .map(|parsed| parsed.clamp(min, max))
-        .map_err(|_| format!("invalid {name}: expected an unsigned integer"))
+        .map_err(|_| format!("invalid {name}: expected an unsigned integer"))?;
+    Ok(ResolvedLoggingUsize {
+        name,
+        applied: supplied.clamp(min, max),
+        supplied: Some(supplied),
+    })
 }
 
 fn init_logging() -> Result<LoggingGuards, String> {
-    let log_buffer_capacity =
-        resolve_logging_usize("FERRUM_LOG_BUFFER_CAPACITY", 4_096, 1, 65_536)?;
-    let max_record_bytes =
-        resolve_logging_usize("FERRUM_LOG_MAX_RECORD_BYTES", 65_536, 1_024, 1_048_576)?;
+    let log_buffer_capacity = resolve_logging_usize(
+        "FERRUM_LOG_BUFFER_CAPACITY",
+        logging::LOG_BUFFER_CAPACITY_DEFAULT,
+        logging::LOG_BUFFER_CAPACITY_MIN,
+        logging::LOG_BUFFER_CAPACITY_MAX,
+    )?;
+    let max_record_bytes = resolve_logging_usize(
+        "FERRUM_LOG_MAX_RECORD_BYTES",
+        logging::LOG_MAX_RECORD_BYTES_DEFAULT,
+        logging::LOG_MAX_RECORD_BYTES_MIN,
+        logging::LOG_MAX_RECORD_BYTES_MAX,
+    )?;
     let log_buffer_bytes = resolve_logging_usize(
         "FERRUM_LOG_BUFFER_BYTES",
-        32 * 1_048_576,
-        max_record_bytes,
-        1_073_741_824,
+        logging::LOG_BUFFER_BYTES_DEFAULT,
+        logging::LOG_BUFFER_BYTES_MIN.max(max_record_bytes.applied),
+        logging::LOG_BUFFER_BYTES_MAX,
     )?;
-    let shutdown_timeout_ms =
-        resolve_logging_usize("FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS", 2_000, 100, 30_000)?;
+    let shutdown_timeout_ms = resolve_logging_usize(
+        "FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS",
+        logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT,
+        logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MIN,
+        logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MAX,
+    )?;
     let options = logging::NonBlockingOptions {
-        record_capacity: log_buffer_capacity,
-        byte_capacity: log_buffer_bytes,
-        max_record_bytes,
-        shutdown_timeout: std::time::Duration::from_millis(shutdown_timeout_ms as u64),
+        record_capacity: log_buffer_capacity.applied,
+        byte_capacity: log_buffer_bytes.applied,
+        max_record_bytes: max_record_bytes.applied,
+        shutdown_timeout: std::time::Duration::from_millis(shutdown_timeout_ms.applied as u64),
     };
     let (stdout_writer, stdout_guard) =
         logging::NonBlockingSink::spawn(logging::SinkName::Stdout, std::io::stdout(), options)
@@ -374,6 +400,24 @@ fn init_logging() -> Result<LoggingGuards, String> {
             .is_ok()
         {
             register_log_level_reloader(fallback_handle);
+        }
+    }
+
+    for resolved in [
+        &log_buffer_capacity,
+        &log_buffer_bytes,
+        &max_record_bytes,
+        &shutdown_timeout_ms,
+    ] {
+        if let Some(supplied) = resolved.supplied
+            && supplied != resolved.applied
+        {
+            warn!(
+                variable = resolved.name,
+                supplied_value = supplied,
+                applied_value = resolved.applied,
+                "logging configuration value was clamped"
+            );
         }
     }
 

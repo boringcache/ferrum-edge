@@ -37,7 +37,13 @@ Alert on any increase in a dropped-record, I/O-failure, or shutdown-timeout
 counter, or on `ferrum_log_sink_healthy == 0`. Increase record/byte capacity only after
 checking collector throughput and memory headroom: retained queue memory is
 bounded by `FERRUM_LOG_BUFFER_BYTES` per sink, and larger records still obey
-`FERRUM_LOG_MAX_RECORD_BYTES`. Shutdown waits no longer than
+`FERRUM_LOG_MAX_RECORD_BYTES`. `queue_capacity_records` is the hard record-slot
+limit, not a promise that the byte budget can hold that many records. Before
+serialization, each producer provisionally reserves the maximum record size;
+after serialization, `reserved_bytes` shrinks to the actual record length until
+write completion. Raising record capacity is therefore a no-op when the byte
+budget is already limiting; leave at least one maximum-record allocation of byte
+headroom for the next admission. Shutdown waits no longer than
 `FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS` per sink and accounts the remaining
 records when that deadline expires.
 

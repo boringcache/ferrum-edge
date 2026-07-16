@@ -9456,12 +9456,27 @@ components:
         sink: { type: string, enum: [stdout, stderr] }
         healthy: { type: boolean }
         accepting: { type: boolean }
-        queue_capacity_records: { type: integer }
-        queue_capacity_bytes: { type: integer }
-        max_record_bytes: { type: integer }
-        queued_records: { type: integer }
-        reserved_bytes: { type: integer }
-        queued_bytes: { type: integer }
+        queue_capacity_records:
+          type: integer
+          description: Hard admitted-record limit; the byte budget may limit admission first.
+        queue_capacity_bytes:
+          type: integer
+          description: Aggregate per-sink reservation limit for admitted records.
+        max_record_bytes:
+          type: integer
+          description: Per-record serialization limit and provisional pre-serialization reservation.
+        queued_records:
+          type: integer
+          description: Records admitted but not yet completed by the writer.
+        reserved_bytes:
+          type: integer
+          description: >-
+            Current byte reservations. A producer initially reserves
+            max_record_bytes; after serialization this shrinks to the actual
+            record length until write completion.
+        queued_bytes:
+          type: integer
+          description: Actual serialized bytes admitted but not yet completed by the writer.
         accepted_records_total: { type: integer, format: uint64 }
         saturation_dropped_records_total: { type: integer, format: uint64 }
         oversized_dropped_records_total: { type: integer, format: uint64 }

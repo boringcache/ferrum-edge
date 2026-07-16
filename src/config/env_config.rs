@@ -2219,10 +2219,11 @@ impl Default for EnvConfig {
             mode: OperatingMode::File,
             namespace: "ferrum".into(),
             log_level: "error".into(),
-            log_buffer_capacity: 4_096,
-            log_buffer_bytes: 32 * 1_048_576,
-            log_max_record_bytes: 65_536,
-            log_shutdown_drain_timeout_ms: 2_000,
+            log_buffer_capacity: crate::logging::LOG_BUFFER_CAPACITY_DEFAULT,
+            log_buffer_bytes: crate::logging::LOG_BUFFER_BYTES_DEFAULT,
+            log_max_record_bytes: crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT,
+            log_shutdown_drain_timeout_ms:
+                crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT as u64,
             secret_refresh_interval_seconds:
                 crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS,
             acme_auto_renew_enabled: false,
@@ -2549,10 +2550,10 @@ impl EnvConfig {
             dns_overrides: HashMap<String, String> = "FERRUM_DNS_OVERRIDES" => HashMap::new();
             namespace: String = "FERRUM_NAMESPACE" => "ferrum".to_string();
             log_level: String = "FERRUM_LOG_LEVEL" => "warn".to_string();
-            log_buffer_capacity: usize = "FERRUM_LOG_BUFFER_CAPACITY" => 4_096usize, clamp(1usize, 65_536usize);
-            log_buffer_bytes: usize = "FERRUM_LOG_BUFFER_BYTES" => 32usize * 1_048_576usize, clamp(1_024usize, 1_073_741_824usize);
-            log_max_record_bytes: usize = "FERRUM_LOG_MAX_RECORD_BYTES" => 65_536usize, clamp(1_024usize, 1_048_576usize);
-            log_shutdown_drain_timeout_ms: u64 = "FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS" => 2_000u64, clamp(100u64, 30_000u64);
+            log_buffer_capacity: usize = "FERRUM_LOG_BUFFER_CAPACITY" => crate::logging::LOG_BUFFER_CAPACITY_DEFAULT, clamp(crate::logging::LOG_BUFFER_CAPACITY_MIN, crate::logging::LOG_BUFFER_CAPACITY_MAX);
+            log_buffer_bytes: usize = "FERRUM_LOG_BUFFER_BYTES" => crate::logging::LOG_BUFFER_BYTES_DEFAULT, clamp(crate::logging::LOG_BUFFER_BYTES_MIN, crate::logging::LOG_BUFFER_BYTES_MAX);
+            log_max_record_bytes: usize = "FERRUM_LOG_MAX_RECORD_BYTES" => crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT, clamp(crate::logging::LOG_MAX_RECORD_BYTES_MIN, crate::logging::LOG_MAX_RECORD_BYTES_MAX);
+            log_shutdown_drain_timeout_ms: u64 = "FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS" => crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT as u64, clamp(crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MIN as u64, crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MAX as u64);
             secret_refresh_interval_seconds: u64 = "FERRUM_SECRET_REFRESH_INTERVAL_SECONDS" => crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS, clamp(1u64, 86_400u64);
             acme_auto_renew_enabled: bool = "FERRUM_ACME_AUTO_RENEW_ENABLED" => false;
             acme_renew_when_remaining_days: u64 = "FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS" => 30u64, clamp(1u64, 365u64);

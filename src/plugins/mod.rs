@@ -2798,13 +2798,16 @@ impl TransactionSummary {
     /// HTTP transport status. Missing or malformed terminal status on a known
     /// gRPC transaction remains a failure: missing is UNKNOWN (2), while
     /// malformed input uses the existing `u32::MAX` invalid-status sentinel.
+    /// Translated gRPC-Web requests are stamped as `request_protocol="grpc"`
+    /// by the H1/H2 and H3 dispatchers; no runtime path currently produces
+    /// `request_protocol="grpc-web"` (mesh uses `mesh.request_protocol`).
     pub fn grpc_status(&self) -> Option<u32> {
         match self.metadata.get("grpc_status") {
             Some(status) => Some(crate::proxy::grpc_proxy::parse_grpc_status_value(status)),
             None if self
                 .metadata
                 .get("request_protocol")
-                .is_some_and(|protocol| matches!(protocol.as_str(), "grpc" | "grpc-web")) =>
+                .is_some_and(|protocol| protocol == "grpc") =>
             {
                 Some(crate::proxy::grpc_proxy::grpc_status::UNKNOWN)
             }
