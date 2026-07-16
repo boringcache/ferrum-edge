@@ -1386,7 +1386,7 @@ async fn test_ldaps_keeps_configured_hostname_for_certificate_verification() {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
     use std::io::Write;
     use tempfile::NamedTempFile;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
 
@@ -1436,8 +1436,9 @@ async fn test_ldaps_keeps_configured_hostname_for_certificate_verification() {
             .accept(stream)
             .await
             .expect("accept hostname-verified TLS");
-        let mut request = [0u8; 1_024];
-        stream.read(&mut request).await.expect("read LDAPS bind");
+        let _request = try_read_ldap_message_bytes(&mut stream)
+            .await
+            .expect("read LDAPS bind");
         stream
             .write_all(&bind_response(1, 0))
             .await
@@ -1523,8 +1524,8 @@ fn search_result_done(message_id: u8, result_code: u8) -> Vec<u8> {
     )
 }
 
-async fn try_read_ldap_message_bytes(
-    stream: &mut tokio::net::TcpStream,
+async fn try_read_ldap_message_bytes<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
 ) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
 
