@@ -3253,9 +3253,7 @@ async fn rollback_failed_batch_create(
         if !prior_plugin_config_ids.contains(plugin_config.id.as_str()) {
             match db.get_plugin_config(namespace, &plugin_config.id).await {
                 Ok(Some(current)) if current.updated_at == plugin_config.updated_at => {
-                    if let Err(error) = db
-                        .delete_plugin_config(namespace, &plugin_config.id)
-                        .await
+                    if let Err(error) = db.delete_plugin_config(namespace, &plugin_config.id).await
                     {
                         errors.push(format!("plugin_config '{}': {}", plugin_config.id, error));
                     }
@@ -4858,29 +4856,30 @@ async fn handle_batch_create(
                 "Batch: namespace admission was lost during persistence; reacquiring for rollback"
             );
             drop(_namespace_config_admission_guard);
-            let rollback_guard =
-                match crud::lock_namespace_config_admission(db.clone(), namespace).await {
-                    Ok(guard) => guard,
-                    Err(rollback_error) => {
-                        return Ok(json_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &json!({
-                                "error": format!(
-                                    "Config admission was lost during batch persistence and could not be reacquired for rollback: {rollback_error}"
-                                ),
-                                "admission_error": error.to_string(),
-                                "persistence_errors": errors,
-                                "created": {
-                                    "proxies": created.proxies,
-                                    "consumers": created.consumers,
-                                    "plugin_configs": created.plugin_configs,
-                                    "upstreams": created.upstreams,
-                                },
-                                "rollback": "not_started",
-                            }),
-                        ));
-                    }
-                };
+            let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(rollback_error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was lost during batch persistence and could not be reacquired for rollback: {rollback_error}"
+                            ),
+                            "admission_error": error.to_string(),
+                            "persistence_errors": errors,
+                            "created": {
+                                "proxies": created.proxies,
+                                "consumers": created.consumers,
+                                "plugin_configs": created.plugin_configs,
+                                "upstreams": created.upstreams,
+                            },
+                            "rollback": "not_started",
+                        }),
+                    ));
+                }
+            };
             let rollback = rollback_guard
                 .run_to_completion_while_held(rollback_failed_batch_create(
                     db.as_ref(),
@@ -5410,9 +5409,7 @@ async fn handle_restore(
     };
     let (delete_result, delete_admission_error) = match delete_completion {
         crud::NamespaceConfigAdmissionCompletion::Held(result) => (result, None),
-        crud::NamespaceConfigAdmissionCompletion::Lost { result, error } => {
-            (result, Some(error))
-        }
+        crud::NamespaceConfigAdmissionCompletion::Lost { result, error } => (result, Some(error)),
     };
     if let Some(error) = delete_admission_error {
         error!(
@@ -5421,21 +5418,25 @@ async fn handle_restore(
             "Restore: namespace admission was lost during clear; reacquiring for recovery"
         );
         drop(namespace_config_admission_guard);
-        namespace_config_admission_guard =
-            match crud::lock_namespace_config_admission(db.clone(), namespace).await {
-                Ok(guard) => guard,
-                Err(recovery_error) => {
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": format!(
-                                "Config admission was lost during restore clear and could not be reacquired for recovery: {recovery_error}"
-                            ),
-                            "restore_errors": [error.to_string()],
-                        }),
-                    ));
-                }
-            };
+        namespace_config_admission_guard = match crud::lock_namespace_config_admission(
+            db.clone(),
+            namespace,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(recovery_error) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Config admission was lost during restore clear and could not be reacquired for recovery: {recovery_error}"
+                        ),
+                        "restore_errors": [error.to_string()],
+                    }),
+                ));
+            }
+        };
         if delete_result.is_ok() {
             let rollback = finish_failed_restore(
                 state,
@@ -5447,29 +5448,31 @@ async fn handle_restore(
                 )],
                 &snapshot,
             );
-            return Ok(match namespace_config_admission_guard
-                .run_to_completion_while_held(rollback)
-                .await
-            {
-                Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
-                Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
-                    error!(
-                        namespace = %namespace,
-                        %error,
-                        "Restore: admission was lost again after clear recovery completed"
-                    );
-                    result
-                }
-                Err(rollback_error) => json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": format!(
-                            "Config admission was unavailable before restore clear recovery: {rollback_error}"
-                        ),
-                        "restore_errors": [error.to_string()],
-                    }),
-                ),
-            });
+            return Ok(
+                match namespace_config_admission_guard
+                    .run_to_completion_while_held(rollback)
+                    .await
+                {
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
+                        error!(
+                            namespace = %namespace,
+                            %error,
+                            "Restore: admission was lost again after clear recovery completed"
+                        );
+                        result
+                    }
+                    Err(rollback_error) => json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was unavailable before restore clear recovery: {rollback_error}"
+                            ),
+                            "restore_errors": [error.to_string()],
+                        }),
+                    ),
+                },
+            );
         }
     }
     if let Err(e) = delete_result {
@@ -5599,28 +5602,27 @@ async fn handle_restore(
             };
             let rollback =
                 finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot);
-            return Ok(match rollback_guard
-                .run_to_completion_while_held(rollback)
-                .await
-            {
-                Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
-                Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
-                    error!(
-                        namespace = %namespace,
-                        %error,
-                        "Restore: admission was lost again after import rollback completed"
-                    );
-                    result
-                }
-                Err(rollback_error) => json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": format!(
-                            "Config admission was unavailable before restore import rollback: {rollback_error}"
-                        ),
-                    }),
-                ),
-            });
+            return Ok(
+                match rollback_guard.run_to_completion_while_held(rollback).await {
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Held(response)) => response,
+                    Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
+                        error!(
+                            namespace = %namespace,
+                            %error,
+                            "Restore: admission was lost again after import rollback completed"
+                        );
+                        result
+                    }
+                    Err(rollback_error) => json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was unavailable before restore import rollback: {rollback_error}"
+                            ),
+                        }),
+                    ),
+                },
+            );
         }
     };
 

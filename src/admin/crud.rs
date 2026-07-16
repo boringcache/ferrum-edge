@@ -143,10 +143,7 @@ pub(crate) struct NamespaceConfigAdmissionGuard {
 
 pub(crate) enum NamespaceConfigAdmissionCompletion<T> {
     Held(T),
-    Lost {
-        result: T,
-        error: anyhow::Error,
-    },
+    Lost { result: T, error: anyhow::Error },
 }
 
 impl NamespaceConfigAdmissionGuard {
