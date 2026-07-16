@@ -2089,9 +2089,8 @@ mod virtual_service_cors {
         credentialed.cors.allow_credentials = Some(true);
         let errors = validate(vec![credentialed]);
         assert!(
-            errors.iter().any(|error| error.contains(
-                "allow_credentials must not be true with an exact `*` origin"
-            )),
+            errors.iter().any(|error| error
+                .contains("allow_credentials must not be true with an exact `*` origin")),
             "{errors:?}"
         );
 
