@@ -29,7 +29,7 @@ use http_body::Body as _;
 
 use ferrum_edge::plugins::{
     Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
-    create_response_stream_inspector,
+    create_response_stream_inspector, log_with_mirror,
 };
 use ferrum_edge::proxy::ProxyBody;
 use ferrum_edge::proxy::deferred_log::{BodyOutcome, DeferredTransactionLogger};
@@ -76,6 +76,13 @@ struct StreamTerminationCapturingPlugin {
 }
 
 struct PassthroughInspector;
+
+struct OrderedLogPlugin {
+    label: &'static str,
+    events: Arc<Mutex<Vec<&'static str>>>,
+    started: Option<Arc<tokio::sync::Notify>>,
+    release: Option<Arc<tokio::sync::Notify>>,
+}
 
 #[async_trait]
 impl ResponseStreamInspector for PassthroughInspector {
@@ -125,6 +132,24 @@ impl Plugin for StreamTerminationCapturingPlugin {
     async fn log(&self, summary: &TransactionSummary) {
         self.summaries.lock().unwrap().push(summary.clone());
         self.events.lock().unwrap().push("log");
+    }
+}
+
+#[async_trait]
+impl Plugin for OrderedLogPlugin {
+    fn name(&self) -> &str {
+        self.label
+    }
+
+    async fn log(&self, _summary: &TransactionSummary) {
+        self.events.lock().unwrap().push(self.label);
+        if let Some(started) = &self.started {
+            started.notify_one();
+        }
+        if let Some(release) = &self.release {
+            release.notified().await;
+            self.events.lock().unwrap().push("first-finished");
+        }
     }
 }
 
@@ -199,6 +224,73 @@ async fn wait_for_events(
         }
     }
     events.lock().unwrap().clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn buffered_logging_is_awaited_and_plugins_run_sequentially() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(OrderedLogPlugin {
+            label: "first-started",
+            events: Arc::clone(&events),
+            started: Some(Arc::clone(&started)),
+            release: Some(Arc::clone(&release)),
+        }),
+        Arc::new(OrderedLogPlugin {
+            label: "second-started",
+            events: Arc::clone(&events),
+            started: None,
+            release: None,
+        }),
+    ];
+    let summary = make_summary_with_status(200);
+    let ctx = make_ctx();
+
+    let log_task = tokio::spawn(async move {
+        log_with_mirror(&plugins, &summary, &ctx).await;
+    });
+    started.notified().await;
+
+    assert!(!log_task.is_finished(), "the caller must await the first hook");
+    assert_eq!(events.lock().unwrap().as_slice(), ["first-started"]);
+
+    release.notify_one();
+    log_task.await.expect("buffered log task joined");
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["first-started", "first-finished", "second-started"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_terminal_logging_is_spawned_after_body_completion() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let plugin: Arc<dyn Plugin> = Arc::new(OrderedLogPlugin {
+        label: "stream-log-started",
+        events: Arc::clone(&events),
+        started: Some(Arc::clone(&started)),
+        release: Some(Arc::clone(&release)),
+    });
+    let logger = DeferredTransactionLogger::new(
+        make_summary_with_status(200),
+        Arc::new(vec![plugin]),
+        make_ctx(),
+    );
+
+    logger.fire(BodyOutcome::success(64));
+    started.notified().await;
+    assert_eq!(events.lock().unwrap().as_slice(), ["stream-log-started"]);
+
+    release.notify_one();
+    let completed = wait_for_events(&events, 2).await;
+    assert_eq!(
+        completed.as_slice(),
+        ["stream-log-started", "first-finished"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -12,8 +12,10 @@
 //! point — the build script discovers this file automatically.
 
 use async_trait::async_trait;
+use http::HeaderValue;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext, TransactionSummary};
@@ -23,24 +25,58 @@ pub struct ExamplePlugin {
     request_body_prefix: Option<Vec<u8>>,
 }
 
+const DEFAULT_HEADER_VALUE: &str = "ferrum-custom";
+const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
+
 impl ExamplePlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
+        let config = config
+            .as_object()
+            .ok_or_else(|| "example_plugin config must be a JSON object".to_string())?;
+
+        for key in config.keys() {
+            if !matches!(key.as_str(), "header_value" | "request_body_prefix") {
+                return Err(format!(
+                    "example_plugin config contains unknown key '{key}'; expected only 'header_value' and 'request_body_prefix'"
+                ));
+            }
+        }
+
+        let header_value = match config.get("header_value") {
+            None => DEFAULT_HEADER_VALUE.to_string(),
+            Some(Value::String(value)) => value.clone(),
+            Some(_) => {
+                return Err(
+                    "example_plugin.header_value must be a string when present".to_string(),
+                );
+            }
+        };
+        if header_value.len() > MAX_HEADER_VALUE_BYTES {
+            return Err(format!(
+                "example_plugin.header_value must be at most {MAX_HEADER_VALUE_BYTES} bytes"
+            ));
+        }
+        HeaderValue::from_str(&header_value).map_err(|error| {
+            format!("example_plugin.header_value must be a valid HTTP header value: {error}")
+        })?;
+
         let request_body_prefix = match config.get("request_body_prefix") {
-            None | Some(Value::Null) => None,
+            None => None,
             Some(Value::String(prefix)) if prefix.is_empty() => {
-                return Err("request_body_prefix must not be empty".to_string());
+                return Err("example_plugin.request_body_prefix must not be empty".to_string());
             }
             Some(Value::String(prefix)) => Some(prefix.as_bytes().to_vec()),
-            Some(_) => return Err("request_body_prefix must be a string".to_string()),
+            Some(_) => {
+                return Err(
+                    "example_plugin.request_body_prefix must be a string when present".to_string(),
+                );
+            }
         };
         Ok(Self {
             // Read configuration from the plugin's JSON config.
             // In the gateway config, this would look like:
             //   { "plugin_name": "example_plugin", "config": { "header_value": "my-gateway" } }
-            header_value: config["header_value"]
-                .as_str()
-                .unwrap_or("ferrum-custom")
-                .to_string(),
+            header_value,
             request_body_prefix,
         })
     }
@@ -54,7 +90,7 @@ impl Plugin for ExamplePlugin {
     }
 
     /// Execution priority. See `src/plugins/mod.rs` for the priority band guide:
-    ///   - 0–999:    Preflight (CORS, IP filtering, correlation IDs)
+    ///   - 0–999:    Matched-request preflight (CORS, IP filtering, correlation IDs)
     ///   - 1000–1999: Authentication (identity verification)
     ///   - 2000–2999: Authorization (access control, rate limiting)
     ///   - 3000–3999: Request transformation
@@ -78,7 +114,9 @@ impl Plugin for ExamplePlugin {
         self.request_body_prefix.is_some()
     }
 
-    /// Called when a request is first received (before routing).
+    /// Called after a route matches and its allowed-method check succeeds.
+    /// On H1, H2, and H3, unmatched 404 and matched-proxy 405 responses invoke
+    /// neither global nor scoped instances of this hook.
     /// Return `PluginResult::Reject` to short-circuit with an error response.
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
         // Example: you could reject requests here based on custom logic.
@@ -121,9 +159,13 @@ impl Plugin for ExamplePlugin {
         PluginResult::Continue
     }
 
-    /// Called for transaction logging (fire-and-forget, after response is sent).
+    /// Called for transaction logging. Buffered handlers await log hooks
+    /// sequentially before returning; native H3 also awaits after body
+    /// completion. Hyper-owned streamed bodies spawn logging after terminal
+    /// body completion. Hand potentially slow I/O to a bounded, plugin-owned
+    /// worker instead of performing it directly here.
     async fn log(&self, _summary: &TransactionSummary) {
-        // Example: send to a custom logging endpoint, write to a file, etc.
+        // Example: enqueue a bounded record for a lifecycle-owned worker.
     }
 
     // ── Optional overrides ──────────────────────────────────────────────────
