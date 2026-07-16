@@ -322,6 +322,12 @@ pub mod _test_support {
         )
     }
 
+    pub fn collect_rejecting_runtime_config_errors_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Vec<String> {
+        crate::config::validation_pipeline::collect_rejecting_runtime_config_errors(config)
+    }
+
     pub async fn lock_namespace_config_admission_for_test(
         namespace: &str,
     ) -> tokio::sync::MutexGuard<'static, ()> {

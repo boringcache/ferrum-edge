@@ -136,12 +136,14 @@ spec before overlaying the replacement bundle. API-spec `DELETE` validates the
 same removal-only candidate and rejects deletion when retained referrers would
 be left dangling.
 
-Graph participation never skips backend-egress admission: policy-only checks
-still run for every `schema_ref` consumer, including custom plugins and plugins
-that ignore an unrecognized `schema_ref` key. On runtime config loads, a
-dangling/non-string reference remains a graph-fatal error, while unrelated
-constructor failures on optional logging sinks retain their existing fail-open
-warning behavior.
+Graph participation never skips backend-egress admission. Literal endpoint
+screening at the direct/batch boundary still runs for disabled configurations;
+enabled `schema_ref` consumers also receive the policy-only checks that follow
+prospective graph construction, including custom plugins and plugins that ignore
+an unrecognized `schema_ref` key. SQL, MongoDB, and control-plane runtime
+snapshots reject dangling/non-string references before cache publication, while
+unrelated constructor failures on optional logging sinks retain their existing
+fail-open warning behavior.
 
 Upgrade note: every **enabled** plugin carrying a top-level `schema_ref`
 participates in this fail-closed graph, even if that plugin does not otherwise

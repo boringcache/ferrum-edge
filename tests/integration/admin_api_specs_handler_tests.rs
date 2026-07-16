@@ -1600,12 +1600,29 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
             proxy_id: None,
             enabled: true,
             priority_override: None,
-            api_spec_id: Some(spec_id.clone()),
+            api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         })
         .await
         .expect("persist spec-owned schema definition");
+    sqlx::query(
+        "UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?",
+    )
+    .bind(&spec_id)
+    .bind("ferrum")
+    .bind(&schema_id)
+    .execute(&store.pool())
+    .await
+    .expect("tag schema definition with API-spec ownership");
+    let owned_plugins = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list spec-owned plugins before replacement");
+    assert!(
+        owned_plugins.iter().any(|plugin| plugin.id == schema_id),
+        "test precondition: the removed definition must be spec-owned"
+    );
     store
         .create_plugin_config(&PluginConfig {
             id: uid("manual-schema-referrer"),
@@ -1659,6 +1676,92 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
         owned_plugins.iter().any(|plugin| plugin.id == schema_id),
         "rejected DELETE must preserve the spec-owned schema definition"
     );
+}
+
+#[tokio::test]
+async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("schema-cascade-proxy");
+    let spec = minimal_json_spec(&proxy_id);
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id")
+        .to_string();
+    let schema_name = uid("cascade-schema");
+    let schema_id = uid("cascade-schema-owner");
+    store
+        .create_plugin_config(&PluginConfig {
+            id: schema_id.clone(),
+            namespace: "ferrum".to_string(),
+            plugin_name: "transaction_log_schema".to_string(),
+            config: json!({"schemas": {(schema_name.clone()): {}}}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist schema definition");
+    sqlx::query(
+        "UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?",
+    )
+    .bind(&spec_id)
+    .bind("ferrum")
+    .bind(&schema_id)
+    .execute(&store.pool())
+    .await
+    .expect("tag schema definition with API-spec ownership");
+
+    let proxy_logger_id = uid("cascade-proxy-logger");
+    let proxy_logger = manual_proxy_plugin(
+        &proxy_logger_id,
+        &proxy_id,
+        "stdout_logging",
+        json!({"schema_ref": schema_name}),
+    );
+    attach_manual_proxy_plugin(&store, &proxy_id, &proxy_logger).await;
+
+    let group_logger_id = uid("cascade-group-logger");
+    let group_logger = PluginConfig {
+        id: group_logger_id.clone(),
+        namespace: "ferrum".to_string(),
+        plugin_name: "stdout_logging".to_string(),
+        config: json!({"schema_ref": schema_name}),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    attach_manual_proxy_plugin(&store, &proxy_id, &group_logger).await;
+
+    let delete_status = client.delete(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::NO_CONTENT,
+        "referrers removed by the same proxy cascade must not block deletion"
+    );
+    for plugin_id in [&schema_id, &proxy_logger_id, &group_logger_id] {
+        assert!(
+            store
+                .get_plugin_config("ferrum", plugin_id)
+                .await
+                .expect("read cascade-deleted plugin")
+                .is_none(),
+            "API-spec deletion must remove cascaded plugin {plugin_id}"
+        );
+    }
 }
 
 #[tokio::test]

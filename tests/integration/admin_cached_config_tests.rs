@@ -1586,7 +1586,7 @@ async fn transaction_log_schema_crud_validates_the_prospective_database_graph() 
 }
 
 #[tokio::test]
-async fn disabled_schema_graph_plugins_defer_policy_validation_for_crud_and_batch() {
+async fn disabled_schema_graph_plugins_defer_graph_validation_but_not_egress_screening() {
     let tc = TestConfig::default();
     let (mut state, _dir) = create_db_admin_state(&tc).await;
     state.backend_allow_ips = ferrum_edge::config::BackendEgressPolicy::from_env(
@@ -1607,7 +1607,7 @@ async fn disabled_schema_graph_plugins_defer_policy_validation_for_crud_and_batc
             "window_seconds": 60,
             "max_requests": 10,
             "sync_mode": "redis",
-            "redis_url": "redis://169.254.169.254:6379/0",
+            "redis_url": "redis://127.0.0.1:6379/0",
             "schema_ref": "missing"
         }
     });
@@ -1615,7 +1615,7 @@ async fn disabled_schema_graph_plugins_defer_policy_validation_for_crud_and_batc
     let (status, body) = admin_post(&base_url, "/plugins/config", &token, &disabled).await;
     assert_eq!(
         status, 201,
-        "disabled direct CRUD must defer policy and graph validation: {body:?}"
+        "disabled direct CRUD must defer construction and graph validation: {body:?}"
     );
 
     let mut batch_plugin = disabled;
@@ -1629,7 +1629,48 @@ async fn disabled_schema_graph_plugins_defer_policy_validation_for_crud_and_batc
     .await;
     assert_eq!(
         status, 201,
-        "disabled batch config must defer policy and graph validation: {body:?}"
+        "disabled batch config must defer construction and graph validation: {body:?}"
+    );
+
+    let denied = json!({
+        "id": "disabled-denied-egress-crud",
+        "plugin_name": "rate_limiting",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "window_seconds": 60,
+            "max_requests": 10,
+            "sync_mode": "redis",
+            "redis_url": "redis://169.254.169.254:6379/0",
+            "schema_ref": "missing"
+        }
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &denied).await;
+    assert_eq!(
+        status, 400,
+        "disabled direct CRUD must retain literal egress screening: {body:?}"
+    );
+    assert!(
+        body.to_string().contains("redis_url IP 169.254.169.254 denied"),
+        "unexpected direct CRUD denial: {body:?}"
+    );
+
+    let mut denied_batch = denied;
+    denied_batch["id"] = json!("disabled-denied-egress-batch");
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({"plugin_configs": [denied_batch]}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "disabled batch config must retain literal egress screening: {body:?}"
+    );
+    assert!(
+        body.to_string().contains("redis_url IP 169.254.169.254 denied"),
+        "unexpected batch denial: {body:?}"
     );
 }
 

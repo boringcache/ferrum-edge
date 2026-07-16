@@ -456,23 +456,74 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_replacement_candida
 
 /// Validate the named log-schema graph produced by deleting an API spec.
 ///
-/// API-spec deletion removes every plugin config owned by the spec. Model that
-/// as an exact replacement with no incoming plugins so retained manual
-/// referrers cannot be stranded by removing a spec-owned schema definition.
+/// API-spec deletion removes every plugin config owned by the spec, every
+/// proxy-scoped config tied to the deleted proxy, and proxy-group configs that
+/// become orphaned after that proxy's associations disappear. Mirror all three
+/// cascades so retained manual referrers cannot be stranded while referrers
+/// deleted by the same operation do not cause a false rejection.
 pub(crate) async fn validate_transaction_log_schema_api_spec_deletion_candidate(
     db: &dyn DatabaseBackend,
     state: &AdminState,
     namespace: &str,
     existing_spec: &crate::config::types::ApiSpec,
 ) -> Result<(), AfterValidateError> {
-    validate_transaction_log_schema_api_spec_replacement_candidate(
-        db,
-        state,
-        namespace,
-        existing_spec,
-        &[],
-    )
-    .await
+    let spec_owned_plugins = db
+        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let mut removed_plugin_ids: HashSet<String> = spec_owned_plugins
+        .into_iter()
+        .map(|plugin| plugin.id)
+        .collect();
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+
+    candidate.proxies.retain(|proxy| {
+        proxy.namespace != namespace || proxy.id != existing_spec.proxy_id
+    });
+    removed_plugin_ids.extend(
+        candidate
+            .plugin_configs
+            .iter()
+            .filter(|plugin| {
+                plugin.namespace == namespace
+                    && plugin.proxy_id.as_deref() == Some(existing_spec.proxy_id.as_str())
+            })
+            .map(|plugin| plugin.id.clone()),
+    );
+
+    let retained_association_ids: HashSet<&str> = candidate
+        .proxies
+        .iter()
+        .flat_map(|proxy| proxy.plugins.iter())
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    removed_plugin_ids.extend(
+        candidate
+            .plugin_configs
+            .iter()
+            .filter(|plugin| {
+                plugin.namespace == namespace
+                    && plugin.scope == crate::config::types::PluginScope::ProxyGroup
+                    && !retained_association_ids.contains(plugin.id.as_str())
+            })
+            .map(|plugin| plugin.id.clone()),
+    );
+
+    if !candidate.plugin_configs.iter().any(|plugin| {
+        removed_plugin_ids.contains(&plugin.id)
+            && crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(plugin)
+    }) {
+        return Ok(());
+    }
+
+    candidate
+        .plugin_configs
+        .retain(|plugin| !removed_plugin_ids.contains(&plugin.id));
+    let http_client = super::plugin_validation_http_client(state);
+    validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
 }
 
 /// Validate a wholesale namespace replacement without retaining resources that

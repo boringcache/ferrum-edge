@@ -334,6 +334,55 @@ fn runtime_load_preserves_optional_logger_fail_open_but_not_dangling_refs() {
 }
 
 #[test]
+fn shared_runtime_rejecting_contract_rejects_dangling_graphs_only() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+
+    let dangling_ref = GatewayConfig {
+        plugin_configs: vec![graph_plugin(
+            "logger",
+            "ferrum",
+            "stdout_logging",
+            json!({"schema_ref": "missing"}),
+        )],
+        ..GatewayConfig::default()
+    };
+    let errors =
+        ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&dangling_ref);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("unknown schema 'missing'")),
+        "database, MongoDB, and CP snapshots must reject dangling graph refs: {errors:?}"
+    );
+
+    let malformed_optional_sink = GatewayConfig {
+        plugin_configs: vec![
+            graph_plugin(
+                "schemas",
+                "ferrum",
+                "transaction_log_schema",
+                json!({"schemas": {"audit": {}}}),
+            ),
+            graph_plugin(
+                "logger",
+                "ferrum",
+                "stdout_logging",
+                json!({"schema_ref": "audit", "filter": "not-an-object"}),
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+    let errors = ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(
+        &malformed_optional_sink,
+    );
+    assert!(
+        errors.is_empty(),
+        "optional sink constructor failures must remain outside the rejecting graph contract: {errors:?}"
+    );
+}
+
+#[test]
 fn schema_ref_opt_in_cannot_bypass_policy_only_egress_validation() {
     let _g = registry_lock();
     registry::reset_for_tests();
