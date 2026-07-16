@@ -55,27 +55,37 @@ fn h3_route_miss_and_method_rejection_precede_request_hooks() {
 
 #[test]
 fn trait_example_and_guides_describe_the_same_request_boundary() {
-    assert!(TRAIT_SOURCE.contains(
-        "Called after routing and per-proxy allowed-method admission succeed."
-    ));
-    assert!(EXAMPLE_SOURCE.contains(
-        "Called after a route matches and its allowed-method check succeeds."
-    ));
-    assert!(CUSTOM_PLUGIN_GUIDE.contains(
-        "returns 404 without running any global or scoped `on_request_received` hook."
-    ));
-    assert!(CUSTOM_PLUGIN_GUIDE.contains(
-        "matched request with a disallowed method returns 405 without running either"
-    ));
-    assert!(EXECUTION_ORDER_GUIDE.contains(
-        "`on_request_received` is therefore a post-route, post-allowed-method hook"
-    ));
+    assert!(
+        TRAIT_SOURCE
+            .contains("Called after routing and per-proxy allowed-method admission succeed.")
+    );
+    assert!(
+        EXAMPLE_SOURCE
+            .contains("Called after a route matches and its allowed-method check succeeds.")
+    );
+    assert!(
+        CUSTOM_PLUGIN_GUIDE.contains(
+            "returns 404 without running any global or scoped `on_request_received` hook."
+        )
+    );
+    assert!(
+        CUSTOM_PLUGIN_GUIDE.contains(
+            "matched request with a disallowed method returns 405 without running either"
+        )
+    );
+    assert!(
+        EXECUTION_ORDER_GUIDE
+            .contains("`on_request_received` is therefore a post-route, post-allowed-method hook")
+    );
 }
 
 #[test]
 fn trait_example_and_guides_describe_buffered_streaming_and_h3_log_timing() {
     for source in [TRAIT_SOURCE, CUSTOM_PLUGIN_GUIDE, EXECUTION_ORDER_GUIDE] {
-        assert!(source.contains("await"), "logging contract must name awaited hooks");
+        assert!(
+            source.contains("await"),
+            "logging contract must name awaited hooks"
+        );
         assert!(
             source.contains("sequential"),
             "logging contract must name sequential invocation"

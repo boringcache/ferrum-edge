@@ -253,7 +253,10 @@ async fn buffered_logging_is_awaited_and_plugins_run_sequentially() {
     });
     started.notified().await;
 
-    assert!(!log_task.is_finished(), "the caller must await the first hook");
+    assert!(
+        !log_task.is_finished(),
+        "the caller must await the first hook"
+    );
     assert_eq!(events.lock().unwrap().as_slice(), ["first-started"]);
 
     release.notify_one();

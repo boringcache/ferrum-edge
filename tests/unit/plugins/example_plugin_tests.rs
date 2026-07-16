@@ -38,15 +38,11 @@ async fn omitted_header_value_uses_the_documented_default() {
         "/example".to_string(),
     );
     let mut request_headers = HashMap::new();
-    let result = plugin
-        .before_proxy(&mut ctx, &mut request_headers)
-        .await;
+    let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
 
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(
-        request_headers
-            .get("x-custom-gateway")
-            .map(String::as_str),
+        request_headers.get("x-custom-gateway").map(String::as_str),
         Some("ferrum-custom")
     );
 }
@@ -79,15 +75,11 @@ async fn valid_config_exercises_request_and_response_hooks() {
 
     let mut request_headers = HashMap::new();
     assert!(matches!(
-        plugin
-            .before_proxy(&mut ctx, &mut request_headers)
-            .await,
+        plugin.before_proxy(&mut ctx, &mut request_headers).await,
         PluginResult::Continue
     ));
     assert_eq!(
-        request_headers
-            .get("x-custom-gateway")
-            .map(String::as_str),
+        request_headers.get("x-custom-gateway").map(String::as_str),
         Some("edge-a")
     );
     assert_eq!(
@@ -105,9 +97,7 @@ async fn valid_config_exercises_request_and_response_hooks() {
         PluginResult::Continue
     ));
     assert_eq!(
-        response_headers
-            .get("x-custom-gateway")
-            .map(String::as_str),
+        response_headers.get("x-custom-gateway").map(String::as_str),
         Some("edge-a")
     );
 }
@@ -135,10 +125,16 @@ fn constructor_rejects_non_object_wrong_type_unknown_and_invalid_header_configs(
     }
 
     let unknown = rejected_config(json!({"header_valeu": "edge-a"}));
-    assert!(unknown.contains("unknown key 'header_valeu'"), "got: {unknown}");
+    assert!(
+        unknown.contains("unknown key 'header_valeu'"),
+        "got: {unknown}"
+    );
 
     let invalid = rejected_config(json!({"header_value": "line\r\nbreak"}));
-    assert!(invalid.contains("valid HTTP header value"), "got: {invalid}");
+    assert!(
+        invalid.contains("valid HTTP header value"),
+        "got: {invalid}"
+    );
 
     let oversized = rejected_config(json!({"header_value": "x".repeat(8 * 1024 + 1)}));
     assert!(oversized.contains("at most 8192 bytes"), "got: {oversized}");

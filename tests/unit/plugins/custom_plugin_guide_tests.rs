@@ -99,9 +99,7 @@ async fn copied_test_pattern_compiles_and_handles_the_fallible_constructor() -> 
 #[test]
 fn markdown_keeps_the_compiled_fallible_constructor_pattern() {
     assert!(GUIDE.contains("<!-- custom-plugin-guide-test: fallible-constructor-result -->"));
-    assert!(GUIDE.contains(
-        "async fn test_my_plugin_adds_header() -> Result<(), String>"
-    ));
+    assert!(GUIDE.contains("async fn test_my_plugin_adds_header() -> Result<(), String>"));
     assert!(GUIDE.contains("let plugin = MyHeaderInjector::new(&config)?;"));
     assert!(!GUIDE.contains("let plugin = MyHeaderInjector::new(&config);"));
     assert!(GUIDE.contains("HeaderName::from_bytes(header_name.as_bytes())"));

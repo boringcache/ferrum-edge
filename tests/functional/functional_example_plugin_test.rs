@@ -54,8 +54,8 @@ async fn serve_header_echo(listener: TcpListener, hits: Arc<AtomicUsize>) {
             let mut request = Vec::with_capacity(2048);
             let mut chunk = [0u8; 1024];
             loop {
-                let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
-                    .await;
+                let read =
+                    tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await;
                 let Ok(Ok(read)) = read else {
                     return;
                 };
@@ -201,10 +201,7 @@ async fn functional_example_plugin_h1_h2_matched_404_and_405_contract() {
         .send()
         .await
         .expect("H1 method rejection");
-    assert_eq!(
-        h1_method.status(),
-        reqwest::StatusCode::METHOD_NOT_ALLOWED
-    );
+    assert_eq!(h1_method.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     assert_early_response_has_no_example_header(h1_method.headers());
 
     let h2 = reqwest::Client::builder()
@@ -239,13 +236,14 @@ async fn functional_example_plugin_h1_h2_matched_404_and_405_contract() {
         .await
         .expect("H2 method rejection");
     assert_eq!(h2_method.version(), reqwest::Version::HTTP_2);
-    assert_eq!(
-        h2_method.status(),
-        reqwest::StatusCode::METHOD_NOT_ALLOWED
-    );
+    assert_eq!(h2_method.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     assert_early_response_has_no_example_header(h2_method.headers());
 
-    assert_eq!(backend.hits(), 4, "only matched H1/H2 requests reach backend");
+    assert_eq!(
+        backend.hits(),
+        4,
+        "only matched H1/H2 requests reach backend"
+    );
     gateway.shutdown();
 }
 
@@ -287,18 +285,14 @@ async fn functional_example_plugin_h3_matched_404_and_405_contract() {
     assert_matched_headers(&first.headers, "global-value");
 
     let scoped = client
-        .get(&format!(
-            "https://localhost:{https_port}/scoped-example/ok"
-        ))
+        .get(&format!("https://localhost:{https_port}/scoped-example/ok"))
         .await
         .expect("H3 scoped matched request");
     assert_eq!(scoped.status, StatusCode::OK);
     assert_matched_headers(&scoped.headers, "scoped-value");
 
     let miss = client
-        .get(&format!(
-            "https://localhost:{https_port}/unmatched-example"
-        ))
+        .get(&format!("https://localhost:{https_port}/unmatched-example"))
         .await
         .expect("H3 route miss");
     assert_eq!(miss.status, StatusCode::NOT_FOUND);
