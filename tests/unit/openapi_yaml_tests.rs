@@ -2688,6 +2688,24 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
 }
 
 #[test]
+fn transaction_debugger_schema_matches_closed_runtime_surface() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/TransactionDebuggerConfig")
+        .expect("missing TransactionDebuggerConfig schema");
+
+    assert_eq!(schema["additionalProperties"], false);
+    let properties: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("transaction debugger properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(properties, BTreeSet::from(["redacted_headers"]));
+}
+
+#[test]
 fn ai_response_guard_schema_matches_strict_runtime_constraints() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

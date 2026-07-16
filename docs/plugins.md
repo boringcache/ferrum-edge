@@ -1082,17 +1082,21 @@ The channel slot is reserved before serialization. Serialization is capped by `m
 
 ### `transaction_debugger`
 
-Emits verbose request/response diagnostics via `tracing::debug!` on the `transaction_debug` target. All output flows through the non-blocking writer, avoiding synchronous stdout mutex contention. Sensitive headers are automatically redacted. Enable per-proxy only for debugging — not recommended for production due to information disclosure risk. Requires `FERRUM_LOG_LEVEL=debug` (or `RUST_LOG=transaction_debug=debug`) to see output.
+Emits verbose request/response and terminal diagnostics via `tracing::debug!` on the `transaction_debug` target. All output flows through the non-blocking writer, avoiding synchronous stdout mutex contention. Sensitive headers are automatically redacted. Enable per-proxy only for debugging — not recommended for production due to information disclosure risk. Requires `FERRUM_LOG_LEVEL=debug` (or `RUST_LOG=transaction_debug=debug`) to see output.
+
+The plugin does not capture request or response payloads. The former `log_request_body` and `log_response_body` options are rejected instead of silently accepting no-op body settings. Terminal HTTP/gRPC diagnostics use the final transaction outcome, including dispatch/body errors, client disconnects, completion and byte counts, rejection phase, and non-zero gRPC status. TCP/UDP/DTLS diagnostics include typed disconnect direction, cause, and error classification.
+
+WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic and exactly one additional terminal session diagnostic when the upgraded session ends. When `correlation_id` or `otel_tracing` supplied `request_id` or `trace_id` metadata, the terminal records include the same selected value; all selected metadata passes through the central sensitivity classifier. The plugin never dumps the complete metadata map.
 
 **Priority:** 9200
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `log_request_body` | bool | `false` | Log incoming request body |
-| `log_response_body` | bool | `false` | Log backend response body |
 | `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list |
 
-**Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
+**Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
+
+The configuration object is closed: any key other than `redacted_headers` is rejected. `schema` and `schema_ref` retain their specialized unsupported-schema error.
 
 ### `correlation_id`
 
