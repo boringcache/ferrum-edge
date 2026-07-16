@@ -119,6 +119,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "batch and restore persistence must preserve concrete outcomes across lease loss"
     );
     assert!(batch_source.contains("rollback_failed_batch_create("));
+    assert!(batch_source.contains("batch_plugin_configs_with_intervening_proxy_dependencies("));
+    assert!(batch_source.contains("protected_plugin_config_ids.contains(&plugin_config.id)"));
     assert!(batch_source.contains("immediately_succeeds_generation(lost_generation)"));
     assert_eq!(
         batch_source
@@ -169,7 +171,15 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "API-spec POST, PUT, and DELETE must serialize through persistence"
     );
     assert!(api_spec_source.contains("run_api_spec_persistence_while_held("));
-    assert!(api_spec_source.contains("error_response(ApiSpecError::NoDatabase)"));
+    assert_eq!(
+        api_spec_source
+            .matches("return Ok(error_response(ApiSpecError::AdmissionUnavailable(")
+            .count(),
+        3,
+        "API-spec POST, PUT, and DELETE lease failures must report admission outages"
+    );
+    assert!(api_spec_source.contains("enum ApiSpecLateWriteRecovery"));
+    assert!(api_spec_source.contains("ApiSpecLateWriteRecovery::Retained"));
     assert!(api_spec_source.contains("base_bundle.proxy.plugins.retain("));
     assert!(api_spec_source.contains("db.update_proxy(&previous_bundle.proxy)"));
     let post_lock = api_spec_source

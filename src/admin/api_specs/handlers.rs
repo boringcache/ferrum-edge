@@ -79,6 +79,12 @@ struct ValidationFailure {
     errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiSpecLateWriteRecovery {
+    Retained,
+    NotRetained,
+}
+
 // ---------------------------------------------------------------------------
 // Helper: map anyhow::Error from DB calls to ApiSpecError
 // ---------------------------------------------------------------------------
@@ -134,7 +140,7 @@ async fn run_api_spec_persistence_while_held<T, F, C>(
 ) -> Result<T, ApiSpecError>
 where
     F: Future<Output = Result<T, anyhow::Error>>,
-    C: Future<Output = Result<(), anyhow::Error>>,
+    C: Future<Output = Result<ApiSpecLateWriteRecovery, anyhow::Error>>,
 {
     match guard.run_to_completion_while_held(future).await {
         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(result)) => {
@@ -171,10 +177,13 @@ where
                         .await
                     {
                         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Ok(
-                            (),
+                            ApiSpecLateWriteRecovery::Retained,
+                        ))) => return Ok(result),
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Ok(
+                            ApiSpecLateWriteRecovery::NotRetained,
                         ))) => {}
                         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
-                            result: Ok(()),
+                            result: Ok(_),
                             error: recovery_error,
                         }) => {
                             tracing::error!(
@@ -256,7 +265,7 @@ async fn compensate_late_api_spec_create(
     bundle: ExtractedBundle,
     spec: ApiSpec,
     state: &AdminState,
-) -> Result<(), anyhow::Error> {
+) -> Result<ApiSpecLateWriteRecovery, anyhow::Error> {
     if crate::admin::crud::current_transaction_log_schema_graph_is_valid(
         db.as_ref(),
         state,
@@ -264,7 +273,11 @@ async fn compensate_late_api_spec_create(
     )
     .await?
     {
-        return Ok(());
+        return if stored_api_spec_bundle_matches(db.as_ref(), &bundle, &spec).await? {
+            Ok(ApiSpecLateWriteRecovery::Retained)
+        } else {
+            Ok(ApiSpecLateWriteRecovery::NotRetained)
+        };
     }
     match crate::admin::crud::validate_transaction_log_schema_api_spec_deletion_candidate(
         db.as_ref(),
@@ -293,7 +306,7 @@ async fn compensate_late_api_spec_create(
     if !db.delete_api_spec(&spec.namespace, &spec.id).await? {
         anyhow::bail!("late API-spec create compensation found no matching API spec");
     }
-    Ok(())
+    Ok(ApiSpecLateWriteRecovery::NotRetained)
 }
 
 async fn late_api_spec_create_compensation_safe(
@@ -356,7 +369,7 @@ async fn compensate_late_api_spec_replace(
     previous_bundle: ExtractedBundle,
     previous_spec: ApiSpec,
     state: &AdminState,
-) -> Result<(), anyhow::Error> {
+) -> Result<ApiSpecLateWriteRecovery, anyhow::Error> {
     if crate::admin::crud::current_transaction_log_schema_graph_is_valid(
         db.as_ref(),
         state,
@@ -364,7 +377,13 @@ async fn compensate_late_api_spec_replace(
     )
     .await?
     {
-        return Ok(());
+        return if stored_api_spec_bundle_matches(db.as_ref(), &written_bundle, &written_spec)
+            .await?
+        {
+            Ok(ApiSpecLateWriteRecovery::Retained)
+        } else {
+            Ok(ApiSpecLateWriteRecovery::NotRetained)
+        };
     }
     match crate::admin::crud::validate_transaction_log_schema_api_spec_replacement_candidate(
         db.as_ref(),
@@ -391,7 +410,7 @@ async fn compensate_late_api_spec_replace(
     }
     db.replace_api_spec_bundle(&previous_bundle, &previous_spec)
         .await?;
-    Ok(())
+    Ok(ApiSpecLateWriteRecovery::NotRetained)
 }
 
 async fn compensate_late_api_spec_delete(
@@ -400,7 +419,7 @@ async fn compensate_late_api_spec_delete(
     previous_spec: ApiSpec,
     additional_plugins: Vec<crate::config::types::PluginConfig>,
     state: &AdminState,
-) -> Result<(), anyhow::Error> {
+) -> Result<ApiSpecLateWriteRecovery, anyhow::Error> {
     if crate::admin::crud::current_transaction_log_schema_graph_is_valid(
         db.as_ref(),
         state,
@@ -408,7 +427,19 @@ async fn compensate_late_api_spec_delete(
     )
     .await?
     {
-        return Ok(());
+        let remains_deleted = db
+            .get_api_spec(&previous_spec.namespace, &previous_spec.id)
+            .await?
+            .is_none()
+            && db
+                .get_proxy_for_write(&previous_spec.namespace, &previous_spec.proxy_id)
+                .await?
+                .is_none();
+        return Ok(if remains_deleted {
+            ApiSpecLateWriteRecovery::Retained
+        } else {
+            ApiSpecLateWriteRecovery::NotRetained
+        });
     }
     if db
         .get_api_spec(&previous_spec.namespace, &previous_spec.id)
@@ -419,7 +450,7 @@ async fn compensate_late_api_spec_delete(
             .await?
             .is_some()
     {
-        return Ok(());
+        return Ok(ApiSpecLateWriteRecovery::NotRetained);
     }
     let mut restored_plugins = previous_bundle.plugins.clone();
     restored_plugins.extend(additional_plugins.iter().cloned());
@@ -465,7 +496,7 @@ async fn compensate_late_api_spec_delete(
     if !additional_plugin_ids.is_empty() && !db.update_proxy(&previous_bundle.proxy).await? {
         anyhow::bail!("late API-spec delete compensation could not restore proxy associations");
     }
-    Ok(())
+    Ok(ApiSpecLateWriteRecovery::NotRetained)
 }
 
 fn is_row_missing_error_message(lower: &str) -> bool {
@@ -2761,7 +2792,9 @@ pub async fn handle_post_api_spec(
             Ok(guard) => guard,
             Err(error) => {
                 tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
-                return Ok(error_response(ApiSpecError::NoDatabase));
+                return Ok(error_response(ApiSpecError::AdmissionUnavailable(
+                    error.to_string(),
+                )));
             }
         };
 
@@ -2921,7 +2954,9 @@ pub async fn handle_put_api_spec(
             Ok(guard) => guard,
             Err(error) => {
                 tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
-                return Ok(error_response(ApiSpecError::NoDatabase));
+                return Ok(error_response(ApiSpecError::AdmissionUnavailable(
+                    error.to_string(),
+                )));
             }
         };
     let existing_spec = match db.get_api_spec(namespace, id).await {
@@ -3265,7 +3300,9 @@ pub async fn handle_delete_api_spec(
             Ok(guard) => guard,
             Err(error) => {
                 tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
-                return Ok(error_response(ApiSpecError::NoDatabase));
+                return Ok(error_response(ApiSpecError::AdmissionUnavailable(
+                    error.to_string(),
+                )));
             }
         };
 

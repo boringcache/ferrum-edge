@@ -3610,6 +3610,7 @@ async fn rollback_failed_batch_create(
     namespace: &str,
     batch: &RestorePayload,
     snapshot: &RestorePayload,
+    protected_plugin_config_ids: &HashSet<String>,
 ) -> Result<(), Vec<String>> {
     let prior_proxy_ids: HashSet<&str> = snapshot
         .proxies
@@ -3653,6 +3654,13 @@ async fn rollback_failed_batch_create(
     }
     for plugin_config in &batch.plugin_configs {
         if !prior_plugin_config_ids.contains(plugin_config.id.as_str()) {
+            if protected_plugin_config_ids.contains(&plugin_config.id) {
+                errors.push(format!(
+                    "plugin_config '{}' gained an intervening proxy association and was not deleted",
+                    plugin_config.id
+                ));
+                continue;
+            }
             match db.get_plugin_config(namespace, &plugin_config.id).await {
                 Ok(Some(current)) if current.updated_at == plugin_config.updated_at => {
                     if let Err(error) = db.delete_plugin_config(namespace, &plugin_config.id).await
@@ -3713,10 +3721,45 @@ async fn rollback_failed_batch_create(
     }
 }
 
+fn batch_plugin_configs_with_intervening_proxy_dependencies(
+    current: &GatewayConfig,
+    batch: &RestorePayload,
+    snapshot: &RestorePayload,
+) -> HashSet<String> {
+    let prior_plugin_config_ids = snapshot
+        .plugin_configs
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let batch_created_plugin_config_ids = batch
+        .plugin_configs
+        .iter()
+        .filter(|resource| !prior_plugin_config_ids.contains(resource.id.as_str()))
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut protected = HashSet::new();
+    for proxy in &current.proxies {
+        for association in &proxy.plugins {
+            if batch_created_plugin_config_ids.contains(association.plugin_config_id.as_str())
+                && !batch.proxies.iter().any(|submitted| {
+                    submitted.id == proxy.id
+                        && submitted.plugins.iter().any(|expected| {
+                            expected.plugin_config_id == association.plugin_config_id
+                        })
+                })
+            {
+                protected.insert(association.plugin_config_id.clone());
+            }
+        }
+    }
+    protected
+}
+
 fn batch_rollback_candidate_after_intervening_write(
     current: &GatewayConfig,
     batch: &RestorePayload,
     snapshot: &RestorePayload,
+    protected_plugin_config_ids: &HashSet<String>,
 ) -> GatewayConfig {
     let prior_proxy_ids = snapshot
         .proxies
@@ -3752,7 +3795,8 @@ fn batch_rollback_candidate_after_intervening_write(
             })
     });
     candidate.plugin_configs.retain(|current| {
-        prior_plugin_config_ids.contains(current.id.as_str())
+        protected_plugin_config_ids.contains(&current.id)
+            || prior_plugin_config_ids.contains(current.id.as_str())
             || !batch.plugin_configs.iter().any(|submitted| {
                 submitted.id == current.id && submitted.updated_at == current.updated_at
             })
@@ -5677,6 +5721,7 @@ async fn handle_batch_create(
                     ));
                 }
             };
+            let mut protected_plugin_config_ids = HashSet::new();
             if !rollback_guard.immediately_succeeds_generation(lost_generation) {
                 let current = match db.load_namespace_snapshot(namespace).await {
                     Ok(current) => current,
@@ -5718,10 +5763,17 @@ async fn handle_batch_create(
                         }),
                     ));
                 }
+                protected_plugin_config_ids =
+                    batch_plugin_configs_with_intervening_proxy_dependencies(
+                        &current,
+                        &batch,
+                        &batch_rollback_snapshot,
+                    );
                 let candidate = batch_rollback_candidate_after_intervening_write(
                     &current,
                     &batch,
                     &batch_rollback_snapshot,
+                    &protected_plugin_config_ids,
                 );
                 if let Err(validation_error) =
                     crud::validate_transaction_log_schema_graph_on_blocking_pool(
@@ -5750,6 +5802,7 @@ async fn handle_batch_create(
                     namespace,
                     &batch,
                     &batch_rollback_snapshot,
+                    &protected_plugin_config_ids,
                 ))
                 .await;
             let (rollback_status, rollback_errors, rollback_admission_error) = match rollback {
