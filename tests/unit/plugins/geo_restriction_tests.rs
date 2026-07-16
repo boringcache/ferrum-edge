@@ -863,6 +863,7 @@ async fn delta_budget_counts_retained_and_rebuilt_mmdb_snapshots() {
                 "updated_at": timestamp
             }
         ],
+        "consumers": [],
         "plugin_configs": [
             {
                 "id": "geo-one",
