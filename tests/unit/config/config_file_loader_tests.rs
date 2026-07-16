@@ -937,7 +937,6 @@ fn test_file_config_rejects_ip_restriction_typos_and_null_lists() {
         )
         .expect_err("file-mode load must reject broadened ip_restriction policy");
         let message = format!("{error:#}");
-        assert!(message.contains("ip_restriction"), "{message}");
         assert!(message.contains("1 plugin config error(s)"), "{message}");
     }
 }

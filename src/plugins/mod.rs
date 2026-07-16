@@ -687,10 +687,7 @@ fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
     let without_zone = unbracketed
         .find('%')
         .map_or(unbracketed, |index| &unbracketed[..index]);
-    without_zone
-        .parse::<Ipv6Addr>()
-        .ok()
-        .map(IpAddr::V6)
+    without_zone.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
 }
 
 fn parse_ipv4_client_ip_literal(client_ip: &str) -> Option<Ipv4Addr> {

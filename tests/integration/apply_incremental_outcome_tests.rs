@@ -588,9 +588,7 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
         serde_json::json!({"allow": ["10.0.0.0/8"]})
     );
 
-    let request_view = state
-        .plugin_cache
-        .request_view("p1", ProxyProtocol::Http);
+    let request_view = state.plugin_cache.request_view("p1", ProxyProtocol::Http);
     let mut ctx = RequestContext::new(
         "198.51.100.44".to_string(),
         "GET".to_string(),

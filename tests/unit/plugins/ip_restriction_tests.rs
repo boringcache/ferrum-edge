@@ -929,7 +929,10 @@ fn shared_admin_and_config_admission_rejects_broadened_policy_shape() {
     });
     let error = ferrum_edge::plugins::validate_plugin_config("ip_restriction", &config)
         .expect_err("shared plugin admission must reject the typo");
-    assert!(error.contains("unknown configuration field 'alow'"), "{error}");
+    assert!(
+        error.contains("unknown configuration field 'alow'"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -961,12 +964,8 @@ fn explicit_null_mode_is_rejected() {
 
 #[test]
 fn one_empty_list_is_allowed_only_when_the_other_list_enforces_policy() {
-    assert!(
-        IpRestriction::new(&json!({"allow": [], "deny": ["192.0.2.0/24"]})).is_ok()
-    );
-    assert!(
-        IpRestriction::new(&json!({"allow": ["10.0.0.0/8"], "deny": []})).is_ok()
-    );
+    assert!(IpRestriction::new(&json!({"allow": [], "deny": ["192.0.2.0/24"]})).is_ok());
+    assert!(IpRestriction::new(&json!({"allow": ["10.0.0.0/8"], "deny": []})).is_ok());
     assert!(IpRestriction::new(&json!({"allow": [], "deny": []})).is_err());
 }
 
@@ -981,7 +980,10 @@ fn sparse_ipv4_rules(count: u32) -> Vec<String> {
 #[tokio::test]
 async fn ten_thousand_rule_miss_and_high_address_match_preserve_decisions() {
     let rules = sparse_ipv4_rules(10_000);
-    let high_match = rules.last().expect("large fixture has a final rule").clone();
+    let high_match = rules
+        .last()
+        .expect("large fixture has a final rule")
+        .clone();
     let plugin = IpRestriction::new(&json!({"allow": rules})).unwrap();
 
     let mut miss = create_context_with_ip("203.0.113.250");
@@ -1017,9 +1019,7 @@ async fn duplicate_and_overlapping_ranges_keep_deny_precedence() {
     .unwrap();
 
     let mut allowed_overlap = create_context_with_ip("10.1.2.127");
-    plugin_utils::assert_continue(
-        plugin.on_request_received(&mut allowed_overlap).await,
-    );
+    plugin_utils::assert_continue(plugin.on_request_received(&mut allowed_overlap).await);
 
     for denied in ["10.1.2.128", "10.1.2.200", "10.1.2.255"] {
         let mut ctx = create_context_with_ip(denied);
