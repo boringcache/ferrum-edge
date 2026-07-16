@@ -1166,6 +1166,7 @@ async fn test_later_stream_fault_instance_is_not_suppressed_by_earlier_delay() {
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "test-proxy".to_string(),
         proxy_name: None,
         listen_port: 9000,
