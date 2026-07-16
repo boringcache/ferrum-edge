@@ -17916,11 +17916,13 @@ components:
         Plugin: geo_restriction — country-level access control backed by a
         MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is fully verified
         and loaded into bounded owned immutable memory at construction. Files
-        larger than 512 MiB and records containing unsupported country codes are
-        rejected before publication. File dependency validation is fatal in
-        file mode, warns in database mode, and is skipped by CP/DP because the
-        file is node-local. CP performs structure-only validation. On runtime
-        nodes that construct the plugin, a missing file uses
+        larger than 512 MiB, aggregate declared MMDB sizes above 512 MiB per
+        validation generation/cache build, and records containing unsupported
+        country codes are rejected before publication. File dependency
+        validation is fatal in file mode, warns in database mode, and is
+        skipped by CP/DP because the file is node-local. CP performs
+        structure-only validation. On runtime nodes that construct the plugin,
+        a missing file uses
         `on_lookup_failure`, while a readable corrupt, incompatible, or
         wrong-product database is rejected.
         Exactly one of `allow_countries` and `deny_countries` must be non-empty.
@@ -17948,7 +17950,9 @@ components:
           pattern: '\S'
           description: >-
             Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database no
-            larger than 512 MiB. Required.
+            larger than 512 MiB. Across one validation generation/cache build,
+            the declared sizes of all distinct MMDB paths must also total no
+            more than 512 MiB. Required.
         allow_countries:
           type: array
           items:
@@ -17997,7 +18001,7 @@ components:
       type: string
       minLength: 2
       maxLength: 2
-      pattern: '^(?:[Aa][DdEeFfGgIiLlMmNnOoQqRrSsTtUuWwXxZz]|[Bb][AaBbDdEeFfGgHhIiJjLlMmNnOoQqRrSsTtVvWwYyZz]|[Cc][AaCcDdFfGgHhIiKkLlMmNnOoRrUuVvWwXxYyZz]|[Dd][EeJjKkMmOoZz]|[Ee][CcEeGgHhRrSsTt]|[Ff][IiJjKkMmOoRr]|[Gg][AaBbDdEeFfGgHhIiLlMmNnPpQqRrSsTtUuWwYy]|[Hh][KkMmNnRrTtUu]|[Ii][DdEeLlMmNnOoQqRrSsTt]|[Jj][EeMmOoPp]|[Kk][EeGgHhIiMmNnPpRrWwYyZz]|[Ll][AaBbCcIiKkRrSsTtUuVvYy]|[Mm][AaCcDdEeFfGgHhKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz]|[Nn][AaCcEeFfGgIiLlOoPpRrUuZz]|[Oo][Mm]|[Pp][AaEeFfGgHhKkLlMmNnRrSsTtWwYy]|[Qq][Aa]|[Rr][EeOoSsUuWw]|[Ss][AaBbCcDdEeGgHhIiJjKkLlMmNnOoRrSsTtVvXxYyZz]|[Tt][CcDdFfGgHhJjKkLlMmNnOoRrTtVvWwZz]|[Uu][AaGgMmSsYyZz]|[Vv][AaCcEeGgIiNnUu]|[Ww][FfSs]|[Xx][Kk]|[Yy][EeTt]|[Zz][AaMmWw])$'
+      pattern: '^(?:[Aa][DdEeFfGgIiLlMmOoQqRrSsTtUuWwXxZz]|[Bb][AaBbDdEeFfGgHhIiJjLlMmNnOoQqRrSsTtVvWwYyZz]|[Cc][AaCcDdFfGgHhIiKkLlMmNnOoRrUuVvWwXxYyZz]|[Dd][EeJjKkMmOoZz]|[Ee][CcEeGgHhRrSsTt]|[Ff][IiJjKkMmOoRr]|[Gg][AaBbDdEeFfGgHhIiLlMmNnPpQqRrSsTtUuWwYy]|[Hh][KkMmNnRrTtUu]|[Ii][DdEeLlMmNnOoQqRrSsTt]|[Jj][EeMmOoPp]|[Kk][EeGgHhIiMmNnPpRrWwYyZz]|[Ll][AaBbCcIiKkRrSsTtUuVvYy]|[Mm][AaCcDdEeFfGgHhKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz]|[Nn][AaCcEeFfGgIiLlOoPpRrUuZz]|[Oo][Mm]|[Pp][AaEeFfGgHhKkLlMmNnRrSsTtWwYy]|[Qq][Aa]|[Rr][EeOoSsUuWw]|[Ss][AaBbCcDdEeGgHhIiJjKkLlMmNnOoRrSsTtVvXxYyZz]|[Tt][CcDdFfGgHhJjKkLlMmNnOoRrTtVvWwZz]|[Uu][AaGgMmSsYyZz]|[Vv][AaCcEeGgIiNnUu]|[Ww][FfSs]|[Xx][Kk]|[Yy][EeTt]|[Zz][AaMmWw])$'
       description: >-
         A currently assigned ISO 3166-1 alpha-2 country code, or XK (the
         user-assigned Kosovo code emitted by MaxMind). Matching is

@@ -14,9 +14,10 @@
 //! construction. This keeps live readers safe from external in-place database
 //! rewrites or truncation while retaining zero-copy decoding from the in-memory
 //! buffer. The complete database and its country record shape are verified
-//! before publication. If the file is unavailable at construction time on a
-//! runtime node, the plugin degrades gracefully and lookups use
-//! `on_lookup_failure`; a readable but invalid database is rejected.
+//! before publication, and each validation/load session bounds the aggregate
+//! declared size of its distinct MMDB paths. If the file is unavailable at
+//! construction time on a runtime node, the plugin degrades gracefully and
+//! lookups use `on_lookup_failure`; a readable but invalid database is rejected.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -27,8 +28,8 @@ use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
 use crate::config::types::{
-    CountryMmdbLoadError, CountryMmdbLoadSession, CountryMmdbSnapshot,
-    SUPPORTED_GEO_COUNTRY_CODES, load_validated_country_mmdb,
+    CountryMmdbLoadError, CountryMmdbLoadSession, CountryMmdbSnapshot, SUPPORTED_GEO_COUNTRY_CODES,
+    load_validated_country_mmdb,
 };
 
 const GEO_COUNTRY_HEADER: &str = "x-geo-country";
@@ -50,8 +51,7 @@ impl CountryCode {
             return None;
         }
         Some(Self(
-            ((bytes[0].to_ascii_uppercase() as u16) << 8)
-                | bytes[1].to_ascii_uppercase() as u16,
+            ((bytes[0].to_ascii_uppercase() as u16) << 8) | bytes[1].to_ascii_uppercase() as u16,
         ))
     }
 
@@ -253,9 +253,7 @@ impl GeoRestriction {
             .as_ref()
             .ok_or_else(|| "MaxMind database not loaded".to_string())?;
 
-        let ip: std::net::IpAddr = ip_str
-            .parse()
-            .map_err(|e| format!("invalid IP: {e}"))?;
+        let ip: std::net::IpAddr = ip_str.parse().map_err(|e| format!("invalid IP: {e}"))?;
         let ip = ip.to_canonical();
 
         let result = reader.lookup(ip).map_err(|e| e.to_string())?;
@@ -385,9 +383,9 @@ impl GeoRestriction {
 }
 
 fn parse_config(config: &Value) -> Result<GeoRestrictionConfig, String> {
-    let object = config.as_object().ok_or_else(|| {
-        format!("geo_restriction: config must be an object, got: {config}")
-    })?;
+    let object = config
+        .as_object()
+        .ok_or_else(|| format!("geo_restriction: config must be an object, got: {config}"))?;
     if let Some(unknown) = object
         .keys()
         .find(|key| !CONFIG_KEYS.contains(&key.as_str()))

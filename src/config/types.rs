@@ -63,6 +63,13 @@ pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
 /// This accommodates current GeoIP2 Enterprise MMDB releases while bounding
 /// admission-time allocation before any untrusted file contents are parsed.
 pub const MAX_COUNTRY_MMDB_SIZE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+/// Maximum aggregate bytes admitted for country MMDB snapshots in one config
+/// validation generation or plugin-cache build session.
+///
+/// Keeping this equal to the per-file ceiling permits one maximum-size
+/// Enterprise database while preventing several individually valid files from
+/// exhausting the heap before a candidate config is accepted or rejected.
+pub const MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES: u64 = MAX_COUNTRY_MMDB_SIZE_BYTES;
 /// Maximum OpenAPI validator config JSON size in bytes.
 ///
 /// Generated validator configs embed resolved operation schemas, so they need
@@ -4875,7 +4882,7 @@ type CountryMmdbDigest = [u8; 32];
 struct CountryMmdbFileVersion {
     path: PathBuf,
     len: u64,
-    modified: SystemTime,
+    modified: Option<SystemTime>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -4887,11 +4894,11 @@ struct CountryMmdbFileVersion {
 }
 
 impl CountryMmdbFileVersion {
-    fn from_metadata(path: &str, metadata: &std::fs::Metadata) -> Option<Self> {
-        Some(Self {
+    fn from_metadata(path: &str, metadata: &std::fs::Metadata) -> Self {
+        Self {
             path: PathBuf::from(path),
             len: metadata.len(),
-            modified: metadata.modified().ok()?,
+            modified: metadata.modified().ok(),
             #[cfg(unix)]
             device: std::os::unix::fs::MetadataExt::dev(metadata),
             #[cfg(unix)]
@@ -4900,7 +4907,7 @@ impl CountryMmdbFileVersion {
             changed_seconds: std::os::unix::fs::MetadataExt::ctime(metadata),
             #[cfg(unix)]
             changed_nanoseconds: std::os::unix::fs::MetadataExt::ctime_nsec(metadata),
-        })
+        }
     }
 }
 
@@ -4918,6 +4925,42 @@ impl std::ops::Deref for CountryMmdbSnapshot {
 struct CountryMmdbGenerationHandoff {
     expected_paths: HashSet<PathBuf>,
     snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
+    aggregate_budget: CountryMmdbAggregateBudget,
+}
+
+#[derive(Default)]
+struct CountryMmdbAggregateBudget {
+    admitted_paths: HashMap<PathBuf, u64>,
+    admitted_bytes: u64,
+}
+
+impl CountryMmdbAggregateBudget {
+    fn admit(&mut self, path: &str, size: u64) -> Result<(), CountryMmdbLoadError> {
+        let path_key = PathBuf::from(path);
+        if let Some(admitted_size) = self.admitted_paths.get(&path_key) {
+            if *admitted_size == size {
+                return Ok(());
+            }
+            return Err(CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database file '{path}' changed size from {admitted_size} to {size} bytes during aggregate admission"
+            )));
+        }
+
+        let next_bytes = self.admitted_bytes.checked_add(size).ok_or_else(|| {
+            CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database aggregate snapshot size overflow while admitting '{path}'"
+            ))
+        })?;
+        if next_bytes > MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES {
+            return Err(CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database aggregate snapshot budget exceeded: loading '{path}' ({size} bytes) would bring this generation/load session to {next_bytes} bytes; maximum aggregate size is {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes"
+            )));
+        }
+
+        self.admitted_paths.insert(path_key, size);
+        self.admitted_bytes = next_bytes;
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -4936,8 +4979,7 @@ struct CountryMmdbCache {
 
 impl CountryMmdbCache {
     fn retain_live(&mut self) {
-        self.by_digest
-            .retain(|_, reader| reader.strong_count() > 0);
+        self.by_digest.retain(|_, reader| reader.strong_count() > 0);
     }
 
     fn get_by_digest(&self, digest: &CountryMmdbDigest) -> Option<Arc<CountryMmdbSnapshot>> {
@@ -4950,15 +4992,29 @@ impl CountryMmdbCache {
         snapshot: Arc<CountryMmdbSnapshot>,
         validation_generation: Option<u64>,
     ) -> Arc<CountryMmdbSnapshot> {
-        if let Some(generation) = validation_generation {
-            if let Some(handoff) = self.validation_handoffs.get_mut(&generation) {
-                handoff
-                    .snapshots
-                    .insert(PathBuf::from(path), Arc::clone(&snapshot));
-            }
+        if let Some(generation) = validation_generation
+            && let Some(handoff) = self.validation_handoffs.get_mut(&generation)
+        {
+            handoff
+                .snapshots
+                .insert(PathBuf::from(path), Arc::clone(&snapshot));
         }
 
         snapshot
+    }
+
+    fn admit_validation_path(
+        &mut self,
+        generation: u64,
+        path: &str,
+        size: u64,
+    ) -> Result<(), CountryMmdbLoadError> {
+        let handoff = self.validation_handoffs.get_mut(&generation).ok_or_else(|| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database validation generation is no longer active".to_string(),
+            )
+        })?;
+        handoff.aggregate_budget.admit(path, size)
     }
 
     fn abort_validation_generation(&mut self, generation: u64) {
@@ -4985,9 +5041,9 @@ impl CountryMmdbCache {
     fn claim_validation_handoffs(
         &mut self,
         paths: &HashSet<PathBuf>,
-    ) -> HashMap<PathBuf, Arc<CountryMmdbSnapshot>> {
+    ) -> Option<CountryMmdbGenerationHandoff> {
         let Some(generation) = self.accepted_validation_generation.take() else {
-            return HashMap::new();
+            return None;
         };
         let matching_generation = self
             .validation_handoffs
@@ -4995,12 +5051,9 @@ impl CountryMmdbCache {
             .is_some_and(|handoff| &handoff.expected_paths == paths);
         if !matching_generation {
             self.accepted_validation_generation = Some(generation);
-            return HashMap::new();
+            return None;
         }
-        self.validation_handoffs
-            .remove(&generation)
-            .map(|handoff| handoff.snapshots)
-            .unwrap_or_default()
+        self.validation_handoffs.remove(&generation)
     }
 }
 
@@ -5033,6 +5086,7 @@ impl CountryMmdbValidationGeneration {
             CountryMmdbGenerationHandoff {
                 expected_paths,
                 snapshots: HashMap::new(),
+                aggregate_budget: CountryMmdbAggregateBudget::default(),
             },
         );
         Ok(Self {
@@ -5070,21 +5124,33 @@ impl Drop for CountryMmdbValidationGeneration {
 /// seeds this per-path map, so every geo instance consumes the exact snapshot
 /// that passed dependency validation without another read or record scan.
 #[derive(Default)]
+struct CountryMmdbLoadSessionState {
+    snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
+    aggregate_budget: CountryMmdbAggregateBudget,
+}
+
+#[derive(Default)]
 pub(crate) struct CountryMmdbLoadSession {
-    snapshots: Mutex<HashMap<PathBuf, Arc<CountryMmdbSnapshot>>>,
+    state: Mutex<CountryMmdbLoadSessionState>,
 }
 
 impl CountryMmdbLoadSession {
     pub(crate) fn claim(paths: &HashSet<PathBuf>) -> Result<Self, String> {
-        let snapshots = {
+        let state = {
             let mut cache = country_mmdb_snapshot_cache()
                 .lock()
                 .map_err(|_| "MaxMind database snapshot cache is unavailable".to_string())?;
             cache.retain_live();
-            cache.claim_validation_handoffs(paths)
+            cache
+                .claim_validation_handoffs(paths)
+                .map(|handoff| CountryMmdbLoadSessionState {
+                    snapshots: handoff.snapshots,
+                    aggregate_budget: handoff.aggregate_budget,
+                })
+                .unwrap_or_default()
         };
         Ok(Self {
-            snapshots: Mutex::new(snapshots),
+            state: Mutex::new(state),
         })
     }
 
@@ -5093,33 +5159,28 @@ impl CountryMmdbLoadSession {
         path: &str,
     ) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
         let path_key = PathBuf::from(path);
-        {
-            let snapshots = self.snapshots.lock().map_err(|_| {
-                CountryMmdbLoadError::Invalid(
-                    "MaxMind database build-session cache is unavailable".to_string(),
-                )
-            })?;
-            if let Some(snapshot) = snapshots.get(&path_key) {
-                return Ok(Arc::clone(snapshot));
-            }
-        }
-
-        let loaded = load_validated_country_mmdb(path)?;
-        let mut snapshots = self.snapshots.lock().map_err(|_| {
+        let mut state = self.state.lock().map_err(|_| {
             CountryMmdbLoadError::Invalid(
                 "MaxMind database build-session cache is unavailable".to_string(),
             )
         })?;
-        Ok(Arc::clone(snapshots.entry(path_key).or_insert(loaded)))
+        if let Some(snapshot) = state.snapshots.get(&path_key) {
+            return Ok(Arc::clone(snapshot));
+        }
+
+        let loaded = load_validated_country_mmdb_inner(
+            path,
+            None,
+            Some(&mut state.aggregate_budget),
+        )?;
+        Ok(Arc::clone(state.snapshots.entry(path_key).or_insert(loaded)))
     }
 }
 
 impl std::fmt::Display for CountryMmdbLoadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable(message) | Self::Invalid(message) => {
-                formatter.write_str(message)
-            }
+            Self::Unavailable(message) | Self::Invalid(message) => formatter.write_str(message),
         }
     }
 }
@@ -5144,13 +5205,113 @@ fn is_supported_mmdb_country_code(code: &str) -> bool {
     if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_alphabetic) {
         return false;
     }
-    let normalized = [
-        bytes[0].to_ascii_uppercase(),
-        bytes[1].to_ascii_uppercase(),
-    ];
+    let normalized = [bytes[0].to_ascii_uppercase(), bytes[1].to_ascii_uppercase()];
     SUPPORTED_GEO_COUNTRY_CODES
         .chunks_exact(2)
         .any(|supported| supported == normalized.as_slice())
+}
+
+fn verify_country_mmdb_path_still_matches(
+    path: &str,
+    opened_version: &CountryMmdbFileVersion,
+) -> Result<(), CountryMmdbLoadError> {
+    let path_metadata = std::fs::metadata(path).map_err(|error| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path '{path}' could not be re-statted after loading: {error}"
+        ))
+    })?;
+    let path_version = CountryMmdbFileVersion::from_metadata(path, &path_metadata);
+    if !path_metadata.is_file() || &path_version != opened_version {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' changed while it was being loaded"
+        )));
+    }
+    Ok(())
+}
+
+/// Platforms without a stable std file-identity API re-open the configured
+/// path and stream its digest without retaining a second snapshot buffer. A
+/// metadata-equivalent atomic replacement therefore cannot preserve stale
+/// bytes in the candidate generation.
+#[cfg(not(unix))]
+fn verify_country_mmdb_path_digest(
+    path: &str,
+    opened_version: &CountryMmdbFileVersion,
+    expected_digest: &CountryMmdbDigest,
+) -> Result<(), CountryMmdbLoadError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let mut path_file = std::fs::File::open(path).map_err(|error| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path '{path}' could not be re-opened after loading: {error}"
+        ))
+    })?;
+    let metadata_before = path_file.metadata().map_err(|error| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path '{path}' metadata not readable during portable identity verification: {error}"
+        ))
+    })?;
+    let path_version_before = CountryMmdbFileVersion::from_metadata(path, &metadata_before);
+    if !metadata_before.is_file() || &path_version_before != opened_version {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' changed before portable identity verification"
+        )));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut total_bytes = 0_u64;
+    {
+        let mut bounded_reader = (&mut path_file).take(opened_version.len + 1);
+        loop {
+            let read = bounded_reader.read(&mut buffer).map_err(|error| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database path '{path}' not readable during portable identity verification: {error}"
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            total_bytes = total_bytes.checked_add(read as u64).ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database path '{path}' size overflow during portable identity verification"
+                ))
+            })?;
+            if total_bytes > opened_version.len {
+                return Err(CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database path target '{path}' grew during portable identity verification"
+                )));
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    if total_bytes != opened_version.len {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' changed size during portable identity verification"
+        )));
+    }
+
+    let metadata_after = path_file.metadata().map_err(|error| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path '{path}' metadata not readable after portable identity verification: {error}"
+        ))
+    })?;
+    let path_version_after = CountryMmdbFileVersion::from_metadata(path, &metadata_after);
+    if &path_version_after != opened_version {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' changed during portable identity verification"
+        )));
+    }
+    verify_country_mmdb_path_still_matches(path, opened_version)?;
+
+    let observed_digest: CountryMmdbDigest = hasher.finalize().into();
+    if &observed_digest != expected_digest {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database path target '{path}' was replaced while it was being loaded"
+        )));
+    }
+    Ok(())
 }
 
 /// Load and comprehensively validate a MaxMind country-capable database into
@@ -5166,12 +5327,13 @@ fn is_supported_mmdb_country_code(code: &str) -> bool {
 pub fn load_validated_country_mmdb(
     path: &str,
 ) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
-    load_validated_country_mmdb_inner(path, None)
+    load_validated_country_mmdb_inner(path, None, None)
 }
 
 fn load_validated_country_mmdb_inner(
     path: &str,
     validation_generation: Option<u64>,
+    aggregate_budget: Option<&mut CountryMmdbAggregateBudget>,
 ) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
     use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
@@ -5200,6 +5362,16 @@ fn load_validated_country_mmdb_inner(
             MAX_COUNTRY_MMDB_SIZE_BYTES
         )));
     }
+    if let Some(aggregate_budget) = aggregate_budget {
+        aggregate_budget.admit(path, metadata.len())?;
+    } else if let Some(generation) = validation_generation {
+        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database snapshot cache is unavailable".to_string(),
+            )
+        })?;
+        cache.admit_validation_path(generation, path, metadata.len())?;
+    }
     let initial_capacity = usize::try_from(metadata.len()).map_err(|_| {
         CountryMmdbLoadError::Invalid(format!(
             "MaxMind database file '{path}' is too large for this platform"
@@ -5211,21 +5383,21 @@ fn load_validated_country_mmdb_inner(
             "MaxMind database file '{path}' cannot reserve its bounded snapshot buffer: {e}"
         ))
     })?;
-    let mut bounded_reader = (&mut file).take(MAX_COUNTRY_MMDB_SIZE_BYTES + 1);
-    bounded_reader.read_to_end(&mut bytes).map_err(|e| {
-        CountryMmdbLoadError::Unavailable(format!(
-            "MaxMind database file '{path}' not readable: {e}"
-        ))
-    })?;
-    drop(bounded_reader);
-    if bytes.len() as u64 > MAX_COUNTRY_MMDB_SIZE_BYTES {
+    {
+        let mut bounded_reader = (&mut file).take(metadata.len());
+        bounded_reader.read_to_end(&mut bytes).map_err(|e| {
+            CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database file '{path}' could not be read consistently: {e}"
+            ))
+        })?;
+    }
+    if bytes.len() as u64 != metadata.len() {
         return Err(CountryMmdbLoadError::Invalid(format!(
-            "MaxMind database file '{path}' grew beyond the maximum supported size of {} bytes while loading",
-            MAX_COUNTRY_MMDB_SIZE_BYTES
+            "MaxMind database file '{path}' changed size while it was being loaded"
         )));
     }
     let metadata_after_read = file.metadata().map_err(|e| {
-        CountryMmdbLoadError::Unavailable(format!(
+        CountryMmdbLoadError::Invalid(format!(
             "MaxMind database file '{path}' metadata not readable after load: {e}"
         ))
     })?;
@@ -5234,8 +5406,11 @@ fn load_validated_country_mmdb_inner(
             "MaxMind database file '{path}' changed while it was being loaded"
         )));
     }
+    verify_country_mmdb_path_still_matches(path, &file_version)?;
 
     let digest: CountryMmdbDigest = Sha256::digest(&bytes).into();
+    #[cfg(not(unix))]
+    verify_country_mmdb_path_digest(path, &file_version, &digest)?;
     {
         let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
             CountryMmdbLoadError::Invalid(
@@ -5317,9 +5492,7 @@ fn load_validated_country_mmdb_inner(
 
     let reader = Arc::new(CountryMmdbSnapshot(reader));
     let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
-        CountryMmdbLoadError::Invalid(
-            "MaxMind database snapshot cache is unavailable".to_string(),
-        )
+        CountryMmdbLoadError::Invalid("MaxMind database snapshot cache is unavailable".to_string())
     })?;
     cache.retain_live();
     if let Some(cached) = cache.get_by_digest(&digest) {
@@ -5344,9 +5517,58 @@ fn validate_mmdb_file_for_generation(
     path: &str,
     generation: &CountryMmdbValidationGeneration,
 ) -> Result<(), String> {
-    load_validated_country_mmdb_inner(path, Some(generation.id()))
+    load_validated_country_mmdb_inner(path, Some(generation.id()), None)
         .map(|_| ())
         .map_err(|error| format!("{field_name}: {error}"))
+}
+
+#[cfg(test)]
+mod country_mmdb_admission_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_budget_rejects_before_exceeding_the_generation_limit() {
+        let mut budget = CountryMmdbAggregateBudget::default();
+        budget
+            .admit("first.mmdb", MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES - 1)
+            .expect("the first snapshot fits");
+
+        let error = budget
+            .admit("second.mmdb", 2)
+            .expect_err("the aggregate must reject before retaining a second snapshot");
+        assert!(error.to_string().contains("aggregate snapshot budget exceeded"));
+        assert_eq!(
+            budget.admitted_bytes,
+            MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES - 1
+        );
+        assert!(
+            !budget
+                .admitted_paths
+                .contains_key(std::path::Path::new("second.mmdb"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_restat_rejects_an_atomic_replacement_of_the_opened_file() {
+        let directory = tempfile::TempDir::new().expect("temporary directory");
+        let path = directory.path().join("country.mmdb");
+        let replacement = directory.path().join("replacement.mmdb");
+        std::fs::write(&path, b"opened snapshot").expect("write original");
+        std::fs::write(&replacement, b"new path target").expect("write replacement");
+
+        let opened_file = std::fs::File::open(&path).expect("open original path target");
+        let path_text = path.to_str().expect("temporary path is UTF-8");
+        let opened_version = CountryMmdbFileVersion::from_metadata(
+            path_text,
+            &opened_file.metadata().expect("opened metadata"),
+        );
+        std::fs::rename(&replacement, &path).expect("atomically replace configured path");
+
+        let error = verify_country_mmdb_path_still_matches(path_text, &opened_version)
+            .expect_err("the configured path must still target the opened inode");
+        assert!(error.to_string().contains("path target"));
+    }
 }
 
 /// Validate a u64 field is within a range.

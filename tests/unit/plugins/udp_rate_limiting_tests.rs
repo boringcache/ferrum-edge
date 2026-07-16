@@ -85,9 +85,7 @@ fn udp_ingress_source_canonicalizes_before_stream_and_datagram_hooks() {
             .count(),
         2
     );
-    assert!(
-        session_source.contains("let datagram_client_ip: Arc<str> = Arc::from(client_ip);")
-    );
+    assert!(session_source.contains("let datagram_client_ip: Arc<str> = Arc::from(client_ip);"));
     assert!(!limiter_source.contains("canonical_ip_text"));
     assert!(limiter_source.contains("Arc::clone(&ctx.client_ip)"));
 }

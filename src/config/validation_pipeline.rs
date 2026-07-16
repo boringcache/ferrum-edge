@@ -440,8 +440,9 @@ impl<'a> ValidationPipeline<'a> {
                         )
                     };
                     let errors = match generation.as_ref() {
-                        Some(generation) => config
-                            .validate_plugin_file_dependencies_for_generation(generation),
+                        Some(generation) => {
+                            config.validate_plugin_file_dependencies_for_generation(generation)
+                        }
                         None => config.validate_plugin_file_dependencies(),
                     };
                     if !errors.is_empty() {

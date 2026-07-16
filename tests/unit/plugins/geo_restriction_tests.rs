@@ -1,24 +1,23 @@
 use base64::Engine;
 use chrono::Utc;
+use ferrum_edge::PluginCache;
 use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::config::types::{
-    GatewayConfig, MAX_COUNTRY_MMDB_SIZE_BYTES, PluginConfig, PluginScope, default_namespace,
-    load_validated_country_mmdb, validate_mmdb_file,
+    GatewayConfig, MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES, MAX_COUNTRY_MMDB_SIZE_BYTES,
+    PluginConfig, PluginScope, default_namespace, load_validated_country_mmdb, validate_mmdb_file,
 };
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
     validate_plugin_config,
 };
-use ferrum_edge::PluginCache;
 use http::{HeaderMap, HeaderValue};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 
-const COUNTRY_MMDB_B64: &str =
-    include_str!("../../fixtures/maxmind/GeoIP2-Country-Test.mmdb.b64");
+const COUNTRY_MMDB_B64: &str = include_str!("../../fixtures/maxmind/GeoIP2-Country-Test.mmdb.b64");
 
 fn country_mmdb_bytes() -> Vec<u8> {
     let encoded: String = COUNTRY_MMDB_B64.lines().collect();
@@ -101,9 +100,8 @@ fn replace_direct_country_with_supported_code(
 fn partially_corrupt_mmdb(mut bytes: Vec<u8>) -> Vec<u8> {
     let reader = maxminddb::Reader::from_source(bytes.as_slice())
         .expect("valid fixture opens before corruption");
-    let search_tree_size = reader.metadata.node_count as usize
-        * reader.metadata.record_size as usize
-        / 4;
+    let search_tree_size =
+        reader.metadata.node_count as usize * reader.metadata.record_size as usize / 4;
     drop(reader);
 
     for offset in 0..search_tree_size {
@@ -129,14 +127,8 @@ fn request_context(client_ip: &str) -> RequestContext {
 
 fn materialized_spoofed_context(client_ip: &str) -> RequestContext {
     let mut raw_headers = HeaderMap::new();
-    raw_headers.append(
-        "x-geo-country",
-        HeaderValue::from_static("attacker-first"),
-    );
-    raw_headers.append(
-        "x-geo-country",
-        HeaderValue::from_static("attacker-second"),
-    );
+    raw_headers.append("x-geo-country", HeaderValue::from_static("attacker-first"));
+    raw_headers.append("x-geo-country", HeaderValue::from_static("attacker-second"));
     let mut ctx = request_context(client_ip);
     ctx.set_raw_headers(raw_headers);
     ctx.materialize_headers();
@@ -250,7 +242,10 @@ fn test_new_rejects_unassigned_and_alias_country_codes() {
             "allow_countries": [country]
         });
         let result = GeoRestriction::new(&config);
-        assert!(result.is_err(), "unassigned code must be rejected: {country}");
+        assert!(
+            result.is_err(),
+            "unassigned code must be rejected: {country}"
+        );
         assert!(result.err().unwrap().contains("unassigned"));
     }
 }
@@ -656,12 +651,7 @@ fn validate_mmdb_file_rejects_oversized_sparse_file_before_reading() {
 
     let validation = validate_mmdb_file("geo_restriction.db_path", path_text(&path));
     assert!(validation.is_err());
-    assert!(
-        validation
-            .err()
-            .unwrap()
-            .contains("maximum supported size")
-    );
+    assert!(validation.err().unwrap().contains("maximum supported size"));
 }
 
 #[test]
@@ -850,7 +840,12 @@ fn validate_mmdb_file_rejects_structurally_valid_unsupported_country_code() {
 
     let validation = validate_mmdb_file("geo_restriction.db_path", path_text(&path));
     assert!(validation.is_err());
-    assert!(validation.err().unwrap().contains("unsupported country code"));
+    assert!(
+        validation
+            .err()
+            .unwrap()
+            .contains("unsupported country code")
+    );
     assert!(
         GeoRestriction::new(&json!({
             "db_path": path_text(&path),
@@ -870,7 +865,12 @@ fn validate_mmdb_file_rejects_wrong_database_type() {
 
     let validation = validate_mmdb_file("geo_restriction.db_path", path_text(&path));
     assert!(validation.is_err());
-    assert!(validation.err().unwrap().contains("unsupported database type"));
+    assert!(
+        validation
+            .err()
+            .unwrap()
+            .contains("unsupported database type")
+    );
     assert!(
         GeoRestriction::new(&json!({
             "db_path": path_text(&path),
@@ -936,6 +936,15 @@ fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
     assert!(!config_source.contains("get_by_file_version"));
     assert!(!config_source.contains("validation_handoff_bytes"));
     assert!(config_source.contains("MAX_COUNTRY_MMDB_SIZE_BYTES"));
+    assert!(config_source.contains("MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES"));
+    assert!(config_source.contains("aggregate_budget.admit(path, metadata.len())"));
+    assert!(
+        config_source.contains("verify_country_mmdb_path_still_matches(path, &file_version)")
+    );
+    assert_eq!(
+        MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES,
+        MAX_COUNTRY_MMDB_SIZE_BYTES
+    );
     assert!(plugin_cache_source.contains("CountryMmdbLoadSession::claim"));
     assert!(validation_source.contains("generation.commit()"));
 }

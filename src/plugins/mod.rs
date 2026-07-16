@@ -1680,8 +1680,7 @@ impl RequestContext {
                     if matches!(
                         key,
                         "x-consumer-username" | "x-consumer-custom-id" | "x-geo-country"
-                    )
-                        || key.starts_with("x-path-param-")
+                    ) || key.starts_with("x-path-param-")
                     {
                         continue;
                     }

@@ -99,7 +99,9 @@ fn native_grpc_strips_raw_geo_assertion_before_authoritative_merge() {
 
     merge_proxy_headers_and_strip_for_grpc(&mut raw_headers, &proxy_headers);
     assert_eq!(
-        raw_headers.get("x-geo-country").and_then(|value| value.to_str().ok()),
+        raw_headers
+            .get("x-geo-country")
+            .and_then(|value| value.to_str().ok()),
         Some("SE")
     );
 }
