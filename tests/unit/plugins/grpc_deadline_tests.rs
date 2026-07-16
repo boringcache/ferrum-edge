@@ -307,8 +307,7 @@ impl Plugin for SlowRejectDecorator {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        self.calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(self.delay).await;
         response_headers.insert(format!("x-{}-complete", self.name), "true".to_string());
         self.completed
@@ -499,7 +498,10 @@ fn deadline_replacement_preserves_safe_decorators_and_strips_conflicting_fields(
         ] {
             assert_eq!(response.headers.get(name).map(String::as_str), Some(value));
         }
-        assert_eq!(response.headers.get("vary").map(String::as_str), Some("Origin"));
+        assert_eq!(
+            response.headers.get("vary").map(String::as_str),
+            Some("Origin")
+        );
         assert!(!response.headers.contains_key("content-encoding"));
         assert!(!response.headers.contains_key("transfer-encoding"));
         assert!(!response.headers.contains_key("grpc-status-details-bin"));
@@ -523,7 +525,12 @@ fn deadline_replacement_preserves_safe_decorators_and_strips_conflicting_fields(
             let frames = parse_grpc_frames(&decoded);
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
-            assert!(frames[0].1.windows(14).any(|window| window == b"grpc-status: 4"));
+            assert!(
+                frames[0]
+                    .1
+                    .windows(14)
+                    .any(|window| window == b"grpc-status: 4")
+            );
         } else {
             assert_eq!(
                 response.headers.get("grpc-status").map(String::as_str),

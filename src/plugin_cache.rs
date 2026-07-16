@@ -2150,8 +2150,7 @@ fn build_protocol_entry(plugins: &[Arc<dyn Plugin>], proto: ProxyProtocol) -> Pr
     }
 }
 
-const H3_GRPC_WEB_NATIVE_POLICY_PLUGINS: [&str; 2] =
-    ["grpc_method_router", "grpc_deadline"];
+const H3_GRPC_WEB_NATIVE_POLICY_PLUGINS: [&str; 2] = ["grpc_method_router", "grpc_deadline"];
 
 fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
     // The merged proxy list is already in configured priority/config order.
@@ -3264,8 +3263,7 @@ impl PluginCache {
                     inner.insert(proto, build_protocol_entry(plugins, proto));
                 }
                 new_proxy_proto.insert(proxy.id.clone(), inner);
-                new_grpc_web_proxy
-                    .insert(proxy.id.clone(), build_grpc_web_protocol_entry(plugins));
+                new_grpc_web_proxy.insert(proxy.id.clone(), build_grpc_web_protocol_entry(plugins));
             }
         }
         let new_global_proto = if global_plugins_changed {

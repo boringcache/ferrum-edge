@@ -10108,22 +10108,21 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             &mut deadline_body,
             initial_response_header_policy_plugins,
         );
-        let (deadline_status, deadline_headers, deadline_body) = if grpc_web_response_content_type
-            .is_some()
-        {
-            // The buffered replacement already emitted the complete gRPC-Web
-            // wire contract, including the terminal trailer frame. Translating
-            // it again would lose the typed status-4 provenance.
-            (StatusCode::OK, deadline_headers, deadline_body)
-        } else {
-            let normalized = crate::proxy::normalize_reject_response(
-                deadline_http_status,
-                &deadline_body,
-                &deadline_headers,
-                matches!(flavor, HttpFlavor::Grpc),
-            );
-            (normalized.http_status, normalized.headers, normalized.body)
-        };
+        let (deadline_status, deadline_headers, deadline_body) =
+            if grpc_web_response_content_type.is_some() {
+                // The buffered replacement already emitted the complete gRPC-Web
+                // wire contract, including the terminal trailer frame. Translating
+                // it again would lose the typed status-4 provenance.
+                (StatusCode::OK, deadline_headers, deadline_body)
+            } else {
+                let normalized = crate::proxy::normalize_reject_response(
+                    deadline_http_status,
+                    &deadline_body,
+                    &deadline_headers,
+                    matches!(flavor, HttpFlavor::Grpc),
+                );
+                (normalized.http_status, normalized.headers, normalized.body)
+            };
         for remaining in plugins[index + 1..]
             .iter()
             .filter(|plugin| plugin.requires_response_committed_hook())

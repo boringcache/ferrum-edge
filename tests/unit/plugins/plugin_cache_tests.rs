@@ -4407,13 +4407,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
                 Some("p1"),
                 true,
             ),
-            make_plugin_config(
-                "grpc-web",
-                "grpc_web",
-                PluginScope::Proxy,
-                Some("p1"),
-                true,
-            ),
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
             make_plugin_config(
                 "method-router",
                 "grpc_method_router",
@@ -4433,7 +4427,11 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
     let cache = PluginCache::new(&config).expect("plugin cache");
     let view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
 
-    assert!(view.plugins.iter().any(|name| name == "request_deduplication"));
+    assert!(
+        view.plugins
+            .iter()
+            .any(|name| name == "request_deduplication")
+    );
     assert!(view.plugins.iter().any(|name| name == "grpc_web"));
     assert_eq!(
         view.plugins
@@ -4483,13 +4481,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
             vec!["grpc-web", "method-router", "deadline"],
         )],
         vec![
-            make_plugin_config(
-                "grpc-web",
-                "grpc_web",
-                PluginScope::Proxy,
-                Some("p1"),
-                true,
-            ),
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
             make_plugin_config(
                 "method-router",
                 "grpc_method_router",
@@ -4514,8 +4506,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
             false,
         )
         .expect("gRPC-Web composed view delta rebuild");
-    let reloaded_view =
-        ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+    let reloaded_view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
     assert!(
         !reloaded_view
             .plugins
