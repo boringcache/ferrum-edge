@@ -174,7 +174,8 @@ pub mod _test_support {
         cache: &crate::PluginCache,
         proxy_id: &str,
     ) -> GrpcWebPluginViewForTest {
-        let view = cache.grpc_web_request_view(proxy_id);
+        let inner = cache.load_inner();
+        let view = inner.grpc_web_request_view(proxy_id);
         GrpcWebPluginViewForTest {
             plugins: view
                 .plugins()

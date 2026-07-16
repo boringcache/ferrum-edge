@@ -2822,11 +2822,6 @@ impl PluginCache {
         inner.request_view(proxy_id, protocol)
     }
 
-    pub(crate) fn grpc_web_request_view(&self, proxy_id: &str) -> PluginCacheRequestView {
-        let inner = self.inner.load();
-        inner.grpc_web_request_view(proxy_id)
-    }
-
     /// Atomically rebuild the cache when config changes. Most old plugin
     /// instances are dropped only after in-flight requests release them;
     /// adaptive-concurrency policies additionally carry coherent admission
