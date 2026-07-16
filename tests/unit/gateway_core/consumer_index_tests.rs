@@ -498,6 +498,57 @@ fn make_consumer_with_hmac(id: &str, username: &str) -> Consumer {
 }
 
 #[test]
+fn test_hmac_identity_lookup_is_namespace_scoped_across_rebuild_and_delta() {
+    let mut tenant_a = make_consumer_with_hmac("tenant-a-consumer", "shared-user");
+    tenant_a.namespace = "tenant-a".to_string();
+    let mut tenant_b = make_consumer_with_hmac("tenant-b-consumer", "shared-user");
+    tenant_b.namespace = "tenant-b".to_string();
+    let index = ConsumerIndex::new(&[tenant_a, tenant_b.clone()]);
+
+    assert_eq!(
+        index
+            .find_hmac_by_identity("tenant-a", "shared-user")
+            .unwrap()
+            .id,
+        "tenant-a-consumer"
+    );
+    assert_eq!(
+        index
+            .find_hmac_by_identity("tenant-b", "shared-user")
+            .unwrap()
+            .id,
+        "tenant-b-consumer"
+    );
+    assert!(
+        index
+            .find_hmac_by_identity("tenant-c", "shared-user")
+            .is_none()
+    );
+
+    tenant_b.username = "rotated-user".to_string();
+    index.apply_delta(&[], &[], &[tenant_b]);
+    assert!(
+        index
+            .find_hmac_by_identity("tenant-b", "shared-user")
+            .is_none()
+    );
+    assert_eq!(
+        index
+            .find_hmac_by_identity("tenant-b", "rotated-user")
+            .unwrap()
+            .id,
+        "tenant-b-consumer"
+    );
+    assert_eq!(
+        index
+            .find_hmac_by_identity("tenant-a", "shared-user")
+            .unwrap()
+            .id,
+        "tenant-a-consumer"
+    );
+}
+
+#[test]
 fn test_auth_type_counts_empty() {
     let index = ConsumerIndex::new(&[]);
     let (keyauth, basic, mtls, jwt, hmac, identity, total) = index.auth_type_counts();

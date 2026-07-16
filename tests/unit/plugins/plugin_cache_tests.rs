@@ -3818,6 +3818,56 @@ fn test_modifies_request_headers_flag_computed() {
 }
 
 #[test]
+fn test_hmac_auth_rejects_request_body_transformer_composition() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["hmac", "transform"])],
+        vec![
+            make_plugin_config("hmac", "hmac_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "gateway",
+                        "value": "ferrum"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("composition must fail closed");
+    assert!(error.contains("hmac_auth cannot be combined"));
+    assert!(error.contains("request_transformer"));
+    assert!(error.contains("protocol Http"));
+}
+
+#[test]
+fn test_hmac_auth_allows_header_only_request_transformer() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["hmac", "transform"])],
+        vec![
+            make_plugin_config("hmac", "hmac_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "transform",
+                "request_transformer",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+
+    assert!(PluginCache::new(&config).is_ok());
+}
+
+#[test]
 fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
     // stdout_logging does not modify request headers
     let config = make_config(

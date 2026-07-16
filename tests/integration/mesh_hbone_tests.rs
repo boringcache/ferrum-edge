@@ -545,7 +545,7 @@ async fn hbone_connect_without_authenticated_peer_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn hbone_connect_with_body_auth_plugin_is_rejected() {
-    const HMAC_SECRET: &str = "mesh-hbone-secret";
+    const HMAC_SECRET: &str = "mesh-hbone-secret-at-least-32-bytes";
 
     let (backend_addr, backend_handle) = start_echo_backend().await;
     let state = create_mesh_proxy_state_with_config(
@@ -565,7 +565,14 @@ async fn hbone_connect_with_body_auth_plugin_is_rejected() {
     let method = "CONNECT";
     let path = "/";
     let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-    let signature = generate_hmac_signature(method, path, &date, HMAC_SECRET);
+    let signature = generate_hmac_signature(
+        method,
+        path,
+        &date,
+        "hmacuser",
+        "orders.default.svc.cluster.local:8080",
+        HMAC_SECRET,
+    );
     let req = Request::builder()
         .method(Method::CONNECT)
         .uri("orders.default.svc.cluster.local:8080")

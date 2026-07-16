@@ -366,6 +366,135 @@ async fn update_config_rejected_candidate_reports_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn update_config_quarantines_invalid_hmac_credentials_before_full_snapshot_swap() {
+    let state = empty_proxy_state();
+    let shared_secret = "shared-hmac-secret-at-least-32-characters";
+    let mut first = test_consumer("c1", "alice");
+    first.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+    let mut duplicate = test_consumer("c2", "bob");
+    duplicate.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+    let mut weak = test_consumer("c3", "carol");
+    weak.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": "too-short"}]),
+    );
+    let mut malformed = test_consumer("c4", "dave");
+    malformed.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{
+            "secret": "strong-hmac-secret-at-least-32-characters",
+            "unexpected": true
+        }]),
+    );
+
+    let outcome = state.update_config(GatewayConfig {
+        consumers: vec![first, duplicate, weak, malformed],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    });
+
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    let config = state.config.load();
+    assert!(config.consumers[0].has_credential("hmac_auth"));
+    assert!(!config.consumers[1].has_credential("hmac_auth"));
+    assert!(!config.consumers[2].has_credential("hmac_auth"));
+    assert!(!config.consumers[3].has_credential("hmac_auth"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_config_preserves_same_hmac_secret_across_namespaces() {
+    let state = empty_proxy_state();
+    let shared_secret = "namespace-reusable-hmac-secret-at-least-32-characters";
+    let mut tenant_a = test_consumer("c1", "alice");
+    tenant_a.namespace = "tenant-a".to_string();
+    tenant_a.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+    let mut tenant_b = test_consumer("c2", "bob");
+    tenant_b.namespace = "tenant-b".to_string();
+    tenant_b.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+
+    assert_eq!(
+        state.update_config(GatewayConfig {
+            consumers: vec![tenant_a, tenant_b],
+            loaded_at: Utc::now(),
+            ..GatewayConfig::default()
+        }),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .config
+            .load()
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("hmac_auth"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_snapshot_rehydrates_quarantined_hmac_after_conflict_repair() {
+    let state = empty_proxy_state();
+    let original_secret = "shared-hmac-secret-at-least-32-characters";
+    let mut first = test_consumer("c1", "alice");
+    first.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": original_secret}]),
+    );
+    let mut second = test_consumer("c2", "bob");
+    second.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": original_secret}]),
+    );
+    assert_eq!(
+        state.update_config(GatewayConfig {
+            consumers: vec![first, second],
+            loaded_at: Utc::now(),
+            ..GatewayConfig::default()
+        }),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(!state.config.load().consumers[1].has_credential("hmac_auth"));
+
+    let mut repaired_first = test_consumer("c1", "alice");
+    repaired_first.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": "rotated-hmac-secret-at-least-32-characters"}]),
+    );
+    let mut rehydrated_second = test_consumer("c2", "bob");
+    rehydrated_second.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": original_secret}]),
+    );
+    assert_eq!(
+        state.update_config(GatewayConfig {
+            consumers: vec![repaired_first, rehydrated_second],
+            loaded_at: Utc::now(),
+            ..GatewayConfig::default()
+        }),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .config
+            .load()
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("hmac_auth"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
     let state = empty_proxy_state();
     let mut plugin = test_plugin_config("security-policy", true);

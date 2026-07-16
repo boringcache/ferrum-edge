@@ -5,7 +5,9 @@
 //!    the same transaction as SQL resource mutations.
 //! 2. Pollers read ordered change records after their accepted sequence cursor,
 //!    collapse each resource to its final operation in the batch, and point-load
-//!    only changed resource IDs.
+//!    only changed resource IDs. Consumer changes force an authoritative full
+//!    reload so credentials stripped from the published snapshot by runtime
+//!    quarantine can be rehydrated after a repair.
 //! 3. Deletes are delivered from durable delete records; normal incremental
 //!    polling does not scan every resource ID or rely on wall-clock timestamps.
 //!
@@ -141,7 +143,7 @@ struct ConsumerCredentialIndexEntry {
     credential_hash: String,
 }
 
-fn credential_value_hash(value: &str) -> String {
+pub(crate) fn credential_value_hash(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     hex::encode(hasher.finalize())
@@ -172,6 +174,22 @@ fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredent
             let indexed = ConsumerCredentialIndexEntry {
                 credential_type: "mtls_auth",
                 credential_hash: credential_value_hash(canonical_mtls_identity(identity)),
+            };
+            if seen.insert(indexed.clone()) {
+                entries.push(indexed);
+            }
+        }
+    }
+
+    // HMAC secrets are hashed before entering the index: the composite primary
+    // key is the cross-process uniqueness backstop, while the stored index
+    // never contains the credential itself. Namespace remains part of that
+    // primary key, so separate tenants may intentionally reuse a secret.
+    for entry in consumer.credential_entries("hmac_auth") {
+        if let Some(secret) = entry.get("secret").and_then(|value| value.as_str()) {
+            let indexed = ConsumerCredentialIndexEntry {
+                credential_type: "hmac_auth",
+                credential_hash: credential_value_hash(secret),
             };
             if seen.insert(indexed.clone()) {
                 entries.push(indexed);
@@ -274,43 +292,6 @@ fn upstream_backend_tls_san_allow_list_json(
             .map(Some)
             .map_err(Into::into)
     }
-}
-
-fn declared_proxy_plugin_association_ids_from_spec(
-    spec: &crate::config::types::ApiSpec,
-) -> Result<HashSet<String>, anyhow::Error> {
-    if spec.content_encoding != "gzip" {
-        warn!(
-            "api_spec '{}' uses unsupported content_encoding '{}'",
-            spec.id, spec.content_encoding
-        );
-        return Ok(HashSet::new());
-    }
-    let cap = usize::try_from(spec.uncompressed_size).unwrap_or(usize::MAX);
-    let body = match crate::admin::spec_codec::decompress_gzip_capped(&spec.spec_content, cap) {
-        Ok(body) => body,
-        Err(e) => {
-            warn!(
-                "failed to decompress stored api_spec '{}' proxy plugin associations: {}",
-                spec.id, e
-            );
-            return Ok(HashSet::new());
-        }
-    };
-    let ids = match crate::admin::api_specs::extract_declared_proxy_plugin_association_ids(
-        &body,
-        Some(spec.spec_format),
-    ) {
-        Ok(ids) => ids,
-        Err(e) => {
-            warn!(
-                "failed to parse stored api_spec '{}' proxy plugin associations: {}",
-                spec.id, e
-            );
-            return Ok(HashSet::new());
-        }
-    };
-    Ok(ids.into_iter().collect())
 }
 
 fn store_canonical_resource_hash(
@@ -1605,6 +1586,22 @@ impl DatabaseStore {
             error!(
                 "Quarantined {} consumer(s) with colliding identities during full config load",
                 quarantined.len()
+            );
+        }
+
+        // Fail-closed hmac_auth secret policy: strip pre-existing or
+        // out-of-band credentials with weak or cross-consumer duplicate
+        // secrets instead of publishing them behind a warning-only
+        // validation run. Admin write-time validation rejects new
+        // violations; this guard covers stored rows.
+        let hmac_quarantined = config.quarantine_invalid_hmac_credentials();
+        if !hmac_quarantined.is_empty() {
+            for message in &hmac_quarantined {
+                error!("{}", message);
+            }
+            error!(
+                "Quarantined {} hmac_auth credential(s) during full config load",
+                hmac_quarantined.len()
             );
         }
 
@@ -4186,6 +4183,14 @@ impl DatabaseStore {
             }
         }
 
+        if !consumer_ops.is_empty() {
+            return Err(anyhow::Error::new(
+                crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                    namespace,
+                ),
+            ));
+        }
+
         let (proxy_upserts, mut removed_proxy_ids) = Self::split_change_ops(proxy_ops);
         let (consumer_upserts, mut removed_consumer_ids) = Self::split_change_ops(consumer_ops);
         let (plugin_config_upserts, mut removed_plugin_config_ids) =
@@ -6104,8 +6109,7 @@ impl DatabaseStore {
                 .transpose()?;
         let previous_declared_assoc_ids = existing_spec
             .as_ref()
-            .map(declared_proxy_plugin_association_ids_from_spec)
-            .transpose()?
+            .map(crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec)
             .unwrap_or_default();
         let desired_resource_hash = store_canonical_resource_hash(bundle)?;
 

@@ -53,7 +53,7 @@ pub(crate) enum WriteAction<'a> {
 pub(crate) enum AfterValidateError {
     BadRequest(Vec<String>),
     Db(anyhow::Error),
-    Response(Response<Full<Bytes>>),
+    Response(Box<Response<Full<Bytes>>>),
 }
 
 /// Validation outcomes for resource-specific checks and generic field validation.
@@ -171,11 +171,177 @@ async fn validate_mtls_auth_candidate(
     }
 }
 
-pub(crate) async fn mtls_consumer_candidate_errors(
+pub(crate) async fn validate_hmac_request_transform_candidates(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    proxies: &[Proxy],
+    plugins: &[PluginConfig],
+    removed_plugin_id: Option<&str>,
+) -> Result<(), AfterValidateError> {
+    // Global plugin scope is global within one runtime namespace. CP snapshots
+    // are filtered before broadcast and file/database modes load one namespace,
+    // so cross-namespace plugins must never create false admission conflicts.
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+
+    if let Some(removed_plugin_id) = removed_plugin_id {
+        candidate
+            .plugin_configs
+            .retain(|plugin| plugin.namespace != namespace || plugin.id != removed_plugin_id);
+    }
+
+    for proxy in proxies {
+        if let Some(existing) = candidate
+            .proxies
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == proxy.id)
+        {
+            *existing = proxy.clone();
+        } else {
+            candidate.proxies.push(proxy.clone());
+        }
+    }
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
+        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+}
+
+/// Validate the exact post-PUT API-spec replacement candidate.
+///
+/// The persistence contract deletes plugin configs owned by the replaced spec,
+/// removes associations declared only by the previous spec, preserves manual
+/// associations, and then overlays the incoming proxy and plugins. Build that
+/// same graph here so admission neither rejects a valid replacement because of
+/// removed globals nor admits an invalid chain by dropping retained manual
+/// associations.
+pub(crate) async fn validate_hmac_request_transform_api_spec_replacement_candidate(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    existing_spec: &crate::config::types::ApiSpec,
+    proxy: &Proxy,
+    plugins: &[PluginConfig],
+) -> Result<(), AfterValidateError> {
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let replaced_plugins = db
+        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let replaced_plugin_ids: HashSet<String> = replaced_plugins
+        .into_iter()
+        .map(|plugin| plugin.id)
+        .collect();
+
+    // Only plugin configs owned by this spec are replaceable. Treating an
+    // incoming same-ID plugin as an overlay on a manual or differently owned
+    // config would make the in-memory candidate diverge from persistence,
+    // where the insert is rejected by the plugin-config primary key.
+    if let Some(plugin) = plugins.iter().find(|plugin| {
+        !replaced_plugin_ids.contains(&plugin.id)
+            && candidate
+                .plugin_configs
+                .iter()
+                .any(|existing| existing.namespace == namespace && existing.id == plugin.id)
+    }) {
+        return Err(AfterValidateError::BadRequest(vec![format!(
+            "plugin_config id '{}' already exists in namespace '{}' outside api_spec '{}'; replacement cannot take ownership of it",
+            plugin.id, namespace, existing_spec.id
+        )]));
+    }
+
+    candidate
+        .plugin_configs
+        .retain(|plugin| !replaced_plugin_ids.contains(&plugin.id));
+    for candidate_proxy in &mut candidate.proxies {
+        candidate_proxy
+            .plugins
+            .retain(|association| !replaced_plugin_ids.contains(&association.plugin_config_id));
+    }
+
+    let previous_declared_assoc_ids =
+        crate::admin::api_specs::declared_proxy_plugin_association_ids_from_stored_spec(
+            existing_spec,
+        );
+    let incoming_assoc_ids: HashSet<&str> = proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    let mut replacement_proxy = proxy.clone();
+    let mut preserved_associations = candidate
+        .proxies
+        .iter()
+        .find(|item| item.namespace == namespace && item.id == proxy.id)
+        .map(|item| item.plugins.clone())
+        .unwrap_or_default();
+    preserved_associations.retain(|association| {
+        !previous_declared_assoc_ids.contains(&association.plugin_config_id)
+            && !incoming_assoc_ids.contains(association.plugin_config_id.as_str())
+    });
+    preserved_associations.extend(proxy.plugins.iter().cloned());
+    replacement_proxy.plugins = preserved_associations;
+
+    if let Some(existing) = candidate
+        .proxies
+        .iter_mut()
+        .find(|item| item.namespace == namespace && item.id == proxy.id)
+    {
+        *existing = replacement_proxy;
+    } else {
+        candidate.proxies.push(replacement_proxy);
+    }
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
+        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+}
+
+/// Validate a wholesale namespace replacement without retaining resources that
+/// the restore will delete. Runtime plugin chains are namespace-scoped, so the
+/// normalized replacement is the complete authoritative candidate.
+pub(crate) fn validate_hmac_request_transform_restore_candidate(
+    state: &AdminState,
+    replacement: &GatewayConfig,
+) -> Result<(), AfterValidateError> {
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugin_cache::validate_hmac_request_transform_candidate(replacement, &http_client)
+        .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+}
+
+async fn consumer_candidate_config(
     db: &dyn DatabaseBackend,
     namespace: &str,
     consumer: &Consumer,
-) -> DbResult<Vec<String>> {
+) -> DbResult<GatewayConfig> {
     let mut config = db.load_namespace_snapshot(namespace).await?;
     if let Some(existing) = config
         .consumers
@@ -186,8 +352,36 @@ pub(crate) async fn mtls_consumer_candidate_errors(
     } else {
         config.consumers.push(consumer.clone());
     }
-    Ok(config
+    Ok(config)
+}
+
+pub(crate) async fn mtls_consumer_candidate_errors(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> DbResult<Vec<String>> {
+    Ok(consumer_candidate_config(db, namespace, consumer)
+        .await?
         .validate_unique_mtls_credentials()
+        .err()
+        .unwrap_or_default())
+}
+
+/// Reject an admin Consumer/credential write whose hmac_auth secret is
+/// already claimed by another consumer in the namespace. Snapshot-based like
+/// the mTLS candidate check (rather than a credential-index probe) so
+/// pre-existing rows written before hmac secrets were policed are still
+/// authoritative. `lock_mtls_admission` serializes same-process prechecks;
+/// namespace-scoped SQL/Mongo uniqueness constraints are the cross-process
+/// persistence backstop.
+pub(crate) async fn hmac_consumer_candidate_errors(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> DbResult<Vec<String>> {
+    Ok(consumer_candidate_config(db, namespace, consumer)
+        .await?
+        .validate_unique_hmac_credentials()
         .err()
         .unwrap_or_default())
 }
@@ -597,13 +791,27 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     if config_update_target_was_not_found(error) {
         return not_found_response::<Consumer>();
     }
-    let message = error.to_string();
-    let status = if super::is_unique_constraint_violation(&message) {
+    let unique_conflict = super::is_unique_constraint_violation(&error.to_string());
+    let message = consumer_persist_error_message(error);
+    let status = if unique_conflict {
         StatusCode::CONFLICT
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
     super::json_response(status, &json!({"error": message}))
+}
+
+/// Redact persistence-level uniqueness diagnostics before they reach an admin
+/// response. MongoDB duplicate-key errors can echo indexed credential-derived
+/// values; callers need the conflict disposition, never credential or index
+/// metadata.
+pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
+    if super::is_unique_constraint_violation(&error.to_string()) {
+        "Consumer identity or credential conflicts with another Consumer in the namespace"
+            .to_string()
+    } else {
+        error.to_string()
+    }
 }
 
 pub(crate) fn hash_consumer_credentials(
@@ -1823,13 +2031,22 @@ impl AdminResource for PluginConfig {
         {
             validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
         }
+        validate_hmac_request_transform_candidates(
+            db,
+            state,
+            namespace,
+            &[],
+            std::slice::from_ref(resource),
+            None,
+        )
+        .await?;
 
         Ok(())
     }
 
     async fn before_delete(
         db: &dyn DatabaseBackend,
-        _state: &AdminState,
+        state: &AdminState,
         namespace: &str,
         existing: &Self,
         _ctx: &ValidationCtx<'_>,
@@ -1837,6 +2054,15 @@ impl AdminResource for PluginConfig {
         if existing.plugin_name == "mtls_auth" {
             validate_mtls_auth_candidate(db, namespace, None, None, Some(&existing.id)).await?;
         }
+        validate_hmac_request_transform_candidates(
+            db,
+            state,
+            namespace,
+            &[],
+            &[],
+            Some(&existing.id),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -2267,18 +2493,29 @@ impl AdminResource for Proxy {
         // effective `mtls_auth` association; compatibility validation itself
         // remains stream-specific.
         validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
+        validate_hmac_request_transform_candidates(
+            db,
+            state,
+            namespace,
+            std::slice::from_ref(resource),
+            &[],
+            None,
+        )
+        .await?;
 
         if resource.dispatch_kind.is_stream()
             && let Some(port) = resource.listen_port
             && ctx.mode != "cp"
         {
             if ctx.reserved_ports.contains(&port) {
-                return Err(AfterValidateError::Response(super::json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": format!(
-                        "listen_port {} conflicts with a gateway reserved port (proxy/admin/gRPC listener)",
-                        port
-                    )}),
+                return Err(AfterValidateError::Response(Box::new(
+                    super::json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} conflicts with a gateway reserved port (proxy/admin/gRPC listener)",
+                            port
+                        )}),
+                    ),
                 )));
             }
 
@@ -2295,12 +2532,14 @@ impl AdminResource for Proxy {
                 )
                 .await
             {
-                return Err(AfterValidateError::Response(super::json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": format!(
-                        "listen_port {} is not available on the host: {}",
-                        port, error
-                    )}),
+                return Err(AfterValidateError::Response(Box::new(
+                    super::json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} is not available on the host: {}",
+                            port, error
+                        )}),
+                    ),
                 )));
             }
         }
@@ -2485,12 +2724,21 @@ impl AdminResource for Consumer {
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
-        if !resource.has_credential("mtls_auth") {
-            return Ok(());
+        let mut errors = Vec::new();
+        if resource.has_credential("mtls_auth") {
+            errors.extend(
+                mtls_consumer_candidate_errors(db, namespace, resource)
+                    .await
+                    .map_err(AfterValidateError::Db)?,
+            );
         }
-        let errors = mtls_consumer_candidate_errors(db, namespace, resource)
-            .await
-            .map_err(AfterValidateError::Db)?;
+        if resource.has_credential("hmac_auth") {
+            errors.extend(
+                hmac_consumer_candidate_errors(db, namespace, resource)
+                    .await
+                    .map_err(AfterValidateError::Db)?,
+            );
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2510,7 +2758,7 @@ fn map_after_validate_error<R: AdminResource>(error: AfterValidateError) -> Resp
     match error {
         AfterValidateError::BadRequest(field_errors) => R::map_after_validate_errors(&field_errors),
         AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
-        AfterValidateError::Response(response) => response,
+        AfterValidateError::Response(response) => *response,
     }
 }
 

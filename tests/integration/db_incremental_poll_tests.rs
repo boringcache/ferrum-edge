@@ -6,7 +6,8 @@
 //! all SQL backends behind dialect-specific SQL rendering.
 
 use chrono::Utc;
-use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig, NamespacedResourceId};
+use ferrum_edge::config::db_backend::is_incremental_full_reload_required;
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
     PluginScope, Proxy, Upstream, UpstreamTarget, default_namespace,
@@ -266,7 +267,7 @@ async fn incremental_poll_does_not_scan_runtime_rows_without_change_records() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn incremental_delete_records_drive_removals_without_resource_row_scans() {
+async fn non_consumer_delete_records_drive_removals_without_resource_row_scans() {
     let (store, _temp_dir) = sqlite_store().await;
     let ts = Utc::now().to_rfc3339();
 
@@ -275,11 +276,9 @@ async fn incremental_delete_records_drive_removals_without_resource_row_scans() 
          (sequence, namespace, resource_type, resource_id, operation, created_at) \
          VALUES \
              (1, 'ferrum', 'proxy', 'deleted-proxy', 'delete', ?), \
-             (2, 'ferrum', 'consumer', 'deleted-consumer', 'delete', ?), \
-             (3, 'ferrum', 'plugin_config', 'deleted-plugin', 'delete', ?), \
-             (4, 'ferrum', 'upstream', 'deleted-upstream', 'delete', ?)",
+             (2, 'ferrum', 'plugin_config', 'deleted-plugin', 'delete', ?), \
+             (3, 'ferrum', 'upstream', 'deleted-upstream', 'delete', ?)",
     )
-    .bind(&ts)
     .bind(&ts)
     .bind(&ts)
     .bind(&ts)
@@ -292,18 +291,43 @@ async fn incremental_delete_records_drive_removals_without_resource_row_scans() 
         .await
         .expect("delete-only incremental poll must succeed");
 
-    assert_eq!(result.sequence_cursor, 4);
+    assert_eq!(result.sequence_cursor, 3);
     assert_eq!(result.removed_proxy_ids, vec!["deleted-proxy"]);
-    assert_eq!(
-        result.removed_consumer_ids,
-        vec![NamespacedResourceId::new("ferrum", "deleted-consumer")]
-    );
+    assert!(result.removed_consumer_ids.is_empty());
     assert_eq!(result.removed_plugin_config_ids, vec!["deleted-plugin"]);
     assert_eq!(result.removed_upstream_ids, vec!["deleted-upstream"]);
     assert!(result.added_or_modified_proxies.is_empty());
     assert!(result.added_or_modified_consumers.is_empty());
     assert!(result.added_or_modified_plugin_configs.is_empty());
     assert!(result.added_or_modified_upstreams.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn consumer_delete_requires_authoritative_reload_for_quarantine_rehydration() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let ts = Utc::now().to_rfc3339();
+
+    sqlx::query(
+        "INSERT INTO config_changes \
+         (sequence, namespace, resource_type, resource_id, operation, created_at) \
+         VALUES (1, 'ferrum', 'consumer', 'deleted-consumer', 'delete', ?)",
+    )
+    .bind(&ts)
+    .execute(&store.pool())
+    .await
+    .expect("manual consumer delete change insert must succeed");
+
+    let error = match store.load_incremental_config("ferrum", 0).await {
+        Ok(_) => panic!("consumer deletion must force an authoritative full reload"),
+        Err(error) => error,
+    };
+    assert!(is_incremental_full_reload_required(&error));
+    assert!(
+        error
+            .to_string()
+            .contains("rehydrate quarantined credentials"),
+        "consumer change escalation must explain the quarantine repair path: {error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
