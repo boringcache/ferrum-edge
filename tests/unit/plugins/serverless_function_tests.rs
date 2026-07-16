@@ -236,10 +236,10 @@ fn test_function_url_diagnostic_form_redacts_path_and_query_credentials() {
 
 #[test]
 fn test_aws_endpoint_override_rejects_non_origin_components() {
-    for endpoint in [
-        "https://example.com/lambda",
-        "https://example.com?token=secret",
-        "https://example.com#fragment",
+    for (endpoint, expected_error) in [
+        ("https://example.com/lambda", "must be an HTTP(S) origin"),
+        ("https://example.com?token=secret", "must be an HTTP(S) origin"),
+        ("https://example.com#fragment", "must not contain a URL fragment"),
     ] {
         let err = expect_err(ServerlessFunction::new(
             &json!({
@@ -252,7 +252,7 @@ fn test_aws_endpoint_override_rejects_non_origin_components() {
             }),
             default_client(),
         ));
-        assert!(err.contains("must be an HTTP(S) origin"), "got: {err}");
+        assert!(err.contains(expected_error), "got: {err}");
     }
 }
 
