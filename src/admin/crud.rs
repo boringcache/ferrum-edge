@@ -720,15 +720,27 @@ async fn recover_late_resource_write<R: AdminResource>(
     Ok(false)
 }
 
-async fn persist_create_to_settlement<R: AdminResource>(
+struct OwnedWriteSettlementContext {
     db: Arc<dyn DatabaseBackend>,
     namespace: String,
-    mut guard: Option<NamespaceConfigAdmissionGuard>,
-    written: R,
+    guard: Option<NamespaceConfigAdmissionGuard>,
     http_client: crate::plugins::PluginHttpClient,
     state: AdminState,
     actor: AuditActor,
+}
+
+async fn persist_create_to_settlement<R: AdminResource>(
+    context: OwnedWriteSettlementContext,
+    written: R,
 ) -> DbResult<()> {
+    let OwnedWriteSettlementContext {
+        db,
+        namespace,
+        mut guard,
+        http_client,
+        state,
+        actor,
+    } = context;
     let success_db = db.clone();
     let result = match run_db_write_while_held(guard.as_ref(), R::db_create(db.as_ref(), &written))
         .await
@@ -786,16 +798,19 @@ async fn persist_create_to_settlement<R: AdminResource>(
 }
 
 async fn persist_update_to_settlement<R: AdminResource>(
-    db: Arc<dyn DatabaseBackend>,
-    namespace: String,
-    mut guard: Option<NamespaceConfigAdmissionGuard>,
+    context: OwnedWriteSettlementContext,
     id: String,
     written: R,
     previous: R,
-    http_client: crate::plugins::PluginHttpClient,
-    state: AdminState,
-    actor: AuditActor,
 ) -> DbResult<bool> {
+    let OwnedWriteSettlementContext {
+        db,
+        namespace,
+        mut guard,
+        http_client,
+        state,
+        actor,
+    } = context;
     let success_db = db.clone();
     let result = match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written))
         .await
@@ -854,15 +869,18 @@ async fn persist_update_to_settlement<R: AdminResource>(
 }
 
 async fn persist_delete_to_settlement<R: AdminResource>(
-    db: Arc<dyn DatabaseBackend>,
-    namespace: String,
-    mut guard: Option<NamespaceConfigAdmissionGuard>,
+    context: OwnedWriteSettlementContext,
     id: String,
     recovery: OwnedLateDeleteRecovery<R>,
-    http_client: crate::plugins::PluginHttpClient,
-    audit_enabled: bool,
-    actor: AuditActor,
 ) -> DbResult<bool> {
+    let OwnedWriteSettlementContext {
+        db,
+        namespace,
+        mut guard,
+        http_client,
+        state,
+        actor,
+    } = context;
     let success_db = db.clone();
     let result = match run_db_write_while_held(
         guard.as_ref(),
@@ -922,7 +940,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
             &namespace,
             audit::delete_diff(R::audit_body(&recovery.previous)),
         );
-        if let Err(error) = audit::record(audit_enabled, success_db, event) {
+        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event) {
             super::log_audit_enqueue_failure(&error);
         }
     }
@@ -1852,18 +1870,20 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     }
 
     let persistence = match tokio::spawn(persist_delete_to_settlement(
-        db_arc.clone(),
-        namespace.to_string(),
-        namespace_config_admission_guard.take(),
+        OwnedWriteSettlementContext {
+            db: db_arc.clone(),
+            namespace: namespace.to_string(),
+            guard: namespace_config_admission_guard.take(),
+            http_client: super::plugin_validation_http_client(state),
+            state: state.clone(),
+            actor: actor.clone(),
+        },
         id.to_string(),
         OwnedLateDeleteRecovery {
             previous: existing.clone(),
             config: previous_snapshot,
             api_spec: previous_api_spec,
         },
-        super::plugin_validation_http_client(state),
-        state.admin_audit_enabled,
-        actor.clone(),
     ))
     .await
     {
@@ -4485,13 +4505,15 @@ async fn handle_write<R: AdminResource>(
     match action {
         WriteAction::Create => {
             let persistence = match tokio::spawn(persist_create_to_settlement(
-                db_arc.clone(),
-                namespace.to_string(),
-                namespace_config_admission_guard.take(),
+                OwnedWriteSettlementContext {
+                    db: db_arc.clone(),
+                    namespace: namespace.to_string(),
+                    guard: namespace_config_admission_guard.take(),
+                    http_client: super::plugin_validation_http_client(state),
+                    state: state.clone(),
+                    actor: actor.clone(),
+                },
                 resource.clone(),
-                super::plugin_validation_http_client(state),
-                state.clone(),
-                actor.clone(),
             ))
             .await
             {
@@ -4512,15 +4534,17 @@ async fn handle_write<R: AdminResource>(
                 ));
             };
             let persistence = match tokio::spawn(persist_update_to_settlement(
-                db_arc.clone(),
-                namespace.to_string(),
-                namespace_config_admission_guard.take(),
+                OwnedWriteSettlementContext {
+                    db: db_arc.clone(),
+                    namespace: namespace.to_string(),
+                    guard: namespace_config_admission_guard.take(),
+                    http_client: super::plugin_validation_http_client(state),
+                    state: state.clone(),
+                    actor: actor.clone(),
+                },
                 id.to_string(),
                 resource.clone(),
                 previous,
-                super::plugin_validation_http_client(state),
-                state.clone(),
-                actor.clone(),
             ))
             .await
             {
