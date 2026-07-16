@@ -54,10 +54,10 @@ use bytes::Bytes;
 use http::header::HeaderValue;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use url::{Host, Url};
 
@@ -102,7 +102,6 @@ struct CachedSpec {
     body: Bytes,
     content_type: String,
     inserted_at: Instant,
-    completion_generation: u64,
 }
 
 /// A sanitized failure response retained during the negative-cache window.
@@ -137,6 +136,26 @@ struct CachedFailure {
     retry_at: Instant,
 }
 
+type FetchOutcome = Result<CachedSpec, FetchFailure>;
+type InFlightFetch = OnceCell<FetchOutcome>;
+
+struct FetchAdmission {
+    _permit: OwnedSemaphorePermit,
+    cell: Arc<InFlightFetch>,
+}
+
+fn lock_in_flight_fetch(
+    slot: &Mutex<Option<Arc<InFlightFetch>>>,
+) -> MutexGuard<'_, Option<Arc<InFlightFetch>>> {
+    match slot.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("spec_expose: recovering poisoned in-flight fetch state");
+            poisoned.into_inner()
+        }
+    }
+}
+
 /// Spec Expose plugin — serves API spec documents on `{listen_path}/specz`.
 pub struct SpecExpose {
     spec_url: String,
@@ -150,18 +169,11 @@ pub struct SpecExpose {
     cache: ArcSwap<Option<CachedSpec>>,
     failure_cache: ArcSwap<Option<CachedFailure>>,
     consecutive_failures: AtomicU32,
-    /// Monotonically identifies published successful fetch completions. With a
-    /// zero TTL, an admitted caller may reuse only a completion published after
-    /// that caller joined, so delayed waiters coalesce without creating a
-    /// durable wall-clock cache.
-    success_generation: AtomicU64,
-    /// Single-flight lock around the upstream fetch. Concurrent cache-miss
-    /// callers serialize here; whoever acquires first does the upstream fetch
-    /// and populates the cache, and the rest observe the fresh entry via
-    /// `cached_spec()` after the lock releases. Prevents a cold-cache request
-    /// flood from fanning out to the upstream document store (the exact DoS
-    /// the cache was added to prevent).
-    fetch_lock: Mutex<()>,
+    /// One transient single-flight completion shared only by callers admitted
+    /// before it finishes. Completion removes the plugin-owned reference;
+    /// admitted waiters retain their own `Arc`, so a zero-TTL body lives only
+    /// until that fetch group drains.
+    in_flight_fetch: Mutex<Option<Arc<InFlightFetch>>>,
     /// Bounds both the in-flight fetch and callers waiting for its completion.
     /// Excess anonymous requests fail quickly instead of growing a mutex queue.
     fetch_admission: Arc<Semaphore>,
@@ -359,8 +371,7 @@ impl SpecExpose {
             cache: ArcSwap::from_pointee(None),
             failure_cache: ArcSwap::from_pointee(None),
             consecutive_failures: AtomicU32::new(0),
-            success_generation: AtomicU64::new(0),
-            fetch_lock: Mutex::new(()),
+            in_flight_fetch: Mutex::new(None),
             fetch_admission: Arc::new(Semaphore::new(MAX_PENDING_FETCHES)),
             http_client,
         })
@@ -401,17 +412,38 @@ impl SpecExpose {
         }
     }
 
-    /// Returns the durable cache entry, or for TTL zero only a successful
-    /// completion published after this caller was admitted. Generation-based
-    /// reuse cannot expire under executor starvation, while a request arriving
-    /// after the completion observes the same generation and re-fetches.
-    fn cached_spec_after_admission(&self, admitted_generation: u64) -> Option<CachedSpec> {
-        if !self.cache_ttl.is_zero() {
-            return self.cached_spec();
+    /// Atomically registers a bounded caller with the current fetch group.
+    /// Registration and group retirement share the same short synchronous
+    /// critical section, so every caller admitted before completion owns the
+    /// group cell even if it is not scheduled again until much later.
+    fn admit_fetch(&self) -> Option<FetchAdmission> {
+        let mut active = lock_in_flight_fetch(&self.in_flight_fetch);
+        let permit = match Arc::clone(&self.fetch_admission).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return None,
+        };
+        let cell = match active.as_ref() {
+            Some(cell) => Arc::clone(cell),
+            None => {
+                let cell = Arc::new(InFlightFetch::new());
+                *active = Some(Arc::clone(&cell));
+                cell
+            }
+        };
+        Some(FetchAdmission {
+            _permit: permit,
+            cell,
+        })
+    }
+
+    fn retire_fetch(&self, cell: &Arc<InFlightFetch>) {
+        let mut active = lock_in_flight_fetch(&self.in_flight_fetch);
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, cell))
+        {
+            *active = None;
         }
-        let snapshot = self.cache.load();
-        let entry = snapshot.as_ref().as_ref()?;
-        (entry.completion_generation != admitted_generation).then(|| entry.clone())
     }
 
     fn cached_failure(&self) -> Option<FetchFailure> {
@@ -447,18 +479,10 @@ impl SpecExpose {
         failure
     }
 
-    fn record_success(&self, entry: &mut CachedSpec) {
-        let next_generation = self
-            .success_generation
-            .load(Ordering::Relaxed)
-            .wrapping_add(1);
-        entry.completion_generation = next_generation;
-        self.cache.store(Arc::new(Some(entry.clone())));
-        // Publish the generation only after its cache entry. A caller admitted
-        // during publication observes the preceding generation and safely
-        // shares this completion after it acquires the fetch lock.
-        self.success_generation
-            .store(next_generation, Ordering::Release);
+    fn record_success(&self, entry: &CachedSpec) {
+        if !self.cache_ttl.is_zero() {
+            self.cache.store(Arc::new(Some(entry.clone())));
+        }
         self.failure_cache.store(Arc::new(None));
         self.consecutive_failures.store(0, Ordering::Relaxed);
     }
@@ -559,7 +583,6 @@ impl SpecExpose {
             body,
             content_type,
             inserted_at: Instant::now(),
-            completion_generation: 0,
         };
 
         Ok(entry)
@@ -733,40 +756,50 @@ impl Plugin for SpecExpose {
             return failure.into_plugin_result();
         }
 
-        let admitted_generation = self.success_generation.load(Ordering::Acquire);
-
         // Admit only a fixed number of cache-miss callers. One performs the
         // fetch; the rest wait for the same completion. Excess callers receive
         // a stable retry signal immediately instead of joining an anonymous,
         // unbounded mutex queue.
-        let _admission = match Arc::clone(&self.fetch_admission).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                return fetch_busy_response();
-            }
+        let admission = match self.admit_fetch() {
+            Some(admission) => admission,
+            None => return fetch_busy_response(),
         };
-        let _guard = self.fetch_lock.lock().await;
 
-        // Re-check both outcomes after acquiring the single-flight lock: the
-        // preceding caller may have completed successfully or failed.
-        if let Some(entry) = self.cached_spec_after_admission(admitted_generation) {
+        // Re-check durable outcomes after joining the fetch group: a preceding
+        // caller may have completed between the lock-free lookup and admission.
+        if let Some(entry) = self.cached_spec() {
+            self.retire_fetch(&admission.cell);
             return spec_response(entry);
         }
         if let Some(failure) = self.cached_failure() {
+            self.retire_fetch(&admission.cell);
             return failure.into_plugin_result();
         }
 
-        let entry = match self.fetch_spec().await {
-            Ok(mut entry) => {
-                self.record_success(&mut entry);
-                entry
-            }
-            Err(failure) => {
-                return self.record_failure(failure).into_plugin_result();
-            }
-        };
+        let in_flight = Arc::clone(&admission.cell);
+        let outcome = admission
+            .cell
+            .get_or_init(|| async {
+                let outcome = match self.fetch_spec().await {
+                    Ok(entry) => {
+                        self.record_success(&entry);
+                        Ok(entry)
+                    }
+                    Err(failure) => Err(self.record_failure(failure)),
+                };
+                // Retire only after the outcome is fully built. Callers that
+                // registered earlier retain this cell; later zero-TTL callers
+                // create a fresh group and re-fetch.
+                self.retire_fetch(&in_flight);
+                outcome
+            })
+            .await
+            .clone();
 
-        spec_response(entry)
+        match outcome {
+            Ok(entry) => spec_response(entry),
+            Err(failure) => failure.into_plugin_result(),
+        }
     }
 
     async fn after_proxy(
@@ -828,5 +861,34 @@ fn fetch_busy_response() -> PluginResult {
         status_code: 503,
         body: Bytes::from_static(FETCH_BUSY_BODY),
         headers,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CachedSpec, SpecExpose};
+    use crate::plugins::PluginHttpClient;
+    use bytes::Bytes;
+    use tokio::time::Instant;
+
+    #[test]
+    fn zero_ttl_success_is_not_retained_in_durable_cache() {
+        let plugin = SpecExpose::new(
+            &serde_json::json!({
+                "spec_url": "http://example.com/openapi.yaml",
+                "cache_ttl_seconds": 0
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("zero-TTL spec expose config");
+        let entry = CachedSpec {
+            body: Bytes::from_static(b"openapi: 3.0.0\n"),
+            content_type: "application/yaml".to_string(),
+            inserted_at: Instant::now(),
+        };
+
+        plugin.record_success(&entry);
+
+        assert!(plugin.cache.load().as_ref().is_none());
     }
 }
