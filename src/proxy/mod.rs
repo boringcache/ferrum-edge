@@ -7319,9 +7319,8 @@ impl ProxyState {
                     // no-op: a same-path file replacement must atomically
                     // publish fresh geo readers even though every serialized
                     // config field and timestamp is unchanged.
-                    let country_mmdb_plugin_cache = self
-                        .plugin_cache
-                        .build_country_mmdb_reload_inner(
+                    let country_mmdb_plugin_cache =
+                        self.plugin_cache.build_country_mmdb_reload_inner(
                             &current.plugin_cache,
                             &new_config,
                             matches!(

@@ -557,7 +557,9 @@ fn non_runtime_full_loads_skip_node_local_plugin_files() {
     assert!(!control_plane.contains("CountryMmdbLoadSession"));
 
     let admin = include_str!("../../../src/admin/mod.rs");
-    let backup_start = admin.find("async fn handle_backup(").expect("backup handler");
+    let backup_start = admin
+        .find("async fn handle_backup(")
+        .expect("backup handler");
     let restore_start = admin[backup_start..]
         .find("async fn handle_restore(")
         .map(|offset| backup_start + offset)

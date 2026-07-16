@@ -45,8 +45,8 @@ mod inner {
         ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
         DeleteAllResourcesError, DeleteMode, FullConfigLoadPurpose, IncrementalResult,
         MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceResourceCounts,
-        NamespacedResourceId,
-        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
+        NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+        SnapshotDataIntegrityError, SortOrder,
     };
     use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
     use crate::config::types::{

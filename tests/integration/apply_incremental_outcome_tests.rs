@@ -296,10 +296,7 @@ fn test_env_config() -> ferrum_edge::config::EnvConfig {
 }
 
 fn proxy_state_with_config(config: GatewayConfig) -> ProxyState {
-    proxy_state_with_config_and_mode(
-        config,
-        ferrum_edge::config::env_config::OperatingMode::File,
-    )
+    proxy_state_with_config_and_mode(config, ferrum_edge::config::env_config::OperatingMode::File)
 }
 
 fn proxy_state_with_config_and_mode(
