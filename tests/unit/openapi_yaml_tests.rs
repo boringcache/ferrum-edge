@@ -993,10 +993,7 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         provider_properties["max_response_body_bytes"]["default"],
         8_388_608
     );
-    assert_eq!(
-        provider_properties["max_response_body_bytes"]["minimum"],
-        1
-    );
+    assert_eq!(provider_properties["max_response_body_bytes"]["minimum"], 1);
     assert_eq!(
         provider_properties["max_response_body_bytes"]["maximum"],
         67_108_864

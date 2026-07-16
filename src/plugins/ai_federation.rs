@@ -609,8 +609,7 @@ impl<'a> HalfOpenProbeGuard<'a> {
     /// circuit outcome, then disarm the cancellation fallback.
     fn release(&mut self) {
         if self.release_on_drop {
-            self.circuit
-                .release_probe(CircuitAdmission::HalfOpenProbe);
+            self.circuit.release_probe(CircuitAdmission::HalfOpenProbe);
             self.release_on_drop = false;
         }
     }
@@ -619,8 +618,7 @@ impl<'a> HalfOpenProbeGuard<'a> {
 impl Drop for HalfOpenProbeGuard<'_> {
     fn drop(&mut self) {
         if self.release_on_drop {
-            self.circuit
-                .release_probe(CircuitAdmission::HalfOpenProbe);
+            self.circuit.release_probe(CircuitAdmission::HalfOpenProbe);
         }
     }
 }
@@ -5952,8 +5950,8 @@ pub mod test_helpers {
         token_uri: String,
         http_client: PluginHttpClient,
     ) -> Result<String, (String, bool)> {
-        let mut cache = OAuth2Cache::new(service_account_json)
-            .map_err(|message| (message, false))?;
+        let mut cache =
+            OAuth2Cache::new(service_account_json).map_err(|message| (message, false))?;
         cache.token_uri = token_uri;
         let latency = AtomicU64::new(0);
         cache
@@ -5973,8 +5971,8 @@ pub mod test_helpers {
         service_account_json: String,
         http_client: PluginHttpClient,
     ) -> Result<String, (String, bool)> {
-        let mut cache = OAuth2Cache::new(service_account_json)
-            .map_err(|message| (message, false))?;
+        let mut cache =
+            OAuth2Cache::new(service_account_json).map_err(|message| (message, false))?;
         cache.private_key_pem = "invalid-test-key".to_string();
         let latency = AtomicU64::new(0);
         cache

@@ -258,9 +258,7 @@ plugin_configs:
         .await
         .expect("read metrics body");
     assert!(
-        !metrics.contains(
-            "ferrum_backend_duration_ms_count{proxy_id=\"federation-isolation\""
-        ),
+        !metrics.contains("ferrum_backend_duration_ms_count{proxy_id=\"federation-isolation\""),
         "provider latency must not be recorded as backend latency: {metrics}"
     );
 

@@ -416,7 +416,10 @@ async fn vertex_oauth_exchange_stops_at_64_kib_and_is_provider_availability_fail
     )
     .await
     .expect_err("forced local JWT key failure must fail before OAuth I/O");
-    assert!(message.contains("invalid RSA private key"), "got: {message}");
+    assert!(
+        message.contains("invalid RSA private key"),
+        "got: {message}"
+    );
     assert!(
         !circuit_failure,
         "local configuration/signing failures must not trip provider availability circuits"
@@ -1266,9 +1269,8 @@ fn malformed_stop_and_tool_shapes_fail_explicitly() {
             json!(""),
         ] {
             let request = tool_round_trip_request(stop);
-            let error =
-                test_helpers::translate_request_test(provider, &request, "model", &config)
-                    .unwrap_err();
+            let error = test_helpers::translate_request_test(provider, &request, "model", &config)
+                .unwrap_err();
             assert!(
                 error.contains("'stop'") || error.contains("stop sequence"),
                 "{provider} rejected through an unexpected path: {error}"
@@ -1278,13 +1280,9 @@ fn malformed_stop_and_tool_shapes_fail_explicitly() {
 
     let mut malformed = tool_round_trip_request(Value::Null);
     malformed["messages"][1]["tool_calls"][0]["function"]["arguments"] = json!("not-json");
-    let error = test_helpers::translate_request_test(
-        "google_gemini",
-        &malformed,
-        "gemini",
-        &json!({}),
-    )
-    .unwrap_err();
+    let error =
+        test_helpers::translate_request_test("google_gemini", &malformed, "gemini", &json!({}))
+            .unwrap_err();
     assert!(
         error.contains("tool_calls[0]") && error.contains("arguments are not valid JSON"),
         "malformed tool arguments rejected through an unexpected path: {error}"
@@ -3862,9 +3860,8 @@ async fn cancelled_half_open_dispatch_releases_the_real_provider_probe() {
             "success_threshold": 1
         }
     }]});
-    let plugin = Arc::new(
-        ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap(),
-    );
+    let plugin =
+        Arc::new(ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap());
     let request = json!({
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "hello"}]
