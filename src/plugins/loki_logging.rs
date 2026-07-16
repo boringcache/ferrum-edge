@@ -1045,10 +1045,7 @@ async fn send_batch_once(
     classify_loki_response(status, drain)
 }
 
-fn classify_loki_response(
-    status: http::StatusCode,
-    drain: LokiDrainOutcome,
-) -> LokiAttemptOutcome {
+fn classify_loki_response(status: http::StatusCode, drain: LokiDrainOutcome) -> LokiAttemptOutcome {
     if status.as_u16() == 204 {
         // A received 204 is Loki's committed success signal. Retrying merely
         // because connection cleanup failed can duplicate an already-ingested

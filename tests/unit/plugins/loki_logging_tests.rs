@@ -908,11 +908,12 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
             .unwrap()
         })
         .collect::<Vec<_>>();
-    assert!(
-        lines
-            .iter()
-            .any(|line| line["request_path"].as_str().unwrap().contains("first-budget-canary"))
-    );
+    assert!(lines.iter().any(|line| {
+        line["request_path"]
+            .as_str()
+            .unwrap()
+            .contains("first-budget-canary")
+    }));
     assert!(lines.iter().any(|line| {
         line["request_path"]
             .as_str()
