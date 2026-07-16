@@ -1704,6 +1704,143 @@ fn assert_component_validity(
     );
 }
 
+#[tokio::test]
+async fn loki_logging_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::loki_logging::{
+        LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES, LOKI_LOGGING_CONFIG_KEYS,
+        LOKI_MAX_BUFFER_MAX_BYTES, LOKI_MAX_CUSTOM_HEADER_NAME_BYTES, LOKI_MAX_MAX_ENTRY_BYTES,
+        LOKI_MAX_RETRIES, LOKI_MAX_RETRY_DELAY_MS, LokiLogging,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/LokiLoggingConfig")
+        .expect("LokiLoggingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["labels"]["additionalProperties"]["type"],
+        "string"
+    );
+    assert!(schema["properties"]["custom_headers"]["additionalProperties"].is_object());
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("Loki properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = LOKI_LOGGING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "Loki runtime/OpenAPI key drift");
+    assert_eq!(
+        schema["properties"]["max_entry_bytes"]["default"],
+        json!(LOKI_DEFAULT_MAX_ENTRY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["max_entry_bytes"]["maximum"],
+        json!(LOKI_MAX_MAX_ENTRY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["buffer_max_bytes"]["default"],
+        json!(LOKI_DEFAULT_BUFFER_MAX_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["buffer_max_bytes"]["maximum"],
+        json!(LOKI_MAX_BUFFER_MAX_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["max_retries"]["maximum"],
+        json!(LOKI_MAX_RETRIES)
+    );
+    assert_eq!(
+        schema["properties"]["retry_delay_ms"]["maximum"],
+        json!(LOKI_MAX_RETRY_DELAY_MS)
+    );
+    assert_eq!(
+        schema["properties"]["custom_headers"]["propertyNames"]["maxLength"],
+        json!(LOKI_MAX_CUSTOM_HEADER_NAME_BYTES)
+    );
+
+    let valid = json!({
+        "endpoint_url": "HTTPS://logs.example.com/loki/api/v1/push?tenant=dynamic",
+        "authorization_header": "Bearer test",
+        "custom_headers": {"X-Scope-OrgID": "tenant-a", "X-Dynamic": "value"},
+        "labels": {"service": "edge", "tenant_name": "tenant-a"},
+        "include_proxy_id_label": false,
+        "include_status_class_label": true,
+        "gzip": false,
+        "batch_size": 10000,
+        "flush_interval_ms": 100,
+        "buffer_capacity": 1000000,
+        "max_entry_bytes": LOKI_MAX_MAX_ENTRY_BYTES,
+        "buffer_max_bytes": LOKI_MAX_BUFFER_MAX_BYTES,
+        "max_retries": LOKI_MAX_RETRIES,
+        "retry_delay_ms": LOKI_MAX_RETRY_DELAY_MS,
+        "schema": {}
+    });
+    assert_component_validity(&spec, "LokiLoggingConfig", &valid, true);
+    assert!(LokiLogging::new(&valid, PluginHttpClient::default()).is_ok());
+    let valid_minima = json!({
+        "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
+        "labels": {"_a": ""},
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "buffer_capacity": 1,
+        "max_entry_bytes": 2048,
+        "buffer_max_bytes": 2048,
+        "max_retries": 0,
+        "retry_delay_ms": 1
+    });
+    assert_component_validity(&spec, "LokiLoggingConfig", &valid_minima, true);
+    assert!(LokiLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let mut invalid = vec![
+        json!({"endpoint_url": "https://logs.example.com/push", "endpont_url": "typo"}),
+        json!({"endpoint_url": "https://user:secret@logs.example.com/push"}),
+        json!({"endpoint_url": "https://logs.example.com/push", "labels": {"__tenant": "x"}}),
+        json!({"endpoint_url": "https://logs.example.com/push", "labels": {"ferrum_emitter": "x"}}),
+        json!({"endpoint_url": "https://logs.example.com/push", "labels": {"tenant": "x".repeat(2049)}}),
+        json!({"endpoint_url": "https://logs.example.com/push", "authorization_header": "   "}),
+        json!({"endpoint_url": "https://logs.example.com/push", "authorization_header": " Bearer test"}),
+        json!({"endpoint_url": "https://logs.example.com/push", "authorization_header": "Bearer test\t"}),
+        json!({"endpoint_url": "https://logs.example.com/push", "custom_headers": {"Bad Header": "x"}}),
+        json!({"endpoint_url": "https://logs.example.com/push", "custom_headers": {"X-Bad": "bad\nvalue"}}),
+        json!({"endpoint_url": "https://logs.example.com/push", "batch_size": 10001}),
+        json!({"endpoint_url": "https://logs.example.com/push", "flush_interval_ms": 99}),
+        json!({"endpoint_url": "https://logs.example.com/push", "buffer_capacity": 1000001}),
+        json!({"endpoint_url": "https://logs.example.com/push", "max_retries": 11}),
+        json!({"endpoint_url": "https://logs.example.com/push", "retry_delay_ms": 0}),
+        json!({"endpoint_url": "https://logs.example.com/push", "max_entry_bytes": 1023}),
+        json!({"endpoint_url": "https://logs.example.com/push", "buffer_max_bytes": 268435457}),
+    ];
+    let oversized_header_name = "x".repeat(LOKI_MAX_CUSTOM_HEADER_NAME_BYTES + 1);
+    let mut oversized_headers = serde_json::Map::new();
+    oversized_headers.insert(oversized_header_name, json!("value"));
+    invalid.push(json!({
+        "endpoint_url": "https://logs.example.com/push",
+        "custom_headers": oversized_headers
+    }));
+    for key in LOKI_LOGGING_CONFIG_KEYS {
+        let mut config = json!({"endpoint_url": "https://logs.example.com/push"});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert((*key).to_string(), serde_json::Value::Null);
+        invalid.push(config);
+    }
+    for config in invalid {
+        assert_component_validity(&spec, "LokiLoggingConfig", &config, false);
+        assert!(
+            LokiLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid Loki config: {config}"
+        );
+    }
+}
+
 #[test]
 fn ip_restriction_schema_matches_the_strict_runtime_shape() {
     use ferrum_edge::plugins::ip_restriction::IpRestriction;
