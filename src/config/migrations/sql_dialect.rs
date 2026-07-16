@@ -100,9 +100,8 @@ impl V001SqlBuilder {
     /// policy). The migration runner skips V001 entirely once version 1 is
     /// recorded, so a table added to V001 here would never be created on an
     /// already-initialized database — yet the proxy persistence path writes to
-    /// `proxy_route_locks` on proxy writes and `mtls_dns_admission_locks` on
-    /// every Consumer/plugin/association write. Re-running this idempotent
-    /// `CREATE TABLE IF NOT EXISTS` pass on every
+    /// `proxy_route_locks` on every create/update/batch/API-spec proxy write.
+    /// Re-running this idempotent `CREATE TABLE IF NOT EXISTS` pass on every
     /// startup guarantees the table exists regardless of whether V001 was
     /// recorded before or after it was folded in. Every statement here must be
     /// idempotent (no error on re-run) so the pass is safe on fresh databases
@@ -112,9 +111,6 @@ impl V001SqlBuilder {
         connection: &mut AnyConnection,
     ) -> Result<(), anyhow::Error> {
         sqlx::query(self.create_proxy_route_locks_sql())
-            .execute(&mut *connection)
-            .await?;
-        sqlx::query(self.create_mtls_dns_admission_locks_sql())
             .execute(&mut *connection)
             .await?;
         sqlx::query(self.create_config_change_locks_sql())
@@ -693,20 +689,23 @@ impl V001SqlBuilder {
     /// validate the effective `san_dns` policy against that transaction's
     /// authoritative snapshot. This preserves exact semantics while no DNS
     /// policy is effective without leaving a cross-process TOCTOU window when
-    /// one is enabled.
+    /// one is enabled. `restore_owner` is a logical fence that persists across
+    /// every transaction in a compensating restore replay.
     fn create_mtls_dns_admission_locks_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS mtls_dns_admission_locks (
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
-                updated_at VARCHAR(64) NOT NULL
+                updated_at VARCHAR(64) NOT NULL,
+                restore_owner VARCHAR(36) COLLATE utf8mb4_0900_as_cs NULL
             )
             "#
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS mtls_dns_admission_locks (
                 namespace TEXT PRIMARY KEY,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                restore_owner TEXT NULL
             )
             "#
         }
@@ -1199,6 +1198,10 @@ mod tests {
                 sql.contains("namespace") && sql.contains("PRIMARY KEY"),
                 "{dialect} must serialize mTLS DNS admission per namespace"
             );
+            assert!(
+                sql.contains("restore_owner"),
+                "{dialect} must persist the whole-rollback guard owner"
+            );
         }
     }
 
@@ -1340,7 +1343,11 @@ mod tests {
     fn test_mysql_mtls_dns_admission_locks_collation_on_namespace() {
         let builder = V001SqlBuilder::new("mysql");
         let sql = builder.create_mtls_dns_admission_locks_sql();
-        assert_columns_have_collation(sql, "mtls_dns_admission_locks", &["namespace"]);
+        assert_columns_have_collation(
+            sql,
+            "mtls_dns_admission_locks",
+            &["namespace", "restore_owner"],
+        );
     }
 
     #[test]

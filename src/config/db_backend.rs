@@ -14,21 +14,28 @@ use std::collections::HashSet;
 pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
     "A proxy with overlapping hosts and listen_path already exists";
 
-/// Whether restore-oriented plugin batches run normal mTLS DNS admission.
+/// Whether restore-oriented batches run normal mTLS DNS admission.
 ///
 /// `RestoreRollbackReplay` is intentionally narrow: it may only replay the
 /// exact raw snapshot captured immediately before a destructive restore. That
 /// snapshot can contain a pre-existing ambiguity the normal runtime rejects,
 /// so validating it during rollback could destroy the operator's prior state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchConfigWriteMode {
     Admission,
-    RestoreRollbackReplay,
+    RestoreRollbackReplay { guard_owner: String },
 }
 
 impl BatchConfigWriteMode {
-    pub(crate) fn validates_mtls_dns(self) -> bool {
-        self == Self::Admission
+    pub(crate) fn validates_mtls_dns(&self) -> bool {
+        matches!(self, Self::Admission)
+    }
+
+    pub(crate) fn guard_owner(&self) -> Option<&str> {
+        match self {
+            Self::Admission => None,
+            Self::RestoreRollbackReplay { guard_owner } => Some(guard_owner),
+        }
     }
 }
 
@@ -722,21 +729,30 @@ pub trait DatabaseBackend: Send + Sync {
     // Batch operations
     // -----------------------------------------------------------------------
 
-    async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error>;
+    async fn batch_create_proxies(
+        &self,
+        proxies: &[Proxy],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error>;
     async fn batch_create_proxies_without_plugins(
         &self,
         proxies: &[Proxy],
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error>;
     async fn batch_attach_proxy_plugins(
         &self,
         proxies: &[Proxy],
-        mode: BatchConfigWriteMode,
+        mode: &BatchConfigWriteMode,
     ) -> Result<(), anyhow::Error>;
-    async fn batch_create_consumers(&self, consumers: &[Consumer]) -> Result<usize, anyhow::Error>;
+    async fn batch_create_consumers(
+        &self,
+        consumers: &[Consumer],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error>;
     async fn batch_create_plugin_configs(
         &self,
         configs: &[PluginConfig],
-        mode: BatchConfigWriteMode,
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error>;
     async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error>;
     /// Clear all resources in a namespace and report the mode that actually ran.
@@ -753,7 +769,24 @@ pub trait DatabaseBackend: Send + Sync {
     async fn delete_all_resources(
         &self,
         namespace: &str,
+        mode: &BatchConfigWriteMode,
     ) -> Result<DeleteMode, DeleteAllResourcesError>;
+
+    /// Block DNS-sensitive writers across a complete restore rollback replay.
+    /// The returned opaque owner must be supplied through
+    /// [`BatchConfigWriteMode::RestoreRollbackReplay`] until release.
+    async fn acquire_restore_rollback_guard(
+        &self,
+        namespace: &str,
+    ) -> Result<String, anyhow::Error>;
+
+    /// Release only the guard owned by `guard_owner`. An owner mismatch must
+    /// fail closed rather than unblocking another rollback.
+    async fn release_restore_rollback_guard(
+        &self,
+        namespace: &str,
+        guard_owner: &str,
+    ) -> Result<(), anyhow::Error>;
 
     // -----------------------------------------------------------------------
     // Connection lifecycle (called from polling loops)

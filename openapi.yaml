@@ -3217,8 +3217,11 @@ paths:
         **Replacement operation** — snapshots the current namespace, deletes
         all existing resources, and imports the provided configuration. If any
         import (or the delete) step fails, Ferrum clears the partial state and
-        reapplies the snapshot. Requires `?confirm=true` query parameter to
-        prevent accidental invocation.
+        reapplies the snapshot. One persistent namespace-scoped datastore guard
+        spans that compensating clear and every replay batch, so other
+        DNS-sensitive writers cannot interleave with the rollback-only raw
+        replay. Requires `?confirm=true` query parameter to prevent accidental
+        invocation.
 
         The recovery snapshot uses a **non-validating raw load** from the
         primary, so an already-invalid-but-present namespace (the case an

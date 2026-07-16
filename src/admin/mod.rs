@@ -3139,14 +3139,14 @@ async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
     halt_on_error: bool,
-    mode: BatchConfigWriteMode,
+    mode: &BatchConfigWriteMode,
 ) -> (PersistCounts, Vec<String>) {
     let mut counts = PersistCounts::default();
     let mut errors = Vec::new();
     let should_continue = |errors: &[String]| !halt_on_error || errors.is_empty();
 
     if should_continue(&errors) && !payload.consumers.is_empty() {
-        match db.batch_create_consumers(&payload.consumers).await {
+        match db.batch_create_consumers(&payload.consumers, mode).await {
             Ok(n) => counts.consumers = n,
             Err(e) => errors.push(format!(
                 "consumers: {}",
@@ -3162,7 +3162,7 @@ async fn persist_payload_resources(
     }
     if should_continue(&errors) && !payload.proxies.is_empty() {
         match db
-            .batch_create_proxies_without_plugins(&payload.proxies)
+            .batch_create_proxies_without_plugins(&payload.proxies, mode)
             .await
         {
             Ok(n) => counts.proxies = n,
@@ -3193,20 +3193,26 @@ async fn rollback_failed_restore(
     namespace: &str,
     snapshot: &RestorePayload,
 ) -> Result<(), Vec<String>> {
-    if let Err(error) = db.delete_all_resources(namespace).await {
-        return Err(vec![format!(
-            "failed to clear partially imported config: {}",
-            error
-        )]);
+    let guard_owner = db
+        .acquire_restore_rollback_guard(namespace)
+        .await
+        .map_err(|error| vec![format!("failed to acquire rollback guard: {error}")])?;
+    let mode = BatchConfigWriteMode::RestoreRollbackReplay {
+        guard_owner: guard_owner.clone(),
+    };
+    let mut errors = Vec::new();
+    if let Err(error) = db.delete_all_resources(namespace, &mode).await {
+        errors.push(format!("failed to clear partially imported config: {error}"));
+    } else {
+        let (_, persist_errors) = persist_payload_resources(db, snapshot, false, &mode).await;
+        errors.extend(persist_errors);
     }
-
-    let (_, errors) = persist_payload_resources(
-        db,
-        snapshot,
-        false,
-        BatchConfigWriteMode::RestoreRollbackReplay,
-    )
-    .await;
+    if let Err(error) = db
+        .release_restore_rollback_guard(namespace, &guard_owner)
+        .await
+    {
+        errors.push(format!("failed to release rollback guard: {error}"));
+    }
     if errors.is_empty() {
         Ok(())
     } else {
@@ -4595,7 +4601,7 @@ async fn handle_batch_create(
         db.as_ref(),
         &batch,
         true,
-        BatchConfigWriteMode::Admission,
+        &BatchConfigWriteMode::Admission,
     )
     .await;
 
@@ -5030,7 +5036,10 @@ async fn handle_restore(
 
     // Phase 3: Delete all existing resources in the namespace (safe: payload is
     // validated and the prior state has been snapshotted from the primary above).
-    if let Err(e) = db.delete_all_resources(namespace).await {
+    if let Err(e) = db
+        .delete_all_resources(namespace, &BatchConfigWriteMode::Admission)
+        .await
+    {
         error!("Restore: failed to delete existing resources: {}", e);
         if e.mode().is_atomic() {
             if e.has_unknown_commit_result() {
@@ -5115,7 +5124,7 @@ async fn handle_restore(
         db.as_ref(),
         &payload,
         false,
-        BatchConfigWriteMode::Admission,
+        &BatchConfigWriteMode::Admission,
     )
     .await;
 

@@ -362,13 +362,16 @@ mod inner {
         label: &'static str,
         owner: String,
         // The update mode chosen at acquisition, carried so release/diagnostics
-        // stay consistent with how acquire/renew stamped the lock. Release is a
-        // mode-independent `delete_one` by `_id`+`owner`, so it needs no branch.
+        // stay consistent with how acquire/renew stamped the lock and so
+        // security-sensitive lock deletion requests majority acknowledgement.
         mode: MongoLockMode,
         stop_tx: Option<tokio::sync::watch::Sender<bool>>,
         renew_task: Option<tokio::task::JoinHandle<()>>,
         valid: Arc<AtomicBool>,
         released: bool,
+        // A replay operation borrows the outer rollback guard and must never
+        // delete it when the individual batch finishes.
+        delete_on_release: bool,
         // Keeps the live connection bundle — and the generated TLS PEM temp
         // files it owns — alive for as long as the reusable lease client may
         // open new sockets, including the best-effort Drop cleanup task.
@@ -376,7 +379,16 @@ mod inner {
     }
 
     impl MongoLockGuard {
+        fn into_persistent_owner(mut self) -> String {
+            self.released = true;
+            self.owner.clone()
+        }
+
         async fn release(&mut self) -> Result<(), anyhow::Error> {
+            if !self.delete_on_release {
+                self.released = true;
+                return Ok(());
+            }
             if let Some(stop_tx) = self.stop_tx.take() {
                 let _ = stop_tx.send(true);
             }
@@ -387,19 +399,38 @@ mod inner {
                 })?;
             }
 
-            // Release is mode-independent: the owning document is deleted by
-            // `_id`+`owner` regardless of how acquire/renew stamped it.
+            // Every release is owner-qualified. Security-sensitive admission
+            // locks additionally require majority acknowledgement so an
+            // election cannot revive stale ownership.
             debug!(
                 "Releasing MongoDB {} lease '{}' (mode={:?})",
                 self.label, self.lock_id, self.mode
             );
-            let result = self
-                .collection
-                .delete_one(doc! {
-                    "_id": &self.lock_id,
-                    "owner": &self.owner,
-                })
-                .await?;
+            let delete = self.collection.delete_one(doc! {
+                "_id": &self.lock_id,
+                "owner": &self.owner,
+            });
+            let result = match self.mode {
+                MongoLockMode::RenewableLease(_) => delete.await,
+                MongoLockMode::UntilExplicitRelease => {
+                    delete.write_concern(WriteConcern::majority()).await
+                }
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(error) if self.mode == MongoLockMode::UntilExplicitRelease => {
+                    // The protected mutation is already committed at every
+                    // admission call site. Report cleanup trouble loudly and
+                    // let Drop retry, but do not turn durable success into a
+                    // false failed response that suppresses hooks/audit.
+                    error!(
+                        "MongoDB {} lock '{}' cleanup failed after a committed operation: {}",
+                        self.label, self.lock_id, error
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
             self.released = true;
             if !self.valid.load(Ordering::Acquire) {
                 anyhow::bail!(
@@ -409,6 +440,13 @@ mod inner {
                 );
             }
             if result.deleted_count != 1 {
+                if self.mode == MongoLockMode::UntilExplicitRelease {
+                    error!(
+                        "MongoDB {} lock '{}' cleanup did not match its owner after a committed operation",
+                        self.label, self.lock_id
+                    );
+                    return Ok(());
+                }
                 anyhow::bail!(
                     "MongoDB {} lease '{}' release did not match the owning document",
                     self.label,
@@ -421,7 +459,7 @@ mod inner {
 
     impl Drop for MongoLockGuard {
         fn drop(&mut self) {
-            if self.released {
+            if self.released || !self.delete_on_release {
                 return;
             }
             if let Some(stop_tx) = self.stop_tx.take() {
@@ -432,6 +470,7 @@ mod inner {
             let lock_id = self.lock_id.clone();
             let owner = self.owner.clone();
             let renew_task = self.renew_task.take();
+            let majority = self.mode == MongoLockMode::UntilExplicitRelease;
             // Keep the bundle (and its TLS temp files) alive for the whole
             // best-effort cleanup so the dedicated lease client can still open
             // a socket even if the store's bundle was already swapped/dropped.
@@ -442,12 +481,15 @@ mod inner {
                     if let Some(renew_task) = renew_task {
                         let _ = renew_task.await;
                     }
-                    let _ = collection
-                        .delete_one(doc! {
-                            "_id": lock_id,
-                            "owner": owner,
-                        })
-                        .await;
+                    let delete = collection.delete_one(doc! {
+                        "_id": lock_id,
+                        "owner": owner,
+                    });
+                    if majority {
+                        let _ = delete.write_concern(WriteConcern::majority()).await;
+                    } else {
+                        let _ = delete.await;
+                    }
                 });
             }
         }
@@ -1278,10 +1320,23 @@ mod inner {
             &self,
             namespace: &str,
         ) -> Result<MongoLockGuard, anyhow::Error> {
+            self.acquire_mtls_dns_admission_lease_for_mode(
+                namespace,
+                &BatchConfigWriteMode::Admission,
+            )
+            .await
+        }
+
+        async fn acquire_mtls_dns_admission_lease_for_mode(
+            &self,
+            namespace: &str,
+            mode: &BatchConfigWriteMode,
+        ) -> Result<MongoLockGuard, anyhow::Error> {
             self.acquire_durable_admission_lock(
                 "mtls_dns_admission_locks",
                 namespace,
                 "mTLS DNS admission",
+                mode.guard_owner(),
             )
             .await
         }
@@ -1290,12 +1345,27 @@ mod inner {
             &self,
             namespaces: impl IntoIterator<Item = &'a str>,
         ) -> Result<Vec<MongoLockGuard>, anyhow::Error> {
+            self.acquire_mtls_dns_admission_leases_for_mode(
+                namespaces,
+                &BatchConfigWriteMode::Admission,
+            )
+            .await
+        }
+
+        async fn acquire_mtls_dns_admission_leases_for_mode<'a>(
+            &self,
+            namespaces: impl IntoIterator<Item = &'a str>,
+            mode: &BatchConfigWriteMode,
+        ) -> Result<Vec<MongoLockGuard>, anyhow::Error> {
             let mut namespaces: Vec<&str> = namespaces.into_iter().collect();
             namespaces.sort_unstable();
             namespaces.dedup();
             let mut leases = Vec::with_capacity(namespaces.len());
             for namespace in namespaces {
-                leases.push(self.acquire_mtls_dns_admission_lease(namespace).await?);
+                leases.push(
+                    self.acquire_mtls_dns_admission_lease_for_mode(namespace, mode)
+                        .await?,
+                );
             }
             Ok(leases)
         }
@@ -1331,6 +1401,7 @@ mod inner {
             collection_name: &str,
             lock_id: &str,
             label: &'static str,
+            guard_owner: Option<&str>,
         ) -> Result<MongoLockGuard, anyhow::Error> {
             // A TTL lease is not a write fence on standalone MongoDB: a paused
             // process could resume after expiry and write concurrently with a
@@ -1344,8 +1415,44 @@ mod inner {
                 .lease_client
                 .database(connection.db.name())
                 .collection::<Document>(collection_name);
-            let owner = Uuid::new_v4().to_string();
+            let owner = guard_owner
+                .map(str::to_string)
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
             let lock_id = lock_id.to_string();
+
+            if guard_owner.is_some() {
+                let client_now = BsonDateTime::now();
+                let document = collection
+                    .find_one_and_update(
+                        doc! { "_id": &lock_id, "owner": &owner },
+                        doc! { "$set": { "updated_at": client_now } },
+                    )
+                    .return_document(ReturnDocument::After)
+                    .write_concern(WriteConcern::majority())
+                    .await?;
+                if document
+                    .as_ref()
+                    .and_then(|document| document.get_str("owner").ok())
+                    != Some(owner.as_str())
+                {
+                    anyhow::bail!(
+                        "MongoDB {label} rollback guard '{lock_id}' is not owned by this replay"
+                    );
+                }
+                return Ok(MongoLockGuard {
+                    collection,
+                    lock_id,
+                    label,
+                    owner,
+                    mode: MongoLockMode::UntilExplicitRelease,
+                    stop_tx: None,
+                    renew_task: None,
+                    valid: Arc::new(AtomicBool::new(true)),
+                    released: false,
+                    delete_on_release: false,
+                    _connection: connection,
+                });
+            }
             let deadline = tokio::time::Instant::now() + MONGO_ADMISSION_LOCK_WAIT_TIMEOUT;
 
             loop {
@@ -1357,6 +1464,7 @@ mod inner {
                     )
                     .upsert(true)
                     .return_document(ReturnDocument::After)
+                    .write_concern(WriteConcern::majority())
                     .await;
 
                 match result {
@@ -1373,6 +1481,7 @@ mod inner {
                             renew_task: None,
                             valid: Arc::new(AtomicBool::new(true)),
                             released: false,
+                            delete_on_release: true,
                             _connection: connection,
                         });
                     }
@@ -1588,6 +1697,7 @@ mod inner {
                 renew_task: Some(renew_task),
                 valid,
                 released: false,
+                delete_on_release: true,
                 _connection: connection,
             })
         }
@@ -6510,29 +6620,36 @@ mod inner {
         // Batch operations
         // -------------------------------------------------------------------
 
-        async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
+        async fn batch_create_proxies(
+            &self,
+            proxies: &[Proxy],
+            mode: &BatchConfigWriteMode,
+        ) -> Result<usize, anyhow::Error> {
             if proxies.is_empty() {
                 return Ok(0);
             }
             let mut mtls_leases = self
-                .acquire_mtls_dns_admission_leases(
+                .acquire_mtls_dns_admission_leases_for_mode(
                     proxies.iter().map(|proxy| proxy.namespace.as_str()),
+                    mode,
                 )
                 .await?;
-            let namespaces: HashSet<&str> = proxies
-                .iter()
-                .map(|proxy| proxy.namespace.as_str())
-                .collect();
-            for namespace in namespaces {
-                self.validate_mtls_dns_candidate(namespace, |candidate| {
-                    candidate.proxies.extend(
-                        proxies
-                            .iter()
-                            .filter(|proxy| proxy.namespace == namespace)
-                            .cloned(),
-                    );
-                })
-                .await?;
+            if mode.validates_mtls_dns() {
+                let namespaces: HashSet<&str> = proxies
+                    .iter()
+                    .map(|proxy| proxy.namespace.as_str())
+                    .collect();
+                for namespace in namespaces {
+                    self.validate_mtls_dns_candidate(namespace, |candidate| {
+                        candidate.proxies.extend(
+                            proxies
+                                .iter()
+                                .filter(|proxy| proxy.namespace == namespace)
+                                .cloned(),
+                        );
+                    })
+                    .await?;
+                }
             }
             let docs: Vec<Document> = proxies.iter().map(proxy_to_doc).collect::<Result<_, _>>()?;
             if self.replica_set_configured() {
@@ -6618,17 +6735,18 @@ mod inner {
         async fn batch_create_proxies_without_plugins(
             &self,
             proxies: &[Proxy],
+            mode: &BatchConfigWriteMode,
         ) -> Result<usize, anyhow::Error> {
             // In MongoDB, plugins are embedded in the proxy document, so this
             // is the same as batch_create_proxies. The distinction only matters
             // for the SQL backend where plugin associations are in a junction table.
-            self.batch_create_proxies(proxies).await
+            self.batch_create_proxies(proxies, mode).await
         }
 
         async fn batch_attach_proxy_plugins(
             &self,
             _proxies: &[Proxy],
-            _mode: BatchConfigWriteMode,
+            _mode: &BatchConfigWriteMode,
         ) -> Result<(), anyhow::Error> {
             // No-op for MongoDB — plugins are embedded in the proxy document.
             // The SQL backend uses this to populate the proxy_plugins junction table.
@@ -6638,29 +6756,33 @@ mod inner {
         async fn batch_create_consumers(
             &self,
             consumers: &[Consumer],
+            mode: &BatchConfigWriteMode,
         ) -> Result<usize, anyhow::Error> {
             if consumers.is_empty() {
                 return Ok(0);
             }
             let mut mtls_leases = self
-                .acquire_mtls_dns_admission_leases(
+                .acquire_mtls_dns_admission_leases_for_mode(
                     consumers.iter().map(|consumer| consumer.namespace.as_str()),
+                    mode,
                 )
                 .await?;
-            let namespaces: HashSet<&str> = consumers
-                .iter()
-                .map(|consumer| consumer.namespace.as_str())
-                .collect();
-            for namespace in namespaces {
-                self.validate_mtls_dns_candidate(namespace, |candidate| {
-                    candidate.consumers.extend(
-                        consumers
-                            .iter()
-                            .filter(|consumer| consumer.namespace == namespace)
-                            .cloned(),
-                    );
-                })
-                .await?;
+            if mode.validates_mtls_dns() {
+                let namespaces: HashSet<&str> = consumers
+                    .iter()
+                    .map(|consumer| consumer.namespace.as_str())
+                    .collect();
+                for namespace in namespaces {
+                    self.validate_mtls_dns_candidate(namespace, |candidate| {
+                        candidate.consumers.extend(
+                            consumers
+                                .iter()
+                                .filter(|consumer| consumer.namespace == namespace)
+                                .cloned(),
+                        );
+                    })
+                    .await?;
+                }
             }
             let docs: Vec<Document> = consumers
                 .iter()
@@ -6813,14 +6935,15 @@ mod inner {
         async fn batch_create_plugin_configs(
             &self,
             configs: &[PluginConfig],
-            mode: BatchConfigWriteMode,
+            mode: &BatchConfigWriteMode,
         ) -> Result<usize, anyhow::Error> {
             if configs.is_empty() {
                 return Ok(0);
             }
             let mut mtls_leases = self
-                .acquire_mtls_dns_admission_leases(
+                .acquire_mtls_dns_admission_leases_for_mode(
                     configs.iter().map(|config| config.namespace.as_str()),
+                    mode,
                 )
                 .await?;
             if mode.validates_mtls_dns() {
@@ -7024,6 +7147,7 @@ mod inner {
         async fn delete_all_resources(
             &self,
             namespace: &str,
+            write_mode: &BatchConfigWriteMode,
         ) -> Result<DeleteMode, DeleteAllResourcesError> {
             // Capture the topology-dependent mode exactly once. This same value
             // selects the implementation branch and is returned on success or
@@ -7036,7 +7160,7 @@ mod inner {
             };
             let delete_error = |source: anyhow::Error| DeleteAllResourcesError::new(mode, source);
             let mut mtls_lease = self
-                .acquire_mtls_dns_admission_lease(namespace)
+                .acquire_mtls_dns_admission_lease_for_mode(namespace, write_mode)
                 .await
                 .map_err(&delete_error)?;
             let ns_filter = doc! { "namespace": namespace };
@@ -7240,6 +7364,35 @@ mod inner {
             mtls_lease.release().await.map_err(&delete_error)?;
             info!("All MongoDB resources deleted (namespace='{}')", namespace);
             Ok(mode)
+        }
+
+        async fn acquire_restore_rollback_guard(
+            &self,
+            namespace: &str,
+        ) -> Result<String, anyhow::Error> {
+            let guard = self.acquire_mtls_dns_admission_lease(namespace).await?;
+            Ok(guard.into_persistent_owner())
+        }
+
+        async fn release_restore_rollback_guard(
+            &self,
+            namespace: &str,
+            guard_owner: &str,
+        ) -> Result<(), anyhow::Error> {
+            let connection = self.connection();
+            let result = connection
+                .lease_client
+                .database(connection.db.name())
+                .collection::<Document>("mtls_dns_admission_locks")
+                .delete_one(doc! { "_id": namespace, "owner": guard_owner })
+                .write_concern(WriteConcern::majority())
+                .await?;
+            if result.deleted_count != 1 {
+                anyhow::bail!(
+                    "MongoDB mTLS DNS restore rollback guard ownership was lost for namespace '{namespace}'"
+                );
+            }
+            Ok(())
         }
 
         // -------------------------------------------------------------------

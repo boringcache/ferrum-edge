@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
@@ -865,6 +866,16 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
+        self.lock_mtls_dns_admission_for_owner_tx(tx, namespace, None)
+            .await
+    }
+
+    async fn lock_mtls_dns_admission_for_owner_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        allowed_restore_owner: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
         let now = Utc::now().to_rfc3339();
         let insert_sql = self.mtls_dns_admission_lock_insert_sql();
         sqlx::query(&insert_sql)
@@ -873,7 +884,7 @@ impl DatabaseStore {
             .execute(&mut **tx)
             .await?;
 
-        if self.db_type == "sqlite" {
+        let restore_owner = if self.db_type == "sqlite" {
             // SQLite has no SELECT ... FOR UPDATE. This write takes the
             // database writer lock inside the same transaction that will
             // persist and validate the candidate.
@@ -884,15 +895,79 @@ impl DatabaseStore {
             .bind(namespace)
             .execute(&mut **tx)
             .await?;
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT restore_owner FROM mtls_dns_admission_locks WHERE namespace = ?",
+            )
+            .bind(namespace)
+            .fetch_one(&mut **tx)
+            .await?
         } else {
-            let lock_sql = self.q("SELECT namespace FROM mtls_dns_admission_locks \
+            let lock_sql = self.q("SELECT restore_owner FROM mtls_dns_admission_locks \
                  WHERE namespace = ? FOR UPDATE");
-            sqlx::query(&lock_sql)
+            sqlx::query_scalar::<_, Option<String>>(&lock_sql)
                 .bind(namespace)
-                .fetch_optional(&mut **tx)
-                .await?;
+                .fetch_one(&mut **tx)
+                .await?
+        };
+
+        match (restore_owner.as_deref(), allowed_restore_owner) {
+            (None, None) => {}
+            (Some(actual), Some(allowed)) if actual == allowed => {}
+            (Some(_), _) => anyhow::bail!(
+                "mTLS DNS admission is blocked while restore rollback replays namespace '{namespace}'"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "mTLS DNS restore rollback guard ownership was lost for namespace '{namespace}'"
+            ),
         }
 
+        Ok(())
+    }
+
+    async fn acquire_restore_rollback_guard_inner(
+        &self,
+        namespace: &str,
+    ) -> Result<String, anyhow::Error> {
+        let owner = Uuid::new_v4().to_string();
+        let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
+        let result = sqlx::query(&self.q(
+            "UPDATE mtls_dns_admission_locks SET restore_owner = ?, updated_at = ? \
+             WHERE namespace = ? AND restore_owner IS NULL",
+        ))
+        .bind(&owner)
+        .bind(Utc::now().to_rfc3339())
+        .bind(namespace)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            anyhow::bail!("failed to claim mTLS DNS restore rollback guard");
+        }
+        tx.commit().await?;
+        Ok(owner)
+    }
+
+    async fn release_restore_rollback_guard_inner(
+        &self,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<(), anyhow::Error> {
+        let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, Some(owner))
+            .await?;
+        let result = sqlx::query(&self.q(
+            "UPDATE mtls_dns_admission_locks SET restore_owner = NULL, updated_at = ? \
+             WHERE namespace = ? AND restore_owner = ?",
+        ))
+        .bind(Utc::now().to_rfc3339())
+        .bind(namespace)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            anyhow::bail!("mTLS DNS restore rollback guard ownership was lost");
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -4840,21 +4915,28 @@ impl DatabaseStore {
     /// Batch-create multiple proxies, chunked into transactions of
     /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
     #[allow(dead_code)]
-    pub async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
-        self.batch_create_proxies_internal(proxies, true).await
+    pub async fn batch_create_proxies(
+        &self,
+        proxies: &[Proxy],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error> {
+        self.batch_create_proxies_internal(proxies, true, mode).await
     }
 
     pub async fn batch_create_proxies_without_plugins(
         &self,
         proxies: &[Proxy],
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
-        self.batch_create_proxies_internal(proxies, false).await
+        self.batch_create_proxies_internal(proxies, false, mode)
+            .await
     }
 
     async fn batch_create_proxies_internal(
         &self,
         proxies: &[Proxy],
         attach_plugins: bool,
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let start = Instant::now();
         if proxies.is_empty() {
@@ -4863,7 +4945,7 @@ impl DatabaseStore {
         let mut total = 0usize;
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
             total += self
-                .batch_create_proxies_chunk(chunk, attach_plugins)
+                .batch_create_proxies_chunk(chunk, attach_plugins, mode)
                 .await?;
         }
         self.check_slow_query("batch_create_proxies", start);
@@ -4875,6 +4957,7 @@ impl DatabaseStore {
         &self,
         proxies: &[Proxy],
         attach_plugins: bool,
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         let mut admission_namespaces: Vec<&str> =
@@ -4882,7 +4965,7 @@ impl DatabaseStore {
         admission_namespaces.sort_unstable();
         admission_namespaces.dedup();
         for namespace in &admission_namespaces {
-            self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
@@ -5028,9 +5111,11 @@ impl DatabaseStore {
             touched_namespaces.insert(proxy.namespace.clone());
         }
 
-        for namespace in &admission_namespaces {
-            self.validate_mtls_dns_admission_tx(&mut tx, namespace)
-                .await?;
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
         }
         for namespace in &touched_namespaces {
             self.compact_config_changes_tx(&mut tx, namespace).await?;
@@ -5043,7 +5128,7 @@ impl DatabaseStore {
     pub async fn batch_attach_proxy_plugins(
         &self,
         proxies: &[Proxy],
-        mode: BatchConfigWriteMode,
+        mode: &BatchConfigWriteMode,
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         if proxies.is_empty() {
@@ -5063,8 +5148,12 @@ impl DatabaseStore {
             admission_namespaces.sort_unstable();
             admission_namespaces.dedup();
             for namespace in &admission_namespaces {
-                self.lock_mtls_dns_admission_tx(&mut tx, namespace)
-                    .await?;
+                self.lock_mtls_dns_admission_for_owner_tx(
+                    &mut tx,
+                    namespace,
+                    mode.guard_owner(),
+                )
+                .await?;
             }
             let mut seen = HashSet::new();
             let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
@@ -5126,6 +5215,7 @@ impl DatabaseStore {
     pub async fn batch_create_consumers(
         &self,
         consumers: &[Consumer],
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let start = Instant::now();
         if consumers.is_empty() {
@@ -5133,7 +5223,7 @@ impl DatabaseStore {
         }
         let mut total = 0usize;
         for chunk in consumers.chunks(Self::BATCH_CHUNK_SIZE) {
-            total += self.batch_create_consumers_chunk(chunk).await?;
+            total += self.batch_create_consumers_chunk(chunk, mode).await?;
         }
         self.check_slow_query("batch_create_consumers", start);
         Ok(total)
@@ -5143,6 +5233,7 @@ impl DatabaseStore {
     async fn batch_create_consumers_chunk(
         &self,
         consumers: &[Consumer],
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         let mut admission_namespaces: Vec<&str> = consumers
@@ -5152,7 +5243,7 @@ impl DatabaseStore {
         admission_namespaces.sort_unstable();
         admission_namespaces.dedup();
         for namespace in &admission_namespaces {
-            self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
@@ -5187,9 +5278,11 @@ impl DatabaseStore {
             touched_namespaces.insert(consumer.namespace.clone());
         }
 
-        for namespace in &admission_namespaces {
-            self.validate_mtls_dns_admission_tx(&mut tx, namespace)
-                .await?;
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
         }
         for namespace in &touched_namespaces {
             self.compact_config_changes_tx(&mut tx, namespace).await?;
@@ -5204,7 +5297,7 @@ impl DatabaseStore {
     pub async fn batch_create_plugin_configs(
         &self,
         configs: &[PluginConfig],
-        mode: BatchConfigWriteMode,
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let start = Instant::now();
         if configs.is_empty() {
@@ -5224,7 +5317,7 @@ impl DatabaseStore {
     async fn batch_create_plugin_configs_chunk(
         &self,
         configs: &[PluginConfig],
-        mode: BatchConfigWriteMode,
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         let mut admission_namespaces: Vec<&str> = configs
@@ -5234,7 +5327,7 @@ impl DatabaseStore {
         admission_namespaces.sort_unstable();
         admission_namespaces.dedup();
         for namespace in &admission_namespaces {
-            self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
@@ -5396,10 +5489,14 @@ impl DatabaseStore {
     /// 5. consumer_identity_index
     /// 6. consumers
     /// 7. upstreams
-    pub async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
+    pub async fn delete_all_resources(
+        &self,
+        namespace: &str,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
-        self.lock_mtls_dns_admission_tx(&mut tx, namespace)
+        self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
             .await?;
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
         let proxy_ids = self
@@ -5451,8 +5548,10 @@ impl DatabaseStore {
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
-        self.validate_mtls_dns_admission_tx(&mut tx, namespace)
-            .await?;
+        if mode.validates_mtls_dns() {
+            self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                .await?;
+        }
         for id in proxy_ids {
             self.record_config_change_tx(&mut tx, namespace, "proxy", &id, "delete")
                 .await?;
@@ -7869,33 +7968,42 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::validate_proxy_plugin_associations(self, proxy_id, namespace, plugins).await
     }
 
-    async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
-        DatabaseStore::batch_create_proxies(self, proxies).await
+    async fn batch_create_proxies(
+        &self,
+        proxies: &[Proxy],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error> {
+        DatabaseStore::batch_create_proxies(self, proxies, mode).await
     }
 
     async fn batch_create_proxies_without_plugins(
         &self,
         proxies: &[Proxy],
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
-        DatabaseStore::batch_create_proxies_without_plugins(self, proxies).await
+        DatabaseStore::batch_create_proxies_without_plugins(self, proxies, mode).await
     }
 
     async fn batch_attach_proxy_plugins(
         &self,
         proxies: &[Proxy],
-        mode: BatchConfigWriteMode,
+        mode: &BatchConfigWriteMode,
     ) -> Result<(), anyhow::Error> {
         DatabaseStore::batch_attach_proxy_plugins(self, proxies, mode).await
     }
 
-    async fn batch_create_consumers(&self, consumers: &[Consumer]) -> Result<usize, anyhow::Error> {
-        DatabaseStore::batch_create_consumers(self, consumers).await
+    async fn batch_create_consumers(
+        &self,
+        consumers: &[Consumer],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error> {
+        DatabaseStore::batch_create_consumers(self, consumers, mode).await
     }
 
     async fn batch_create_plugin_configs(
         &self,
         configs: &[PluginConfig],
-        mode: BatchConfigWriteMode,
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         DatabaseStore::batch_create_plugin_configs(self, configs, mode).await
     }
@@ -7907,15 +8015,32 @@ impl DatabaseBackend for DatabaseStore {
     async fn delete_all_resources(
         &self,
         namespace: &str,
+        write_mode: &BatchConfigWriteMode,
     ) -> Result<
         crate::config::db_backend::DeleteMode,
         crate::config::db_backend::DeleteAllResourcesError,
     > {
         let mode = crate::config::db_backend::DeleteMode::Atomic;
-        DatabaseStore::delete_all_resources(self, namespace)
+        DatabaseStore::delete_all_resources(self, namespace, write_mode)
             .await
             .map(|()| mode)
             .map_err(|error| crate::config::db_backend::DeleteAllResourcesError::new(mode, error))
+    }
+
+    async fn acquire_restore_rollback_guard(
+        &self,
+        namespace: &str,
+    ) -> Result<String, anyhow::Error> {
+        self.acquire_restore_rollback_guard_inner(namespace).await
+    }
+
+    async fn release_restore_rollback_guard(
+        &self,
+        namespace: &str,
+        guard_owner: &str,
+    ) -> Result<(), anyhow::Error> {
+        self.release_restore_rollback_guard_inner(namespace, guard_owner)
+            .await
     }
 
     async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {

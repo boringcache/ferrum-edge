@@ -5,7 +5,8 @@ use ferrum_edge::_test_support::{
     parse_scheme, statement_timeout_sql,
 };
 use ferrum_edge::config::db_backend::{
-    DatabaseBackend, is_incremental_full_reload_required, is_mtls_dns_identity_conflict,
+    BatchConfigWriteMode, DatabaseBackend, is_incremental_full_reload_required,
+    is_mtls_dns_identity_conflict,
 };
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
@@ -772,6 +773,77 @@ async fn independent_sqlite_stores_atomically_serialize_policy_association_and_i
         !stored_proxy.plugins.is_empty(),
         stored_consumer.credentials.get("mtls_auth").is_none()
     );
+}
+
+#[tokio::test]
+async fn restore_rollback_guard_blocks_other_sqlite_admin_writers_across_batches() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("mtls_dns_restore_guard.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store_a = DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    let store_b = DatabaseStore::connect_with_pool_config(
+        "sqlite",
+        &db_url,
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    let guard_owner = store_a
+        .acquire_restore_rollback_guard("ferrum")
+        .await
+        .unwrap();
+    let replay_mode = BatchConfigWriteMode::RestoreRollbackReplay {
+        guard_owner: guard_owner.clone(),
+    };
+    store_a
+        .delete_all_resources("ferrum", &replay_mode)
+        .await
+        .expect("the guard owner must be able to clear the partial restore state");
+    let replayed = make_consumer("replayed", "alice");
+    store_a
+        .batch_create_consumers(&[replayed], &replay_mode)
+        .await
+        .expect("the guard owner must be able to replay a batch");
+
+    let wrong_owner_mode = BatchConfigWriteMode::RestoreRollbackReplay {
+        guard_owner: "not-the-owner".to_string(),
+    };
+    let wrong_owner = store_b
+        .batch_create_consumers(
+            &[make_consumer("wrong-owner", "mallory")],
+            &wrong_owner_mode,
+        )
+        .await
+        .expect_err("a replay must not borrow another rollback's guard");
+    assert!(
+        wrong_owner.to_string().contains("restore rollback replays"),
+        "unexpected wrong-owner rejection: {wrong_owner:#}"
+    );
+
+    let blocked = store_b
+        .create_consumer(&make_consumer("concurrent", "bob"))
+        .await
+        .expect_err("another admin process must remain blocked between replay batches");
+    assert!(
+        blocked.to_string().contains("restore rollback replays"),
+        "unexpected rollback-guard rejection: {blocked:#}"
+    );
+
+    store_a
+        .release_restore_rollback_guard("ferrum", &guard_owner)
+        .await
+        .unwrap();
+    store_b
+        .create_consumer(&make_consumer("after-release", "carol"))
+        .await
+        .expect("normal admission must resume after rollback guard release");
 }
 
 #[tokio::test]
