@@ -695,6 +695,10 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Aggregate CORS policy state staged across every attached CORS instance
+    /// and consumed by the cache-inserted CORS finalizer. Kept outside public
+    /// metadata so policy details never enter transaction logs.
+    pub(crate) cors_state: cors::CorsRequestState,
     /// Claim-derived upstream headers committed by the first accepted
     /// authentication attempt and held until `before_proxy`. Kept out of
     /// `metadata` so authorization-phase rejection logging can never serialize
@@ -1063,6 +1067,7 @@ impl RequestContext {
             auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
+            cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
@@ -3113,6 +3118,12 @@ pub trait Plugin: Send + Sync {
     /// Called when a request is first received (before routing).
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Identifies the cache-internal wrapper used to defer a composed CORS
+    /// chain. This prevents incremental cache rebuilds from nesting wrappers.
+    fn is_deferred_cors_wrapper(&self) -> bool {
+        false
     }
 
     /// Authentication phase. Uses ConsumerIndex for O(1) credential lookups.

@@ -15169,6 +15169,7 @@ mod tests {
                     exposed_headers: Vec::new(),
                     max_age_seconds: None,
                     allow_credentials: None,
+                    unmatched_preflights: None,
                 },
             }],
             ..MeshSlice::default()

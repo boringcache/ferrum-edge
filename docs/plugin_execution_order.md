@@ -78,7 +78,7 @@ Request In
 └─────────────────────────┘
 ```
 
-Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
+Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, a native direct CORS policy returns a `204` preflight response in phase 1 without ever reaching authentication (an Istio projection returns its source-compatible 200). Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
 
@@ -391,6 +391,14 @@ OpenTelemetry tracing runs at priority 25 — the earliest of any plugin — so 
 ### CORS runs next (priority 100)
 
 Browser preflight (`OPTIONS`) requests must be answered before authentication. If an auth plugin ran first, it would reject the preflight with `401` and the browser would never complete the CORS handshake. CORS at priority 100 ensures preflight responses are returned immediately.
+
+When a proxy has multiple CORS instances, the cache keeps their equal-priority
+order stable, evaluates the whole contiguous CORS chain, and inserts one
+internal finalizer after it. The finalizer emits the intersection of origin,
+method, header, credentials, exposed-header, and max-age policy, so an earlier
+approval cannot bypass a later restriction. A priority override that places a
+different plugin between CORS instances is rejected during cache construction;
+this preserves the phase-1 short-circuit boundary on H1, H2, and H3.
 
 ### Request termination runs immediately after CORS (priority 125)
 

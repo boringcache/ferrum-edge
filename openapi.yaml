@@ -13075,13 +13075,36 @@ components:
 
     CorsConfig:
       type: object
-      description: "Plugin: cors — Cross-Origin Resource Sharing."
+      additionalProperties: false
+      required: [allowed_origins]
+      description: |
+        Plugin: cors — Cross-Origin Resource Sharing. Unknown keys, null values,
+        non-object configs, and an omitted origin policy are rejected.
+      allOf:
+        - if:
+            not:
+              required: [unmatched_preflights]
+          then:
+            properties:
+              allowed_methods:
+                minItems: 1
+                default: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+              allowed_headers:
+                minItems: 1
+                default: ["Accept", "Authorization", "Content-Type", "Origin", "X-Requested-With"]
+              max_age:
+                default: 86400
+        - not:
+            required: [preflight_continue, unmatched_preflights]
       properties:
         allowed_origins:
           type: array
+          minItems: 1
           items:
             oneOf:
               - type: string
+                minLength: 1
+                pattern: '^\S+$'
               - type: object
                 additionalProperties: false
                 minProperties: 1
@@ -13093,42 +13116,59 @@ components:
                 properties:
                   exact:
                     type: string
-                    description: Exact origin match (case-insensitive).
+                    minLength: 1
+                    pattern: '^\S+$'
+                    description: >-
+                      Exact origin, canonicalized at config time (scheme/host
+                      case, IDNA, IP serialization, and default ports). The
+                      exact value `*` has Istio's documented allow-all meaning.
                   prefix:
                     type: string
+                    minLength: 1
                     description: >-
                       Literal byte-prefix of the request Origin header
                       (case-sensitive), e.g. "https://app.".
                   regex:
                     type: string
+                    minLength: 1
                     description: >-
                       RE2 pattern that must FULLY match the request Origin
                       header. Compiled (and size-bounded) at config time; an
                       invalid pattern is rejected.
-          default: ["*"]
           description: >-
-            Permitted origins. Each entry is either a string (`"*"` for any
-            origin, an exact `scheme://host[:port]` origin matched
-            case-insensitively, or a `*.suffix.com` wildcard-subdomain pattern)
+            Required permitted-origin policy. Each entry is either a string
+            (`"*"` for intentional allow-all, an exact `scheme://host[:port]`
+            origin canonicalized on the cold config path, or a
+            `*.suffix.com` wildcard-subdomain pattern)
             or an Istio `StringMatch`-shaped object carrying exactly one of
-            `exact` / `prefix` / `regex`. A matching origin is reflected verbatim
-            into `Access-Control-Allow-Origin`.
+            `exact` / `prefix` / `regex`. Prefix and regex retain literal Istio
+            matcher semantics and are not broadened by exact canonicalization.
         allowed_methods:
           type: array
           items:
             type: string
-          default: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-          description: Allowed methods
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: >-
+            Allowed methods. Omission uses the native direct-plugin default;
+            with `unmatched_preflights`, omission/empty preserves Istio's
+            empty list.
         allowed_headers:
           type: array
           items:
             type: string
-          default: ["Accept", "Authorization", "Content-Type", "Origin", "X-Requested-With"]
-          description: Allowed headers
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: >-
+            Allowed headers. Omission uses the native direct-plugin default;
+            with `unmatched_preflights`, omission/empty preserves Istio's
+            empty list.
         exposed_headers:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: []
           description: Response headers exposed to browser JavaScript
         allow_credentials:
@@ -13138,12 +13178,26 @@ components:
         max_age:
           type: integer
           format: uint64
-          default: 86400
-          description: Preflight cache duration in seconds
+          description: >-
+            Preflight cache duration in seconds. Native direct-plugin omission
+            defaults to 86400; translated Istio omission remains absent.
         preflight_continue:
           type: boolean
           default: false
-          description: Pass preflight requests to backend
+          description: >-
+            Pass allowed preflights to the backend. Backend status/body are
+            retained, but every Access-Control response field is replaced by
+            the complete gateway-authoritative policy.
+        unmatched_preflights:
+          type: string
+          enum: [forward, ignore]
+          description: >-
+            Istio projection marker. `forward` preserves omitted,
+            `UNSPECIFIED`, and `FORWARD` behavior; `ignore` returns a local 200
+            without CORS authorization fields. Its presence also preserves
+            omitted/empty method and header lists and omitted max age instead
+            of applying native direct-plugin defaults. It is mutually exclusive
+            with `preflight_continue`.
 
     OpaPluginConfig:
       type: object

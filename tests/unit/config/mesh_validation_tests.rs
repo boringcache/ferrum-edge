@@ -2012,6 +2012,7 @@ mod virtual_service_cors {
                 exposed_headers: Vec::new(),
                 max_age_seconds: None,
                 allow_credentials: None,
+                unmatched_preflights: None,
             },
         }
     }
@@ -2061,23 +2062,18 @@ mod virtual_service_cors {
     }
 
     #[test]
-    fn wildcard_shaped_exact_origin_rejected() {
-        // The K8s translator defers wildcard-shaped exacts; the native/file
-        // source has no translator, so mesh validation must reject them —
-        // projected as the cors plugin's plain-string form they would flip
-        // into the plugin's own wildcard syntax (silent allow-all/subdomain
-        // widening of Istio's literal-exact semantics).
-        for wildcard in ["*", "*.example.com"] {
-            let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
-                wildcard.into(),
-            )])]);
-            assert!(
-                errors
-                    .iter()
-                    .any(|error| error.contains("must not be wildcard-shaped")),
-                "exact `{wildcard}` must be rejected: {errors:?}"
-            );
-        }
+    fn exact_star_is_istio_allow_all_but_other_wildcard_exacts_are_rejected() {
+        let exact_star = validate(vec![policy(vec![MeshCorsOriginMatch::Exact("*".into())])]);
+        assert!(exact_star.is_empty(), "{exact_star:?}");
+
+        let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
+            "*.example.com".into(),
+        )])]);
+        assert!(
+            errors.iter().any(|error| error
+                .contains("wildcard syntax other than Istio's exact `*`")),
+            "non-Istio wildcard exact must be rejected: {errors:?}"
+        );
         // Wildcard-looking PREFIX matchers are fine — prefix is a literal
         // byte-prefix in both Istio and the plugin object form.
         let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Prefix(
@@ -2284,6 +2280,9 @@ mod virtual_service_cors {
             exposed_headers: vec!["x-b".into()],
             max_age_seconds: Some(600),
             allow_credentials: Some(true),
+            unmatched_preflights: Some(
+                ferrum_edge::modes::mesh::config::MeshCorsUnmatchedPreflights::Ignore,
+            ),
         };
         let config = cors_plugin_config_from_mesh_policy(&full);
         assert_eq!(
@@ -2299,7 +2298,9 @@ mod virtual_service_cors {
         assert_eq!(config["exposed_headers"], serde_json::json!(["x-b"]));
         assert_eq!(config["max_age"], serde_json::json!(600));
         assert_eq!(config["allow_credentials"], serde_json::json!(true));
-        // Sparse policies omit the optional keys entirely.
+        assert_eq!(config["unmatched_preflights"], serde_json::json!("ignore"));
+        // Sparse Istio policies preserve empty lists and omitted max age while
+        // synthesizing the source API's default FORWARD behavior.
         let sparse = cors_plugin_config_from_mesh_policy(&MeshCorsPolicy {
             allowed_origins: vec![MeshCorsOriginMatch::Exact("https://a.example".into())],
             allowed_methods: Vec::new(),
@@ -2307,8 +2308,12 @@ mod virtual_service_cors {
             exposed_headers: Vec::new(),
             max_age_seconds: None,
             allow_credentials: None,
+            unmatched_preflights: None,
         });
-        assert!(sparse.get("allowed_methods").is_none());
+        assert_eq!(sparse["allowed_methods"], serde_json::json!([]));
+        assert_eq!(sparse["allowed_headers"], serde_json::json!([]));
+        assert_eq!(sparse["exposed_headers"], serde_json::json!([]));
+        assert_eq!(sparse["unmatched_preflights"], serde_json::json!("forward"));
         assert!(sparse.get("max_age").is_none());
         assert!(sparse.get("allow_credentials").is_none());
         assert!(sparse.get("preflight_continue").is_none());

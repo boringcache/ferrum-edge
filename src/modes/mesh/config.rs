@@ -2208,6 +2208,18 @@ pub struct MeshCorsPolicy {
     pub max_age_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_credentials: Option<bool>,
+    /// Preserve the Istio source field's presence and value. Omission and
+    /// explicit `FORWARD` are behaviorally identical but remain distinct on
+    /// the mesh wire; both synthesize the plugin's explicit forward mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmatched_preflights: Option<MeshCorsUnmatchedPreflights>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshCorsUnmatchedPreflights {
+    Forward,
+    Ignore,
 }
 
 /// One Istio `StringMatch` origin matcher. Hand-written serde keeps the wire
@@ -2269,8 +2281,9 @@ impl<'de> Deserialize<'de> for MeshCorsOriginMatch {
 /// (`src/plugins/cors.rs`): exact origins are plain strings, prefix/regex are
 /// single-key matcher objects — byte-for-byte the shape the K8s translator's
 /// gateway-side `route_cors_plugin` emits, pinned by a unit test so the two
-/// projections can never drift. `preflight_continue` is intentionally never
-/// set: the plugin answers preflights itself (Istio semantics).
+/// projections can never drift. The synthesized config always carries
+/// `unmatched_preflights`, which selects Istio semantics without changing the
+/// defaults of operator-authored direct plugin configurations.
 pub fn cors_plugin_config_from_mesh_policy(policy: &MeshCorsPolicy) -> serde_json::Value {
     let origins: Vec<serde_json::Value> = policy
         .allowed_origins
@@ -2286,24 +2299,18 @@ pub fn cors_plugin_config_from_mesh_policy(policy: &MeshCorsPolicy) -> serde_jso
         "allowed_origins".to_string(),
         serde_json::Value::from(origins),
     );
-    if !policy.allowed_methods.is_empty() {
-        config.insert(
-            "allowed_methods".to_string(),
-            serde_json::json!(policy.allowed_methods),
-        );
-    }
-    if !policy.allowed_headers.is_empty() {
-        config.insert(
-            "allowed_headers".to_string(),
-            serde_json::json!(policy.allowed_headers),
-        );
-    }
-    if !policy.exposed_headers.is_empty() {
-        config.insert(
-            "exposed_headers".to_string(),
-            serde_json::json!(policy.exposed_headers),
-        );
-    }
+    config.insert(
+        "allowed_methods".to_string(),
+        serde_json::json!(policy.allowed_methods),
+    );
+    config.insert(
+        "allowed_headers".to_string(),
+        serde_json::json!(policy.allowed_headers),
+    );
+    config.insert(
+        "exposed_headers".to_string(),
+        serde_json::json!(policy.exposed_headers),
+    );
     if let Some(max_age) = policy.max_age_seconds {
         config.insert("max_age".to_string(), serde_json::json!(max_age));
     }
@@ -2313,6 +2320,19 @@ pub fn cors_plugin_config_from_mesh_policy(policy: &MeshCorsPolicy) -> serde_jso
             serde_json::Value::Bool(allow_credentials),
         );
     }
+    config.insert(
+        "unmatched_preflights".to_string(),
+        serde_json::Value::String(
+            match policy
+                .unmatched_preflights
+                .unwrap_or(MeshCorsUnmatchedPreflights::Forward)
+            {
+                MeshCorsUnmatchedPreflights::Forward => "forward",
+                MeshCorsUnmatchedPreflights::Ignore => "ignore",
+            }
+            .to_string(),
+        ),
+    );
     serde_json::Value::Object(config)
 }
 
@@ -2679,18 +2699,14 @@ fn validate_virtual_service_cors_policies(
                         errors.push(format!(
                             "{context}: cors.allowed_origins[{index}] must not be empty"
                         ));
-                    } else if trimmed.starts_with('*') {
-                        // A wildcard-shaped `exact` (`*`, `*.example.com`) can
-                        // never match a real Origin under Istio's
-                        // literal-exact semantics, but projected as the cors
-                        // plugin's plain-string form it would flip into the
-                        // plugin's OWN wildcard syntax (allow-all / subdomain
-                        // match) — a silent policy WIDENING. The K8s
-                        // translator already defers such policies; this
-                        // boundary check closes the native/file source too,
-                        // rejecting the slice fail-closed.
+                    } else if trimmed.starts_with('*') && trimmed != "*" {
+                        // Istio explicitly defines exact `*` as allow-all.
+                        // Other wildcard-shaped exacts (for example
+                        // `*.example.com`) remain literal StringMatch values
+                        // upstream and must not be reinterpreted as Ferrum's
+                        // native wildcard-subdomain syntax.
                         errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] exact matcher must not be wildcard-shaped — Istio exact semantics match the literal string only; use a prefix or regex matcher for wildcard intent"
+                            "{context}: cors.allowed_origins[{index}] exact matcher must not use wildcard syntax other than Istio's exact `*` allow-all value"
                         ));
                     } else if trimmed.len() != value.len() {
                         // The cors plugin TRIMS plain-string origins, so a
@@ -2700,7 +2716,9 @@ fn validate_virtual_service_cors_policies(
                         errors.push(format!(
                             "{context}: cors.allowed_origins[{index}] exact matcher must not have leading/trailing whitespace — Istio exact semantics match the literal string only"
                         ));
-                    } else if let Err(err) = crate::plugins::cors::validate_exact_origin(value) {
+                    } else if trimmed != "*"
+                        && let Err(err) = crate::plugins::cors::validate_exact_origin(value)
+                    {
                         // Synthesis projects exacts into the cors plugin's
                         // plain `allowed_origins` form, whose construction
                         // rejects non-origin values (paths, query/fragment,
@@ -2735,8 +2753,8 @@ fn validate_virtual_service_cors_policies(
             }
         }
         // Method/header lists are copied verbatim into the synthesized `cors`
-        // plugin config, whose construction trims each entry and rejects
-        // empty-after-trim values, invalid HTTP methods, and invalid header
+        // plugin config, whose construction rejects padded/empty values,
+        // invalid HTTP methods, and invalid header
         // names — run the plugin's own admission (shared
         // `plugins::cors::{validate_method,validate_header_name}`, not a
         // fork) here so a bad token rejects the slice at the config boundary
@@ -2766,7 +2784,11 @@ fn validate_virtual_service_cors_policies(
                     errors.push(format!(
                         "{context}: cors.{field}[{index}] must not be empty"
                     ));
-                } else if let Err(err) = validate(field, trimmed) {
+                } else if trimmed.len() != value.len() {
+                    errors.push(format!(
+                        "{context}: cors.{field}[{index}] must not have leading/trailing whitespace"
+                    ));
+                } else if let Err(err) = validate(field, value) {
                     errors.push(format!("{context}: {err}"));
                 }
             }

@@ -189,7 +189,7 @@ fn test_http_grpc_plugins() {
 #[test]
 fn test_http_only_plugins() {
     // Plugins that only support HTTP
-    let plugins = vec![("cors", json!({"origins": ["*"]}))];
+    let plugins = vec![("cors", json!({"allowed_origins": ["*"]}))];
 
     for (name, config) in plugins {
         let plugin = make_plugin(name, config);
