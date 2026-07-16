@@ -975,6 +975,29 @@ fn ldap_auth_schema_matches_runtime_invariants() {
 }
 
 #[test]
+fn ldap_dial_policy_documentation_matches_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/LdapAuthConfig")
+        .expect("LdapAuthConfig exists");
+    let schema_description = schema["description"]
+        .as_str()
+        .expect("LdapAuthConfig description");
+    let url_description = schema["properties"]["ldap_url"]["description"]
+        .as_str()
+        .expect("ldap_url description");
+    assert!(schema_description.contains("uncached A+AAAA lookup"));
+    assert!(schema_description.contains("TLS/SNI verification"));
+    assert!(url_description.contains("policy-screens all A/AAAA candidates"));
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("**Dial-time DNS and egress policy:**"));
+    assert!(guide.contains("screened again immediately before its TCP dial"));
+    assert!(guide.contains("service-account and end-user connections"));
+}
+
+#[test]
 fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -1262,6 +1285,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     );
 
     for (plugin_name, config) in [
+        ("bot_detection", json!({})),
         ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
         (
             "fault_injection",
@@ -1289,6 +1313,9 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     }
 
     for (plugin_name, config) in [
+        ("bot_detection", None),
+        ("bot_detection", Some(serde_json::Value::Null)),
+        ("bot_detection", Some(json!([]))),
         ("udp_rate_limiting", None),
         ("udp_rate_limiting", Some(json!({}))),
         ("fault_injection", None),
@@ -2582,4 +2609,124 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
+}
+
+#[test]
+fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
+    use ferrum_edge::plugins::bot_detection::{BOT_DETECTION_CONFIG_KEYS, BotDetection};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/BotDetectionConfig")
+        .expect("BotDetectionConfig component exists");
+
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("BotDetectionConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = BOT_DETECTION_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(schema_fields, runtime_fields);
+
+    assert_eq!(
+        schema["properties"]["blocked_patterns"]["type"],
+        json!(["array", "null"])
+    );
+    assert_eq!(
+        schema["properties"]["allow_list"]["type"],
+        json!(["array", "null"])
+    );
+    assert_eq!(
+        schema["properties"]["allow_missing_user_agent"]["type"],
+        json!(["boolean", "null"])
+    );
+    assert_eq!(
+        schema["properties"]["custom_response_code"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(schema["properties"]["custom_response_code"]["minimum"], 400);
+    assert_eq!(schema["properties"]["custom_response_code"]["maximum"], 599);
+
+    for valid in [
+        json!({}),
+        json!({
+            "blocked_patterns": [" FerrumAuditCrawler "],
+            "allow_list": ["TrustedBot"],
+            "allow_missing_user_agent": false,
+            "custom_response_code": 451
+        }),
+        json!({
+            "blocked_patterns": null,
+            "allow_list": null,
+            "allow_missing_user_agent": null,
+            "custom_response_code": null
+        }),
+        json!({"blocked_patterns": [], "allow_missing_user_agent": false}),
+        json!({"custom_response_code": 400}),
+        json!({"custom_response_code": 403.0}),
+        json!({"custom_response_code": 599}),
+        // U+FEFF ZWNBSP is not in Rust's Unicode White_Space set.
+        json!({"blocked_patterns": ["\u{feff}"]}),
+        json!({"allow_list": ["\u{feff}"]}),
+    ] {
+        assert_component_validity(&spec, "BotDetectionConfig", &valid, true);
+        BotDetection::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+
+    for invalid in [
+        serde_json::Value::Null,
+        json!([]),
+        json!("config"),
+        json!({"blocked_paterns": ["FerrumAuditCrawler"]}),
+        json!({
+            "blocked_patterns": ["FerrumAuditCrawler"],
+            "allow_missing_useragent": false
+        }),
+        json!({"allowlist": ["TrustedBot"]}),
+        json!({"custom_reponse_code": 451}),
+        json!({"allow_missing_useragent": false}),
+        json!({"blocked_patterns": "FerrumAuditCrawler"}),
+        json!({"blocked_patterns": [42]}),
+        json!({"blocked_patterns": [""]}),
+        json!({"blocked_patterns": [" \t "]}),
+        // U+0085 NEL is in Rust's Unicode White_Space set.
+        json!({"blocked_patterns": ["\u{0085}"]}),
+        json!({"allow_list": "TrustedBot"}),
+        json!({"allow_list": [false]}),
+        json!({"allow_list": ["\n"]}),
+        json!({"allow_list": ["\u{0085}"]}),
+        json!({"allow_missing_user_agent": "false"}),
+        json!({"custom_response_code": "451"}),
+        json!({"custom_response_code": 451.5}),
+        json!({"blocked_patterns": []}),
+        json!({"blocked_patterns": [], "allow_missing_user_agent": true}),
+        json!({"blocked_patterns": [], "allow_missing_user_agent": null}),
+        json!({"custom_response_code": -1}),
+        json!({"custom_response_code": 100}),
+        json!({"custom_response_code": 199}),
+        json!({"custom_response_code": 204}),
+        json!({"custom_response_code": 205}),
+        json!({"custom_response_code": 304}),
+        json!({"custom_response_code": 399}),
+        json!({"custom_response_code": 600}),
+        json!({"custom_response_code": 1e100}),
+    ] {
+        assert_component_validity(&spec, "BotDetectionConfig", &invalid, false);
+        assert!(
+            BotDetection::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("Configuration must be a top-level object."));
+    assert!(guide.contains("unknown keys are rejected instead of falling back to defaults"));
+    assert!(guide.contains("Only 400–599 is accepted"));
+    assert!(guide.contains("never reflect the client-controlled User-Agent"));
+    assert!(guide.contains("Native gRPC rejections instead use an empty-body HTTP 200"));
 }

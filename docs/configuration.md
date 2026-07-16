@@ -793,7 +793,7 @@ Core environment parsing lives in `src/config/env_config.rs`; early startup/pool
 
 ## Backend Egress / SSRF Protection
 
-The gateway dials backends, upstream targets, service-discovery results, and plugin endpoints (AI providers, log sinks, JWKS/OIDC, webhooks). Every production egress path resolves through the shared DNS cache, and each resolved IP — on **every** fresh resolve and cache insertion, including stale/background refreshes — is screened against the **backend egress policy**. This is what makes DNS rebinding safe: a hostname that re-resolves to a now-denied address is rejected at insertion and never cached or served.
+The gateway dials backends, upstream targets, service-discovery results, and plugin endpoints (AI providers, log sinks, JWKS/OIDC, webhooks). On shared-cache egress paths, each resolved IP is screened against the backend egress policy on **every** fresh resolve and cache insertion, including stale/background refreshes, so a hostname that re-resolves to a denied address is rejected rather than cached or served. LDAP applies a stricter connection-establishment path: every connection/reconnection bypasses DNS caches, resolves both A and AAAA, rejects the complete answer if any candidate is denied, and rechecks each concrete candidate immediately before dialing while retaining the configured hostname for TLS/SNI verification.
 
 The policy is composed from four `FERRUM_BACKEND_*` env vars and evaluated in this precedence (first match wins) for each resolved IP:
 
