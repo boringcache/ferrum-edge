@@ -141,8 +141,8 @@ pub(crate) struct NamespaceConfigAdmissionGuard {
 
 impl NamespaceConfigAdmissionGuard {
     pub(crate) fn ensure_held(&self) -> Result<(), anyhow::Error> {
-        let elapsed_millis = u64::try_from(self.lease_started_at.elapsed().as_millis())
-            .unwrap_or(u64::MAX);
+        let elapsed_millis =
+            u64::try_from(self.lease_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         if self.valid.load(Ordering::Acquire)
             && elapsed_millis < self.valid_until_millis.load(Ordering::Acquire)
         {
