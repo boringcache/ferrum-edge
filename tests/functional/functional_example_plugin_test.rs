@@ -4,6 +4,7 @@
 
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
+use crate::scaffolding::reserve_colocated_tcp_udp;
 
 use http::{HeaderMap, Method, StatusCode};
 use std::sync::{
@@ -129,6 +130,46 @@ plugin_configs:
     )
 }
 
+async fn start_h3_gateway_with_retry(backend_port: u16) -> (TestGateway, u16) {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_error = String::new();
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let (https_tcp, https_udp) = reserve_colocated_tcp_udp()
+            .await
+            .expect("reserve colocated HTTPS port");
+        let https_port = https_tcp.port;
+        assert_eq!(https_port, https_udp.port);
+        drop(https_tcp);
+        drop(https_udp);
+
+        let result = TestGateway::builder()
+            .mode_file(build_config(backend_port))
+            .log_level("warn")
+            // The outer loop owns retries so each attempt gets a fresh TCP/UDP
+            // HTTPS port and a fresh harness temp directory.
+            .max_attempts(1)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+            .spawn()
+            .await;
+
+        match result {
+            Ok(gateway) => return (gateway, https_port),
+            Err(error) => {
+                last_error = error.to_string();
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    panic!("start H3 example gateway after retries: {last_error}");
+}
+
 fn assert_matched_headers(headers: &HeaderMap, expected: &str) {
     assert_eq!(
         headers
@@ -251,22 +292,7 @@ async fn functional_example_plugin_h1_h2_matched_404_and_405_contract() {
 #[tokio::test]
 async fn functional_example_plugin_h3_matched_404_and_405_contract() {
     let backend = HeaderEchoBackend::start().await;
-    let https_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("reserve example H3 port");
-    let https_port = https_listener.local_addr().expect("example H3 addr").port();
-    drop(https_listener);
-
-    let mut gateway = TestGateway::builder()
-        .mode_file(build_config(backend.port))
-        .log_level("warn")
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-        .spawn()
-        .await
-        .expect("start H3 example gateway");
+    let (mut gateway, https_port) = start_h3_gateway_with_retry(backend.port).await;
 
     let client = Http3Client::insecure().expect("H3 client");
     let first_url = format!("https://localhost:{https_port}/global-example/ok");
