@@ -3346,10 +3346,12 @@ paths:
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
           description: >-
-            Restore aborted because the prior configuration could not be
-            snapshotted for rollback (database/connectivity failure). Existing
-            config was NOT deleted; retry once the database is reachable. Also
-            returned when the admin API is otherwise unavailable.
+            Restore aborted because the pre-snapshot namespace guard could not
+            be acquired or the prior configuration could not be snapshotted for
+            rollback. A database/connectivity failure has `failure_class:
+            connectivity`. Existing config was NOT deleted; retry once the
+            database is reachable. Also returned when the admin API is otherwise
+            unavailable.
           content:
             application/json:
               schema:
@@ -3361,12 +3363,12 @@ paths:
                   failure_class:
                     type: string
                     enum: [connectivity]
-                    description: Distinguishes a retryable snapshot availability failure from stored-data corruption.
+                    description: Distinguishes a retryable guard/snapshot availability failure from stored-data corruption.
                   restore_errors:
                     type: array
                     items:
                       type: string
-                    description: The snapshot/connectivity error that caused the abort
+                    description: The guard, snapshot, or connectivity error that caused the abort
 
   # ── Proxies ─────────────────────────────────────────────────────────
   /proxies:

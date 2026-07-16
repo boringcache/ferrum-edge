@@ -487,11 +487,15 @@ fn mark_non_transient(
     error.context(NonTransientDbInitError).context(message)
 }
 
-/// Returns true when a full-config load error is a transient
-/// connectivity/resource failure (SQL or MongoDB) a caller may recover from by
-/// serving `FERRUM_DB_CONFIG_BACKUP_PATH`. Schema drift, decode, query,
-/// authentication, and validation failures are non-transient and return false.
-fn is_transient_config_load_error(error: &anyhow::Error) -> bool {
+/// Returns true when an error chain contains a transient database
+/// connectivity/resource failure from SQL or MongoDB.
+///
+/// Full-config loading uses this to decide whether an on-disk backup is safe to
+/// serve. Restore also uses it when the pre-snapshot namespace guard cannot be
+/// acquired, so a pool/network outage retains the same operator-facing
+/// `failure_class: connectivity` contract as a snapshot query outage. Schema
+/// drift, decode, query, authentication, and validation failures return false.
+pub(crate) fn is_transient_database_error(error: &anyhow::Error) -> bool {
     error.chain().any(|source| {
         if let Some(sqlx_err) = source.downcast_ref::<sqlx::Error>() {
             return is_transient_sqlx_error(sqlx_err);
@@ -501,6 +505,10 @@ fn is_transient_config_load_error(error: &anyhow::Error) -> bool {
         }
         false
     })
+}
+
+fn is_transient_config_load_error(error: &anyhow::Error) -> bool {
+    is_transient_database_error(error)
 }
 
 /// MongoDB counterpart to [`is_transient_sqlx_error`] for the full-config load

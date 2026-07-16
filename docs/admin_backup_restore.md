@@ -81,7 +81,7 @@ The recovery snapshot in step 2 is captured with a **non-validating raw load fro
 
 - **Invalid-but-present config still snapshots.** An already-invalid namespace (dangling references, conflicting listen_paths, invalid regex) — precisely what an operator runs restore to *repair* — loads its raw rows without the fatal validation pipeline, so the snapshot succeeds and rollback stays available throughout the repair. A restore that imports cleanly succeeds and repairs the namespace; if a later step fails, rollback reapplies the (still invalid) prior config.
 - **One guard spans the entire restore.** Ferrum acquires a persistent namespace-scoped datastore guard before reading the rollback snapshot and keeps the same owner through the destructive clear, every successful-import batch, and any compensating replay. Other admin processes therefore cannot insert resources absent from the payload between phases or have a concurrent write erased by rollback. On MongoDB, the owner also pins the exact connection generation, so reconnect/failover cannot move a later phase to a different bundle. The guarded rollback replay bypasses normal mTLS DNS admission only for the captured snapshot; the guarded successful import still runs full admission.
-- **An unreadable snapshot aborts the restore.** Connectivity/timeouts return `503`; corrupt or undecodable stored rows/documents return `500` with `failure_class: "data_integrity"` and a safe resource type/id when available. Both abort before deleting anything. Semantic config invalidity alone is still tolerated by this raw snapshot path.
+- **An unavailable guard or unreadable snapshot aborts the restore.** A connectivity/timeout failure while acquiring the pre-snapshot guard or reading the snapshot returns `503` with `failure_class: "connectivity"`; guard contention also returns `503` but is not mislabeled as a database outage. Corrupt or undecodable stored rows/documents return `500` with `failure_class: "data_integrity"` and a safe resource type/id when available. All paths abort before deleting anything. Semantic config invalidity alone is still tolerated by this raw snapshot path.
 
 Both the config resources and the `api_specs` count are read from the **primary**, never a lagging read replica, so the recovery report is authoritative.
 
@@ -203,8 +203,9 @@ Counts matching the snapshot likewise report `unknown_outcome` and retain the
 guard. Only a definitive atomic abort takes the `not_needed` short-circuit and
 releases the guard, preserving `api_specs`.
 
-When the prior config cannot be snapshotted for rollback, restore **aborts before
-any delete**. Connectivity failures return `503` with
+When the pre-snapshot guard cannot be acquired or the prior config cannot be
+snapshotted for rollback, restore **aborts before any delete**. Connectivity
+failures in either phase return `503` with
 `failure_class: "connectivity"`. Stored row/document integrity failures return
 `500` with `failure_class: "data_integrity"` and identify the offending resource
 type/id when safely available. Both are fail-safe paths: the destructive delete

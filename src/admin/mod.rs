@@ -5087,14 +5087,22 @@ async fn handle_restore(
     let restore_guard_owner = match db.acquire_mtls_dns_admission_guard(namespace).await {
         Ok(owner) => owner,
         Err(error) => {
+            let mut response = json!({
+                "error": format!(
+                    "Restore aborted: the namespace admission guard could not be acquired: {}. Existing config was NOT deleted.",
+                    error
+                ),
+                "restore_errors": [format!(
+                    "failed to acquire the pre-snapshot namespace admission guard: {}",
+                    error
+                )],
+            });
+            if crate::config::db_loader::is_transient_database_error(&error) {
+                response["failure_class"] = json!("connectivity");
+            }
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": format!(
-                        "Restore aborted: the namespace admission guard could not be acquired: {}. Existing config was NOT deleted.",
-                        error
-                    )
-                }),
+                &response,
             ));
         }
     };
