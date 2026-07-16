@@ -599,7 +599,10 @@ fn h3_deadline_preflight_runs_committed_hooks_exactly_once() {
         "generic reject finalization must not invoke committed hooks before the bounded helper"
     );
     assert!(preflight.contains("run_h3_deadline_bounded_reject_committed_hooks("));
-    assert!(!preflight.contains("run_h3_reject_response_committed_hooks("));
+    assert!(
+        preflight.contains("run_h3_reject_response_committed_hooks("),
+        "the impossible normalization fallback must retain the same committed-hook contract"
+    );
     assert!(preflight.contains("send_h3_finalized_reject_response("));
 }
 

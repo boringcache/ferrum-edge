@@ -9,14 +9,14 @@ use std::sync::Arc;
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
 #[test]
-fn h3_grpc_web_requests_load_grpc_policy_plugins() {
+fn h3_grpc_web_requests_keep_the_http_protocol_key() {
     use ferrum_edge::_test_support::h3_plugin_protocol_for_request_for_test;
     use ferrum_edge::config::types::HttpFlavor;
     use ferrum_edge::plugins::ProxyProtocol;
 
     assert_eq!(
         h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain, true),
-        ProxyProtocol::Grpc
+        ProxyProtocol::Http
     );
     assert_eq!(
         h3_plugin_protocol_for_request_for_test(HttpFlavor::Plain, false),
@@ -284,6 +284,257 @@ impl Plugin for StalledResponseTransformer {
     }
 }
 
+struct SlowRejectDecorator {
+    name: &'static str,
+    delay: std::time::Duration,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    completed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Plugin for SlowRejectDecorator {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        response_headers.insert(format!("x-{}-complete", self.name), "true".to_string());
+        self.completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PluginResult::Continue
+    }
+}
+
+struct StalledContextFreeBodyTransformer;
+
+#[async_trait::async_trait]
+impl Plugin for StalledContextFreeBodyTransformer {
+    fn name(&self) -> &str {
+        "stalled_context_free_body_transformer"
+    }
+
+    fn modifies_request_body(&self) -> bool {
+        true
+    }
+
+    async fn transform_request_body(
+        &self,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn rejection_hook_deadline_selects_terminal_status_and_finishes_cleanup_once() {
+    use ferrum_edge::_test_support::{
+        finalize_plugin_rejection_for_test, gateway_deadline_response_selected_for_test,
+        set_grpc_deadline_budget_for_test,
+    };
+
+    let calls = (0..2)
+        .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+        .collect::<Vec<_>>();
+    let completed = (0..2)
+        .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+        .collect::<Vec<_>>();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(SlowRejectDecorator {
+            name: "slow-cleanup",
+            delay: std::time::Duration::from_millis(20),
+            calls: Arc::clone(&calls[0]),
+            completed: Arc::clone(&completed[0]),
+        }),
+        Arc::new(SlowRejectDecorator {
+            name: "later-decorator",
+            delay: std::time::Duration::ZERO,
+            calls: Arc::clone(&calls[1]),
+            completed: Arc::clone(&completed[1]),
+        }),
+    ];
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(1));
+
+    let (status, body, headers) = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        finalize_plugin_rejection_for_test(
+            &plugins,
+            &mut ctx,
+            429,
+            b"rate limited".to_vec(),
+            HashMap::from([(
+                "access-control-allow-origin".to_string(),
+                "https://browser.example".to_string(),
+            )]),
+        ),
+    )
+    .await
+    .expect("cleanup must finish without reusing the expired deadline");
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("Deadline exceeded at gateway")
+    );
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .map(String::as_str),
+        Some("https://browser.example")
+    );
+    assert_eq!(
+        headers.get("x-slow-cleanup-complete").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        headers
+            .get("x-later-decorator-complete")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(gateway_deadline_response_selected_for_test(&ctx));
+    for count in calls.iter().chain(completed.iter()) {
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn context_free_final_body_timeout_marks_authoritative_deadline_provenance() {
+    use ferrum_edge::_test_support::{
+        gateway_deadline_response_selected_for_test,
+        run_context_free_final_request_body_hooks_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledContextFreeBodyTransformer)];
+    let mut ctx = create_grpc_context_with_timeout(None);
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(5));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        run_context_free_final_request_body_hooks_for_test(
+            &plugins,
+            &mut ctx,
+            &HashMap::new(),
+            b"transformed body",
+        ),
+    )
+    .await
+    .expect("context-free body hook must stop at the absolute RPC deadline");
+
+    match result {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
+        }
+        other => panic!("expected terminal deadline rejection, got {other:?}"),
+    }
+    assert!(gateway_deadline_response_selected_for_test(&ctx));
+}
+
+#[test]
+fn deadline_replacement_preserves_safe_decorators_and_strips_conflicting_fields() {
+    use base64::Engine as _;
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, buffered_grpc_deadline_replacement_for_test, parse_grpc_frames,
+    };
+
+    for content_type in [None, Some("application/grpc-web-text+proto")] {
+        let response = buffered_grpc_deadline_replacement_for_test(
+            content_type,
+            HashMap::from([
+                (
+                    "access-control-allow-origin".to_string(),
+                    "https://browser.example".to_string(),
+                ),
+                ("x-correlation-id".to_string(), "request-123".to_string()),
+                (
+                    "traceparent".to_string(),
+                    "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01".to_string(),
+                ),
+                ("set-cookie".to_string(), "session=renewed".to_string()),
+                (
+                    "strict-transport-security".to_string(),
+                    "max-age=31536000".to_string(),
+                ),
+                ("Vary".to_string(), "Accept-Encoding, Origin".to_string()),
+                ("content-length".to_string(), "999".to_string()),
+                ("content-encoding".to_string(), "gzip".to_string()),
+                ("transfer-encoding".to_string(), "chunked".to_string()),
+                ("grpc-status".to_string(), "13".to_string()),
+                ("grpc-message".to_string(), "backend failure".to_string()),
+                ("grpc-status-details-bin".to_string(), "stale".to_string()),
+            ]),
+            b"discarded backend body".to_vec(),
+        );
+
+        assert_eq!(response.http_status, http::StatusCode::OK);
+        for (name, value) in [
+            ("access-control-allow-origin", "https://browser.example"),
+            ("x-correlation-id", "request-123"),
+            (
+                "traceparent",
+                "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+            ),
+            ("set-cookie", "session=renewed"),
+            ("strict-transport-security", "max-age=31536000"),
+        ] {
+            assert_eq!(response.headers.get(name).map(String::as_str), Some(value));
+        }
+        assert_eq!(response.headers.get("vary").map(String::as_str), Some("Origin"));
+        assert!(!response.headers.contains_key("content-encoding"));
+        assert!(!response.headers.contains_key("transfer-encoding"));
+        assert!(!response.headers.contains_key("grpc-status-details-bin"));
+
+        if let Some(content_type) = content_type {
+            assert_eq!(
+                response.headers.get("content-type").map(String::as_str),
+                Some(content_type)
+            );
+            assert!(!response.headers.contains_key("grpc-status"));
+            assert_eq!(
+                response
+                    .headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok()),
+                Some(response.body.len())
+            );
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&response.body)
+                .expect("text gRPC-Web deadline body must be base64");
+            let frames = parse_grpc_frames(&decoded);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
+            assert!(frames[0].1.windows(14).any(|window| window == b"grpc-status: 4"));
+        } else {
+            assert_eq!(
+                response.headers.get("grpc-status").map(String::as_str),
+                Some("4")
+            );
+            assert!(!response.headers.contains_key("content-length"));
+            assert!(response.body.is_empty());
+        }
+    }
+}
+
 struct CommittedHookProbe {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     observed_grpc_statuses: Arc<std::sync::Mutex<Vec<Option<String>>>>,
@@ -457,7 +708,7 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     let mut headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
-        ("x-backend".to_string(), "discard-me".to_string()),
+        ("x-correlation-id".to_string(), "request-123".to_string()),
     ]);
     let mut body = b"backend response".to_vec();
 
@@ -466,7 +717,10 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
             .await;
 
     assert!(normalized);
-    assert_eq!(headers.len(), 3);
+    assert_eq!(
+        headers.get("x-correlation-id").map(String::as_str),
+        Some("request-123")
+    );
     assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
     assert_eq!(
         headers.get("grpc-message").map(String::as_str),
@@ -509,7 +763,10 @@ async fn response_normalizer_deadline_preserves_grpc_web_framing() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let mut headers = HashMap::from([
             ("content-type".to_string(), "application/grpc".to_string()),
-            ("x-backend".to_string(), "discard-me".to_string()),
+            (
+                "access-control-allow-origin".to_string(),
+                "https://browser.example".to_string(),
+            ),
         ]);
         let mut body = b"backend response".to_vec();
 
@@ -528,6 +785,12 @@ async fn response_normalizer_deadline_preserves_grpc_web_framing() {
             Some(content_type)
         );
         assert_eq!(headers.get("x-grpc-web").map(String::as_str), Some("1"));
+        assert_eq!(
+            headers
+                .get("access-control-allow-origin")
+                .map(String::as_str),
+            Some("https://browser.example")
+        );
         assert!(headers.contains_key("access-control-expose-headers"));
         assert!(!headers.contains_key("grpc-status"));
         assert!(!headers.contains_key("grpc-message"));

@@ -3386,6 +3386,32 @@ pub(crate) async fn run_final_request_body_hooks(
     headers: &HashMap<String, String>,
     body: &[u8],
 ) -> PluginResult {
+    match run_final_request_body_hooks_with_provenance(
+        plugins,
+        ctx.as_deref_mut(),
+        grpc_deadline_at,
+        headers,
+        body,
+    )
+    .await
+    {
+        crate::plugins::RequestPluginDeadlineResult::Completed(result) => result,
+        crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded => {
+            if let Some(ctx) = ctx.as_deref_mut() {
+                ctx.mark_gateway_deadline_response_selected();
+            }
+            crate::plugins::grpc_deadline_exceeded_plugin_result()
+        }
+    }
+}
+
+pub(crate) async fn run_final_request_body_hooks_with_provenance(
+    plugins: &[Arc<dyn Plugin>],
+    mut ctx: Option<&mut RequestContext>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> crate::plugins::RequestPluginDeadlineResult {
     let deadline_expired = grpc_deadline_at
         .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
         || ctx.as_deref().is_some_and(|ctx| {
@@ -3397,10 +3423,7 @@ pub(crate) async fn run_final_request_body_hooks(
                     .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
         });
     if deadline_expired {
-        if let Some(ctx) = ctx.as_deref_mut() {
-            ctx.mark_gateway_deadline_response_selected();
-        }
-        return crate::plugins::grpc_deadline_exceeded_plugin_result();
+        return crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded;
     }
     for plugin in plugins {
         let deadline = ctx
@@ -3414,27 +3437,32 @@ pub(crate) async fn run_final_request_body_hooks(
             )
             .await
             {
-                Ok(result) => result,
-                Err(()) => {
-                    ctx.mark_gateway_deadline_response_selected();
-                    crate::plugins::grpc_deadline_exceeded_plugin_result()
-                }
+                Ok(result) => crate::plugins::RequestPluginDeadlineResult::Completed(result),
+                Err(()) => crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded,
             }
         } else {
-            crate::plugins::await_request_plugin_deadline(
+            crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
                 plugin.on_final_request_body(headers, body),
             )
             .await
         };
         match result {
-            PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                return reject;
+            crate::plugins::RequestPluginDeadlineResult::Completed(PluginResult::Continue) => {}
+            crate::plugins::RequestPluginDeadlineResult::Completed(
+                reject @ PluginResult::Reject { .. },
+            )
+            | crate::plugins::RequestPluginDeadlineResult::Completed(
+                reject @ PluginResult::RejectBinary { .. },
+            ) => {
+                return crate::plugins::RequestPluginDeadlineResult::Completed(reject);
+            }
+            crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded => {
+                return crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded;
             }
         }
     }
-    PluginResult::Continue
+    crate::plugins::RequestPluginDeadlineResult::Completed(PluginResult::Continue)
 }
 
 pub(crate) struct RejectedResponseParts {
@@ -13322,17 +13350,88 @@ pub(crate) async fn log_rejected_request_with_path(
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
 }
 
-fn is_terminal_gateway_deadline_rejection(
-    status_code: u16,
-    response_headers: &HashMap<String, String>,
-) -> bool {
-    status_code == StatusCode::OK.as_u16()
-        && response_headers
-            .get("grpc-status")
-            .is_some_and(|status| status == GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER)
-        && response_headers
-            .get("grpc-message")
-            .is_some_and(|message| message == GATEWAY_DEADLINE_EXCEEDED_MESSAGE)
+/// Keep already-applied response decorators while removing fields that describe
+/// the response representation, transport framing, cache state, or terminal
+/// gRPC outcome being replaced. `Vary: Origin` is retained explicitly because
+/// it is part of the CORS decorator contract rather than backend content
+/// negotiation for the discarded representation.
+fn retain_deadline_response_decorators(response_headers: &mut HashMap<String, String>) {
+    let preserve_origin_vary = response_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("vary"))
+        .is_some_and(|(_, value)| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("origin"))
+        });
+    response_headers.retain(|name, _| {
+        ![
+            "accept-ranges",
+            "age",
+            "cache-control",
+            "cdn-cache-control",
+            "connection",
+            "content-encoding",
+            "content-digest",
+            "content-language",
+            "content-length",
+            "content-location",
+            "content-md5",
+            "content-range",
+            "content-type",
+            "digest",
+            "etag",
+            "expires",
+            "grpc-accept-encoding",
+            "grpc-encoding",
+            "grpc-message",
+            "grpc-previous-rpc-attempts",
+            "grpc-retry-pushback-ms",
+            "grpc-status",
+            "grpc-status-details-bin",
+            "keep-alive",
+            "last-modified",
+            "pragma",
+            "proxy-authenticate",
+            "proxy-connection",
+            "proxy-status",
+            "repr-digest",
+            "retry-after",
+            "surrogate-control",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "vary",
+            "warning",
+        ]
+        .iter()
+        .any(|managed| name.eq_ignore_ascii_case(managed))
+    });
+    if preserve_origin_vary {
+        response_headers.insert("vary".to_string(), "Origin".to_string());
+    }
+}
+
+fn replace_rejection_with_gateway_deadline(
+    status_code: &mut u16,
+    response_body: Option<&mut Vec<u8>>,
+    response_headers: &mut HashMap<String, String>,
+) {
+    *status_code = StatusCode::OK.as_u16();
+    if let Some(body) = response_body {
+        body.clear();
+    }
+    retain_deadline_response_decorators(response_headers);
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    response_headers.insert(
+        "grpc-status".to_string(),
+        GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+    );
+    response_headers.insert(
+        "grpc-message".to_string(),
+        GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
+    );
 }
 
 async fn run_after_proxy_hooks_on_rejection(
@@ -13355,8 +13454,7 @@ async fn run_after_proxy_hooks_on_rejection(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
         "true".to_string(),
     );
-    let terminal_gateway_deadline =
-        is_terminal_gateway_deadline_rejection(*status_code, response_headers);
+    let mut terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
 
     for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
         // Once an earlier phase has selected the canonical client-deadline
@@ -13371,15 +13469,30 @@ async fn run_after_proxy_hooks_on_rejection(
             continue;
         }
         let result = if terminal_gateway_deadline {
-            plugin
-                .after_proxy(ctx, *status_code, response_headers)
-                .await
+            crate::plugins::RequestPluginDeadlineResult::Completed(
+                plugin
+                    .after_proxy(ctx, *status_code, response_headers)
+                    .await,
+            )
         } else {
-            crate::plugins::await_request_plugin_deadline(
+            crate::plugins::await_rejection_plugin_deadline_with_provenance(
                 ctx.grpc_deadline_at(),
                 plugin.after_proxy(ctx, *status_code, response_headers),
             )
             .await
+        };
+        let result = match result {
+            crate::plugins::RequestPluginDeadlineResult::Completed(result) => result,
+            crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded => {
+                ctx.mark_gateway_deadline_response_selected();
+                terminal_gateway_deadline = true;
+                replace_rejection_with_gateway_deadline(
+                    status_code,
+                    response_body.as_deref_mut(),
+                    response_headers,
+                );
+                continue;
+            }
         };
         match result {
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
@@ -13468,6 +13581,14 @@ async fn run_after_proxy_hooks_on_rejection(
             }
             PluginResult::Continue => {}
         }
+    }
+
+    if terminal_gateway_deadline {
+        replace_rejection_with_gateway_deadline(
+            status_code,
+            response_body.as_deref_mut(),
+            response_headers,
+        );
     }
 
     if let Some(previous_marker) = previous_marker {
@@ -13828,7 +13949,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     {
         let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
         let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
-        let terminal_gateway_deadline = is_terminal_gateway_deadline_rejection(*status, headers);
+        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
         for (index, plugin) in plugins.iter().enumerate() {
             if !plugin.requires_response_committed_hook() {
                 continue;
@@ -13861,10 +13982,8 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             .await
             .is_err()
             {
-                let deadline_reject = normalized_grpc_deadline_exceeded();
-                *status = deadline_reject.http_status.as_u16();
-                *headers = deadline_reject.headers;
-                *body = deadline_reject.body;
+                ctx.mark_gateway_deadline_response_selected();
+                replace_rejection_with_gateway_deadline(status, Some(body), headers);
                 for remaining in plugins[index + 1..]
                     .iter()
                     .filter(|plugin| plugin.requires_response_committed_hook())
@@ -14450,12 +14569,14 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
     ctx.mark_gateway_deadline_response_selected();
+    retain_deadline_response_decorators(response_headers);
     if let Some(content_type) = grpc_web_response_content_type {
         let mut response = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
             grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
             GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
         );
+        response.headers.extend(response_headers.drain());
         finalize_grpc_web_error_response_headers(
             &mut response,
             initial_response_header_policy_plugins,
@@ -14464,7 +14585,6 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
         *response_headers = response.headers;
         *response_body = response.body;
     } else {
-        response_headers.clear();
         grpc_proxy::finalize_grpc_error_response_headers(
             response_headers,
             grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -14688,8 +14808,7 @@ async fn build_grpc_web_reject_response(
         &message,
     );
     finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));
-    let terminal_gateway_deadline = grpc_status == grpc_proxy::grpc_status::DEADLINE_EXCEEDED
-        && message == GATEWAY_DEADLINE_EXCEEDED_MESSAGE;
+    let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if plugins
         .iter()
         .any(|plugin| plugin.requires_response_committed_hook())

@@ -237,8 +237,8 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     );
     assert!(
         source.contains("let request_protocol = h3_plugin_protocol_for_request(")
-            && source.contains("grpc_web_response_content_type.is_some(),"),
-        "H3 plugin-chain selection must use the effective request policy flavor"
+            && source.contains("epoch.plugin_cache.grpc_web_request_view(&proxy.id)"),
+        "H3 gRPC-Web must retain its HTTP protocol key and use the composed cache view"
     );
     assert!(
         policy_block.contains("grpc_web_response_content_type.as_deref()"),
@@ -388,6 +388,32 @@ struct CommittedCapturePlugin {
     observation: Mutex<Option<CommittedObservation>>,
 }
 
+struct StalledCommittedPlugin {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Plugin for StalledCommittedPlugin {
+    fn name(&self) -> &str {
+        "stalled_h3_committed"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+    }
+}
+
 #[async_trait]
 impl Plugin for CommittedCapturePlugin {
     fn name(&self) -> &str {
@@ -499,6 +525,88 @@ async fn h3_grpc_web_reject_commits_final_wire_shape_once_before_log() {
     );
 }
 
+#[tokio::test]
+async fn h3_reject_committed_timeout_selects_status_four_and_runs_remaining_hooks_once() {
+    use ferrum_edge::_test_support::{
+        gateway_deadline_response_selected_for_test, set_grpc_deadline_budget_for_test,
+    };
+
+    for grpc_web_content_type in [None, Some("application/grpc-web+proto")] {
+        let stalled_calls = Arc::new(AtomicUsize::new(0));
+        let capture = Arc::new(CommittedCapturePlugin::default());
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(StalledCommittedPlugin {
+                calls: Arc::clone(&stalled_calls),
+            }),
+            capture.clone(),
+        ];
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/pkg.Service/Denied".to_string(),
+        );
+        set_grpc_deadline_budget_for_test(&mut ctx, Some(5));
+        let headers = HashMap::from([
+            (
+                "access-control-allow-origin".to_string(),
+                "https://browser.example".to_string(),
+            ),
+            ("content-length".to_string(), "999".to_string()),
+            ("grpc-status".to_string(), "7".to_string()),
+        ]);
+
+        let replaced = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            ferrum_edge::_test_support::run_h3_reject_response_committed_hooks(
+                &plugins,
+                &mut ctx,
+                HttpFlavor::Grpc,
+                grpc_web_content_type,
+                StatusCode::FORBIDDEN,
+                br#"{"error":"blocked"}"#,
+                &headers,
+            ),
+        )
+        .await
+        .expect("stalled committed observer must not retain the H3 handler");
+
+        assert!(replaced);
+        assert!(gateway_deadline_response_selected_for_test(&ctx));
+        assert_eq!(stalled_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(capture.committed_calls.load(Ordering::SeqCst), 1);
+        let observed = capture
+            .observation
+            .lock()
+            .expect("observation lock")
+            .clone()
+            .expect("remaining committed observer");
+        assert_eq!(observed.status, StatusCode::OK.as_u16());
+        assert_eq!(
+            observed
+                .headers
+                .get("access-control-allow-origin")
+                .map(String::as_str),
+            Some("https://browser.example")
+        );
+        if grpc_web_content_type.is_some() {
+            assert!(!observed.headers.contains_key("grpc-status"));
+            assert_eq!(observed.body.first(), Some(&0x80));
+            assert!(
+                observed
+                    .body
+                    .windows(b"grpc-status: 4".len())
+                    .any(|window| window == b"grpc-status: 4")
+            );
+        } else {
+            assert_eq!(
+                observed.headers.get("grpc-status").map(String::as_str),
+                Some("4")
+            );
+            assert!(observed.body.is_empty());
+        }
+    }
+}
+
 #[test]
 fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
     let source = include_str!("../../../src/http3/server.rs");
@@ -522,19 +630,23 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
         "wire send helpers must not run committed hooks after rejection logging"
     );
 
-    let unbounded_commit_occurrences = source
+    assert!(
+        source.contains("run_h3_deadline_bounded_reject_committed_hooks_with_policy("),
+        "every public and policy-aware H3 rejection helper must share one bounded contract"
+    );
+    let committed_boundaries = source
         .matches("run_h3_reject_response_committed_hooks(")
-        .count();
-    let deadline_bounded_commit_occurrences = source
-        .matches("run_h3_deadline_bounded_reject_committed_hooks(")
-        .count();
-    let send_occurrences = source
+        .count()
+        + source
+            .matches("run_h3_deadline_bounded_reject_committed_hooks(")
+            .count();
+    let plugin_reject_sends = source
         .matches("send_h3_plugin_reject_flavor_aware(")
         .count();
     assert_eq!(
-        unbounded_commit_occurrences + deadline_bounded_commit_occurrences,
-        send_occurrences,
-        "every plugin-aware reject send must have exactly one explicit committed-hook boundary"
+        committed_boundaries,
+        plugin_reject_sends + 1,
+        "every plugin-aware reject send needs one committed boundary; the extra count is the second helper definition"
     );
 
     for (start_marker, end_marker, phase) in [

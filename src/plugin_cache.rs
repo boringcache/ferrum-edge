@@ -2126,6 +2126,11 @@ struct ProtocolSnapshot {
     proxy: HashMap<String, HashMap<ProxyProtocol, ProtocolEntry>>,
     /// Global fallback: protocol → ProtocolEntry
     global: HashMap<ProxyProtocol, ProtocolEntry>,
+    /// HTTP plugin view plus the two native-gRPC policies that are compatible
+    /// with recognized H3 gRPC-Web requests.
+    grpc_web_proxy: HashMap<String, ProtocolEntry>,
+    /// Global fallback for the composed H3 gRPC-Web view.
+    grpc_web_global: ProtocolEntry,
 }
 
 const ALL_PROXY_PROTOCOLS: [ProxyProtocol; 5] = [
@@ -2145,18 +2150,43 @@ fn build_protocol_entry(plugins: &[Arc<dyn Plugin>], proto: ProxyProtocol) -> Pr
     }
 }
 
+const H3_GRPC_WEB_NATIVE_POLICY_PLUGINS: [&str; 2] =
+    ["grpc_method_router", "grpc_deadline"];
+
+fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
+    // The merged proxy list is already in configured priority/config order.
+    // Filtering it once preserves that order, retains every ordinary HTTP
+    // guardrail, and includes each compatible native-gRPC policy instance at
+    // most once even if a future implementation supports both protocols.
+    let plugins = Arc::new(
+        plugins
+            .iter()
+            .filter(|plugin| {
+                plugin.supported_protocols().contains(&ProxyProtocol::Http)
+                    || (H3_GRPC_WEB_NATIVE_POLICY_PLUGINS.contains(&plugin.name())
+                        && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let phase = build_phase_data(&plugins);
+    ProtocolEntry { plugins, phase }
+}
+
 /// Build the full protocol snapshot from the plugin map + global fallback.
 fn build_protocol_snapshot(
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
 ) -> ProtocolSnapshot {
     let mut proxy = HashMap::with_capacity(proxy_map.len());
+    let mut grpc_web_proxy = HashMap::with_capacity(proxy_map.len());
     for (proxy_id, plugins) in proxy_map {
         let mut inner = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
         for &proto in &ALL_PROXY_PROTOCOLS {
             inner.insert(proto, build_protocol_entry(plugins, proto));
         }
         proxy.insert(proxy_id.clone(), inner);
+        grpc_web_proxy.insert(proxy_id.clone(), build_grpc_web_protocol_entry(plugins));
     }
 
     let mut global = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
@@ -2164,7 +2194,14 @@ fn build_protocol_snapshot(
         global.insert(proto, build_protocol_entry(globals, proto));
     }
 
-    ProtocolSnapshot { proxy, global }
+    let grpc_web_global = build_grpc_web_protocol_entry(globals);
+
+    ProtocolSnapshot {
+        proxy,
+        global,
+        grpc_web_proxy,
+        grpc_web_global,
+    }
 }
 
 /// Collect all JWKS URIs actively referenced by `jwks_auth` plugin instances
@@ -2497,6 +2534,38 @@ impl PluginCacheInner {
             requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_id),
         }
     }
+
+    pub(crate) fn grpc_web_request_view(&self, proxy_id: &str) -> PluginCacheRequestView {
+        let entry = self
+            .protocol_snapshot
+            .grpc_web_proxy
+            .get(proxy_id)
+            .unwrap_or(&self.protocol_snapshot.grpc_web_global);
+        let capabilities = entry.phase.capabilities;
+        let backend_path_plugins = capabilities
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+            .then(|| Arc::clone(&entry.phase.backend_path_plugins));
+        PluginCacheRequestView {
+            plugins: Arc::clone(&entry.plugins),
+            grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
+            auth_plugins: Arc::clone(&entry.phase.auth_plugins),
+            authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
+            backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
+            backend_path_plugins,
+            request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
+            initial_response_header_policy_plugins: Arc::clone(
+                &entry.phase.initial_response_header_policy_plugins,
+            ),
+            initial_response_header_policy_names: Arc::clone(
+                &entry.phase.initial_response_header_policy_names,
+            ),
+            response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
+            capabilities,
+            requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
+            requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
+            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_id),
+        }
+    }
 }
 
 /// Request-scoped plugin cache values for one proxy/protocol pair.
@@ -2752,6 +2821,11 @@ impl PluginCache {
     pub fn request_view(&self, proxy_id: &str, protocol: ProxyProtocol) -> PluginCacheRequestView {
         let inner = self.inner.load();
         inner.request_view(proxy_id, protocol)
+    }
+
+    pub(crate) fn grpc_web_request_view(&self, proxy_id: &str) -> PluginCacheRequestView {
+        let inner = self.inner.load();
+        inner.grpc_web_request_view(proxy_id)
     }
 
     /// Atomically rebuild the cache when config changes. Most old plugin
@@ -3176,8 +3250,10 @@ impl PluginCache {
         // Rebuild protocol snapshot (plugins + phase data) for changed proxies.
         // Clone-and-patch from the current snapshot so unchanged proxies are preserved.
         let mut new_proxy_proto = current.protocol_snapshot.proxy.clone();
+        let mut new_grpc_web_proxy = current.protocol_snapshot.grpc_web_proxy.clone();
         for id in removed_proxy_ids {
             new_proxy_proto.remove(id);
+            new_grpc_web_proxy.remove(id);
         }
         for proxy in &config.proxies {
             if proxy_ids_to_rebuild.contains(&proxy.id)
@@ -3188,6 +3264,8 @@ impl PluginCache {
                     inner.insert(proto, build_protocol_entry(plugins, proto));
                 }
                 new_proxy_proto.insert(proxy.id.clone(), inner);
+                new_grpc_web_proxy
+                    .insert(proxy.id.clone(), build_grpc_web_protocol_entry(plugins));
             }
         }
         let new_global_proto = if global_plugins_changed {
@@ -3198,6 +3276,11 @@ impl PluginCache {
             g
         } else {
             current.protocol_snapshot.global.clone()
+        };
+        let new_grpc_web_global = if global_plugins_changed {
+            build_grpc_web_protocol_entry(&new_globals)
+        } else {
+            current.protocol_snapshot.grpc_web_global.clone()
         };
 
         let new_global_requires_buffering = if global_plugins_changed {
@@ -3237,6 +3320,8 @@ impl PluginCache {
             ProtocolSnapshot {
                 proxy: new_proxy_proto,
                 global: new_global_proto,
+                grpc_web_proxy: new_grpc_web_proxy,
+                grpc_web_global: new_grpc_web_global,
             },
             new_ws_frame,
             new_global_requires_ws_frame,

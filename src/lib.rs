@@ -126,6 +126,74 @@ pub mod _test_support {
         (response_status, response_body, response_headers)
     }
 
+    pub fn gateway_deadline_response_selected_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.gateway_deadline_response_selected()
+    }
+
+    pub fn mark_gateway_deadline_response_selected_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.mark_gateway_deadline_response_selected();
+    }
+
+    pub async fn run_context_free_final_request_body_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> crate::plugins::PluginResult {
+        let deadline = ctx.grpc_deadline_at();
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            None,
+            deadline,
+            headers,
+            body.to_vec(),
+        )
+        .await;
+        crate::proxy::run_final_request_body_hooks_with_provenance(
+            plugins,
+            None,
+            deadline,
+            headers,
+            &transformed,
+        )
+        .await
+        .into_plugin_result(ctx)
+    }
+
+    pub struct GrpcWebPluginViewForTest {
+        pub plugins: Vec<String>,
+        pub grpc_deadline_plugins: Vec<String>,
+        pub backend_path_plugins: Vec<String>,
+    }
+
+    pub fn grpc_web_request_view_for_test(
+        cache: &crate::PluginCache,
+        proxy_id: &str,
+    ) -> GrpcWebPluginViewForTest {
+        let view = cache.grpc_web_request_view(proxy_id);
+        GrpcWebPluginViewForTest {
+            plugins: view
+                .plugins()
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+            grpc_deadline_plugins: view
+                .grpc_deadline_plugins()
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+            backend_path_plugins: view
+                .backend_path_plugins()
+                .iter()
+                .map(|plugin| plugin.name().to_string())
+                .collect(),
+        }
+    }
+
     pub fn bind_authorized_backend_path_for_test(
         ctx: &mut crate::plugins::RequestContext,
         path: &str,
@@ -853,7 +921,7 @@ pub mod _test_support {
         http_status: StatusCode,
         body: &[u8],
         headers: &HashMap<String, String>,
-    ) {
+    ) -> bool {
         crate::http3::server::run_h3_reject_response_committed_hooks(
             plugins,
             ctx,
@@ -863,7 +931,7 @@ pub mod _test_support {
             body,
             headers,
         )
-        .await;
+        .await
     }
 
     // ── proxy/mod ────────────────────────────────────────────────────────────
@@ -911,10 +979,39 @@ pub mod _test_support {
         );
         let mut headers = HashMap::from([
             ("content-type".to_string(), "application/json".to_string()),
-            ("x-backend".to_string(), "discard-me".to_string()),
+            ("x-correlation-id".to_string(), "request-123".to_string()),
         ]);
         let mut body = b"backend response".to_vec();
         let http_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
+            &mut ctx,
+            grpc_web_response_content_type,
+            &mut headers,
+            &mut body,
+            &[],
+        );
+        NormalizedRejectResponse {
+            http_status,
+            headers,
+            body,
+            grpc_status: ctx
+                .metadata
+                .get("grpc_status")
+                .and_then(|value| value.parse().ok()),
+            grpc_message: ctx.metadata.get("grpc_message").cloned(),
+        }
+    }
+
+    pub fn buffered_grpc_deadline_replacement_for_test(
+        grpc_web_response_content_type: Option<&str>,
+        mut headers: HashMap<String, String>,
+        mut body: Vec<u8>,
+    ) -> NormalizedRejectResponse {
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Service/Call".to_string(),
+        );
+        let http_status = crate::proxy::replace_buffered_grpc_response_with_deadline(
             &mut ctx,
             grpc_web_response_content_type,
             &mut headers,

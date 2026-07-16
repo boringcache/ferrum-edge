@@ -4392,6 +4392,147 @@ fn test_default_priority_used_when_no_override() {
 }
 
 #[test]
+fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_policies() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["dedup", "grpc-web", "method-router", "deadline"],
+        )],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "grpc-web",
+                "grpc_web",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "method-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "deadline",
+                "grpc_deadline",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("plugin cache");
+    let view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+
+    assert!(view.plugins.iter().any(|name| name == "request_deduplication"));
+    assert!(view.plugins.iter().any(|name| name == "grpc_web"));
+    assert_eq!(
+        view.plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_method_router")
+            .count(),
+        1
+    );
+    assert_eq!(
+        view.plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_deadline")
+            .count(),
+        1
+    );
+    assert_eq!(view.grpc_deadline_plugins, vec!["grpc_deadline"]);
+    assert!(
+        view.backend_path_plugins
+            .iter()
+            .any(|name| name == "grpc_method_router")
+    );
+    assert!(
+        view.backend_path_plugins
+            .iter()
+            .any(|name| name == "grpc_deadline")
+    );
+
+    let merged_names = cache
+        .get_plugins("p1")
+        .iter()
+        .filter(|plugin| {
+            plugin.supported_protocols().contains(&ProxyProtocol::Http)
+                || (["grpc_method_router", "grpc_deadline"].contains(&plugin.name())
+                    && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
+        })
+        .map(|plugin| plugin.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        view.plugins, merged_names,
+        "the precomputed composed view must preserve merged priority/config order"
+    );
+
+    let reloaded = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["grpc-web", "method-router", "deadline"],
+        )],
+        vec![
+            make_plugin_config(
+                "grpc-web",
+                "grpc_web",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "method-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "deadline",
+                "grpc_deadline",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    cache
+        .apply_delta(
+            &reloaded,
+            &std::collections::HashSet::from(["p1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("gRPC-Web composed view delta rebuild");
+    let reloaded_view =
+        ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+    assert!(
+        !reloaded_view
+            .plugins
+            .iter()
+            .any(|name| name == "request_deduplication")
+    );
+    assert_eq!(
+        reloaded_view
+            .plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_deadline")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn test_priority_override_reverses_default_order() {
     // Give cors a higher priority number than key_auth via override
     let config = make_config(

@@ -1385,6 +1385,8 @@ async fn test_multi_auth_deadline_expiry_overrides_earlier_server_reject() {
 
 #[tokio::test]
 async fn terminal_deadline_reject_runs_decorators_but_not_replacers() {
+    use ferrum_edge::_test_support::mark_gateway_deadline_response_selected_for_test;
+
     let plugins: Vec<Arc<dyn Plugin>> = vec![
         Arc::new(DeadlineRejectDecorator),
         Arc::new(DeadlineRejectReplacer),
@@ -1395,6 +1397,7 @@ async fn terminal_deadline_reject_runs_decorators_but_not_replacers() {
         "/my.Service/Unary".to_string(),
     );
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+    mark_gateway_deadline_response_selected_for_test(&mut ctx);
 
     let (status, body, headers) = finalize_plugin_rejection_for_test(
         &plugins,
@@ -1428,6 +1431,36 @@ async fn terminal_deadline_reject_runs_decorators_but_not_replacers() {
         !headers.contains_key("x-replaced"),
         "an expired fail-closed replacer must not override the terminal deadline"
     );
+}
+
+#[tokio::test]
+async fn deadline_text_without_typed_provenance_does_not_claim_gateway_ownership() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(DeadlineRejectReplacer)];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+
+    let (status, body, headers) = finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        200,
+        Vec::new(),
+        HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("grpc-status".to_string(), "4".to_string()),
+            (
+                "grpc-message".to_string(),
+                "Deadline exceeded at gateway".to_string(),
+            ),
+        ]),
+    )
+    .await;
+
+    assert_eq!(status, 503);
+    assert_eq!(body.as_slice(), b"must not replace terminal deadline");
+    assert_eq!(headers.get("x-replaced").map(String::as_str), Some("true"));
 }
 
 #[tokio::test]
