@@ -124,6 +124,16 @@ isolation: the same schema name can be defined independently in separate
 namespaces, while a referrer cannot resolve a definition from another
 namespace. File reloads, DB poll cycles, and control-plane snapshots use the
 same prospective graph rules before atomically publishing a new runtime cache.
+API-spec `POST` validates extracted plugins against the same authoritative
+namespace snapshot, and exact `PUT` first removes the plugins owned by the old
+spec before overlaying the replacement bundle.
+
+Graph participation never skips backend-egress admission: policy-only checks
+still run for every `schema_ref` consumer, including custom plugins and plugins
+that ignore an unrecognized `schema_ref` key. On runtime config loads, a
+dangling/non-string reference remains a graph-fatal error, while unrelated
+constructor failures on optional logging sinks retain their existing fail-open
+warning behavior.
 
 Inline `schema:` blocks have no registry dependency; they compile directly
 against the static field metadata in `fields.rs`.

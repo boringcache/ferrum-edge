@@ -256,7 +256,7 @@ pub(crate) async fn validate_transaction_log_schema_candidates(
     }
 
     let http_client = super::plugin_validation_http_client(state);
-    crate::plugins::transaction_log_schema::validate_config_graph(&candidate, &http_client)
+    crate::plugins::transaction_log_schema::validate_config_graph(&candidate, &http_client, true)
         .map_err(AfterValidateError::BadRequest)
 }
 
@@ -362,6 +362,65 @@ pub(crate) async fn validate_hmac_request_transform_api_spec_replacement_candida
     let http_client = super::plugin_validation_http_client(state);
     crate::plugin_cache::validate_hmac_request_transform_candidate(&candidate, &http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))
+}
+
+/// Validate the named log-schema graph produced by an exact API-spec PUT.
+///
+/// `replace_api_spec_bundle` deletes every plugin config owned by the old spec
+/// before inserting the replacement bundle. Mirror that ownership boundary so
+/// removed definitions/referrers cannot leak into validation and retained
+/// manual plugins remain part of the authoritative prospective namespace.
+pub(crate) async fn validate_transaction_log_schema_api_spec_replacement_candidate(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    existing_spec: &crate::config::types::ApiSpec,
+    plugins: &[PluginConfig],
+) -> Result<(), AfterValidateError> {
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let replaced_plugins = db
+        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    let replaced_plugin_ids: HashSet<String> = replaced_plugins
+        .into_iter()
+        .map(|plugin| plugin.id)
+        .collect();
+
+    if let Some(plugin) = plugins.iter().find(|plugin| {
+        !replaced_plugin_ids.contains(&plugin.id)
+            && candidate
+                .plugin_configs
+                .iter()
+                .any(|existing| existing.namespace == namespace && existing.id == plugin.id)
+    }) {
+        return Err(AfterValidateError::BadRequest(vec![format!(
+            "plugin_config id '{}' already exists in namespace '{}' outside api_spec '{}'; replacement cannot take ownership of it",
+            plugin.id, namespace, existing_spec.id
+        )]));
+    }
+
+    candidate
+        .plugin_configs
+        .retain(|plugin| !replaced_plugin_ids.contains(&plugin.id));
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugins::transaction_log_schema::validate_config_graph(&candidate, &http_client, true)
+        .map_err(AfterValidateError::BadRequest)
 }
 
 /// Validate a wholesale namespace replacement without retaining resources that
@@ -2031,9 +2090,18 @@ impl AdminResource for PluginConfig {
             }
         }
 
-        if !crate::plugins::transaction_log_schema::participates_in_config_graph(resource)
-            && let Err(error) = validate_plugin_config_definition(state, resource)
-        {
+        if crate::plugins::transaction_log_schema::participates_in_config_graph(resource) {
+            if let Err(error) = crate::plugins::validate_plugin_config_policy_only(
+                &resource.plugin_name,
+                &resource.config,
+                &state.backend_allow_ips,
+            ) {
+                return Err(AfterValidateError::BadRequest(vec![format!(
+                    "Invalid plugin config: {}",
+                    error
+                )]));
+            }
+        } else if let Err(error) = validate_plugin_config_definition(state, resource) {
             return Err(AfterValidateError::BadRequest(vec![format!(
                 "Invalid plugin config: {}",
                 error

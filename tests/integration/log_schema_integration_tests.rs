@@ -214,6 +214,100 @@ fn prospective_graph_is_namespace_scoped_across_multiple_instances() {
 }
 
 #[test]
+fn runtime_load_preserves_optional_logger_fail_open_but_not_dangling_refs() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    let policy = ferrum_edge::config::BackendEgressPolicy::unrestricted();
+
+    let mut malformed_optional_sink = GatewayConfig {
+        plugin_configs: vec![
+            graph_plugin(
+                "schemas",
+                "ferrum",
+                "transaction_log_schema",
+                json!({"schemas": {"audit": {}}}),
+            ),
+            graph_plugin(
+                "logger",
+                "ferrum",
+                "stdout_logging",
+                json!({"schema_ref": "audit", "filter": "not-an-object"}),
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+    ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(
+        &mut malformed_optional_sink,
+        &policy,
+    )
+    .expect("optional logger constructor failures remain fail-open on runtime load");
+
+    let mut dangling_ref = GatewayConfig {
+        plugin_configs: vec![graph_plugin(
+            "logger",
+            "ferrum",
+            "stdout_logging",
+            json!({"schema_ref": "missing"}),
+        )],
+        ..GatewayConfig::default()
+    };
+    let error = ferrum_edge::_test_support::validate_plugin_configs_fatal_for_test(
+        &mut dangling_ref,
+        &policy,
+    )
+    .expect_err("reference-integrity failures remain fatal");
+    assert!(error.contains("1 errors"), "unexpected error: {error}");
+}
+
+#[test]
+fn schema_ref_opt_in_cannot_bypass_policy_only_egress_validation() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    let policy = ferrum_edge::config::BackendEgressPolicy::from_env(
+        ferrum_edge::config::BackendAllowIps::Both,
+        "",
+        "",
+        true,
+    )
+    .expect("default egress policy is valid");
+    let mut config = GatewayConfig {
+        plugin_configs: vec![
+            graph_plugin(
+                "schemas",
+                "ferrum",
+                "transaction_log_schema",
+                json!({"schemas": {"audit": {}}}),
+            ),
+            graph_plugin(
+                "rate-limit",
+                "ferrum",
+                "rate_limiting",
+                json!({
+                    "window_seconds": 60,
+                    "max_requests": 10,
+                    "sync_mode": "redis",
+                    "redis_url": "redis://169.254.169.254:6379/0",
+                    "schema_ref": "audit"
+                }),
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+
+    let errors = ferrum_edge::_test_support::collect_plugin_config_errors_for_test(
+        &mut config,
+        &policy,
+    )
+    .expect("collect validation should return policy errors");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("redis_url IP 169.254.169.254 denied")),
+        "schema_ref must not bypass policy-only checks: {errors:?}"
+    );
+}
+
+#[test]
 fn schema_ref_resolves_when_schema_registered_first() {
     let _g = registry_lock();
     registry::reset_for_tests();

@@ -1309,14 +1309,28 @@ async fn validate_bundle(
                 "Unknown plugin name '{}'. Available plugins: {:?}",
                 plugin.plugin_name, known_plugins
             ));
-        } else if plugin.enabled
-            && let Err(e) = crate::plugins::validate_plugin_config_with_policy(
-                &plugin.plugin_name,
-                &plugin.config,
-                &state.backend_allow_ips,
-            )
-        {
-            plugin_errors.push(e);
+        } else if plugin.enabled {
+            let validation = if crate::plugins::transaction_log_schema::participates_in_config_graph(
+                plugin,
+            ) {
+                // Full construction must run only after the prospective
+                // namespace's schema definitions have been staged below.
+                // Keep policy-only admission active in this preliminary pass.
+                crate::plugins::validate_plugin_config_policy_only(
+                    &plugin.plugin_name,
+                    &plugin.config,
+                    &state.backend_allow_ips,
+                )
+            } else {
+                crate::plugins::validate_plugin_config_with_policy(
+                    &plugin.plugin_name,
+                    &plugin.config,
+                    &state.backend_allow_ips,
+                )
+            };
+            if let Err(error) = validation {
+                plugin_errors.push(error);
+            }
         }
 
         if !plugin_errors.is_empty() {
@@ -1751,6 +1765,47 @@ async fn validate_bundle(
             Err(crate::admin::crud::AfterValidateError::Response(_)) => {
                 return Err(ApiSpecError::Internal(
                     "HMAC request-transform candidate validation returned an unexpected response"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        let validation_result = if let Some(put_ctx) = put_ctx.as_ref() {
+            crate::admin::crud::validate_transaction_log_schema_api_spec_replacement_candidate(
+                db,
+                state,
+                namespace,
+                put_ctx.spec,
+                &bundle.plugins,
+            )
+            .await
+        } else {
+            crate::admin::crud::validate_transaction_log_schema_candidates(
+                db,
+                state,
+                namespace,
+                &bundle.plugins,
+                None,
+            )
+            .await
+        };
+        match validation_result {
+            Ok(()) => {}
+            Err(crate::admin::crud::AfterValidateError::BadRequest(errors)) => {
+                failures.push(ValidationFailure {
+                    resource_type: "plugin_graph",
+                    id: bundle.proxy.id.clone(),
+                    errors,
+                });
+            }
+            Err(crate::admin::crud::AfterValidateError::Db(error)) => {
+                return Err(classify_db_error(error));
+            }
+            Err(crate::admin::crud::AfterValidateError::Response(_)) => {
+                return Err(ApiSpecError::Internal(
+                    "Transaction-log schema candidate validation returned an unexpected response"
                         .to_string(),
                 ));
             }

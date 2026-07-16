@@ -66,6 +66,12 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
 
     let pipeline_source = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(pipeline_source.contains("transaction_log_schema::validate_config_graph("));
+
+    let api_spec_source = include_str!("../../../src/admin/api_specs/handlers.rs");
+    assert!(api_spec_source.contains("validate_transaction_log_schema_candidates("));
+    assert!(api_spec_source.contains(
+        "validate_transaction_log_schema_api_spec_replacement_candidate("
+    ));
 }
 
 #[test]

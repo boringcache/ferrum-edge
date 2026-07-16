@@ -318,7 +318,37 @@ pub mod _test_support {
         crate::plugins::transaction_log_schema::validate_config_graph(
             config,
             &crate::plugins::PluginHttpClient::default(),
+            true,
         )
+    }
+
+    pub fn validate_plugin_configs_fatal_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<(), String> {
+        crate::config::validation_pipeline::ValidationPipeline::new(config)
+            .validate_plugin_configs(
+                backend_allow_ips,
+                crate::config::validation_pipeline::ValidationAction::FatalCount(
+                    "Validation failed with {} errors",
+                ),
+            )
+            .run()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn collect_plugin_config_errors_for_test(
+        config: &mut crate::config::types::GatewayConfig,
+        backend_allow_ips: &crate::config::BackendEgressPolicy,
+    ) -> Result<Vec<String>, String> {
+        crate::config::validation_pipeline::ValidationPipeline::new(config)
+            .validate_plugin_configs(
+                backend_allow_ips,
+                crate::config::validation_pipeline::ValidationAction::Collect,
+            )
+            .run()
+            .map_err(|error| error.to_string())
     }
 
     // ── plugins/request_deduplication ─────────────────────────────────────────

@@ -29,9 +29,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tracing::warn;
 
 use super::Plugin;
-use crate::plugins::utils::log_schema::{SchemaCapabilities, SummarySchema, registry};
+use crate::plugins::utils::log_schema::{
+    SchemaCapabilities, SummarySchema, registry, resolve_schema,
+};
 
 /// Fixed-shape keys accepted by the outer plugin config. The `schemas` value
 /// itself remains an intentionally open map keyed by operator-defined names.
@@ -144,6 +147,7 @@ pub(crate) fn participates_in_config_graph(
 pub(crate) fn validate_config_graph(
     config: &crate::config::types::GatewayConfig,
     http_client: &crate::plugins::PluginHttpClient,
+    optional_failures_are_errors: bool,
 ) -> Result<(), Vec<String>> {
     let namespaces: BTreeSet<&str> = config
         .plugin_configs
@@ -186,15 +190,40 @@ pub(crate) fn validate_config_graph(
                 && plugin.plugin_name != "transaction_log_schema"
                 && plugin.config.get("schema_ref").is_some()
         }) {
-            if let Err(error) = super::validate_plugin_config_with_http_client(
-                &plugin.plugin_name,
+            // Reference integrity is graph-fatal even for optional logging
+            // plugins: fail-open applies to a malformed sink/filter, not to a
+            // dangling or ambiguous prospective graph. BASE resolution checks
+            // the shared invariants (type, mutual exclusion, existence); the
+            // plugin constructor below performs any capability-specific
+            // recompilation such as ws_logging's disconnect fields.
+            if let Err(error) = resolve_schema(
                 &plugin.config,
-                http_client.clone(),
+                &plugin.plugin_name,
+                SchemaCapabilities::BASE,
             ) {
                 errors.push(format!(
                     "Plugin '{}' (id={}, namespace={}): {}",
                     plugin.plugin_name, plugin.id, namespace, error
                 ));
+                continue;
+            }
+            if let Err(error) = super::validate_plugin_config_with_http_client(
+                &plugin.plugin_name,
+                &plugin.config,
+                http_client.clone(),
+            ) {
+                let message = format!(
+                    "Plugin '{}' (id={}, namespace={}): {}",
+                    plugin.plugin_name, plugin.id, namespace, error
+                );
+                if !optional_failures_are_errors
+                    && super::plugin_failure_policy(&plugin.plugin_name)
+                        == Some(super::PluginFailurePolicy::OptionalFailOpen)
+                {
+                    warn!("Optional plugin config validation warning: {}", message);
+                } else {
+                    errors.push(message);
+                }
             }
         }
 

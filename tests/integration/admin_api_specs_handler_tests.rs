@@ -1464,6 +1464,64 @@ async fn post_with_failing_plugin_config_returns_422_via_real_validator() {
 }
 
 #[tokio::test]
+async fn api_spec_post_and_exact_put_validate_against_prospective_schema_graph() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let schema_name = uid("api-spec-schema");
+    let schema_plugin = PluginConfig {
+        id: uid("schema-plugin"),
+        namespace: "ferrum".to_string(),
+        plugin_name: "transaction_log_schema".to_string(),
+        config: json!({"schemas": {(schema_name.clone()): {}}}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    store
+        .create_plugin_config(&schema_plugin)
+        .await
+        .expect("persist prospective schema without publishing the live registry");
+
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("schema-api-spec-proxy");
+    let plugin_id = uid("schema-api-spec-logger");
+    let mut spec = json_spec_with_plugin(
+        &proxy_id,
+        "backend.internal",
+        &plugin_id,
+        "stdout_logging",
+        json!({"schema_ref": schema_name}),
+    );
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "POST must use the authoritative prospective graph: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id");
+
+    spec["info"]["version"] = json!("2.0.0");
+    spec["x-ferrum-plugins"][0]["config"]["filter"] =
+        json!({"status_code_min": 500});
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::OK,
+        "exact PUT must remove old spec-owned plugins and overlay replacements before graph validation: {put_body}"
+    );
+}
+
+#[tokio::test]
 async fn post_rejects_hmac_request_body_transformer_composition() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;

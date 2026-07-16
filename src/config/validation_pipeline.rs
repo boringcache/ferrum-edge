@@ -409,6 +409,7 @@ impl<'a> ValidationPipeline<'a> {
                         crate::plugins::transaction_log_schema::validate_config_graph(
                             config,
                             &graph_http_client,
+                            matches!(&action, ValidationAction::Collect),
                         )
                     {
                         errors.extend(graph_errors);
@@ -424,6 +425,30 @@ impl<'a> ValidationPipeline<'a> {
                         if crate::plugins::transaction_log_schema::participates_in_config_graph(
                             plugin_config,
                         ) {
+                            if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
+                                &plugin_config.plugin_name,
+                                &plugin_config.config,
+                                backend_allow_ips,
+                            ) {
+                                let message = format!(
+                                    "Plugin '{}' (id={}): {}",
+                                    plugin_config.plugin_name, plugin_config.id, err
+                                );
+                                if !matches!(&action, ValidationAction::Collect)
+                                    && crate::plugins::plugin_failure_policy(
+                                        &plugin_config.plugin_name,
+                                    ) == Some(
+                                        crate::plugins::PluginFailurePolicy::OptionalFailOpen,
+                                    )
+                                {
+                                    warn!(
+                                        "Optional plugin config validation warning: {}",
+                                        message
+                                    );
+                                } else {
+                                    errors.push(message);
+                                }
+                            }
                             continue;
                         }
                         if let Err(err) = crate::plugins::validate_plugin_config_with_policy(
