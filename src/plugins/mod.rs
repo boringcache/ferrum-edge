@@ -927,6 +927,13 @@ pub struct RequestContext {
     /// release another instance's in-flight marker. This set is bounded by the
     /// completion-state map above.
     pub(crate) serverless_external_side_effect_owners: HashSet<u64>,
+    /// Whether a successful terminate-mode serverless invocation produced the
+    /// current synthetic response. Unlike ordinary plugin rejections, every
+    /// final 2xx-5xx function response is application-owned content and must run
+    /// through the buffered response-body lifecycle when configured. Kept out
+    /// of public metadata so a custom plugin cannot opt an unrelated rejection
+    /// into that contract.
+    pub(crate) serverless_terminate_response: bool,
     /// Deduplication instance currently publishing an owned terminal response
     /// from the observe-only committed hook. This transient private marker lets
     /// the ordinary publication path retain in-flight protection when no replay
@@ -1264,6 +1271,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
             serverless_external_side_effect_owners: HashSet::new(),
+            serverless_terminate_response: false,
             serverless_owned_dedup_publication: None,
             gateway_response_compression_algorithm: None,
             response_stream_id: None,
@@ -1446,6 +1454,7 @@ impl RequestContext {
             serverless_external_side_effect_owners: self
                 .serverless_external_side_effect_owners
                 .clone(),
+            serverless_terminate_response: self.serverless_terminate_response,
             serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,

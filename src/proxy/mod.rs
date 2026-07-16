@@ -178,8 +178,9 @@ pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_
 /// Marker recorded in `ctx.metadata` for the duration of
 /// [`apply_synthetic_response_body_hooks`] — i.e. while the response-body hook
 /// pipeline (`on_response_body`, `transform_response_body_with_context`,
-/// `on_final_response_body`) runs over a synthetic 2xx plugin short-circuit body
-/// rather than a real backend response. Unlike
+/// `on_final_response_body`) runs over a governed synthetic plugin short-circuit
+/// body rather than a real backend response. This includes final 2xx-5xx
+/// terminate-mode serverless responses. Unlike
 /// [`REJECTION_RESPONSE_METADATA_KEY`] (scoped to the `after_proxy` reject hooks
 /// only), this marker stays set across the body-hook phase so that a storing
 /// plugin's `on_final_response_body` can tell apart "this body was produced by a
@@ -13397,19 +13398,20 @@ pub(crate) async fn apply_plugin_rejection_response(
 }
 
 /// Decide whether response-body guardrails / transforms should run over a
-/// synthetic 2xx plugin short-circuit body (e.g. `ai_federation` /
-/// `ai_semantic_cache` synthetic responses surfaced via `RejectBinary{200}`).
+/// synthetic plugin short-circuit body. This includes ordinary successful
+/// synthetic responses (e.g. `ai_federation` / `ai_semantic_cache` surfaced via
+/// `RejectBinary{200}`) and every final 2xx-5xx terminate-mode serverless
+/// response, which is application-owned content rather than a gateway error.
 ///
 /// General rule: these hooks (`on_response_body`,
 /// `transform_response_body_with_context`, `on_final_response_body`) run over a
-/// 2xx short-circuit body **only** when there is a body to inspect and the same
-/// response-body-buffering capability gate the normal response path uses is
-/// satisfied. Specifically we skip when:
+/// governed short-circuit body **only** when there is a body to inspect and the
+/// same response-body-buffering capability gate the normal response path uses
+/// is satisfied. Specifically we skip when:
 /// - the request is gRPC (synthetic gRPC bodies are handled as trailers-only),
-/// - the status is not 2xx,
-/// - the status is 204 (a body-emitting transform there is protocol-incorrect —
-///   `204 No Content` MUST NOT carry a body; 304 is already outside the 2xx
-///   range checked above),
+/// - the status is neither 2xx nor a marked final serverless response,
+/// - the status is 204, 205, or 304 (a body-emitting transform there is
+///   protocol-incorrect),
 /// - the synthetic body is empty (nothing to inspect/transform), or
 /// - no active plugin wants to buffer this response. We mirror the normal
 ///   response path's two-tier gate exactly: a plugin's per-request
@@ -13429,16 +13431,18 @@ fn should_apply_synthetic_response_body_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
 ) -> bool {
+    let governed_synthetic_status = (200..300).contains(&status_code)
+        || (ctx.serverless_terminate_response && (200..=599).contains(&status_code));
     !is_grpc_request
-        && (200..300).contains(&status_code)
-        && status_code != 204
+        && governed_synthetic_status
+        && !matches!(status_code, 204 | 205 | 304)
         && !response_body.is_empty()
         && plugins.iter().any(|plugin| {
             plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
         })
 }
 
-/// Run the synthetic 2xx short-circuit response-body hook pipeline
+/// Run the governed synthetic short-circuit response-body hook pipeline
 /// (`on_response_body`, `transform_response_body_with_context`,
 /// `on_final_response_body`) over a plugin-generated body, replacing the
 /// response when a body guardrail rejects it.
@@ -13448,7 +13452,7 @@ fn should_apply_synthetic_response_body_hooks(
 /// run the `after_proxy` reject hooks. The caller
 /// ([`apply_reject_after_proxy_and_synthetic_body_hooks`]) runs those hooks
 /// exactly once after this function returns, over whatever the final response
-/// turned out to be (the synthetic 2xx or the body-rejection response), so
+/// turned out to be (the synthetic response or the body-rejection response), so
 /// one-shot `after_proxy` response state (e.g. the `oidc_relying_party` rotated
 /// session cookie, `response_transformer` route overrides) lands on the final
 /// response exactly once instead of being consumed by an earlier pass and lost
@@ -13572,17 +13576,17 @@ async fn apply_synthetic_response_body_hooks(
 ///
 /// Ordering: the synthetic body hooks run first (they may *replace* the
 /// response when `ai_response_guard` / `ai_semantic_firewall` rejects the
-/// synthetic 2xx body — see [`apply_synthetic_response_body_hooks`], which
+/// synthetic body — see [`apply_synthetic_response_body_hooks`], which
 /// rebuilds headers via [`rebuild_plugin_rejection_response_headers`] without
 /// running `after_proxy`). The `after_proxy` reject hooks then run a single
-/// time over whatever the FINAL response is (the synthetic 2xx OR the
+/// time over whatever the FINAL response is (the synthetic response OR the
 /// body-rejection response). Running `after_proxy` exactly once — and last —
 /// preserves one-shot response state that those hooks emit: the
 /// `oidc_relying_party` rotated session cookie and `response_transformer`
 /// route-override headers are staged from metadata that the hook consumes on
 /// first invocation, so they must be applied to the final response, not
-/// consumed against a synthetic 2xx that a later body rejection discards. The
-/// reject-path `after_proxy` hooks are header-only and do not depend on the
+/// consumed against a synthetic response that a later body rejection discards.
+/// The reject-path `after_proxy` hooks are header-only and do not depend on the
 /// body-hook output (`compression::after_proxy` deliberately no-ops on the
 /// rejection path), so deferring them past the body hooks is safe.
 pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
@@ -13614,21 +13618,22 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         // ahead of the body hooks: doing so would re-break the one-shot
         // `after_proxy` response-state contract that the caller relies on. The
         // body hooks may REPLACE the response when a guardrail rejects the
-        // synthetic 2xx body (`apply_synthetic_response_body_hooks` rebuilds
+        // synthetic body (`apply_synthetic_response_body_hooks` rebuilds
         // headers via `rebuild_plugin_rejection_response_headers`). The
         // `after_proxy` reject hooks therefore have to run exactly once and LAST,
         // over the FINAL response, so one-shot state emitted from consumed
         // metadata — the `oidc_relying_party` rotated session cookie, the
         // `response_transformer` route override — lands on whatever the client
-        // actually receives instead of being consumed against a synthetic 2xx
-        // that a later body rejection discards (see commit 36de1bf0 and the
-        // function-level doc on `apply_reject_after_proxy_and_synthetic_body_hooks`).
+        // actually receives instead of being consumed against a synthetic
+        // response that a later body rejection discards (see commit 36de1bf0
+        // and the function-level doc on
+        // `apply_reject_after_proxy_and_synthetic_body_hooks`).
         // The two requirements directly conflict; we keep the one-shot guarantee
         // and accept the minor body-transform divergence on the synthetic path.
         apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
     }
     // Apply the after_proxy reject hooks exactly once, over the final response
-    // (the synthetic 2xx or the body-rejection response produced above), so
+    // (the synthetic response or the body-rejection response produced above), so
     // one-shot response state (rotated session cookie, route overrides) is
     // emitted onto whatever the client actually receives. Runs LAST by design —
     // see the divergence note above.
@@ -29698,6 +29703,8 @@ mod tests {
         should_buffer: bool,
     }
 
+    struct SyntheticBodyTransformPlugin;
+
     struct SyntheticNormalizationProbePlugin;
 
     struct RejectHeaderPlugin;
@@ -29722,6 +29729,26 @@ mod tests {
 
         fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
             self.should_buffer
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for SyntheticBodyTransformPlugin {
+        fn name(&self) -> &str {
+            "synthetic_body_transform"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        async fn transform_response_body(
+            &self,
+            _body: &[u8],
+            _content_type: Option<&str>,
+            _response_headers: &HashMap<String, String>,
+        ) -> Option<Vec<u8>> {
+            Some(b"transformed application response".to_vec())
         }
     }
 
@@ -30414,6 +30441,64 @@ mod tests {
         assert_eq!(
             ctx.metadata.get("test:committed_body").map(String::as_str),
             Some(r#"{"error":"blocked"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_serverless_non_2xx_runs_synthetic_body_transforms() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SyntheticBodyTransformPlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/invoke".to_string(),
+        );
+        ctx.serverless_terminate_response = true;
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 429,
+            body: bytes::Bytes::from_static(b"original function error"),
+            headers: HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"function-v1\"".to_string()),
+                ("content-digest".to_string(), "sha-256=:stale:".to_string()),
+            ]),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.body, b"transformed application response");
+        assert!(!response.headers.contains_key("etag"));
+        assert!(!response.headers.contains_key("content-digest"));
+        assert_eq!(
+            response.headers.get("content-length").map(String::as_str),
+            Some("32")
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_non_2xx_reject_does_not_run_synthetic_body_transforms() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SyntheticBodyTransformPlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/invoke".to_string(),
+        );
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 429,
+            body: bytes::Bytes::from_static(b"ordinary gateway rejection"),
+            headers: HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("etag".to_string(), "\"gateway-v1\"".to_string()),
+            ]),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.body, b"ordinary gateway rejection");
+        assert_eq!(
+            response.headers.get("etag").map(String::as_str),
+            Some("\"gateway-v1\"")
         );
     }
 

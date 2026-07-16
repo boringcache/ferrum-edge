@@ -1777,6 +1777,13 @@ impl Plugin for ServerlessFunction {
                     "serverless_function: terminate mode — returning function response (status {})",
                     status
                 );
+                // Every valid terminate response is application-owned content,
+                // including redirects and errors. Mark it for the shared
+                // synthetic body lifecycle so configured response transforms
+                // and successful-response guardrails are not limited to the
+                // ordinary synthetic-2xx gate. Replays are already stored after
+                // this lifecycle and deliberately do not set the marker again.
+                ctx.serverless_terminate_response = true;
                 let body = if ctx.method.eq_ignore_ascii_case("HEAD")
                     || matches!(status, 204 | 205 | 304)
                 {
