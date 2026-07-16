@@ -2104,6 +2104,35 @@ fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
 }
 
 #[test]
+fn adaptive_concurrency_schema_documents_generation_handoff_exceptions() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AdaptiveConcurrencyConfig")
+        .expect("missing AdaptiveConcurrencyConfig schema");
+
+    let shadow_description = schema
+        .pointer("/properties/shadow_mode/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("shadow_mode description should be present");
+    assert!(
+        shadow_description.contains("structural generation handoff")
+            && shadow_description.contains("still fail closed"),
+        "shadow_mode must document the structural handoff exception"
+    );
+
+    let header_description = schema
+        .pointer("/properties/expose_headers/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("expose_headers description should be present");
+    assert!(
+        header_description.contains("genuine per-target limit rejections")
+            && header_description.contains("Generation-handoff rejections omit"),
+        "expose_headers must document generation-handoff omission"
+    );
+}
+
+#[test]
 fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 

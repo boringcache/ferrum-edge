@@ -13503,7 +13503,7 @@ components:
           format: uint64
           default: 10000
           minimum: 1
-          description: Maximum number of distinct target keys this stable plugin policy will track, bounding limiter memory for high-cardinality wildcard upstreams. State is retained across compatible config reloads; lowering this value or changing the policy's effective subset-filtered backend targets, route-override destinations, or route execution order drains live permits and resets tracked target state before the new key space takes effect. Service-discovery changes outside the policy's selected subset remain compatible. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503) until the policy is removed/recreated, its route key space changes, or the process restarts. Existing keys continue to be admitted subject to their adaptive limit.
+          description: Maximum number of distinct target keys this stable plugin policy will track, bounding limiter memory for high-cardinality wildcard upstreams. State is retained across compatible config reloads. Lowering this value or changing the policy's effective subset-filtered backend targets, route-override destinations, or route execution order publishes an independent tracking space; retired permits finish against detached state, while retired cache and load-balancer views cannot admit, repopulate, or train the replacement. Service-discovery changes outside the policy's selected subset remain compatible. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503) until the policy is removed/recreated, its route key space changes, or the process restarts. Existing keys continue to be admitted subject to their adaptive limit.
         min_limit:
           type: integer
           format: uint64
@@ -13550,11 +13550,11 @@ components:
         shadow_mode:
           type: boolean
           default: false
-          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit.
+          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. Retired cache/load-balancer views and requests crossing a structural generation handoff still fail closed so they cannot repopulate the replacement tracking space.
         expose_headers:
           type: boolean
           default: false
-          description: Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on rejection responses.
+          description: Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Generation-handoff rejections omit them because no truthful per-target limit or in-flight value exists.
 
     IpRestrictionConfig:
       type: object
