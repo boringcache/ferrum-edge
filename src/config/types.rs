@@ -15,7 +15,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
-use std::sync::LazyLock;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
+use std::time::SystemTime;
 
 /// Maximum length for resource IDs.
 const MAX_ID_LENGTH: usize = 254;
@@ -4827,6 +4829,87 @@ pub enum CountryMmdbLoadError {
     Invalid(String),
 }
 
+type CountryMmdbReader = maxminddb::Reader<Vec<u8>>;
+type CountryMmdbDigest = [u8; 32];
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CountryMmdbFileVersion {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl CountryMmdbFileVersion {
+    fn from_metadata(path: &str, metadata: &std::fs::Metadata) -> Option<Self> {
+        Some(Self {
+            path: PathBuf::from(path),
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            #[cfg(unix)]
+            device: std::os::unix::fs::MetadataExt::dev(metadata),
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(metadata),
+            #[cfg(unix)]
+            changed_seconds: std::os::unix::fs::MetadataExt::ctime(metadata),
+            #[cfg(unix)]
+            changed_nanoseconds: std::os::unix::fs::MetadataExt::ctime_nsec(metadata),
+        })
+    }
+}
+
+/// Immutable, fully validated country MMDB snapshot shared by live plugins.
+pub struct CountryMmdbSnapshot(CountryMmdbReader);
+
+impl std::ops::Deref for CountryMmdbSnapshot {
+    type Target = maxminddb::Reader<Vec<u8>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Default)]
+struct CountryMmdbCache {
+    by_digest: HashMap<CountryMmdbDigest, Weak<CountryMmdbSnapshot>>,
+    by_file_version: HashMap<CountryMmdbFileVersion, CountryMmdbDigest>,
+}
+
+impl CountryMmdbCache {
+    fn retain_live(&mut self) {
+        self.by_digest
+            .retain(|_, reader| reader.strong_count() > 0);
+        let by_digest = &self.by_digest;
+        self.by_file_version
+            .retain(|_, digest| by_digest.contains_key(digest));
+    }
+
+    fn get_by_digest(&self, digest: &CountryMmdbDigest) -> Option<Arc<CountryMmdbSnapshot>> {
+        self.by_digest.get(digest).and_then(Weak::upgrade)
+    }
+
+    fn get_by_file_version(
+        &self,
+        version: &CountryMmdbFileVersion,
+    ) -> Option<Arc<CountryMmdbSnapshot>> {
+        self.by_file_version
+            .get(version)
+            .and_then(|digest| self.get_by_digest(digest))
+    }
+}
+
+fn country_mmdb_snapshot_cache() -> &'static Mutex<CountryMmdbCache> {
+    static CACHE: OnceLock<Mutex<CountryMmdbCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(CountryMmdbCache::default()))
+}
+
 impl std::fmt::Display for CountryMmdbLoadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -4858,10 +4941,14 @@ fn is_mmdb_country_code(code: &str) -> bool {
 /// Owning the bytes keeps live readers independent from external in-place file
 /// rewrites and truncation. Verification traverses the complete search tree and
 /// data section, while the record scan proves that the advertised product is
-/// structurally compatible with the fields used by `geo_restriction`.
+/// structurally compatible with the fields used by `geo_restriction`. A weak,
+/// versioned, content-addressed cache shares an identical validated snapshot
+/// across live plugin instances without repeating reads or verification for an
+/// unchanged file and without keeping retired generations alive.
 pub fn load_validated_country_mmdb(
     path: &str,
-) -> Result<maxminddb::Reader<Vec<u8>>, CountryMmdbLoadError> {
+) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
+    use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
 
     let mut file = std::fs::File::open(path).map_err(|e| {
@@ -4879,6 +4966,20 @@ pub fn load_validated_country_mmdb(
             "'{path}' exists but is not a regular file"
         )));
     }
+    let file_version = CountryMmdbFileVersion::from_metadata(path, &metadata);
+    {
+        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database snapshot cache is unavailable".to_string(),
+            )
+        })?;
+        cache.retain_live();
+        if let Some(file_version) = file_version.as_ref()
+            && let Some(reader) = cache.get_by_file_version(file_version)
+        {
+            return Ok(reader);
+        }
+    }
 
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(|e| {
@@ -4886,6 +4987,33 @@ pub fn load_validated_country_mmdb(
             "MaxMind database file '{path}' not readable: {e}"
         ))
     })?;
+    let metadata_after_read = file.metadata().map_err(|e| {
+        CountryMmdbLoadError::Unavailable(format!(
+            "MaxMind database file '{path}' metadata not readable after load: {e}"
+        ))
+    })?;
+    if CountryMmdbFileVersion::from_metadata(path, &metadata_after_read) != file_version {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' changed while it was being loaded"
+        )));
+    }
+
+    let digest: CountryMmdbDigest = Sha256::digest(&bytes).into();
+    {
+        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database snapshot cache is unavailable".to_string(),
+            )
+        })?;
+        cache.retain_live();
+        if let Some(reader) = cache.get_by_digest(&digest) {
+            if let Some(file_version) = file_version {
+                cache.by_file_version.insert(file_version, digest);
+            }
+            return Ok(reader);
+        }
+    }
+
     let reader = maxminddb::Reader::from_source(bytes).map_err(|e| {
         CountryMmdbLoadError::Invalid(format!(
             "MaxMind database file '{path}' is not a valid readable .mmdb: {e}"
@@ -4948,6 +5076,23 @@ pub fn load_validated_country_mmdb(
         )));
     }
 
+    let reader = Arc::new(CountryMmdbSnapshot(reader));
+    let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+        CountryMmdbLoadError::Invalid(
+            "MaxMind database snapshot cache is unavailable".to_string(),
+        )
+    })?;
+    cache.retain_live();
+    if let Some(cached) = cache.get_by_digest(&digest) {
+        if let Some(file_version) = file_version {
+            cache.by_file_version.insert(file_version, digest);
+        }
+        return Ok(cached);
+    }
+    if let Some(file_version) = file_version {
+        cache.by_file_version.insert(file_version, digest);
+    }
+    cache.by_digest.insert(digest, Arc::downgrade(&reader));
     Ok(reader)
 }
 

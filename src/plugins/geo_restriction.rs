@@ -19,7 +19,6 @@
 //! and lookups use `on_lookup_failure`; a readable but invalid database is rejected.
 
 use async_trait::async_trait;
-use maxminddb::Reader;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,7 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
-use crate::config::types::{CountryMmdbLoadError, load_validated_country_mmdb};
+use crate::config::types::{
+    CountryMmdbLoadError, CountryMmdbSnapshot, load_validated_country_mmdb,
+};
 
 const GEO_COUNTRY_HEADER: &str = "x-geo-country";
 const CONFIG_KEYS: &[&str] = &[
@@ -38,10 +39,11 @@ const CONFIG_KEYS: &[&str] = &[
     "on_lookup_failure",
 ];
 
-// Current ISO 3166-1 alpha-2 assignments. User-assigned, reserved, deleted,
-// and compatibility aliases (for example EU, UK, XK, and ZZ) are deliberately
-// excluded so a policy typo cannot become an effective-but-impossible rule.
-const ASSIGNED_COUNTRY_CODES: &[u8] = concat!(
+// Current ISO 3166-1 alpha-2 assignments plus XK, the user-assigned Kosovo code
+// emitted by MaxMind country-capable products. Other user-assigned, reserved,
+// deleted, and compatibility aliases are deliberately excluded so a policy
+// typo cannot become an effective-but-impossible rule.
+const SUPPORTED_COUNTRY_CODES: &[u8] = concat!(
     "ADAEAFAGAIALAMAOAQARASATAUAWAXAZ",
     "BABBBDBEBFBGBHBIBJBLBMBNBOBQBRBSBTBVBWBYBZ",
     "CACCCDCFCGCHCICKCLCMCNCOCRCUCVCWCXCYCZ",
@@ -65,6 +67,7 @@ const ASSIGNED_COUNTRY_CODES: &[u8] = concat!(
     "UAUGUMUSUYUZ",
     "VAVCVEVGVIVNVU",
     "WFWS",
+    "XK",
     "YEYT",
     "ZAZMZW",
 )
@@ -89,9 +92,9 @@ impl CountryCode {
         [(self.0 >> 8) as u8, self.0 as u8]
     }
 
-    fn is_assigned(self) -> bool {
+    fn is_supported(self) -> bool {
         let code = self.bytes();
-        ASSIGNED_COUNTRY_CODES
+        SUPPORTED_COUNTRY_CODES
             .chunks_exact(2)
             .any(|assigned| assigned == code.as_slice())
     }
@@ -154,7 +157,7 @@ enum LookupFailureAction {
 }
 
 pub struct GeoRestriction {
-    reader: Option<Arc<Reader<Vec<u8>>>>,
+    reader: Option<Arc<CountryMmdbSnapshot>>,
     db_path: String,
     /// Packed ISO country-code bitsets keep membership checks allocation-free.
     allow_countries: CountrySet,
@@ -223,7 +226,7 @@ impl GeoRestriction {
         // fallback condition. Once bytes are readable, however, corruption,
         // product mismatch, and incompatible records reject the generation.
         let reader = match load_validated_country_mmdb(&db_path) {
-            Ok(r) => Some(Arc::new(r)),
+            Ok(r) => Some(r),
             Err(CountryMmdbLoadError::Unavailable(error)) => {
                 warn!(
                     db_path = %db_path,
@@ -453,7 +456,7 @@ fn parse_country_set(config: &Value, key: &str) -> Result<CountrySet, String> {
                 "geo_restriction: '{key}' contains invalid ISO 3166-1 alpha-2 country code: {country:?}"
             ));
         };
-        if !country_code.is_assigned() {
+        if !country_code.is_supported() {
             return Err(format!(
                 "geo_restriction: '{key}' contains unassigned ISO 3166-1 alpha-2 country code: {country:?}"
             ));

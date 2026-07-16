@@ -1255,7 +1255,7 @@ fn geo_restriction_schema_matches_strict_runtime_contract() {
         (
             json!({
                 "db_path": "/nonexistent/country.mmdb",
-                "allow_countries": ["ad", "cA", "Zw"]
+                "allow_countries": ["ad", "cA", "xK", "Zw"]
             }),
             true,
         ),
@@ -1352,7 +1352,7 @@ fn geo_restriction_schema_matches_strict_runtime_contract() {
         );
     }
 
-    let mut assigned_code_count = 0;
+    let mut supported_code_count = 0;
     for first in b'A'..=b'Z' {
         for second in b'A'..=b'Z' {
             let code = String::from_utf8(vec![first, second]).expect("ASCII country code");
@@ -1368,11 +1368,12 @@ fn geo_restriction_schema_matches_strict_runtime_contract() {
                 "schema/runtime country assignment mismatch for {code}"
             );
             if runtime_valid {
-                assigned_code_count += 1;
+                supported_code_count += 1;
             }
         }
     }
-    assert_eq!(assigned_code_count, 249);
+    // 249 currently assigned ISO codes plus MaxMind's XK extension.
+    assert_eq!(supported_code_count, 250);
 }
 
 #[tokio::test]

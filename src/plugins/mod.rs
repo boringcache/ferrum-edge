@@ -453,6 +453,8 @@ pub enum UdpDatagramDirection {
 /// relaying the response to the client).
 #[allow(dead_code)]
 pub struct UdpDatagramContext<'a> {
+    /// Canonical client IP identity. IPv4-mapped IPv6 is normalized once when
+    /// the UDP/DTLS session is created so per-datagram hooks only clone this Arc.
     pub client_ip: Arc<str>,
     pub proxy_id: Arc<str>,
     pub proxy_name: Option<Arc<str>>,

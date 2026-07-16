@@ -17991,10 +17991,11 @@ components:
       type: string
       minLength: 2
       maxLength: 2
-      pattern: '^(?:[Aa][DdEeFfGgIiLlMmNnOoQqRrSsTtUuWwXxZz]|[Bb][AaBbDdEeFfGgHhIiJjLlMmNnOoQqRrSsTtVvWwYyZz]|[Cc][AaCcDdFfGgHhIiKkLlMmNnOoRrUuVvWwXxYyZz]|[Dd][EeJjKkMmOoZz]|[Ee][CcEeGgHhRrSsTt]|[Ff][IiJjKkMmOoRr]|[Gg][AaBbDdEeFfGgHhIiLlMmNnPpQqRrSsTtUuWwYy]|[Hh][KkMmNnRrTtUu]|[Ii][DdEeLlMmNnOoQqRrSsTt]|[Jj][EeMmOoPp]|[Kk][EeGgHhIiMmNnPpRrWwYyZz]|[Ll][AaBbCcIiKkRrSsTtUuVvYy]|[Mm][AaCcDdEeFfGgHhKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz]|[Nn][AaCcEeFfGgIiLlOoPpRrUuZz]|[Oo][Mm]|[Pp][AaEeFfGgHhKkLlMmNnRrSsTtWwYy]|[Qq][Aa]|[Rr][EeOoSsUuWw]|[Ss][AaBbCcDdEeGgHhIiJjKkLlMmNnOoRrSsTtVvXxYyZz]|[Tt][CcDdFfGgHhJjKkLlMmNnOoRrTtVvWwZz]|[Uu][AaGgMmSsYyZz]|[Vv][AaCcEeGgIiNnUu]|[Ww][FfSs]|[Yy][EeTt]|[Zz][AaMmWw])$'
+      pattern: '^(?:[Aa][DdEeFfGgIiLlMmNnOoQqRrSsTtUuWwXxZz]|[Bb][AaBbDdEeFfGgHhIiJjLlMmNnOoQqRrSsTtVvWwYyZz]|[Cc][AaCcDdFfGgHhIiKkLlMmNnOoRrUuVvWwXxYyZz]|[Dd][EeJjKkMmOoZz]|[Ee][CcEeGgHhRrSsTt]|[Ff][IiJjKkMmOoRr]|[Gg][AaBbDdEeFfGgHhIiLlMmNnPpQqRrSsTtUuWwYy]|[Hh][KkMmNnRrTtUu]|[Ii][DdEeLlMmNnOoQqRrSsTt]|[Jj][EeMmOoPp]|[Kk][EeGgHhIiMmNnPpRrWwYyZz]|[Ll][AaBbCcIiKkRrSsTtUuVvYy]|[Mm][AaCcDdEeFfGgHhKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz]|[Nn][AaCcEeFfGgIiLlOoPpRrUuZz]|[Oo][Mm]|[Pp][AaEeFfGgHhKkLlMmNnRrSsTtWwYy]|[Qq][Aa]|[Rr][EeOoSsUuWw]|[Ss][AaBbCcDdEeGgHhIiJjKkLlMmNnOoRrSsTtVvXxYyZz]|[Tt][CcDdFfGgHhJjKkLlMmNnOoRrTtVvWwZz]|[Uu][AaGgMmSsYyZz]|[Vv][AaCcEeGgIiNnUu]|[Ww][FfSs]|[Xx][Kk]|[Yy][EeTt]|[Zz][AaMmWw])$'
       description: >-
-        A currently assigned ISO 3166-1 alpha-2 country code. Matching is
-        case-insensitive and runtime storage is normalized to uppercase;
+        A currently assigned ISO 3166-1 alpha-2 country code, or XK (the
+        user-assigned Kosovo code emitted by MaxMind). Matching is
+        case-insensitive and runtime storage is normalized to uppercase. Other
         reserved, user-assigned, deleted, and alias codes are rejected.
 
     RateSpec:

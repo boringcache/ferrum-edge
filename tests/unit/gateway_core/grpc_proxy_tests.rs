@@ -10,6 +10,7 @@ use ferrum_edge::plugins::{
 };
 use ferrum_edge::proxy::build_backend_url;
 use ferrum_edge::proxy::grpc_proxy;
+use ferrum_edge::proxy::headers::merge_proxy_headers_and_strip_for_grpc;
 use serde_json::json;
 
 fn test_proxy() -> Proxy {
@@ -81,6 +82,26 @@ fn headers_with_content_type(ct: &str) -> hyper::HeaderMap {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("content-type", ct.parse().unwrap());
     headers
+}
+
+#[test]
+fn native_grpc_strips_raw_geo_assertion_before_authoritative_merge() {
+    let mut raw_headers = hyper::HeaderMap::new();
+    raw_headers.append("x-geo-country", "attacker-first".parse().unwrap());
+    raw_headers.append("x-geo-country", "attacker-second".parse().unwrap());
+
+    merge_proxy_headers_and_strip_for_grpc(&mut raw_headers, &HashMap::new());
+    assert!(!raw_headers.contains_key("x-geo-country"));
+
+    let mut raw_headers = hyper::HeaderMap::new();
+    raw_headers.insert("x-geo-country", "attacker".parse().unwrap());
+    let proxy_headers = HashMap::from([("x-geo-country".to_string(), "SE".to_string())]);
+
+    merge_proxy_headers_and_strip_for_grpc(&mut raw_headers, &proxy_headers);
+    assert_eq!(
+        raw_headers.get("x-geo-country").and_then(|value| value.to_str().ok()),
+        Some("SE")
+    );
 }
 
 // --- is_grpc_content_type detection tests ---

@@ -1,13 +1,15 @@
 use base64::Engine;
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    GatewayConfig, PluginConfig, PluginScope, default_namespace, validate_mmdb_file,
+    GatewayConfig, PluginConfig, PluginScope, default_namespace, load_validated_country_mmdb,
+    validate_mmdb_file,
 };
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use http::{HeaderMap, HeaderValue};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tempfile::TempDir;
 
 const COUNTRY_MMDB_B64: &str =
@@ -188,7 +190,7 @@ fn test_new_rejects_invalid_country_code() {
 
 #[test]
 fn test_new_rejects_unassigned_and_alias_country_codes() {
-    for country in ["ZZ", "EU", "UK", "XK"] {
+    for country in ["ZZ", "EU", "UK"] {
         let config = json!({
             "db_path": "/nonexistent/path/to/test.mmdb",
             "allow_countries": [country]
@@ -200,8 +202,8 @@ fn test_new_rejects_unassigned_and_alias_country_codes() {
 }
 
 #[test]
-fn test_new_accepts_assigned_country_codes_case_insensitively() {
-    for country in ["ad", "uS", "Zw"] {
+fn test_new_accepts_supported_country_codes_case_insensitively() {
+    for country in ["ad", "uS", "xK", "Zw"] {
         let config = json!({
             "db_path": "/nonexistent/path/to/test.mmdb",
             "allow_countries": [country]
@@ -575,6 +577,16 @@ fn validate_mmdb_file_accepts_verified_country_fixture() {
     let directory = TempDir::new().unwrap();
     let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
     assert!(validate_mmdb_file("geo_restriction.db_path", path_text(&path)).is_ok());
+}
+
+#[test]
+fn validated_mmdb_snapshots_are_shared_across_live_instances() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+
+    let first = load_validated_country_mmdb(path_text(&path)).unwrap();
+    let second = load_validated_country_mmdb(path_text(&path)).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
 }
 
 #[test]

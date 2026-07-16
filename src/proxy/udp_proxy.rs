@@ -1912,7 +1912,7 @@ async fn process_new_session_datagram(
         std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
     if !udp_datagram_allowed(
         &view.datagram_plugins,
-        Arc::from(client_addr.ip().to_string()),
+        Arc::from(client_addr.ip().to_canonical().to_string()),
         Arc::from(view.proxy.id.as_str()),
         view.proxy.name.as_deref().map(Arc::from),
         listen_port,
@@ -2991,7 +2991,7 @@ async fn handle_dtls_client_inner(
     let dgram_plugins = Arc::clone(datagram_plugins);
     // Pre-compute context strings as Arc<str> — per-datagram "clone" is a pointer
     // bump (~5ns) instead of heap allocation + memcpy.
-    let dgram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
+    let dgram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_canonical().to_string());
     let dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let dgram_proxy_name: Option<Arc<str>> = proxy_name.map(Arc::from);
     let dgram_listen_port = listen_port;
@@ -3466,7 +3466,7 @@ async fn create_session(
     let now = coarse_epoch_millis();
     let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
     let auth_method = stream_ctx.auth_method;
-    let datagram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
+    let datagram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_canonical().to_string());
     let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let datagram_proxy_name: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
     let session = Arc::new(UdpSession {

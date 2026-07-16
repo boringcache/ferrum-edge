@@ -18,8 +18,9 @@ fn make_plugin(
 }
 
 fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext<'static> {
+    let client_ip: std::net::IpAddr = client_ip.parse().expect("test client IP parses");
     UdpDatagramContext {
-        client_ip: Arc::from(client_ip),
+        client_ip: Arc::from(client_ip.to_canonical().to_string()),
         proxy_id: Arc::from("proxy-1"),
         proxy_name: Some(Arc::from("test-proxy")),
         listen_port: 5353,
@@ -71,6 +72,21 @@ fn requires_udp_datagram_hooks() {
 fn tracked_keys_count_starts_at_zero() {
     let plugin = make_plugin(json!({"datagrams_per_second": 100}));
     assert_eq!(plugin.tracked_keys_count(), Some(0));
+}
+
+#[test]
+fn udp_session_source_canonicalizes_once_before_datagram_hooks() {
+    let session_source = include_str!("../../../src/proxy/udp_proxy.rs");
+    let limiter_source = include_str!("../../../src/plugins/udp_rate_limiting.rs");
+
+    assert_eq!(
+        session_source
+            .matches("client_addr.ip().to_canonical().to_string()")
+            .count(),
+        3
+    );
+    assert!(!limiter_source.contains("canonical_ip_text"));
+    assert!(limiter_source.contains("Arc::clone(&ctx.client_ip)"));
 }
 
 #[test]
