@@ -374,7 +374,7 @@ fn grpc_web_reject_finalizer_moves_rich_status_details_into_body_trailer() {
             ("grpc-message".to_string(), "denied".to_string()),
             ("grpc-status-details-bin".to_string(), "AQID".to_string()),
             (
-                "access-control-expose-headers".to_string(),
+                "Access-Control-Expose-Headers".to_string(),
                 "X-Request-ID, grpc-status".to_string(),
             ),
         ]);

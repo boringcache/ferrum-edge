@@ -14078,10 +14078,14 @@ fn build_grpc_web_error_response(
 
 fn merge_grpc_web_expose_headers(
     required: Option<&str>,
-    configured: Option<&str>,
+    headers: &HashMap<String, String>,
 ) -> Option<String> {
     let mut merged = String::new();
-    for value in [required, configured].into_iter().flatten() {
+    let configured = headers.iter().filter_map(|(name, value)| {
+        name.eq_ignore_ascii_case("access-control-expose-headers")
+            .then_some(value.as_str())
+    });
+    for value in required.into_iter().chain(configured) {
         for token in value
             .split(',')
             .map(str::trim)
@@ -14147,13 +14151,8 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
         );
     }
 
-    let expose_headers = merge_grpc_web_expose_headers(
-        expose_headers.as_deref(),
-        response
-            .headers
-            .get("access-control-expose-headers")
-            .map(String::as_str),
-    );
+    let expose_headers =
+        merge_grpc_web_expose_headers(expose_headers.as_deref(), &response.headers);
 
     response.headers.retain(|name, _| {
         ![
