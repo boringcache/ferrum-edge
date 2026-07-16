@@ -549,25 +549,6 @@ async fn recover_late_resource_write<R: AdminResource>(
     Ok(false)
 }
 
-pub(crate) async fn recover_late_consumer_update(
-    db: Arc<dyn DatabaseBackend>,
-    namespace: &str,
-    lost_generation: u64,
-    written: &Consumer,
-    previous: &Consumer,
-) -> Result<bool, anyhow::Error> {
-    recover_late_resource_write(
-        db,
-        namespace,
-        lost_generation,
-        LateResourceWrite::Update { id: &written.id },
-        Some(written),
-        Some(previous),
-        None,
-    )
-    .await
-}
-
 async fn validate_transaction_log_schema_graph_on_blocking_pool(
     candidate: GatewayConfig,
     http_client: crate::plugins::PluginHttpClient,
