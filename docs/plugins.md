@@ -2318,20 +2318,23 @@ config:
 
 ### `fault_injection`
 
-Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; TCP/UDP stream proxies run the same decision in `on_stream_connect`. Stream rejects close the frontend connection/session, so HTTP status/body/grpc-status fields only have downstream meaning for HTTP-family protocols.
+Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; raw TCP proxies run the same decision in `on_stream_connect`. UDP and DTLS are not supported: their listener/session loops cannot safely wait inside a plugin delay without head-of-line blocking unrelated datagrams. TCP admission races fault delays against client disconnect, and all fault delays are capped at one minute. Stream rejects close the frontend connection, so HTTP status/body fields only have downstream meaning for HTTP-family protocols.
 
 **Priority:** 2940
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `abort.status_code` | u16 | required when `abort` is set | Final HTTP status to return, 200-599 |
-| `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0 |
-| `abort.grpc_status` | u32 (optional) | — | gRPC status trailer to emit on gRPC rejects, 0-16 |
+| `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
+| `abort.grpc_status` | u32 (optional) | — | gRPC status to emit only on native `application/grpc*` rejects (excluding gRPC-Web), 0-16 |
 | `abort.body` | String | `""` | HTTP response body for aborts |
-| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-3,600,000 ms |
-| `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0 |
+| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-60,000 ms |
+| `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
+| `runtime_overlay_scope` | String (optional) | — | RTDS scope with at least one non-whitespace character (outer whitespace is trimmed) for `ferrum.fault_injection.<scope>.{abort,delay}_percent` |
 
-Each plugin instance owns its own sampling counter, so proxy-scoped and proxy-group-scoped instances make independent decisions. The plugin rejects no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
+Each plugin instance owns a process-random sampling stream and makes independent delay/abort rolls. Multiple scoped instances therefore all decide in configured priority order: a delaying instance does not suppress a later sibling, while the first abort naturally short-circuits the remaining plugin chain. Route-local VirtualService faults still deduplicate against proxy-scoped faults through a private source marker, so route translation does not accidentally stack the same policy surface. The plugin rejects static no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
+
+When `runtime_overlay_scope` is set, a mesh request epoch captures the matching RTDS values atomically with the plugin config. Missing or malformed keys fall back independently to the static percentage. RTDS layers are ordered lexicographically by Runtime resource name, with later names winning; duplicate Runtime names are rejected. A numeric RTDS value may be `0` to temporarily disable one configured fault kind.
 
 ```yaml
 plugin_name: fault_injection
@@ -2344,6 +2347,7 @@ config:
   delay:
     duration_ms: 250
     percentage: 10.0
+  runtime_overlay_scope: checkout
 ```
 
 ---

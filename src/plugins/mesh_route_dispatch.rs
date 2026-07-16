@@ -72,18 +72,16 @@ use crate::plugins::mesh::authz::{
     NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
     NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
 };
-use crate::plugins::utils::fault_roll::FaultRoller;
+use crate::plugins::fault_injection::{
+    ROUTE_FAULT_INJECTED_METADATA_KEY, is_native_grpc_request,
+};
+use crate::plugins::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
 use crate::plugins::utils::route_header_transform::{
     RawRouteHeaderTransformRule, RouteHeaderTransformRule, parse_route_header_transforms,
 };
 use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
 };
-
-/// Maximum delay duration for a route-local fault action (matches the
-/// `fault_injection` plugin's cap so the two surfaces share a single
-/// upper bound).
-const FAULT_ACTION_MAX_DELAY_MS: u64 = 3_600_000;
 
 /// Top-level config for the plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,10 +282,10 @@ fn validate_fault_action(rule_idx: usize, fault: &FaultActionConfig) -> Result<(
                 "mesh_route_dispatch.rules[{rule_idx}].fault.delay.duration_ms must be > 0"
             ));
         }
-        if delay.duration_ms > FAULT_ACTION_MAX_DELAY_MS {
+        if delay.duration_ms > MAX_FAULT_DELAY_MS {
             return Err(format!(
                 "mesh_route_dispatch.rules[{rule_idx}].fault.delay.duration_ms must be \
-                 <= {FAULT_ACTION_MAX_DELAY_MS} (1 hour), got {}",
+                 <= {MAX_FAULT_DELAY_MS} (1 minute), got {}",
                 delay.duration_ms
             ));
         }
@@ -724,8 +722,8 @@ pub struct RouteRule {
     pub redirect: Option<RouteRedirectConfig>,
     /// Per-rule fault roller. Constructed at config-load time whenever
     /// `fault` is `Some` so the request hot path does one atomic counter
-    /// increment + a splitmix64 mix per fault decision. `None` when the
-    /// rule carries no fault. The `apply_fault_action` helper falls back
+    /// increment + two SplitMix finalizations per fault decision. `None` when
+    /// the rule carries no fault. The `apply_fault_action` helper falls back
     /// to a throwaway `FaultRoller::new()` if this is somehow unset on a
     /// fault-carrying rule — defense in depth for hand-constructed
     /// `RouteRule` literals in tests.
@@ -1282,7 +1280,7 @@ pub struct FaultActionConfig {
 #[serde(deny_unknown_fields)]
 pub struct FaultDelayConfig {
     /// How long to delay when the percentile roll hits, in milliseconds.
-    /// Bounded to `[1, 3_600_000]` (1 ms to 1 hour) so a misconfigured
+    /// Bounded to `[1, 60_000]` (1 ms to 1 minute) so a misconfigured
     /// fault can't wedge a proxy forever.
     pub duration_ms: u64,
     /// Percent of matching requests that trigger the delay. Range
@@ -2097,10 +2095,10 @@ fn authority_without_port(authority: &str) -> String {
 /// through to the normal route-override path.
 ///
 /// The fault decision is one paired `FaultRoller::roll_pair` call (one
-/// atomic increment + splitmix64 mix). When both delay and abort trigger,
-/// the delay runs first, then the abort fires — matching the proxy-scoped
-/// `fault_injection` plugin's ordering so the two surfaces stay
-/// semantically identical.
+/// atomic increment + two domain-separated SplitMix finalizations). When both
+/// delay and abort trigger, the delay runs first, then the abort fires —
+/// matching the proxy-scoped `fault_injection` plugin's ordering so the two
+/// surfaces stay semantically identical.
 ///
 /// Guards against double-faulting when a global / proxy-scoped
 /// `fault_injection` plugin (priority 2940, runs before
@@ -2137,11 +2135,14 @@ async fn apply_fault_action(
         return None;
     }
 
-    // Mark before any sleeps so concurrent plugin instances (e.g.
-    // proxy-scoped `fault_injection` that runs after this one for some
-    // reason) skip their own fault decision.
+    // Mark before any sleeps so a priority-overridden proxy-scoped
+    // `fault_injection` instance that runs later skips its own decision.
     ctx.metadata
         .insert("fault_injected".to_string(), "true".to_string());
+    ctx.metadata.insert(
+        ROUTE_FAULT_INJECTED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
 
     if outcome.delay_triggered
         && let Some(delay) = fault.delay.as_ref()
@@ -2158,7 +2159,7 @@ async fn apply_fault_action(
         // proper `application/grpc` trailers-only response. Plain HTTP
         // requests on the same rule never receive a stray header.
         if let Some(grpc_status) = abort.grpc_status
-            && is_grpc_request(headers)
+            && is_native_grpc_request(headers)
         {
             reject_headers.insert("grpc-status".to_string(), grpc_status.to_string());
         }
@@ -2173,21 +2174,6 @@ async fn apply_fault_action(
     // through to normal route-override processing so the request still
     // dispatches.
     None
-}
-
-/// gRPC content-type detection consistent with `proxy::detect_http_flavor`.
-/// Returns `true` only for the `application/grpc[+...]` content types and
-/// explicitly excludes the gRPC-Web variants (`application/grpc-web*`)
-/// because those are normalised by the proxy's gRPC-Web bridge, not the
-/// trailer-based gRPC path.
-fn is_grpc_request(headers: &HashMap<String, String>) -> bool {
-    headers
-        .get("content-type")
-        .map(|ct| {
-            let lower = ct.to_ascii_lowercase();
-            lower.starts_with("application/grpc") && !lower.starts_with("application/grpc-web")
-        })
-        .unwrap_or(false)
 }
 
 fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String, String>) -> bool {
@@ -4972,12 +4958,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delay_duration_above_one_hour() {
+    fn rejects_delay_duration_above_one_minute() {
         let err = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"methods": ["GET"]},
                 "destination": {"upstream_id": "canary"},
-                "fault": {"delay": {"duration_ms": 3_600_001, "percentage": 50.0}}
+                "fault": {"delay": {"duration_ms": 60_001, "percentage": 50.0}}
             }]
         }))
         .unwrap_err();
@@ -5186,6 +5172,67 @@ mod tests {
         // canary upstream still gets the matched request.
         assert!(matches!(result, PluginResult::Continue));
         assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("canary"));
+    }
+
+    #[tokio::test]
+    async fn proxy_delay_followed_by_route_fault_does_not_stack() {
+        let proxy_fault = crate::plugins::fault_injection::FaultInjectionPlugin::new(&json!({
+            "delay": {"duration_ms": 1, "percentage": 100.0}
+        }))
+        .unwrap();
+        let route = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"abort": {"status_code": 503, "percentage": 100.0}}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+
+        assert!(matches!(
+            proxy_fault.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            route.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("canary"));
+        assert!(!ctx.metadata.contains_key(ROUTE_FAULT_INJECTED_METADATA_KEY));
+        assert_eq!(
+            ctx.metadata.get("fault_type").map(String::as_str),
+            Some("delay")
+        );
+    }
+
+    #[tokio::test]
+    async fn route_source_marker_suppresses_later_proxy_fault_surface() {
+        let route = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"},
+                "fault": {"delay": {"duration_ms": 1, "percentage": 100.0}}
+            }]
+        }))
+        .unwrap();
+        let later = crate::plugins::fault_injection::FaultInjectionPlugin::new(&json!({
+            "abort": {"status_code": 503, "percentage": 100.0}
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/api");
+        let mut headers = HashMap::new();
+
+        assert!(matches!(
+            route.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert!(ctx.metadata.contains_key(ROUTE_FAULT_INJECTED_METADATA_KEY));
+        assert!(matches!(
+            later.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
     }
 
     #[tokio::test]

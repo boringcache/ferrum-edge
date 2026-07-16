@@ -347,6 +347,8 @@ fn both_directions_transferred(c2b_bytes: &AtomicU64, b2c_bytes: &AtomicU64) -> 
 pub(crate) const STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED: &str = "Frontend TLS handshake failed";
 pub(crate) const STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED: &str = "Backend TLS handshake failed";
 pub(crate) const STREAM_ERR_REJECTED_BY_PLUGIN: &str = "rejected by plugin";
+pub(crate) const STREAM_ERR_CLIENT_DISCONNECTED_DURING_ADMISSION: &str =
+    "client disconnected during plugin admission";
 pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
 pub(crate) const STREAM_ERR_CIRCUIT_BREAKER_OPEN: &str = "circuit breaker open";
 pub(crate) const STREAM_ERR_BACKEND_MAX_CONNECTIONS: &str = "Backend maxConnections reached";
@@ -1885,13 +1887,27 @@ async fn handle_tcp_connection(
 async fn run_tcp_stream_connect_plugins(
     plugins: &[Arc<dyn Plugin>],
     stream_ctx: &mut StreamConnectionContext,
+    client_stream: &TcpStream,
     proxy_id: &str,
     client_ip: IpAddr,
     connection_label: &'static str,
     rejection_detail: &'static str,
 ) -> Result<(), anyhow::Error> {
     for plugin in plugins {
-        if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
+        let result = if plugin.name() == "fault_injection" {
+            tokio::select! {
+                result = plugin.on_stream_connect(stream_ctx) => result,
+                () = wait_for_tcp_peer_disconnect(client_stream) => {
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::ClientDisconnectedDuringAdmission,
+                        connection_label,
+                    ).into());
+                }
+            }
+        } else {
+            plugin.on_stream_connect(stream_ctx).await
+        };
+        if let PluginResult::Reject { .. } = result {
             debug!(
                 proxy_id = %proxy_id,
                 client = %client_ip,
@@ -1904,6 +1920,25 @@ async fn run_tcp_stream_connect_plugins(
         }
     }
     Ok(())
+}
+
+/// Wait until the accepted TCP peer closes or resets without consuming any
+/// application bytes. `Ready::is_read_closed` observes FIN/RDHUP even when
+/// unread data remains queued; error readiness covers resets. If ordinary data
+/// makes the socket continuously readable, the small poll interval prevents a
+/// busy loop while preserving the bytes for the eventual relay.
+async fn wait_for_tcp_peer_disconnect(client_stream: &TcpStream) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    loop {
+        match client_stream
+            .ready(tokio::io::Interest::READABLE | tokio::io::Interest::ERROR)
+            .await
+        {
+            Ok(ready) if ready.is_read_closed() || ready.is_error() => return,
+            Err(_) => return,
+            Ok(_) => tokio::time::sleep(POLL_INTERVAL).await,
+        }
+    }
 }
 
 /// Maximum number of opening client bytes captured for stream first-bytes
@@ -2225,21 +2260,16 @@ async fn handle_tcp_connection_inner(
 
         // Run on_stream_connect plugins (they see SNI but not decrypted data).
         if !plugins.is_empty() {
-            for plugin in plugins.iter() {
-                if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
-                    debug!(
-                        proxy_id = %proxy_id,
-                        client = %remote_addr.ip(),
-                        sni = ?stream_ctx.sni_hostname,
-                        "TCP passthrough connection rejected by plugin"
-                    );
-                    return Err(StreamSetupError::new(
-                        StreamSetupKind::RejectedByPlugin,
-                        "(passthrough)",
-                    )
-                    .into());
-                }
-            }
+            run_tcp_stream_connect_plugins(
+                plugins.as_ref(),
+                stream_ctx,
+                &client_stream,
+                proxy_id,
+                remote_addr.ip(),
+                "TCP passthrough",
+                "(passthrough)",
+            )
+            .await?;
         }
 
         // Circuit breaker check — reject before DNS resolution or backend
@@ -2610,6 +2640,7 @@ async fn handle_tcp_connection_inner(
             run_tcp_stream_connect_plugins(
                 plugins.as_ref(),
                 stream_ctx,
+                tls_stream.get_ref().0,
                 proxy_id,
                 remote_addr.ip(),
                 "TCP/TLS",
@@ -2635,6 +2666,7 @@ async fn handle_tcp_connection_inner(
             run_tcp_stream_connect_plugins(
                 plugins.as_ref(),
                 stream_ctx,
+                &client_stream,
                 proxy_id,
                 remote_addr.ip(),
                 "TCP",
@@ -7948,6 +7980,19 @@ mod cause_direction_tests {
     }
 
     #[test]
+    fn typed_admission_disconnect_maps_to_recv_error_and_client_direction() {
+        let e = err(StreamSetupKind::ClientDisconnectedDuringAdmission);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
+            DisconnectCause::RecvError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
+            Direction::ClientToBackend
+        );
+    }
+
+    #[test]
     fn typed_kind_takes_precedence_over_misleading_error_class() {
         // Adversarial: RejectedByPlugin (client-side) classified as
         // ConnectionTimeout (which the class-fallback would call backend).
@@ -8135,7 +8180,7 @@ mod first_bytes_peek_tests {
 
     use tokio::io::AsyncWriteExt;
 
-    use super::peek_tcp_first_bytes;
+    use super::{peek_tcp_first_bytes, wait_for_tcp_peer_disconnect};
 
     /// Bind a loopback listener and return it with its address.
     async fn listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
@@ -8144,6 +8189,57 @@ mod first_bytes_peek_tests {
             .expect("bind");
         let addr = l.local_addr().expect("addr");
         (l, addr)
+    }
+
+    #[tokio::test]
+    async fn disconnect_wait_observes_close_with_unread_bytes_queued() {
+        let (listener, addr) = listener().await;
+        let peer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            client.write_all(b"queued-before-close").await.expect("write");
+            client.shutdown().await.expect("shutdown");
+        });
+        let (server, _) = listener.accept().await.expect("accept");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_tcp_peer_disconnect(&server),
+        )
+        .await
+        .expect("read-closed readiness must cancel admission promptly");
+        peer.await.expect("peer task");
+
+        let mut queued = [0_u8; 32];
+        let queued_len = server.peek(&mut queued).await.expect("peek queued bytes");
+        assert!(queued_len > 0, "disconnect wait must not consume application bytes");
+    }
+
+    #[tokio::test]
+    async fn disconnect_wait_does_not_treat_queued_bytes_as_close() {
+        let (listener, addr) = listener().await;
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            client.write_all(b"still-open").await.expect("write");
+            let _ = release_rx.await;
+            client.shutdown().await.expect("shutdown");
+        });
+        let (server, _) = listener.accept().await.expect("accept");
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(75),
+                wait_for_tcp_peer_disconnect(&server),
+            )
+            .await
+            .is_err(),
+            "ordinary readable data on an open connection must not cancel admission"
+        );
+        let mut queued = [0_u8; 32];
+        assert!(server.peek(&mut queued).await.expect("peek") > 0);
+
+        let _ = release_tx.send(());
+        peer.await.expect("peer task");
     }
 
     /// A first TCP segment shorter than `min_len` must be reassembled by further

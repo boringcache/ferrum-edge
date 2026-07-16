@@ -6,9 +6,10 @@
 //!
 //! Runs in the `before_proxy` phase for HTTP-family requests so it fires after
 //! authentication, authorization, and consumer rate limiting but before backend
-//! dispatch. Stream proxies run the same fault decision in `on_stream_connect`;
-//! stream rejects close the connection/session and do not deliver HTTP status
-//! bodies to clients.
+//! dispatch. Raw TCP proxies run the same fault decision in `on_stream_connect`;
+//! stream rejects close the connection and do not deliver HTTP status bodies
+//! to clients. UDP and DTLS are not supported because delaying their shared
+//! listener/session loops would head-of-line block unrelated datagrams.
 //!
 //! ## Config
 //!
@@ -37,26 +38,25 @@
 //! When `runtime_overlay_scope: "<scope>"` is set, the plugin reads its
 //! `abort.percentage` and `delay.percentage` from the RTDS-driven
 //! [`MeshRuntimeOverlay`](crate::modes::mesh::config::MeshRuntimeOverlay)
-//! at request time. Reserved keys:
+//! from the same plugin-cache/request-epoch generation. Reserved keys:
 //!
 //! - `ferrum.fault_injection.<scope>.abort_percent`
 //! - `ferrum.fault_injection.<scope>.delay_percent`
 //!
 //! Each accepts either a `Number(0..=100)` or a `FractionalPercent` value.
 //! Missing / malformed entries fall back to the static config so a partial
-//! overlay never silently disables the plugin.
+//! overlay never silently disables the plugin. A valid zero temporarily
+//! disables that fault side for the accepted generation.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::utils::fault_roll::FaultRoller;
+use super::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
 use super::{Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext};
-use runtime_overlay::FaultOverridesSnapshot;
 
 pub mod runtime_overlay;
 
-const MAX_DELAY_MS: u64 = 3_600_000;
 const NON_UDP_PROTOCOLS: &[ProxyProtocol] = &[
     ProxyProtocol::Http,
     ProxyProtocol::Grpc,
@@ -80,12 +80,6 @@ pub struct FaultInjectionPlugin {
     abort: Option<AbortFault>,
     delay: Option<DelayFault>,
     roller: FaultRoller,
-    /// Optional RTDS overlay scope. When set, the plugin reads its
-    /// `abort.percentage` and `delay.percentage` from
-    /// `ferrum.fault_injection.<scope>.{abort,delay}_percent` on every
-    /// request and falls back to the static config when the overlay does
-    /// not carry the key. Empty string is rejected at construction.
-    runtime_overlay_scope: Option<String>,
 }
 
 impl FaultInjectionPlugin {
@@ -169,9 +163,9 @@ impl FaultInjectionPlugin {
                         "fault_injection: delay.duration_ms must be greater than 0".to_string()
                     );
                 }
-                if duration_ms > MAX_DELAY_MS {
+                if duration_ms > MAX_FAULT_DELAY_MS {
                     return Err(format!(
-                        "fault_injection: delay.duration_ms must be <= {MAX_DELAY_MS}, got {duration_ms}"
+                        "fault_injection: delay.duration_ms must be <= {MAX_FAULT_DELAY_MS}, got {duration_ms}"
                     ));
                 }
 
@@ -193,7 +187,7 @@ impl FaultInjectionPlugin {
             );
         }
 
-        let runtime_overlay_scope = match obj.get("runtime_overlay_scope") {
+        match obj.get("runtime_overlay_scope") {
             Some(Value::String(s)) => {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
@@ -202,45 +196,17 @@ impl FaultInjectionPlugin {
                             .to_string(),
                     );
                 }
-                Some(trimmed.to_string())
             }
-            Some(Value::Null) | None => None,
+            None => {}
             Some(_) => {
                 return Err("fault_injection: runtime_overlay_scope must be a string".to_string());
             }
-        };
+        }
 
         Ok(Self {
             abort,
             delay,
             roller: FaultRoller::new(),
-            runtime_overlay_scope,
-        })
-    }
-
-    /// Resolve the abort percentage for this request, preferring the
-    /// RTDS-driven overlay when the plugin has a configured scope and the
-    /// overlay carries the matching key. Returns `None` when no abort
-    /// fault is configured at all.
-    fn effective_abort_percentage(&self, overrides: &FaultOverridesSnapshot) -> Option<f64> {
-        self.abort.as_ref().map(|abort| {
-            self.runtime_overlay_scope
-                .as_deref()
-                .and_then(|scope| overrides.abort_percent(scope))
-                .unwrap_or(abort.percentage)
-        })
-    }
-
-    /// Resolve the delay percentage for this request, preferring the
-    /// RTDS-driven overlay when the plugin has a configured scope and the
-    /// overlay carries the matching key. Returns `None` when no delay
-    /// fault is configured at all.
-    fn effective_delay_percentage(&self, overrides: &FaultOverridesSnapshot) -> Option<f64> {
-        self.delay.as_ref().map(|delay| {
-            self.runtime_overlay_scope
-                .as_deref()
-                .and_then(|scope| overrides.delay_percent(scope))
-                .unwrap_or(delay.percentage)
         })
     }
 }
@@ -286,17 +252,17 @@ fn parse_percentage(val: Option<&Value>, field_name: &str) -> Result<f64, String
 }
 
 impl FaultInjectionPlugin {
-    fn decide_faults(&self, overrides: &FaultOverridesSnapshot) -> (bool, bool) {
+    fn decide_faults(&self) -> (bool, bool) {
         let outcome = self.roller.roll_pair(
-            self.effective_delay_percentage(overrides),
-            self.effective_abort_percentage(overrides),
+            self.delay.as_ref().map(|delay| delay.percentage),
+            self.abort.as_ref().map(|abort| abort.percentage),
         );
         (outcome.delay_triggered, outcome.abort_triggered)
     }
 
-    fn reject_for_abort(&self, abort: &AbortFault) -> PluginResult {
+    fn reject_for_abort(&self, abort: &AbortFault, is_grpc_request: bool) -> PluginResult {
         let mut headers = HashMap::new();
-        if let Some(grpc_status) = abort.grpc_status {
+        if is_grpc_request && let Some(grpc_status) = abort.grpc_status {
             headers.insert("grpc-status".to_string(), grpc_status.to_string());
         }
         PluginResult::Reject {
@@ -313,6 +279,21 @@ impl FaultInjectionPlugin {
             headers: HashMap::new(),
         }
     }
+}
+
+/// Private source marker written by a route-local fault. A normal
+/// `fault_injected=true` marker intentionally does not suppress sibling
+/// `fault_injection` instances; only a route-local action causes a later,
+/// priority-overridden proxy-scoped instance to no-op.
+pub(crate) const ROUTE_FAULT_INJECTED_METADATA_KEY: &str = "fault_injection.route_applied";
+
+pub(crate) fn is_native_grpc_request(headers: &HashMap<String, String>) -> bool {
+    headers
+        .get("content-type")
+        .map(|content_type| {
+            crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
+        })
+        .unwrap_or(false)
 }
 
 #[async_trait]
@@ -332,14 +313,13 @@ impl Plugin for FaultInjectionPlugin {
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if ctx.metadata.contains_key("fault_injected") {
+        if ctx.metadata.contains_key(ROUTE_FAULT_INJECTED_METADATA_KEY) {
             return PluginResult::Continue;
         }
 
-        let overrides = runtime_overlay::current_overrides();
-        let (delay_triggered, abort_triggered) = self.decide_faults(&overrides);
+        let (delay_triggered, abort_triggered) = self.decide_faults();
 
         if !delay_triggered && !abort_triggered {
             return PluginResult::Continue;
@@ -365,7 +345,7 @@ impl Plugin for FaultInjectionPlugin {
             ctx.metadata
                 .insert("fault_abort_status".to_string(), a.status_code.to_string());
 
-            return self.reject_for_abort(a);
+            return self.reject_for_abort(a, is_native_grpc_request(headers));
         }
 
         ctx.metadata
@@ -375,16 +355,7 @@ impl Plugin for FaultInjectionPlugin {
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
-        if ctx
-            .metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.contains_key("fault_injected"))
-        {
-            return PluginResult::Continue;
-        }
-
-        let overrides = runtime_overlay::current_overrides();
-        let (delay_triggered, abort_triggered) = self.decide_faults(&overrides);
+        let (delay_triggered, abort_triggered) = self.decide_faults();
 
         if !delay_triggered && !abort_triggered {
             return PluginResult::Continue;

@@ -41,8 +41,8 @@ use crate::config::types::{
 };
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::{MeshConfig, WorkloadSelector};
+use crate::plugins::utils::fault_roll::MAX_FAULT_DELAY_MS;
 
-const MAX_FAULT_DELAY_MS: u64 = 3_600_000;
 const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

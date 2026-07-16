@@ -9926,7 +9926,7 @@ extensionProviders:
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
                         "fault": {
                             "delay": {
-                                "fixedDelay": "2h",
+                                "fixedDelay": "61s",
                                 "percentage": {"value": 100.0}
                             }
                         }
