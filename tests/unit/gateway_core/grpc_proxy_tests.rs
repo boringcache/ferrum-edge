@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
 use ferrum_edge::plugins::security_headers::SecurityHeaders;
@@ -375,6 +377,83 @@ fn grpc_error_policy_preserves_gateway_terminal_and_transport_authority() {
             response.headers().get(managed).is_none(),
             "{managed} leaked"
         );
+    }
+}
+
+#[test]
+fn grpc_web_reject_finalizer_moves_rich_status_details_into_body_trailer() {
+    for (response_content_type, is_text) in [
+        ("application/grpc-web+proto", false),
+        ("application/grpc-web-text+proto", true),
+    ] {
+        let mut response = ferrum_edge::plugins::grpc_web::error_response_for_content_type(
+            response_content_type,
+            7,
+            "denied",
+        );
+        let finalized_headers = HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("grpc-status".to_string(), "7".to_string()),
+            ("grpc-message".to_string(), "denied".to_string()),
+            ("grpc-status-details-bin".to_string(), "AQID".to_string()),
+            (
+                "Access-Control-Expose-Headers".to_string(),
+                "X-Request-ID, grpc-status".to_string(),
+            ),
+        ]);
+
+        ferrum_edge::_test_support::finalize_grpc_web_error_response_headers(
+            &mut response,
+            &[],
+            Some(&finalized_headers),
+        );
+
+        for terminal in ["grpc-status", "grpc-message", "grpc-status-details-bin"] {
+            assert!(!response.headers.contains_key(terminal));
+        }
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some(response_content_type)
+        );
+        let expected_content_length = response.body.len().to_string();
+        assert_eq!(
+            response.headers.get("content-length").map(String::as_str),
+            Some(expected_content_length.as_str())
+        );
+        let exposed_headers = response
+            .headers
+            .get("access-control-expose-headers")
+            .expect("gRPC-Web rejects must expose configured and terminal metadata");
+        for expected in [
+            "grpc-status",
+            "grpc-message",
+            "grpc-status-details-bin",
+            "X-Request-ID",
+        ] {
+            assert!(
+                exposed_headers
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case(expected)),
+                "missing {expected} in {exposed_headers}"
+            );
+        }
+        assert_eq!(
+            exposed_headers
+                .split(',')
+                .filter(|token| token.trim().eq_ignore_ascii_case("grpc-status"))
+                .count(),
+            1,
+            "mandatory exposure must not be duplicated: {exposed_headers}"
+        );
+        let wire_body = if is_text {
+            BASE64.decode(&response.body).expect("decode text response")
+        } else {
+            response.body
+        };
+        let trailer = String::from_utf8_lossy(&wire_body[5..]);
+        assert!(trailer.contains("grpc-status: 7\r\n"));
+        assert!(trailer.contains("grpc-message: denied\r\n"));
+        assert!(trailer.contains("grpc-status-details-bin: AQID\r\n"));
     }
 }
 
