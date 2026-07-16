@@ -15811,17 +15811,34 @@ components:
 
     GrpcDeadlineConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: grpc_deadline — Manages the grpc-timeout metadata header.
-        Supports all gRPC timeout units (H, M, S, m, u, n).
+        Supports all gRPC timeout units (H, M, S, m, u, n). At least one
+        effective rule is required. When both deadline values are configured,
+        default_deadline_ms must be less than or equal to max_deadline_ms;
+        runtime validation enforces this cross-field relationship.
+      anyOf:
+        - required: [max_deadline_ms]
+        - required: [default_deadline_ms]
+        - required: [subtract_gateway_processing]
+          properties:
+            subtract_gateway_processing:
+              const: true
+        - required: [reject_no_deadline]
+          properties:
+            reject_no_deadline:
+              const: true
       properties:
         max_deadline_ms:
           type: integer
           format: uint64
+          minimum: 1
           description: Cap incoming deadlines to this value (milliseconds)
         default_deadline_ms:
           type: integer
           format: uint64
+          minimum: 1
           description: Inject grpc-timeout when client omits it
         subtract_gateway_processing:
           type: boolean
@@ -15833,8 +15850,10 @@ components:
           type: boolean
           default: false
           description: >-
-            Reject requests missing grpc-timeout with HTTP 400. Takes
-            precedence over default_deadline_ms.
+            Reject requests missing a positive grpc-timeout. Takes precedence
+            over default_deadline_ms. Native H2/H3 gRPC clients receive HTTP
+            200 with a non-OK grpc-status in the trailers-only header block;
+            the internal plugin rejection status is not exposed as HTTP 400.
 
     AiSemanticFirewallBuiltinPackConfig:
       oneOf:

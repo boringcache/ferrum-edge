@@ -1581,22 +1581,21 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
 
 #[tokio::test]
 async fn test_request_view_precomputes_response_committed_hook_capability() {
-    let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["audit"])],
-        vec![make_plugin_config_with_json(
-            "audit",
-            "ai_transcript_audit",
-            json!({
-                "capture": { "request": true, "response": true },
-                "sink": {
-                    "type": "http",
-                    "endpoint_url": "https://audit.example.com/ingest"
-                }
-            }),
-            PluginScope::Proxy,
-            Some("p1"),
-        )],
+    let mut audit = make_plugin_config_with_json(
+        "audit",
+        "ai_transcript_audit",
+        json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
     );
+    audit.priority_override = Some(125);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
     let cache = PluginCache::new(&config).unwrap();
     let view = cache.request_view("p1", ProxyProtocol::Http);
 
@@ -1604,11 +1603,45 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
         view.capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
     );
+    assert_eq!(view.response_committed_plugins().len(), 1);
+    assert_eq!(
+        view.response_committed_plugins()[0].name(),
+        "ai_transcript_audit"
+    );
+    assert_eq!(view.response_committed_plugins()[0].priority(), 125);
     assert!(
         !cache
             .request_view("missing", ProxyProtocol::Http)
             .capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+    );
+}
+
+#[test]
+fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
+    let mut deadline = make_plugin_config_with_json(
+        "deadline",
+        "grpc_deadline",
+        json!({"default_deadline_ms": 1000}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    deadline.priority_override = Some(120);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["deadline"])],
+        vec![deadline],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    assert_eq!(grpc_view.grpc_deadline_plugins().len(), 1);
+    assert_eq!(grpc_view.grpc_deadline_plugins()[0].name(), "grpc_deadline");
+    assert_eq!(grpc_view.grpc_deadline_plugins()[0].priority(), 120);
+    assert!(
+        cache
+            .request_view("p1", ProxyProtocol::Http)
+            .grpc_deadline_plugins()
+            .is_empty()
     );
 }
 
@@ -3500,8 +3533,33 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
+#[tokio::test]
+async fn test_priority_override_delegates_deadline_rejection_replacement_capability() {
+    let mut audit = make_plugin_config_with_json(
+        "audit",
+        "ai_transcript_audit",
+        json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    audit.priority_override = Some(100);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].may_replace_rejection_response());
+}
+
 #[test]
-fn test_priority_override_delegates_rejection_replacement_capability() {
+fn test_priority_override_delegates_spec_rejection_replacement_capability() {
     let mut plugin_config = make_plugin_config_with_json(
         "ps1",
         "spec_expose",
@@ -3523,6 +3581,7 @@ fn test_priority_override_delegates_rejection_replacement_capability() {
     assert_eq!(plugins[0].priority(), 211);
     assert!(plugins[0].applies_after_proxy_on_reject());
     assert!(plugins[0].may_replace_rejection_response());
+    assert!(!plugins[0].warn_on_rejection_response_replacement());
 }
 
 #[test]
@@ -4953,6 +5012,129 @@ fn test_default_priority_used_when_no_override() {
     // cors (100) should come before key_auth (1200)
     assert_eq!(plugins[0].name(), "cors");
     assert_eq!(plugins[1].name(), "key_auth");
+}
+
+#[test]
+fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_policies() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["dedup", "grpc-web", "method-router", "deadline"],
+        )],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "method-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "deadline",
+                "grpc_deadline",
+                json!({"default_deadline_ms": 1000}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("plugin cache");
+    let view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+
+    assert!(
+        view.plugins
+            .iter()
+            .any(|name| name == "request_deduplication")
+    );
+    assert!(view.plugins.iter().any(|name| name == "grpc_web"));
+    assert_eq!(
+        view.plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_method_router")
+            .count(),
+        1
+    );
+    assert_eq!(
+        view.plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_deadline")
+            .count(),
+        1
+    );
+    assert_eq!(view.grpc_deadline_plugins, vec!["grpc_deadline"]);
+    assert_eq!(view.backend_path_plugins, vec!["grpc_method_router"]);
+
+    let merged_names = cache
+        .get_plugins("p1")
+        .iter()
+        .filter(|plugin| {
+            plugin.supported_protocols().contains(&ProxyProtocol::Http)
+                || (["grpc_method_router", "grpc_deadline"].contains(&plugin.name())
+                    && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
+        })
+        .map(|plugin| plugin.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        view.plugins, merged_names,
+        "the precomputed composed view must preserve merged priority/config order"
+    );
+
+    let reloaded = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["grpc-web", "method-router", "deadline"],
+        )],
+        vec![
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "method-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "deadline",
+                "grpc_deadline",
+                json!({"default_deadline_ms": 1000}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    cache
+        .apply_delta(
+            &reloaded,
+            &std::collections::HashSet::from(["p1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("gRPC-Web composed view delta rebuild");
+    let reloaded_view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+    assert!(
+        !reloaded_view
+            .plugins
+            .iter()
+            .any(|name| name == "request_deduplication")
+    );
+    assert_eq!(
+        reloaded_view
+            .plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_deadline")
+            .count(),
+        1
+    );
 }
 
 #[test]

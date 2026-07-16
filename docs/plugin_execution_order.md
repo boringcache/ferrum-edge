@@ -6,12 +6,16 @@ Ferrum Edge executes plugins in a deterministic order based on two dimensions: *
 
 HTTP-family routing and per-proxy allowed-method admission occur before the
 ordinary plugin lifecycle begins. Native gRPC requests also pass a POST-only
-admission gate at this boundary. Requests admitted by those checks then pass
-through the request/header phases in strict order. Buffered responses run the
-body phases before logging; streamed non-buffered responses skip the buffered
-body phases and run a terminal stream hook before logging. WebSocket
-connections optionally enter a frame phase after the HTTP upgrade completes.
-Plugins only run in the phases they implement:
+admission gate at this boundary. Admitted gRPC requests then run the synchronous
+`grpc_deadline` policy preflight immediately after routing: it establishes one
+receipt-anchored monotonic deadline before any plugin or body await. The normal
+`before_proxy` hook later writes the relative remaining header for the backend;
+it does not create or re-arm the gateway timer. Requests admitted by those
+checks then pass through the request/header phases in strict order. Buffered
+responses run the body phases before logging; streamed non-buffered responses
+skip the buffered body phases and run a terminal stream hook before logging.
+WebSocket connections optionally enter a frame phase after the HTTP upgrade
+completes. Plugins only run in the phases they implement:
 
 ```
 Request In
@@ -19,6 +23,11 @@ Request In
     ▼
 ┌─────────────────────────┐
 │ Route + method admission│  Unmatched: 404; disallowed: 405; gRPC non-POST: reject
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 0. gRPC deadline policy │  Synchronous receipt-time budget preflight
 └────────────┬────────────┘
              │
              ▼
@@ -177,13 +186,17 @@ When a plugin returns a replacement body from `transform_response_body`, the cor
 
 For gateway-generated rejection responses, a small set of header-only `after_proxy` plugins opt in to still run. This preserves headers such as `Access-Control-Allow-Origin`, `traceparent`, and request IDs on rejected responses without treating them as backend responses.
 
+An RPC deadline discovered while buffering an upload is finalized through this same rejection path even when it occurs before authentication, authorization, `before_proxy`, or backend dispatch. Immediately-ready non-replacing decorators and committed observers run against the canonical status-4 result before it is emitted, gRPC-Web translation happens only after those synchronous headers are finalized, and the rejection is logged before the frontend returns. If a rejection or committed hook is still pending when the deadline wins, that exact invocation and the remaining eligible hooks continue once, in priority order, on owned response/context state under a bounded detached cleanup task. Their late mutations cannot race or delay the client-visible response. Response-replacing hooks cannot overwrite an already-selected terminal deadline.
+
 Post-routing method-filter responses and native-gRPC gateway errors also apply the resolved route's precomputed initial-response policy at the client HEADERS boundary. Pre-routing failures have no resolved plugin configuration. Protocol-owned gRPC terminal metadata and HTTP framing are restored after policy.
 
 `after_proxy` rejections are also honored before anything is sent downstream. This matters for plugins like `response_size_limiting`, whose `Content-Length` fast path now replaces oversized backend responses instead of only logging a warning.
 
-`on_response_committed` is buffered-only and observe-only. It receives mutable request context plus the final client-visible status, headers, and body after every `on_final_response_body` hook and any rejection replacement. It cannot mutate or reject the response. Exporters use it for record construction while retaining fail-closed sink admission in an earlier rejecting hook. The proxy gates the phase on a precomputed per-protocol capability bit, so no plugin scan occurs on the normal buffered path when no exporter needs it.
+`on_response_committed` is buffered-only and observe-only. It receives mutable request context plus the final client-visible status, headers, and body after every `on_final_response_body` hook and any rejection replacement. It cannot mutate or reject the response. Exporters use it for record construction while retaining fail-closed sink admission in an earlier rejecting hook. Each opted-in hook is invoked at most once. If the gRPC deadline expires inside one committed hook, the gateway first replaces the outcome with the terminal `DEADLINE_EXCEEDED` representation, then transfers that pending invocation and the remaining committed hooks to owned state. They continue in order under a post-response timeout, so a blocked exporter cannot retain the H1/H2/H3 response writer indefinitely. The proxy uses a precomputed per-protocol committed-hook list, so normal buffered requests do not rescan the full plugin chain.
 
 `on_response_stream_terminated` is streaming-only. It receives mutable request context plus the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before the final `TransactionSummary.metadata` snapshot and `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup, accounting, and aggregate metadata write-back after the stream ends. Plugins can key bounded shared inspector state by `ctx.response_stream_id()`, remove it here on every terminal outcome (including client disconnect), and write the aggregate into `ctx.metadata`; for example, `ai_tool_governor` writes streamed dry-run decisions before transaction logging. `request_deduplication` uses the same hook to release a non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error), so a same-key retry cannot re-execute a side-effecting operation that has no replayable response or tombstone.
+
+The absolute gRPC response-deadline wrapper sits outside the response-inspector chain. Its partial-DATA decision therefore counts only bytes emitted by the final inspected body, not backend chunks an inspector consumed and buffered. If an inspector has emitted zero bytes when the deadline fires, the client still receives the clean status-4 terminal representation.
 
 ## Stream Proxy Lifecycle (TCP/UDP)
 
@@ -445,7 +458,7 @@ Given all built-in plugins enabled, the execution order is:
 | 50 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 51 | `serverless_function` | 3025 | before_proxy |
 | 52 | `response_mock` | 3030 | before_proxy |
-| 53 | `grpc_deadline` | 3050 | before_proxy |
+| 53 | `grpc_deadline` | 3050 | receipt-time deadline preflight, before_proxy |
 | 54 | `request_mirror` | 3075 | before_proxy |
 | 55 | `load_testing` | 3080 | before_proxy |
 | 56 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
@@ -601,9 +614,12 @@ is not universally fire-and-forget. `log_with_mirror` awaits each primary
 transaction hook sequentially:
 
 - Buffered H1/H2/gRPC responses, synchronous rejection/error paths, and other
-  buffered terminal paths await all log hooks before the response is returned.
-  Direct network or filesystem I/O therefore adds client-visible handler
-  latency, with multiple hooks adding that latency serially.
+  buffered terminal paths normally await all log hooks before the response is
+  returned. Direct network or filesystem I/O therefore adds client-visible
+  handler latency, with multiple hooks adding that latency serially. When an
+  absolute gRPC deadline is active, Ferrum moves the owned summary, context, and
+  plugin list to a five-second detached cleanup task so a blocked log sink
+  cannot delay the terminal RPC response.
 - Hyper-owned streamed H1/H2 and gRPC bodies return from the handler first.
   Body completion fires a spawned task that awaits streaming terminal hooks and
   then log hooks sequentially. The task can be lost when no Tokio runtime is
@@ -704,6 +720,8 @@ The default priority is `5000` (the Custom band), which runs after all transform
 ## Protocol Support
 
 Each plugin declares which proxy protocols it supports via `supported_protocols()`. The gateway skips plugins that don't support the current proxy's protocol — for example, CORS is never invoked for a TCP stream proxy.
+
+Recognized H3 gRPC-Web requests retain the ordinary `Http` protocol view so HTTP-only validators, deduplication, and other guardrails keep running. At cache rebuild time the gateway composes `grpc_method_router` and `grpc_deadline` into that same priority-ordered view when those native-gRPC policies are configured. No other gRPC-only plugin is added, and each plugin instance appears at most once.
 
 TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that supports `Tcp` also supports TCP+TLS, and a plugin that supports `Udp` also supports UDP+DTLS.
 

@@ -199,17 +199,58 @@ impl GrpcClient {
         body: Bytes,
         extra_headers: &[(&str, String)],
     ) -> Result<GrpcResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.request_with_headers(path, body, extra_headers, true)
+            .await
+    }
+
+    /// Send the first message of a bidirectional RPC while deliberately
+    /// keeping the request direction open until the response terminates.
+    pub async fn bidi_with_headers(
+        &self,
+        path: &str,
+        body: Bytes,
+        extra_headers: &[(&str, String)],
+    ) -> Result<GrpcResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.request_with_headers(path, body, extra_headers, false)
+            .await
+    }
+
+    async fn request_with_headers(
+        &self,
+        path: &str,
+        body: Bytes,
+        extra_headers: &[(&str, String)],
+        end_request_stream: bool,
+    ) -> Result<GrpcResponse, Box<dyn std::error::Error + Send + Sync>> {
         let (host, port) = parse_target(&self.target)?;
         let response = match &self.transport {
             Transport::H2c => {
                 let tcp = TcpStream::connect((host.as_str(), port)).await?;
-                self.send_over_io(tcp, &host, port, path, body, extra_headers, false)
-                    .await?
+                self.send_over_io(
+                    tcp,
+                    &host,
+                    port,
+                    path,
+                    body,
+                    extra_headers,
+                    false,
+                    end_request_stream,
+                )
+                .await?
             }
             Transport::Tls { root_pem, insecure } => {
                 let tls = tls_connect(&host, port, root_pem.as_deref(), *insecure).await?;
-                self.send_over_io(tls, &host, port, path, body, extra_headers, true)
-                    .await?
+                self.send_over_io(
+                    tls,
+                    &host,
+                    port,
+                    path,
+                    body,
+                    extra_headers,
+                    true,
+                    end_request_stream,
+                )
+                .await?
             }
         };
         Ok(response)
@@ -225,6 +266,7 @@ impl GrpcClient {
         body: Bytes,
         extra_headers: &[(&str, String)],
         tls: bool,
+        end_request_stream: bool,
     ) -> Result<GrpcResponse, Box<dyn std::error::Error + Send + Sync>>
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -256,7 +298,7 @@ impl GrpcClient {
         // well-formed gRPC error that the caller needs to assert on. Preserve
         // the write error for the no-response case and keep collecting.
         let request_send_error = req_body
-            .send_data(framed.freeze(), true)
+            .send_data(framed.freeze(), end_request_stream)
             .err()
             .map(|e| format!("request body error: {e}"));
 

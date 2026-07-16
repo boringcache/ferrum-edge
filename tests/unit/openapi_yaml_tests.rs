@@ -2044,6 +2044,79 @@ fn opa_schema_matches_runtime_validation_contract() {
 }
 
 #[test]
+fn grpc_deadline_schema_matches_runtime_validation_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let component = spec
+        .pointer("/components/schemas/GrpcDeadlineConfig")
+        .expect("GrpcDeadlineConfig component exists");
+    assert_eq!(component.get("additionalProperties"), Some(&json!(false)));
+    let reject_description = component
+        .pointer("/properties/reject_no_deadline/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("reject_no_deadline description exists");
+    for contract in ["Native H2/H3", "HTTP 200", "trailers-only", "grpc-status"] {
+        assert!(
+            reject_description.contains(contract),
+            "missing native gRPC wire contract `{contract}`"
+        );
+    }
+
+    let parity_cases = [
+        (json!({}), false),
+        (json!({"max_deadline_ms": 0}), false),
+        (json!({"default_deadline_ms": 0}), false),
+        (json!({"max_deadline_ms": null}), false),
+        (json!({"reject_no_deadline": null}), false),
+        (json!({"max_deadline_ms": "5000"}), false),
+        (json!({"reject_no_deadline": 1}), false),
+        (json!({"reject_no_deadline": false}), false),
+        (json!({"subtract_gateway_processing": false}), false),
+        (
+            json!({"max_deadline_ms": 30000, "reject_no_deadine": true}),
+            false,
+        ),
+        (json!({"max_deadline_ms": 30000}), true),
+        (json!({"default_deadline_ms": 5000}), true),
+        (json!({"reject_no_deadline": true}), true),
+        (json!({"subtract_gateway_processing": true}), true),
+        (
+            json!({
+                "max_deadline_ms": 30000,
+                "default_deadline_ms": 5000,
+                "subtract_gateway_processing": true,
+                "reject_no_deadline": true
+            }),
+            true,
+        ),
+    ];
+    for (config, expected_valid) in parity_cases {
+        assert_component_validity(&spec, "GrpcDeadlineConfig", &config, expected_valid);
+        let runtime_valid = ferrum_edge::plugins::create_plugin("grpc_deadline", &config).is_ok();
+        assert_eq!(
+            runtime_valid, expected_valid,
+            "runtime/schema parity drift for {config}"
+        );
+    }
+
+    let cross_field = json!({"max_deadline_ms": 5000, "default_deadline_ms": 60000});
+    let runtime_error = ferrum_edge::plugins::create_plugin("grpc_deadline", &cross_field)
+        .err()
+        .expect("runtime rejects default above max");
+    assert!(runtime_error.contains("cannot exceed"));
+    assert!(
+        component
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|description| {
+                description.contains("default_deadline_ms must be less than or equal")
+                    && description.contains("runtime validation")
+            }),
+        "OpenAPI must document the dynamic cross-field rule JSON Schema cannot compare"
+    );
+}
+
+#[test]
 fn upstream_runtime_serialization_is_covered_by_openapi() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

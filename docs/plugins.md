@@ -3371,15 +3371,19 @@ its ordinary `before_proxy` position and behavior.
 | `max_deadline_ms` | u64 (optional) | *(none)* | Cap incoming deadlines to this value (milliseconds). Must be positive — `0` is rejected at plugin load time (it would reject every request). |
 | `default_deadline_ms` | u64 (optional) | *(none)* | Inject `grpc-timeout` when client omits it. Must be positive — `0` is rejected. If both are set, `default_deadline_ms` cannot exceed `max_deadline_ms`. |
 | `subtract_gateway_processing` | bool | `false` | Subtract elapsed gateway time before forwarding |
-| `reject_no_deadline` | bool | `false` | Reject requests missing `grpc-timeout` (gRPC clients receive normalized `grpc-status`) |
+| `reject_no_deadline` | bool | `false` | Reject requests missing a positive `grpc-timeout` (native H2/H3 clients receive HTTP 200 with a non-OK trailers-only `grpc-status`) |
 
-The plugin requires at least one rule — empty configs are rejected at load time so it cannot be a no-op. Parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), `n` (nanoseconds). Malformed values (non-ASCII, non-digit, or unknown unit) are treated as missing and fall back to `default_deadline_ms` if configured — they never panic the worker.
+The plugin requires at least one effective rule — empty configs and configs containing only `false` boolean rules are rejected at load time so it cannot be a no-op. Configuration is strict: unknown keys, explicit `null`, and incorrect field types are rejected with the property name. This prevents a misspelled enforcement rule from silently weakening policy.
+
+It parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), `n` (nanoseconds). Zero values are not deadlines and are treated as missing, so they cannot satisfy `reject_no_deadline`. Positive sub-millisecond values are rounded up to one millisecond. Other malformed values (non-ASCII, non-digit, oversized, or unknown unit) are treated as missing and fall back to `default_deadline_ms` if configured — they never panic the worker.
 
 Forwarded deadlines are re-encoded to stay within the gRPC wire-format limit of 8 digits, preserving millisecond precision whenever it fits.
 
-When `subtract_gateway_processing` is true and the remaining deadline is zero or negative, returns gRPC status `DEADLINE_EXCEEDED` (status code 4) using the trailers-only response pattern.
+The gateway establishes one monotonic absolute deadline at request receipt, before IP/geo/bot restrictions, authentication, authorization, body buffering, or plugin I/O. This phase-0 ordering is intentional and fail closed: when `reject_no_deadline` is enabled, a missing or malformed deadline is rejected before security plugins, so the deadline-policy response can precede the `401`/`403` that the same request would otherwise receive. It prevents unauthenticated requests from bypassing the configured total RPC resource ceiling. That same instant bounds connection acquisition, all H2/H3 attempts and retry backoff, and response headers/body/trailers. The header sent to a backend remains a relative duration; when `subtract_gateway_processing` is true it is derived from the absolute deadline. Later plugin instances and transports reuse the typed instant and never subtract elapsed time from that rewritten header again.
 
-Populates `ctx.metadata` with `grpc_original_deadline_ms` and `grpc_adjusted_deadline_ms`.
+When the absolute deadline is exhausted, the gateway returns gRPC status `DEADLINE_EXCEEDED` (status code 4). Upload expiry in every buffering phase uses the normal finalized rejection lifecycle, so rejection decorators, committed observers, gRPC-Web response translation/CORS, logging, and admission cleanup are not skipped. If H2 or H3 response headers were already committed but no client-visible DATA bytes were forwarded, it emits a terminal status-4 trailer frame; after partial DATA it aborts the stream because a complete gRPC message boundary cannot be assumed. Response-inspector buffering does not count as client-visible DATA. H3 downstream writes and coalescer flushes are bounded by the same absolute instant, preventing QUIC flow-control stalls from outliving the RPC. Deadline-capable streaming relays remove an upstream `Content-Length` before committing headers because the terminal replacement has a different representation length.
+
+When this plugin is configured, it populates `ctx.metadata` with `grpc_original_deadline_ms` and `grpc_adjusted_deadline_ms`. Merely sending a parseable `grpc-timeout` header without a `grpc_deadline` policy does not create those plugin-policy transaction-log fields.
 
 ```yaml
 plugin_name: grpc_deadline
