@@ -150,7 +150,10 @@ async fn test_rate_limiting_mapped_ipv4_shares_native_budget() {
 
     let mut mapped = create_test_context();
     mapped.client_ip = "::ffff:192.0.2.10".to_string();
-    assert_reject(plugin.on_request_received(&mut mapped).await, 429);
+    assert_reject(
+        plugin.on_request_received(&mut mapped).await,
+        Some(429),
+    );
     assert_eq!(plugin.tracked_keys_count(), Some(1));
 }
 
