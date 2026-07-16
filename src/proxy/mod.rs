@@ -17813,8 +17813,11 @@ async fn handle_proxy_request_inner(
             bodyless => bodyless,
         };
     }
-    let proxy_headers: &HashMap<String, String> =
-        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    // Keep only the independently owned header map borrowed across dispatch.
+    // When no owned map exists, borrow `ctx.headers` at each use so final-body
+    // deadline provenance can still update the rest of `ctx` without cloning
+    // the hot-path request headers.
+    let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
 
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
@@ -17870,7 +17873,7 @@ async fn handle_proxy_request_inner(
             }
         };
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
-        let websocket_proxy_headers = proxy_headers.clone();
+        let websocket_proxy_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
         return handle_websocket_request_authenticated(
             request,
             state,
@@ -18286,7 +18289,7 @@ async fn handle_proxy_request_inner(
             );
 
             // Transform request body via plugins (e.g., gRPC-Web base64 decoding)
-            let mut hook_headers = proxy_headers.clone();
+            let mut hook_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
             hook_headers
                 .entry(":path".to_string())
                 .or_insert_with(|| path.clone());
@@ -18412,7 +18415,7 @@ async fn handle_proxy_request_inner(
                 &grpc_backend_url,
                 &state.grpc_pool,
                 &state.dns_cache,
-                proxy_headers,
+                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                 grpc_should_stream,
                 state.max_response_body_size_bytes,
                 ctx.grpc_deadline_at(),
@@ -18498,7 +18501,7 @@ async fn handle_proxy_request_inner(
                             let post_header_upload_timeout_ms =
                                 grpc_proxy::streaming_post_header_upload_timeout_ms_after_proxy_headers(
                                     request.headers(),
-                                    proxy_headers,
+                                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                                     proxy.as_ref(),
                                 );
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
@@ -18564,7 +18567,7 @@ async fn handle_proxy_request_inner(
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
-                    proxy_headers,
+                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     state.max_grpc_recv_size_bytes,
                     body_size_exceeded,
                     upload_observer,
@@ -18638,7 +18641,7 @@ async fn handle_proxy_request_inner(
                             &grpc_backend_url,
                             &state.grpc_pool,
                             &state.dns_cache,
-                            proxy_headers,
+                            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                             grpc_should_stream,
                             state.max_response_body_size_bytes,
                             ctx.grpc_deadline_at(),
@@ -18690,7 +18693,7 @@ async fn handle_proxy_request_inner(
         let grpc_method = hyper::Method::POST; // gRPC always uses POST
         let grpc_req_headers: hyper::HeaderMap = if grpc_has_retry {
             let mut hm = hyper::HeaderMap::new();
-            for (k, v) in proxy_headers {
+            for (k, v) in owned_proxy_headers_ref.unwrap_or(&ctx.headers) {
                 if let (Ok(name), Ok(val)) = (
                     hyper::header::HeaderName::from_bytes(k.as_bytes()),
                     hyper::header::HeaderValue::from_str(v),
@@ -18753,7 +18756,7 @@ async fn handle_proxy_request_inner(
                         prev_target,
                         hash_key,
                         &ctx.client_ip,
-                        proxy_headers,
+                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     ) {
                     if !retry_target_preserves_backend_path(
                         backend_path_is_policy_bound,
@@ -19100,7 +19103,7 @@ async fn handle_proxy_request_inner(
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
-                    proxy_headers,
+                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     grpc_should_stream,
                     state.max_response_body_size_bytes,
                     ctx.grpc_deadline_at(),
@@ -20791,7 +20794,7 @@ async fn handle_proxy_request_inner(
             &proxy,
             &current_url,
             &method,
-            proxy_headers,
+            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
             client_request_body,
             upstream_target.as_deref(),
             &plugins,
@@ -20884,7 +20887,7 @@ async fn handle_proxy_request_inner(
                     prev_target,
                     hash_key,
                     &ctx.client_ip,
-                    proxy_headers,
+                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                 ) {
                 if !retry_target_preserves_backend_path(
                     backend_path_is_policy_bound,
@@ -20937,7 +20940,7 @@ async fn handle_proxy_request_inner(
                 {
                     result = client_grpc_deadline_exceeded_response_for_request(
                         &ctx,
-                        proxy_headers,
+                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                         result.backend_resolved_ip.clone(),
                     );
                     break;
@@ -21143,7 +21146,7 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     &current_url,
                     &method,
-                    proxy_headers,
+                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
                     h3_retry_stream_response,
@@ -21161,7 +21164,7 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     &current_url,
                     &method,
-                    proxy_headers,
+                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
                     should_stream && is_last_attempt,
@@ -21202,7 +21205,7 @@ async fn handle_proxy_request_inner(
             &proxy,
             &backend_url,
             &method,
-            proxy_headers,
+            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
             client_request_body,
             upstream_target.as_deref(),
             &plugins,

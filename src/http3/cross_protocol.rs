@@ -1438,36 +1438,37 @@ where
         backend_start,
         bytes_sent,
     );
-    let mut outcome = match crate::http3::stream_util::await_terminal_response_write_before_deadline(
-        ctx.grpc_deadline_at(),
-        write,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
-            crate::http3::stream_util::abort_response_stream(stream);
-            crate::http3::stream_util::halt_request_body(stream);
-            terminal_deadline_write_aborted_outcome(
-                StatusCode::OK.as_u16(),
-                0,
-                backend_start,
-                bytes_sent,
-                true,
-            )
-        }
-        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-            crate::http3::stream_util::abort_response_stream(stream);
-            crate::http3::stream_util::halt_request_body(stream);
-            terminal_deadline_write_aborted_outcome(
-                StatusCode::OK.as_u16(),
-                0,
-                backend_start,
-                bytes_sent,
-                false,
-            )
-        }
-    };
+    let mut outcome =
+        match crate::http3::stream_util::await_terminal_response_write_before_deadline(
+            ctx.grpc_deadline_at(),
+            write,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                crate::http3::stream_util::halt_request_body(stream);
+                terminal_deadline_write_aborted_outcome(
+                    StatusCode::OK.as_u16(),
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    true,
+                )
+            }
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                crate::http3::stream_util::halt_request_body(stream);
+                terminal_deadline_write_aborted_outcome(
+                    StatusCode::OK.as_u16(),
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    false,
+                )
+            }
+        };
     outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
     outcome.body_error_class = Some(ErrorClass::ClientDisconnect);
     Ok(outcome)
@@ -2627,10 +2628,7 @@ where
         let mut response_status = status;
         let mut response_body = match crate::plugins::await_grpc_deadline(
             grpc_web_deadline_at,
-            collect_reqwest_response_body_with_limit(
-                response,
-                state.max_response_body_size_bytes,
-            ),
+            collect_reqwest_response_body_with_limit(response, state.max_response_body_size_bytes),
         )
         .await
         {
@@ -2702,74 +2700,79 @@ where
 
         let plugin_pipeline = async {
             if !plugins.is_empty() {
-            normalize_response_body_for_inspection(
-                plugins,
-                ctx,
-                response_status,
-                &mut response_headers,
-                &mut response_body,
-            )
-            .await;
-            for plugin in plugins {
-                let result = plugin
-                    .on_response_body(ctx, response_status, &response_headers, &response_body)
-                    .await;
-                match result {
-                    PluginResult::Continue => {}
-                    reject @ PluginResult::Reject { .. }
-                    | reject @ PluginResult::RejectBinary { .. } => {
-                        apply_buffered_plain_plugin_reject(
-                            plugins,
-                            ctx,
-                            reject,
-                            &mut response_status,
-                            &mut response_headers,
-                            &mut response_body,
-                        )
+                normalize_response_body_for_inspection(
+                    plugins,
+                    ctx,
+                    response_status,
+                    &mut response_headers,
+                    &mut response_body,
+                )
+                .await;
+                for plugin in plugins {
+                    let result = plugin
+                        .on_response_body(ctx, response_status, &response_headers, &response_body)
                         .await;
-                        break;
+                    match result {
+                        PluginResult::Continue => {}
+                        reject @ PluginResult::Reject { .. }
+                        | reject @ PluginResult::RejectBinary { .. } => {
+                            apply_buffered_plain_plugin_reject(
+                                plugins,
+                                ctx,
+                                reject,
+                                &mut response_status,
+                                &mut response_headers,
+                                &mut response_body,
+                            )
+                            .await;
+                            break;
+                        }
                     }
                 }
-            }
 
-            for plugin in plugins {
-                if let Some(transformed) = plugin
-                    .transform_response_body_with_context(
-                        &mut *ctx,
-                        &response_body,
-                        content_type_of(&response_headers),
-                        &response_headers,
-                    )
-                    .await
-                {
-                    response_headers
-                        .insert("content-length".to_string(), transformed.len().to_string());
-                    response_body = transformed;
-                    plugin.on_response_body_transformed(ctx, &mut response_headers);
-                }
-            }
-
-            for plugin in plugins {
-                let result = plugin
-                    .on_final_response_body(ctx, response_status, &response_headers, &response_body)
-                    .await;
-                match result {
-                    PluginResult::Continue => {}
-                    reject @ PluginResult::Reject { .. }
-                    | reject @ PluginResult::RejectBinary { .. } => {
-                        apply_buffered_plain_plugin_reject(
-                            plugins,
-                            ctx,
-                            reject,
-                            &mut response_status,
-                            &mut response_headers,
-                            &mut response_body,
+                for plugin in plugins {
+                    if let Some(transformed) = plugin
+                        .transform_response_body_with_context(
+                            &mut *ctx,
+                            &response_body,
+                            content_type_of(&response_headers),
+                            &response_headers,
                         )
-                        .await;
-                        break;
+                        .await
+                    {
+                        response_headers
+                            .insert("content-length".to_string(), transformed.len().to_string());
+                        response_body = transformed;
+                        plugin.on_response_body_transformed(ctx, &mut response_headers);
                     }
                 }
-            }
+
+                for plugin in plugins {
+                    let result = plugin
+                        .on_final_response_body(
+                            ctx,
+                            response_status,
+                            &response_headers,
+                            &response_body,
+                        )
+                        .await;
+                    match result {
+                        PluginResult::Continue => {}
+                        reject @ PluginResult::Reject { .. }
+                        | reject @ PluginResult::RejectBinary { .. } => {
+                            apply_buffered_plain_plugin_reject(
+                                plugins,
+                                ctx,
+                                reject,
+                                &mut response_status,
+                                &mut response_headers,
+                                &mut response_body,
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                }
 
                 if !response_committed_plugins.is_empty() {
                     crate::proxy::run_deadline_bounded_response_committed_hooks(
@@ -2844,7 +2847,10 @@ where
                 )
                 .await;
             }
-            debug!(?error, "cross-protocol H3 buffered response header write failed");
+            debug!(
+                ?error,
+                "cross-protocol H3 buffered response header write failed"
+            );
             record_cross_protocol_header_write_disconnect(
                 state,
                 proxy,
@@ -3027,7 +3033,10 @@ where
             )
             .await;
         }
-        debug!(?error, "cross-protocol H3 streaming response header write failed");
+        debug!(
+            ?error,
+            "cross-protocol H3 streaming response header write failed"
+        );
         record_cross_protocol_header_write_disconnect(
             state,
             proxy,
@@ -8666,7 +8675,10 @@ mod tests {
             "write_plain_grpc_web_client_deadline(",
             "append_plain_grpc_web_client_deadline(",
         ] {
-            assert!(body.contains(required), "missing deadline guard: {required}");
+            assert!(
+                body.contains(required),
+                "missing deadline guard: {required}"
+            );
         }
     }
 }
