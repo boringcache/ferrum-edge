@@ -23,10 +23,9 @@ authoritative Gateway API conformance check, and it **gates** merges:
   runtime image, proto, the conformance script, dependencies, or related CI.
 - **Gating:** the workflow's `gate` job fails the check when change detection,
   the upstream suite, or the black-box checks fail (a lab skipped on an
-  irrelevant PR passes). Separately, `ci.yml`'s
-  `Gateway API Conformance (CI mirror)` job mirrors this workflow's conclusion
-  into the aggregate `Tests` gate as a `require_success`, so a red conformance
-  run also reds main CI. The workflow is **not** advisory.
+  irrelevant PR passes). The `gate` job (`Gateway API Conformance`) is a
+  branch-protection required check in its own right — `ci.yml` no longer runs
+  a runner-holding mirror job for it. The workflow is **not** advisory.
 
 ## Default run parameters
 
@@ -115,7 +114,7 @@ single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
 
 ## CI Evidence
 
-The standalone `gateway-api-conformance.yml` workflow is the single owner that deploys the lab on PRs, and its `gate` job is the authoritative conformance check. The `Gateway API Conformance (CI mirror)` job in `ci.yml` only mirrors that run's result back into the aggregate `Tests` gate. The lab consists of:
+The standalone `gateway-api-conformance.yml` workflow is the single owner that deploys the lab on PRs, and its `gate` job is the authoritative conformance check, required directly via branch protection (there is no mirror job in `ci.yml`). The lab consists of:
 
 - Ferrum control plane/controller with Gateway API watches enabled.
 - A routable Ferrum data-plane deployment and NodePort Service mapped to host ports 80 and 443 in kind.

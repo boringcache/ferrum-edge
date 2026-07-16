@@ -5871,7 +5871,7 @@ async fn handle_h3_request(
             let mut response_body_reject = None;
             for plugin in plugins.iter() {
                 let deadline = ctx.grpc_deadline_at();
-                let result = crate::plugins::await_request_plugin_deadline(
+                let result = match crate::plugins::await_grpc_deadline(
                     deadline,
                     plugin.on_response_body(
                         &mut ctx,
@@ -5880,7 +5880,14 @@ async fn handle_h3_request(
                         &response_body,
                     ),
                 )
-                .await;
+                .await
+                {
+                    Ok(result) => result,
+                    Err(()) => {
+                        ctx.mark_gateway_deadline_response_selected();
+                        crate::plugins::grpc_deadline_exceeded_plugin_result()
+                    }
+                };
                 match result {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
@@ -5952,7 +5959,7 @@ async fn handle_h3_request(
             let mut response_body_reject = None;
             for plugin in plugins.iter() {
                 let deadline = ctx.grpc_deadline_at();
-                let result = crate::plugins::await_request_plugin_deadline(
+                let result = match crate::plugins::await_grpc_deadline(
                     deadline,
                     plugin.on_final_response_body(
                         &mut ctx,
@@ -5961,7 +5968,14 @@ async fn handle_h3_request(
                         &response_body,
                     ),
                 )
-                .await;
+                .await
+                {
+                    Ok(result) => result,
+                    Err(()) => {
+                        ctx.mark_gateway_deadline_response_selected();
+                        crate::plugins::grpc_deadline_exceeded_plugin_result()
+                    }
+                };
                 match result {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
@@ -6026,6 +6040,137 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
+        // Build and send buffered response
+        let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
+        let resp_builder =
+            apply_response_headers(Response::builder().status(status), &response_headers);
+
+        let resp = resp_builder
+            .body(())
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 proxy response: {}", e))?;
+        let grpc_deadline_at = ctx.grpc_deadline_at();
+        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+        let response_body_bytes = response_body.len() as u64;
+        let mut bytes_received = 0;
+        let mut body_completed = true;
+        let mut client_disconnected = false;
+        let mut body_error_class = None;
+        let mut downstream_write_error: Option<anyhow::Error> = None;
+        macro_rules! await_buffered_h3_write {
+            ($write:expr) => {{
+                match if terminal_gateway_deadline {
+                    crate::http3::stream_util::await_terminal_response_write_before_deadline(
+                        grpc_deadline_at,
+                        $write,
+                    )
+                    .await
+                } else {
+                    crate::http3::stream_util::await_response_write_before_deadline(
+                        grpc_deadline_at,
+                        $write,
+                    )
+                    .await
+                } {
+                    Ok(()) => true,
+                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => {
+                        body_completed = false;
+                        client_disconnected = true;
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        downstream_write_error = Some(error.into());
+                        false
+                    }
+                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                        crate::proxy::insert_grpc_error_metadata(
+                            &mut ctx.metadata,
+                            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                        );
+                        crate::http3::stream_util::abort_response_stream(&mut stream);
+                        crate::http3::stream_util::halt_request_body(&mut stream);
+                        body_completed = false;
+                        false
+                    }
+                }
+            }};
+        }
+        let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));
+        if response_headers_sent && !response_body.is_empty() {
+            if await_buffered_h3_write!(stream.send_data(Bytes::from(response_body))) {
+                bytes_received = response_body_bytes;
+            }
+        }
+
+        // Response-body plugins cannot inspect or transform trailers today.
+        // Conservatively drop backend trailers whenever the buffered response
+        // plugin pipeline ran successfully, rather than forwarding
+        // backend-controlled fields that may contain policy-relevant content
+        // the configured plugins never saw.
+        if !plugins.is_empty() {
+            response_trailers = None;
+        }
+
+        // Forward backend response trailers, if any (issue #1630). Strip
+        // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with
+        // the same helper the streaming path's
+        // `finish_h3_response_with_backend_trailers` uses, then send them
+        // before FIN. An empty map after stripping is skipped — emit a bare
+        // `finish()` exactly as before.
+        if body_completed {
+            match response_trailers {
+                Some(mut trailers) => {
+                    strip_response_hop_by_hop_trailers(&mut trailers);
+                    if !trailers.is_empty() {
+                        let trailer_write = if terminal_gateway_deadline {
+                            crate::http3::stream_util::await_terminal_response_write_before_deadline(
+                                grpc_deadline_at,
+                                stream.send_trailers(trailers),
+                            )
+                            .await
+                        } else {
+                            crate::http3::stream_util::await_response_write_before_deadline(
+                                grpc_deadline_at,
+                                stream.send_trailers(trailers),
+                            )
+                            .await
+                        };
+                        match trailer_write {
+                            Ok(()) => {}
+                            Err(crate::http3::stream_util::H3ResponseWriteError::Write(err)) => {
+                                // The trailers are valid for the backend but the H3
+                                // client could not accept them (e.g. HeaderTooBig).
+                                // The body was sent, so drop the trailers and still
+                                // try a clean FIN, preserving issue #1630 behavior.
+                                debug!(
+                                    error = %err,
+                                    "H3 send_trailers failed on buffered response; dropping trailers and finishing cleanly"
+                                );
+                            }
+                            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                                crate::proxy::insert_grpc_error_metadata(
+                                    &mut ctx.metadata,
+                                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                                );
+                                crate::http3::stream_util::abort_response_stream(&mut stream);
+                                crate::http3::stream_util::halt_request_body(&mut stream);
+                                body_completed = false;
+                            }
+                        }
+                    }
+                    if body_completed {
+                        let _ = await_buffered_h3_write!(stream.finish());
+                    }
+                }
+                None => {
+                    let _ = await_buffered_h3_write!(stream.finish());
+                }
+            }
+        }
+
+        // Transaction logging follows downstream response completion so a
+        // deadline-triggered reset cannot be reported as a full successful
+        // buffered response. `raw_request_body_bytes` remains the pre-transform
+        // wire size, while `bytes_received` advances only after DATA completes.
         let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
         let plugin_external_io_ms = ctx
@@ -6034,13 +6179,6 @@ async fn handle_h3_request(
             / 1_000_000.0;
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
-
-        // Request bytes: `raw_request_body_bytes` captured the on-wire size
-        // before plugin `transform_request_body` ran, so the summary reflects
-        // bytes actually received from the client rather than the possibly
-        // rewritten `body_data.len()`. Response bytes: the H3 buffered-response
-        // path has `response_body` in scope — its `Vec<u8>` length is what
-        // will flow to the client.
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -6063,131 +6201,18 @@ async fn handle_h3_request(
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
             error_class: h3_error_class,
+            client_disconnected,
+            body_error_class,
+            body_completed,
             bytes_sent: raw_request_body_bytes,
-            bytes_received: response_body.len() as u64,
+            bytes_received,
             metadata: crate::proxy::clone_log_metadata(&ctx),
             ..TransactionSummary::default()
         };
-
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
-
         record_request(&state, response_status);
-
-        // Build and send buffered response
-        let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let resp_builder =
-            apply_response_headers(Response::builder().status(status), &response_headers);
-
-        let resp = resp_builder
-            .body(())
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 proxy response: {}", e))?;
-        let grpc_deadline_at = ctx.grpc_deadline_at();
-        let terminal_gateway_deadline = ctx
-            .metadata
-            .get("grpc_status")
-            .is_some_and(|status| status == GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER)
-            && ctx
-                .metadata
-                .get("grpc_message")
-                .is_some_and(|message| message == GATEWAY_DEADLINE_EXCEEDED_MESSAGE);
-        macro_rules! await_buffered_h3_write {
-            ($write:expr) => {
-                match if terminal_gateway_deadline {
-                    crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                        grpc_deadline_at,
-                        $write,
-                    )
-                    .await
-                } else {
-                    crate::http3::stream_util::await_response_write_before_deadline(
-                        grpc_deadline_at,
-                        $write,
-                    )
-                    .await
-                } {
-                    Ok(()) => {}
-                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => {
-                        return Err(error.into());
-                    }
-                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                        crate::proxy::insert_grpc_error_metadata(
-                            &mut ctx.metadata,
-                            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
-                        );
-                        crate::http3::stream_util::abort_response_stream(&mut stream);
-                        crate::http3::stream_util::halt_request_body(&mut stream);
-                        return Ok(());
-                    }
-                }
-            };
-        }
-        await_buffered_h3_write!(stream.send_response(resp));
-        if !response_body.is_empty() {
-            await_buffered_h3_write!(stream.send_data(Bytes::from(response_body)));
-        }
-
-        // Response-body plugins cannot inspect or transform trailers today.
-        // Conservatively drop backend trailers whenever the buffered response
-        // plugin pipeline ran successfully, rather than forwarding
-        // backend-controlled fields that may contain policy-relevant content
-        // the configured plugins never saw.
-        if !plugins.is_empty() {
-            response_trailers = None;
-        }
-
-        // Forward backend response trailers, if any (issue #1630). Strip
-        // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with
-        // the same helper the streaming path's
-        // `finish_h3_response_with_backend_trailers` uses, then send them
-        // before FIN. An empty map after stripping is skipped — emit a bare
-        // `finish()` exactly as before.
-        match response_trailers {
-            Some(mut trailers) => {
-                strip_response_hop_by_hop_trailers(&mut trailers);
-                if !trailers.is_empty() {
-                    let trailer_write = if terminal_gateway_deadline {
-                        crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                            grpc_deadline_at,
-                            stream.send_trailers(trailers),
-                        )
-                        .await
-                    } else {
-                        crate::http3::stream_util::await_response_write_before_deadline(
-                            grpc_deadline_at,
-                            stream.send_trailers(trailers),
-                        )
-                        .await
-                    };
-                    match trailer_write {
-                        Ok(()) => {}
-                        Err(crate::http3::stream_util::H3ResponseWriteError::Write(err)) => {
-                            // The trailers are valid for the backend but the H3
-                            // client could not accept them (e.g. HeaderTooBig).
-                            // The body was sent, so drop the trailers and still
-                            // try a clean FIN, preserving issue #1630 behavior.
-                            debug!(
-                                error = %err,
-                                "H3 send_trailers failed on buffered response; dropping trailers and finishing cleanly"
-                            );
-                        }
-                        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                            crate::proxy::insert_grpc_error_metadata(
-                                &mut ctx.metadata,
-                                crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
-                            );
-                            crate::http3::stream_util::abort_response_stream(&mut stream);
-                            crate::http3::stream_util::halt_request_body(&mut stream);
-                            return Ok(());
-                        }
-                    }
-                }
-                await_buffered_h3_write!(stream.finish());
-            }
-            None => {
-                await_buffered_h3_write!(stream.finish());
-            }
+        if let Some(error) = downstream_write_error {
+            return Err(error);
         }
     }
 
@@ -8364,10 +8389,13 @@ async fn dispatch_grpc_native_h3(
         )
         .await;
     if let Err(write_error) = response_header_write {
-        let response_header_deadline_expired = matches!(
-            write_error,
-            crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
-        );
+        let (response_header_deadline_expired, response_header_client_disconnected) =
+            match write_error {
+                crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded => {
+                    (true, false)
+                }
+                crate::http3::stream_util::H3ResponseWriteError::Write(_) => (false, true),
+            };
         if response_header_deadline_expired {
             crate::proxy::insert_grpc_error_metadata(
                 &mut ctx.metadata,
@@ -8433,9 +8461,10 @@ async fn dispatch_grpc_native_h3(
             request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
             0,
             false,
-            true,
+            response_header_client_disconnected,
             None,
-            Some(crate::retry::ErrorClass::ClientDisconnect),
+            response_header_client_disconnected
+                .then_some(crate::retry::ErrorClass::ClientDisconnect),
             start_time,
             backend_start,
             *plugin_execution_ns,
@@ -8490,14 +8519,14 @@ async fn dispatch_grpc_native_h3(
     tokio::pin!(grpc_deadline_sleep);
 
     macro_rules! await_downstream_grpc_write {
-        ($write:expr) => {
+        ($write:expr) => {{
             match crate::http3::stream_util::await_response_write_before_deadline(
                 grpc_deadline_at,
                 $write,
             )
             .await
             {
-                Ok(()) => {}
+                Ok(()) => true,
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                     client_deadline_expired = true;
                     coalesce_buf.clear();
@@ -8508,15 +8537,15 @@ async fn dispatch_grpc_native_h3(
                         GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
                     );
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                    break 'outer;
+                    false
                 }
                 Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
                     client_disconnected = true;
                     body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                    break 'outer;
+                    false
                 }
             }
-        };
+        }};
     }
 
     'outer: loop {
@@ -8551,7 +8580,9 @@ async fn dispatch_grpc_native_h3(
                         ) {
                             let data =
                                 crate::http3::config::copy_remaining_response_chunk(&mut chunk);
-                            await_downstream_grpc_write!(stream.send_data(data));
+                            if !await_downstream_grpc_write!(stream.send_data(data)) {
+                                break 'outer;
+                            }
                             bytes_streamed += chunk_len as u64;
                             flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
                             continue;
@@ -8562,7 +8593,9 @@ async fn dispatch_grpc_native_h3(
                         if coalesce_buf.len() >= coalesce_min_bytes {
                             let data = coalesce_buf.split().freeze();
                             let data_len = data.len() as u64;
-                            await_downstream_grpc_write!(stream.send_data(data));
+                            if !await_downstream_grpc_write!(stream.send_data(data)) {
+                                break 'outer;
+                            }
                             bytes_streamed += data_len;
                             flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
                         }
@@ -8606,7 +8639,9 @@ async fn dispatch_grpc_native_h3(
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                await_downstream_grpc_write!(stream.send_data(data));
+                if !await_downstream_grpc_write!(stream.send_data(data)) {
+                    break 'outer;
+                }
                 bytes_streamed += data_len;
                 flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
             }
@@ -8685,7 +8720,9 @@ async fn dispatch_grpc_native_h3(
             if !coalesce_buf.is_empty() {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                await_downstream_grpc_write!(stream.send_data(data));
+                if !await_downstream_grpc_write!(stream.send_data(data)) {
+                    break 'outer;
+                }
                 bytes_streamed += data_len;
             }
             // Terminal trailers carry the gRPC status. Capture `grpc-status`
@@ -10019,6 +10056,7 @@ async fn finalize_h3_upload_deadline_rejection(
     rejection_phase: &str,
     plugin_execution_ns: u64,
 ) -> Result<(), anyhow::Error> {
+    ctx.mark_gateway_deadline_response_selected();
     let Some(mut reject) = plugin_result_into_reject_parts(
         crate::plugins::grpc_deadline_exceeded_plugin_result(),
     ) else {

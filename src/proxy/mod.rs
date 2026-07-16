@@ -3384,7 +3384,8 @@ pub(crate) async fn run_final_request_body_hooks(
     headers: &HashMap<String, String>,
     body: &[u8],
 ) -> PluginResult {
-    if grpc_deadline_at.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    let deadline_expired =
+        grpc_deadline_at.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
         || ctx.as_deref().is_some_and(|ctx| {
             ctx.metadata
                 .get("grpc_deadline.request_body_transform_timed_out")
@@ -3392,8 +3393,11 @@ pub(crate) async fn run_final_request_body_hooks(
                 || ctx
                     .grpc_deadline_at()
                     .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
-        })
-    {
+        });
+    if deadline_expired {
+        if let Some(ctx) = ctx.as_deref_mut() {
+            ctx.mark_gateway_deadline_response_selected();
+        }
         return crate::plugins::grpc_deadline_exceeded_plugin_result();
     }
     for plugin in plugins {
@@ -3402,11 +3406,18 @@ pub(crate) async fn run_final_request_body_hooks(
             .and_then(RequestContext::grpc_deadline_at)
             .or(grpc_deadline_at);
         let result = if let Some(ctx) = ctx.as_deref_mut() {
-            crate::plugins::await_request_plugin_deadline(
+            match crate::plugins::await_grpc_deadline(
                 deadline,
                 plugin.on_final_request_body_with_context(ctx, headers, body),
             )
             .await
+            {
+                Ok(result) => result,
+                Err(()) => {
+                    ctx.mark_gateway_deadline_response_selected();
+                    crate::plugins::grpc_deadline_exceeded_plugin_result()
+                }
+            }
         } else {
             crate::plugins::await_request_plugin_deadline(
                 deadline,
@@ -13932,12 +13943,19 @@ pub(crate) async fn run_after_proxy_hooks(
         }
 
         let deadline = ctx.grpc_deadline_at();
-        match crate::plugins::await_request_plugin_deadline(
+        let result = match crate::plugins::await_grpc_deadline(
             deadline,
             plugin.after_proxy(ctx, response_status, response_headers),
         )
         .await
         {
+            Ok(result) => result,
+            Err(()) => {
+                ctx.mark_gateway_deadline_response_selected();
+                crate::plugins::grpc_deadline_exceeded_plugin_result()
+            }
+        };
+        match result {
             PluginResult::Continue => {
                 ctx.record_buffered_initial_response_header_plugin(
                     plugin.as_ref(),
@@ -14429,6 +14447,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     response_body: &mut Vec<u8>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
+    ctx.mark_gateway_deadline_response_selected();
     if let Some(content_type) = grpc_web_response_content_type {
         let mut response = crate::plugins::grpc_web::error_response_for_content_type(
             content_type,
@@ -14700,6 +14719,7 @@ async fn build_grpc_web_reject_response(
             .await
             .is_err()
             {
+                ctx.mark_gateway_deadline_response_selected();
                 grpc_status = grpc_proxy::grpc_status::DEADLINE_EXCEEDED;
                 message = GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string();
                 translated = crate::plugins::grpc_web::error_response_for_content_type(
@@ -16163,6 +16183,12 @@ async fn handle_proxy_request_inner(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     debug!(proxy_id = %proxy.id, method = %method, path = %path, client_ip = %ctx.client_ip, "Request routed to proxy");
 
+    // Preserve the path the client actually requested before any plugin can
+    // select a rewritten backend path. Upload-deadline rejection logging runs
+    // before route overrides are applied, while normal transaction logging
+    // below shares this same authoritative client-path snapshot.
+    let original_request_path = path.clone();
+
     // Reuse the client-visible flavor and strict gRPC-Web classification made
     // before routing. In particular, WebSocket precedence must continue to
     // suppress gRPC-Web shaping for route-level rejects carrying a hostile
@@ -17116,15 +17142,6 @@ async fn handle_proxy_request_inner(
     // destination (pool-poisoning invariant).
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
-
-    // Preserve the path the client actually requested for access logging. The
-    // documented contract (the `route_override_path` field doc and
-    // `docs/mesh.md`) is that transaction logs record the original request
-    // path, not the VirtualService-rewritten backend path; the rewrite below
-    // only affects backend URL building and `ctx.path` for dispatch. The
-    // transaction summaries built later in this function source `request_path`
-    // from this value, not the rebased `path`/`ctx.path`.
-    let original_request_path = path.clone();
 
     // Istio `VirtualService.http[].rewrite.uri`: `mesh_route_dispatch` set
     // `ctx.route_override_path` for the matched route. Rebase the request path

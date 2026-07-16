@@ -288,6 +288,124 @@ fn h3_native_buffered_response_writes_are_deadline_bounded() {
 }
 
 #[test]
+fn h3_native_buffered_deadline_outcome_is_recorded_before_transaction_logging() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let writer = source
+        .split("// Build and send buffered response")
+        .nth(1)
+        .expect("native H3 buffered response writer")
+        .split("pub(crate) fn h3_plugin_protocol_for_request")
+        .next()
+        .expect("bounded native H3 buffered response writer");
+    let deadline_metadata = writer
+        .rfind("insert_grpc_error_metadata(")
+        .expect("write deadline must update transaction metadata");
+    let summary = writer
+        .find("let summary = TransactionSummary {")
+        .expect("buffered transaction summary must remain present");
+    let log = writer
+        .find("log_with_mirror(&plugins, &summary, &ctx)")
+        .expect("buffered transaction log call must remain present");
+    assert!(deadline_metadata < summary && summary < log);
+    assert!(writer[..summary].contains("body_completed = false"));
+    assert!(writer[..summary].contains("bytes_received = response_body_bytes"));
+    assert!(writer[summary..log].contains("body_completed,"));
+    assert!(writer[summary..log].contains("bytes_received,"));
+}
+
+#[test]
+fn h3_buffered_terminal_write_bias_uses_typed_gateway_provenance() {
+    let context = include_str!("../../../src/plugins/mod.rs");
+    assert!(context.contains("gateway_deadline_response_selected: bool"));
+    assert!(context.contains("fn mark_gateway_deadline_response_selected"));
+
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let replacement = proxy
+        .split("pub(crate) fn replace_buffered_grpc_response_with_deadline(")
+        .nth(1)
+        .expect("shared buffered deadline replacement")
+        .split("pub(crate) async fn transform_buffered_response_body_with_deadline")
+        .next()
+        .expect("bounded shared buffered deadline replacement");
+    assert!(replacement.contains("ctx.mark_gateway_deadline_response_selected()"));
+
+    let cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
+    let buffered = cross_protocol
+        .split("Ok(GrpcResponseKind::Buffered(resp)) => {")
+        .nth(1)
+        .expect("buffered cross-protocol gRPC response arm")
+        .split("Ok(GrpcResponseKind::Streaming(streaming)) => {")
+        .next()
+        .expect("bounded buffered gRPC response arm");
+    let writer = buffered
+        .split("let grpc_deadline_at = ctx.grpc_deadline_at();")
+        .nth(1)
+        .expect("buffered cross-protocol writer");
+    let header_write = writer
+        .find("let header_write =")
+        .expect("buffered cross-protocol header write");
+    assert!(writer[..header_write].contains("ctx.gateway_deadline_response_selected()"));
+    assert!(!writer[..header_write].contains("metadata.get(\"grpc_status\")"));
+
+    let native = include_str!("../../../src/http3/server.rs");
+    let native_writer = native
+        .split("// Build and send buffered response")
+        .nth(1)
+        .expect("native H3 buffered response writer")
+        .split("macro_rules! await_buffered_h3_write")
+        .next()
+        .expect("bounded native H3 provenance setup");
+    assert!(native_writer.contains("ctx.gateway_deadline_response_selected()"));
+    assert!(!native_writer.contains("metadata.get(\"grpc_status\")"));
+}
+
+#[test]
+fn native_h3_response_header_deadline_is_not_a_client_disconnect() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let branch = source
+        .split("if let Err(write_error) = response_header_write {")
+        .nth(1)
+        .expect("native H3 response-header failure branch")
+        .split("// Stream the response body with the shared QUIC coalescer")
+        .next()
+        .expect("bounded response-header failure branch");
+    assert!(branch.contains("H3ResponseWriteError::DeadlineExceeded =>"));
+    assert!(branch.contains("(true, false)"));
+    assert!(branch.contains("H3ResponseWriteError::Write(_) => (false, true)"));
+    assert!(branch.contains("response_header_client_disconnected,"));
+    assert!(branch.contains("response_header_client_disconnected\n                .then_some"));
+}
+
+#[test]
+fn h3_send_only_terminal_rejection_write_is_deadline_bounded() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let writer = source
+        .split("async fn write_final_grpc_body_reject_send<S>(")
+        .nth(1)
+        .expect("send-only terminal gRPC rejection writer")
+        .split("fn content_type_of(")
+        .next()
+        .expect("bounded send-only terminal gRPC rejection writer");
+    assert!(writer.contains("ctx.gateway_deadline_response_selected()"));
+    assert!(writer.contains("await_terminal_response_write_before_deadline("));
+    assert!(writer.contains("abort_response_stream(stream)"));
+    assert!(writer.contains("terminal_deadline_write_aborted_outcome("));
+    assert!(writer.contains("bytes_sent,\n                false,"));
+
+    let outcome = source
+        .split("fn terminal_deadline_write_aborted_outcome(")
+        .nth(1)
+        .expect("terminal deadline write outcome")
+        .split("async fn write_final_body_reject<S>(")
+        .next()
+        .expect("bounded terminal deadline write outcome");
+    assert!(
+        outcome.contains("client_disconnected.then_some(ErrorClass::ClientDisconnect)"),
+        "deadline expiry must not be reported as a disconnect-oriented body error"
+    );
+}
+
+#[test]
 fn h3_native_grpc_write_deadlines_remain_client_owned_and_observable() {
     let source = include_str!("../../../src/http3/server.rs");
     let relay = source

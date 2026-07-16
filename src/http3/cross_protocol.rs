@@ -3486,6 +3486,7 @@ where
                 .await;
             }
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
+                ctx.mark_gateway_deadline_response_selected();
                 release_cross_protocol_circuit_breaker_probe_on_admission_reject(
                     state,
                     proxy,
@@ -3985,7 +3986,7 @@ where
                 response_trailers.clear();
             }
             for plugin in plugins.iter() {
-                let result = crate::plugins::await_request_plugin_deadline(
+                let result = match crate::plugins::await_grpc_deadline(
                     ctx.grpc_deadline_at(),
                     plugin.on_response_body(
                         ctx,
@@ -3994,7 +3995,14 @@ where
                         &response_body,
                     ),
                 )
-                .await;
+                .await
+                {
+                    Ok(result) => result,
+                    Err(()) => {
+                        ctx.mark_gateway_deadline_response_selected();
+                        crate::plugins::grpc_deadline_exceeded_plugin_result()
+                    }
+                };
                 match result {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
@@ -4063,7 +4071,7 @@ where
                     .record_later_response_header_mutations(&mut plugin_response_headers);
             }
             for plugin in plugins.iter() {
-                let result = crate::plugins::await_request_plugin_deadline(
+                let result = match crate::plugins::await_grpc_deadline(
                     ctx.grpc_deadline_at(),
                     plugin.on_final_response_body(
                         ctx,
@@ -4072,7 +4080,14 @@ where
                         &response_body,
                     ),
                 )
-                .await;
+                .await
+                {
+                    Ok(result) => result,
+                    Err(()) => {
+                        ctx.mark_gateway_deadline_response_selected();
+                        crate::plugins::grpc_deadline_exceeded_plugin_result()
+                    }
+                };
                 match result {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
@@ -4186,14 +4201,7 @@ where
             }
 
             let grpc_deadline_at = ctx.grpc_deadline_at();
-            let terminal_gateway_deadline = ctx
-                .metadata
-                .get("grpc_status")
-                .is_some_and(|status| status == GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER)
-                && ctx
-                    .metadata
-                    .get("grpc_message")
-                    .is_some_and(|message| message == GATEWAY_DEADLINE_EXCEEDED_MESSAGE);
+            let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
             let header_write = if terminal_gateway_deadline {
                 crate::http3::stream_util::await_terminal_response_write_before_deadline(
                     grpc_deadline_at,
@@ -5432,29 +5440,29 @@ where
     // QUIC flow-control credit, preventing the select loop from polling its
     // timer and retaining the upstream H2 body indefinitely.
     macro_rules! await_downstream_write {
-        ($write:expr) => {
+        ($write:expr) => {{
             match crate::http3::stream_util::await_response_write_before_deadline(
                 grpc_deadline_at,
                 $write,
             )
             .await
             {
-                Ok(()) => {}
+                Ok(()) => true,
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                     client_deadline_expired = true;
                     coalesce_buf.clear();
                     trailers = None;
                     body_error_class = Some(ErrorClass::ClientDisconnect);
                     crate::http3::stream_util::abort_response_stream(stream);
-                    break 'outer;
+                    false
                 }
                 Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
                     client_disconnected = true;
                     body_error_class = Some(ErrorClass::ClientDisconnect);
-                    break 'outer;
+                    false
                 }
             }
-        };
+        }};
     }
 
     'outer: loop {
@@ -5524,7 +5532,9 @@ where
                                 data_len,
                                 coalesce.min_bytes,
                             ) {
-                                await_downstream_write!(stream.send_data(data));
+                                if !await_downstream_write!(stream.send_data(data)) {
+                                    break 'outer;
+                                }
                                 bytes_streamed += data_len as u64;
                                 flush_timer
                                     .as_mut()
@@ -5536,7 +5546,9 @@ where
                             if coalesce_buf.len() >= coalesce.min_bytes {
                                 let out = coalesce_buf.split().freeze();
                                 let out_len = out.len() as u64;
-                                await_downstream_write!(stream.send_data(out));
+                                if !await_downstream_write!(stream.send_data(out)) {
+                                    break 'outer;
+                                }
                                 bytes_streamed += out_len;
                                 flush_timer
                                     .as_mut()
@@ -5562,7 +5574,9 @@ where
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let out = coalesce_buf.split().freeze();
                 let out_len = out.len() as u64;
-                await_downstream_write!(stream.send_data(out));
+                if !await_downstream_write!(stream.send_data(out)) {
+                    break 'outer;
+                }
                 bytes_streamed += out_len;
                 flush_timer
                     .as_mut()
@@ -5582,7 +5596,9 @@ where
             if !coalesce_buf.is_empty() {
                 let out = coalesce_buf.split().freeze();
                 let out_len = out.len() as u64;
-                await_downstream_write!(stream.send_data(out));
+                if !await_downstream_write!(stream.send_data(out)) {
+                    break 'outer;
+                }
                 bytes_streamed += out_len;
             }
             // When trailers are present, the caller writes the trailing
@@ -5982,7 +5998,7 @@ fn terminal_deadline_write_aborted_outcome(
         client_disconnected,
         connection_error: false,
         error_class: None,
-        body_error_class: Some(ErrorClass::ClientDisconnect),
+        body_error_class: client_disconnected.then_some(ErrorClass::ClientDisconnect),
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     }
@@ -6049,9 +6065,7 @@ where
         &headers,
         matches!(flavor, HttpFlavor::Grpc),
     );
-    let terminal_gateway_deadline = normalized.grpc_status
-        == Some(grpc_proxy::grpc_status::DEADLINE_EXCEEDED)
-        && normalized.grpc_message.as_deref() == Some(GATEWAY_DEADLINE_EXCEEDED_MESSAGE);
+    let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if !response_committed_plugins.is_empty() {
         for (index, plugin) in response_committed_plugins.iter().enumerate() {
             if terminal_gateway_deadline {
@@ -6097,6 +6111,7 @@ where
                 .is_err()
             };
             if deadline_exceeded {
+                ctx.mark_gateway_deadline_response_selected();
                 let deadline = normalized_h3_grpc_deadline();
                 (normalized, grpc_web_reject) = normalize_reject_for_client(
                     ctx,
@@ -6135,9 +6150,7 @@ where
     // must not park forever on exhausted QUIC flow-control credit. Give the
     // complete HEADERS/DATA/FIN writer one immediate poll after expiry and reset
     // the stream if any constituent write would block.
-    let terminal_gateway_deadline = normalized.grpc_status
-        == Some(grpc_proxy::grpc_status::DEADLINE_EXCEEDED)
-        && normalized.grpc_message.as_deref() == Some(GATEWAY_DEADLINE_EXCEEDED_MESSAGE);
+    let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if let Some(translated) = grpc_web_reject {
         let write = write_reject_with_headers(
             stream,
@@ -6372,6 +6385,17 @@ where
             if !plugin.requires_response_committed_hook() {
                 continue;
             }
+            if ctx.gateway_deadline_response_selected() {
+                plugin
+                    .on_response_committed(
+                        ctx,
+                        normalized.http_status.as_u16(),
+                        &normalized.headers,
+                        &normalized.body,
+                    )
+                    .await;
+                continue;
+            }
             if crate::plugins::await_grpc_deadline(
                 ctx.grpc_deadline_at(),
                 plugin.on_response_committed(
@@ -6384,6 +6408,7 @@ where
             .await
             .is_err()
             {
+                ctx.mark_gateway_deadline_response_selected();
                 normalized = normalized_h3_grpc_deadline();
                 apply_h3_grpc_reject_metadata(ctx, &normalized);
                 for remaining in plugins[index + 1..]
@@ -6403,7 +6428,29 @@ where
             }
         }
     }
-    write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent).await
+    let write = write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent);
+    if !ctx.gateway_deadline_response_selected() {
+        return write.await;
+    }
+    match crate::http3::stream_util::await_terminal_response_write_before_deadline(
+        ctx.grpc_deadline_at(),
+        write,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+            crate::http3::stream_util::abort_response_stream(stream);
+            Ok(terminal_deadline_write_aborted_outcome(
+                normalized.http_status.as_u16(),
+                0,
+                backend_start,
+                bytes_sent,
+                false,
+            ))
+        }
+    }
 }
 
 /// Borrow the `content-type` value for body-transform plugin dispatch
