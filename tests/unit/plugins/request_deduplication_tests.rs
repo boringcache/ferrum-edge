@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    finalize_plugin_rejection_for_test,
-    request_deduplication_completed_size_snapshot_for_test,
+    finalize_plugin_rejection_for_test, request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
@@ -448,7 +447,9 @@ async fn committed_replay_skips_second_response_body_transform() {
     );
     let mut replay_headers =
         HashMap::from([("idempotency-key".to_string(), "finalized".to_string())]);
-    let replay = dedup.before_proxy(&mut replay_ctx, &mut replay_headers).await;
+    let replay = dedup
+        .before_proxy(&mut replay_ctx, &mut replay_headers)
+        .await;
     let transforms: Vec<Arc<dyn Plugin>> = vec![Arc::new(AppendingResponseTransform)];
     match finalize_plugin_rejection_for_test(&transforms, &mut replay_ctx, replay).await {
         PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"presented-once"),
@@ -746,8 +747,7 @@ async fn terminal_serverless_ambiguous_query_releases_every_dedup_owner() {
         "/api".to_string(),
     );
     ctx.set_raw_query_string("role=user&role=admin".to_string());
-    let mut headers =
-        HashMap::from([("idempotency-key".to_string(), "correctable".to_string())]);
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "correctable".to_string())]);
     for dedup in [&first, &second] {
         assert!(matches!(
             dedup.before_proxy(&mut ctx, &mut headers).await,
@@ -780,9 +780,7 @@ async fn terminal_serverless_ambiguous_query_releases_every_dedup_owner() {
         let mut retry_headers =
             HashMap::from([("idempotency-key".to_string(), "correctable".to_string())]);
         assert!(matches!(
-            dedup
-                .before_proxy(&mut retry_ctx, &mut retry_headers)
-                .await,
+            dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
             PluginResult::Continue
         ));
     }
@@ -843,9 +841,7 @@ async fn terminal_serverless_encoded_body_releases_dedup_owner() {
         ("content-length".to_string(), compressed.len().to_string()),
     ]);
     assert!(matches!(
-        dedup
-            .before_proxy(&mut retry_ctx, &mut retry_headers)
-            .await,
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
         PluginResult::Continue
     ));
 }
