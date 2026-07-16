@@ -75,7 +75,7 @@ paths:
 
 ## CI Expectations
 
-- Full-mode PR CI runs format, tests in parallel, lint, perf regression, and five build targets: Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64. The CI planner keeps ordinary non-vendored documentation, license, and agent-instruction-only PRs on a lightweight diff-hygiene + `Tests` aggregate path; vendored Markdown and live-suite contract/runbook docs still select full mode. The perf-regression job is path-gated on full-mode PRs (runs only for performance-sensitive changes) and always runs on pushes to `main` and on manual `workflow_dispatch`.
+- Full-mode PR CI runs formatting and integration-shard coverage inside `ci-plan`, then runs consolidated test jobs (unit + inline lib, all secret backends, Consul + LDAP), two integration shards, three functional shards, lint, perf regression, and five build targets: Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64. The planner also emits trusted, fail-closed Helm/mesh/eBPF path gates so irrelevant jobs skip before runner allocation. Ordinary non-vendored documentation, license, and agent-instruction-only PRs stay on a lightweight diff-hygiene + `Tests` aggregate path; vendored Markdown and live-suite contract/runbook docs still select full mode. The perf-regression job retains its separate path gate on full-mode PRs and always runs on pushes to `main` and on manual `workflow_dispatch`.
 - Push to main overwrites the `latest` release and publishes multi-arch Docker images to Docker Hub and GHCR.
 - Tags `v*` create versioned releases and Docker tags.
 - Required secrets are `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.

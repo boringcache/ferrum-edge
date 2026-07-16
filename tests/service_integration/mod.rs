@@ -19,11 +19,12 @@
 //!
 //! Container-backed tests self-skip (with a printed notice) when Docker is
 //! unavailable, so the suite is safe to run locally without Docker. In CI the
-//! `test-service-integration` matrix runs on Docker-enabled runners where a
+//! `test-service-integration` job runs both backends with `--no-fail-fast` on a
+//! Docker-enabled runner where a
 //! container that fails to start is a HARD failure (see
 //! `common::containers::fail_in_ci_else_skip`).
 //!
-//! Run per backend (see also the CI matrix):
+//! Run per backend (see also the consolidated CI job):
 //!   cargo test --test service_integration consul
 //!   cargo test --test service_integration ldap
 

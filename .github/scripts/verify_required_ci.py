@@ -17,20 +17,15 @@ from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS
 
 REQUIRED_JOBS = {
     "ci-plan",
-    "fmt",
     "test-unit",
-    "test-lib",
     "test-secrets",
     "test-service-integration",
     "test-pkcs11-softhsm",
-    "build-integration-tests-archive",
+    "build-test-artifacts",
     "test-integration",
-    "test-integration-coverage",
     "test-conformance",
     "dependency-audit",
     "test-vendor-patches",
-    "build-gateway-binary",
-    "build-functional-tests-archive",
     "test-functional",
     "plugin-hardening-redis-regression",
     "gateway-api-conformance",
@@ -40,7 +35,6 @@ REQUIRED_JOBS = {
     "mesh-e2e-sidecar-live",
     "helm-chart",
     "lint",
-    "detect-ebpf-live-changes",
     "build-ebpf",
     "build-ebpf-userspace",
     "ebpf-live",
@@ -54,27 +48,40 @@ REQUIRED_JOBS = {
 # directly depend on the planner and enforce full mode. Other required jobs are
 # downstream of one of these roots and are skipped transitively in light mode.
 DIRECT_FULL_CI_JOBS = {
-    "fmt",
     "test-unit",
-    "test-lib",
     "test-secrets",
     "test-service-integration",
     "test-pkcs11-softhsm",
-    "build-integration-tests-archive",
+    "build-test-artifacts",
     "test-conformance",
     "dependency-audit",
-    "test-vendor-patches",
-    "build-gateway-binary",
-    "build-functional-tests-archive",
     "gateway-api-conformance",
     "coverage-gate",
     "mesh-e2e-sidecar-live",
     "lint",
-    "detect-ebpf-live-changes",
-    "build-ebpf",
     "build-ebpf-userspace",
     "performance-regression",
     "build-binaries",
+}
+
+PATH_GATED_JOBS = {
+    "mesh-multicluster-federation": "run_mesh_federation",
+    "mesh-e2e-sidecar": "run_mesh_sidecar_smoke",
+    "helm-chart": "run_helm",
+    "build-ebpf": "run_ebpf_build",
+    "ebpf-live": "run_ebpf_live",
+    "netns-capture-live": "run_ebpf_live",
+    "two-cluster-mesh-live": "run_ebpf_live",
+}
+
+REMOVED_JOBS = {
+    "fmt",
+    "test-lib",
+    "build-integration-tests-archive",
+    "test-integration-coverage",
+    "build-gateway-binary",
+    "build-functional-tests-archive",
+    "detect-ebpf-live-changes",
 }
 
 
@@ -105,6 +112,15 @@ def extract_job_body(ci_yml: str, job: str) -> str:
     return match.group("body")
 
 
+def job_needs(body: str, dependency: str) -> bool:
+    scalar = re.search(rf"(?m)^    needs: {re.escape(dependency)}$", body)
+    inline = re.search(
+        rf"(?m)^    needs: \[[^\n]*\b{re.escape(dependency)}\b[^\n]*\]$", body
+    )
+    block = re.search(rf"(?m)^      - {re.escape(dependency)}$", body)
+    return bool(scalar or inline or block)
+
+
 def extract_documentation_paths(workflow_yml: str) -> set[str]:
     paths = set(
         re.findall(
@@ -125,17 +141,52 @@ def main() -> int:
     extra = sorted(needs - REQUIRED_JOBS)
 
     planner_errors: list[str] = []
+    aggregate_body = extract_job_body(ci_yml, "test")
+    for job in sorted(REQUIRED_JOBS):
+        if f"needs.{job}.result" not in aggregate_body:
+            planner_errors.append(
+                f"jobs.test must report and enforce the result of `{job}`"
+            )
+
     for job in sorted(DIRECT_FULL_CI_JOBS):
         body = extract_job_body(ci_yml, job)
-        if not re.search(r"(?m)^    needs: ci-plan$", body):
+        if not job_needs(body, "ci-plan"):
             planner_errors.append(f"jobs.{job} must directly need ci-plan")
         if "needs.ci-plan.outputs.mode == 'full'" not in body:
             planner_errors.append(f"jobs.{job} must require full CI mode")
+
+    for job, output in sorted(PATH_GATED_JOBS.items()):
+        body = extract_job_body(ci_yml, job)
+        if not job_needs(body, "ci-plan"):
+            planner_errors.append(f"jobs.{job} must directly need ci-plan")
+        if "needs.ci-plan.outputs.mode == 'full'" not in body:
+            planner_errors.append(f"jobs.{job} must require full CI mode")
+        if f"needs.ci-plan.outputs.{output} == 'true'" not in body:
+            planner_errors.append(
+                f"jobs.{job} must use the ci-plan `{output}` path gate"
+            )
+        if f"needs.ci-plan.outputs.{output}" not in aggregate_body:
+            planner_errors.append(
+                f"jobs.test must enforce the ci-plan `{output}` path gate"
+            )
+
+    for job in sorted(REMOVED_JOBS):
+        if re.search(rf"(?m)^  {re.escape(job)}:$", ci_yml):
+            planner_errors.append(f"consolidated jobs.{job} must not remain in ci.yml")
 
     ci_plan_body = extract_job_body(ci_yml, "ci-plan")
     if 'git diff --name-only --no-renames "${base_ref}...HEAD"' not in ci_plan_body:
         planner_errors.append(
             "jobs.ci-plan must disable rename detection when collecting changed files"
+        )
+    for output in sorted(set(PATH_GATED_JOBS.values())):
+        if not re.search(rf"(?m)^      {re.escape(output)}:", ci_plan_body):
+            planner_errors.append(f"jobs.ci-plan must publish `{output}`")
+    if "cargo fmt --all -- --check" not in ci_plan_body:
+        planner_errors.append("jobs.ci-plan must run the Rust formatting gate")
+    if "integration-coverage.diff" not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must run the integration shard-coverage gate"
         )
 
     node_waypoint_yml = Path(
