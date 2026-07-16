@@ -78,8 +78,7 @@ fn buffered_h3_committed_deadline_preserves_binary_text_and_native_framing() {
         "application/grpc-web+proto",
         "application/grpc-web-text+proto",
     ] {
-        let response =
-            h3_buffered_grpc_deadline_replacement_for_test(Some(content_type));
+        let response = h3_buffered_grpc_deadline_replacement_for_test(Some(content_type));
         assert_eq!(response.http_status, http::StatusCode::OK);
         assert_eq!(
             response.headers.get("content-type").map(String::as_str),
@@ -89,7 +88,11 @@ fn buffered_h3_committed_deadline_preserves_binary_text_and_native_framing() {
             response.headers.get("x-grpc-web").map(String::as_str),
             Some("1")
         );
-        assert!(response.headers.contains_key("access-control-expose-headers"));
+        assert!(
+            response
+                .headers
+                .contains_key("access-control-expose-headers")
+        );
         assert!(!response.headers.contains_key("grpc-status"));
         assert!(!response.headers.contains_key("grpc-message"));
 
@@ -143,8 +146,7 @@ fn buffered_h3_committed_deadline_preserves_binary_text_and_native_framing() {
 fn retry_backoff_deadline_response_is_request_aware_for_grpc_web() {
     use base64::Engine as _;
     use ferrum_edge::_test_support::{
-        GRPC_FRAME_TRAILER, client_grpc_deadline_response_for_request_for_test,
-        parse_grpc_frames,
+        GRPC_FRAME_TRAILER, client_grpc_deadline_response_for_request_for_test, parse_grpc_frames,
     };
     use ferrum_edge::retry::ErrorClass;
 

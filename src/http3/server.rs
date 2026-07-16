@@ -9683,34 +9683,26 @@ async fn run_h3_deadline_bounded_reject_committed_hooks(
         return false;
     }
 
-    let (committed_status, committed_headers, committed_body) =
-        if let Some(content_type) = grpc_web_response_content_type {
-            let (grpc_status, grpc_message) =
-                h3_grpc_reject_signal(http_status, body, headers);
-            let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
-                content_type,
-                grpc_status,
-                grpc_message.as_ref(),
-            );
-            crate::proxy::finalize_grpc_web_error_response_headers(
-                &mut translated,
-                &[],
-                Some(headers),
-            );
-            (StatusCode::OK, translated.headers, translated.body)
-        } else {
-            let normalized = crate::proxy::normalize_reject_response(
-                http_status,
-                body,
-                headers,
-                matches!(flavor, HttpFlavor::Grpc),
-            );
-            (
-                normalized.http_status,
-                normalized.headers,
-                normalized.body,
-            )
-        };
+    let (committed_status, committed_headers, committed_body) = if let Some(content_type) =
+        grpc_web_response_content_type
+    {
+        let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
+        let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_status,
+            grpc_message.as_ref(),
+        );
+        crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, &[], Some(headers));
+        (StatusCode::OK, translated.headers, translated.body)
+    } else {
+        let normalized = crate::proxy::normalize_reject_response(
+            http_status,
+            body,
+            headers,
+            matches!(flavor, HttpFlavor::Grpc),
+        );
+        (normalized.http_status, normalized.headers, normalized.body)
+    };
 
     for (index, plugin) in plugins.iter().enumerate() {
         if crate::plugins::await_grpc_deadline(
@@ -10349,12 +10341,7 @@ mod h3_request_body_timeout_tests {
         let mut body = b"backend response".to_vec();
 
         let status =
-            super::replace_h3_response_with_grpc_deadline(
-                &mut ctx,
-                &mut headers,
-                &mut body,
-                &[],
-            );
+            super::replace_h3_response_with_grpc_deadline(&mut ctx, &mut headers, &mut body, &[]);
 
         assert_eq!(status, http::StatusCode::OK);
         assert_eq!(headers.len(), 3);

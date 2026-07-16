@@ -29,7 +29,9 @@ fn h3_native_mesh_refusal_screens_plain_and_grpc_before_dispatch() {
 fn translated_h3_grpc_web_threads_preacquired_admission_into_grpc_dispatch() {
     let server = include_str!("../../../src/http3/server.rs");
     let bridge = server
-        .find("crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest")
+        .find(
+            "crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest",
+        )
         .expect("H3 cross-protocol bridge request must remain present");
     let bridge = &server[bridge..];
     assert!(
@@ -106,8 +108,7 @@ fn buffered_h3_deadline_replacements_keep_grpc_web_wire_flavor() {
         .expect("buffered H3 direct response write must remain present");
     assert!(replacement < response_write);
     assert!(
-        committed[..response_write]
-            .contains("grpc_web_response_content_type.as_deref()"),
+        committed[..response_write].contains("grpc_web_response_content_type.as_deref()"),
         "the direct H3 buffered writer must pass the original gRPC-Web flavor into replacement"
     );
 
@@ -135,7 +136,10 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
         .find("// Build the backend-facing header map")
         .expect("H3 gRPC upload buffering must remain bounded");
     let body = &body[..body_end];
-    for error in ["H3RequestBodyReadError::TimedOut", "H3RequestBodyReadError::DeadlineExceeded"] {
+    for error in [
+        "H3RequestBodyReadError::TimedOut",
+        "H3RequestBodyReadError::DeadlineExceeded",
+    ] {
         let branch = body
             .find(error)
             .unwrap_or_else(|| panic!("missing {error} upload branch"));

@@ -1412,9 +1412,8 @@ fn generic_retry_backoff_uses_request_aware_grpc_deadline_response() {
         "gRPC-Web retry-backoff expiry must use the request-aware deadline shaper"
     );
     assert!(
-        !backoff.contains(
-            "client_grpc_deadline_exceeded_response(result.backend_resolved_ip.clone())"
-        ),
+        !backoff
+            .contains("client_grpc_deadline_exceeded_response(result.backend_resolved_ip.clone())"),
         "the generic retry backoff must not regress to native-only gRPC framing"
     );
     assert!(backoff.contains("&ctx,"));

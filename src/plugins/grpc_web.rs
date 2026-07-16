@@ -355,9 +355,7 @@ pub(crate) fn client_uses_grpc_web(ctx: &RequestContext) -> bool {
     ctx.metadata.contains_key(META_GRPC_WEB_ORIGINAL_CT)
 }
 
-pub(crate) fn retained_response_content_type(
-    ctx: &RequestContext,
-) -> Option<&'static str> {
+pub(crate) fn retained_response_content_type(ctx: &RequestContext) -> Option<&'static str> {
     ctx.metadata
         .get(META_GRPC_WEB_ORIGINAL_CT)
         .map(|content_type| response_content_type(content_type))

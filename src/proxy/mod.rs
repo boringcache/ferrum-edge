@@ -14444,13 +14444,9 @@ async fn build_grpc_web_reject_response(
                 );
                 let mut deadline_headers = reject.headers.clone();
                 deadline_headers.retain(|name, _| {
-                    ![
-                        "grpc-status",
-                        "grpc-message",
-                        "grpc-status-details-bin",
-                    ]
-                    .iter()
-                    .any(|terminal| name.eq_ignore_ascii_case(terminal))
+                    !["grpc-status", "grpc-message", "grpc-status-details-bin"]
+                        .iter()
+                        .any(|terminal| name.eq_ignore_ascii_case(terminal))
                 });
                 finalize_grpc_web_error_response_headers(
                     &mut translated,

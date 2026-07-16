@@ -303,6 +303,8 @@ fn attach_grpc_web_deadline_plugins(
             updated_at: Utc::now(),
         },
     ]
+}
+
 fn create_test_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
     Upstream {
         id: id.to_string(),
