@@ -199,6 +199,23 @@ fn native_h3_client_deadlines_remain_health_neutral() {
 }
 
 #[test]
+fn h3_deadline_preflight_runs_committed_hooks_exactly_once() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let preflight = source
+        .find("// Resolve the effective gRPC policy before any plugin/body await.")
+        .expect("H3 gRPC deadline preflight must remain present");
+    let preflight = &source[preflight..];
+    let preflight_end = preflight
+        .find("// Pre-computed capability bitset")
+        .expect("H3 gRPC deadline preflight must remain bounded");
+    let preflight = &preflight[..preflight_end];
+
+    assert!(preflight.contains("run_h3_deadline_bounded_reject_committed_hooks("));
+    assert!(!preflight.contains("run_h3_reject_response_committed_hooks("));
+    assert!(preflight.contains("send_h3_finalized_reject_response("));
+}
+
+#[test]
 fn preacquired_admission_has_exactly_once_outcome_and_release_ownership() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

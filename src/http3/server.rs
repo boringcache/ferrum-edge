@@ -1558,19 +1558,12 @@ async fn handle_h3_request(
                 &mut headers,
                 &mut reject_body,
                 true,
-                true,
+                false,
             )
             .await;
-            let http_status =
+            let mut http_status =
                 StatusCode::from_u16(reject_status).unwrap_or(StatusCode::BAD_REQUEST);
-            let log_status_code = h3_reject_log_status_and_metadata(
-                &mut ctx,
-                http_flavor,
-                http_status,
-                &reject_body,
-                &headers,
-            );
-            run_h3_reject_response_committed_hooks(
+            let deadline_replaced = run_h3_deadline_bounded_reject_committed_hooks(
                 &plugins,
                 &mut ctx,
                 http_flavor,
@@ -1578,8 +1571,29 @@ async fn handle_h3_request(
                 http_status,
                 &reject_body,
                 &headers,
+                initial_response_header_policy_plugins.as_ref(),
             )
             .await;
+            if deadline_replaced {
+                http_status = replace_buffered_h3_response_with_grpc_deadline(
+                    &mut ctx,
+                    grpc_web_response_content_type.as_deref(),
+                    &mut headers,
+                    &mut reject_body,
+                    initial_response_header_policy_plugins.as_ref(),
+                );
+            }
+            let log_status_code = if deadline_replaced {
+                StatusCode::OK.as_u16()
+            } else {
+                h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    http_status,
+                    &reject_body,
+                    &headers,
+                )
+            };
             record_request(&state, log_status_code);
             log_rejected_request(
                 &plugins,
@@ -1590,17 +1604,27 @@ async fn handle_h3_request(
                 0,
             )
             .await;
-            send_h3_plugin_reject_flavor_aware(
-                &mut stream,
-                &plugins,
-                &mut ctx,
-                http_flavor,
-                grpc_web_response_content_type.as_deref(),
-                http_status,
-                &reject_body,
-                &headers,
-            )
-            .await?;
+            if deadline_replaced && grpc_web_response_content_type.is_some() {
+                send_h3_finalized_reject_response(
+                    &mut stream,
+                    StatusCode::OK,
+                    &reject_body,
+                    &headers,
+                )
+                .await?;
+            } else {
+                send_h3_plugin_reject_flavor_aware(
+                    &mut stream,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    http_status,
+                    &reject_body,
+                    &headers,
+                )
+                .await?;
+            }
             return Ok(());
         }
     }
