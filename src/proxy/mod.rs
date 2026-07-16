@@ -7798,8 +7798,7 @@ impl ProxyState {
         // on this async call path. Preload every MMDB that the prospective
         // delta would reconstruct on the blocking pool, then let the cache
         // stage claim the generation handoff without synchronous file work.
-        let prospective_delta =
-            crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+        let prospective_delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
         let prospective_proxy_rebuilds =
             prospective_delta.proxy_ids_needing_plugin_rebuild(&new_config);
         if crate::plugin_cache::country_mmdb_preload_required(
@@ -7835,13 +7834,11 @@ impl ProxyState {
                     // disappear after its off-thread MMDB generation was
                     // accepted. Claim and publish that handoff rather than
                     // leaving it unowned or retaining stale geo readers.
-                    let Some(plugin_cache) = self
-                        .plugin_cache
-                        .build_country_mmdb_reload_inner(
-                            &current.plugin_cache,
-                            &new_config,
-                            false,
-                        )?
+                    let Some(plugin_cache) = self.plugin_cache.build_country_mmdb_reload_inner(
+                        &current.plugin_cache,
+                        &new_config,
+                        false,
+                    )?
                     else {
                         return Ok(None);
                     };

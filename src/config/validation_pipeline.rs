@@ -139,11 +139,9 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
                 crate::plugins::ip_restriction::IpRestriction::new(&plugin_config.config)
                     .map(|_| ())
             }
-            "geo_restriction" => {
-                crate::plugins::geo_restriction::GeoRestriction::validate_config(
-                    &plugin_config.config,
-                )
-            }
+            "geo_restriction" => crate::plugins::geo_restriction::GeoRestriction::validate_config(
+                &plugin_config.config,
+            ),
             _ => continue,
         };
         if let Err(error) = shape_error {
