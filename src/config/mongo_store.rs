@@ -2587,8 +2587,9 @@ mod inner {
         /// update (which may remove associations).
         async fn cleanup_orphaned_proxy_group_plugins(
             &self,
+            namespace: &str,
         ) -> Result<Vec<(String, String)>, anyhow::Error> {
-            self.cleanup_orphaned_proxy_group_plugins_opt_session(None)
+            self.cleanup_orphaned_proxy_group_plugins_opt_session(namespace, None)
                 .await
         }
 
@@ -2596,12 +2597,13 @@ mod inner {
         /// participates in a `ClientSession`-scoped transaction.
         async fn cleanup_orphaned_proxy_group_plugins_opt_session(
             &self,
+            namespace: &str,
             session: Option<&mut ClientSession>,
         ) -> Result<Vec<(String, String)>, anyhow::Error> {
             if let Some(s) = session {
                 let plugin_configs = self.plugin_configs();
                 let mut cursor = plugin_configs
-                    .find(doc! { "scope": "proxy_group" })
+                    .find(doc! { "scope": "proxy_group", "namespace": namespace })
                     .projection(doc! { "_id": 1, "namespace": 1 })
                     .session(&mut *s)
                     .await?;
@@ -2622,14 +2624,17 @@ mod inner {
                 for (id, namespace) in &group_plugins {
                     let count = self
                         .proxies()
-                        .count_documents(doc! { "plugins.plugin_config_id": id })
+                        .count_documents(doc! {
+                            "namespace": namespace,
+                            "plugins.plugin_config_id": id,
+                        })
                         .session(&mut *s)
                         .await?;
                     if count == 0 {
                         info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
                         let result = self
                             .plugin_configs()
-                            .delete_one(doc! { "_id": id })
+                            .delete_one(doc! { "_id": id, "namespace": namespace })
                             .session(&mut *s)
                             .await?;
                         if result.deleted_count > 0 {
@@ -2643,7 +2648,7 @@ mod inner {
             // Find all proxy_group-scoped plugin config IDs
             let plugin_configs = self.plugin_configs();
             let mut cursor = plugin_configs
-                .find(doc! { "scope": "proxy_group" })
+                .find(doc! { "scope": "proxy_group", "namespace": namespace })
                 .projection(doc! { "_id": 1, "namespace": 1 })
                 .await?;
             let mut group_plugins: Vec<(String, String)> = Vec::new();
@@ -2663,11 +2668,17 @@ mod inner {
                 // Check if any proxy still references this plugin config
                 let count = self
                     .proxies()
-                    .count_documents(doc! { "plugins.plugin_config_id": id })
+                    .count_documents(doc! {
+                        "namespace": namespace,
+                        "plugins.plugin_config_id": id,
+                    })
                     .await?;
                 if count == 0 {
                     info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
-                    let result = self.plugin_configs().delete_one(doc! { "_id": id }).await?;
+                    let result = self
+                        .plugin_configs()
+                        .delete_one(doc! { "_id": id, "namespace": namespace })
+                        .await?;
                     if result.deleted_count > 0 {
                         deleted.push((id.clone(), namespace.clone()));
                     }
@@ -4653,7 +4664,10 @@ mod inner {
                                     return Ok((false, Vec::<(String, String)>::new()));
                                 }
                                 let orphaned = this
-                                    .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
+                                    .cleanup_orphaned_proxy_group_plugins_opt_session(
+                                        namespace.as_str(),
+                                        Some(&mut *s),
+                                    )
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 this.record_config_change_in_session(
@@ -4806,7 +4820,8 @@ mod inner {
                 return Err(err);
             }
             let orphaned_proxy_group_plugin_deletes =
-                self.cleanup_orphaned_proxy_group_plugins().await?;
+                self.cleanup_orphaned_proxy_group_plugins(&proxy.namespace)
+                    .await?;
             for (plugin_id, namespace) in orphaned_proxy_group_plugin_deletes {
                 self.record_config_change(&namespace, "plugin_config", &plugin_id, "delete")
                     .await?;
@@ -4997,7 +5012,10 @@ mod inner {
                                 }
 
                                 let orphaned_proxy_group_plugin_deletes = this
-                                    .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
+                                    .cleanup_orphaned_proxy_group_plugins_opt_session(
+                                        namespace.as_str(),
+                                        Some(&mut *s),
+                                    )
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 if result.deleted_count > 0 {
@@ -5212,7 +5230,7 @@ mod inner {
                 }
             }
             let orphaned_proxy_group_plugin_deletes =
-                self.cleanup_orphaned_proxy_group_plugins().await?;
+                self.cleanup_orphaned_proxy_group_plugins(namespace).await?;
             if result.deleted_count > 0 {
                 self.record_config_change(&proxy_namespace, "proxy", id, "delete")
                     .await?;
@@ -6219,52 +6237,67 @@ mod inner {
         async fn create_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
             let doc = upstream_to_doc(upstream)?;
-            if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                session
-                    .start_transaction()
-                    .and_run(
-                        (self, doc, upstream.namespace.clone(), upstream.id.clone()),
-                        |s, (this, doc, namespace, id)| {
-                            Box::pin(async move {
-                                this.upstreams()
-                                    .insert_one(doc.clone())
-                                    .session(&mut *s)
-                                    .await?;
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "upstream",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
-                                Ok(())
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("create_upstream transaction failed: {}", e))?;
-                self.compact_config_changes_best_effort(&upstream.namespace)
-                    .await;
-            } else {
-                self.upstreams().insert_one(doc).await?;
-                if let Err(err) = self
-                    .record_config_change(&upstream.namespace, "upstream", &upstream.id, "upsert")
-                    .await
-                {
-                    self.rollback_standalone_created_document(
-                        "upstreams",
-                        &upstream.namespace,
-                        "upstream",
-                        &upstream.id,
-                        &err,
-                    )
-                    .await;
-                    return Err(err);
-                }
-            }
+            let mut mtls_lease = self
+                .acquire_mtls_dns_admission_lease(&upstream.namespace)
+                .await?;
+            mtls_lease
+                .run_mutation(async {
+                    if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        session
+                            .start_transaction()
+                            .and_run(
+                                (self, doc, upstream.namespace.clone(), upstream.id.clone()),
+                                |s, (this, doc, namespace, id)| {
+                                    Box::pin(async move {
+                                        this.upstreams()
+                                            .insert_one(doc.clone())
+                                            .session(&mut *s)
+                                            .await?;
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            "upstream",
+                                            id.as_str(),
+                                            "upsert",
+                                        )
+                                        .await?;
+                                        Ok(())
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(anyhow::Error::new)
+                            .context("create_upstream transaction failed")?;
+                        self.compact_config_changes_best_effort(&upstream.namespace)
+                            .await;
+                    } else {
+                        self.upstreams().insert_one(doc).await?;
+                        if let Err(err) = self
+                            .record_config_change(
+                                &upstream.namespace,
+                                "upstream",
+                                &upstream.id,
+                                "upsert",
+                            )
+                            .await
+                        {
+                            self.rollback_standalone_created_document(
+                                "upstreams",
+                                &upstream.namespace,
+                                "upstream",
+                                &upstream.id,
+                                &err,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            mtls_lease.release().await?;
             self.check_slow_query("create_upstream", start);
             Ok(())
         }
@@ -6274,6 +6307,9 @@ mod inner {
             // Preserve api_spec_id by carrying it into the replacement document.
             // Returning an error is safer than silently detaching spec ownership.
             let mut doc = upstream_to_doc(upstream)?;
+            let mut mtls_lease = self
+                .acquire_mtls_dns_admission_lease(&upstream.namespace)
+                .await?;
             let existing_doc = self
                 .upstreams()
                 .find_one(doc! { "_id": &upstream.id, "namespace": &upstream.namespace })
@@ -6281,6 +6317,7 @@ mod inner {
             if existing_doc.is_none() {
                 // No document in this namespace — phantom update, no
                 // config-change record (DB-M4).
+                mtls_lease.release().await?;
                 self.check_slow_query("update_upstream", start);
                 return Ok(false);
             }
@@ -6288,6 +6325,7 @@ mod inner {
                 Some(Bson::String(s)) if !s.is_empty() => Some(s.clone()),
                 Some(Bson::Null) | None => None,
                 Some(other) => {
+                    mtls_lease.release().await?;
                     anyhow::bail!(
                         "upstream {} has non-string api_spec_id ownership tag: {:?}",
                         upstream.id,
@@ -6298,86 +6336,99 @@ mod inner {
             if let Some(sid) = existing_spec_id {
                 doc.insert("api_spec_id", sid);
             }
-            if self.replica_set_configured() {
-                let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
-                let matched = session
-                    .start_transaction()
-                    .and_run(
-                        (self, doc, upstream.namespace.clone(), upstream.id.clone()),
-                        |s, (this, doc, namespace, id)| {
-                            Box::pin(async move {
-                                let replace_result = this
-                                    .upstreams()
-                                    .replace_one(
-                                        doc! {
-                                            "_id": id.as_str(),
-                                            "namespace": namespace.as_str(),
-                                        },
-                                        doc.clone(),
-                                    )
-                                    .session(&mut *s)
-                                    .await?;
-                                if replace_result.matched_count == 0 {
-                                    // Phantom update: no config-change record
-                                    // (DB-M4).
-                                    return Ok(false);
-                                }
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "upstream",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
-                                Ok(true)
-                            })
-                        },
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("update_upstream transaction failed: {}", e))?;
-                if matched {
-                    self.compact_config_changes_best_effort(&upstream.namespace)
-                        .await;
-                }
-                self.check_slow_query("update_upstream", start);
-                return Ok(matched);
-            } else {
-                let replace_result = self
-                    .upstreams()
-                    .replace_one(
-                        doc! { "_id": &upstream.id, "namespace": &upstream.namespace },
-                        doc,
-                    )
-                    .await?;
-                if replace_result.matched_count == 0 {
-                    // Phantom update (concurrent delete): no config-change
-                    // record (DB-M4).
-                    self.check_slow_query("update_upstream", start);
-                    return Ok(false);
-                }
-                if let Err(err) = self
-                    .record_config_change(&upstream.namespace, "upstream", &upstream.id, "upsert")
-                    .await
-                {
-                    self.rollback_standalone_updated_document(
-                        "upstreams",
-                        "upstream",
-                        &upstream.id,
-                        existing_doc,
-                        &err,
-                    )
-                    .await;
-                    return Err(err);
-                }
-            }
+            let matched = mtls_lease
+                .run_mutation(async {
+                    if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        let matched = session
+                            .start_transaction()
+                            .and_run(
+                                (self, doc, upstream.namespace.clone(), upstream.id.clone()),
+                                |s, (this, doc, namespace, id)| {
+                                    Box::pin(async move {
+                                        let replace_result = this
+                                            .upstreams()
+                                            .replace_one(
+                                                doc! {
+                                                    "_id": id.as_str(),
+                                                    "namespace": namespace.as_str(),
+                                                },
+                                                doc.clone(),
+                                            )
+                                            .session(&mut *s)
+                                            .await?;
+                                        if replace_result.matched_count == 0 {
+                                            // Phantom update: no config-change record
+                                            // (DB-M4).
+                                            return Ok(false);
+                                        }
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            "upstream",
+                                            id.as_str(),
+                                            "upsert",
+                                        )
+                                        .await?;
+                                        Ok(true)
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(anyhow::Error::new)
+                            .context("update_upstream transaction failed")?;
+                        if matched {
+                            self.compact_config_changes_best_effort(&upstream.namespace)
+                                .await;
+                        }
+                        Ok(matched)
+                    } else {
+                        let replace_result = self
+                            .upstreams()
+                            .replace_one(
+                                doc! { "_id": &upstream.id, "namespace": &upstream.namespace },
+                                doc,
+                            )
+                            .await?;
+                        if replace_result.matched_count == 0 {
+                            // Phantom update (concurrent delete): no config-change
+                            // record (DB-M4).
+                            return Ok(false);
+                        }
+                        if let Err(err) = self
+                            .record_config_change(
+                                &upstream.namespace,
+                                "upstream",
+                                &upstream.id,
+                                "upsert",
+                            )
+                            .await
+                        {
+                            self.rollback_standalone_updated_document(
+                                "upstreams",
+                                "upstream",
+                                &upstream.id,
+                                existing_doc,
+                                &err,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                        Ok(true)
+                    }
+                })
+                .await?;
+            mtls_lease.release().await?;
             self.check_slow_query("update_upstream", start);
-            Ok(true)
+            Ok(matched)
         }
 
         async fn delete_upstream(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
+            let deleted = mtls_lease
+                .run_mutation(async {
             let deleted = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -6484,7 +6535,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("delete_upstream transaction failed: {}", e))?;
+                    .map_err(anyhow::Error::new)
+                    .context("delete_upstream transaction failed")?;
                 if deleted {
                     self.compact_config_changes_best_effort(namespace).await;
                 }
@@ -6547,11 +6599,10 @@ mod inner {
                     .await?;
                 if proxy_refs_after > 0 {
                     if let Err(err) = self.upstreams().insert_one(existing).await {
-                        warn!(
-                            "MongoDB standalone delete_upstream re-insert after late proxy \
-                             reference failed for '{}': {}",
-                            id, err
-                        );
+                        return Err(anyhow::Error::new(err).context(format!(
+                            "MongoDB standalone delete_upstream could not restore '{}' after a late proxy reference",
+                            id
+                        )));
                     }
                     anyhow::bail!(
                         "Upstream {} is referenced by one or more proxies and cannot be deleted",
@@ -6562,6 +6613,10 @@ mod inner {
                     .await?;
                 true
             };
+            Ok(deleted)
+                })
+                .await?;
+            mtls_lease.release().await?;
             self.check_slow_query("delete_upstream", start);
             Ok(deleted)
         }
@@ -6589,6 +6644,9 @@ mod inner {
             upstream_id: &str,
         ) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
+            let deleted_namespace = mtls_lease
+                .run_mutation(async {
             let deleted_namespace = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -6641,9 +6699,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("cleanup_orphaned_upstream transaction failed: {}", e)
-                    })?
+                    .map_err(anyhow::Error::new)
+                    .context("cleanup_orphaned_upstream transaction failed")?
             } else {
                 let count = self
                     .proxies()
@@ -6671,6 +6728,10 @@ mod inner {
                     None
                 }
             };
+            Ok(deleted_namespace)
+                })
+                .await?;
+            mtls_lease.release().await?;
             if let Some(namespace) = deleted_namespace {
                 if self.replica_set_configured() {
                     self.compact_config_changes_best_effort(&namespace).await;
@@ -7390,6 +7451,7 @@ mod inner {
         async fn batch_create_upstreams(
             &self,
             upstreams: &[Upstream],
+            mode: &BatchConfigWriteMode,
         ) -> Result<usize, anyhow::Error> {
             if upstreams.is_empty() {
                 return Ok(0);
@@ -7398,7 +7460,16 @@ mod inner {
                 .iter()
                 .map(upstream_to_doc)
                 .collect::<Result<_, _>>()?;
-            if self.replica_set_configured() {
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases_for_mode(
+                    upstreams
+                        .iter()
+                        .map(|upstream| upstream.namespace.as_str()),
+                    mode,
+                )
+                .await?;
+            let count = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+            let count = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
                 let changes: Vec<(String, String)> = upstreams
@@ -7429,9 +7500,8 @@ mod inner {
                         })
                     })
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("batch_create_upstreams transaction failed: {}", e)
-                    })?;
+                    .map_err(anyhow::Error::new)
+                    .context("batch_create_upstreams transaction failed")?;
                 let namespaces: HashSet<String> = upstreams
                     .iter()
                     .map(|upstream| upstream.namespace.clone())
@@ -7439,7 +7509,7 @@ mod inner {
                 for namespace in namespaces {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
-                Ok(count)
+                count
             } else {
                 let ids: Vec<&str> = upstreams
                     .iter()
@@ -7475,8 +7545,13 @@ mod inner {
                         .await;
                     return Err(err);
                 }
-                Ok(result.inserted_ids.len())
-            }
+                result.inserted_ids.len()
+            };
+            Ok(count)
+                })
+                .await?;
+            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Ok(count)
         }
 
         async fn delete_all_resources(
@@ -8485,8 +8560,8 @@ mod inner {
                 orphaned_proxy_group_plugin_deletes = session
                     .start_transaction()
                     .and_run(
-                        (self, prepared_docs, upsert_changes),
-                        |s, (this, prepared_docs, upsert_changes)| {
+                        (self, prepared_docs, upsert_changes, spec.namespace.clone()),
+                        |s, (this, prepared_docs, upsert_changes, namespace)| {
                             Box::pin(async move {
                                 if let Some((_, doc)) = &prepared_docs.upstream {
                                     this.upstreams()
@@ -8509,7 +8584,10 @@ mod inner {
                                     .session(&mut *s)
                                     .await?;
                                 let orphaned = this
-                                    .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
+                                    .cleanup_orphaned_proxy_group_plugins_opt_session(
+                                        namespace.as_str(),
+                                        Some(&mut *s),
+                                    )
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 for change in upsert_changes.iter() {
@@ -8951,7 +9029,10 @@ mod inner {
                                     .session(&mut *s)
                                     .await?;
                                 let orphaned = this
-                                    .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
+                                    .cleanup_orphaned_proxy_group_plugins_opt_session(
+                                        namespace.as_str(),
+                                        Some(&mut *s),
+                                    )
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
 
@@ -9119,7 +9200,8 @@ mod inner {
                     .await;
                     return Err(e);
                 }
-                self.cleanup_orphaned_proxy_group_plugins().await?
+                self.cleanup_orphaned_proxy_group_plugins(&spec.namespace)
+                    .await?
             };
 
             if use_replica_set {
@@ -9648,7 +9730,10 @@ mod inner {
                                         .await?;
                                 }
                                 let orphaned = this
-                                    .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
+                                    .cleanup_orphaned_proxy_group_plugins_opt_session(
+                                        namespace.as_str(),
+                                        Some(&mut *s),
+                                    )
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 this.upstreams()
@@ -9772,7 +9857,7 @@ mod inner {
                             .extend(proxy_plugin_config_ids.iter().cloned());
                     }
                 }
-                match self.cleanup_orphaned_proxy_group_plugins().await {
+                match self.cleanup_orphaned_proxy_group_plugins(namespace).await {
                     Ok(deleted) => orphaned_proxy_group_plugin_deletes = deleted,
                     Err(e) => {
                         warn!(

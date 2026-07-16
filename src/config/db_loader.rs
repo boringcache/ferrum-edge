@@ -859,7 +859,8 @@ impl DatabaseStore {
     }
 
     /// Serialize every mutation that can change either consumer mTLS
-    /// credentials or the effective plugin association graph for a namespace.
+    /// credentials or the effective plugin association graph, and block every
+    /// namespace resource mutation while a persistent restore owner exists.
     /// The caller holds this row through candidate validation and commit.
     async fn lock_mtls_dns_admission_tx(
         &self,
@@ -2486,7 +2487,8 @@ impl DatabaseStore {
         }
 
         // Clean up orphaned proxy_group plugin configs (no remaining associations)
-        self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+        self.cleanup_orphaned_proxy_group_plugins(&mut tx, &proxy.namespace)
+            .await?;
 
         if let Some(old_upstream_id) = old_upstream_id.as_deref()
             && proxy.upstream_id.as_deref() != Some(old_upstream_id)
@@ -2576,7 +2578,8 @@ impl DatabaseStore {
         }
 
         // Clean up orphaned proxy_group plugin configs (no remaining associations)
-        self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+        self.cleanup_orphaned_proxy_group_plugins(&mut tx, namespace)
+            .await?;
 
         // If this was a spec-owned proxy, delete every upstream tagged with the
         // spec id, not only the proxy's current upstream_id. Direct admin CRUD
@@ -2646,12 +2649,14 @@ impl DatabaseStore {
     async fn cleanup_orphaned_proxy_group_plugins(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
     ) -> Result<(), anyhow::Error> {
         let orphaned_configs: Vec<(String, String)> = sqlx::query(&self.q(
             "SELECT pc.id, pc.namespace FROM plugin_configs pc \
-                 WHERE pc.scope = 'proxy_group' \
+                 WHERE pc.scope = 'proxy_group' AND pc.namespace = ? \
                  AND NOT EXISTS (SELECT 1 FROM proxy_plugins pp WHERE pp.plugin_config_id = pc.id)",
         ))
+        .bind(namespace)
         .fetch_all(&mut **tx)
         .await?
         .iter()
@@ -3614,6 +3619,8 @@ impl DatabaseStore {
         let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, &upstream.namespace)
+            .await?;
         sqlx::query(
             &self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
@@ -3682,6 +3689,8 @@ impl DatabaseStore {
         let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, &upstream.namespace)
+            .await?;
         // Existence read inside the transaction is the not-found authority —
         // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
         // (sqlx's default) counts *changed* rows, so an update writing
@@ -3778,6 +3787,7 @@ impl DatabaseStore {
     pub async fn delete_upstream(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         // Scope the existence check to the caller's namespace (issue #2122) so
         // a tenant cannot delete a same-id upstream in another namespace.
         let existing: Option<AnyRow> =
@@ -3844,6 +3854,7 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
 
         self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id)
             .await?;
@@ -5395,6 +5406,7 @@ impl DatabaseStore {
     pub async fn batch_create_upstreams(
         &self,
         upstreams: &[Upstream],
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let start = Instant::now();
         if upstreams.is_empty() {
@@ -5402,7 +5414,7 @@ impl DatabaseStore {
         }
         let mut total = 0usize;
         for chunk in upstreams.chunks(Self::BATCH_CHUNK_SIZE) {
-            total += self.batch_create_upstreams_chunk(chunk).await?;
+            total += self.batch_create_upstreams_chunk(chunk, mode).await?;
         }
         self.check_slow_query("batch_create_upstreams", start);
         Ok(total)
@@ -5412,8 +5424,19 @@ impl DatabaseStore {
     async fn batch_create_upstreams_chunk(
         &self,
         upstreams: &[Upstream],
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        let mut admission_namespaces: Vec<&str> = upstreams
+            .iter()
+            .map(|upstream| upstream.namespace.as_str())
+            .collect();
+        admission_namespaces.sort_unstable();
+        admission_namespaces.dedup();
+        for namespace in &admission_namespaces {
+            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
+                .await?;
+        }
         let mut touched_namespaces = HashSet::new();
         let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
@@ -6782,7 +6805,8 @@ impl DatabaseStore {
             .execute(&mut *tx)
             .await?;
         }
-        self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+        self.cleanup_orphaned_proxy_group_plugins(&mut tx, &spec.namespace)
+            .await?;
 
         // Update the api_specs row (no CASCADE delete needed since proxy survives).
         let tags_json = serialize_api_spec_string_list(&spec.id, "tags", &spec.tags)?;
@@ -7390,7 +7414,8 @@ impl DatabaseStore {
         // cascade. If a spec-associated proxy was the last proxy referencing a
         // proxy_group plugin, mirror delete_proxy() and remove that now-orphaned
         // shared plugin config inside the same transaction.
-        self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+        self.cleanup_orphaned_proxy_group_plugins(&mut tx, namespace)
+            .await?;
 
         // Delete spec-owned upstream (no FK cascade on this path).
         sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
@@ -8016,8 +8041,12 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::batch_create_plugin_configs(self, configs, mode).await
     }
 
-    async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error> {
-        DatabaseStore::batch_create_upstreams(self, upstreams).await
+    async fn batch_create_upstreams(
+        &self,
+        upstreams: &[Upstream],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error> {
+        DatabaseStore::batch_create_upstreams(self, upstreams, mode).await
     }
 
     async fn delete_all_resources(

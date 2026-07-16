@@ -814,6 +814,10 @@ async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_bat
     DatabaseBackend::update_consumer(&store_a, &guarded_consumer, &guarded_mode)
         .await
         .expect("the pre-read guard owner must be able to persist the credential update");
+    store_a
+        .batch_create_upstreams(&[make_upstream("guarded-upstream")], &guarded_mode)
+        .await
+        .expect("the restore owner must be able to persist its upstream batch");
 
     let wrong_owner_mode = BatchConfigWriteMode::RestoreRollbackReplay {
         guard_owner: "not-the-owner".to_string(),
@@ -837,6 +841,16 @@ async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_bat
     assert!(
         blocked.to_string().contains("guarded operation owns"),
         "unexpected rollback-guard rejection: {blocked:#}"
+    );
+    let blocked_upstream = store_b
+        .create_upstream(&make_upstream("concurrent-upstream"))
+        .await
+        .expect_err("another admin process must not mutate upstreams during restore");
+    assert!(
+        blocked_upstream
+            .to_string()
+            .contains("guarded operation owns"),
+        "unexpected upstream restore-guard rejection: {blocked_upstream:#}"
     );
 
     store_a

@@ -763,7 +763,11 @@ pub trait DatabaseBackend: Send + Sync {
         configs: &[PluginConfig],
         mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error>;
-    async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error>;
+    async fn batch_create_upstreams(
+        &self,
+        upstreams: &[Upstream],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error>;
     /// Clear all resources in a namespace and report the mode that actually ran.
     ///
     /// SQL backends run the clear inside a single transaction, so a failure
@@ -781,8 +785,8 @@ pub trait DatabaseBackend: Send + Sync {
         mode: &BatchConfigWriteMode,
     ) -> Result<DeleteMode, DeleteAllResourcesError>;
 
-    /// Block DNS-sensitive writers across a multi-step namespace operation.
-    /// The opaque owner must be supplied to guarded writes until release.
+    /// Block namespace resource writers across a multi-step operation. The
+    /// opaque owner must be supplied to guarded writes until release.
     async fn acquire_mtls_dns_admission_guard(
         &self,
         namespace: &str,

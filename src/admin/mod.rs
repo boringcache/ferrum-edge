@@ -3196,7 +3196,7 @@ async fn persist_payload_resources(
         }
     }
     if should_continue(&errors) && !payload.upstreams.is_empty() {
-        match db.batch_create_upstreams(&payload.upstreams).await {
+        match db.batch_create_upstreams(&payload.upstreams, mode).await {
             Ok(n) => counts.upstreams = n,
             Err(e) => errors.push(format!("upstreams: {}", e)),
         }
