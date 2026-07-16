@@ -454,6 +454,7 @@ async fn test_stream_connect_abort_100_percent() {
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "test-proxy".to_string(),
         proxy_name: None,
         listen_port: 9000,
@@ -504,6 +505,7 @@ async fn test_stream_connect_delay_100_percent() {
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "test-proxy".to_string(),
         proxy_name: None,
         listen_port: 9000,
