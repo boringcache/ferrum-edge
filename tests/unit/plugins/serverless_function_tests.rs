@@ -1265,6 +1265,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "decoded-path",
         "copied-path-other-host",
         "nested-double-encoded",
+        "nested-over-decode-budget",
+        "destination-over-decode-budget",
         "nested-path-encoded",
         "copied-query-other-host",
         "malformed",
@@ -1275,10 +1277,18 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-external-label",
     ] {
         let server = MockServer::start().await;
-        let function_url = format!(
-            "{}/signed%2Ftrigger?code=secret%2Fvalue",
-            server.uri()
-        );
+        let function_url = if case == "destination-over-decode-budget" {
+            let mut path = "signed/trigger".to_string();
+            for _ in 0..12 {
+                path = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
+            }
+            format!("{}/{path}?code=secret%2Fvalue", server.uri())
+        } else {
+            format!(
+                "{}/signed%2Ftrigger?code=secret%2Fvalue",
+                server.uri()
+            )
+        };
         let location = match case {
             "relative-query" => "?code=secret%2Fvalue".to_string(),
             "absolute-destination" => function_url.clone(),
@@ -1299,6 +1309,14 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
                     url::form_urlencoded::byte_serialize(encoded.as_bytes()).collect();
                 format!("https://redirect.example/continue?next={double_encoded}")
             }
+            "nested-over-decode-budget" => {
+                let mut encoded = function_url.clone();
+                for _ in 0..12 {
+                    encoded = url::form_urlencoded::byte_serialize(encoded.as_bytes()).collect();
+                }
+                format!("https://redirect.example/continue?next={encoded}")
+            }
+            "destination-over-decode-budget" => "/next".to_string(),
             "nested-path-encoded" => {
                 let encoded: String =
                     url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();

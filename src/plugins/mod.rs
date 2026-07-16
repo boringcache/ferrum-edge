@@ -260,6 +260,18 @@ fn is_transform_invalidated_response_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("x-ms-content-crc64")
 }
 
+/// Whether buffered response bytes may be rewritten while preserving the
+/// response status semantics.
+///
+/// A `206 Partial Content` body is only the selected range, not a complete
+/// representation. Rewriting those bytes and merely removing `Content-Range`
+/// would leave either a malformed 206 or a misleading full-response status.
+/// Keep the range response untouched instead. All protocol paths and the
+/// provider/protocol normalization phase consult this shared gate.
+pub(crate) fn response_body_rewrite_allowed(response_status: u16) -> bool {
+    response_status != 206
+}
+
 /// Finalize one successful buffered response-body transformation.
 ///
 /// Every protocol path calls this immediately after replacing the bytes and
@@ -837,6 +849,12 @@ pub struct RequestContext {
     /// release another instance's in-flight marker. This set is bounded by the
     /// completion-state map above.
     pub(crate) serverless_external_side_effect_owners: HashSet<u64>,
+    /// Deduplication instance currently publishing an owned terminal response
+    /// from the observe-only committed hook. This transient private marker lets
+    /// the ordinary publication path retain in-flight protection when no replay
+    /// can be stored. Committed hooks run sequentially, so at most one instance
+    /// occupies the slot.
+    pub(crate) serverless_owned_dedup_publication: Option<u64>,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -1166,6 +1184,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
             serverless_external_side_effect_owners: HashSet::new(),
+            serverless_owned_dedup_publication: None,
             gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
@@ -1331,6 +1350,7 @@ impl RequestContext {
             serverless_external_side_effect_owners: self
                 .serverless_external_side_effect_owners
                 .clone(),
+            serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
@@ -2289,6 +2309,9 @@ pub async fn normalize_response_body_for_inspection(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Vec<u8>,
 ) -> bool {
+    if !response_body_rewrite_allowed(response_status) {
+        return false;
+    }
     let content_type = response_headers.get("content-type").cloned();
     let mut normalized = false;
     for plugin in plugins {

@@ -2361,24 +2361,26 @@ where
                 }
             }
 
-            for plugin in plugins {
-                if let Some(transformed) = plugin
-                    .transform_response_body_with_context(
-                        &mut *ctx,
-                        &response_body,
-                        content_type_of(&response_headers),
-                        &response_headers,
-                    )
-                    .await
-                {
-                    response_headers
-                        .insert("content-length".to_string(), transformed.len().to_string());
-                    response_body = transformed;
-                    crate::plugins::finalize_response_body_transformation(
-                        plugin.as_ref(),
-                        ctx,
-                        &mut response_headers,
-                    );
+            if crate::plugins::response_body_rewrite_allowed(response_status) {
+                for plugin in plugins {
+                    if let Some(transformed) = plugin
+                        .transform_response_body_with_context(
+                            &mut *ctx,
+                            &response_body,
+                            content_type_of(&response_headers),
+                            &response_headers,
+                        )
+                        .await
+                    {
+                        response_headers
+                            .insert("content-length".to_string(), transformed.len().to_string());
+                        response_body = transformed;
+                        crate::plugins::finalize_response_body_transformation(
+                            plugin.as_ref(),
+                            ctx,
+                            &mut response_headers,
+                        );
+                    }
                 }
             }
 
@@ -3790,24 +3792,26 @@ where
             // while the wire trailers stay separate for the split H3 wire shape.
             // content-length updates land on the view and flow into the wire
             // headers after reconciliation below.
-            for plugin in plugins.iter() {
-                if let Some(transformed) = plugin
-                    .transform_response_body_with_context(
-                        &mut *ctx,
-                        &response_body,
-                        content_type_of(&plugin_response_headers),
-                        &plugin_response_headers,
-                    )
-                    .await
-                {
-                    plugin_response_headers
-                        .insert("content-length".to_string(), transformed.len().to_string());
-                    response_body = transformed;
-                    crate::plugins::finalize_response_body_transformation(
-                        plugin.as_ref(),
-                        ctx,
-                        &mut plugin_response_headers,
-                    );
+            if crate::plugins::response_body_rewrite_allowed(response_status) {
+                for plugin in plugins.iter() {
+                    if let Some(transformed) = plugin
+                        .transform_response_body_with_context(
+                            &mut *ctx,
+                            &response_body,
+                            content_type_of(&plugin_response_headers),
+                            &plugin_response_headers,
+                        )
+                        .await
+                    {
+                        plugin_response_headers
+                            .insert("content-length".to_string(), transformed.len().to_string());
+                        response_body = transformed;
+                        crate::plugins::finalize_response_body_transformation(
+                            plugin.as_ref(),
+                            ctx,
+                            &mut plugin_response_headers,
+                        );
+                    }
                 }
             }
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {

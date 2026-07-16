@@ -613,6 +613,144 @@ async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
 }
 
 #[tokio::test]
+async fn oversized_terminal_serverless_response_retains_inflight_protection() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 128]))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({"max_entry_size_bytes": 32}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "oversized-key".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) = match serverless
+        .before_proxy(&mut first_ctx, &mut first_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => (status_code, headers, body),
+        other => panic!("expected oversized terminal response, got {other:?}"),
+    };
+    dedup
+        .on_response_committed(&mut first_ctx, status, &response_headers, &body)
+        .await;
+    assert_eq!(dedup.tracked_keys_count(), Some(1));
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "oversized-key".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn oversized_buffered_fallback_retains_uncertain_serverless_protection() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(600).set_body_string("invalid status"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({"max_entry_size_bytes": 32}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate",
+            "on_error": "continue"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "oversized-fallback-key".to_string(),
+    )]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        serverless
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let backend_body = vec![b'y'; 128];
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, 200, &HashMap::new(), &backend_body)
+            .await,
+        PluginResult::Continue
+    ));
+    dedup
+        .on_response_committed(&mut first_ctx, 200, &HashMap::new(), &backend_body)
+        .await;
+    assert_eq!(dedup.tracked_keys_count(), Some(1));
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "oversized-fallback-key".to_string(),
+    )]);
+    assert!(matches!(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn test_concurrent_duplicate_returns_conflict() {
     let config = json!({});
     let plugin = make_plugin(config);

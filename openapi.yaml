@@ -15164,9 +15164,12 @@ components:
         while stripping hop-by-hop, Connection-listed, transport-managed,
         provider-control, and credential-bearing fields. Redirect Location is
         removed when a relative, absolute, encoded, or nested target exposes
-        the configured signed function path/query; unrelated redirects remain.
+        the configured signed function path/query; residual encoding beyond
+        the bounded inspection budget also fails closed, while unrelated
+        redirects remain.
         Later body rewrites invalidate ranges, validators, integrity metadata,
-        and content-bound signatures while unmodified responses retain them.
+        and content-bound signatures while unmodified responses retain them;
+        206 Partial Content responses skip rewriting to preserve range semantics.
         Deduplicated terminal replays preserve the final status/body but use
         sanitized headers: session/authentication fields, Retry-After,
         trace/correlation fields, and rate-limit counters are not replayed.

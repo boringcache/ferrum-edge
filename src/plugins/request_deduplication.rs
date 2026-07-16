@@ -867,6 +867,7 @@ impl RequestDeduplication {
         status_code: u16,
         headers: HashMap<String, String>,
         body: &[u8],
+        retain_inflight_on_skip: bool,
     ) -> LocalCompletionAction {
         let entry_size = cached_response_retained_size(body.len(), &headers);
         let _guard = self.accounting_guard();
@@ -885,8 +886,12 @@ impl RequestDeduplication {
         }
 
         if entry_size > self.max_entry_size_bytes {
-            entry.remove();
-            let inflight_count = decrement_atomic(&self.inflight_count);
+            let inflight_count = if retain_inflight_on_skip {
+                self.inflight_count.load(Ordering::Relaxed)
+            } else {
+                entry.remove();
+                decrement_atomic(&self.inflight_count)
+            };
             return LocalCompletionAction::Skipped {
                 inflight_count,
                 reason: CompletionSkipReason::EntryTooLarge { entry_size },
@@ -904,10 +909,12 @@ impl RequestDeduplication {
                     inserted_at: Instant::now(),
                 })
             } else {
-                entry.remove();
+                if !retain_inflight_on_skip {
+                    entry.remove();
+                }
                 None
             };
-            let inflight_count = if redis_candidate.is_some() {
+            let inflight_count = if redis_candidate.is_some() || retain_inflight_on_skip {
                 self.inflight_count.load(Ordering::Relaxed)
             } else {
                 decrement_atomic(&self.inflight_count)
@@ -1874,6 +1881,8 @@ impl Plugin for RequestDeduplication {
         {
             return PluginResult::Continue;
         }
+        let retain_inflight_on_storage_skip =
+            ctx.serverless_owned_dedup_publication == Some(self.instance_id);
 
         // Only cache if this instance acquired a completion state in
         // `before_proxy`. Take it before any await so a later hook cannot reuse
@@ -1934,6 +1943,7 @@ impl Plugin for RequestDeduplication {
             response_status,
             safe_headers,
             body,
+            retain_inflight_on_storage_skip,
         ) {
             LocalCompletionAction::Published {
                 cached,
@@ -1969,7 +1979,18 @@ impl Plugin for RequestDeduplication {
                 }
                 if let Some(cached) = redis_candidate {
                     match self.redis_set(&key, &fingerprint, &cached).await {
-                        RedisStoreAction::Stored | RedisStoreAction::SkippedSize => {
+                        RedisStoreAction::Stored => {
+                            self.remove_matching_local_inflight(
+                                &key,
+                                &fingerprint,
+                                &local_inflight_owner_token,
+                            );
+                            if let Some(token) = redis_lock_token.as_deref() {
+                                self.redis_release_inflight(&key, &fingerprint, token)
+                                    .await;
+                            }
+                        }
+                        RedisStoreAction::SkippedSize if !retain_inflight_on_storage_skip => {
                             self.remove_matching_local_inflight(
                                 &key,
                                 &fingerprint,
@@ -1981,16 +2002,19 @@ impl Plugin for RequestDeduplication {
                             }
                         }
                         // Nothing was retained locally. If Redis publication
-                        // fails too, keep both in-flight locks until
-                        // `inflight_ttl` so retries cannot immediately re-run a
-                        // completed side-effecting request with no replay value.
-                        RedisStoreAction::Failed => {}
+                        // fails too (or an owned terminal response cannot fit
+                        // the Redis payload limit), keep both in-flight locks
+                        // until `inflight_ttl` so retries cannot immediately
+                        // re-run an external side effect with no replay value.
+                        RedisStoreAction::SkippedSize | RedisStoreAction::Failed => {}
                     }
                     return PluginResult::Continue;
                 }
-                if let Some(token) = redis_lock_token.as_deref() {
-                    self.redis_release_inflight(&key, &fingerprint, token)
-                        .await;
+                if !retain_inflight_on_storage_skip {
+                    if let Some(token) = redis_lock_token.as_deref() {
+                        self.redis_release_inflight(&key, &fingerprint, token)
+                            .await;
+                    }
                 }
                 return PluginResult::Continue;
             }
@@ -2009,7 +2033,18 @@ impl Plugin for RequestDeduplication {
         // cannot miss both the lock and the replayable response.
         if self.redis_client.is_some() {
             match self.redis_set(&key, &fingerprint, &cached).await {
-                RedisStoreAction::Stored | RedisStoreAction::SkippedSize => {
+                RedisStoreAction::Stored => {
+                    if let Some(token) = redis_lock_token.as_deref() {
+                        self.redis_release_inflight(&key, &fingerprint, token)
+                            .await;
+                    }
+                }
+                // The local replay is available, but a peer cannot see it. For
+                // an externally executing terminal response, retain the
+                // distributed lock until its TTL instead of allowing a peer to
+                // re-execute the side effect immediately.
+                RedisStoreAction::SkippedSize if retain_inflight_on_storage_skip => {}
+                RedisStoreAction::SkippedSize => {
                     if let Some(token) = redis_lock_token.as_deref() {
                         self.redis_release_inflight(&key, &fingerprint, token)
                             .await;
@@ -2046,9 +2081,13 @@ impl Plugin for RequestDeduplication {
         let synthetic_marker = ctx
             .metadata
             .remove(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+        let previous_publication_owner = ctx
+            .serverless_owned_dedup_publication
+            .replace(self.instance_id);
         let _ = self
             .on_final_response_body(ctx, response_status, response_headers, body)
             .await;
+        ctx.serverless_owned_dedup_publication = previous_publication_owner;
         if let Some(marker) = synthetic_marker {
             ctx.metadata.insert(
                 crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),

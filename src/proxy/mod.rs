@@ -13498,18 +13498,21 @@ async fn apply_synthetic_response_body_hooks(
 
     let content_type = response_headers.get("content-type").cloned();
     let ct_ref = content_type.as_deref();
-    for plugin in plugins.iter() {
-        if let Some(transformed) = plugin
-            .transform_response_body_with_context(ctx, response_body, ct_ref, response_headers)
-            .await
-        {
-            response_headers.insert("content-length".to_string(), transformed.len().to_string());
-            *response_body = transformed;
-            crate::plugins::finalize_response_body_transformation(
-                plugin.as_ref(),
-                ctx,
-                response_headers,
-            );
+    if crate::plugins::response_body_rewrite_allowed(*response_status) {
+        for plugin in plugins.iter() {
+            if let Some(transformed) = plugin
+                .transform_response_body_with_context(ctx, response_body, ct_ref, response_headers)
+                .await
+            {
+                response_headers
+                    .insert("content-length".to_string(), transformed.len().to_string());
+                *response_body = transformed;
+                crate::plugins::finalize_response_body_transformation(
+                    plugin.as_ref(),
+                    ctx,
+                    response_headers,
+                );
+            }
         }
     }
 
@@ -19029,26 +19032,28 @@ async fn handle_proxy_request_inner(
                     }
                     let content_type = plugin_response_headers.get("content-type").cloned();
                     let ct_ref = content_type.as_deref();
-                    for plugin in plugins.iter() {
-                        if let Some(transformed) = plugin
-                            .transform_response_body_with_context(
-                                &mut ctx,
-                                &response_body,
-                                ct_ref,
-                                &plugin_response_headers,
-                            )
-                            .await
-                        {
-                            plugin_response_headers.insert(
-                                "content-length".to_string(),
-                                transformed.len().to_string(),
-                            );
-                            response_body = transformed;
-                            crate::plugins::finalize_response_body_transformation(
-                                plugin.as_ref(),
-                                &mut ctx,
-                                &mut plugin_response_headers,
-                            );
+                    if crate::plugins::response_body_rewrite_allowed(response_status) {
+                        for plugin in plugins.iter() {
+                            if let Some(transformed) = plugin
+                                .transform_response_body_with_context(
+                                    &mut ctx,
+                                    &response_body,
+                                    ct_ref,
+                                    &plugin_response_headers,
+                                )
+                                .await
+                            {
+                                plugin_response_headers.insert(
+                                    "content-length".to_string(),
+                                    transformed.len().to_string(),
+                                );
+                                response_body = transformed;
+                                crate::plugins::finalize_response_body_transformation(
+                                    plugin.as_ref(),
+                                    &mut ctx,
+                                    &mut plugin_response_headers,
+                                );
+                            }
                         }
                     }
                     if let Some(policy_state) =
@@ -20611,6 +20616,7 @@ async fn handle_proxy_request_inner(
     // intentionally remain after on_response_body.
     if !after_proxy_rejected
         && !plugins.is_empty()
+        && crate::plugins::response_body_rewrite_allowed(response_status)
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
@@ -20674,6 +20680,7 @@ async fn handle_proxy_request_inner(
     // JSON fields in the response body before it is sent to the client.
     if !after_proxy_rejected
         && !plugins.is_empty()
+        && crate::plugins::response_body_rewrite_allowed(response_status)
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();

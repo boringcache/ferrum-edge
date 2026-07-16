@@ -968,27 +968,33 @@ struct FunctionDestination {
     url: Url,
     sensitive_path: Option<String>,
     sensitive_query_pairs: Vec<(String, String)>,
+    has_unresolved_encoding: bool,
 }
 
 impl FunctionDestination {
     fn new(raw: &str) -> Result<Self, String> {
         let url = Url::parse(raw)
             .map_err(|_| "serverless_function: invalid function destination URL".to_string())?;
-        let sensitive_path = (url.path() != "/" && !url.path().is_empty())
-            .then(|| decode_percent_layers(url.path()));
-        let sensitive_query_pairs = url
-            .query_pairs()
-            .map(|(key, value)| {
-                (
-                    decode_percent_layers(key.as_ref()),
-                    decode_percent_layers(value.as_ref()),
-                )
-            })
-            .collect();
+        let mut has_unresolved_encoding = false;
+        let sensitive_path = if url.path() != "/" && !url.path().is_empty() {
+            let decoded = decode_percent_layers(url.path());
+            has_unresolved_encoding |= !decoded.fully_decoded;
+            Some(decoded.value)
+        } else {
+            None
+        };
+        let mut sensitive_query_pairs = Vec::new();
+        for (key, value) in url.query_pairs() {
+            let key = decode_percent_layers(key.as_ref());
+            let value = decode_percent_layers(value.as_ref());
+            has_unresolved_encoding |= !key.fully_decoded || !value.fully_decoded;
+            sensitive_query_pairs.push((key.value, value.value));
+        }
         Ok(Self {
             url,
             sensitive_path,
             sensitive_query_pairs,
+            has_unresolved_encoding,
         })
     }
 
@@ -1000,6 +1006,12 @@ impl FunctionDestination {
         if !self.has_sensitive_components() {
             return false;
         }
+        // If the accepted destination itself exceeds the bounded decoding
+        // budget, no function-controlled redirect can be proven credential
+        // free. Keep accepting the provider URL, but strip Location fail closed.
+        if self.has_unresolved_encoding {
+            return true;
+        }
         self.location_exposes_destination_inner(location, 0)
     }
 
@@ -1009,11 +1021,14 @@ impl FunctionDestination {
         // removing the field. Valid benign relative/absolute redirects remain
         // eligible below.
         let decoded_location = decode_percent_layers(location);
+        if !decoded_location.fully_decoded {
+            return true;
+        }
         let Some(candidate) = self
             .url
             .join(location)
             .ok()
-            .or_else(|| self.url.join(&decoded_location).ok())
+            .or_else(|| self.url.join(&decoded_location.value).ok())
         else {
             return true;
         };
@@ -1025,17 +1040,21 @@ impl FunctionDestination {
             return true;
         }
 
-        let candidate_pairs: Vec<(String, String)> = candidate
-            .query_pairs()
-            .map(|(key, value)| {
-                (
-                    decode_percent_layers(key.as_ref()),
-                    decode_percent_layers(value.as_ref()),
-                )
-            })
-            .collect();
+        let mut candidate_pairs = Vec::new();
+        for (key, value) in candidate.query_pairs() {
+            let key = decode_percent_layers(key.as_ref());
+            let value = decode_percent_layers(value.as_ref());
+            if !key.fully_decoded || !value.fully_decoded {
+                return true;
+            }
+            candidate_pairs.push((key.value, value.value));
+        }
 
         let candidate_path = decode_percent_layers(candidate.path());
+        if !candidate_path.fully_decoded {
+            return true;
+        }
+        let candidate_path = candidate_path.value;
         let exposes_signed_path = self
             .sensitive_path
             .as_deref()
@@ -1082,7 +1101,10 @@ impl FunctionDestination {
             }
             if let Some(fragment) = candidate.fragment() {
                 let decoded_fragment = decode_percent_layers(fragment);
-                if let Some(reference) = nested_uri_reference(&decoded_fragment)
+                if !decoded_fragment.fully_decoded {
+                    return true;
+                }
+                if let Some(reference) = nested_uri_reference(&decoded_fragment.value)
                     && self.location_exposes_destination_inner(reference, depth + 1)
                 {
                     return true;
@@ -1128,18 +1150,34 @@ fn has_ascii_case_insensitive_prefix(value: &str, prefix: &str) -> bool {
         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
-fn decode_percent_layers(value: &str) -> String {
+const MAX_REDIRECT_PERCENT_DECODE_LAYERS: usize = 8;
+
+struct DecodedPercentLayers {
+    value: String,
+    fully_decoded: bool,
+}
+
+fn decode_percent_layers(value: &str) -> DecodedPercentLayers {
     let mut decoded = value.to_string();
-    for _ in 0..3 {
+    for _ in 0..MAX_REDIRECT_PERCENT_DECODE_LAYERS {
         let next = percent_decode_str(&decoded)
             .decode_utf8_lossy()
             .into_owned();
         if next == decoded {
-            break;
+            return DecodedPercentLayers {
+                value: decoded,
+                fully_decoded: true,
+            };
         }
         decoded = next;
     }
-    decoded
+    let next = percent_decode_str(&decoded)
+        .decode_utf8_lossy()
+        .into_owned();
+    DecodedPercentLayers {
+        fully_decoded: next == decoded,
+        value: decoded,
+    }
 }
 
 fn sanitize_function_response_headers(

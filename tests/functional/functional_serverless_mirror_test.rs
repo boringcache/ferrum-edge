@@ -61,15 +61,27 @@ async fn start_function_server(port: u16, invocations: Arc<AtomicUsize>) {
             let invocations = Arc::clone(&invocations);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
-                let _n = stream.read(&mut buf).await.unwrap_or(0);
+                let n = stream.read(&mut buf).await.unwrap_or(0);
                 invocations.fetch_add(1, Ordering::SeqCst);
 
-                let body = r#"{"source":"serverless-function","message":"hello from function"}"#;
-                let response = format!(
-                    "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nContent-Type: application/json\r\nRetry-After: 30\r\nWWW-Authenticate: Bearer realm=function\r\nTraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nX-RateLimit-Remaining: 0\r\nETag: \"function-v1\"\r\nLast-Modified: Wed, 01 Jan 2025 00:00:00 GMT\r\nDigest: sha-256=stale\r\nContent-Digest: sha-256=:stale:\r\nRepr-Digest: sha-256=:stale:\r\nContent-MD5: stale-md5\r\nContent-Range: bytes 0-63/64\r\nAccept-Ranges: bytes\r\nSignature-Input: sig1=(\"content-digest\")\r\nSignature: sig1=:stale:\r\nContent-Disposition: attachment; filename=decision.json\r\nSet-Cookie: first=1; Path=/\r\nSet-Cookie: second=2; Path=/\r\nConnection: close, x-function-internal\r\nX-Function-Internal: strip-me\r\nX-Amz-Request-Id: provider-control\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
+                let is_partial_response = String::from_utf8_lossy(&buf[..n])
+                    .contains(r#""path":"/fn/range""#);
+                let response = if is_partial_response {
+                    let body = r#"{"source":"serverless-function","message":"partial"}"#;
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Type: application/json\r\nContent-Range: bytes 0-51/100\r\nAccept-Ranges: bytes\r\nETag: \"partial-v1\"\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    let body =
+                        r#"{"source":"serverless-function","message":"hello from function"}"#;
+                    format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nContent-Type: application/json\r\nRetry-After: 30\r\nWWW-Authenticate: Bearer realm=function\r\nTraceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\r\nX-RateLimit-Remaining: 0\r\nETag: \"function-v1\"\r\nLast-Modified: Wed, 01 Jan 2025 00:00:00 GMT\r\nDigest: sha-256=stale\r\nContent-Digest: sha-256=:stale:\r\nRepr-Digest: sha-256=:stale:\r\nContent-MD5: stale-md5\r\nContent-Range: bytes 0-63/64\r\nAccept-Ranges: bytes\r\nSignature-Input: sig1=(\"content-digest\")\r\nSignature: sig1=:stale:\r\nContent-Disposition: attachment; filename=decision.json\r\nSet-Cookie: first=1; Path=/\r\nSet-Cookie: second=2; Path=/\r\nConnection: close, x-function-internal\r\nX-Function-Internal: strip-me\r\nX-Amz-Request-Id: provider-control\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
@@ -463,6 +475,31 @@ upstreams: []
     );
     assert!(head_replay.bytes().await.unwrap().is_empty());
     assert_eq!(function_invocations.load(Ordering::SeqCst), 3);
+
+    let partial = client
+        .get(format!("http://127.0.0.1:{}/fn/range", proxy_port))
+        .send()
+        .await
+        .expect("partial response request failed");
+    assert_eq!(partial.status().as_u16(), 206);
+    assert_eq!(
+        partial
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 0-51/100")
+    );
+    assert_eq!(
+        partial
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok()),
+        Some("\"partial-v1\"")
+    );
+    let partial_body = partial.text().await.unwrap();
+    assert!(partial_body.contains("serverless-function"));
+    assert!(!partial_body.contains("gateway-rewritten"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 4);
 
     let _ = gw.kill();
     let _ = gw.wait();
