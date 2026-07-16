@@ -408,12 +408,9 @@ async fn rejection_hook_deadline_selects_terminal_status_and_finishes_cleanup_on
     assert!(!headers.contains_key("x-later-decorator-complete"));
     assert!(gateway_deadline_response_selected_for_test(&ctx));
 
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        completion[1].notified(),
-    )
-    .await
-    .expect("detached rejection cleanup must continue in plugin order");
+    tokio::time::timeout(std::time::Duration::from_secs(2), completion[1].notified())
+        .await
+        .expect("detached rejection cleanup must continue in plugin order");
     for count in calls.iter().chain(completed.iter()) {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -647,12 +644,9 @@ async fn committed_deadline_replacement_runs_remaining_hooks_exactly_once() {
     assert!(observed[2].lock().expect("third probe lock").is_empty());
 
     stalled_release.notify_waiters();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        completion[2].notified(),
-    )
-    .await
-    .expect("detached committed observers must continue in plugin order");
+    tokio::time::timeout(std::time::Duration::from_secs(2), completion[2].notified())
+        .await
+        .expect("detached committed observers must continue in plugin order");
     for call_count in &calls {
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
