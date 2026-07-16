@@ -346,7 +346,7 @@ async fn test_cohere_v2_streaming_format() {
     // Cohere v2 SSE: the terminal `message-end` event carries counts under
     // `delta.usage.tokens.*`. The previous SSE detector classified all
     // `message*` events as Anthropic and dropped these.
-    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "text/event-stream".to_string());

@@ -482,6 +482,17 @@ impl Plugin for AiTokenMetrics {
 
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
 
+        // Buffering is a shared response-level decision: another plugin may
+        // require an SSE body even when this instance did not opt in. Enforce
+        // the local streaming policy again before inspection so a sibling
+        // bufferer cannot enable token accounting implicitly.
+        if is_event_stream_content_type(content_type) && !self.buffer_streaming_responses {
+            debug!(
+                "ai_token_metrics: skipping SSE response because stream buffering is disabled"
+            );
+            return PluginResult::Continue;
+        }
+
         if body.is_empty() {
             debug!("ai_token_metrics: empty response body, skipping");
             return PluginResult::Continue;
