@@ -1440,10 +1440,12 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                     LateResourceWrite::Delete { id },
                     None,
                     Some(&existing),
-                    previous_snapshot.as_ref().map(|config| LateDeleteSnapshots {
-                        config,
-                        api_spec: previous_api_spec.as_ref(),
-                    }),
+                    previous_snapshot
+                        .as_ref()
+                        .map(|config| LateDeleteSnapshots {
+                            config,
+                            api_spec: previous_api_spec.as_ref(),
+                        }),
                 )
                 .await
                 {
