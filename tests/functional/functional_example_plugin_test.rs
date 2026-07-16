@@ -7,18 +7,20 @@ use crate::scaffolding::clients::{GetOptions, Http3Client};
 use crate::scaffolding::reserve_colocated_tcp_udp;
 
 use http::{HeaderMap, Method, StatusCode};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
+// File mode intentionally probes this backend with an untagged h2c preface
+// during startup. Tag client-driven contract traffic so backend accounting
+// still detects 404/405 leaks without treating that probe as a routed request.
+const CONTRACT_REQUEST_HEADER: &str = "x-example-contract-request";
+
 struct HeaderEchoBackend {
     port: u16,
-    hits: Arc<AtomicUsize>,
+    contract_requests: Arc<Mutex<Vec<String>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -28,14 +30,24 @@ impl HeaderEchoBackend {
             .await
             .expect("bind example backend");
         let port = listener.local_addr().expect("example backend addr").port();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let task = tokio::spawn(serve_header_echo(listener, Arc::clone(&hits)));
+        let contract_requests = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(serve_header_echo(
+            listener,
+            Arc::clone(&contract_requests),
+        ));
         sleep(Duration::from_millis(100)).await;
-        Self { port, hits, task }
+        Self {
+            port,
+            contract_requests,
+            task,
+        }
     }
 
-    fn hits(&self) -> usize {
-        self.hits.load(Ordering::SeqCst)
+    fn contract_requests(&self) -> Vec<String> {
+        self.contract_requests
+            .lock()
+            .expect("contract request lock")
+            .clone()
     }
 }
 
@@ -45,12 +57,12 @@ impl Drop for HeaderEchoBackend {
     }
 }
 
-async fn serve_header_echo(listener: TcpListener, hits: Arc<AtomicUsize>) {
+async fn serve_header_echo(listener: TcpListener, contract_requests: Arc<Mutex<Vec<String>>>) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             continue;
         };
-        let hits = Arc::clone(&hits);
+        let contract_requests = Arc::clone(&contract_requests);
         tokio::spawn(async move {
             let mut request = Vec::with_capacity(2048);
             let mut chunk = [0u8; 1024];
@@ -78,7 +90,16 @@ async fn serve_header_echo(listener: TcpListener, hits: Arc<AtomicUsize>) {
                 name.eq_ignore_ascii_case("x-custom-gateway")
                     .then(|| value.trim())
             });
-            hits.fetch_add(1, Ordering::SeqCst);
+            if let Some(contract_request) = request.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(CONTRACT_REQUEST_HEADER)
+                    .then(|| value.trim())
+            }) {
+                contract_requests
+                    .lock()
+                    .expect("contract request lock")
+                    .push(contract_request.to_string());
+            }
             let observed = observed.unwrap_or("missing");
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nX-Backend-Observed: {observed}\r\nConnection: close\r\n\r\nok"
@@ -218,12 +239,13 @@ async fn functional_example_plugin_h1_h2_matched_404_and_405_contract() {
         .timeout(Duration::from_secs(10))
         .build()
         .expect("H1 client");
-    for (path, expected) in [
-        ("/global-example/ok", "global-value"),
-        ("/scoped-example/ok", "scoped-value"),
+    for (path, expected, contract_request) in [
+        ("/global-example/ok", "global-value", "h1-global"),
+        ("/scoped-example/ok", "scoped-value", "h1-scoped"),
     ] {
         let response = h1
             .get(gateway.proxy_url(path))
+            .header(CONTRACT_REQUEST_HEADER, contract_request)
             .send()
             .await
             .expect("H1 matched request");
@@ -232,6 +254,7 @@ async fn functional_example_plugin_h1_h2_matched_404_and_405_contract() {
     }
     let h1_miss = h1
         .get(gateway.proxy_url("/unmatched-example"))
+        .header(CONTRACT_REQUEST_HEADER, "h1-miss")
         .send()
         .await
         .expect("H1 route miss");
@@ -239,6 +262,7 @@ async fn functional_example_plugin_h1_h2_matched_404_and_405_contract() {
     assert_early_response_has_no_example_header(h1_miss.headers());
     let h1_method = h1
         .post(gateway.proxy_url("/global-example/blocked"))
+        .header(CONTRACT_REQUEST_HEADER, "h1-method")
         .send()
         .await
         .expect("H1 method rejection");
@@ -250,12 +274,13 @@ async fn functional_example_plugin_h1_h2_matched_404_and_405_contract() {
         .timeout(Duration::from_secs(10))
         .build()
         .expect("H2 client");
-    for (path, expected) in [
-        ("/global-example/ok", "global-value"),
-        ("/scoped-example/ok", "scoped-value"),
+    for (path, expected, contract_request) in [
+        ("/global-example/ok", "global-value", "h2-global"),
+        ("/scoped-example/ok", "scoped-value", "h2-scoped"),
     ] {
         let response = h2
             .get(gateway.proxy_url(path))
+            .header(CONTRACT_REQUEST_HEADER, contract_request)
             .send()
             .await
             .expect("H2 matched request");
@@ -265,6 +290,7 @@ async fn functional_example_plugin_h1_h2_matched_404_and_405_contract() {
     }
     let h2_miss = h2
         .get(gateway.proxy_url("/unmatched-example"))
+        .header(CONTRACT_REQUEST_HEADER, "h2-miss")
         .send()
         .await
         .expect("H2 route miss");
@@ -273,6 +299,7 @@ async fn functional_example_plugin_h1_h2_matched_404_and_405_contract() {
     assert_early_response_has_no_example_header(h2_miss.headers());
     let h2_method = h2
         .post(gateway.proxy_url("/scoped-example/blocked"))
+        .header(CONTRACT_REQUEST_HEADER, "h2-method")
         .send()
         .await
         .expect("H2 method rejection");
@@ -281,9 +308,14 @@ async fn functional_example_plugin_h1_h2_matched_404_and_405_contract() {
     assert_early_response_has_no_example_header(h2_method.headers());
 
     assert_eq!(
-        backend.hits(),
-        4,
-        "only matched H1/H2 requests reach backend"
+        backend.contract_requests(),
+        vec![
+            String::from("h1-global"),
+            String::from("h1-scoped"),
+            String::from("h2-global"),
+            String::from("h2-scoped"),
+        ],
+        "only matched H1/H2 contract requests reach backend"
     );
     gateway.shutdown();
 }
@@ -298,7 +330,13 @@ async fn functional_example_plugin_h3_matched_404_and_405_contract() {
     let first_url = format!("https://localhost:{https_port}/global-example/ok");
     let deadline = Instant::now() + Duration::from_secs(10);
     let first = loop {
-        match client.get(&first_url).await {
+        match client
+            .get_with_options(
+                &first_url,
+                GetOptions::default().header(CONTRACT_REQUEST_HEADER, "h3-global"),
+            )
+            .await
+        {
             Ok(response) => break response,
             Err(error) if Instant::now() < deadline => {
                 let _ = error;
@@ -311,14 +349,20 @@ async fn functional_example_plugin_h3_matched_404_and_405_contract() {
     assert_matched_headers(&first.headers, "global-value");
 
     let scoped = client
-        .get(&format!("https://localhost:{https_port}/scoped-example/ok"))
+        .get_with_options(
+            &format!("https://localhost:{https_port}/scoped-example/ok"),
+            GetOptions::default().header(CONTRACT_REQUEST_HEADER, "h3-scoped"),
+        )
         .await
         .expect("H3 scoped matched request");
     assert_eq!(scoped.status, StatusCode::OK);
     assert_matched_headers(&scoped.headers, "scoped-value");
 
     let miss = client
-        .get(&format!("https://localhost:{https_port}/unmatched-example"))
+        .get_with_options(
+            &format!("https://localhost:{https_port}/unmatched-example"),
+            GetOptions::default().header(CONTRACT_REQUEST_HEADER, "h3-miss"),
+        )
         .await
         .expect("H3 route miss");
     assert_eq!(miss.status, StatusCode::NOT_FOUND);
@@ -327,13 +371,19 @@ async fn functional_example_plugin_h3_matched_404_and_405_contract() {
     let method = client
         .get_with_options(
             &format!("https://localhost:{https_port}/global-example/blocked"),
-            GetOptions::default().method(Method::POST),
+            GetOptions::default()
+                .method(Method::POST)
+                .header(CONTRACT_REQUEST_HEADER, "h3-method"),
         )
         .await
         .expect("H3 method rejection");
     assert_eq!(method.status, StatusCode::METHOD_NOT_ALLOWED);
     assert_early_response_has_no_example_header(&method.headers);
 
-    assert_eq!(backend.hits(), 2, "only matched H3 requests reach backend");
+    assert_eq!(
+        backend.contract_requests(),
+        vec![String::from("h3-global"), String::from("h3-scoped")],
+        "only matched H3 contract requests reach backend"
+    );
     gateway.shutdown();
 }
