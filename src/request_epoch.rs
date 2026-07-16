@@ -61,8 +61,8 @@ mod tests {
         PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget, default_namespace,
     };
     use crate::plugins::{
-        BackendAdmissionContext, BackendAdmissionDecision, PluginHttpClient, ProxyProtocol,
-        RequestContext,
+        BackendAdmissionContext, BackendAdmissionDecision, PluginHttpClient, PluginResult,
+        ProxyProtocol, RequestContext,
     };
     use chrono::Utc;
     use serde_json::{Map, Value, json};
@@ -282,6 +282,153 @@ mod tests {
         assert_eq!(after.route_generation, before.route_generation);
         assert_eq!(after.config.proxies.len(), 1);
         assert_eq!(after.config.proxies[0].id, "old");
+    }
+
+    #[tokio::test]
+    async fn fault_overlay_publication_keeps_in_flight_request_epoch_coherent() {
+        use crate::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+        use crate::plugins::Plugin;
+        use crate::plugins::fault_injection::runtime_overlay::{
+            FaultOverlayMaterialization, materialize_config,
+        };
+
+        async fn execute_before_proxy_chain(plugins: Arc<Vec<Arc<dyn Plugin>>>) -> PluginResult {
+            let mut ctx = RequestContext::new(
+                "192.0.2.10".to_string(),
+                "GET".to_string(),
+                "/checkout".to_string(),
+            );
+            let mut headers = HashMap::new();
+            for plugin in plugins.iter() {
+                match plugin.before_proxy(&mut ctx, &mut headers).await {
+                    PluginResult::Continue => {}
+                    terminal => return terminal,
+                }
+            }
+            PluginResult::Continue
+        }
+
+        let static_fault = || {
+            plugin_config(
+                "fault",
+                "fault_injection",
+                json!({
+                    "abort": {"status_code": 503, "percentage": 50.0},
+                    "runtime_overlay_scope": "checkout"
+                }),
+            )
+        };
+        let overlay = |percentage| MeshRuntimeOverlay {
+            fields: HashMap::from([(
+                "ferrum.fault_injection.checkout.abort_percent".to_string(),
+                RuntimeValue::Number(percentage),
+            )]),
+        };
+
+        let mut fault_a = static_fault();
+        assert_eq!(
+            materialize_config(&mut fault_a.config, &overlay(100.0)),
+            FaultOverlayMaterialization::Changed
+        );
+        let config_a = config(
+            vec![proxy("checkout", "/checkout", vec!["fault"])],
+            vec![fault_a],
+            vec![],
+        );
+        let store = epoch_store(config_a);
+        let epoch_a = store.load();
+        let plugins_a = epoch_a
+            .plugin_cache
+            .request_view("checkout", ProxyProtocol::Http)
+            .plugins();
+
+        let mut fault_b = static_fault();
+        assert_eq!(
+            materialize_config(&mut fault_b.config, &overlay(0.0)),
+            FaultOverlayMaterialization::Disabled
+        );
+        fault_b.enabled = false;
+        let config_b = config(
+            vec![proxy("checkout", "/checkout", vec!["fault"])],
+            vec![fault_b],
+            vec![],
+        );
+        store
+            .update_config(
+                |current| {
+                    let plugin_cache =
+                        PluginCache::build_inner(&config_b, &PluginHttpClient::default())?;
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::new(config_b.clone()),
+                        route_table: RouterCache::build_route_table_snapshot(&config_b),
+                        plugin_cache,
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: false,
+                        lb_changed: false,
+                    }))
+                },
+                |_| {},
+            )
+            .unwrap_or_else(|error| panic!("generation B should publish: {error}"))
+            .expect("generation B should publish");
+
+        let epoch_b = store.load();
+        let plugins_b = epoch_b
+            .plugin_cache
+            .request_view("checkout", ProxyProtocol::Http)
+            .plugins();
+        assert!(!Arc::ptr_eq(&epoch_a, &epoch_b));
+        assert!(matches!(
+            execute_before_proxy_chain(Arc::clone(&plugins_a)).await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ));
+        assert!(matches!(
+            execute_before_proxy_chain(Arc::clone(&plugins_b)).await,
+            PluginResult::Continue
+        ));
+
+        let invalid_config = config(
+            vec![proxy("checkout", "/checkout", vec!["fault"])],
+            vec![plugin_config(
+                "fault",
+                "fault_injection",
+                json!({"runtime_overlay_scope": "checkout"}),
+            )],
+            vec![],
+        );
+        let rejection = store.update_config(
+            |current| {
+                let plugin_cache =
+                    PluginCache::build_inner(&invalid_config, &PluginHttpClient::default())?;
+                Ok(Some(StagedRequestEpoch {
+                    config: Arc::new(invalid_config.clone()),
+                    route_table: RouterCache::build_route_table_snapshot(&invalid_config),
+                    plugin_cache,
+                    consumer_index: Arc::clone(&current.consumer_index),
+                    load_balancer: Arc::clone(&current.load_balancer),
+                    route_changed: false,
+                    lb_changed: false,
+                }))
+            },
+            |_| {},
+        );
+        assert!(rejection.is_err());
+        assert!(Arc::ptr_eq(&epoch_b, &store.load()));
+        assert!(matches!(
+            execute_before_proxy_chain(plugins_a).await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ));
+        assert!(matches!(
+            execute_before_proxy_chain(plugins_b).await,
+            PluginResult::Continue
+        ));
     }
 
     #[test]

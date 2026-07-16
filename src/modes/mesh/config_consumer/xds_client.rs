@@ -43,7 +43,8 @@ const INITIAL_TYPE_URL_ORDER: [&str; 7] = [
     ECDS_TYPE_URL,
     // RTDS is subscribed alongside the other xDS types; runtime knobs feed
     // fault-injection percentages, transformer gates, and the tracing log
-    // level via `runtime_overlay_consumers::apply_overlay` at slice install.
+    // level. Fault values bind to the candidate plugin cache; the remaining
+    // process-wide consumers publish after slice acceptance.
     // Kept last so the baseline slice can apply even when the CP has no
     // Runtime layers to send.
     RTDS_TYPE_URL,
@@ -399,6 +400,7 @@ impl ResourceAccumulator {
         }
 
         let mut accumulated = Vec::with_capacity(resources.len());
+        let mut runtime_names = BTreeSet::new();
         for resource in resources {
             if !resource.type_url.is_empty() && resource.type_url != type_url {
                 return Err(format!(
@@ -413,6 +415,11 @@ impl ResourceAccumulator {
                 ));
             }
             validate_resource_name_shape(type_url, &name)?;
+            if type_url == RTDS_TYPE_URL && !runtime_names.insert(name.clone()) {
+                return Err(format!(
+                    "xDS RTDS response contains duplicate Runtime resource name '{name}'"
+                ));
+            }
             // ECDS reverse-translation reads the full bytes back to decode
             // its inner TypedExtensionConfig. RTDS reverse-translation does
             // the same to decode the layer struct. Other resource types
@@ -428,6 +435,15 @@ impl ResourceAccumulator {
                 validate_ecds_destination_rule_carrier(&accumulated_resource)?;
             }
             accumulated.push(accumulated_resource);
+        }
+
+        // Envoy does not assign precedence semantics to SotW wire order.
+        // Canonicalize RTDS layers by resource name so reconnects, CP map
+        // iteration, and equivalent permutations always produce one overlay.
+        // Reverse translation applies later entries last, so lexicographically
+        // greater names have deterministic precedence on conflicting keys.
+        if type_url == RTDS_TYPE_URL {
+            accumulated.sort_by(|left, right| left.name.cmp(&right.name));
         }
 
         self.resources_by_type
@@ -1323,9 +1339,9 @@ fn reverse_translate(
     log_omitted_sds_trust_domains(trust_domains);
     log_ignored_sds_resource_names(ignored_sds_names);
 
-    // GAP-3E: merge RTDS layers into the slice's runtime overlay. Layers
-    // arrive sorted by resource name on the wire; later fields win on key
-    // conflicts so a higher-priority layer overrides a base layer. Layers
+    // GAP-3E: merge RTDS layers into the slice's runtime overlay. The
+    // accumulator canonicalizes resources by name independent of wire order;
+    // lexicographically later names win on key conflicts. Layers
     // with empty `name` would have been rejected at name decode, so any
     // resource that reaches this point has a stable identity.
     let mut runtime_overlay = MeshRuntimeOverlay::default();
@@ -2076,6 +2092,193 @@ mod tests {
                     .expect("empty response applies");
             }
         }
+    }
+
+    fn runtime_resource(name: &str, fields: &[(&str, runtime_proto::value::Kind)]) -> proto::Any {
+        let fields = fields
+            .iter()
+            .map(|(key, kind)| {
+                (
+                    (*key).to_string(),
+                    runtime_proto::Value {
+                        kind: Some(kind.clone()),
+                    },
+                )
+            })
+            .collect();
+        proto::Any {
+            type_url: RTDS_TYPE_URL.to_string(),
+            value: runtime_proto::Runtime {
+                name: name.to_string(),
+                layer: Some(runtime_proto::Struct { fields }),
+            }
+            .encode_to_vec(),
+        }
+    }
+
+    fn coherent_accumulator_with_rtds(resources: &[proto::Any]) -> ResourceAccumulator {
+        let mut accumulator = primed_accumulator();
+        accumulator
+            .apply_sotw_response(ECDS_TYPE_URL, &[], "v1")
+            .expect("ECDS apply");
+        accumulator
+            .apply_sotw_response(RTDS_TYPE_URL, resources, "rtds-v1")
+            .expect("RTDS apply");
+        accumulator
+    }
+
+    #[test]
+    fn rtds_precedence_is_lexicographic_and_wire_order_independent() {
+        use crate::modes::mesh::config::RuntimeValue;
+        use runtime_proto::value::Kind;
+
+        let base = runtime_resource(
+            "10-base",
+            &[
+                (
+                    "ferrum.fault_injection.checkout.abort_percent",
+                    Kind::NumberValue(10.0),
+                ),
+                (
+                    "ferrum.request_transformer.checkout.enabled",
+                    Kind::BoolValue(false),
+                ),
+            ],
+        );
+        let override_layer = runtime_resource(
+            "90-override",
+            &[
+                (
+                    "ferrum.fault_injection.checkout.abort_percent",
+                    Kind::NumberValue(75.0),
+                ),
+                (
+                    "ferrum.request_transformer.checkout.enabled",
+                    Kind::BoolValue(true),
+                ),
+            ],
+        );
+
+        for resources in [
+            vec![base.clone(), override_layer.clone()],
+            vec![override_layer.clone(), base.clone()],
+        ] {
+            let accumulator = coherent_accumulator_with_rtds(&resources);
+            let names = accumulator
+                .resources(RTDS_TYPE_URL)
+                .iter()
+                .map(|resource| resource.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec!["10-base", "90-override"]);
+
+            let slice = accumulator
+                .try_build_mesh_slice(&test_config())
+                .expect("reverse translation")
+                .expect("required types are coherent");
+            assert_eq!(
+                slice
+                    .runtime_overlay
+                    .fields
+                    .get("ferrum.fault_injection.checkout.abort_percent"),
+                Some(&RuntimeValue::Number(75.0))
+            );
+            assert_eq!(
+                slice
+                    .runtime_overlay
+                    .fields
+                    .get("ferrum.request_transformer.checkout.enabled"),
+                Some(&RuntimeValue::Bool(true))
+            );
+        }
+    }
+
+    #[test]
+    fn rtds_sotw_replacement_drops_removed_override_layer() {
+        use crate::modes::mesh::config::RuntimeValue;
+        use runtime_proto::value::Kind;
+
+        let base = runtime_resource(
+            "10-base",
+            &[
+                (
+                    "ferrum.fault_injection.checkout.delay_percent",
+                    Kind::NumberValue(10.0),
+                ),
+                (
+                    "ferrum.request_transformer.checkout.enabled",
+                    Kind::BoolValue(false),
+                ),
+            ],
+        );
+        let override_layer = runtime_resource(
+            "90-override",
+            &[
+                (
+                    "ferrum.fault_injection.checkout.delay_percent",
+                    Kind::NumberValue(90.0),
+                ),
+                (
+                    "ferrum.request_transformer.checkout.enabled",
+                    Kind::BoolValue(true),
+                ),
+            ],
+        );
+        let mut accumulator = coherent_accumulator_with_rtds(&[override_layer, base.clone()]);
+        accumulator
+            .apply_sotw_response(RTDS_TYPE_URL, &[base], "rtds-v2")
+            .expect("replacement applies");
+
+        let slice = accumulator
+            .try_build_mesh_slice(&test_config())
+            .expect("reverse translation")
+            .expect("required types are coherent");
+        assert_eq!(
+            slice
+                .runtime_overlay
+                .fields
+                .get("ferrum.fault_injection.checkout.delay_percent"),
+            Some(&RuntimeValue::Number(10.0))
+        );
+        assert_eq!(
+            slice
+                .runtime_overlay
+                .fields
+                .get("ferrum.request_transformer.checkout.enabled"),
+            Some(&RuntimeValue::Bool(false))
+        );
+    }
+
+    #[test]
+    fn duplicate_rtds_resource_name_is_rejected_without_replacing_prior_set() {
+        use runtime_proto::value::Kind;
+
+        let old = runtime_resource(
+            "stable",
+            &[("ferrum.log.level", Kind::StringValue("info".to_string()))],
+        );
+        let mut accumulator = coherent_accumulator_with_rtds(std::slice::from_ref(&old));
+        let duplicate_a = runtime_resource(
+            "duplicate",
+            &[("ferrum.log.level", Kind::StringValue("debug".to_string()))],
+        );
+        let duplicate_b = runtime_resource(
+            "duplicate",
+            &[("ferrum.log.level", Kind::StringValue("warn".to_string()))],
+        );
+        let error = accumulator
+            .apply_sotw_response(RTDS_TYPE_URL, &[duplicate_a, duplicate_b], "rtds-v2")
+            .expect_err("duplicate Runtime names must NACK");
+
+        assert!(error.contains("duplicate Runtime resource name 'duplicate'"));
+        assert_eq!(accumulator.resources(RTDS_TYPE_URL).len(), 1);
+        assert_eq!(accumulator.resources(RTDS_TYPE_URL)[0].name, "stable");
+        assert_eq!(
+            accumulator
+                .versions_by_type
+                .get(RTDS_TYPE_URL)
+                .map(String::as_str),
+            Some("rtds-v1")
+        );
     }
 
     fn service_port_map(slice: &MeshSlice) -> BTreeMap<(String, String), Vec<u16>> {

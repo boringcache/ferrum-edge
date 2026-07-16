@@ -1435,6 +1435,13 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
             }),
         ),
         (
+            "fault_injection",
+            json!({
+                "abort": {"status_code": 503, "percentage": 1.0},
+                "runtime_overlay_scope": "checkout"
+            }),
+        ),
+        (
             "serverless_function",
             json!({
                 "provider": "aws_lambda",
@@ -1550,6 +1557,62 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
             }),
             false,
         );
+    }
+
+    for invalid_scope in [json!(""), json!(" \t "), json!(42), json!(true)] {
+        assert_component_validity(
+            &spec,
+            "FaultInjectionConfig",
+            &json!({
+                "abort": {"status_code": 503, "percentage": 1.0},
+                "runtime_overlay_scope": invalid_scope
+            }),
+            false,
+        );
+    }
+    assert_component_validity(
+        &spec,
+        "FaultInjectionConfig",
+        &json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "runtime_overlay_scope": null
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "FaultInjectionConfig",
+        &json!({"delay": {"duration_ms": 60_000, "percentage": f64::from_bits(1)}}),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "FaultInjectionConfig",
+        &json!({"delay": {"duration_ms": 60_001, "percentage": 1.0}}),
+        false,
+    );
+    for valid in [
+        json!({
+            "abort": null,
+            "delay": {"duration_ms": 1, "percentage": 1.0}
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "delay": null
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "delay": {"duration_ms": 1, "percentage": 1.0}
+        }),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &valid, true);
+    }
+    for invalid in [
+        json!({"abort": null}),
+        json!({"delay": null}),
+        json!({"abort": null, "delay": null}),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &invalid, false);
     }
 }
 
@@ -2201,6 +2264,29 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
 
     assert_component_validity(&spec, "MeshRouteDispatchConfig", &representative, true);
     MeshRouteDispatch::new(&representative).expect("representative config is runtime-valid");
+
+    let tiny_fault = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "fault": {"abort": {
+                "status_code": 503,
+                "percentage": f64::from_bits(1)
+            }}
+        }]
+    });
+    assert_component_validity(&spec, "MeshRouteDispatchConfig", &tiny_fault, true);
+    MeshRouteDispatch::new(&tiny_fault).expect("tiny positive percentage is runtime-valid");
+
+    let overlong_fault = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "fault": {"delay": {"duration_ms": 60_001, "percentage": 1.0}}
+        }]
+    });
+    assert_component_validity(&spec, "MeshRouteDispatchConfig", &overlong_fault, false);
+    assert!(MeshRouteDispatch::new(&overlong_fault).is_err());
 
     let documented_old_transform = json!({
         "rules": [{
