@@ -2837,6 +2837,7 @@ async fn ensure_hmac_consumer_candidate(
 
 async fn persist_consumer_update(
     db: &dyn DatabaseBackend,
+    admission_guard: &crud::NamespaceConfigAdmissionGuard,
     mut consumer: Consumer,
     success_status: StatusCode,
 ) -> Response<Full<Bytes>> {
@@ -2849,6 +2850,12 @@ async fn persist_consumer_update(
             ensure_hmac_consumer_candidate(db, &consumer.namespace, &consumer).await
     {
         return *response;
+    }
+    if let Err(error) = admission_guard.ensure_held() {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": format!("Config admission unavailable: {error}")}),
+        );
     }
     consumer.updated_at = Utc::now();
     match db.update_consumer(&consumer).await {
@@ -3451,7 +3458,13 @@ async fn handle_update_credentials(
     {
         return Ok(*resp);
     }
-    let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
+    let response = persist_consumer_update(
+        db.as_ref(),
+        &_namespace_config_admission_guard,
+        consumer.clone(),
+        StatusCode::OK,
+    )
+    .await;
     if response.status().is_success() {
         let event = audit::AuditEvent::new(
             actor,
@@ -3512,8 +3525,13 @@ async fn handle_delete_credentials(
     };
     let before = consumer.clone();
     consumer.credentials.remove(cred_type);
-    let response =
-        persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::NO_CONTENT).await;
+    let response = persist_consumer_update(
+        db.as_ref(),
+        &_namespace_config_admission_guard,
+        consumer.clone(),
+        StatusCode::NO_CONTENT,
+    )
+    .await;
     if response.status().is_success() {
         let event = audit::AuditEvent::new(
             actor,
@@ -3634,7 +3652,13 @@ async fn handle_append_credential(
     {
         return Ok(*resp);
     }
-    let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
+    let response = persist_consumer_update(
+        db.as_ref(),
+        &_namespace_config_admission_guard,
+        consumer.clone(),
+        StatusCode::OK,
+    )
+    .await;
     if response.status().is_success() {
         let event = audit::AuditEvent::new(
             actor,
@@ -3741,7 +3765,13 @@ async fn handle_delete_credential_by_index(
         }
     }
 
-    let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
+    let response = persist_consumer_update(
+        db.as_ref(),
+        &_namespace_config_admission_guard,
+        consumer.clone(),
+        StatusCode::OK,
+    )
+    .await;
     if response.status().is_success() {
         let event = audit::AuditEvent::new(
             actor,

@@ -687,20 +687,40 @@ impl DatabaseStore {
     }
 
     fn config_admission_lease_acquire_sql(&self) -> String {
+        let now = self.config_admission_lease_now_sql();
         match self.db_type.as_str() {
-            "mysql" => "INSERT INTO config_admission_locks \
-                 (namespace, owner, expires_at) VALUES (?, ?, ?) \
+            "mysql" => format!(
+                "INSERT INTO config_admission_locks \
+                 (namespace, owner, expires_at) VALUES (?, ?, {now} + ?) \
                  ON DUPLICATE KEY UPDATE \
-                 owner = IF(expires_at <= ? OR owner = VALUES(owner), VALUES(owner), owner), \
+                 owner = IF(expires_at <= {now} OR owner = VALUES(owner), VALUES(owner), owner), \
                  expires_at = IF(owner = VALUES(owner), VALUES(expires_at), expires_at)"
-                .to_string(),
-            _ => self.q("INSERT INTO config_admission_locks \
-                 (namespace, owner, expires_at) VALUES (?, ?, ?) \
+            ),
+            _ => self.q(&format!(
+                "INSERT INTO config_admission_locks \
+                 (namespace, owner, expires_at) VALUES (?, ?, {now} + ?) \
                  ON CONFLICT (namespace) DO UPDATE SET \
                  owner = excluded.owner, expires_at = excluded.expires_at \
-                 WHERE config_admission_locks.expires_at <= ? \
-                    OR config_admission_locks.owner = excluded.owner"),
+                 WHERE config_admission_locks.expires_at <= {now} \
+                    OR config_admission_locks.owner = excluded.owner"
+            )),
         }
+    }
+
+    fn config_admission_lease_now_sql(&self) -> &'static str {
+        match self.db_type.as_str() {
+            "mysql" => "CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)",
+            "sqlite" => "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)",
+            _ => "CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)",
+        }
+    }
+
+    fn config_admission_lease_renew_sql(&self) -> String {
+        let now = self.config_admission_lease_now_sql();
+        self.q(&format!(
+            "UPDATE config_admission_locks SET expires_at = {now} + ? \
+             WHERE namespace = ? AND owner = ? AND expires_at > {now}"
+        ))
     }
 
     fn config_change_retention_upsert_sql(&self) -> String {
@@ -7364,14 +7384,11 @@ impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
         namespace: &str,
         owner: &str,
     ) -> Result<bool, anyhow::Error> {
-        let now = Utc::now().timestamp_millis();
-        let expires_at = now + CONFIG_ADMISSION_LEASE_DURATION_MILLIS;
         let sql = self.config_admission_lease_acquire_sql();
         let result = sqlx::query(&sql)
             .bind(namespace)
             .bind(owner)
-            .bind(expires_at)
-            .bind(now)
+            .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
             .execute(&self.pool())
             .await?;
         Ok(result.rows_affected() > 0)
@@ -7382,15 +7399,11 @@ impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
         namespace: &str,
         owner: &str,
     ) -> Result<bool, anyhow::Error> {
-        let now = Utc::now().timestamp_millis();
-        let expires_at = now + CONFIG_ADMISSION_LEASE_DURATION_MILLIS;
-        let sql = self.q("UPDATE config_admission_locks SET expires_at = ? \
-             WHERE namespace = ? AND owner = ? AND expires_at > ?");
+        let sql = self.config_admission_lease_renew_sql();
         let result = sqlx::query(&sql)
-            .bind(expires_at)
+            .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
             .bind(namespace)
             .bind(owner)
-            .bind(now)
             .execute(&self.pool())
             .await?;
         Ok(result.rows_affected() == 1)

@@ -1066,7 +1066,7 @@ mod inner {
             self.connection.load_full()
         }
 
-        /// Aggregation-pipeline update that takes or holds the migration lease
+        /// Aggregation-pipeline update that takes or holds a lease
         /// using MongoDB SERVER time (`$$NOW`). Clock skew on the connecting
         /// client can never enter the expiry comparison: the server both
         /// evaluates whether the existing lease is expired and stamps the new
@@ -1074,7 +1074,10 @@ mod inner {
         /// The lease is (re)claimed only when it is missing, server-expired, or
         /// already owned by us; otherwise every field is left untouched so an
         /// active owner is never stomped.
-        fn migration_lease_acquire_pipeline(owner: &str) -> Vec<Document> {
+        fn server_time_lease_acquire_pipeline(
+            owner: &str,
+            duration_millis: i64,
+        ) -> Vec<Document> {
             vec![
                 doc! {
                     "$set": {
@@ -1093,7 +1096,7 @@ mod inner {
                         "expires_at": {
                             "$cond": [
                                 "$_ferrum_claimable",
-                                { "$add": [ "$$NOW", MONGO_MIGRATION_LEASE_DURATION_MILLIS ] },
+                                { "$add": [ "$$NOW", duration_millis ] },
                                 "$expires_at",
                             ],
                         },
@@ -1107,16 +1110,24 @@ mod inner {
             ]
         }
 
-        /// Aggregation-pipeline update that renews the lease with a fresh
+        /// Aggregation-pipeline update that renews a lease with a fresh
         /// server-time (`$$NOW`) expiry. The owner match stays in the query
         /// filter so a renewal that no longer owns the lock matches nothing.
-        fn migration_lease_renew_pipeline() -> Vec<Document> {
+        fn server_time_lease_renew_pipeline(duration_millis: i64) -> Vec<Document> {
             vec![doc! {
                 "$set": {
-                    "expires_at": { "$add": [ "$$NOW", MONGO_MIGRATION_LEASE_DURATION_MILLIS ] },
+                    "expires_at": { "$add": [ "$$NOW", duration_millis ] },
                     "updated_at": "$$NOW",
                 },
             }]
+        }
+
+        async fn lease_server_time(&self) -> Result<BsonDateTime, anyhow::Error> {
+            let response = self.db().run_command(doc! { "hello": 1 }).await?;
+            response
+                .get_datetime("localTime")
+                .cloned()
+                .map_err(|error| anyhow::anyhow!("MongoDB hello response omitted localTime: {error}"))
         }
 
         /// The migration-lease duration in milliseconds (exposed for tests that
@@ -1232,7 +1243,10 @@ mod inner {
                         collection
                             .find_one_and_update(
                                 doc! { "_id": MONGO_MIGRATION_LOCK_ID },
-                                Self::migration_lease_acquire_pipeline(&owner),
+                                Self::server_time_lease_acquire_pipeline(
+                                    &owner,
+                                    MONGO_MIGRATION_LEASE_DURATION_MILLIS,
+                                ),
                             )
                             .upsert(true)
                             .return_document(ReturnDocument::After)
@@ -1317,7 +1331,9 @@ mod inner {
                                 renew_collection
                                     .update_one(
                                         renew_filter,
-                                        MongoStore::migration_lease_renew_pipeline(),
+                                        MongoStore::server_time_lease_renew_pipeline(
+                                            MONGO_MIGRATION_LEASE_DURATION_MILLIS,
+                                        ),
                                     )
                                     .await
                             }
@@ -3230,33 +3246,49 @@ mod inner {
             namespace: &str,
             owner: &str,
         ) -> Result<bool, anyhow::Error> {
-            let now = BsonDateTime::now();
-            let expires_at = BsonDateTime::from_millis(
-                now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
-            );
-            let result = self
-                .config_admission_locks()
+            let collection = self.config_admission_locks();
+            let result = collection
                 .find_one_and_update(
-                    doc! {
-                        "_id": namespace,
-                        "$or": [
-                            { "expires_at": { "$exists": false } },
-                            { "expires_at": { "$lte": now } },
-                            { "owner": owner },
-                        ],
-                    },
-                    doc! {
-                        "$set": {
-                            "owner": owner,
-                            "expires_at": expires_at,
-                            "updated_at": now,
-                        },
-                        "$setOnInsert": { "created_at": now },
-                    },
+                    doc! { "_id": namespace },
+                    Self::server_time_lease_acquire_pipeline(
+                        owner,
+                        CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+                    ),
                 )
                 .upsert(true)
                 .return_document(ReturnDocument::After)
                 .await;
+            let result = match result {
+                Err(error) if is_pipeline_update_unsupported(&error) => {
+                    let now = self.lease_server_time().await?;
+                    let expires_at = BsonDateTime::from_millis(
+                        now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+                    );
+                    collection
+                        .find_one_and_update(
+                            doc! {
+                                "_id": namespace,
+                                "$or": [
+                                    { "expires_at": { "$exists": false } },
+                                    { "expires_at": { "$lte": now } },
+                                    { "owner": owner },
+                                ],
+                            },
+                            doc! {
+                                "$set": {
+                                    "owner": owner,
+                                    "expires_at": expires_at,
+                                    "updated_at": now,
+                                },
+                                "$setOnInsert": { "created_at": now },
+                            },
+                        )
+                        .upsert(true)
+                        .return_document(ReturnDocument::After)
+                        .await
+                }
+                result => result,
+            };
             match result {
                 Ok(Some(document)) => Ok(document.get_str("owner").ok() == Some(owner)),
                 Ok(None) => Ok(false),
@@ -3270,26 +3302,43 @@ mod inner {
             namespace: &str,
             owner: &str,
         ) -> Result<bool, anyhow::Error> {
-            let now = BsonDateTime::now();
-            let expires_at = BsonDateTime::from_millis(
-                now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
-            );
-            let result = self
-                .config_admission_locks()
+            let collection = self.config_admission_locks();
+            let result = collection
                 .update_one(
                     doc! {
                         "_id": namespace,
                         "owner": owner,
-                        "expires_at": { "$gt": now },
+                        "$expr": { "$gt": [ "$expires_at", "$$NOW" ] },
                     },
-                    doc! {
-                        "$set": {
-                            "expires_at": expires_at,
-                            "updated_at": now,
-                        },
-                    },
+                    Self::server_time_lease_renew_pipeline(
+                        CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+                    ),
                 )
-                .await?;
+                .await;
+            let result = match result {
+                Err(error) if is_pipeline_update_unsupported(&error) => {
+                    let now = self.lease_server_time().await?;
+                    let expires_at = BsonDateTime::from_millis(
+                        now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
+                    );
+                    collection
+                        .update_one(
+                            doc! {
+                                "_id": namespace,
+                                "owner": owner,
+                                "expires_at": { "$gt": now },
+                            },
+                            doc! {
+                                "$set": {
+                                    "expires_at": expires_at,
+                                    "updated_at": now,
+                                },
+                            },
+                        )
+                        .await
+                }
+                result => result,
+            }?;
             Ok(result.matched_count == 1)
         }
 

@@ -94,11 +94,17 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
             >= 6,
         "credential, batch, and restore mutations must share namespace admission"
     );
+    assert!(
+        batch_source.contains("admission_guard.ensure_held()"),
+        "credential persistence must recheck namespace admission after async validation"
+    );
     let sql_store_source = include_str!("../../../src/config/db_loader.rs");
     assert!(sql_store_source.contains("config_admission_locks"));
+    assert!(sql_store_source.contains("config_admission_lease_now_sql"));
     assert!(sql_store_source.contains("self.batch_create_plugin_configs_chunk(configs).await?"));
     let mongo_store_source = include_str!("../../../src/config/mongo_store.rs");
     assert!(mongo_store_source.contains("config_admission_locks"));
+    assert!(mongo_store_source.contains("server_time_lease_acquire_pipeline"));
 
     let pipeline_source = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(pipeline_source.contains("transaction_log_schema::validate_config_graph("));
