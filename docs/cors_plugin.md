@@ -223,7 +223,8 @@ contiguous chain and emits one policy: origins, methods, request headers,
 exposed headers, credentials, and max age compose restrictively (intersection,
 with the shortest max age). A permissive earlier instance cannot short-circuit
 a stricter later instance. Priority overrides that interleave another plugin
-inside the CORS chain are rejected at cache construction.
+inside the CORS chain are rejected at cache construction. The same restrictive
+composition applies when gRPC-Web requests use the gRPC request-policy chain.
 
 ## Request Flow
 

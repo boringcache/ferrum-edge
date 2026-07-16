@@ -248,6 +248,15 @@ async fn multiple_cors_instances_intersect_preflight_and_actual_policy() {
         plugins.iter().map(|plugin| plugin.name()).collect::<Vec<_>>(),
         vec!["cors", "cors", "__cors_finalizer"]
     );
+    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    assert_eq!(
+        grpc_plugins
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["cors", "cors", "__cors_finalizer"],
+        "the deferred chain must retain CORS gRPC-Web protocol support"
+    );
 
     let mut method_conflict = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -483,6 +492,91 @@ fn rejected_cors_reload_retains_the_last_good_snapshot() {
     let after = cache.get_plugins("p1");
     assert_eq!(after.len(), before.len());
     assert!(Arc::ptr_eq(&after[0], &before[0]));
+}
+
+#[test]
+fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
+    let initial = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-wide"])],
+        vec![cors_config(
+            "cors-wide",
+            &["GET", "DELETE"],
+            &["X-Test"],
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&initial).expect("initial single-CORS cache");
+    assert_eq!(
+        cache
+            .get_plugins("p1")
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["cors"]
+    );
+
+    let composed = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["cors-wide", "cors-narrow"],
+        )],
+        vec![
+            cors_config(
+                "cors-wide",
+                &["GET", "DELETE"],
+                &["X-Test"],
+                None,
+            ),
+            cors_config("cors-narrow", &["GET"], &["X-Test"], None),
+        ],
+    );
+    let composed_delta = ConfigDelta::compute(&initial, &composed);
+    let composed_proxy_ids = composed_delta.proxy_ids_needing_plugin_rebuild(&composed);
+    cache
+        .apply_delta(
+            &composed,
+            &composed_proxy_ids,
+            &composed_delta.removed_proxy_ids,
+            composed_delta.global_plugin_configs_changed,
+        )
+        .expect("install composed CORS chain through delta reload");
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        assert_eq!(
+            cache
+                .get_plugins_for_protocol("p1", protocol)
+                .iter()
+                .map(|plugin| plugin.name())
+                .collect::<Vec<_>>(),
+            vec!["cors", "cors", "__cors_finalizer"]
+        );
+    }
+
+    let reduced = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-narrow"])],
+        vec![cors_config("cors-narrow", &["GET"], &["X-Test"], None)],
+    );
+    let reduced_delta = ConfigDelta::compute(&composed, &reduced);
+    let reduced_proxy_ids = reduced_delta.proxy_ids_needing_plugin_rebuild(&reduced);
+    cache
+        .apply_delta(
+            &reduced,
+            &reduced_proxy_ids,
+            &reduced_delta.removed_proxy_ids,
+            reduced_delta.global_plugin_configs_changed,
+        )
+        .expect("remove composed CORS boundary through delta reload");
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        assert_eq!(
+            cache
+                .get_plugins_for_protocol("p1", protocol)
+                .iter()
+                .map(|plugin| plugin.name())
+                .collect::<Vec<_>>(),
+            vec!["cors"],
+            "a stale deferred wrapper/finalizer must not survive the reload"
+        );
+    }
 }
 
 #[tokio::test]

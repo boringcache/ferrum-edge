@@ -3711,7 +3711,7 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
             // Only translatable if it compiles — otherwise the projected plugin
             // config would fail validation and be silently dropped, defeating
             // the route's CORS policy. Keep it deferred instead.
-            regex::Regex::new(regex).ok()?;
+            regex::Regex::new(&crate::config::types::anchor_regex_pattern(regex)).ok()?;
             Some(serde_json::json!({ "regex": regex }))
         }
         _ => None,
@@ -3738,8 +3738,13 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
         Some(Value::String(s)) => parse_istio_duration_secs(s).is_some(),
         _ => false,
     };
+    let allow_credentials_ok = matches!(
+        cors.get("allowCredentials"),
+        None | Some(Value::Null) | Some(Value::Bool(_))
+    );
     origins_ok
         && max_age_ok
+        && allow_credentials_ok
         && cors_unmatched_preflights(cors).is_ok()
         && cors_string_arrays_plugin_valid(cors)
 }
@@ -3948,7 +3953,8 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
             name = %object.metadata.name,
             "VirtualService http[].corsPolicy is not faithfully translatable (allowOrigins[] \
              must be exact/prefix/regex StringMatch with a compilable regex, or the legacy \
-             allowOrigin exact list, plus a parseable maxAge); leaving it unprojected. \
+             allowOrigin exact list, plus well-typed methods, headers, credentials, \
+             unmatched-preflight mode, and maxAge); leaving it unprojected. \
              Configure the `cors` plugin directly."
         );
         return None;

@@ -185,7 +185,12 @@ fn reject_config(backend_port: u16) -> Value {
             proxy(
                 "h3-grpc-web-received",
                 "/received",
-                &["grpc-web-received", "grpc-web-cors", "received-reject"],
+                &[
+                    "grpc-web-received",
+                    "grpc-web-cors",
+                    "grpc-web-cors-narrow",
+                    "received-reject",
+                ],
             ),
             proxy(
                 "h3-grpc-web-authenticate",
@@ -225,6 +230,14 @@ fn reject_config(backend_port: u16) -> Value {
             },
             {
                 "id": "grpc-web-cors",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-received",
+                "enabled": true,
+                "config": {"allowed_origins": ["https://app.example"]},
+            },
+            {
+                "id": "grpc-web-cors-narrow",
                 "plugin_name": "cors",
                 "scope": "proxy",
                 "proxy_id": "h3-grpc-web-received",

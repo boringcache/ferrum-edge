@@ -762,6 +762,10 @@ impl Plugin for CorsFinalizer {
         self.priority
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_GRPC_PROTOCOLS
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         finalize_cors_request(ctx)
     }

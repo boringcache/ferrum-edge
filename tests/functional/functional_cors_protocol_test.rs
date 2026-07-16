@@ -2,13 +2,14 @@
 
 use crate::common::{EchoServer, TestGateway, spawn_http_echo};
 use crate::scaffolding::clients::{GetOptions, Http3Client};
+use crate::scaffolding::ports::reserve_port;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
 
 const ORIGIN: &str = "https://app.example";
+const CANONICAL_ORIGIN: &str = "https://xn--bcher-kva.example";
 
 #[derive(Debug)]
 struct CapturedResponse {
@@ -270,6 +271,43 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
         assert_eq!(header(&response, "access-control-allow-origin"), "*");
     }
 
+    for response in [
+        send_h1_path(
+            &harness,
+            "/canonical",
+            Method::GET,
+            None,
+            None,
+            CANONICAL_ORIGIN,
+        )
+        .await,
+        send_h2_path(
+            &harness,
+            "/canonical",
+            Method::GET,
+            None,
+            None,
+            CANONICAL_ORIGIN,
+        )
+        .await,
+        send_h3_path(
+            &harness,
+            "/canonical",
+            Method::GET,
+            None,
+            None,
+            CANONICAL_ORIGIN,
+        )
+        .await,
+    ] {
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            header(&response, "access-control-allow-origin"),
+            CANONICAL_ORIGIN,
+            "configured Unicode host and default HTTPS port must match the browser-serialized origin"
+        );
+    }
+
     harness.shutdown();
 }
 
@@ -282,32 +320,44 @@ struct CorsProtocolHarness {
 impl CorsProtocolHarness {
     async fn spawn() -> Self {
         let echo = spawn_http_echo().await.expect("spawn CORS backend");
-        let https_listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("reserve HTTPS port");
-        let https_port = https_listener.local_addr().expect("HTTPS addr").port();
-        drop(https_listener);
-
-        let gateway = TestGateway::builder()
-            .mode_file(cors_config(echo.port))
-            .log_level("warn")
-            .env("FERRUM_ENABLE_HTTP3", "true")
-            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-            .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-            .spawn()
-            .await
-            .expect("start CORS protocol gateway");
-        gateway
-            .wait_for_proxy_port(Duration::from_secs(5))
-            .await
-            .expect("proxy port ready");
-
-        Self {
-            gateway,
-            echo,
-            https_port,
+        let config = cors_config(echo.port);
+        let mut last_error = String::new();
+        for _ in 0..5 {
+            let reservation = reserve_port().await.expect("reserve HTTPS port");
+            let https_port = reservation.drop_and_take_port();
+            let spawn = TestGateway::builder()
+                .mode_file(config.clone())
+                .log_level("warn")
+                // The pinned HTTPS/QUIC port must change between attempts, so
+                // this outer loop owns startup retries.
+                .max_attempts(1)
+                .env("FERRUM_ENABLE_HTTP3", "true")
+                .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+                .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+                .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+                .spawn()
+                .await;
+            match spawn {
+                Ok(mut gateway) => {
+                    match gateway.wait_for_proxy_port(Duration::from_secs(5)).await {
+                        Ok(()) => {
+                            return Self {
+                                gateway,
+                                echo,
+                                https_port,
+                            };
+                        }
+                        Err(error) => {
+                            last_error = error.to_string();
+                            gateway.shutdown();
+                        }
+                    }
+                }
+                Err(error) => last_error = error.to_string(),
+            }
         }
+        echo.abort();
+        panic!("start CORS protocol gateway after retries: {last_error}");
     }
 
     fn h1_h2_url(&self, path: &str) -> String {
@@ -349,6 +399,12 @@ fn cors_config(backend_port: u16) -> String {
             "/istio-star",
             backend_port,
             &["istio-star"],
+        ),
+        cors_proxy(
+            "canonical",
+            "/canonical",
+            backend_port,
+            &["canonical"],
         ),
     ];
     let config = serde_json::json!({
@@ -429,6 +485,16 @@ fn cors_config(backend_port: u16) -> String {
                     "allowed_headers": [],
                     "exposed_headers": [],
                     "unmatched_preflights": "forward"
+                }
+            },
+            {
+                "id": "canonical",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "proxy_id": "canonical",
+                "enabled": true,
+                "config": {
+                    "allowed_origins": ["HTTPS://BÜCHER.EXAMPLE:443"]
                 }
             }
         ]

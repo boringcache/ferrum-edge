@@ -68,6 +68,10 @@ impl Plugin for DeferredCorsPlugin {
         self.inner.priority()
     }
 
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        self.inner.supported_protocols()
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         ctx.cors_state.defer_finalization = true;
         self.inner.on_request_received(ctx).await

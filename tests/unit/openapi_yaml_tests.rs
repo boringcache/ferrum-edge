@@ -1565,7 +1565,9 @@ fn cors_schema_matches_strict_runtime_and_istio_projection_surface() {
 
     let cases = [
         (json!({"allowed_origins": ["*"]}), true),
+        (json!({"allowed_origins": ["*.example.com"]}), true),
         (json!({"allowed_origins": ["https://app.example:443"]}), true),
+        (json!({"allowed_origins": ["HTTPS://BÜCHER.EXAMPLE:443"]}), true),
         (json!({"allowed_origins": [{"exact": "*"}]}), true),
         (
             json!({
@@ -1580,7 +1582,11 @@ fn cors_schema_matches_strict_runtime_and_istio_projection_surface() {
         (json!(true), false),
         (json!({"origins": ["*"]}), false),
         (json!({"allowed_origins": null}), false),
+        (json!({"allowed_origins": ["not-an-origin"]}), false),
+        (json!({"allowed_origins": ["https://app.example/path"]}), false),
+        (json!({"allowed_origins": [{"exact": "*.example.com"}]}), false),
         (json!({"allowed_origins": ["*"], "allowed_methods": []}), false),
+        (json!({"allowed_origins": ["*"], "max_age": -1}), false),
         (
             json!({
                 "allowed_origins": ["*"],

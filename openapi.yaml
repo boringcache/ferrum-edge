@@ -13073,6 +13073,26 @@ components:
               default: 10000
               description: Maximum nonce cache entries before eviction sweep
 
+    CorsExactOrigin:
+      oneOf:
+        - type: string
+          const: "*"
+        - type: string
+          minLength: 1
+          pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?:\[[0-9A-Fa-f:.]+\]|[^:/?#@\s]+)(?::[0-9]+)?$'
+      description: >-
+        Exact HTTP(S) origin. The runtime URL parser additionally validates the
+        host and port and canonicalizes scheme/host case, default ports, IDNA,
+        IPv4, and IPv6. Exact `*` is Istio's allow-all value.
+
+    CorsAllowedOriginString:
+      oneOf:
+        - $ref: '#/components/schemas/CorsExactOrigin'
+        - type: string
+          minLength: 3
+          pattern: '^\*\.[^*/:\s]+$'
+          description: Native wildcard-subdomain matcher such as `*.example.com`.
+
     CorsConfig:
       type: object
       additionalProperties: false
@@ -13102,9 +13122,7 @@ components:
           minItems: 1
           items:
             oneOf:
-              - type: string
-                minLength: 1
-                pattern: '^\S+$'
+              - $ref: '#/components/schemas/CorsAllowedOriginString'
               - type: object
                 additionalProperties: false
                 minProperties: 1
@@ -13115,9 +13133,7 @@ components:
                   multi-key objects are rejected at config time.
                 properties:
                   exact:
-                    type: string
-                    minLength: 1
-                    pattern: '^\S+$'
+                    $ref: '#/components/schemas/CorsExactOrigin'
                     description: >-
                       Exact origin, canonicalized at config time (scheme/host
                       case, IDNA, IP serialization, and default ports). The
@@ -13178,6 +13194,7 @@ components:
         max_age:
           type: integer
           format: uint64
+          minimum: 0
           description: >-
             Preflight cache duration in seconds. Native direct-plugin omission
             defaults to 86400; translated Istio omission remains absent.

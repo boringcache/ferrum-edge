@@ -466,7 +466,8 @@ internal finalizer after it. The finalizer emits the intersection of origin,
 method, header, credentials, exposed-header, and max-age policy, so an earlier
 approval cannot bypass a later restriction. A priority override that places a
 different plugin between CORS instances is rejected during cache construction;
-this preserves the phase-1 short-circuit boundary on H1, H2, and H3.
+this preserves the phase-1 short-circuit boundary on H1, H2, H3, and the
+gRPC-Web request-policy chain.
 
 ### Request termination runs immediately after CORS (priority 125)
 
