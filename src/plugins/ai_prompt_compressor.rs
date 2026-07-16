@@ -1100,9 +1100,7 @@ fn decode_json_string_ascii(body: &[u8], start: usize) -> Option<(Option<u8>, us
         b'u' => {
             let digits = body.get(start + 2..start + 6)?;
             let scalar = digits.iter().try_fold(0u16, |value, byte| {
-                value
-                    .checked_mul(16)?
-                    .checked_add(hex_digit(*byte)? as u16)
+                value.checked_mul(16)?.checked_add(hex_digit(*byte)? as u16)
             })?;
             return Some((
                 (scalar <= u8::MAX as u16).then_some(scalar as u8),
