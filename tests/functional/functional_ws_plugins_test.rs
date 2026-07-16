@@ -131,10 +131,10 @@ async fn start_ws_echo_server_recording_close(
                     Message::Close(None) => break,
                     _ => None,
                 };
-                if let Some(outgoing) = outgoing {
-                    if sink.send(outgoing).await.is_err() {
-                        break;
-                    }
+                if let Some(outgoing) = outgoing
+                    && sink.send(outgoing).await.is_err()
+                {
+                    break;
                 }
             }
         });
