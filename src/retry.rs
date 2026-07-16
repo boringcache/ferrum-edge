@@ -237,6 +237,7 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
         // backend-vs-client attribution that the class itself can't
         // express.
         StreamSetupKind::RejectedByPlugin
+        | StreamSetupKind::ClientDisconnectedDuringAdmission
         | StreamSetupKind::NoHealthyTargets
         | StreamSetupKind::CircuitBreakerOpen
         | StreamSetupKind::BackendMaxConnectionsExceeded

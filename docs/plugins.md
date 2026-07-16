@@ -2086,7 +2086,7 @@ For HTTP and gRPC, admission runs after load balancing selects the backend targe
 
 **Behavior notes:**
 
-- **Reload continuity** is keyed by the plugin configuration's namespace and ID. Compatible cache rebuilds preserve learned limits and count permits held by streaming bodies or WebSocket sessions against the replacement plugin; requests that pinned an older compatible cache view may still admit against the shared counters, but use the replacement admission bounds and cannot train them with retired feedback. Limit-bound changes clamp the shared learned limit at publication. Strict scale-out that only adds concrete effective targets or protected proxy-group associations while preserving every old target key, scope, and route meaning is compatible when `max_tracked_keys` is not lowered, so a long-lived old-target permit does not block admission to the new target. A `key_by`, plugin-scope, effective route-override destination or execution order, effective target retirement/replacement, policy-coverage contraction/remap, lowering `max_tracked_keys`, or a transition involving an ambiguous zero-target route establishes a new tracking space, so the replacement returns `503` until older permits drain, then resets retired target state before admitting; this brief fail-closed transition also applies in `shadow_mode`. Service-discovery churn outside a policy's selected subset and route-plugin edits that cannot change its destination remain compatible. Removing and later recreating a policy starts new state, as does removing the last proxy/proxy-group association and later reattaching it.
+- **Reload continuity** is keyed by the plugin configuration's namespace and ID. Compatible cache rebuilds preserve learned limits and count permits held by streaming bodies or WebSocket sessions against the replacement plugin; requests that pinned an older compatible cache view may still admit against the shared counters, but use the replacement admission bounds and cannot train them with retired feedback. Limit-bound changes clamp the shared learned limit at publication. Strict scale-out that only adds concrete effective targets or protected proxy-group associations while preserving every old target key, scope, and route meaning is compatible when `max_tracked_keys` is not lowered, so a long-lived old-target permit does not block admission to the new target. A `key_by`, plugin-scope, effective route-override destination or execution order, effective target retirement/replacement (including service-discovery replacement), policy-coverage contraction/remap, lowering `max_tracked_keys`, or a transition involving an ambiguous zero-target route establishes an independent tracking space. Retired permits finish against their detached state; retired cache and load-balancer views cannot admit, repopulate, or train the replacement policy. That retired-view generation check fails closed even in `shadow_mode`: shadow mode bypasses only a current target's adaptive limit, never structural generation ownership. Service-discovery churn outside a policy's selected subset and route-plugin edits that cannot change its destination remain compatible. Removing and later recreating a policy starts new state, as does removing the last proxy/proxy-group association and later reattaching it.
 - **Failure recovery** is cohort-aware. Every concurrent backend failure or high-latency sample applies its own multiplicative decrease, bounded by `min_limit`, and invalidates additive-growth credit for requests admitted before that decrease. The lower limit must admit a later healthy cohort before it can grow again, so completion ordering and a large `increase_step` cannot immediately erase the backoff.
 - **Unknown configuration keys are rejected.** Misspelled limit, scope, tracking, sampling, shadow, or header fields fail startup/write/reload validation instead of falling back to defaults.
 - **Streaming responses** record their latency sample at TTFB (response-header arrival) while the in-flight slot is held for the full body. Unlike a WebSocket session this slot is still transient (it frees when the body completes), so streaming keeps the normal growth behavior rather than the handshake-style suppression above. For very long-lived streaming/SSE backends this means the limit can grow on fast TTFB while slots stay tied up for the stream duration.
@@ -2103,8 +2103,8 @@ For HTTP and gRPC, admission runs after load balancing selects the backend targe
 | `target_latency_multiplier` | f64 | `1.5` | Target latency threshold as a multiple of the learned minimum observed backend latency. Must be finite and greater than `1.0`. |
 | `decrease_ratio` | f64 | `0.8` | Multiplicative decrease applied after a failure signal or high latency. Must be greater than `0` and less than `1`. |
 | `increase_step` | u64 | `1` | Additive increase applied when the target is saturated and latency remains within the target. |
-| `shadow_mode` | bool | `false` | Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. |
-| `expose_headers` | bool | `false` | Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Policy-generation and key-space-drain rejections omit them because those transitions have no truthful per-target limit or in-flight value. |
+| `shadow_mode` | bool | `false` | Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. Retired cache/load-balancer views and requests crossing a structural generation handoff still fail closed so they cannot repopulate the replacement tracking space. |
+| `expose_headers` | bool | `false` | Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Generation-handoff rejections omit them because those transitions have no truthful per-target limit or in-flight value. |
 
 ```yaml
 plugin_name: adaptive_concurrency
@@ -2323,7 +2323,7 @@ config:
 
 ### `fault_injection`
 
-Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; TCP/UDP stream proxies run the same decision in `on_stream_connect`. Stream rejects close the frontend connection/session, so HTTP status/body/grpc-status fields only have downstream meaning for HTTP-family protocols.
+Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; raw TCP proxies run the same decision in `on_stream_connect`. UDP and DTLS are not supported: their listener/session loops cannot safely wait inside a plugin delay without head-of-line blocking unrelated datagrams. TCP admission races fault delays against client resets and transport errors while preserving valid read-half closes, and all fault delays are capped at one minute. Stream rejects close the frontend connection, so HTTP status/body fields only have downstream meaning for HTTP-family protocols.
 
 When route-sensitive backend-path policy such as `grpc_method_router` is active, the HTTP-family fault decision runs only after the backend-effective method is authorized. A denied rewritten method therefore returns the policy rejection without first sleeping or receiving a synthetic fault response. Proxies without backend-path policy retain the ordinary `before_proxy` ordering.
 
@@ -2332,13 +2332,18 @@ When route-sensitive backend-path policy such as `grpc_method_router` is active,
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `abort.status_code` | u16 | required when `abort` is set | Final HTTP status to return, 200-599 |
-| `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0 |
-| `abort.grpc_status` | u32 (optional) | — | gRPC status trailer to emit on gRPC rejects, 0-16 |
+| `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
+| `abort.grpc_status` | u32 (optional) | — | gRPC status to emit only for actual native gRPC requests (excluding gRPC-Web and WebSocket even if an earlier plugin rewrites or preserves `application/grpc`), 0-16 |
 | `abort.body` | String | `""` | HTTP response body for aborts |
-| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-3,600,000 ms |
-| `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0 |
+| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-60,000 ms |
+| `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
+| `runtime_overlay_scope` | String or null (optional) | — | RTDS scope with at least one non-whitespace character (outer whitespace is trimmed) for `ferrum.fault_injection.<scope>.{abort,delay}_percent`; null is equivalent to omission |
 
-Each plugin instance owns its own sampling counter, so proxy-scoped and proxy-group-scoped instances make independent decisions. The plugin rejects no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
+Each plugin instance owns a process-random sampling stream and makes independent delay/abort rolls. Multiple scoped instances therefore all decide in configured priority order: a delaying instance does not suppress a later sibling, while the first abort naturally short-circuits the remaining plugin chain. Route-local VirtualService faults still deduplicate against proxy-scoped faults through a private source marker, so route translation does not accidentally stack the same policy surface. The plugin rejects static no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
+
+`abort` and `delay` may be omitted or set to `null` to represent an unused side, but at least one must be an object. `runtime_overlay_scope: null` is likewise equivalent to omitting the optional scope. RTDS zero materialization treats a null sibling exactly like an omitted sibling, so removing the only configured side disables that plugin instance for the accepted generation.
+
+When `runtime_overlay_scope` is set, a mesh request epoch captures the matching RTDS values atomically with the plugin config. Missing or malformed keys fall back independently to the static percentage. RTDS layers are ordered lexicographically by Runtime resource name, with later names winning; duplicate Runtime names are rejected. A numeric RTDS value may be `0` to temporarily disable one configured fault kind.
 
 ```yaml
 plugin_name: fault_injection
@@ -2351,6 +2356,7 @@ config:
   delay:
     duration_ms: 250
     percentage: 10.0
+  runtime_overlay_scope: checkout
 ```
 
 ---

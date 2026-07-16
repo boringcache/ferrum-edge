@@ -1,6 +1,7 @@
 use ferrum_edge::_test_support::{
     StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
-    classify_stream_error, disconnect_cause_for_failure,
+    classify_stream_error, disconnect_cause_for_failure, tcp_fault_admission_retry_delays_for_test,
+    tcp_fault_admission_should_cancel_for_test, wait_for_tcp_peer_reset_for_test,
 };
 use ferrum_edge::plugins::{Direction, DisconnectCause};
 use ferrum_edge::retry::ErrorClass;
@@ -10,6 +11,93 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+#[test]
+fn test_tcp_fault_admission_requires_actual_socket_error() {
+    assert!(!tcp_fault_admission_should_cancel_for_test(
+        Ok(tokio::io::Ready::ERROR),
+        Ok(None),
+    ));
+    assert!(!tcp_fault_admission_should_cancel_for_test(
+        Err(io::Error::other("simulated readiness poll failure")),
+        Ok(None),
+    ));
+    assert!(!tcp_fault_admission_should_cancel_for_test(
+        Ok(tokio::io::Ready::ERROR),
+        Err(io::Error::other("simulated socket-error query failure")),
+    ));
+    assert!(tcp_fault_admission_should_cancel_for_test(
+        Ok(tokio::io::Ready::ERROR),
+        Ok(Some(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "simulated reset",
+        ))),
+    ));
+}
+
+#[test]
+fn test_tcp_fault_admission_spurious_readiness_uses_bounded_backoff() {
+    assert_eq!(
+        tcp_fault_admission_retry_delays_for_test(10),
+        [1, 2, 4, 8, 16, 32, 50, 50, 50, 50].map(Duration::from_millis)
+    );
+}
+
+#[tokio::test]
+async fn test_tcp_fault_admission_observes_abortive_reset() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("listener address");
+    let peer = tokio::spawn(async move {
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.set_zero_linger().expect("set abortive close");
+    });
+    let (server, _) = listener.accept().await.expect("accept");
+
+    peer.await.expect("peer task");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_tcp_peer_reset_for_test(&server),
+    )
+    .await
+    .expect("actual reset must cancel fault admission promptly");
+}
+
+#[tokio::test]
+async fn test_tcp_fault_admission_preserves_half_close_and_queued_bytes() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("listener address");
+    let (half_closed_tx, half_closed_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(b"complete-request").await.expect("write");
+        client.shutdown().await.expect("half close");
+        let _ = half_closed_tx.send(());
+        let _ = release_rx.await;
+    });
+    let (server, _) = listener.accept().await.expect("accept");
+    half_closed_rx.await.expect("half-close signal");
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(75),
+            wait_for_tcp_peer_reset_for_test(&server),
+        )
+        .await
+        .is_err(),
+        "a valid read-half FIN must not cancel fault admission"
+    );
+    let mut queued = [0_u8; 32];
+    let queued_len = server.peek(&mut queued).await.expect("peek queued bytes");
+    assert!(queued_len > 0, "reset wait must not consume request bytes");
+
+    let _ = release_tx.send(());
+    peer.await.expect("peer task");
+}
 
 #[test]
 fn test_classify_stream_error_preserves_tls_failures() {

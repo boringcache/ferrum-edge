@@ -1435,6 +1435,13 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
             }),
         ),
         (
+            "fault_injection",
+            json!({
+                "abort": {"status_code": 503, "percentage": 1.0},
+                "runtime_overlay_scope": "checkout"
+            }),
+        ),
+        (
             "serverless_function",
             json!({
                 "provider": "aws_lambda",
@@ -1550,6 +1557,62 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
             }),
             false,
         );
+    }
+
+    for invalid_scope in [json!(""), json!(" \t "), json!(42), json!(true)] {
+        assert_component_validity(
+            &spec,
+            "FaultInjectionConfig",
+            &json!({
+                "abort": {"status_code": 503, "percentage": 1.0},
+                "runtime_overlay_scope": invalid_scope
+            }),
+            false,
+        );
+    }
+    assert_component_validity(
+        &spec,
+        "FaultInjectionConfig",
+        &json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "runtime_overlay_scope": null
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "FaultInjectionConfig",
+        &json!({"delay": {"duration_ms": 60_000, "percentage": f64::from_bits(1)}}),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "FaultInjectionConfig",
+        &json!({"delay": {"duration_ms": 60_001, "percentage": 1.0}}),
+        false,
+    );
+    for valid in [
+        json!({
+            "abort": null,
+            "delay": {"duration_ms": 1, "percentage": 1.0}
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "delay": null
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "delay": {"duration_ms": 1, "percentage": 1.0}
+        }),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &valid, true);
+    }
+    for invalid in [
+        json!({"abort": null}),
+        json!({"delay": null}),
+        json!({"abort": null, "delay": null}),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &invalid, false);
     }
 }
 
@@ -2154,6 +2217,35 @@ fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
 }
 
 #[test]
+fn adaptive_concurrency_schema_documents_generation_handoff_exceptions() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AdaptiveConcurrencyConfig")
+        .expect("missing AdaptiveConcurrencyConfig schema");
+
+    let shadow_description = schema
+        .pointer("/properties/shadow_mode/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("shadow_mode description should be present");
+    assert!(
+        shadow_description.contains("structural generation handoff")
+            && shadow_description.contains("still fail closed"),
+        "shadow_mode must document the structural handoff exception"
+    );
+
+    let header_description = schema
+        .pointer("/properties/expose_headers/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("expose_headers description should be present");
+    assert!(
+        header_description.contains("genuine per-target limit rejections")
+            && header_description.contains("Generation-handoff rejections omit"),
+        "expose_headers must document generation-handoff omission"
+    );
+}
+
+#[test]
 fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 
@@ -2222,6 +2314,29 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
 
     assert_component_validity(&spec, "MeshRouteDispatchConfig", &representative, true);
     MeshRouteDispatch::new(&representative).expect("representative config is runtime-valid");
+
+    let tiny_fault = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "fault": {"abort": {
+                "status_code": 503,
+                "percentage": f64::from_bits(1)
+            }}
+        }]
+    });
+    assert_component_validity(&spec, "MeshRouteDispatchConfig", &tiny_fault, true);
+    MeshRouteDispatch::new(&tiny_fault).expect("tiny positive percentage is runtime-valid");
+
+    let overlong_fault = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "fault": {"delay": {"duration_ms": 60_001, "percentage": 1.0}}
+        }]
+    });
+    assert_component_validity(&spec, "MeshRouteDispatchConfig", &overlong_fault, false);
+    assert!(MeshRouteDispatch::new(&overlong_fault).is_err());
 
     let documented_old_transform = json!({
         "rules": [{
