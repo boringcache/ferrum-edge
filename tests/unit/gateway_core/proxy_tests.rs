@@ -1405,6 +1405,65 @@ async fn test_auth_rejection_cookie_storage_key_excludes_insecure_transport_secu
 }
 
 #[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_allows_secure_cookie_on_trustworthy_http_origin() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "transport=staged; Path=/",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "transport=selected; Secure; Path=/",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    for authority in [
+        "localhost",
+        "LOCALHOST.:8080",
+        "app.localhost:8080",
+        "127.0.0.1:8080",
+        "127.255.255.254",
+        "[::1]:8080",
+    ] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/cookie-scope".to_string(),
+        );
+        ctx.request_authority = Some(authority.to_string());
+
+        let (_, _, headers) =
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+                .await
+                .expect("both auth attempts must reject");
+
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("transport=selected; Secure; Path=/"),
+            "trustworthy HTTP authority {authority} must retain selected ownership"
+        );
+    }
+
+    for authority in ["localhost.example", "128.0.0.1", "[::2]"] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/cookie-scope".to_string(),
+        );
+        ctx.request_authority = Some(authority.to_string());
+
+        let (_, _, headers) =
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+                .await
+                .expect("both auth attempts must reject");
+
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("transport=selected; Secure; Path=/\ntransport=staged; Path=/"),
+            "untrustworthy HTTP authority {authority} must preserve the storable staged cookie"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_auth_rejection_cookie_storage_key_matches_user_agent_value_parsing() {
     let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
         cookies: "space=staged value; Path=/\ncomma=staged,value; Path=/\nquote=staged\"value; Path=/\nbackslash=staged\\value; Path=/\nunbalanced=staged; Path=/\ncontrol=staged; Path=/\ncarriage=staged; Path=/\ntab=staged; Path=/\ndel=staged; Path=/\npath_control=staged; Path=/",

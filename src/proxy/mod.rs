@@ -14618,6 +14618,44 @@ fn default_set_cookie_path(request_path: &str) -> &str {
     }
 }
 
+/// Browsers treat HTTP loopback and `localhost` origins as potentially
+/// trustworthy, so they may store `Secure` cookies even without TLS. Match the
+/// default trust boundary from Secure Contexts; user-configured browser
+/// allowlists are intentionally unknowable at the proxy.
+fn request_authority_is_potentially_trustworthy(authority: &str) -> bool {
+    let Some((host, _)) = split_request_authority(authority) else {
+        return false;
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let localhost_suffix = ".localhost";
+    if host.eq_ignore_ascii_case("localhost")
+        || (host.len() > localhost_suffix.len()
+            && host
+                .get(host.len() - localhost_suffix.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(localhost_suffix)))
+    {
+        return true;
+    }
+
+    let ip_literal = host
+        .strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+        .unwrap_or(host);
+    match ip_literal.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => address.octets()[0] == 127,
+        Ok(std::net::IpAddr::V6(address)) => address.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+fn request_can_store_secure_cookie(ctx: &RequestContext) -> bool {
+    ctx.request_is_secure
+        || ctx
+            .request_authority
+            .as_deref()
+            .is_some_and(request_authority_is_potentially_trustworthy)
+}
+
 struct SetCookieStorageKey<'a> {
     name: &'a str,
     domain: Option<CanonicalSetCookieDomain<'a>>,
@@ -14791,11 +14829,12 @@ fn set_cookie_conflicts(
 /// the rejection path: successful authentication only removes the metadata.
 pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
     let default_path = default_set_cookie_path(&ctx.path);
+    let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
     let mut staged = Vec::new();
     if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
-        collect_later_set_cookies(&mut staged, existing, default_path, ctx.request_is_secure);
+        collect_later_set_cookies(&mut staged, existing, default_path, can_store_secure_cookie);
     }
-    collect_later_set_cookies(&mut staged, &cookie, default_path, ctx.request_is_secure);
+    collect_later_set_cookies(&mut staged, &cookie, default_path, can_store_secure_cookie);
 
     if staged.is_empty() {
         ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
@@ -14815,6 +14854,7 @@ fn attach_auth_rejection_set_cookie(
         return;
     };
     let default_path = default_set_cookie_path(&ctx.path);
+    let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
 
     // A custom plugin can return multiple case variants because rejection
     // headers use a String-keyed HashMap. Sort the variants by their exact key
@@ -14831,7 +14871,7 @@ fn attach_auth_rejection_set_cookie(
 
     let mut merged = Vec::new();
     for (_, value) in selected_variants {
-        collect_later_set_cookies(&mut merged, &value, default_path, ctx.request_is_secure);
+        collect_later_set_cookies(&mut merged, &value, default_path, can_store_secure_cookie);
     }
 
     let mut staged_cookies = Vec::new();
@@ -14839,13 +14879,13 @@ fn attach_auth_rejection_set_cookie(
         &mut staged_cookies,
         &staged,
         default_path,
-        ctx.request_is_secure,
+        can_store_secure_cookie,
     );
     for candidate in staged_cookies {
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
         // independently scoped requester-owned cookies from earlier rejects.
-        if !set_cookie_conflicts(&merged, &candidate, default_path, ctx.request_is_secure) {
+        if !set_cookie_conflicts(&merged, &candidate, default_path, can_store_secure_cookie) {
             merged.push(candidate);
         }
     }
