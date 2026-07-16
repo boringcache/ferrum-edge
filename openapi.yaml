@@ -6300,10 +6300,12 @@ components:
           description: |
             Maximum allowed response amplification factor for UDP proxies.
             When set, backend→client datagrams are dropped if their size exceeds
-            `last_request_size * factor`. Protects against UDP amplification
-            attacks (e.g., spoofed-source reflection). When omitted (default),
-            no per-datagram amplification cap is applied. Only applicable for
-            `udp` / `dtls` proxies.
+            `max(payload_size, 28) * factor`; 28 bytes is the minimum IPv4+UDP
+            wire size, so a legal zero-length request retains a bounded response
+            budget. This protects against UDP amplification attacks (e.g.,
+            spoofed-source reflection). When omitted (default), no per-datagram
+            amplification cap is applied. Only applicable for `udp` / `dtls`
+            proxies.
         allowed_methods:
           oneOf:
             - type: array
@@ -18261,13 +18263,14 @@ components:
         Plugin: geo_restriction — country-level access control backed by a
         MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is fully verified
         and loaded into bounded owned immutable memory at construction. Files
-        larger than 512 MiB, aggregate declared MMDB sizes above 512 MiB per
+        larger than 512 MiB, aggregate verified MMDB content above 512 MiB per
         validation generation/cache build, and records containing unsupported
         country codes are rejected before publication. File dependency
-        validation is fatal in file mode, warns in database mode, and is
-        skipped by CP/DP because the file is node-local. CP performs
-        structure-only validation. On runtime nodes that construct the plugin,
-        a missing file uses
+        validation is fatal in file mode and warns for absent/unreadable files
+        in database mode. CP performs structure-only validation without opening
+        node-local files; DP validates and refreshes its node-local files for
+        full snapshots and affected incremental rebuilds. On runtime nodes that
+        construct the plugin, a missing file uses
         `on_lookup_failure`, while a readable corrupt, incompatible, or
         wrong-product database is rejected.
         Exactly one of `allow_countries` and `deny_countries` must be non-empty.
@@ -18296,8 +18299,12 @@ components:
           description: >-
             Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database no
             larger than 512 MiB. Across one validation generation/cache build,
-            the declared sizes of all distinct MMDB paths must also total no
-            more than 512 MiB. Required.
+            the verified sizes of all distinct content snapshots must also total
+            no more than 512 MiB; equivalent path spellings with identical
+            verified content are charged once. A changed candidate overlaps the live snapshot;
+            when their combined size exceeds 512 MiB, hot replacement is
+            rejected and the installed database must be loaded by restarting
+            the gateway. Required.
         allow_countries:
           type: array
           items:

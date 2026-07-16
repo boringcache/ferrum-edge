@@ -890,7 +890,7 @@ fn country_mmdb_plugin_is_active(config: &GatewayConfig, plugin_config: &PluginC
 
 /// Whether an incremental cache stage would construct at least one active geo
 /// plugin and therefore needs an off-thread MMDB validation handoff first.
-pub(crate) fn country_mmdb_preload_required(
+fn country_mmdb_preload_required_for_scope(
     config: &GatewayConfig,
     proxy_ids_to_rebuild: &HashSet<String>,
     rebuild_globals: bool,
@@ -2991,6 +2991,30 @@ impl PluginCache {
         Ok(())
     }
 
+    /// Whether the exact delta-build scope, including adaptive-concurrency
+    /// route-definition expansion, reconstructs an active geo plugin.
+    pub(crate) fn country_mmdb_preload_required(
+        &self,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<String>,
+        rebuild_globals: bool,
+    ) -> bool {
+        let current = self.inner.load();
+        let mut expanded_proxy_ids = proxy_ids_to_rebuild.clone();
+        let mut rebuild_adaptive_globals = false;
+        include_adaptive_concurrency_route_rebuilds(
+            &current.adaptive_concurrency_instances,
+            config,
+            &mut expanded_proxy_ids,
+            &mut rebuild_adaptive_globals,
+        );
+        country_mmdb_preload_required_for_scope(
+            config,
+            &expanded_proxy_ids,
+            rebuild_globals || rebuild_adaptive_globals,
+        )
+    }
+
     /// Incrementally update the plugin cache, only rebuilding plugins for
     /// proxies identified in `proxy_ids_to_rebuild`. All other proxy plugin
     /// lists — including their stateful plugin instances (rate limiters, etc.)
@@ -3000,7 +3024,8 @@ impl PluginCache {
     /// global-scoped plugin config was added/modified/removed).
     /// `force_node_local_refresh` additionally rebuilds every active country
     /// MMDB instance for DP full snapshots whose CP source cannot hand off
-    /// node-local validation snapshots.
+    /// node-local validation snapshots. `require_country_mmdb_preload` forbids
+    /// synchronous MMDB loading during an incremental async cache stage.
     /// Returns `Err` if any enabled plugin config cannot be resolved or fails
     /// validation during incremental update, matching the behavior of `rebuild()`.
     pub(crate) fn build_delta_inner(
@@ -3011,11 +3036,14 @@ impl PluginCache {
         removed_proxy_ids: &[String],
         rebuild_globals: bool,
         force_node_local_refresh: bool,
+        require_country_mmdb_preload: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let country_mmdb_load_session = if force_node_local_refresh && !paths.is_empty() {
             CountryMmdbLoadSession::for_node_local_refresh(&paths)?
+        } else if require_country_mmdb_preload {
+            CountryMmdbLoadSession::claim_preloaded(&paths)?
         } else {
             CountryMmdbLoadSession::claim(&paths)?
         };
@@ -3677,6 +3705,7 @@ impl PluginCache {
             proxy_ids_to_rebuild,
             removed_proxy_ids,
             rebuild_globals,
+            false,
             false,
         )?;
 

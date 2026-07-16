@@ -377,6 +377,7 @@ async fn update_config_empty_candidate_returns_unchanged() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(country_mmdb_validation_handoff)]
 async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() {
     let directory = TempDir::new().unwrap();
     let mmdb_path = directory.path().join("country.mmdb");
@@ -473,6 +474,97 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
     );
     assert!(matches!(
         geo.on_request_received(&mut after).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(country_mmdb_validation_handoff)]
+async fn incremental_preloads_geo_for_adaptive_route_rebuild_scope_expansion() {
+    let directory = TempDir::new().unwrap();
+    let mmdb_path = directory.path().join("country.mmdb");
+    std::fs::write(&mmdb_path, country_mmdb_bytes()).unwrap();
+
+    let mut p1 = test_proxy("adaptive-route-1", "/one");
+    let mut p2 = test_proxy("adaptive-route-2", "/two");
+    p2.plugins.push(
+        serde_json::from_value(serde_json::json!({"plugin_config_id": "geo-policy"}))
+            .unwrap(),
+    );
+    let config = GatewayConfig {
+        version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
+        proxies: vec![p1.clone(), p2],
+        plugin_configs: vec![
+            PluginConfig {
+                id: "adaptive-policy".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
+                plugin_name: "adaptive_concurrency".to_string(),
+                config: serde_json::json!({
+                    "min_limit": 1,
+                    "initial_limit": 2,
+                    "max_limit": 2,
+                    "shadow_mode": true
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            PluginConfig {
+                id: "geo-policy".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
+                plugin_name: "geo_restriction".to_string(),
+                config: serde_json::json!({
+                    "db_path": mmdb_path.to_str().unwrap(),
+                    "deny_countries": ["SE"],
+                    "on_lookup_failure": "allow"
+                }),
+                scope: PluginScope::Proxy,
+                proxy_id: Some("adaptive-route-2".to_string()),
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let state = proxy_state_with_config(config);
+
+    // Only proxy 1 appears in the prospective ConfigDelta. Its destination
+    // change alters the global adaptive-concurrency route definition, which
+    // expands the actual plugin rebuild scope to every proxy, including proxy
+    // 2's geo policy. Remove the file so the accepted off-thread handoff must
+    // carry a lookup-failure result; a synchronous fallback is forbidden by
+    // the incremental build session and would reject this update.
+    std::fs::remove_file(&mmdb_path).unwrap();
+    p1.backend_host = "replacement.local".to_string();
+    p1.updated_at = Utc::now() + Duration::milliseconds(1);
+    let outcome = state
+        .apply_incremental(delta_with_proxy(p1, Utc::now()))
+        .await;
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    let plugins = state
+        .plugin_cache
+        .request_view("adaptive-route-2", ProxyProtocol::Http)
+        .plugins();
+    let geo = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "geo_restriction")
+        .unwrap();
+    let mut request = RequestContext::new(
+        "89.160.20.112".to_string(),
+        "GET".to_string(),
+        "/two".to_string(),
+    );
+    assert!(matches!(
+        geo.on_request_received(&mut request).await,
         PluginResult::Continue
     ));
 }

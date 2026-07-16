@@ -1385,7 +1385,7 @@ async fn run_tcp_accept_loop(
                     // (after TLS handshake for TLS proxies, so client cert is available).
                     let mut stream_ctx = StreamConnectionContext {
                         client_ip: client_ip.clone(),
-                        // `direct_client_ip` is always the raw socket peer. When PROXY
+                        // `direct_client_ip` is the canonicalized socket peer. When PROXY
                         // protocol is active `client_ip` may differ (forwarded source IP).
                         direct_client_ip: direct_client_ip.clone(),
                         canonical_client_ip: Default::default(),

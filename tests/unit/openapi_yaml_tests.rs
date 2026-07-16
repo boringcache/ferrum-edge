@@ -1480,18 +1480,32 @@ fn geo_restriction_schema_matches_strict_runtime_contract() {
     for first in b'A'..=b'Z' {
         for second in b'A'..=b'Z' {
             let code = String::from_utf8(vec![first, second]).expect("ASCII country code");
-            let config = json!({
-                "db_path": "/nonexistent/country.mmdb",
-                "allow_countries": [code.clone()],
-                "on_lookup_failure": "deny"
-            });
-            let schema_valid = validator.validate(&config).is_ok();
-            let runtime_valid = GeoRestriction::new(&config).is_ok();
-            assert_eq!(
-                schema_valid, runtime_valid,
-                "schema/runtime country assignment mismatch for {code}"
-            );
-            if runtime_valid {
+            let lowercase = code.to_ascii_lowercase();
+            let mixed_case =
+                String::from_utf8(vec![first.to_ascii_lowercase(), second]).expect("ASCII code");
+            let mut assignment_supported = None;
+            for candidate in [code.clone(), lowercase, mixed_case] {
+                let config = json!({
+                    "db_path": "/nonexistent/country.mmdb",
+                    "allow_countries": [candidate.clone()],
+                    "on_lookup_failure": "deny"
+                });
+                let schema_valid = validator.validate(&config).is_ok();
+                let runtime_valid = GeoRestriction::new(&config).is_ok();
+                assert_eq!(
+                    schema_valid, runtime_valid,
+                    "schema/runtime country assignment mismatch for {candidate}"
+                );
+                if let Some(expected) = assignment_supported {
+                    assert_eq!(
+                        runtime_valid, expected,
+                        "country assignment must be case-insensitive for {candidate}"
+                    );
+                } else {
+                    assignment_supported = Some(runtime_valid);
+                }
+            }
+            if assignment_supported == Some(true) {
                 supported_code_count += 1;
             }
         }

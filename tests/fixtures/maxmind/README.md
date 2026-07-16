@@ -7,5 +7,8 @@ The upstream repository contains the generator and source records used to
 produce it. Tests decode the fixture into a temporary node-local file and
 derive wrong-product and partially corrupt cases in hosted CI.
 
+Decoded fixture SHA-256:
+`b37601903448683d241af52893c8cbf0fed461e0cdebe0bfaca01891fdeb6db9`.
+
 Copyright (c) 2013-2026 MaxMind, Inc. Licensed under the Apache License 2.0 or
 MIT License, matching the upstream `maxmind/MaxMind-DB` repository.

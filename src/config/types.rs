@@ -2168,8 +2168,10 @@ pub struct Proxy {
     pub udp_idle_timeout_seconds: u64,
     /// Maximum allowed response amplification factor for UDP proxies.
     /// When set, backend→client datagrams are dropped if their size exceeds
-    /// `last_request_size * factor`. Protects against UDP amplification attacks.
-    /// `None` (default) = no limit.
+    /// `max(payload_size, 28) * factor`, where 28 bytes is the minimum IPv4+UDP
+    /// wire size. This preserves a bounded reply budget for legal zero-length
+    /// datagrams while protecting against UDP amplification attacks. `None`
+    /// (default) = no limit.
     #[serde(default)]
     pub udp_max_response_amplification_factor: Option<f32>,
     /// TCP stream idle timeout in seconds. After this duration of no data
@@ -4989,19 +4991,27 @@ struct CountryMmdbGenerationHandoff {
 
 #[derive(Default)]
 struct CountryMmdbAggregateBudget {
-    admitted_paths: HashMap<PathBuf, u64>,
+    // The content cache retains one snapshot per digest, so aggregate
+    // accounting uses that same stable identity. Equivalent path spellings
+    // (relative/absolute, symlink aliases, or redundant components) cannot
+    // double-charge bytes that ultimately resolve to one immutable snapshot.
+    admitted_snapshots: HashMap<CountryMmdbDigest, u64>,
     admitted_bytes: u64,
 }
 
 impl CountryMmdbAggregateBudget {
-    fn admit(&mut self, path: &str, size: u64) -> Result<(), CountryMmdbLoadError> {
-        let path_key = PathBuf::from(path);
-        if let Some(admitted_size) = self.admitted_paths.get(&path_key) {
+    fn admit(
+        &mut self,
+        path: &str,
+        digest: CountryMmdbDigest,
+        size: u64,
+    ) -> Result<(), CountryMmdbLoadError> {
+        if let Some(admitted_size) = self.admitted_snapshots.get(&digest) {
             if *admitted_size == size {
                 return Ok(());
             }
             return Err(CountryMmdbLoadError::Invalid(format!(
-                "MaxMind database file '{path}' changed size from {admitted_size} to {size} bytes during aggregate admission"
+                "MaxMind database content for '{path}' changed size from {admitted_size} to {size} bytes during aggregate admission"
             )));
         }
 
@@ -5016,10 +5026,34 @@ impl CountryMmdbAggregateBudget {
             )));
         }
 
-        self.admitted_paths.insert(path_key, size);
+        self.admitted_snapshots.insert(digest, size);
         self.admitted_bytes = next_bytes;
         Ok(())
     }
+}
+
+fn validate_country_mmdb_snapshot_peak(
+    path: &str,
+    live_bytes: u64,
+    inflight_bytes: u64,
+    candidate_bytes: u64,
+) -> Result<u64, CountryMmdbLoadError> {
+    let retained_bytes = live_bytes.checked_add(inflight_bytes).ok_or_else(|| {
+        CountryMmdbLoadError::Invalid(
+            "MaxMind database retained snapshot size overflow".to_string(),
+        )
+    })?;
+    let peak_bytes = retained_bytes.checked_add(candidate_bytes).ok_or_else(|| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database peak snapshot size overflow while admitting '{path}'"
+        ))
+    })?;
+    if peak_bytes > MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database peak snapshot budget exceeded: loading '{path}' ({candidate_bytes} bytes) while retaining {live_bytes} live and {inflight_bytes} in-flight bytes would require {peak_bytes} bytes; maximum aggregate size is {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes. If this changes a live database, it cannot be hot-replaced under the bounded overlap budget and requires a gateway restart after the replacement is installed; otherwise the resulting configuration itself exceeds the aggregate budget"
+        )));
+    }
+    Ok(peak_bytes)
 }
 
 #[derive(Default)]
@@ -5068,24 +5102,12 @@ impl CountryMmdbCache {
         candidate_bytes: u64,
     ) -> Result<(), CountryMmdbLoadError> {
         let live_bytes = self.live_snapshot_bytes()?;
-        let retained_bytes = live_bytes
-            .checked_add(self.inflight_snapshot_bytes)
-            .ok_or_else(|| {
-                CountryMmdbLoadError::Invalid(
-                    "MaxMind database retained snapshot size overflow".to_string(),
-                )
-            })?;
-        let peak_bytes = retained_bytes.checked_add(candidate_bytes).ok_or_else(|| {
-            CountryMmdbLoadError::Invalid(format!(
-                "MaxMind database peak snapshot size overflow while admitting '{path}'"
-            ))
-        })?;
-        if peak_bytes > MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES {
-            return Err(CountryMmdbLoadError::Invalid(format!(
-                "MaxMind database peak snapshot budget exceeded: loading '{path}' ({candidate_bytes} bytes) while retaining {live_bytes} live and {} in-flight bytes would require {peak_bytes} bytes; maximum aggregate size is {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes",
-                self.inflight_snapshot_bytes
-            )));
-        }
+        validate_country_mmdb_snapshot_peak(
+            path,
+            live_bytes,
+            self.inflight_snapshot_bytes,
+            candidate_bytes,
+        )?;
         self.inflight_snapshot_bytes = self
             .inflight_snapshot_bytes
             .checked_add(candidate_bytes)
@@ -5127,10 +5149,11 @@ impl CountryMmdbCache {
         snapshot
     }
 
-    fn admit_validation_path(
+    fn admit_validation_snapshot(
         &mut self,
         generation: u64,
         path: &str,
+        digest: CountryMmdbDigest,
         size: u64,
     ) -> Result<(), CountryMmdbLoadError> {
         let handoff = self
@@ -5141,7 +5164,7 @@ impl CountryMmdbCache {
                     "MaxMind database validation generation is no longer active".to_string(),
                 )
             })?;
-        handoff.aggregate_budget.admit(path, size)
+        handoff.aggregate_budget.admit(path, digest, size)
     }
 
     fn record_validation_failure(
@@ -5252,6 +5275,15 @@ fn country_mmdb_snapshot_cache() -> &'static Mutex<CountryMmdbCache> {
     CACHE.get_or_init(|| Mutex::new(CountryMmdbCache::default()))
 }
 
+fn lock_country_mmdb_cache_recovering_poison(
+    cache: &Mutex<CountryMmdbCache>,
+) -> std::sync::MutexGuard<'_, CountryMmdbCache> {
+    match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// RAII owner for one plugin-file validation generation. The pipeline commits
 /// only after every later validation step succeeds; any early return drops the
 /// guard and releases every strong MMDB handoff owned by the rejected config.
@@ -5305,9 +5337,9 @@ impl Drop for CountryMmdbValidationGeneration {
         if self.committed {
             return;
         }
-        if let Ok(mut cache) = country_mmdb_snapshot_cache().lock() {
-            cache.abort_validation_generation(self.id);
-        }
+        let mut cache =
+            lock_country_mmdb_cache_recovering_poison(country_mmdb_snapshot_cache());
+        cache.abort_validation_generation(self.id);
     }
 }
 
@@ -5321,10 +5353,20 @@ struct CountryMmdbLoadSessionState {
     aggregate_budget: CountryMmdbAggregateBudget,
 }
 
-#[derive(Default)]
 pub(crate) struct CountryMmdbLoadSession {
     state: Mutex<CountryMmdbLoadSessionState>,
     refresh_country_mmdb_plugins: bool,
+    allow_synchronous_load: bool,
+}
+
+impl Default for CountryMmdbLoadSession {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(CountryMmdbLoadSessionState::default()),
+            refresh_country_mmdb_plugins: false,
+            allow_synchronous_load: true,
+        }
+    }
 }
 
 impl CountryMmdbLoadSession {
@@ -5347,7 +5389,17 @@ impl CountryMmdbLoadSession {
         Ok(Self {
             state: Mutex::new(state),
             refresh_country_mmdb_plugins,
+            allow_synchronous_load: true,
         })
+    }
+
+    /// Claim an off-thread validation handoff for an incremental cache stage.
+    /// If cache construction reaches an unvalidated path, fail closed instead
+    /// of synchronously opening and scanning an MMDB on the async caller.
+    pub(crate) fn claim_preloaded(paths: &HashSet<PathBuf>) -> Result<Self, String> {
+        let mut session = Self::claim(paths)?;
+        session.allow_synchronous_load = false;
+        Ok(session)
     }
 
     /// Build a load session for a node-local refresh when the configuration
@@ -5380,6 +5432,11 @@ impl CountryMmdbLoadSession {
         }
         if let Some(error) = state.failures.get(&path_key) {
             return Err(error.clone());
+        }
+        if !self.allow_synchronous_load {
+            return Err(CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database file '{path}' was not preloaded before incremental plugin-cache staging"
+            )));
         }
 
         let loaded =
@@ -5614,16 +5671,6 @@ fn load_validated_country_mmdb_inner(
             MAX_COUNTRY_MMDB_SIZE_BYTES
         )));
     }
-    if let Some(aggregate_budget) = aggregate_budget {
-        aggregate_budget.admit(path, metadata.len())?;
-    } else if let Some(generation) = validation_generation {
-        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
-            CountryMmdbLoadError::Invalid(
-                "MaxMind database snapshot cache is unavailable".to_string(),
-            )
-        })?;
-        cache.admit_validation_path(generation, path, metadata.len())?;
-    }
     // Stream the content identity before allocating a candidate snapshot. An
     // unchanged reload can then reuse its live content-addressed snapshot with
     // only a fixed-size digest buffer, while changed content must pass the
@@ -5675,6 +5722,20 @@ fn load_validated_country_mmdb_inner(
     let digest: CountryMmdbDigest = hasher.finalize().into();
     #[cfg(not(unix))]
     verify_country_mmdb_path_digest(path, &file_version, &digest)?;
+    // Charge the same content identity used by the snapshot cache. This runs
+    // after a bounded, fixed-buffer digest and before any candidate Vec
+    // allocation, so equivalent path spellings deduplicate without weakening
+    // the aggregate memory gate or introducing path-canonicalization TOCTOU.
+    if let Some(aggregate_budget) = aggregate_budget {
+        aggregate_budget.admit(path, digest, metadata.len())?;
+    } else if let Some(generation) = validation_generation {
+        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database snapshot cache is unavailable".to_string(),
+            )
+        })?;
+        cache.admit_validation_snapshot(generation, path, digest, metadata.len())?;
+    }
     {
         let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
             CountryMmdbLoadError::Invalid(
@@ -5829,8 +5890,9 @@ fn load_validated_country_mmdb_inner(
 
 /// Validate that a MaxMind `.mmdb` database file exists, is fully intact, and
 /// contains a supported country record shape. Per-mode callers decide whether
-/// a failure is fatal (file mode) or a warning (database mode); CP/DP skip this
-/// node-local dependency check.
+/// a failure is fatal (file mode) or a warning/fallback (database mode). CP
+/// skips node-local files; DP invokes the same validation during node-local
+/// plugin refresh and rejects readable invalid candidates.
 pub fn validate_mmdb_file(field_name: &str, path: &str) -> Result<(), String> {
     load_validated_country_mmdb(path)
         .map(|_| ())
@@ -5856,6 +5918,9 @@ fn validate_mmdb_file_for_generation(
     }
 }
 
+// Testing-policy exception: peak-budget, digest-identity, and poisoned-lock
+// bookkeeping is private by design and cannot be exercised externally without
+// widening the runtime API. Public MMDB behavior remains covered externally.
 #[cfg(test)]
 mod country_mmdb_admission_tests {
     use super::*;
@@ -5864,11 +5929,15 @@ mod country_mmdb_admission_tests {
     fn aggregate_budget_rejects_before_exceeding_the_generation_limit() {
         let mut budget = CountryMmdbAggregateBudget::default();
         budget
-            .admit("first.mmdb", MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES - 1)
+            .admit(
+                "first.mmdb",
+                [1; 32],
+                MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES - 1,
+            )
             .expect("the first snapshot fits");
 
         let error = budget
-            .admit("second.mmdb", 2)
+            .admit("second.mmdb", [2; 32], 2)
             .expect_err("the aggregate must reject before retaining a second snapshot");
         assert!(
             error
@@ -5879,11 +5948,56 @@ mod country_mmdb_admission_tests {
             budget.admitted_bytes,
             MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES - 1
         );
+        assert!(!budget.admitted_snapshots.contains_key(&[2; 32]));
+    }
+
+    #[test]
+    fn aggregate_budget_deduplicates_equivalent_path_spellings_by_digest() {
+        let mut budget = CountryMmdbAggregateBudget::default();
+        let snapshot_size = (MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES / 2) + 1;
+        budget
+            .admit("country.mmdb", [1; 32], snapshot_size)
+            .expect("the first snapshot fits");
+        budget
+            .admit("./country.mmdb", [1; 32], snapshot_size)
+            .expect("the same content must not be charged twice");
+
+        assert_eq!(budget.admitted_bytes, snapshot_size);
+        assert_eq!(budget.admitted_snapshots.len(), 1);
         assert!(
-            !budget
-                .admitted_paths
-                .contains_key(std::path::Path::new("second.mmdb"))
+            budget
+                .admit("other.mmdb", [2; 32], snapshot_size)
+                .is_err()
         );
+    }
+
+    #[test]
+    fn peak_budget_diagnoses_large_live_snapshot_as_restart_required() {
+        let snapshot_size = (MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES / 2) + 1;
+        let error = validate_country_mmdb_snapshot_peak(
+            "country.mmdb",
+            snapshot_size,
+            0,
+            snapshot_size,
+        )
+        .expect_err("two overlapping large snapshots exceed the peak bound");
+
+        assert!(error.to_string().contains("requires a gateway restart"));
+    }
+
+    #[test]
+    fn poisoned_cache_lock_is_recovered_for_generation_cleanup() {
+        let cache = Mutex::new(CountryMmdbCache::default());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = cache.lock().expect("cache lock");
+            guard.active_validation_generations.insert(7);
+            panic!("poison the private cache lock");
+        }));
+        assert!(panic.is_err());
+
+        let mut guard = lock_country_mmdb_cache_recovering_poison(&cache);
+        guard.abort_validation_generation(7);
+        assert!(!guard.active_validation_generations.contains(&7));
     }
 
     #[cfg(unix)]

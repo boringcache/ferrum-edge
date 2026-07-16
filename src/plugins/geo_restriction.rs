@@ -415,8 +415,9 @@ fn parse_config(config: &Value) -> Result<GeoRestrictionConfig, String> {
 
     let inject_headers = bool_config(config, "inject_headers", false)?;
     let on_lookup_failure = lookup_failure_action(config)?;
-    let on_lookup_failure_explicit =
-        !matches!(config.get("on_lookup_failure"), None | Some(Value::Null));
+    // Explicit null is rejected by `lookup_failure_action`, so successful
+    // parsing only needs to distinguish presence from omission here.
+    let on_lookup_failure_explicit = config.get("on_lookup_failure").is_some();
 
     Ok(GeoRestrictionConfig {
         db_path,

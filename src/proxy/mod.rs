@@ -7030,6 +7030,7 @@ impl ProxyState {
         staged_config: Arc<GatewayConfig>,
         delta: &crate::config_delta::ConfigDelta,
         force_node_local_plugin_refresh: bool,
+        require_country_mmdb_preload: bool,
     ) -> Result<StagedRequestEpoch, String> {
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
         let rebuild_globals = delta.global_plugin_configs_changed;
@@ -7049,6 +7050,7 @@ impl ProxyState {
             &delta.removed_proxy_ids,
             rebuild_globals,
             force_node_local_plugin_refresh,
+            require_country_mmdb_preload,
         )?;
         let consumer_inner = if consumer_changed {
             ConsumerIndex::build_inner(&new_config.consumers)
@@ -7395,6 +7397,7 @@ impl ProxyState {
                         self.env_config.mode,
                         crate::config::env_config::OperatingMode::DataPlane
                     ),
+                    false,
                 )?;
                 route_changed.set(staged.route_changed);
                 applied_delta = Some(delta);
@@ -7795,13 +7798,15 @@ impl ProxyState {
         }
 
         // Incremental database and CP/DP deltas stage plugin caches directly
-        // on this async call path. Preload every MMDB that the prospective
-        // delta would reconstruct on the blocking pool, then let the cache
-        // stage claim the generation handoff without synchronous file work.
+        // on this async call path. Expand the prospective rebuild scope using
+        // the same adaptive-concurrency route-definition logic as cache
+        // staging, preload every MMDB that exact scope reconstructs on the
+        // blocking pool, then require the cache stage to claim the handoff
+        // without synchronous file work.
         let prospective_delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
         let prospective_proxy_rebuilds =
             prospective_delta.proxy_ids_needing_plugin_rebuild(&new_config);
-        if crate::plugin_cache::country_mmdb_preload_required(
+        if self.plugin_cache.country_mmdb_preload_required(
             &new_config,
             &prospective_proxy_rebuilds,
             prospective_delta.global_plugin_configs_changed,
@@ -7858,6 +7863,7 @@ impl ProxyState {
                     Arc::clone(&staged_config),
                     &delta,
                     false,
+                    true,
                 )?;
                 route_changed.set(staged.route_changed);
                 applied_delta = Some(delta);

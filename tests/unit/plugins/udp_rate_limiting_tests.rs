@@ -19,8 +19,9 @@ fn make_plugin(
 
 fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext<'static> {
     let client_ip: std::net::IpAddr = client_ip.parse().expect("test client IP parses");
+    let client_addr = std::net::SocketAddr::new(client_ip, 5353);
     UdpDatagramContext {
-        client_ip: Arc::from(client_ip.to_canonical().to_string()),
+        client_ip: ferrum_edge::proxy::udp_proxy::udp_session_client_ip(client_addr),
         proxy_id: Arc::from("proxy-1"),
         proxy_name: Some(Arc::from("test-proxy")),
         listen_port: 5353,
@@ -75,19 +76,22 @@ fn tracked_keys_count_starts_at_zero() {
 }
 
 #[test]
-fn udp_ingress_source_canonicalizes_before_stream_and_datagram_hooks() {
-    let session_source = include_str!("../../../src/proxy/udp_proxy.rs");
-    let limiter_source = include_str!("../../../src/plugins/udp_rate_limiting.rs");
-
+fn udp_session_admission_canonicalizes_mapped_client_identity() {
+    let mapped: std::net::SocketAddr = "[::ffff:192.0.2.10]:5353".parse().unwrap();
     assert_eq!(
-        session_source
-            .matches("let client_ip = client_addr.ip().to_canonical().to_string();")
-            .count(),
-        2
+        ferrum_edge::proxy::udp_proxy::udp_session_client_ip(mapped).as_ref(),
+        "192.0.2.10"
     );
-    assert!(session_source.contains("let datagram_client_ip: Arc<str> = Arc::from(client_ip);"));
-    assert!(!limiter_source.contains("canonical_ip_text"));
-    assert!(limiter_source.contains("Arc::clone(&ctx.client_ip)"));
+}
+
+#[test]
+fn zero_length_udp_request_retains_bounded_response_budget() {
+    use ferrum_edge::proxy::udp_proxy::udp_amplification_request_size;
+
+    assert_eq!(udp_amplification_request_size(0), 28);
+    assert_eq!(udp_amplification_request_size(1), 28);
+    assert_eq!(udp_amplification_request_size(28), 28);
+    assert_eq!(udp_amplification_request_size(29), 29);
 }
 
 #[test]

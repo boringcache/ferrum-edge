@@ -40,6 +40,22 @@ use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 /// Maximum datagram size for UDP forwarding.
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
+/// Smallest IPv4 UDP datagram on the wire: 20-byte IP header plus 8-byte UDP
+/// header. Payload-only accounting would give a legal zero-length datagram no
+/// response budget at all; this conservative floor keeps that session usable
+/// without granting more amplification than the traffic received on the wire.
+const MIN_UDP_REQUEST_WIRE_SIZE_BYTES: u64 = 28;
+
+/// Canonical identity used at every UDP/DTLS session-admission boundary.
+pub fn udp_session_client_ip(client_addr: SocketAddr) -> Arc<str> {
+    Arc::from(client_addr.ip().to_canonical().to_string())
+}
+
+/// Request size charged to the UDP response-amplification budget.
+pub fn udp_amplification_request_size(payload_size: usize) -> u64 {
+    (payload_size as u64).max(MIN_UDP_REQUEST_WIRE_SIZE_BYTES)
+}
+
 /// Metrics for a single UDP proxy listener.
 #[derive(Default)]
 pub struct UdpProxyMetrics {
@@ -1914,7 +1930,7 @@ async fn process_new_session_datagram(
         std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
     if !udp_datagram_allowed(
         &view.datagram_plugins,
-        Arc::from(client_addr.ip().to_canonical().to_string()),
+        udp_session_client_ip(client_addr),
         Arc::from(view.proxy.id.as_str()),
         view.proxy.name.as_deref().map(Arc::from),
         listen_port,
@@ -2075,7 +2091,7 @@ async fn forward_client_datagram_to_backend(
     // conservative budget based on bytes accepted from the client.
     session
         .last_request_size
-        .store(data.len() as u64, Ordering::Release);
+        .store(udp_amplification_request_size(data.len()), Ordering::Release);
 
     let send_result = if let Some(ref dtls) = session.dtls_conn {
         dtls.send(data)
@@ -2318,14 +2334,14 @@ async fn start_dtls_frontend_listener(
                 let proxy_name = proxy.name.clone();
                 let proxy_namespace = proxy.namespace.clone();
                 let backend_scheme = proxy.effective_scheme();
-                let client_ip = client_addr.ip().to_canonical().to_string();
+                let client_ip = udp_session_client_ip(client_addr);
 
                 // Run on_stream_connect plugins (with DTLS client cert if available)
                 let mut stream_ctx = StreamConnectionContext {
-                    client_ip: client_ip.clone(),
+                    client_ip: client_ip.to_string(),
                     // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
                     // direct_client_ip always equals client_ip for UDP sessions.
-                    direct_client_ip: client_ip,
+                    direct_client_ip: client_ip.to_string(),
                     canonical_client_ip: Default::default(),
                     proxy_id: proxy.id.clone(),
                     proxy_name: proxy_name.clone(),
@@ -3001,7 +3017,7 @@ async fn handle_dtls_client_inner(
     let dgram_plugins = Arc::clone(datagram_plugins);
     // Pre-compute context strings as Arc<str> — per-datagram "clone" is a pointer
     // bump (~5ns) instead of heap allocation + memcpy.
-    let dgram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_canonical().to_string());
+    let dgram_client_ip = udp_session_client_ip(client_addr);
     let dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let dgram_proxy_name: Option<Arc<str>> = proxy_name.map(Arc::from);
     let dgram_listen_port = listen_port;
@@ -3060,7 +3076,7 @@ async fn handle_dtls_client_inner(
 
             // Publish before sending so a fast backend reply cannot observe a
             // zero or stale amplification budget.
-            last_request_size_fwd.store(len as u64, Ordering::Release);
+            last_request_size_fwd.store(udp_amplification_request_size(len), Ordering::Release);
             let send_ok = if let Some(ref dtls) = backend_dtls_write {
                 dtls.send(&data).await.map_err(|e| e.to_string())
             } else if let Some(ref sock) = backend_udp_write {
@@ -3230,14 +3246,14 @@ async fn create_session(
     let proxy_namespace = proxy.namespace.clone();
     let backend_scheme = proxy.effective_scheme();
     let is_passthrough = proxy.passthrough;
-    let client_ip = client_addr.ip().to_canonical().to_string();
+    let client_ip = udp_session_client_ip(client_addr);
 
     // Run on_stream_connect plugins before creating backend connection
     let mut stream_ctx = StreamConnectionContext {
-        client_ip: client_ip.clone(),
+        client_ip: client_ip.to_string(),
         // PROXY protocol is not supported on plain UDP (TCP-borne only);
         // direct_client_ip always equals client_ip for UDP sessions.
-        direct_client_ip: client_ip.clone(),
+        direct_client_ip: client_ip.to_string(),
         canonical_client_ip: Default::default(),
         proxy_id: proxy_id.to_string(),
         proxy_name: proxy_name.clone(),
@@ -3478,7 +3494,7 @@ async fn create_session(
     let now = coarse_epoch_millis();
     let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
     let auth_method = stream_ctx.auth_method;
-    let datagram_client_ip: Arc<str> = Arc::from(client_ip);
+    let datagram_client_ip = Arc::clone(&client_ip);
     let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let datagram_proxy_name: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
     let session = Arc::new(UdpSession {
@@ -3491,7 +3507,7 @@ async fn create_session(
         bytes_received: AtomicU64::new(0),
         // Establish the first response budget before the reply task is spawned.
         // The caller has already accepted this datagram through policy hooks.
-        last_request_size: AtomicU64::new(initial_data.len() as u64),
+        last_request_size: AtomicU64::new(udp_amplification_request_size(initial_data.len())),
         backend_target: format!("{}:{}", backend_host, backend_port),
         backend_resolved_ip: resolved_ip.to_string(),
         sni_hostname: stream_ctx.sni_hostname.clone(),
@@ -4418,7 +4434,7 @@ mod tests {
         );
         assert_eq!(
             session.last_request_size.load(Ordering::Relaxed),
-            b"payload".len() as u64,
+            super::udp_amplification_request_size(b"payload".len()),
             "accepted client datagrams must establish the amplification budget before send"
         );
     }

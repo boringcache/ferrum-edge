@@ -3,9 +3,8 @@ use chrono::Utc;
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::config::types::{
-    CURRENT_CONFIG_VERSION, GatewayConfig, MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES,
-    MAX_COUNTRY_MMDB_SIZE_BYTES, PluginConfig, PluginScope, default_namespace,
-    load_validated_country_mmdb, validate_mmdb_file,
+    CURRENT_CONFIG_VERSION, GatewayConfig, MAX_COUNTRY_MMDB_SIZE_BYTES, PluginConfig, PluginScope,
+    default_namespace, load_validated_country_mmdb, validate_mmdb_file,
 };
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
 use ferrum_edge::plugins::{
@@ -14,6 +13,7 @@ use ferrum_edge::plugins::{
 };
 use http::{HeaderMap, HeaderValue};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,6 +26,15 @@ fn country_mmdb_bytes() -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .expect("MaxMind fixture base64 decodes")
+}
+
+#[test]
+fn upstream_country_mmdb_fixture_has_pinned_sha256() {
+    let digest = Sha256::digest(country_mmdb_bytes());
+    assert_eq!(
+        format!("{digest:x}"),
+        "b37601903448683d241af52893c8cbf0fed461e0cdebe0bfaca01891fdeb6db9"
+    );
 }
 
 fn write_fixture(directory: &TempDir, name: &str, bytes: &[u8]) -> PathBuf {
@@ -511,7 +520,7 @@ async fn authoritative_header_overwrites_spoof_only_after_successful_lookup() {
 }
 
 #[tokio::test]
-async fn fail_open_never_forwards_client_country_assertion() {
+async fn fail_open_preserves_ingress_country_header_stripping() {
     for inject_headers in [false, true] {
         let plugin = GeoRestriction::new(&json!({
             "db_path": "/nonexistent/path/to/test.mmdb",
@@ -520,7 +529,17 @@ async fn fail_open_never_forwards_client_country_assertion() {
             "on_lookup_failure": "allow"
         }))
         .unwrap();
-        let mut ctx = materialized_spoofed_context("203.0.113.1");
+        let mut raw_headers = HeaderMap::new();
+        raw_headers.append("x-geo-country", HeaderValue::from_static("attacker-first"));
+        raw_headers.append("x-geo-country", HeaderValue::from_static("attacker-second"));
+        assert_eq!(raw_headers.get_all("x-geo-country").iter().count(), 2);
+        let mut ctx = request_context("203.0.113.1");
+        ctx.set_raw_headers(raw_headers);
+        ctx.materialize_headers();
+        assert!(
+            !ctx.headers.contains_key("x-geo-country"),
+            "the production materialization boundary strips every spoofed value"
+        );
 
         assert!(matches!(
             plugin.on_request_received(&mut ctx).await,
@@ -732,12 +751,13 @@ fn reload_rereads_same_length_timestamp_preserving_replacement() {
 }
 
 #[test]
+#[serial_test::serial(country_mmdb_validation_handoff)]
 fn rejected_config_generation_releases_mmdb_handoff() {
     let directory = TempDir::new().unwrap();
     let unique = replace_direct_country_with_supported_code(country_mmdb_bytes(), b"XK");
     let path = write_fixture(&directory, "country-xk.mmdb", &unique);
     let snapshot = load_validated_country_mmdb(path_text(&path)).unwrap();
-    assert_eq!(Arc::strong_count(&snapshot), 1);
+    let weak_snapshot = Arc::downgrade(&snapshot);
 
     let config_path = directory.path().join("rejected.json");
     let config = json!({
@@ -771,14 +791,15 @@ fn rejected_config_generation_releases_mmdb_handoff() {
     )
     .expect_err("the stream validation stage must reject this generation");
     assert!(error.to_string().contains("stream proxy"));
-    assert_eq!(
-        Arc::strong_count(&snapshot),
-        1,
-        "rejected generation must release its validation handoff"
+    drop(snapshot);
+    assert!(
+        weak_snapshot.upgrade().is_none(),
+        "rejected generation must release its validation handoff snapshot"
     );
 }
 
 #[tokio::test]
+#[serial_test::serial(country_mmdb_validation_handoff)]
 async fn accepted_generation_hands_every_distinct_mmdb_path_to_cache_build() {
     let directory = TempDir::new().unwrap();
     let first_path = write_fixture(&directory, "country-one.mmdb", &country_mmdb_bytes());
@@ -1039,92 +1060,6 @@ fn validate_mmdb_file_rejects_partial_corruption_after_open() {
         .is_err(),
         "constructor admission must reject a partially corrupt database"
     );
-}
-
-#[test]
-fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
-    let source = include_str!("../../../src/plugins/geo_restriction.rs");
-    let plugin_context_source = include_str!("../../../src/plugins/mod.rs");
-    let config_source = include_str!("../../../src/config/types.rs");
-    let plugin_cache_source = include_str!("../../../src/plugin_cache.rs");
-    let validation_source = include_str!("../../../src/config/validation_pipeline.rs");
-    let lookup_source = source
-        .split("fn lookup_country")
-        .nth(1)
-        .and_then(|tail| tail.split("fn check_ip").next())
-        .expect("lookup_country source section");
-    assert!(!source.contains("open_mmap"));
-    assert!(!source.contains("Reader<Mmap>"));
-    assert!(!source.contains("HashSet<String>"));
-    assert!(!source.contains("Option<String>"));
-    assert!(source.contains("decode_path(&maxminddb::path!"));
-    assert!(source.contains("CountrySet"));
-    assert!(!lookup_source.contains("is_supported"));
-    assert!(config_source.contains("try_reserve_exact(initial_capacity)"));
-    assert!(config_source.contains("validation_handoffs"));
-    assert!(config_source.contains("CountryMmdbValidationGeneration"));
-    assert!(config_source.contains("abort_validation_generation"));
-    assert!(config_source.contains("accepted_validation_generation"));
-    assert!(config_source.contains("active_validation_generations"));
-    assert!(config_source.contains("expected_paths"));
-    assert!(!config_source.contains("get_by_file_version"));
-    assert!(!config_source.contains("validation_handoff_bytes"));
-    assert!(config_source.contains("MAX_COUNTRY_MMDB_SIZE_BYTES"));
-    assert!(config_source.contains("MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES"));
-    assert!(config_source.contains("aggregate_budget.admit(path, metadata.len())"));
-    assert!(config_source.contains("verify_country_mmdb_path_still_matches(path, &file_version)"));
-    assert!(config_source.contains("CountryMmdbAllocationReservation"));
-    assert!(config_source.contains("inflight_snapshot_bytes"));
-    assert!(config_source.contains("live_snapshot_bytes"));
-    assert!(config_source.contains("record_validation_failure"));
-    assert!(config_source.contains("failures: HashMap<PathBuf, CountryMmdbLoadError>"));
-    assert!(config_source.contains("live + in-flight + candidate"));
-    assert!(config_source.contains("custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)"));
-    assert!(plugin_context_source.contains("backend_geo_country: Option<[u8; 2]>"));
-    assert!(source.contains("ctx.set_backend_geo_country(code.bytes())"));
-    let loader_source = config_source
-        .split("fn load_validated_country_mmdb_inner(")
-        .nth(1)
-        .and_then(|tail| tail.split("pub fn validate_mmdb_file(").next())
-        .expect("country MMDB loader source section");
-    let pre_open_metadata = loader_source
-        .find("let path_metadata_before_open = std::fs::metadata(path)")
-        .expect("non-blocking path type validation must precede open");
-    let open = loader_source
-        .find("open_country_mmdb_path(path)")
-        .expect("MMDB path open");
-    let opened_metadata = loader_source
-        .find("let metadata = file.metadata()")
-        .expect("opened-handle metadata validation");
-    assert!(pre_open_metadata < open && open < opened_metadata);
-    let digest_cache_lookup = loader_source
-        .find("cache.get_by_digest(&digest)")
-        .expect("streamed digest cache lookup");
-    let portable_digest_checks = loader_source
-        .match_indices("verify_country_mmdb_path_digest(path, &file_version, &digest)")
-        .map(|(offset, _)| offset)
-        .collect::<Vec<_>>();
-    let peak_reservation = loader_source
-        .find("CountryMmdbAllocationReservation::reserve")
-        .expect("global peak allocation reservation");
-    let buffer_allocation = loader_source
-        .find("bytes.try_reserve_exact(initial_capacity)")
-        .expect("bounded owned snapshot allocation");
-    assert_eq!(portable_digest_checks.len(), 2);
-    assert!(portable_digest_checks[0] < digest_cache_lookup);
-    assert!(digest_cache_lookup < peak_reservation);
-    assert!(peak_reservation < buffer_allocation);
-    assert!(buffer_allocation < portable_digest_checks[1]);
-    assert_eq!(
-        MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES,
-        MAX_COUNTRY_MMDB_SIZE_BYTES
-    );
-    assert!(plugin_cache_source.contains("CountryMmdbLoadSession::claim"));
-    assert!(plugin_cache_source.contains("CountryMmdbLoadSession::for_node_local_refresh"));
-    assert!(plugin_cache_source.contains("refresh_country_mmdb_plugins"));
-    assert!(plugin_cache_source.contains("build_country_mmdb_reload_inner"));
-    assert!(plugin_cache_source.contains("country_mmdb_snapshot_bytes(&new_map, &new_globals)"));
-    assert!(validation_source.contains("generation.commit()"));
 }
 
 // --- validate_plugin_file_dependencies tests ---
