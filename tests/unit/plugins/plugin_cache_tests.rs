@@ -2937,7 +2937,7 @@ fn test_priority_override_applied_correctly() {
 }
 
 #[tokio::test]
-async fn test_priority_override_delegates_rejection_replacement_capability() {
+async fn test_priority_override_delegates_deadline_rejection_replacement_capability() {
     let mut audit = make_plugin_config_with_json(
         "audit",
         "ai_transcript_audit",
@@ -2959,6 +2959,32 @@ async fn test_priority_override_delegates_rejection_replacement_capability() {
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
     assert!(plugins[0].may_replace_rejection_response());
+}
+
+#[test]
+fn test_priority_override_delegates_spec_rejection_replacement_capability() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "spec_expose",
+        json!({"spec_url": "https://example.com/openapi.json"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(211);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "spec_expose");
+    assert_eq!(plugins[0].priority(), 211);
+    assert!(plugins[0].applies_after_proxy_on_reject());
+    assert!(plugins[0].may_replace_rejection_response());
+    assert!(!plugins[0].warn_on_rejection_response_replacement());
 }
 
 #[test]

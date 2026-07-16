@@ -270,7 +270,9 @@ reload.
 metrics with label names baked into the time-series store; chargeback is
 an in-memory accounting plugin; transaction_debugger emits debug-only
 traces. None of them serialize summaries for shipping, so customization
-doesn't apply.
+doesn't apply. The transaction debugger's config is otherwise closed as well:
+only `redacted_headers` is accepted, and every other unsupported key is
+rejected rather than ignored.
 
 ## Validation
 

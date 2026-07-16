@@ -348,6 +348,9 @@ impl Plugin for PriorityOverridePlugin {
     fn may_replace_rejection_response(&self) -> bool {
         self.inner.may_replace_rejection_response()
     }
+    fn warn_on_rejection_response_replacement(&self) -> bool {
+        self.inner.warn_on_rejection_response_replacement()
+    }
     fn requires_response_body_buffering(&self) -> bool {
         self.inner.requires_response_body_buffering()
     }

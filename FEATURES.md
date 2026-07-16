@@ -168,7 +168,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ### Spec Expose Plugin
 
-- **Spec Expose** — exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a `/specz` sub-path of each proxy's listen path. Fetches the spec from a configured upstream URL and returns it to the caller with the upstream's `Content-Type` preserved. The `/specz` endpoint is unauthenticated — the plugin short-circuits before authentication runs, so consumers can discover API contracts without credentials. Supports per-plugin TLS verification skip for internal endpoints with self-signed certificates. Only works with prefix-based `listen_path` proxies.
+- **Spec Expose** — exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) through `GET` and bodyless `HEAD` on a canonical `/specz` sub-path of each prefix-based listen path, including trailing-slash prefixes. Without an explicit trusted override, only supported spec media types are preserved from upstream and every other value falls back to `application/octet-stream`; responses include `nosniff`. The unauthenticated endpoint uses bounded single-flight fetch admission, short negative-cache backoff, response-size limits, egress screening, credential-safe diagnostics, and fail-closed custom-CA handling. It short-circuits before authentication but after IP and bot controls.
 
 ### SSE Plugin
 

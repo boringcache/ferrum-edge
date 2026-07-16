@@ -256,7 +256,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
 | `api_chargeback_sink` | | ✓ | Exports durable stream charge events or snapshot deltas to ClickHouse |
 | `workload_metrics` | ✓ | ✓ | Adds direction-aware mesh source/destination labels to stream metadata and emits mesh spans when Telemetry providers are configured |
-| `transaction_debugger` | | ✓ | Prints debug info for stream connections |
+| `transaction_debugger` | | ✓ | Prints typed terminal diagnostics for stream connections |
 
 ### When Hooks Fire
 
@@ -270,6 +270,16 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 ## WebSocket Frame Lifecycle (`on_ws_frame`)
 
 WebSocket connections go through the normal HTTP plugin pipeline during the upgrade handshake — authentication, authorization, rate limiting, and all other HTTP phases execute before the connection is upgraded. Once the WebSocket upgrade completes, the frame-level hooks kick in.
+
+Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
+after both relay directions finish, including clean closes, typed errors, drain
+timeouts, and upgrades that never establish frame flow. The disconnect-plugin
+list is cloned from the same request-generation snapshot that accepted the
+upgrade, so a configuration reload cannot mix plugin generations within a live
+session. `transaction_debugger` emits the ordinary HTTP handshake terminal
+diagnostic plus one WebSocket terminal diagnostic. Both expose the same
+selected `request_id` / `trace_id` correlation metadata when present, after
+central sensitivity classification; neither dumps raw metadata.
 
 The `on_ws_frame` phase fires for every **Text**, **Binary**, **Ping**, and **Pong** frame in both directions:
 
@@ -470,7 +480,7 @@ Given all built-in plugins enabled, the execution order is:
 | 72 | `loki_logging` | 9155 | log, on_stream_disconnect |
 | 73 | `udp_logging` | 9160 | log, on_stream_disconnect |
 | 74 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 75 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 75 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect, on_ws_disconnect |
 | 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
 | 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect, on_ws_disconnect |
 | 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
@@ -508,7 +518,7 @@ Browser preflight (`OPTIONS`) requests must be answered before authentication. I
 
 ### Spec expose runs after IP restriction and bot detection (priority 210)
 
-`spec_expose` intercepts `GET {listen_path}/specz` requests and returns the API specification document without proxying. It runs at priority 210 — after IP restriction (150) and bot detection (200) so blocked IPs and bots cannot access spec endpoints, but before all authentication plugins (950+). This makes the `/specz` endpoint unauthenticated by design, allowing legitimate API consumers to discover contracts without credentials while still enforcing network-level security policies.
+`spec_expose` intercepts `GET` and `HEAD` at the canonical `{listen_path}/specz` resource and returns the API specification without proxying. `HEAD` retains the GET representation until response-body transforms and guards establish the final status and headers, then suppresses the wire body. It runs at priority 210 — after IP restriction (150) and bot detection (200) so blocked IPs and bots cannot access spec endpoints, but before all authentication plugins (950+). This makes the `/specz` endpoint unauthenticated by design, allowing legitimate API consumers to discover contracts without credentials while still enforcing network-level security policies. Route-level `allowed_methods` admission still runs before the plugin.
 
 ### Authentication before authorization (1000s before 2000s)
 
