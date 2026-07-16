@@ -16417,6 +16417,18 @@ components:
     AiPromptCompressorConfig:
       type: object
       additionalProperties: false
+      allOf:
+        - if:
+            required: [request_family]
+            properties:
+              request_family:
+                const: text_completions
+          then:
+            properties:
+              compress_roles:
+                contains:
+                  type: string
+                  pattern: '^\s*[Uu][Ss][Ee][Rr]\s*$'
       description: "Plugin: ai_prompt_compressor — Shortens LLM prompt text to reduce token usage, cost, and latency using a bounded model-free statistical (extractive) filter. Rewrites messages[].content (per role) and the legacy top-level prompt only for admitted OpenAI Chat Completions or Text Completions representations. Code blocks, inline code, URLs, Unicode numbers, common identifiers, and negations are preserved verbatim. Successful rewrites reserialize the complete JSON body. No model files, network calls, or external services are used."
       properties:
         compress_roles:
@@ -16437,7 +16449,7 @@ components:
         min_content_tokens:
           type: integer
           minimum: 0
-          maximum: 262144
+          maximum: 131072
           default: 200
           description: "Estimated-token floor per content string. Content below this is passed through unchanged so short prompts are not mangled. Token counts are estimated (~4 characters per token); no model tokenizer is embedded."
         max_scan_bytes:
@@ -16445,7 +16457,7 @@ components:
           minimum: 1
           maximum: 1048576
           default: 1048576
-          description: "Skip compression when the request body exceeds this size. The immutable hard maximum is 1048576 bytes; eligible prompt text is additionally capped at 524288 bytes, 32768 whitespace-delimited units or emitted tokenizer entries, 256 rewritable fields, and 1024 preserve markers per body."
+          description: "Skip compression when the request body exceeds this size. The immutable hard maximum is 1048576 bytes; eligible prompt text is additionally capped at 524288 bytes, 32768 whitespace-delimited units or emitted tokenizer entries, 256 rewritable fields, and 1024 preserve markers per body. A transformed body is staged beside request metadata for wire-path reuse only when it is at most 65536 bytes."
         preserve_tag:
           type: string
           minLength: 1

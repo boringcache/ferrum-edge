@@ -72,10 +72,10 @@ original bytes.
 | --- | --- | --- | --- |
 | `compress_roles` | string[] | `["user"]` | Message roles whose `content` is compressed (case-insensitive). Must be non-empty. When it contains `user`, the legacy top-level `prompt` is compressed too. |
 | `target_ratio` | number | `0.5` | Fraction of word-tokens to keep. `0.5` targets ~50% reduction; `0.3` is more aggressive. Must be strictly between `0` and `1`. |
-| `min_content_tokens` | integer | `200` | Estimated-token floor per content string. Range `0..=262144`; content below this is passed through unchanged so short prompts are not mangled. |
+| `min_content_tokens` | integer | `200` | Estimated-token floor per content string. Range `0..=131072`; content below this is passed through unchanged so short prompts are not mangled. |
 | `max_scan_bytes` | integer | `1048576` | Skip compression entirely when the request body exceeds this many bytes. Range `1..=1048576`; the upper bound is immutable. |
 | `preserve_tag` | string | _(unset)_ | Optional marker name. Text wrapped in `<TAG>…</TAG>` is copied through verbatim and all markers are stripped. Nested spans are flattened; unmatched open text is preserved to the end; unmatched closes are stripped. May contain ASCII letters, digits, `-`, and `_`. |
-| `request_family` | string | `auto` | `auto` requires the body shape to agree with a standard `/chat/completions` or `/completions` path. Use `chat_completions` or `text_completions` only as an explicit assertion for a compatible custom endpoint. |
+| `request_family` | string | `auto` | `auto` requires the body shape to agree with a standard `/chat/completions` or `/completions` path. Use `chat_completions` or `text_completions` only as an explicit assertion for a compatible custom endpoint. Fixed `text_completions` configurations must include `user` in `compress_roles` because the top-level prompt is user text. |
 
 Token counts are **estimated** with a ~4-characters-per-token heuristic; the
 plugin embeds no model tokenizer, so `min_content_tokens` and the reported
@@ -91,6 +91,8 @@ bytes of lexical growth), and a process-wide eight-job admission budget prevents
 concurrent compressors from multiplying intermediate allocations. Admitted jobs
 run on Tokio's blocking worker pool instead of request executors; saturated or
 over-budget work passes through unchanged without joining a waiter queue.
+Reusable transformed-body staging is separately capped at 65,536 bytes; larger
+direct-dispatch prompts retain only the metadata representation.
 
 An empty config object (`{}`) is valid and applies the defaults: on standard
 OpenAI Chat/Text Completions paths, compress `user` content longer than ~200
@@ -150,11 +152,13 @@ On the standard backend-dispatch path, the context-aware request-body transform
 produces the compressed bytes actually sent upstream. For already-plaintext JSON
 uploads, `before_proxy` also rewrites `ctx.metadata["request_body"]` so direct
 dispatchers that consume that metadata can forward the compressed prompt. The
-plugin stages that result privately and reuses it when the authoritative input
-is unchanged; if an earlier wire transform changed the bytes, it discards the
+plugin stages results of at most 65,536 bytes privately and reuses them when the
+authoritative input is unchanged; larger results are not duplicated beside
+request metadata and are recomputed on normal wire dispatch under the same work
+budget. If an earlier wire transform changed the bytes, the plugin discards any
 stage and recomputes against the actual representation. Opt-in gzip/brotli
-decompression therefore compresses and measures the resulting plaintext once on
-the standard path. Compressed client uploads cannot be compressed for direct
+decompression therefore compresses and measures the resulting plaintext on the
+standard path. Compressed client uploads cannot be compressed for direct
 `ai_federation` dispatch because federation returns before request-body
 transforms run; use the standard backend-dispatch path for that combination.
 

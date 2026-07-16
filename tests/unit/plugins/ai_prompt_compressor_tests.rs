@@ -100,6 +100,7 @@ fn plugin_metadata_matches_registration() {
     assert!(plugin.modifies_request_body());
     assert!(plugin.requires_request_body_buffering());
     assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(plugin.needs_final_request_body_context());
 }
 
 #[test]
@@ -128,13 +129,14 @@ fn invalid_configs_rejected() {
         json!({"max_scan_bytes": 0}),
         json!({"max_scan_bytes": "1024"}),
         json!({"max_scan_bytes": 1_048_577}),
-        json!({"min_content_tokens": 262_145}),
+        json!({"min_content_tokens": 131_073}),
         json!({"preserve_tag": ""}),
         json!({"preserve_tag": " keep"}),
         json!({"preserve_tag": "keep "}),
         json!({"preserve_tag": "bad tag"}),
         json!({"preserve_tag": "no/slash"}),
         json!({"request_family": "images"}),
+        json!({"request_family": "text_completions", "compress_roles": ["system"]}),
         json!({"compress_role": ["system"]}),
         json!({"target_rato": 0.9}),
         json!({"compress_roles": null}),
@@ -156,11 +158,13 @@ fn valid_configs_accepted() {
         json!({"target_ratio": 0.3}),
         json!({"compress_roles": ["user", "system"]}),
         json!({"min_content_tokens": 0}),
+        json!({"min_content_tokens": 131_072}),
         json!({"max_scan_bytes": 2048}),
         json!({"preserve_tag": "keep-this_1"}),
         json!({"request_family": "auto"}),
         json!({"request_family": "chat_completions"}),
         json!({"request_family": "text_completions"}),
+        json!({"request_family": "text_completions", "compress_roles": [" User "]}),
     ] {
         assert!(
             AiPromptCompressor::new(&config).is_ok(),
@@ -787,6 +791,45 @@ async fn before_proxy_rewrites_metadata_and_records_stats() {
     assert!(ctx.metadata.keys().any(|key| {
         key.starts_with("ai_prompt_compressor.instances.") && key.ends_with(".tokens_saved")
     }));
+}
+
+#[tokio::test]
+async fn large_metadata_rewrite_still_produces_wire_body_beyond_stage_cap() {
+    let plugin = compressor(1, 0.9);
+    let words = (0..10_000)
+        .map(|mut index| {
+            let mut suffix = ['a'; 5];
+            for character in suffix.iter_mut().rev() {
+                *character = char::from(b'a' + (index % 26) as u8);
+                index /= 26;
+            }
+            format!("meaningful{}", suffix.iter().collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body = chat_body("user", &words);
+    let original = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        ctx.metadata["request_body"].len() > 65_536,
+        "fixture must exercise the no-large-private-stage path"
+    );
+
+    let wire = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &original,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("large unstaged metadata rewrite must recompute for wire dispatch");
+    let parsed: Value = serde_json::from_slice(&wire).unwrap();
+    assert!(first_message_content(&parsed).len() < words.len());
+    assert!(wire.len() > 65_536);
 }
 
 #[tokio::test]

@@ -44,10 +44,12 @@
 //!   `ctx.metadata["request_body"]` so any later `before_proxy` consumer that
 //!   dispatches directly from that metadata sends the compressed prompt. It also
 //!   records `ai_prompt_compressor.*` observability metadata.
-//! * The context-aware request-body transform reuses the staged result when the
-//!   source digest matches, or recomputes against an earlier transform's final
-//!   bytes. This hook produces the bytes actually sent upstream and replaces
-//!   provisional counters with authoritative wire counters.
+//! * The context-aware request-body transform reuses a staged result of at most
+//!   65,536 bytes when the source digest matches, or recomputes against an
+//!   earlier transform's final bytes. Larger direct-dispatch bodies retain only
+//!   their metadata representation. This hook produces the bytes actually sent
+//!   upstream and replaces provisional counters with authoritative wire
+//!   counters.
 //!   Compression is gated to POST requests: the context-aware variant checks
 //!   `ctx.method` (H1/H2 and the H3 cross-protocol bridge), and the no-context
 //!   compatibility variant requires explicit `:method` and `:path` pseudo-
@@ -77,6 +79,8 @@ const DEFAULT_MAX_SCAN_BYTES: usize = 1_048_576;
 const HARD_MAX_SCAN_BYTES: usize = 1_048_576;
 /// Maximum aggregate eligible prompt bytes considered in one body.
 const MAX_TARGET_TEXT_BYTES: usize = 524_288;
+/// Largest meaningful per-field token floor under the eligible-text ceiling.
+const MAX_MIN_CONTENT_TOKENS: usize = (MAX_TARGET_TEXT_BYTES + 3) / 4;
 /// Maximum aggregate whitespace-delimited units admitted before token allocation.
 const MAX_TOKEN_UNITS: usize = 32_768;
 /// Maximum independently rewritable text fields in one request body.
@@ -85,6 +89,8 @@ const MAX_TARGET_FIELDS: usize = 256;
 const MAX_PRESERVE_MARKERS: usize = 1_024;
 /// Maximum lexical growth allowed while reserializing the complete JSON body.
 const MAX_JSON_OUTPUT_GROWTH_BYTES: usize = 65_536;
+/// Maximum transformed body retained beside request metadata for wire-path reuse.
+const MAX_STAGED_OUTPUT_BYTES: usize = 65_536;
 /// Maximum simultaneous statistical compression jobs across all plugin instances.
 const MAX_CONCURRENT_COMPRESSIONS: usize = 8;
 
@@ -145,8 +151,8 @@ struct CompressionStats {
     fields_compressed: usize,
 }
 
-/// Compression staged in `before_proxy` for reuse by the authoritative wire
-/// transform when no earlier transform changed the source representation.
+/// Bounded compression staged in `before_proxy` for reuse by the authoritative
+/// wire transform when no earlier transform changed the source representation.
 #[derive(Clone, Debug)]
 pub(crate) struct StagedCompression {
     source_len: usize,
@@ -238,11 +244,10 @@ impl AiPromptCompressor {
 
         let min_content_tokens =
             optional_usize(config, "min_content_tokens")?.unwrap_or(DEFAULT_MIN_CONTENT_TOKENS);
-        let maximum_estimated_tokens = HARD_MAX_SCAN_BYTES.div_ceil(4);
-        if min_content_tokens > maximum_estimated_tokens {
+        if min_content_tokens > MAX_MIN_CONTENT_TOKENS {
             return Err(format!(
                 "ai_prompt_compressor: 'min_content_tokens' must not exceed \
-                 {maximum_estimated_tokens}"
+                 {MAX_MIN_CONTENT_TOKENS}"
             ));
         }
 
@@ -298,6 +303,13 @@ impl AiPromptCompressor {
                 ));
             }
         };
+        if request_family == RequestFamilyPolicy::TextCompletions && !compress_prompt_field {
+            return Err(
+                "ai_prompt_compressor: 'compress_roles' must include 'user' when \
+                 'request_family' is 'text_completions'"
+                    .to_string(),
+            );
+        }
 
         Ok(Self {
             instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
@@ -939,6 +951,13 @@ impl Plugin for AiPromptCompressor {
         true
     }
 
+    fn needs_final_request_body_context(&self) -> bool {
+        // The context-aware transform owns method/path admission, staged-result
+        // reuse, and final-wire statistics. Opt in even when no other active
+        // body plugin needs a final-hook context.
+        true
+    }
+
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         ctx.method == "POST"
             && (self.request_family != RequestFamilyPolicy::Auto
@@ -984,19 +1003,31 @@ impl Plugin for AiPromptCompressor {
         }
         let source_len = body.len();
 
-        if let Some(compression) = self.compress_body(body.as_bytes(), Some(&ctx.path)).await
-            && let Ok(serialized) = String::from_utf8(compression.output.clone())
-        {
+        if let Some(compression) = self.compress_body(body.as_bytes(), Some(&ctx.path)).await {
+            // Direct dispatchers consume the metadata representation and can
+            // await a provider without ever running body transforms. Retain a
+            // second representation only below a strict ceiling; larger bodies
+            // are recomputed for normal wire dispatch under the same work
+            // budget instead of remaining duplicated across provider latency.
+            let staged_output = (compression.output.len() <= MAX_STAGED_OUTPUT_BYTES)
+                .then(|| compression.output.clone());
+            let Ok(serialized) = String::from_utf8(compression.output) else {
+                return PluginResult::Continue;
+            };
             ctx.metadata.insert("request_body".to_string(), serialized);
-            ctx.ai_prompt_compressor_staged.insert(
-                self.instance_id,
-                StagedCompression {
-                    source_len,
-                    source_sha256: compression.source_sha256,
-                    output: compression.output,
-                    stats: compression.stats.clone(),
-                },
-            );
+            if let Some(output) = staged_output {
+                ctx.ai_prompt_compressor_staged.insert(
+                    self.instance_id,
+                    StagedCompression {
+                        source_len,
+                        source_sha256: compression.source_sha256,
+                        output,
+                        stats: compression.stats.clone(),
+                    },
+                );
+            } else {
+                ctx.ai_prompt_compressor_staged.remove(&self.instance_id);
+            }
             record_stats_metadata(ctx, self.instance_id, &compression.stats);
             debug!(
                 original_tokens = compression.stats.original_tokens,

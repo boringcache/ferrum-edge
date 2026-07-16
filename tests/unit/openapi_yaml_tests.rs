@@ -1994,10 +1994,11 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
         json!({}),
         json!({"compress_roles": ["user", "system"]}),
         json!({"target_ratio": 0.25}),
-        json!({"min_content_tokens": 262144}),
+        json!({"min_content_tokens": 131072}),
         json!({"max_scan_bytes": 1048576}),
         json!({"preserve_tag": "keep-this_1"}),
         json!({"request_family": "chat_completions"}),
+        json!({"request_family": "text_completions", "compress_roles": [" User "]}),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
@@ -2015,8 +2016,10 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
         json!({"target_ratio": null}),
         json!({"min_content_tokens": null}),
         json!({"max_scan_bytes": 1048577}),
+        json!({"min_content_tokens": 131073}),
         json!({"preserve_tag": null}),
         json!({"request_family": "images"}),
+        json!({"request_family": "text_completions", "compress_roles": ["system"]}),
     ] {
         assert!(
             validator.validate(&config).is_err(),
