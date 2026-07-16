@@ -167,10 +167,7 @@ fn transaction_log_schema_closed_object_keys_match_openapi() {
             METADATA_POLICY_KEYS,
         ),
     ] {
-        let runtime: BTreeSet<String> = runtime_keys
-            .iter()
-            .map(|key| (*key).to_string())
-            .collect();
+        let runtime: BTreeSet<String> = runtime_keys.iter().map(|key| (*key).to_string()).collect();
         assert_eq!(runtime, schema_property_names(&spec, label, pointer));
     }
 

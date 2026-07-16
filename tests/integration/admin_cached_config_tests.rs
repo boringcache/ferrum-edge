@@ -1575,22 +1575,12 @@ async fn transaction_log_schema_crud_validates_the_prospective_database_graph() 
 
     let mut renamed = schema.clone();
     renamed["config"] = json!({"schemas": {"renamed": {}}});
-    let (status, body) = admin_put(
-        &base_url,
-        "/plugins/config/schema-owner",
-        &token,
-        &renamed,
-    )
-    .await;
+    let (status, body) =
+        admin_put(&base_url, "/plugins/config/schema-owner", &token, &renamed).await;
     assert_eq!(status, 400, "dangling rename was admitted: {body:?}");
     assert!(body.to_string().contains("unknown schema 'audit'"));
 
-    let (status, body) = admin_delete(
-        &base_url,
-        "/plugins/config/schema-owner",
-        &token,
-    )
-    .await;
+    let (status, body) = admin_delete(&base_url, "/plugins/config/schema-owner", &token).await;
     assert_eq!(status, 400, "dangling delete was admitted: {body:?}");
     assert!(body.to_string().contains("unknown schema 'audit'"));
 }
@@ -1657,22 +1647,12 @@ async fn transaction_log_schema_batch_and_restore_are_definition_order_independe
             "config": {"schema_ref": "missing"}
         }]
     });
-    let (status, body) = admin_post(
-        &base_url,
-        "/restore?confirm=true",
-        &token,
-        &invalid_restore,
-    )
-    .await;
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &invalid_restore).await;
     assert_eq!(status, 400, "dangling restore was admitted: {body:?}");
     assert!(body.to_string().contains("unknown schema 'missing'"));
 
-    let (status, _, _) = admin_get(
-        &base_url,
-        "/plugins/config/restore-schema",
-        &token,
-    )
-    .await;
+    let (status, _, _) = admin_get(&base_url, "/plugins/config/restore-schema", &token).await;
     assert_eq!(
         status,
         reqwest::StatusCode::OK,

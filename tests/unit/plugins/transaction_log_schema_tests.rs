@@ -207,10 +207,7 @@ fn test_unknown_derived_field_entry_key_rejected_with_path() {
     }))
     .expect_err("unknown derived-field keys must be rejected");
     assert!(err.contains("[audit]"), "got: {err}");
-    assert!(
-        err.contains("derived_fields[0].from"),
-        "got: {err}"
-    );
+    assert!(err.contains("derived_fields[0].from"), "got: {err}");
 }
 
 #[test]

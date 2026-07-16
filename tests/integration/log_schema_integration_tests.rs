@@ -48,12 +48,7 @@ fn registry_lock() -> registry::ReloadBracketTestGuard {
     registry::lock_for_tests()
 }
 
-fn graph_plugin(
-    id: &str,
-    namespace: &str,
-    plugin_name: &str,
-    config: Value,
-) -> PluginConfig {
+fn graph_plugin(id: &str, namespace: &str, plugin_name: &str, config: Value) -> PluginConfig {
     PluginConfig {
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),
@@ -128,7 +123,9 @@ fn prospective_graph_rejects_duplicate_names_and_dangling_renames_or_deletes() {
     ])
     .expect_err("duplicate names across schema instances must be rejected");
     assert!(
-        duplicate.iter().any(|error| error.contains("registered more than once")),
+        duplicate
+            .iter()
+            .any(|error| error.contains("registered more than once")),
         "unexpected duplicate errors: {duplicate:?}"
     );
 

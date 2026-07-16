@@ -2168,10 +2168,7 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
     let mut new_schema = old_schema;
     new_schema.config = json!({"schemas": {"after": {}}});
     new_schema.updated_at += chrono::Duration::seconds(1);
-    let new_config = make_config(
-        vec![make_proxy("p1", "/api", vec![])],
-        vec![new_schema],
-    );
+    let new_config = make_config(vec![make_proxy("p1", "/api", vec![])], vec![new_schema]);
     let delta = ConfigDelta::compute(&old_config, &new_config);
     let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
     cache

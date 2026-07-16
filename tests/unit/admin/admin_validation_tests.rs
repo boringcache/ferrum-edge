@@ -297,10 +297,9 @@ fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
             created_at: now,
             updated_at: now,
         };
-        let error = ferrum_edge::_test_support::validate_admin_plugin_config_for_test(
-            &plugin_config,
-        )
-        .expect_err("admin constructor validation must reject unknown keys");
+        let error =
+            ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config)
+                .expect_err("admin constructor validation must reject unknown keys");
         assert!(error.contains(expected_path), "unexpected error: {error}");
     }
 }

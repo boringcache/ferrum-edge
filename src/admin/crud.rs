@@ -239,9 +239,9 @@ pub(crate) async fn validate_transaction_log_schema_candidates(
         .map_err(AfterValidateError::Db)?;
 
     if let Some(removed_plugin_id) = removed_plugin_id {
-        candidate.plugin_configs.retain(|plugin| {
-            plugin.namespace != namespace || plugin.id != removed_plugin_id
-        });
+        candidate
+            .plugin_configs
+            .retain(|plugin| plugin.namespace != namespace || plugin.id != removed_plugin_id);
     }
     for plugin in plugins {
         if let Some(existing) = candidate
@@ -2082,9 +2082,8 @@ impl AdminResource for PluginConfig {
         )
         .await?;
         if crate::plugins::transaction_log_schema::participates_in_config_graph(resource)
-            || existing.is_some_and(
-                crate::plugins::transaction_log_schema::participates_in_config_graph,
-            )
+            || existing
+                .is_some_and(crate::plugins::transaction_log_schema::participates_in_config_graph)
         {
             validate_transaction_log_schema_candidates(
                 db,

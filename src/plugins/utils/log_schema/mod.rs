@@ -714,9 +714,7 @@ fn parse_derived_fields(
     let mut out = Vec::with_capacity(arr.len());
     for (index, entry) in arr.iter().enumerate() {
         let obj = entry.as_object().ok_or_else(|| {
-            format!(
-                "{plugin_name}: schema 'derived_fields[{index}]' entry must be an object"
-            )
+            format!("{plugin_name}: schema 'derived_fields[{index}]' entry must be an object")
         })?;
         for key in obj.keys() {
             if !DERIVED_FIELD_KEYS.contains(&key.as_str()) {
@@ -736,9 +734,7 @@ fn parse_derived_fields(
                 )
             })?;
         let kind_str = obj.get("kind").and_then(Value::as_str).ok_or_else(|| {
-            format!(
-                "{plugin_name}: schema 'derived_fields[{index}]' entry '{name}' missing 'kind'"
-            )
+            format!("{plugin_name}: schema 'derived_fields[{index}]' entry '{name}' missing 'kind'")
         })?;
         let kind = DerivedKind::parse(kind_str)?;
         if is_sensitive_metadata_key(name) {
