@@ -2763,16 +2763,38 @@ pub async fn handle_post_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    if let Err(error) = run_api_spec_persistence_while_held(
-        db.clone(),
-        namespace,
-        _namespace_config_admission_guard,
-        db.submit_api_spec_bundle(&bundle, &spec),
-        compensate_late_api_spec_create(db.clone(), bundle.clone(), spec.clone(), state),
-        true,
-    )
+    let settlement_db = db.clone();
+    let persistence_db = db.clone();
+    let compensation_db = db.clone();
+    let settlement_namespace = namespace.to_string();
+    let persistence_bundle = bundle.clone();
+    let persistence_spec = spec.clone();
+    let compensation_bundle = bundle.clone();
+    let compensation_spec = spec.clone();
+    let settlement_state = state.clone();
+    let persistence = tokio::spawn(async move {
+        run_api_spec_persistence_while_held(
+            settlement_db,
+            &settlement_namespace,
+            _namespace_config_admission_guard,
+            persistence_db.submit_api_spec_bundle(&persistence_bundle, &persistence_spec),
+            compensate_late_api_spec_create(
+                compensation_db,
+                compensation_bundle,
+                compensation_spec,
+                &settlement_state,
+            ),
+            true,
+        )
+        .await
+    })
     .await
-    {
+    .unwrap_or_else(|error| {
+        Err(ApiSpecError::Internal(format!(
+            "API-spec create persistence task failed: {error}"
+        )))
+    });
+    if let Err(error) = persistence {
         return Ok(error_response(error));
     }
 
@@ -2974,23 +2996,41 @@ pub async fn handle_put_api_spec(
     // Preserve original created_at
     spec.created_at = existing_spec.created_at;
 
-    if let Err(error) = run_api_spec_persistence_while_held(
-        db.clone(),
-        namespace,
-        _namespace_config_admission_guard,
-        db.replace_api_spec_bundle(&bundle, &spec),
-        compensate_late_api_spec_replace(
-            db.clone(),
-            bundle.clone(),
-            spec.clone(),
-            previous_bundle,
-            existing_spec.clone(),
-            state,
-        ),
-        true,
-    )
+    let settlement_db = db.clone();
+    let persistence_db = db.clone();
+    let compensation_db = db.clone();
+    let settlement_namespace = namespace.to_string();
+    let persistence_bundle = bundle.clone();
+    let persistence_spec = spec.clone();
+    let compensation_bundle = bundle.clone();
+    let compensation_spec = spec.clone();
+    let compensation_previous_spec = existing_spec.clone();
+    let settlement_state = state.clone();
+    let persistence = tokio::spawn(async move {
+        run_api_spec_persistence_while_held(
+            settlement_db,
+            &settlement_namespace,
+            _namespace_config_admission_guard,
+            persistence_db.replace_api_spec_bundle(&persistence_bundle, &persistence_spec),
+            compensate_late_api_spec_replace(
+                compensation_db,
+                compensation_bundle,
+                compensation_spec,
+                previous_bundle,
+                compensation_previous_spec,
+                &settlement_state,
+            ),
+            true,
+        )
+        .await
+    })
     .await
-    {
+    .unwrap_or_else(|error| {
+        Err(ApiSpecError::Internal(format!(
+            "API-spec replace persistence task failed: {error}"
+        )))
+    });
+    if let Err(error) = persistence {
         return Ok(error_response(error));
     }
 
@@ -3263,21 +3303,34 @@ pub async fn handle_delete_api_spec(
         }
     }
 
-    let persistence = match run_api_spec_persistence_while_held(
-        db.clone(),
-        namespace,
-        _namespace_config_admission_guard,
-        db.delete_api_spec(namespace, id),
-        compensate_late_api_spec_delete(
-            db.clone(),
-            previous_bundle,
-            existing.clone(),
-            additional_plugins,
-        ),
-        false,
-    )
+    let settlement_db = db.clone();
+    let persistence_db = db.clone();
+    let compensation_db = db.clone();
+    let settlement_namespace = namespace.to_string();
+    let persistence_id = id.to_string();
+    let compensation_spec = existing.clone();
+    let persistence = match tokio::spawn(async move {
+        run_api_spec_persistence_while_held(
+            settlement_db,
+            &settlement_namespace,
+            _namespace_config_admission_guard,
+            persistence_db.delete_api_spec(&settlement_namespace, &persistence_id),
+            compensate_late_api_spec_delete(
+                compensation_db,
+                previous_bundle,
+                compensation_spec,
+                additional_plugins,
+            ),
+            false,
+        )
+        .await
+    })
     .await
-    {
+    .unwrap_or_else(|error| {
+        Err(ApiSpecError::Internal(format!(
+            "API-spec delete persistence task failed: {error}"
+        )))
+    }) {
         Ok(result) => result,
         Err(error) => return Ok(error_response(error)),
     };
