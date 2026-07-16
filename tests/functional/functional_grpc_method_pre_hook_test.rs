@@ -74,10 +74,7 @@ async fn functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3()
     );
 
     let h3_client = Http3Client::insecure().expect("H3 client");
-    let h3_url = format!(
-        "https://localhost:{}/test.Policy/H3",
-        gateway.https_port
-    );
+    let h3_url = format!("https://localhost:{}/test.Policy/H3", gateway.https_port);
     let allowed_h3 = send_h3_grpc(&h3_client, &h3_url)
         .await
         .expect("allowed H3 gRPC request");
@@ -170,13 +167,8 @@ async fn start_gateway(
     drop(https_udp);
 
     let (shutdown_tx, _) = watch::channel(false);
-    let handles = ferrum_edge::modes::file::serve(
-        env_config,
-        config,
-        options,
-        shutdown_tx.clone(),
-    )
-    .await?;
+    let handles =
+        ferrum_edge::modes::file::serve(env_config, config, options, shutdown_tx.clone()).await?;
 
     Ok(RunningGateway {
         http_port,
@@ -301,26 +293,25 @@ async fn send_h3_grpc(
 fn assert_grpc_success(status: StatusCode, headers: &HeaderMap, body: &Bytes, protocol: &str) {
     assert_eq!(status, StatusCode::OK, "{protocol} gRPC HTTP status");
     assert_eq!(
-        headers.get("grpc-status").and_then(|value| value.to_str().ok()),
+        headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
         Some("0"),
         "{protocol} allowed request should reach the fake gRPC backend"
     );
     assert!(body.is_empty(), "{protocol} fake backend returns no DATA");
 }
 
-fn assert_grpc_rate_reject(
-    status: StatusCode,
-    headers: &HeaderMap,
-    body: &Bytes,
-    protocol: &str,
-) {
+fn assert_grpc_rate_reject(status: StatusCode, headers: &HeaderMap, body: &Bytes, protocol: &str) {
     assert_eq!(status, StatusCode::OK, "{protocol} gRPC rejection status");
     assert!(
         body.is_empty(),
         "{protocol} gRPC rate rejection must be trailers-only"
     );
     assert_eq!(
-        headers.get("grpc-status").and_then(|value| value.to_str().ok()),
+        headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
         Some("8"),
         "{protocol} rate rejection must be RESOURCE_EXHAUSTED"
     );
