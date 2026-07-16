@@ -139,7 +139,10 @@ impl Plugin for UdpRateLimiting {
 
     async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
         let over_capacity = self.maybe_evict();
-        let key = Arc::clone(&ctx.client_ip);
+        let key: Arc<str> = match super::utils::canonical_ip_text(ctx.client_ip.as_ref()) {
+            std::borrow::Cow::Borrowed(_) => Arc::clone(&ctx.client_ip),
+            std::borrow::Cow::Owned(canonical) => Arc::from(canonical),
+        };
 
         if over_capacity && !self.limiter.contains_local_key(&key) {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
@@ -150,7 +153,7 @@ impl Plugin for UdpRateLimiting {
             .limiter
             .check_with_redis_key(
                 Arc::clone(&key),
-                || Self::redis_ip_key(&ctx.client_ip),
+                || Self::redis_ip_key(key.as_ref()),
                 &UdpRateLimitOp {
                     datagram_size: ctx.datagram_size as u64,
                 },

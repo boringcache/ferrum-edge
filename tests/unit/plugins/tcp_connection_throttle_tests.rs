@@ -137,6 +137,27 @@ async fn test_tcp_connection_throttle_rejects_second_connection_for_same_ip() {
 }
 
 #[tokio::test]
+async fn test_tcp_connection_throttle_shares_mapped_ipv4_identity() {
+    let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+
+    let mut native = make_ctx("tcp-proxy", "192.0.2.10", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut native).await,
+        PluginResult::Continue
+    ));
+
+    let mut mapped = make_ctx("tcp-proxy", "::ffff:192.0.2.10", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut mapped).await,
+        PluginResult::Reject {
+            status_code: 429,
+            ..
+        }
+    ));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
+#[tokio::test]
 async fn test_tcp_connection_throttle_releases_slot_on_disconnect() {
     let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
 

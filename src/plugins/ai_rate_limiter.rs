@@ -255,9 +255,10 @@ impl AiRateLimiter {
             return key;
         }
 
-        let mut key = String::with_capacity(ctx.client_ip.len() + 3);
+        let client_ip = super::utils::canonical_ip_text(ctx.client_ip.as_str());
+        let mut key = String::with_capacity(client_ip.len() + 3);
         key.push_str("ip:");
-        key.push_str(&ctx.client_ip);
+        key.push_str(client_ip.as_ref());
         key
     }
 

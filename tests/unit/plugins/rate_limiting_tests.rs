@@ -137,6 +137,24 @@ async fn test_rate_limiting_plugin_ip_limiting() {
 }
 
 #[tokio::test]
+async fn test_rate_limiting_mapped_ipv4_shares_native_budget() {
+    let plugin = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "ip"
+    }));
+
+    let mut native = create_test_context();
+    native.client_ip = "192.0.2.10".to_string();
+    assert_continue(plugin.on_request_received(&mut native).await);
+
+    let mut mapped = create_test_context();
+    mapped.client_ip = "::ffff:192.0.2.10".to_string();
+    assert_reject(plugin.on_request_received(&mut mapped).await, 429);
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
+#[tokio::test]
 async fn test_rate_limiting_plugin_short_window() {
     let config = json!({
         "window_seconds": 1,

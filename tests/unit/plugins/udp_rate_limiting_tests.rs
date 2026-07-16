@@ -296,6 +296,24 @@ async fn tracked_keys_count_reflects_active_clients() {
     assert_eq!(plugin.tracked_keys_count(), Some(2));
 }
 
+#[tokio::test]
+async fn mapped_ipv4_shares_native_client_budget() {
+    let plugin = make_plugin(json!({"datagrams_per_second": 1}));
+
+    let native = make_ctx("192.0.2.10", 100);
+    assert_eq!(
+        plugin.on_udp_datagram(&native).await,
+        UdpDatagramVerdict::Forward
+    );
+
+    let mapped = make_ctx("::ffff:192.0.2.10", 100);
+    assert_eq!(
+        plugin.on_udp_datagram(&mapped).await,
+        UdpDatagramVerdict::Drop
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
 // ── Combined Limits ───────────────────────────────────────────────────
 
 #[tokio::test]

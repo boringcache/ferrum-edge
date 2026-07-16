@@ -2068,6 +2068,7 @@ Limits concurrent TCP connections per observed client identity on a per-proxy ba
 - Otherwise the key is `proxy:{proxy_id}:ip:{client_ip}`
 
 The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners.
+IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 before the fallback IP key is built, so the two textual forms share one connection budget.
 
 This makes plaintext TCP listeners IP-scoped, while TCP+TLS and UDP+DTLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP/UDP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
 
@@ -2149,27 +2150,28 @@ Restricts access based on the geographic location of the client IP address using
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `db_path` | String | (required) | Path to MaxMind `.mmdb` file |
-| `allow_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to allow (whitelist mode). Case-insensitive — normalized to uppercase at load. |
-| `deny_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to deny (blacklist mode). Case-insensitive — normalized to uppercase at load. |
-| `inject_headers` | bool | `false` | Inject `x-geo-country` (uppercase ISO code) into the proxied request. HTTP-family proxies only — ignored for TCP/UDP streams. |
+| `allow_countries` | String[] | `[]` | Currently assigned ISO 3166-1 alpha-2 country codes to allow (whitelist mode). Case-insensitive — normalized to uppercase at load. Reserved, user-assigned, deleted, alias, and nonexistent codes are rejected. |
+| `deny_countries` | String[] | `[]` | Currently assigned ISO 3166-1 alpha-2 country codes to deny (blacklist mode). Case-insensitive — normalized to uppercase at load. Reserved, user-assigned, deleted, alias, and nonexistent codes are rejected. |
+| `inject_headers` | bool | `false` | Inject `x-geo-country` (uppercase ISO code) into the proxied request. Client-supplied values are always stripped, including on fail-open lookups. HTTP-family proxies only — ignored for TCP/UDP streams. |
 | `on_lookup_failure` | String | `"allow"` | Action when GeoIP lookup fails (private IP, unallocated range, missing `.mmdb` on data plane): `allow` or `deny`. |
 
 `allow_countries` and `deny_countries` are mutually exclusive. At least one must be non-empty.
 
-Country code matches are O(1) — both lists are stored as `HashSet<String>` and compared in uppercase.
+Country code matches are O(1) and allocation-free on the default request path: codes are decoded as borrowed MMDB strings, packed into two bytes, and matched against precomputed bitsets. A `String` is created only when `inject_headers: true` emits an authoritative value.
+IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 before lookup, so both forms receive the same GeoIP decision.
 
-The `.mmdb` file is memory-mapped at plugin startup for zero-copy lookups on the hot path. A gateway restart (or config reload) is required to pick up a new database file.
+The `.mmdb` file is read into an owned immutable byte buffer at plugin startup. Ferrum fully verifies the search tree and data section, checks for a supported country-capable product (`GeoIP2`/`GeoLite2` Country or City, or GeoIP2 Enterprise), and scans the country record shape before publishing the plugin. This prevents external in-place updates from invalidating a live reader: existing plugin generations keep their immutable snapshot while a restart or config reload validates and publishes the replacement. A readable corrupt, incompatible, or wrong-product database is rejected; only an absent or unreadable node-local file degrades to `on_lookup_failure`.
 
 **CP/DP deployment note:** In control plane / data plane deployments, the `.mmdb` file only needs to exist on the **data plane** nodes where proxy traffic is handled. The control plane accepts `geo_restriction` plugin configs via the admin API without requiring the file locally. If the `.mmdb` file is missing on a data plane node at startup, the plugin degrades gracefully — all GeoIP lookups fall back to the `on_lookup_failure` policy (default: `allow`) until the file is deployed and the config is reloaded. Other proxies and plugins are unaffected.
 
 **Behavior by mode:**
 
-| Mode | Missing `.mmdb` file at startup |
-|------|-------------------------------|
-| **File** | Fatal — gateway refuses to start |
-| **Database** | Warning logged, plugin degrades to `on_lookup_failure` policy |
-| **Control Plane** | Admin API accepts config normally (CP does not proxy traffic) |
-| **Data Plane** | Warning logged, plugin degrades to `on_lookup_failure` policy; all other proxies/plugins work normally |
+| Mode | MMDB dependency behavior at startup/reload |
+|------|--------------------------------------------|
+| **File** | An absent, unreadable, or invalid file is fatal — the gateway refuses to publish the config. |
+| **Database** | Warning logged for an absent/unreadable file; plugin degrades to `on_lookup_failure`. Readable invalid files are rejected during plugin construction. |
+| **Control Plane** | No local-file existence requirement (CP does not proxy traffic); strict plugin structure is still validated. A readable invalid file is rejected if present at the configured path. |
+| **Data Plane** | Warning logged for an absent/unreadable node-local file and the plugin degrades to `on_lookup_failure`; a readable invalid file rejects the new plugin generation. |
 
 > **Note:** Ferrum Edge does not ship or bundle any GeoIP database. Operators are responsible for obtaining a MaxMind GeoIP2 or GeoLite2 `.mmdb` file, accepting MaxMind's license terms, and managing updates. GeoLite2 (free) requires a [MaxMind account](https://www.maxmind.com/en/geolite2/signup) and is subject to the [GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula). MaxMind publishes weekly database updates.
 
@@ -2228,6 +2230,8 @@ At least one rate window must be configured in every rule. Do not combine the cu
 - `limit_by: "consumer"` — Enforces in `authorize` phase (after auth), keyed by the authenticated identity: mapped consumer username when present, otherwise external `authenticated_identity`. Falls back to client IP if neither exists.
 - `limit_by: "spiffe_identity"` — Enforces in `authorize` phase (after `spiffe_identity`), keyed by `ctx.peer_spiffe_id`. Falls back to client IP if no peer SPIFFE identity exists.
 - Stream (`on_stream_connect`) — `consumer` mode uses the stream Consumer identity when available. `spiffe_identity` mode uses `peer_spiffe_id` metadata written by the stream `spiffe_identity` hook. Both modes fall back to client IP when their identity is absent.
+
+Every client-IP fallback canonicalizes IPv4-mapped IPv6 to native IPv4 before constructing local or Redis keys, so both textual forms share one budget.
 
 **Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
 
@@ -4237,6 +4241,8 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 `provider` is parsed case-insensitively and ignores surrounding whitespace.
 
+When `limit_by: "ip"`, IPv4-mapped IPv6 is canonicalized to native IPv4 before constructing local or Redis keys, so both textual forms share one token budget.
+
 **Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster. Database-backed token counters are intentionally unsupported.
 
 **Streaming token accounting**: SSE responses (Anthropic `message_start` / `message_delta`, OpenAI `stream_options.include_usage`) are counted when the final usage signal is available. Configure OpenAI-compatible clients to send `stream_options.include_usage: true` whenever possible. If a streamed 2xx response has no final usage, the default `on_unmetered_response: "charge_estimate"` keeps the pre-request reservation so streaming is not free. When only a partial token signal is observed (e.g., a `message_delta` carrying `output_tokens` without a preceding `message_start`), the available count is still recorded against the budget — partial information is preferred over dropping the request entirely. Token sums use saturating arithmetic.
@@ -4705,6 +4711,7 @@ Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm 
 | `redis_password` | String (optional) | — | Redis password |
 
 At least one of `datagrams_per_second` or `bytes_per_second` must be set; if both are configured each is enforced independently and the first to trip drops the datagram.
+IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 before local or Redis key construction, so both textual forms share one datagram and byte budget.
 
 **Counter storage** (`sync_mode`): UDP rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode centralizes datagram and byte counters across data planes and falls back to local counters while Redis is unavailable.
 

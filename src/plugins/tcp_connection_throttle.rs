@@ -86,13 +86,14 @@ impl TcpConnectionThrottle {
                 key
             }
             None => {
+                let client_ip = super::utils::canonical_ip_text(ctx.client_ip.as_str());
                 let mut key = String::with_capacity(
-                    "proxy::ip:".len() + ctx.proxy_id.len() + ctx.client_ip.len(),
+                    "proxy::ip:".len() + ctx.proxy_id.len() + client_ip.len(),
                 );
                 key.push_str("proxy:");
                 key.push_str(&ctx.proxy_id);
                 key.push_str(":ip:");
-                key.push_str(&ctx.client_ip);
+                key.push_str(client_ip.as_ref());
                 key
             }
         }

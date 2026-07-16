@@ -1,13 +1,91 @@
+use base64::Engine;
 use chrono::Utc;
 use ferrum_edge::config::types::{
     GatewayConfig, PluginConfig, PluginScope, default_namespace, validate_mmdb_file,
 };
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
+use http::{HeaderMap, HeaderValue};
 use serde_json::json;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
 
-// Note: geo_restriction tests that require actual .mmdb files are limited to
-// config validation tests. Full lookup tests would require a MaxMind test database.
+const COUNTRY_MMDB_B64: &str =
+    include_str!("../../fixtures/maxmind/GeoIP2-Country-Test.mmdb.b64");
+
+fn country_mmdb_bytes() -> Vec<u8> {
+    let encoded: String = COUNTRY_MMDB_B64.lines().collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("MaxMind fixture base64 decodes")
+}
+
+fn write_fixture(directory: &TempDir, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = directory.path().join(name);
+    std::fs::write(&path, bytes).expect("write generated MMDB fixture");
+    path
+}
+
+fn path_text(path: &Path) -> &str {
+    path.to_str().expect("temporary MMDB path is UTF-8")
+}
+
+fn replace_database_type(mut bytes: Vec<u8>) -> Vec<u8> {
+    const ORIGINAL: &[u8] = b"GeoIP2-Country";
+    const REPLACEMENT: &[u8] = b"GeoIP2-ASN-XYZ";
+    assert_eq!(ORIGINAL.len(), REPLACEMENT.len());
+    let offset = bytes
+        .windows(ORIGINAL.len())
+        .position(|window| window == ORIGINAL)
+        .expect("fixture contains its database type");
+    bytes[offset..offset + ORIGINAL.len()].copy_from_slice(REPLACEMENT);
+    bytes
+}
+
+fn partially_corrupt_mmdb(mut bytes: Vec<u8>) -> Vec<u8> {
+    let reader = maxminddb::Reader::from_source(bytes.as_slice())
+        .expect("valid fixture opens before corruption");
+    let search_tree_size = reader.metadata.node_count as usize
+        * reader.metadata.record_size as usize
+        / 4;
+    drop(reader);
+
+    for offset in 0..search_tree_size {
+        let original = bytes[offset];
+        bytes[offset] ^= 0xff;
+        let verification_rejects = maxminddb::Reader::from_source(bytes.as_slice())
+            .is_ok_and(|candidate| candidate.verify().is_err());
+        if verification_rejects {
+            return bytes;
+        }
+        bytes[offset] = original;
+    }
+    panic!("failed to derive a partially corrupt MMDB fixture");
+}
+
+fn request_context(client_ip: &str) -> RequestContext {
+    RequestContext::new(
+        client_ip.to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    )
+}
+
+fn materialized_spoofed_context(client_ip: &str) -> RequestContext {
+    let mut raw_headers = HeaderMap::new();
+    raw_headers.append(
+        "x-geo-country",
+        HeaderValue::from_static("attacker-first"),
+    );
+    raw_headers.append(
+        "x-geo-country",
+        HeaderValue::from_static("attacker-second"),
+    );
+    let mut ctx = request_context(client_ip);
+    ctx.set_raw_headers(raw_headers);
+    ctx.materialize_headers();
+    ctx
+}
 
 fn make_geo_plugin(id: &str, enabled: bool, config: serde_json::Value) -> PluginConfig {
     PluginConfig {
@@ -97,13 +175,72 @@ fn test_new_both_allow_and_deny_fails() {
 
 #[test]
 fn test_new_rejects_invalid_country_code() {
-    let config = json!({
-        "db_path": "/nonexistent/path/to/test.mmdb",
-        "allow_countries": ["USA"]
-    });
-    let result = GeoRestriction::new(&config);
-    assert!(result.is_err());
-    assert!(result.err().unwrap().contains("country code"));
+    for country in ["USA", " US ", "U1"] {
+        let config = json!({
+            "db_path": "/nonexistent/path/to/test.mmdb",
+            "allow_countries": [country]
+        });
+        let result = GeoRestriction::new(&config);
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("country code"));
+    }
+}
+
+#[test]
+fn test_new_rejects_unassigned_and_alias_country_codes() {
+    for country in ["ZZ", "EU", "UK", "XK"] {
+        let config = json!({
+            "db_path": "/nonexistent/path/to/test.mmdb",
+            "allow_countries": [country]
+        });
+        let result = GeoRestriction::new(&config);
+        assert!(result.is_err(), "unassigned code must be rejected: {country}");
+        assert!(result.err().unwrap().contains("unassigned"));
+    }
+}
+
+#[test]
+fn test_new_accepts_assigned_country_codes_case_insensitively() {
+    for country in ["ad", "uS", "Zw"] {
+        let config = json!({
+            "db_path": "/nonexistent/path/to/test.mmdb",
+            "allow_countries": [country]
+        });
+        assert!(
+            GeoRestriction::new(&config).is_ok(),
+            "assigned code must be accepted case-insensitively: {country}"
+        );
+    }
+}
+
+#[test]
+fn test_new_rejects_unknown_and_null_fields() {
+    for config in [
+        json!({
+            "db_path": "/nonexistent/path/to/test.mmdb",
+            "allow_countries": ["US"],
+            "on_lookup_failur": "deny"
+        }),
+        json!({
+            "db_path": "/nonexistent/path/to/test.mmdb",
+            "allow_countries": null
+        }),
+        json!({
+            "db_path": "/nonexistent/path/to/test.mmdb",
+            "allow_countries": ["US"],
+            "inject_headers": null
+        }),
+        json!({
+            "db_path": "/nonexistent/path/to/test.mmdb",
+            "allow_countries": ["US"],
+            "on_lookup_failure": null
+        }),
+    ] {
+        assert!(
+            GeoRestriction::new(&config).is_err(),
+            "strict config must reject {config}"
+        );
+    }
 }
 
 #[test]
@@ -225,6 +362,179 @@ async fn test_default_on_lookup_failure_is_allow_fail_open() {
     );
 }
 
+#[tokio::test]
+async fn valid_mmdb_preserves_direct_country_precedence() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+
+    // 89.160.20.112 is direct country SE and registered country DE in the
+    // generated upstream fixture. The direct country must win.
+    let deny_direct = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "deny_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let mut direct_ctx = request_context("89.160.20.112");
+    assert!(matches!(
+        deny_direct.on_request_received(&mut direct_ctx).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+
+    let deny_registered = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "deny_countries": ["DE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let mut registered_ctx = request_context("89.160.20.112");
+    assert!(matches!(
+        deny_registered
+            .on_request_received(&mut registered_ctx)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn valid_mmdb_canonicalizes_ipv4_mapped_ipv6_for_policy() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    let plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "deny_countries": ["SE"],
+        "on_lookup_failure": "allow"
+    }))
+    .unwrap();
+
+    for client_ip in ["89.160.20.112", "::ffff:89.160.20.112"] {
+        let mut ctx = request_context(client_ip);
+        assert!(
+            matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "native and mapped forms must receive the same country decision: {client_ip}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn authoritative_header_overwrites_spoof_only_after_successful_lookup() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    let plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "inject_headers": true,
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let mut ctx = materialized_spoofed_context("89.160.20.112");
+
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.headers.get("x-geo-country").map(String::as_str),
+        Some("SE")
+    );
+}
+
+#[tokio::test]
+async fn fail_open_never_forwards_client_country_assertion() {
+    for inject_headers in [false, true] {
+        let plugin = GeoRestriction::new(&json!({
+            "db_path": "/nonexistent/path/to/test.mmdb",
+            "allow_countries": ["US"],
+            "inject_headers": inject_headers,
+            "on_lookup_failure": "allow"
+        }))
+        .unwrap();
+        let mut ctx = materialized_spoofed_context("203.0.113.1");
+
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        assert!(!ctx.headers.contains_key("x-geo-country"));
+    }
+}
+
+#[tokio::test]
+async fn later_fail_open_instance_clears_an_earlier_instance_assertion() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    let authoritative = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "inject_headers": true,
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let fail_open = GeoRestriction::new(&json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "allow_countries": ["SE"],
+        "inject_headers": true,
+        "on_lookup_failure": "allow"
+    }))
+    .unwrap();
+    let mut ctx = materialized_spoofed_context("89.160.20.112");
+
+    assert!(matches!(
+        authoritative.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(ctx.headers.get("x-geo-country").unwrap(), "SE");
+    assert!(matches!(
+        fail_open.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(!ctx.headers.contains_key("x-geo-country"));
+}
+
+#[tokio::test]
+async fn live_reader_owns_bytes_across_in_place_update_and_reload() {
+    let directory = TempDir::new().unwrap();
+    let valid = country_mmdb_bytes();
+    let corrupt = partially_corrupt_mmdb(valid.clone());
+    let path = write_fixture(&directory, "country.mmdb", &valid);
+    let config = json!({
+        "db_path": path_text(&path),
+        "deny_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    });
+    let old_generation = GeoRestriction::new(&config).unwrap();
+
+    std::fs::write(&path, &corrupt).unwrap();
+    assert!(
+        GeoRestriction::new(&config).is_err(),
+        "a corrupt replacement must not publish"
+    );
+
+    let mut in_flight = request_context("89.160.20.112");
+    assert!(matches!(
+        old_generation.on_request_received(&mut in_flight).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+
+    std::fs::write(&path, &valid).unwrap();
+    assert!(
+        GeoRestriction::new(&config).is_ok(),
+        "a fully valid replacement can publish on reload"
+    );
+}
+
 // --- validate_mmdb_file tests ---
 
 #[test]
@@ -258,6 +568,70 @@ fn test_validate_mmdb_file_rejects_invalid_mmdb_contents() {
 
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("not a valid readable .mmdb"));
+}
+
+#[test]
+fn validate_mmdb_file_accepts_verified_country_fixture() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    assert!(validate_mmdb_file("geo_restriction.db_path", path_text(&path)).is_ok());
+}
+
+#[test]
+fn validate_mmdb_file_rejects_wrong_database_type() {
+    let directory = TempDir::new().unwrap();
+    let bytes = replace_database_type(country_mmdb_bytes());
+    let path = write_fixture(&directory, "asn.mmdb", &bytes);
+
+    let validation = validate_mmdb_file("geo_restriction.db_path", path_text(&path));
+    assert!(validation.is_err());
+    assert!(validation.err().unwrap().contains("unsupported database type"));
+    assert!(
+        GeoRestriction::new(&json!({
+            "db_path": path_text(&path),
+            "allow_countries": ["US"]
+        }))
+        .is_err(),
+        "constructor admission must reject a readable wrong-product database"
+    );
+}
+
+#[test]
+fn validate_mmdb_file_rejects_partial_corruption_after_open() {
+    let directory = TempDir::new().unwrap();
+    let bytes = partially_corrupt_mmdb(country_mmdb_bytes());
+    let reader = maxminddb::Reader::from_source(bytes.as_slice())
+        .expect("generated corruption must pass the shallow open step");
+    assert!(reader.verify().is_err());
+    let path = write_fixture(&directory, "corrupt.mmdb", &bytes);
+
+    let validation = validate_mmdb_file("geo_restriction.db_path", path_text(&path));
+    assert!(validation.is_err());
+    assert!(
+        validation
+            .err()
+            .unwrap()
+            .contains("failed comprehensive verification")
+    );
+    assert!(
+        GeoRestriction::new(&json!({
+            "db_path": path_text(&path),
+            "allow_countries": ["US"]
+        }))
+        .is_err(),
+        "constructor admission must reject a partially corrupt database"
+    );
+}
+
+#[test]
+fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
+    let source = include_str!("../../../src/plugins/geo_restriction.rs");
+    assert!(!source.contains("open_mmap"));
+    assert!(!source.contains("Reader<Mmap>"));
+    assert!(!source.contains("HashSet<String>"));
+    assert!(!source.contains("Option<String>"));
+    assert!(source.contains("decode_path(&maxminddb::path!"));
+    assert!(source.contains("CountrySet"));
 }
 
 // --- validate_plugin_file_dependencies tests ---
@@ -338,20 +712,20 @@ fn test_validate_plugin_file_deps_deduplicates_paths() {
     );
 }
 
-// --- modifies_request_headers capability ---
+// --- header mutation capability ---
 
 #[test]
-fn test_modifies_request_headers_true_when_inject_enabled() {
-    // The proxy uses this hint to take the explicit-clone code path; without
-    // it `before_proxy` modifications happen on a soon-to-be-restored buffer
-    // and the resulting behavior is fragile.
+fn test_injection_does_not_require_before_proxy_header_clone() {
+    // Geo assertions are stripped/replaced in on_request_received while the
+    // materialized request map is still authoritative. Keep the expensive
+    // before_proxy clone capability disabled even when injection is enabled.
     let config = json!({
         "db_path": "/nonexistent/path/test.mmdb",
         "allow_countries": ["US"],
         "inject_headers": true
     });
     let plugin = GeoRestriction::new(&config).unwrap();
-    assert!(plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_headers());
 }
 
 #[test]

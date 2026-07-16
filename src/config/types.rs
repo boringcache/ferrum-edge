@@ -4815,33 +4815,150 @@ fn validate_pkcs11_key_source(
     ))
 }
 
-/// Validate that a MaxMind `.mmdb` database file exists and can be parsed.
-/// This catches unreadable/corrupt/empty files so file-mode startup doesn't
-/// silently fail open when geo_restriction falls back to `on_lookup_failure`.
-/// Per-mode callers decide whether a failure is fatal (file mode), a warning
-/// (db mode), or a config-rejection (dp mode).
-pub fn validate_mmdb_file(field_name: &str, path: &str) -> Result<(), String> {
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        format!(
-            "{}: MaxMind database file '{}' not accessible: {}",
-            field_name, path, e
-        )
+/// Failure class for a country MMDB dependency.
+///
+/// A node-local file that is absent or unreadable remains eligible for the
+/// configured request-time lookup-failure policy. A file that was read but is
+/// corrupt, the wrong MaxMind product, or incompatible with country lookups is
+/// rejected instead of being published as an apparently working policy.
+#[derive(Debug)]
+pub enum CountryMmdbLoadError {
+    Unavailable(String),
+    Invalid(String),
+}
+
+impl std::fmt::Display for CountryMmdbLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(message) | Self::Invalid(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+fn is_supported_country_mmdb_type(database_type: &str) -> bool {
+    matches!(
+        database_type,
+        "GeoIP2-Country"
+            | "GeoLite2-Country"
+            | "GeoIP2-City"
+            | "GeoLite2-City"
+            | "GeoIP2-Enterprise"
+    )
+}
+
+fn is_mmdb_country_code(code: &str) -> bool {
+    code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
+/// Load and comprehensively validate a MaxMind country-capable database into
+/// an owned immutable buffer.
+///
+/// Owning the bytes keeps live readers independent from external in-place file
+/// rewrites and truncation. Verification traverses the complete search tree and
+/// data section, while the record scan proves that the advertised product is
+/// structurally compatible with the fields used by `geo_restriction`.
+pub fn load_validated_country_mmdb(
+    path: &str,
+) -> Result<maxminddb::Reader<Vec<u8>>, CountryMmdbLoadError> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        CountryMmdbLoadError::Unavailable(format!(
+            "MaxMind database file '{path}' not accessible: {e}"
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|e| {
+        CountryMmdbLoadError::Unavailable(format!(
+            "MaxMind database file '{path}' metadata not readable: {e}"
+        ))
     })?;
     if !metadata.is_file() {
-        return Err(format!(
-            "{}: '{}' exists but is not a regular file",
-            field_name, path
-        ));
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "'{path}' exists but is not a regular file"
+        )));
     }
-    // SAFETY: Validation is read-only and the file descriptor is scoped to
-    // this function. We do not mutate or truncate the file while mapped.
-    unsafe { maxminddb::Reader::open_mmap(path) }.map_err(|e| {
-        format!(
-            "{}: MaxMind database file '{}' is not a valid readable .mmdb: {}",
-            field_name, path, e
-        )
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| {
+        CountryMmdbLoadError::Unavailable(format!(
+            "MaxMind database file '{path}' not readable: {e}"
+        ))
     })?;
-    Ok(())
+    let reader = maxminddb::Reader::from_source(bytes).map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' is not a valid readable .mmdb: {e}"
+        ))
+    })?;
+
+    reader.verify().map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' failed comprehensive verification: {e}"
+        ))
+    })?;
+
+    if !is_supported_country_mmdb_type(&reader.metadata.database_type) {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' has unsupported database type '{}'; expected a GeoIP2/GeoLite2 Country or City database, or GeoIP2 Enterprise",
+            reader.metadata.database_type
+        )));
+    }
+
+    let mut found_country_code = false;
+    let networks = reader.networks(Default::default()).map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' cannot enumerate country records: {e}"
+        ))
+    })?;
+    for network in networks {
+        let lookup = network.map_err(|e| {
+            CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database file '{path}' contains an invalid network record: {e}"
+            ))
+        })?;
+        let country: Option<&str> = lookup
+            .decode_path(&maxminddb::path!["country", "iso_code"])
+            .map_err(|e| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' has an incompatible country record: {e}"
+                ))
+            })?;
+        let registered_country: Option<&str> = lookup
+            .decode_path(&maxminddb::path!["registered_country", "iso_code"])
+            .map_err(|e| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' has an incompatible registered-country record: {e}"
+                ))
+            })?;
+
+        for code in [country, registered_country].into_iter().flatten() {
+            if !is_mmdb_country_code(code) {
+                return Err(CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' contains an invalid country code {code:?}"
+                )));
+            }
+            found_country_code = true;
+        }
+    }
+
+    if !found_country_code {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' contains no country or registered-country ISO codes"
+        )));
+    }
+
+    Ok(reader)
+}
+
+/// Validate that a MaxMind `.mmdb` database file exists, is fully intact, and
+/// contains a supported country record shape. Per-mode callers decide whether
+/// a failure is fatal (file mode) or a warning (database mode); CP/DP skip this
+/// node-local dependency check.
+pub fn validate_mmdb_file(field_name: &str, path: &str) -> Result<(), String> {
+    load_validated_country_mmdb(path)
+        .map(|_| ())
+        .map_err(|error| format!("{field_name}: {error}"))
 }
 
 /// Validate a u64 field is within a range.
