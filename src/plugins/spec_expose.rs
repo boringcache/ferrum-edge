@@ -3,8 +3,9 @@
 //!
 //! When a `GET` or `HEAD` request arrives at `{listen_path}/specz`, the plugin
 //! fetches the specification document from the configured `spec_url` and
-//! returns it to the caller (`HEAD` returns representation headers only). The
-//! `/specz` endpoint is unauthenticated — it short-circuits
+//! returns it to the caller (`HEAD` retains the GET representation through
+//! response-body policy, then returns its final status and headers without a
+//! wire body). The `/specz` endpoint is unauthenticated — it short-circuits
 //! before the authentication phase so consumers can discover API contracts
 //! without credentials. Because it is anonymous and the upstream may be a
 //! distinct, less-trusted service, the served response sets
@@ -79,6 +80,10 @@ const ZERO_TTL_COALESCE_WINDOW: Duration = Duration::from_millis(100);
 /// Failed fetches back off from one second to a maximum of thirty seconds.
 const FAILURE_BACKOFF_BASE_SECONDS: u64 = 1;
 const FAILURE_BACKOFF_MAX_SECONDS: u64 = 30;
+/// Private request marker kept only until the rejection-response hook phase.
+/// It ensures HEAD carries the full GET representation through body policy and
+/// suppresses it only after those hooks have established the final metadata.
+const HEAD_RESPONSE_MARKER: &str = "ferrum:spec_expose_head_response";
 
 const CONFIG_KEYS: [&str; 5] = [
     "spec_url",
@@ -106,7 +111,7 @@ struct FetchFailure {
 }
 
 impl FetchFailure {
-    fn into_plugin_result(self, is_head: bool) -> PluginResult {
+    fn into_plugin_result(self) -> PluginResult {
         let mut headers = HashMap::with_capacity(3);
         headers.insert("content-type".to_string(), "application/json".to_string());
         headers.insert("content-length".to_string(), self.body.len().to_string());
@@ -116,7 +121,7 @@ impl FetchFailure {
         );
         PluginResult::Reject {
             status_code: self.status_code,
-            body: if is_head { String::new() } else { self.body },
+            body: self.body,
             headers,
         }
     }
@@ -590,12 +595,8 @@ fn url_has_userinfo(spec_url: &str) -> bool {
 }
 
 fn raw_url_authority(spec_url: &str) -> Option<&str> {
-    let Some((_, after_scheme)) = spec_url.split_once(':') else {
-        return None;
-    };
-    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
-        return None;
-    };
+    let (_, after_scheme) = spec_url.split_once(':')?;
+    let authority_and_path = after_scheme.strip_prefix("//")?;
     let authority_end = authority_and_path
         .find(['/', '?', '#'])
         .unwrap_or(authority_and_path.len());
@@ -676,13 +677,20 @@ impl Plugin for SpecExpose {
             return PluginResult::Continue;
         }
 
+        if is_head {
+            ctx.metadata
+                .insert(HEAD_RESPONSE_MARKER.to_string(), "true".to_string());
+        } else {
+            ctx.metadata.remove(HEAD_RESPONSE_MARKER);
+        }
+
         // Fast paths are lock-free. A cached failure is the completion state
         // shared by every caller during the backoff window.
         if let Some(entry) = self.cached_spec() {
-            return spec_response(entry, is_head);
+            return spec_response(entry);
         }
         if let Some(failure) = self.cached_failure() {
-            return failure.into_plugin_result(is_head);
+            return failure.into_plugin_result();
         }
 
         // Admit only a fixed number of cache-miss callers. One performs the
@@ -696,7 +704,7 @@ impl Plugin for SpecExpose {
                     503,
                     "API specification fetch is busy; retry after the indicated delay",
                 )
-                .into_plugin_result(is_head);
+                .into_plugin_result();
             }
         };
         let _guard = self.fetch_lock.lock().await;
@@ -704,10 +712,10 @@ impl Plugin for SpecExpose {
         // Re-check both outcomes after acquiring the single-flight lock: the
         // preceding caller may have completed successfully or failed.
         if let Some(entry) = self.cached_spec() {
-            return spec_response(entry, is_head);
+            return spec_response(entry);
         }
         if let Some(failure) = self.cached_failure() {
-            return failure.into_plugin_result(is_head);
+            return failure.into_plugin_result();
         }
 
         let entry = match self.fetch_spec().await {
@@ -716,15 +724,43 @@ impl Plugin for SpecExpose {
                 entry
             }
             Err(failure) => {
-                return self.record_failure(failure).into_plugin_result(is_head);
+                return self.record_failure(failure).into_plugin_result();
             }
         };
 
-        spec_response(entry, is_head)
+        spec_response(entry)
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if ctx.metadata.remove(HEAD_RESPONSE_MARKER).as_deref() != Some("true") {
+            return PluginResult::Continue;
+        }
+
+        // Synthetic response-body transforms and guards have already run when
+        // reject-path after_proxy hooks execute. Replace only the wire body now
+        // while retaining their final GET status and representation metadata.
+        PluginResult::RejectBinary {
+            status_code: response_status,
+            body: Bytes::new(),
+            headers: response_headers.clone(),
+        }
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    fn may_replace_rejection_response(&self) -> bool {
+        true
     }
 }
 
-fn spec_response(entry: CachedSpec, is_head: bool) -> PluginResult {
+fn spec_response(entry: CachedSpec) -> PluginResult {
     let mut headers = HashMap::with_capacity(3);
     headers.insert("content-type".to_string(), entry.content_type);
     headers.insert("content-length".to_string(), entry.body.len().to_string());
@@ -734,7 +770,7 @@ fn spec_response(entry: CachedSpec, is_head: bool) -> PluginResult {
     headers.insert("x-content-type-options".to_string(), "nosniff".to_string());
     PluginResult::RejectBinary {
         status_code: 200,
-        body: if is_head { Bytes::new() } else { entry.body },
+        body: entry.body,
         headers,
     }
 }

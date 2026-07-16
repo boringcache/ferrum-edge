@@ -774,10 +774,10 @@ async fn test_head_fetches_get_representation_then_reuses_it_without_a_body() {
     .unwrap();
 
     let mut head_ctx = make_ctx("HEAD", "/api/specz", "/api/");
-    let (head_status, head_body, head_headers) =
+    let (head_status, head_representation, mut head_headers) =
         reject_parts(plugin.on_request_received(&mut head_ctx).await);
     assert_eq!(head_status, 200);
-    assert!(head_body.is_empty());
+    assert_eq!(head_representation, BODY);
     assert_eq!(
         head_headers.get("content-type").map(String::as_str),
         Some("application/yaml")
@@ -794,6 +794,17 @@ async fn test_head_fetches_get_representation_then_reuses_it_without_a_body() {
             .map(String::as_str),
         Some("nosniff")
     );
+
+    // The full GET representation survives the body-hook phase. The plugin's
+    // reject-path after_proxy hook suppresses it only at finalization.
+    let (suppressed_status, suppressed_body, suppressed_headers) = reject_parts(
+        plugin
+            .after_proxy(&mut head_ctx, head_status, &mut head_headers)
+            .await,
+    );
+    assert_eq!(suppressed_status, head_status);
+    assert!(suppressed_body.is_empty());
+    assert_eq!(suppressed_headers, head_headers);
 
     let mut get_ctx = make_ctx("GET", "/api/specz?download=true", "/api/");
     let (get_status, get_body, get_headers) =
@@ -812,9 +823,10 @@ async fn test_head_failure_has_get_metadata_and_no_body() {
     .unwrap();
 
     let mut ctx = make_ctx("HEAD", "/api/specz", "/api");
-    let (status, body, headers) = reject_parts(plugin.on_request_received(&mut ctx).await);
+    let (status, representation, mut headers) =
+        reject_parts(plugin.on_request_received(&mut ctx).await);
     assert_eq!(status, 502);
-    assert!(body.is_empty());
+    assert!(!representation.is_empty());
     assert_eq!(
         headers.get("content-type").map(String::as_str),
         Some("application/json")
@@ -826,6 +838,14 @@ async fn test_head_failure_has_get_metadata_and_no_body() {
             .is_some_and(|value| value > 0)
     );
     assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
+
+    let (_, suppressed_body, suppressed_headers) = reject_parts(
+        plugin
+            .after_proxy(&mut ctx, status, &mut headers)
+            .await,
+    );
+    assert!(suppressed_body.is_empty());
+    assert_eq!(suppressed_headers, headers);
 }
 
 /// Finding #68: an attacker-controllable upstream must not be able to make the

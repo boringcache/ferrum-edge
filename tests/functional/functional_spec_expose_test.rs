@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
-const SPEC_BODY: &str = "openapi: 3.1.0\ninfo:\n  title: Ferrum\n";
+const SPEC_SOURCE_BODY: &str = r#"{"openapi":"3.1.0","info":{"title":"Ferrum"}}"#;
 
 struct StaticServer {
     port: u16,
@@ -101,30 +101,46 @@ plugin_configs:
     config:
       spec_url: "http://127.0.0.1:{spec_origin_port}/private/openapi.yaml?token=signed"
       cache_ttl_seconds: 60
+  - id: "spec-response-transform"
+    plugin_name: response_transformer
+    scope: global
+    enabled: true
+    config:
+      rules:
+        - operation: add
+          target: body
+          key: head_parity
+          value: checked
 "#
     )
 }
 
-fn assert_spec_metadata(headers: &HeaderMap) {
+fn assert_spec_metadata(headers: &HeaderMap) -> usize {
     assert_eq!(
         headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
-        Some("application/yaml")
+        Some("application/json")
     );
-    assert_eq!(
-        headers
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok()),
-        Some(SPEC_BODY.len())
-    );
+    let content_length = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("spec response Content-Length");
     assert_eq!(
         headers
             .get("x-content-type-options")
             .and_then(|value| value.to_str().ok()),
         Some("nosniff")
     );
+    content_length
+}
+
+fn assert_transformed_spec(body: &str) {
+    let document: serde_json::Value = serde_json::from_str(body).expect("transformed JSON spec");
+    assert_eq!(document["openapi"], "3.1.0");
+    assert_eq!(document["info"]["title"], "Ferrum");
+    assert_eq!(document["head_parity"], "checked");
 }
 
 async fn h3_request_until_ready(client: &Http3Client, url: &str, method: Method) -> Http3Response {
@@ -144,31 +160,58 @@ async fn h3_request_until_ready(client: &Http3Client, url: &str, method: Method)
     }
 }
 
+async fn spawn_spec_gateway(backend_port: u16, spec_origin_port: u16) -> (TestGateway, u16) {
+    const MAX_ATTEMPTS: usize = 5;
+    let mut last_error = String::new();
+
+    for _ in 0..MAX_ATTEMPTS {
+        let reservation = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) => {
+                last_error = error.to_string();
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        let https_port = match reservation.local_addr() {
+            Ok(address) => address.port(),
+            Err(error) => {
+                last_error = error.to_string();
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        drop(reservation);
+
+        let result = TestGateway::builder()
+            .mode_file(build_config(backend_port, spec_origin_port))
+            .log_level("warn")
+            .max_attempts(1)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+            .spawn()
+            .await;
+        match result {
+            Ok(gateway) => return (gateway, https_port),
+            Err(error) => {
+                last_error = error.to_string();
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    panic!("failed to spawn spec_expose H3 gateway after {MAX_ATTEMPTS} attempts: {last_error}");
+}
+
 #[ignore]
 #[tokio::test]
 async fn functional_spec_expose_get_head_path_and_method_contract_across_http_versions() {
-    let origin = StaticServer::start(SPEC_BODY, "application/yaml").await;
+    let origin = StaticServer::start(SPEC_SOURCE_BODY, "application/json").await;
     let backend = StaticServer::start("ordinary backend", "text/plain").await;
 
-    let https_reservation = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("reserve HTTPS port");
-    let https_port = https_reservation
-        .local_addr()
-        .expect("HTTPS reservation addr")
-        .port();
-    drop(https_reservation);
-
-    let mut gateway = TestGateway::builder()
-        .mode_file(build_config(backend.port, origin.port))
-        .log_level("warn")
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-        .spawn()
-        .await
-        .expect("start spec_expose gateway");
+    let (mut gateway, https_port) = spawn_spec_gateway(backend.port, origin.port).await;
     gateway
         .wait_for_proxy_port(Duration::from_secs(10))
         .await
@@ -185,15 +228,18 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
     // but returns metadata only.
     let h1_head = h1.head(&canonical).send().await.expect("H1 HEAD");
     assert_eq!(h1_head.status(), reqwest::StatusCode::OK);
-    assert_spec_metadata(h1_head.headers());
+    let representation_length = assert_spec_metadata(h1_head.headers());
+    assert!(representation_length > SPEC_SOURCE_BODY.len());
     assert!(h1_head.bytes().await.expect("H1 HEAD body").is_empty());
     assert_eq!(origin.hits(), 1);
     assert_eq!(backend.hits(), 0);
 
     let h1_get = h1.get(&canonical).send().await.expect("H1 GET");
     assert_eq!(h1_get.status(), reqwest::StatusCode::OK);
-    assert_spec_metadata(h1_get.headers());
-    assert_eq!(h1_get.text().await.expect("H1 GET body"), SPEC_BODY);
+    assert_eq!(assert_spec_metadata(h1_get.headers()), representation_length);
+    let h1_body = h1_get.text().await.expect("H1 GET body");
+    assert_eq!(h1_body.len(), representation_length);
+    assert_transformed_spec(&h1_body);
     assert_eq!(
         origin.hits(),
         1,
@@ -215,7 +261,8 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
         .send()
         .await
         .expect("H1 encoded separator");
-    assert_ne!(encoded.text().await.expect("encoded body"), SPEC_BODY);
+    let encoded_body = encoded.text().await.expect("encoded body");
+    assert!(!encoded_body.contains("\"openapi\""));
     assert_eq!(origin.hits(), 1);
 
     // Route method admission runs before the plugin and can exclude HEAD.
@@ -235,22 +282,25 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
         .expect("h2c client");
     let h2_get = h2.get(&canonical).send().await.expect("H2 GET");
     assert_eq!(h2_get.version(), reqwest::Version::HTTP_2);
-    assert_spec_metadata(h2_get.headers());
-    assert_eq!(h2_get.text().await.expect("H2 GET body"), SPEC_BODY);
+    assert_eq!(assert_spec_metadata(h2_get.headers()), representation_length);
+    let h2_body = h2_get.text().await.expect("H2 GET body");
+    assert_eq!(h2_body.len(), representation_length);
+    assert_transformed_spec(&h2_body);
     let h2_head = h2.head(&canonical).send().await.expect("H2 HEAD");
     assert_eq!(h2_head.version(), reqwest::Version::HTTP_2);
-    assert_spec_metadata(h2_head.headers());
+    assert_eq!(assert_spec_metadata(h2_head.headers()), representation_length);
     assert!(h2_head.bytes().await.expect("H2 HEAD body").is_empty());
 
     let h3 = Http3Client::insecure().expect("H3 client");
     let h3_url = format!("https://localhost:{https_port}/api/specz?download=true");
     let h3_get = h3_request_until_ready(&h3, &h3_url, Method::GET).await;
     assert_eq!(h3_get.status, StatusCode::OK);
-    assert_spec_metadata(&h3_get.headers);
-    assert_eq!(h3_get.body_text(), SPEC_BODY);
+    assert_eq!(assert_spec_metadata(&h3_get.headers), representation_length);
+    assert_eq!(h3_get.body_bytes.len(), representation_length);
+    assert_transformed_spec(&h3_get.body_text());
     let h3_head = h3_request_until_ready(&h3, &h3_url, Method::HEAD).await;
     assert_eq!(h3_head.status, StatusCode::OK);
-    assert_spec_metadata(&h3_head.headers);
+    assert_eq!(assert_spec_metadata(&h3_head.headers), representation_length);
     assert!(h3_head.body_bytes.is_empty());
 
     let h3_blocked_url = format!("https://localhost:{https_port}/blocked/specz");

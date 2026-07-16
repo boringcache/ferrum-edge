@@ -2591,7 +2591,7 @@ Rules are evaluated in order — first match wins. Regex paths use the same `~` 
 
 ### `spec_expose`
 
-Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a canonical `/specz` sub-path of each proxy's listen path. `GET` returns the configured specification and `HEAD` returns the same status and representation headers (including `Content-Type`, `Content-Length`, and `X-Content-Type-Options`) with no body. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
+Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a canonical `/specz` sub-path of each proxy's listen path. `GET` returns the configured specification and `HEAD` carries that GET representation through response-body transforms and guards before returning the same final status and representation headers (including `Content-Type`, `Content-Length`, and `X-Content-Type-Options`) with no wire body. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
 
 Useful for providing a common, discoverable pattern for API specifications across enterprise-wide APIs.
 

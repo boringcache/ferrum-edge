@@ -15008,7 +15008,7 @@ components:
     SpecExposeConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) for GET and HEAD on the canonical /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s). Failed fetches are coalesced and negatively cached with bounded exponential backoff; excess cache-miss waiters receive HTTP 503 with Retry-After."
+      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) for GET and HEAD on the canonical /specz sub-path. HEAD retains the GET representation through response-body policy, then returns the final status and representation headers without a wire body. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s). Failed fetches are coalesced and negatively cached with bounded exponential backoff; excess cache-miss waiters receive HTTP 503 with Retry-After."
       required:
         - spec_url
       properties:
