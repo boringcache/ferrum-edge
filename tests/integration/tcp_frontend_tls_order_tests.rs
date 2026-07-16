@@ -439,11 +439,9 @@ async fn assert_backend_was_dialed(accepted: &AtomicUsize) {
 
 /// Pulls a stream summary out of stdout captured by [`StdoutRedirect`].
 /// `stdout_logging` writes its JSON line straight to the process's
-/// stdout fd — through the non-blocking stdout writer in the binary, or
-/// a direct synchronous write in-process (as here, where the binary's
-/// `init_logging` never installs that writer) — never through a
-/// `tracing_subscriber::fmt`-backed buffer. The matching summary is the
-/// JSON line carrying our proxy id.
+/// stdout fd through the installed non-blocking stdout sink, never through
+/// a `tracing_subscriber::fmt`-backed buffer. The matching summary is the JSON
+/// line carrying our proxy id.
 fn parse_direct_write_stream_summary(captured: &str) -> Option<Value> {
     captured
         .lines()
@@ -454,16 +452,14 @@ fn parse_direct_write_stream_summary(captured: &str) -> Option<Value> {
 }
 
 /// `libc::dup2` redirect of `STDOUT_FILENO` into a tempfile, so a test can
-/// observe what `stdout_logging` (which writes directly to
-/// `std::io::stdout()` post-#1131) emits. The returned guard restores the
-/// original stdout fd on drop, even on panic.
+/// observe what the injected non-blocking `stdout_logging` sink emits. The
+/// returned guard restores the original stdout fd on drop, even on panic.
 ///
 /// Safe under nextest's process-per-test model: the redirect is process-
 /// global, but nextest gives every test its own process so the redirect
 /// can't bleed into another test. The single-threaded `current_thread`
-/// runtime keeps gateway/listener tasks on the same process whose stdout
-/// is redirected, so their `writeln!(std::io::stdout(), …)` lands in the
-/// tempfile.
+/// runtime keeps gateway/listener tasks and the sink worker in the same
+/// process whose stdout is redirected, so the record lands in the tempfile.
 #[cfg(unix)]
 struct StdoutRedirect {
     file: tempfile::NamedTempFile,
@@ -582,14 +578,34 @@ async fn tcp_tls_frontend_handshake_failure_does_not_connect_backend() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn tcp_tls_frontend_handshake_failure_logs_client_side_disconnect_summary() {
-    // `stdout_logging` writes its stream summary straight to the
-    // process's stdout fd, not through a `tracing_subscriber::fmt`
-    // writer (in-process, the binary's non-blocking writer is never
-    // installed, so the plugin's synchronous stdout fallback runs).
-    // Capture stdout at the libc fd level instead. Safe under nextest's
-    // process-per-test (this is the model `test-integration` uses); the
+    // Capture stdout at the libc fd level, then explicitly install the same
+    // bounded non-blocking sink shape that the binary installs. Safe under
+    // nextest's process-per-test model (used by `test-integration`); the
     // redirect is undone on `Drop` for resilience against panic.
     let stdout_capture = StdoutRedirect::install();
+    let sink_options = ferrum_edge::logging::NonBlockingOptions {
+        record_capacity: 8,
+        byte_capacity: 512 * 1024,
+        max_record_bytes: 64 * 1024,
+        shutdown_timeout: Duration::from_secs(1),
+    };
+    let (stdout_sink, mut stdout_guard) = ferrum_edge::logging::NonBlockingSink::spawn(
+        ferrum_edge::logging::SinkName::Stdout,
+        std::io::stdout(),
+        sink_options,
+    )
+    .expect("spawn test stdout sink");
+    let (stderr_sink, mut stderr_guard) = ferrum_edge::logging::NonBlockingSink::spawn(
+        ferrum_edge::logging::SinkName::Stderr,
+        std::io::sink(),
+        sink_options,
+    )
+    .expect("spawn test stderr sink");
+    stdout_sink
+        .set_failure_fallback(stderr_sink.clone())
+        .expect("install separate test stderr fallback");
+    ferrum_edge::logging::set_process_log_sinks(stdout_sink, stderr_sink)
+        .expect("install test process log sinks");
 
     let backend = reserve_port().await.expect("reserve backend port");
     let backend_port = backend.local_addr().expect("backend addr").port();
@@ -618,7 +634,8 @@ async fn tcp_tls_frontend_handshake_failure_logs_client_side_disconnect_summary(
     // stream summary (or we exceed `TEST_TIMEOUT`).
     let summary = {
         let mut summary = None;
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+        while std::time::Instant::now() < deadline {
             if let Some(found) = parse_direct_write_stream_summary(&stdout_capture.drain()) {
                 summary = Some(found);
                 break;
@@ -659,6 +676,8 @@ async fn tcp_tls_frontend_handshake_failure_logs_client_side_disconnect_summary(
     backend_task.abort();
     let _ = backend_task.await;
     shutdown_gateway_or_panic(shutdown_tx, join).await;
+    assert!(stdout_guard.shutdown(), "test stdout sink should drain");
+    assert!(stderr_guard.shutdown(), "test stderr sink should drain");
     drop(stdout_capture);
 }
 
