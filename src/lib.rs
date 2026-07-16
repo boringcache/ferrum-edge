@@ -322,6 +322,12 @@ pub mod _test_support {
         )
     }
 
+    pub async fn lock_namespace_config_admission_for_test(
+        namespace: &str,
+    ) -> tokio::sync::MutexGuard<'static, ()> {
+        crate::admin::crud::lock_namespace_config_admission(namespace).await
+    }
+
     pub fn validate_plugin_configs_fatal_for_test(
         config: &mut crate::config::types::GatewayConfig,
         backend_allow_ips: &crate::config::BackendEgressPolicy,

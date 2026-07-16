@@ -2383,6 +2383,12 @@ pub async fn handle_post_api_spec(
     // Assign IDs for POST: mint UUIDs for every empty ID, re-link references.
     assign_ids_for_post(&mut bundle);
 
+    // Keep the authoritative namespace snapshot used by plugin-graph admission
+    // stable through bundle persistence. This is shared with direct CRUD,
+    // batch, restore, and API-spec PUT/DELETE mutations.
+    let _namespace_config_admission_guard =
+        crate::admin::crud::lock_namespace_config_admission(namespace).await;
+
     // Validate: field checks + DB cross-checks (listen_path uniqueness, etc.)
     let ValidatedBundle { bundle, metadata } = match validate_bundle(
         bundle,
@@ -2467,12 +2473,14 @@ pub async fn handle_put_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    // Check spec exists and belongs to this namespace
-    let existing_spec = match db.get_api_spec(namespace, id).await {
-        Ok(Some(s)) => s,
+    // Preserve the endpoint's early not-found behavior before collecting a
+    // potentially large body. The spec is re-read under the namespace
+    // admission guard below before any prospective validation uses it.
+    match db.get_api_spec(namespace, id).await {
+        Ok(Some(_)) => {}
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
         Err(e) => return Ok(error_response(classify_db_error(e))),
-    };
+    }
 
     let declared_format = parse_content_type(req.headers());
     let max_mib = state.admin_spec_max_body_size_mib;
@@ -2486,6 +2494,17 @@ pub async fn handle_put_api_spec(
     let (mut bundle, metadata) = match extract(&body, declared_format, namespace) {
         Ok(v) => v,
         Err(e) => return Ok(error_response(ApiSpecError::Extract(e))),
+    };
+
+    // Serialize every graph-relevant read below through replacement
+    // persistence. Re-read the spec after acquiring the guard so a concurrent
+    // API-spec delete cannot leave validation based on a stale owner row.
+    let _namespace_config_admission_guard =
+        crate::admin::crud::lock_namespace_config_admission(namespace).await;
+    let existing_spec = match db.get_api_spec(namespace, id).await {
+        Ok(Some(spec)) => spec,
+        Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
+        Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
     let existing_spec_upstream =
@@ -2750,6 +2769,9 @@ pub async fn handle_delete_api_spec(
         Ok(db) => db,
         Err(e) => return Ok(error_response(e)),
     };
+
+    let _namespace_config_admission_guard =
+        crate::admin::crud::lock_namespace_config_admission(namespace).await;
 
     let existing = match db.get_api_spec(namespace, id).await {
         Ok(Some(spec)) => spec,

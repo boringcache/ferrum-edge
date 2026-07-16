@@ -1302,7 +1302,7 @@ mod tests {
         // still applies. BASE callers see the exact registered schema.
         let _g = registry::lock_for_tests();
         registry::reset_for_tests();
-        registry::begin_reload();
+        registry::begin_reload().expect("reload bracket opens");
         let raw = json!({ "summary_type": "http", "rename": { "proxy_id": "route_id" } });
         let compiled = SummarySchema::compile(
             &raw,
@@ -1312,7 +1312,7 @@ mod tests {
         .expect("named schema compiles");
         registry::register_named("portable", Arc::new(raw), compiled)
             .expect("register named schema");
-        registry::commit_reload();
+        registry::commit_reload().expect("reload bracket commits");
 
         let cfg = json!({ "schema_ref": "portable" });
         let base = resolve_schema(&cfg, "http_logging", SchemaCapabilities::BASE)
@@ -1363,7 +1363,7 @@ mod tests {
         // equivalent inline schema's collision error.
         let _g = registry::lock_for_tests();
         registry::reset_for_tests();
-        registry::begin_reload();
+        registry::begin_reload().expect("reload bracket opens");
         let raw = json!({ "summary_type": "http", "static_fields": { "event": "access" } });
         let compiled = SummarySchema::compile(
             &raw,
@@ -1373,7 +1373,7 @@ mod tests {
         .expect("named schema compiles under BASE");
         registry::register_named("with_event", Arc::new(raw), compiled)
             .expect("register named schema");
-        registry::commit_reload();
+        registry::commit_reload().expect("reload bracket commits");
 
         let cfg = json!({ "schema_ref": "with_event" });
         assert!(resolve_schema(&cfg, "http_logging", SchemaCapabilities::BASE).is_ok());

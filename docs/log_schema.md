@@ -118,6 +118,12 @@ logger submitted immediately after its schema definition resolves from the
 database snapshot; validation does not depend on whether a runtime poll has
 already refreshed the live registry.
 
+Graph-relevant direct CRUD, batch, restore, and API-spec mutations for the same
+namespace are serialized within an admin process from the authoritative
+snapshot read through persistence. Concurrent requests therefore cannot both
+validate against snapshots that omit the other request's committed graph
+change.
+
 Batch and restore payloads use the same definition-first graph pass, so a
 payload can list referrers before definitions. Each namespace is validated in
 isolation: the same schema name can be defined independently in separate
@@ -134,6 +140,12 @@ that ignore an unrecognized `schema_ref` key. On runtime config loads, a
 dangling/non-string reference remains a graph-fatal error, while unrelated
 constructor failures on optional logging sinks retain their existing fail-open
 warning behavior.
+
+Upgrade note: every **enabled** plugin carrying a top-level `schema_ref`
+participates in this fail-closed graph, even if that plugin does not otherwise
+recognize the key. Remove accidental/stale `schema_ref` keys or add the named
+definition before upgrading or reloading. Disabled entries remain inert until
+they are enabled, at which point the same graph validation applies.
 
 Inline `schema:` blocks have no registry dependency; they compile directly
 against the static field metadata in `fields.rs`.
@@ -338,7 +350,9 @@ For named schemas:
   TCP/UDP protocol lists. A schema-only configuration therefore leaves every
   runtime list empty and preserves the existing no-plugin transaction-summary
   fast path. Full- and delta-reload cache tests cover this invariant, including
-  multiple schema instances.
+  multiple schema instances; the schema-only test also pins repeated request
+  views to the same precomputed `Arc` lists so a per-request list allocation
+  regression fails deterministically without a wall-clock benchmark.
 
 ## Operator Cookbook
 

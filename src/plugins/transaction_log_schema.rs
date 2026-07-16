@@ -168,7 +168,12 @@ pub(crate) fn validate_config_graph(
     let mut errors = Vec::new();
 
     for namespace in namespaces {
-        registry::begin_reload();
+        if let Err(error) = registry::begin_reload() {
+            errors.push(format!(
+                "transaction-log schema registry could not begin validation for namespace '{namespace}': {error}"
+            ));
+            continue;
+        }
 
         for plugin in config.plugin_configs.iter().filter(|plugin| {
             plugin.enabled
@@ -237,7 +242,11 @@ pub(crate) fn validate_config_graph(
             }
         }
 
-        registry::abort_reload();
+        if let Err(error) = registry::abort_reload() {
+            errors.push(format!(
+                "transaction-log schema registry could not discard validation for namespace '{namespace}': {error}"
+            ));
+        }
     }
 
     if errors.is_empty() {
@@ -342,7 +351,7 @@ mod tests {
     fn reload_bracket_publishes_to_registry() {
         let _g = lock();
         registry::reset_for_tests();
-        registry::begin_reload();
+        registry::begin_reload().expect("reload bracket opens");
         let _plugin = TransactionLogSchema::new(&json!({
             "schemas": {
                 "splunk_cim": { "summary_type": "both", "rename": { "proxy_id": "route_id" } },
@@ -350,7 +359,7 @@ mod tests {
             }
         }))
         .expect("plugin constructed");
-        registry::commit_reload();
+        registry::commit_reload().expect("reload bracket commits");
         assert!(registry::lookup_named("splunk_cim").is_some());
         assert!(registry::lookup_named("datadog").is_some());
     }
@@ -359,7 +368,7 @@ mod tests {
     fn duplicate_across_plugins_in_reload_rejected() {
         let _g = lock();
         registry::reset_for_tests();
-        registry::begin_reload();
+        registry::begin_reload().expect("reload bracket opens");
         let _p1 = TransactionLogSchema::new(&json!({
             "schemas": { "splunk_cim": { "summary_type": "both" } }
         }))
@@ -368,5 +377,6 @@ mod tests {
             "schemas": { "splunk_cim": { "summary_type": "http" } }
         }));
         assert!(r.is_err());
+        registry::abort_reload().expect("reload bracket aborts");
     }
 }

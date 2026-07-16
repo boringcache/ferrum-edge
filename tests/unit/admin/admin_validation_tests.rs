@@ -50,6 +50,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("Some(&existing.id)"));
     assert!(crud_source.contains(".chain(replaced_plugins.iter())"));
     assert!(crud_source.contains("is_enabled_config_graph_participant(resource)"));
+    assert!(crud_source.contains("const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;"));
+    assert!(crud_source.contains("tokio::task::spawn_blocking(move ||"));
 
     let graph_validation = crud_source
         .rfind("validate_transaction_log_schema_candidates(")
@@ -66,6 +68,13 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(batch_source.contains("crud::validate_transaction_log_schema_candidates("));
     assert!(batch_source.contains("&batch.plugin_configs,"));
     assert!(batch_source.contains("is_enabled_config_graph_participant"));
+    assert!(
+        batch_source
+            .matches("crud::lock_namespace_config_admission(namespace).await")
+            .count()
+            >= 6,
+        "credential, batch, and restore mutations must share namespace admission"
+    );
 
     let pipeline_source = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(pipeline_source.contains("transaction_log_schema::validate_config_graph("));
@@ -75,6 +84,36 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(
         api_spec_source.contains("validate_transaction_log_schema_api_spec_replacement_candidate(")
     );
+    assert_eq!(
+        api_spec_source
+            .matches("crate::admin::crud::lock_namespace_config_admission(namespace).await")
+            .count(),
+        3,
+        "API-spec POST, PUT, and DELETE must serialize through persistence"
+    );
+    let post_lock = api_spec_source
+        .find("crate::admin::crud::lock_namespace_config_admission(namespace).await")
+        .expect("POST admission guard");
+    let post_persist = api_spec_source
+        .find("db.submit_api_spec_bundle(&bundle, &spec).await")
+        .expect("POST persistence");
+    assert!(post_lock < post_persist);
+    let put_lock = api_spec_source[post_lock + 1..]
+        .find("crate::admin::crud::lock_namespace_config_admission(namespace).await")
+        .map(|position| position + post_lock + 1)
+        .expect("PUT admission guard");
+    let put_persist = api_spec_source
+        .find("db.replace_api_spec_bundle(&bundle, &spec).await")
+        .expect("PUT persistence");
+    assert!(put_lock < put_persist);
+    let delete_lock = api_spec_source[put_lock + 1..]
+        .find("crate::admin::crud::lock_namespace_config_admission(namespace).await")
+        .map(|position| position + put_lock + 1)
+        .expect("DELETE admission guard");
+    let delete_persist = api_spec_source
+        .find("db.delete_api_spec(namespace, id).await")
+        .expect("DELETE persistence");
+    assert!(delete_lock < delete_persist);
 }
 
 #[test]

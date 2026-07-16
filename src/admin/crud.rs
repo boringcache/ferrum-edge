@@ -88,13 +88,13 @@ pub(crate) enum BatchPreparationError {
     Internal(String),
 }
 
-const MTLS_ADMISSION_LOCK_SHARDS: usize = 64;
-static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+const NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS: usize = 64;
+static NAMESPACE_CONFIG_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
 
-/// Best-effort serialization of mTLS-sensitive admin mutations for a namespace
-/// from candidate validation through persistence. A bounded process-global
-/// lock set covers every `AdminState` served by this process without retaining
-/// attacker-chosen namespace strings indefinitely.
+/// Best-effort serialization of graph- and credential-sensitive admin
+/// mutations for a namespace from candidate validation through persistence. A
+/// bounded process-global lock set covers every `AdminState` served by this
+/// process without retaining attacker-chosen namespace strings indefinitely.
 ///
 /// The datastore's exact mTLS credential index remains the authoritative
 /// cross-process backstop for exact identities. The additional ASCII-folded
@@ -105,17 +105,42 @@ static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
 /// this lock deliberately does not claim to coordinate separate admin processes.
 /// Every credential mutation takes this lock, even for non-mTLS types, because
 /// those endpoints persist the complete `Consumer` and could otherwise replay
-/// stale `mtls_auth` entries loaded before a concurrent mTLS mutation.
-pub(crate) async fn lock_mtls_admission(namespace: &str) -> MutexGuard<'static, ()> {
-    let locks = MTLS_ADMISSION_LOCKS.get_or_init(|| {
-        (0..MTLS_ADMISSION_LOCK_SHARDS)
+/// stale `mtls_auth` entries loaded before a concurrent mTLS mutation. Every
+/// plugin-graph mutation (including API-spec bundles) uses the same lock so a
+/// prospective transaction-log schema snapshot remains authoritative until
+/// the corresponding write commits.
+pub(crate) async fn lock_namespace_config_admission(
+    namespace: &str,
+) -> MutexGuard<'static, ()> {
+    let locks = NAMESPACE_CONFIG_ADMISSION_LOCKS.get_or_init(|| {
+        (0..NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS)
             .map(|_| Mutex::new(()))
             .collect()
     });
     let mut hasher = DefaultHasher::new();
     namespace.hash(&mut hasher);
-    let shard = hasher.finish() as usize % MTLS_ADMISSION_LOCK_SHARDS;
+    let shard = hasher.finish() as usize % NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS;
     locks[shard].lock().await
+}
+
+async fn validate_transaction_log_schema_graph_on_blocking_pool(
+    candidate: GatewayConfig,
+    http_client: crate::plugins::PluginHttpClient,
+) -> Result<(), AfterValidateError> {
+    tokio::task::spawn_blocking(move || {
+        crate::plugins::transaction_log_schema::validate_config_graph(
+            &candidate,
+            &http_client,
+            true,
+        )
+    })
+    .await
+    .map_err(|error| {
+        AfterValidateError::Db(anyhow::anyhow!(
+            "transaction-log schema validation task failed: {error}"
+        ))
+    })?
+    .map_err(AfterValidateError::BadRequest)
 }
 
 async fn validate_mtls_auth_candidate(
@@ -256,8 +281,7 @@ pub(crate) async fn validate_transaction_log_schema_candidates(
     }
 
     let http_client = super::plugin_validation_http_client(state);
-    crate::plugins::transaction_log_schema::validate_config_graph(&candidate, &http_client, true)
-        .map_err(AfterValidateError::BadRequest)
+    validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
 }
 
 /// Validate the exact post-PUT API-spec replacement candidate.
@@ -427,8 +451,7 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_replacement_candida
     }
 
     let http_client = super::plugin_validation_http_client(state);
-    crate::plugins::transaction_log_schema::validate_config_graph(&candidate, &http_client, true)
-        .map_err(AfterValidateError::BadRequest)
+    validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
 }
 
 /// Validate a wholesale namespace replacement without retaining resources that
@@ -477,9 +500,9 @@ pub(crate) async fn mtls_consumer_candidate_errors(
 /// already claimed by another consumer in the namespace. Snapshot-based like
 /// the mTLS candidate check (rather than a credential-index probe) so
 /// pre-existing rows written before hmac secrets were policed are still
-/// authoritative. `lock_mtls_admission` serializes same-process prechecks;
-/// namespace-scoped SQL/Mongo uniqueness constraints are the cross-process
-/// persistence backstop.
+/// authoritative. `lock_namespace_config_admission` serializes same-process
+/// prechecks; namespace-scoped SQL/Mongo uniqueness constraints are the
+/// cross-process persistence backstop.
 pub(crate) async fn hmac_consumer_candidate_errors(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -510,7 +533,7 @@ pub(crate) trait AdminResource:
     const VALIDATION_ERROR_LABEL: &'static str;
     const NOT_FOUND_MESSAGE: &'static str;
     const ID_CONFLICT_LABEL: &'static str = Self::RESOURCE_LABEL;
-    const SERIALIZE_MTLS_ADMISSION: bool = false;
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = false;
 
     fn id(&self) -> &str;
     fn set_id(&mut self, id: String);
@@ -809,8 +832,8 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
-    let _mtls_admission_guard = if R::SERIALIZE_MTLS_ADMISSION {
-        Some(lock_mtls_admission(namespace).await)
+    let _namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
+        Some(lock_namespace_config_admission(namespace).await)
     } else {
         None
     };
@@ -1935,7 +1958,7 @@ impl AdminResource for PluginConfig {
     const RESOURCE_LABEL: &'static str = "Plugin config";
     const VALIDATION_ERROR_LABEL: &'static str = "plugin config fields";
     const NOT_FOUND_MESSAGE: &'static str = "Plugin config not found";
-    const SERIALIZE_MTLS_ADMISSION: bool = true;
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
     const ID_CONFLICT_LABEL: &'static str = "PluginConfig";
 
     fn id(&self) -> &str {
@@ -2278,7 +2301,7 @@ impl AdminResource for Proxy {
     const RESOURCE_LABEL: &'static str = "Proxy";
     const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
-    const SERIALIZE_MTLS_ADMISSION: bool = true;
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id
@@ -2717,7 +2740,7 @@ impl AdminResource for Consumer {
     const RESOURCE_LABEL: &'static str = "Consumer";
     const VALIDATION_ERROR_LABEL: &'static str = "consumer fields";
     const NOT_FOUND_MESSAGE: &'static str = "Consumer not found";
-    const SERIALIZE_MTLS_ADMISSION: bool = true;
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id
@@ -2944,8 +2967,8 @@ async fn handle_write<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
-    let _mtls_admission_guard = if R::SERIALIZE_MTLS_ADMISSION {
-        Some(lock_mtls_admission(namespace).await)
+    let _namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
+        Some(lock_namespace_config_admission(namespace).await)
     } else {
         None
     };

@@ -2137,10 +2137,46 @@ fn transaction_log_schema_only_cache_preserves_no_plugin_fast_path_for_all_proto
         ProxyProtocol::Tcp,
         ProxyProtocol::Udp,
     ] {
+        let first_view = cache.request_view("p1", protocol);
+        let second_view = cache.request_view("p1", protocol);
+        let first_plugins = first_view.plugins();
+        let second_plugins = second_view.plugins();
         assert!(
-            cache.get_plugins_for_protocol("p1", protocol).is_empty(),
+            first_plugins.is_empty(),
             "config-only schema instances leaked into the {protocol:?} runtime list"
         );
+        assert!(
+            Arc::ptr_eq(&first_plugins, &second_plugins),
+            "{protocol:?} request views must reuse the precomputed plugin list instead of allocating per request"
+        );
+
+        let first_auth = first_view.auth_plugins();
+        let second_auth = second_view.auth_plugins();
+        let first_authorize = first_view.authorize_plugins();
+        let second_authorize = second_view.authorize_plugins();
+        let first_backend_admission = first_view.backend_admission_plugins();
+        let second_backend_admission = second_view.backend_admission_plugins();
+        let first_redactions = first_view.request_headers_to_redact();
+        let second_redactions = second_view.request_headers_to_redact();
+        let first_initial_response = first_view.initial_response_header_policy_plugins();
+        let second_initial_response = second_view.initial_response_header_policy_plugins();
+        let first_initial_names = first_view.initial_response_header_policy_names();
+        let second_initial_names = second_view.initial_response_header_policy_names();
+        assert!(Arc::ptr_eq(&first_auth, &second_auth));
+        assert!(Arc::ptr_eq(&first_authorize, &second_authorize));
+        assert!(Arc::ptr_eq(
+            &first_backend_admission,
+            &second_backend_admission
+        ));
+        assert!(Arc::ptr_eq(&first_redactions, &second_redactions));
+        assert!(Arc::ptr_eq(
+            &first_initial_response,
+            &second_initial_response
+        ));
+        assert!(Arc::ptr_eq(&first_initial_names, &second_initial_names));
+        assert!(!first_view.requires_response_body_buffering());
+        assert!(!first_view.requires_request_body_buffering());
+        assert!(!first_view.requires_ws_frame_hooks());
     }
     assert!(registry::lookup_named("audit-a").is_some());
     assert!(registry::lookup_named("audit-b").is_some());
