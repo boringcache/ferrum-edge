@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use tracing::warn;
 
 use super::{Plugin, PluginResult, RequestContext};
@@ -358,14 +358,7 @@ fn v4_range(value: u32, prefix: u8) -> Option<ParsedRule> {
 }
 
 fn parse_rule_ip(ip: &str) -> Option<IpAddr> {
-    let unbracketed = ip
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(ip);
-    let without_zone = unbracketed
-        .find('%')
-        .map_or(unbracketed, |index| &unbracketed[..index]);
-    without_zone.parse().ok()
+    super::parse_client_ip_literal(ip)
 }
 
 /// Check if an IP address matches one exact-IP/CIDR rule.

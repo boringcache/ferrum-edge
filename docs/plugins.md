@@ -2121,11 +2121,11 @@ config:
 
 ### `ip_restriction`
 
-Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP — via both `on_request_received` (HTTP-family) and `on_stream_connect` (TCP/UDP).
+Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP/TLS, and UDP/DTLS — via both `on_request_received` (HTTP-family) and `on_stream_connect` (stream-family).
 
 **Priority:** 150
 
-**Supported protocols:** All (HTTP, gRPC, WebSocket, TCP, UDP)
+**Supported protocols:** All (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP/TLS, UDP/DTLS)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

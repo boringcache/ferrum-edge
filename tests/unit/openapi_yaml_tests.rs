@@ -1582,6 +1582,7 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"alow": ["10.0.0.0/8"], "deny": ["192.0.2.0/24"]}),
         json!({"allow": "10.0.0.0/8"}),
         json!({"allow": [""]}),
+        json!({"allow": ["   "]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, false);
         assert!(

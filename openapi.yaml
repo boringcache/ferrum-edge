@@ -13583,6 +13583,7 @@ components:
           items:
             type: string
             minLength: 1
+            pattern: '.*\S.*'
           default: []
           description: >-
             Allowed IP addresses or CIDR ranges (IPv4 or IPv6). Empty list
@@ -13592,6 +13593,7 @@ components:
           items:
             type: string
             minLength: 1
+            pattern: '.*\S.*'
           default: []
           description: >-
             Denied IP addresses or CIDR ranges (IPv4 or IPv6). Always takes

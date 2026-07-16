@@ -637,6 +637,16 @@ fn ipv4_too_many_octets_is_rejected() {
     assert!(result.is_err());
 }
 
+#[test]
+fn ipv6_only_literal_decorations_do_not_broaden_ipv4_rules() {
+    use ferrum_edge::plugins::ip_restriction::ip_matches;
+
+    assert!(!ip_matches("[192.0.2.1]", "192.0.2.1"));
+    assert!(!ip_matches("192.0.2.1%eth0", "192.0.2.1"));
+    assert!(!ip_matches("192.0.2.1", "[192.0.2.1]"));
+    assert!(!ip_matches("192.0.2.1", "192.0.2.1%eth0"));
+}
+
 #[tokio::test]
 async fn ipv4_rule_matches_ipv4_mapped_ipv6_client() {
     let plugin = IpRestriction::new(&json!({
