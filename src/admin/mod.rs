@@ -3713,6 +3713,70 @@ async fn rollback_failed_batch_create(
     }
 }
 
+fn batch_rollback_candidate_after_intervening_write(
+    current: &GatewayConfig,
+    batch: &RestorePayload,
+    snapshot: &RestorePayload,
+) -> GatewayConfig {
+    let prior_proxy_ids = snapshot
+        .proxies
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let prior_consumer_ids = snapshot
+        .consumers
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let prior_plugin_config_ids = snapshot
+        .plugin_configs
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let prior_upstream_ids = snapshot
+        .upstreams
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut candidate = current.clone();
+    candidate.proxies.retain(|current| {
+        prior_proxy_ids.contains(current.id.as_str())
+            || !batch.proxies.iter().any(|submitted| {
+                submitted.id == current.id && submitted.updated_at == current.updated_at
+            })
+    });
+    candidate.consumers.retain(|current| {
+        prior_consumer_ids.contains(current.id.as_str())
+            || !batch.consumers.iter().any(|submitted| {
+                submitted.id == current.id && submitted.updated_at == current.updated_at
+            })
+    });
+    candidate.plugin_configs.retain(|current| {
+        prior_plugin_config_ids.contains(current.id.as_str())
+            || !batch.plugin_configs.iter().any(|submitted| {
+                submitted.id == current.id && submitted.updated_at == current.updated_at
+            })
+    });
+    candidate.upstreams.retain(|current| {
+        prior_upstream_ids.contains(current.id.as_str())
+            || !batch.upstreams.iter().any(|submitted| {
+                submitted.id == current.id && submitted.updated_at == current.updated_at
+            })
+    });
+    candidate
+}
+
+fn transaction_log_graph_validation_error_message(error: crud::AfterValidateError) -> String {
+    match error {
+        crud::AfterValidateError::BadRequest(errors)
+        | crud::AfterValidateError::Conflict(errors) => errors.join("; "),
+        crud::AfterValidateError::Db(error) => error.to_string(),
+        crud::AfterValidateError::Response(_) => {
+            "transaction-log schema validation returned an HTTP response".to_string()
+        }
+    }
+}
+
 async fn rollback_failed_restore(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -5598,21 +5662,71 @@ async fn handle_batch_create(
                 }
             };
             if !rollback_guard.immediately_succeeds_generation(lost_generation) {
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": "Config admission was lost during batch persistence; rollback was skipped because another writer acquired the namespace lease",
-                        "admission_error": error.to_string(),
-                        "persistence_errors": errors,
-                        "created": {
-                            "proxies": created.proxies,
-                            "consumers": created.consumers,
-                            "plugin_configs": created.plugin_configs,
-                            "upstreams": created.upstreams,
-                        },
-                        "rollback": "skipped_after_intervening_write",
-                    }),
-                ));
+                let current = match db.load_namespace_snapshot(namespace).await {
+                    Ok(current) => current,
+                    Err(recovery_error) => {
+                        return Ok(json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({
+                                "error": format!(
+                                    "Config admission was lost during batch persistence and the intervening graph could not be loaded for recovery: {recovery_error}"
+                                ),
+                                "admission_error": error.to_string(),
+                                "persistence_errors": errors,
+                                "rollback": "not_started_after_intervening_write",
+                            }),
+                        ));
+                    }
+                };
+                let http_client = plugin_validation_http_client(state);
+                if crud::validate_transaction_log_schema_graph_on_blocking_pool(
+                    current.clone(),
+                    http_client.clone(),
+                )
+                .await
+                .is_ok()
+                {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": "Config admission was lost during batch persistence after another writer acquired the namespace lease; the merged graph is valid and was preserved",
+                            "admission_error": error.to_string(),
+                            "persistence_errors": errors,
+                            "created": {
+                                "proxies": created.proxies,
+                                "consumers": created.consumers,
+                                "plugin_configs": created.plugin_configs,
+                                "upstreams": created.upstreams,
+                            },
+                            "rollback": "not_needed_after_intervening_write",
+                        }),
+                    ));
+                }
+                let candidate = batch_rollback_candidate_after_intervening_write(
+                    &current,
+                    &batch,
+                    &batch_rollback_snapshot,
+                );
+                if let Err(validation_error) =
+                    crud::validate_transaction_log_schema_graph_on_blocking_pool(
+                        candidate,
+                        http_client,
+                    )
+                    .await
+                {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was lost during batch persistence; conditional rollback after an intervening writer would not restore a valid transaction-log schema graph: {}",
+                                transaction_log_graph_validation_error_message(validation_error)
+                            ),
+                            "admission_error": error.to_string(),
+                            "persistence_errors": errors,
+                            "rollback": "skipped_after_intervening_write",
+                        }),
+                    ));
+                }
             }
             let rollback = rollback_guard
                 .run_to_completion_while_held(rollback_failed_batch_create(

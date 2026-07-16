@@ -2772,8 +2772,12 @@ pub async fn handle_post_api_spec(
     let compensation_bundle = bundle.clone();
     let compensation_spec = spec.clone();
     let settlement_state = state.clone();
+    let audit_db = db.clone();
+    let audit_enabled = state.admin_audit_enabled;
+    let audit_actor = actor.clone();
+    let audit_spec = spec.clone();
     let persistence = tokio::spawn(async move {
-        run_api_spec_persistence_while_held(
+        let result = run_api_spec_persistence_while_held(
             settlement_db,
             &settlement_namespace,
             _namespace_config_admission_guard,
@@ -2786,7 +2790,26 @@ pub async fn handle_post_api_spec(
             ),
             true,
         )
-        .await
+        .await;
+        if result.is_ok() {
+            let event = audit::AuditEvent::new(
+                &audit_actor,
+                "create",
+                "api_spec",
+                &audit_spec.id,
+                &audit_spec.namespace,
+                audit::create_diff(json!({
+                    "id": audit_spec.id,
+                    "proxy_id": audit_spec.proxy_id,
+                    "content_hash": audit_spec.content_hash,
+                    "spec_version": audit_spec.spec_version,
+                })),
+            );
+            if let Err(error) = audit::record(audit_enabled, audit_db, event) {
+                log_audit_enqueue_failure(&error);
+            }
+        }
+        result
     })
     .await
     .unwrap_or_else(|error| {
@@ -2804,18 +2827,6 @@ pub async fn handle_post_api_spec(
         "content_hash": spec.content_hash,
         "spec_version": spec.spec_version,
     });
-
-    let event = audit::AuditEvent::new(
-        actor,
-        "create",
-        "api_spec",
-        &spec_id,
-        namespace,
-        audit::create_diff(resp_body.clone()),
-    );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-        log_audit_enqueue_failure(&error);
-    }
 
     // Build the body + standard headers via the shared `json_resp` helper, then
     // inject the `Location` header. This keeps body-serialisation and header
@@ -3006,8 +3017,13 @@ pub async fn handle_put_api_spec(
     let compensation_spec = spec.clone();
     let compensation_previous_spec = existing_spec.clone();
     let settlement_state = state.clone();
+    let audit_db = db.clone();
+    let audit_enabled = state.admin_audit_enabled;
+    let audit_actor = actor.clone();
+    let audit_spec = spec.clone();
+    let audit_previous_spec = existing_spec.clone();
     let persistence = tokio::spawn(async move {
-        run_api_spec_persistence_while_held(
+        let result = run_api_spec_persistence_while_held(
             settlement_db,
             &settlement_namespace,
             _namespace_config_admission_guard,
@@ -3022,7 +3038,34 @@ pub async fn handle_put_api_spec(
             ),
             true,
         )
-        .await
+        .await;
+        if result.is_ok() {
+            let event = audit::AuditEvent::new(
+                &audit_actor,
+                "update",
+                "api_spec",
+                &audit_spec.id,
+                &audit_spec.namespace,
+                audit::update_diff(
+                    json!({
+                        "id": audit_previous_spec.id,
+                        "proxy_id": audit_previous_spec.proxy_id,
+                        "content_hash": audit_previous_spec.content_hash,
+                        "spec_version": audit_previous_spec.spec_version,
+                    }),
+                    json!({
+                        "id": audit_spec.id,
+                        "proxy_id": audit_spec.proxy_id,
+                        "content_hash": audit_spec.content_hash,
+                        "spec_version": audit_spec.spec_version,
+                    }),
+                ),
+            );
+            if let Err(error) = audit::record(audit_enabled, audit_db, event) {
+                log_audit_enqueue_failure(&error);
+            }
+        }
+        result
     })
     .await
     .unwrap_or_else(|error| {
@@ -3040,24 +3083,6 @@ pub async fn handle_put_api_spec(
         "content_hash": spec.content_hash,
         "spec_version": spec.spec_version,
     });
-
-    let before = json!({
-        "id": existing_spec.id,
-        "proxy_id": existing_spec.proxy_id,
-        "content_hash": existing_spec.content_hash,
-        "spec_version": existing_spec.spec_version,
-    });
-    let event = audit::AuditEvent::new(
-        actor,
-        "update",
-        "api_spec",
-        id,
-        namespace,
-        audit::update_diff(before, resp_body.clone()),
-    );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-        log_audit_enqueue_failure(&error);
-    }
 
     Ok(json_resp(StatusCode::OK, &resp_body))
 }
@@ -3309,8 +3334,12 @@ pub async fn handle_delete_api_spec(
     let settlement_namespace = namespace.to_string();
     let persistence_id = id.to_string();
     let compensation_spec = existing.clone();
+    let audit_db = db.clone();
+    let audit_enabled = state.admin_audit_enabled;
+    let audit_actor = actor.clone();
+    let audit_spec = existing.clone();
     let persistence = match tokio::spawn(async move {
-        run_api_spec_persistence_while_held(
+        let result = run_api_spec_persistence_while_held(
             settlement_db,
             &settlement_namespace,
             _namespace_config_admission_guard,
@@ -3323,7 +3352,26 @@ pub async fn handle_delete_api_spec(
             ),
             false,
         )
-        .await
+        .await;
+        if matches!(&result, Ok(true)) {
+            let event = audit::AuditEvent::new(
+                &audit_actor,
+                "delete",
+                "api_spec",
+                &audit_spec.id,
+                &audit_spec.namespace,
+                audit::delete_diff(json!({
+                    "id": audit_spec.id,
+                    "proxy_id": audit_spec.proxy_id,
+                    "content_hash": audit_spec.content_hash,
+                    "spec_version": audit_spec.spec_version,
+                })),
+            );
+            if let Err(error) = audit::record(audit_enabled, audit_db, event) {
+                log_audit_enqueue_failure(&error);
+            }
+        }
+        result
     })
     .await
     .unwrap_or_else(|error| {
@@ -3335,22 +3383,6 @@ pub async fn handle_delete_api_spec(
         Err(error) => return Ok(error_response(error)),
     };
     if persistence {
-        let event = audit::AuditEvent::new(
-            actor,
-            "delete",
-            "api_spec",
-            id,
-            namespace,
-            audit::delete_diff(json!({
-                "id": existing.id,
-                "proxy_id": existing.proxy_id,
-                "content_hash": existing.content_hash,
-                "spec_version": existing.spec_version,
-            })),
-        );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-            log_audit_enqueue_failure(&error);
-        }
         Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header("Cache-Control", "no-store")

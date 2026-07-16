@@ -726,8 +726,13 @@ async fn persist_create_to_settlement<R: AdminResource>(
     mut guard: Option<NamespaceConfigAdmissionGuard>,
     written: R,
     http_client: crate::plugins::PluginHttpClient,
+    state: AdminState,
+    actor: AuditActor,
 ) -> DbResult<()> {
-    match run_db_write_while_held(guard.as_ref(), R::db_create(db.as_ref(), &written)).await {
+    let success_db = db.clone();
+    let result = match run_db_write_while_held(guard.as_ref(), R::db_create(db.as_ref(), &written))
+        .await
+    {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
         Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
             Ok(()) => {
@@ -764,7 +769,20 @@ async fn persist_create_to_settlement<R: AdminResource>(
             Err(persistence_error) => Err(persistence_error),
         },
         Err(error) => Err(error),
+    };
+    if result.is_ok() {
+        finish_write_success(
+            success_db,
+            &state,
+            &actor,
+            &namespace,
+            &written,
+            None,
+            WriteAction::Create,
+        )
+        .await;
     }
+    result
 }
 
 async fn persist_update_to_settlement<R: AdminResource>(
@@ -775,8 +793,13 @@ async fn persist_update_to_settlement<R: AdminResource>(
     written: R,
     previous: R,
     http_client: crate::plugins::PluginHttpClient,
+    state: AdminState,
+    actor: AuditActor,
 ) -> DbResult<bool> {
-    match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written)).await {
+    let success_db = db.clone();
+    let result = match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written))
+        .await
+    {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
         Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
             Ok(false) => Ok(false),
@@ -814,7 +837,20 @@ async fn persist_update_to_settlement<R: AdminResource>(
             Err(persistence_error) => Err(persistence_error),
         },
         Err(error) => Err(error),
+    };
+    if matches!(&result, Ok(true)) {
+        finish_write_success(
+            success_db,
+            &state,
+            &actor,
+            &namespace,
+            &written,
+            Some(&previous),
+            WriteAction::Update { id: &id },
+        )
+        .await;
     }
+    result
 }
 
 async fn persist_delete_to_settlement<R: AdminResource>(
@@ -824,8 +860,15 @@ async fn persist_delete_to_settlement<R: AdminResource>(
     id: String,
     recovery: OwnedLateDeleteRecovery<R>,
     http_client: crate::plugins::PluginHttpClient,
+    audit_enabled: bool,
+    actor: AuditActor,
 ) -> DbResult<bool> {
-    match run_db_write_while_held(guard.as_ref(), R::db_delete(db.as_ref(), &namespace, &id)).await
+    let success_db = db.clone();
+    let result = match run_db_write_while_held(
+        guard.as_ref(),
+        R::db_delete(db.as_ref(), &namespace, &id),
+    )
+    .await
     {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
         Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
@@ -869,6 +912,72 @@ async fn persist_delete_to_settlement<R: AdminResource>(
             Err(persistence_error) => Err(persistence_error),
         },
         Err(error) => Err(error),
+    };
+    if matches!(&result, Ok(true)) {
+        let event = AuditEvent::new(
+            &actor,
+            "delete",
+            R::RESOURCE_NAME.replace(' ', "_"),
+            &id,
+            &namespace,
+            audit::delete_diff(R::audit_body(&recovery.previous)),
+        );
+        if let Err(error) = audit::record(audit_enabled, success_db, event) {
+            super::log_audit_enqueue_failure(&error);
+        }
+    }
+    result
+}
+
+async fn finish_write_success<R: AdminResource>(
+    db: Arc<dyn DatabaseBackend>,
+    state: &AdminState,
+    actor: &AuditActor,
+    namespace: &str,
+    resource: &R,
+    existing: Option<&R>,
+    action: WriteAction<'_>,
+) {
+    if let Err(error) = R::after_write(
+        db.as_ref(),
+        state,
+        namespace,
+        resource,
+        existing,
+        action,
+    )
+    .await
+    {
+        tracing::warn!(
+            "Post-write hook failed for {} '{}': {}",
+            R::RESOURCE_NAME,
+            resource.id(),
+            error
+        );
+    }
+
+    let (audit_action, diff) = match action {
+        WriteAction::Create => ("create", audit::create_diff(R::audit_body(resource))),
+        WriteAction::Update { .. } => {
+            let before = existing
+                .map(R::audit_body)
+                .unwrap_or_else(|| json!(null));
+            (
+                "update",
+                audit::update_diff(before, R::audit_body(resource)),
+            )
+        }
+    };
+    let event = AuditEvent::new(
+        actor,
+        audit_action,
+        R::RESOURCE_NAME.replace(' ', "_"),
+        resource.id(),
+        namespace,
+        diff,
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+        super::log_audit_enqueue_failure(&error);
     }
 }
 
@@ -1762,6 +1871,8 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             api_spec: previous_api_spec,
         },
         super::plugin_validation_http_client(state),
+        state.admin_audit_enabled,
+        actor.clone(),
     ))
     .await
     {
@@ -1771,20 +1882,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         )),
     };
     match persistence {
-        Ok(true) => {
-            let event = AuditEvent::new(
-                actor,
-                "delete",
-                R::RESOURCE_NAME.replace(' ', "_"),
-                id,
-                namespace,
-                audit::delete_diff(R::audit_body(&existing)),
-            );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event) {
-                super::log_audit_enqueue_failure(&error);
-            }
-            Ok(super::empty_response(StatusCode::NO_CONTENT))
-        }
+        Ok(true) => Ok(super::empty_response(StatusCode::NO_CONTENT)),
         Ok(false) => Ok(not_found_response::<R>()),
         Err(error) => Ok(R::map_delete_db_error(&error)),
     }
@@ -4401,6 +4499,8 @@ async fn handle_write<R: AdminResource>(
                 namespace_config_admission_guard.take(),
                 resource.clone(),
                 super::plugin_validation_http_client(state),
+                state.clone(),
+                actor.clone(),
             ))
             .await
             {
@@ -4428,6 +4528,8 @@ async fn handle_write<R: AdminResource>(
                 resource.clone(),
                 previous,
                 super::plugin_validation_http_client(state),
+                state.clone(),
+                actor.clone(),
             ))
             .await
             {
@@ -4445,42 +4547,6 @@ async fn handle_write<R: AdminResource>(
                 Err(error) => return Ok(R::map_persist_db_error(&error, action)),
             }
         }
-    }
-
-    if let Err(error) =
-        R::after_write(db, state, namespace, &resource, existing.as_ref(), action).await
-    {
-        tracing::warn!(
-            "Post-write hook failed for {} '{}': {}",
-            R::RESOURCE_NAME,
-            resource.id(),
-            error
-        );
-    }
-
-    let (audit_action, diff) = match action {
-        WriteAction::Create => ("create", audit::create_diff(R::audit_body(&resource))),
-        WriteAction::Update { .. } => {
-            let before = existing
-                .as_ref()
-                .map(R::audit_body)
-                .unwrap_or_else(|| json!(null));
-            (
-                "update",
-                audit::update_diff(before, R::audit_body(&resource)),
-            )
-        }
-    };
-    let event = AuditEvent::new(
-        actor,
-        audit_action,
-        R::RESOURCE_NAME.replace(' ', "_"),
-        resource.id(),
-        namespace,
-        diff,
-    );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db_arc, event) {
-        super::log_audit_enqueue_failure(&error);
     }
 
     let body = R::response_body_for_role(&resource, actor.role);
