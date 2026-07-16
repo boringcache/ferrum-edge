@@ -30,7 +30,7 @@ use crate::config::types::{
 };
 use crate::config::validation_pipeline::{
     ConfigValidationRejection, ValidationAction, ValidationPipeline,
-    collect_rejecting_runtime_config_errors,
+    collect_rejecting_runtime_config_errors, validate_plugin_file_dependencies_off_thread,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -1889,16 +1889,18 @@ impl DatabaseStore {
             );
         }
 
-        let validation = ValidationPipeline::new(&mut config)
+        ValidationPipeline::new(&mut config)
             .validate_unique_consumer_identities(ValidationAction::Warn)
             .validate_unique_consumer_credentials(ValidationAction::Warn)
-            .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn);
-        let validation = if purpose.loads_node_local_plugin_files() {
-            validation.validate_plugin_file_dependencies(ValidationAction::Warn)
-        } else {
-            validation
-        };
-        validation.run()?;
+            .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)
+            .run()?;
+        if purpose.loads_node_local_plugin_files() {
+            config = validate_plugin_file_dependencies_off_thread(
+                config,
+                ValidationAction::Warn,
+            )
+            .await?;
+        }
 
         // Hot-path isolation: strip api_spec_id from runtime config. The row
         // mappers preserve api_spec_id so admin GET/list paths can serialise

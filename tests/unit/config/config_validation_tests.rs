@@ -576,3 +576,29 @@ fn non_runtime_full_loads_skip_node_local_plugin_files() {
         assert!(source.contains("if purpose.loads_node_local_plugin_files() {"));
     }
 }
+
+#[test]
+fn runtime_mmdb_validation_runs_off_async_workers() {
+    let validation = include_str!("../../../src/config/validation_pipeline.rs");
+    assert!(validation.contains("validate_plugin_file_dependencies_off_thread"));
+    assert!(validation.contains("tokio::task::spawn_blocking"));
+
+    for source in [
+        include_str!("../../../src/config/db_loader.rs"),
+        include_str!("../../../src/config/mongo_store.rs"),
+    ] {
+        assert!(source.contains("validate_plugin_file_dependencies_off_thread("));
+        assert!(source.contains("ValidationAction::Warn"));
+        assert!(source.contains(".await?"));
+    }
+
+    let dp_client = include_str!("../../../src/grpc/dp_client.rs");
+    assert!(dp_client.contains("update_config_off_thread(config).await"));
+
+    let file_loader = include_str!("../../../src/config/file_loader.rs");
+    let file_mode = include_str!("../../../src/modes/file.rs");
+    assert!(file_loader.contains("load_config_from_file_off_thread"));
+    assert!(file_loader.contains("reload_config_from_file_off_thread"));
+    assert!(file_mode.contains("load_config_from_file_off_thread("));
+    assert!(file_mode.contains("reload_config_from_file_off_thread("));
+}

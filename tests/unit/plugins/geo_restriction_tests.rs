@@ -1045,6 +1045,26 @@ fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
     assert!(config_source.contains("MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES"));
     assert!(config_source.contains("aggregate_budget.admit(path, metadata.len())"));
     assert!(config_source.contains("verify_country_mmdb_path_still_matches(path, &file_version)"));
+    assert!(config_source.contains("CountryMmdbAllocationReservation"));
+    assert!(config_source.contains("inflight_snapshot_bytes"));
+    assert!(config_source.contains("live_snapshot_bytes"));
+    assert!(config_source.contains("live + in-flight + candidate"));
+    let loader_source = config_source
+        .split("fn load_validated_country_mmdb_inner(")
+        .nth(1)
+        .and_then(|tail| tail.split("pub fn validate_mmdb_file(").next())
+        .expect("country MMDB loader source section");
+    let digest_cache_lookup = loader_source
+        .find("cache.get_by_digest(&digest)")
+        .expect("streamed digest cache lookup");
+    let peak_reservation = loader_source
+        .find("CountryMmdbAllocationReservation::reserve")
+        .expect("global peak allocation reservation");
+    let buffer_allocation = loader_source
+        .find("bytes.try_reserve_exact(initial_capacity)")
+        .expect("bounded owned snapshot allocation");
+    assert!(digest_cache_lookup < peak_reservation);
+    assert!(peak_reservation < buffer_allocation);
     assert_eq!(
         MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES,
         MAX_COUNTRY_MMDB_SIZE_BYTES

@@ -64,7 +64,8 @@ pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
 /// admission-time allocation before any untrusted file contents are parsed.
 pub const MAX_COUNTRY_MMDB_SIZE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 /// Maximum aggregate bytes admitted for country MMDB snapshots in one config
-/// validation generation or plugin-cache build session.
+/// validation generation or plugin-cache build session, and for the global
+/// peak of live plus in-flight candidate snapshot buffers.
 ///
 /// Keeping this equal to the per-file ceiling permits one maximum-size
 /// Enterprise database while preventing several individually valid files from
@@ -5023,6 +5024,10 @@ impl CountryMmdbAggregateBudget {
 #[derive(Default)]
 struct CountryMmdbCache {
     by_digest: HashMap<CountryMmdbDigest, Weak<CountryMmdbSnapshot>>,
+    /// Candidate buffers that passed peak admission but have not yet become
+    /// content-addressed snapshots. Tracking them globally prevents concurrent
+    /// reloads from each admitting against the same live-only baseline.
+    inflight_snapshot_bytes: u64,
     /// Generation-owned strong references bridge dependency validation to the
     /// immediately following plugin-cache build. A failed validation pipeline
     /// aborts its generation; an accepted generation supersedes the previous
@@ -5041,6 +5046,67 @@ impl CountryMmdbCache {
 
     fn get_by_digest(&self, digest: &CountryMmdbDigest) -> Option<Arc<CountryMmdbSnapshot>> {
         self.by_digest.get(digest).and_then(Weak::upgrade)
+    }
+
+    fn live_snapshot_bytes(&self) -> Result<u64, CountryMmdbLoadError> {
+        self.by_digest
+            .values()
+            .filter_map(Weak::upgrade)
+            .try_fold(0_u64, |total, snapshot| {
+                total.checked_add(snapshot.size_bytes()).ok_or_else(|| {
+                    CountryMmdbLoadError::Invalid(
+                        "MaxMind database live snapshot size overflow".to_string(),
+                    )
+                })
+            })
+    }
+
+    fn reserve_snapshot_allocation(
+        &mut self,
+        path: &str,
+        candidate_bytes: u64,
+    ) -> Result<(), CountryMmdbLoadError> {
+        let live_bytes = self.live_snapshot_bytes()?;
+        let retained_bytes = live_bytes
+            .checked_add(self.inflight_snapshot_bytes)
+            .ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(
+                    "MaxMind database retained snapshot size overflow".to_string(),
+                )
+            })?;
+        let peak_bytes = retained_bytes.checked_add(candidate_bytes).ok_or_else(|| {
+            CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database peak snapshot size overflow while admitting '{path}'"
+            ))
+        })?;
+        if peak_bytes > MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES {
+            return Err(CountryMmdbLoadError::Invalid(format!(
+                "MaxMind database peak snapshot budget exceeded: loading '{path}' ({candidate_bytes} bytes) while retaining {live_bytes} live and {} in-flight bytes would require {peak_bytes} bytes; maximum aggregate size is {MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES} bytes",
+                self.inflight_snapshot_bytes
+            )));
+        }
+        self.inflight_snapshot_bytes = self
+            .inflight_snapshot_bytes
+            .checked_add(candidate_bytes)
+            .ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(
+                    "MaxMind database in-flight snapshot size overflow".to_string(),
+                )
+            })?;
+        Ok(())
+    }
+
+    fn release_snapshot_allocation(&mut self, candidate_bytes: u64) {
+        if let Some(remaining) = self.inflight_snapshot_bytes.checked_sub(candidate_bytes) {
+            self.inflight_snapshot_bytes = remaining;
+        } else {
+            tracing::error!(
+                candidate_bytes,
+                inflight_bytes = self.inflight_snapshot_bytes,
+                "MaxMind database snapshot allocation accounting underflow"
+            );
+            self.inflight_snapshot_bytes = 0;
+        }
     }
 
     fn prepare_snapshot_return(
@@ -5112,6 +5178,53 @@ impl CountryMmdbCache {
             return None;
         }
         self.validation_handoffs.remove(&generation)
+    }
+}
+
+/// RAII reservation for one not-yet-published MMDB snapshot buffer. Error
+/// paths release the global peak-memory charge automatically; successful
+/// publication converts the reservation to a weak-cache entry while holding
+/// the same cache lock.
+struct CountryMmdbAllocationReservation {
+    size_bytes: u64,
+    active: bool,
+}
+
+impl CountryMmdbAllocationReservation {
+    fn reserve(path: &str, size_bytes: u64) -> Result<Self, CountryMmdbLoadError> {
+        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database snapshot cache is unavailable".to_string(),
+            )
+        })?;
+        cache.retain_live();
+        cache.reserve_snapshot_allocation(path, size_bytes)?;
+        Ok(Self {
+            size_bytes,
+            active: true,
+        })
+    }
+
+    fn release_with_cache(&mut self, cache: &mut CountryMmdbCache) {
+        if self.active {
+            cache.release_snapshot_allocation(self.size_bytes);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for CountryMmdbAllocationReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        match country_mmdb_snapshot_cache().lock() {
+            Ok(mut cache) => self.release_with_cache(&mut cache),
+            Err(poisoned) => {
+                let mut cache = poisoned.into_inner();
+                self.release_with_cache(&mut cache);
+            }
+        }
     }
 }
 
@@ -5411,7 +5524,7 @@ fn load_validated_country_mmdb_inner(
     aggregate_budget: Option<&mut CountryMmdbAggregateBudget>,
 ) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
     use sha2::{Digest as _, Sha256};
-    use std::io::Read as _;
+    use std::io::{Read as _, Seek as _, SeekFrom};
 
     let mut file = std::fs::File::open(path).map_err(|e| {
         CountryMmdbLoadError::Unavailable(format!(
@@ -5447,9 +5560,77 @@ fn load_validated_country_mmdb_inner(
         })?;
         cache.admit_validation_path(generation, path, metadata.len())?;
     }
+    // Stream the content identity before allocating a candidate snapshot. An
+    // unchanged reload can then reuse its live content-addressed snapshot with
+    // only a fixed-size digest buffer, while changed content must pass the
+    // global live + in-flight + candidate peak-memory admission below.
+    let mut hasher = Sha256::new();
+    let mut digest_buffer = [0_u8; 16 * 1024];
+    let mut digested_bytes = 0_u64;
+    {
+        let mut bounded_reader = (&mut file).take(metadata.len() + 1);
+        loop {
+            let read = bounded_reader.read(&mut digest_buffer).map_err(|e| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' could not be hashed consistently: {e}"
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            digested_bytes = digested_bytes.checked_add(read as u64).ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' size overflow while hashing"
+                ))
+            })?;
+            if digested_bytes > metadata.len() {
+                return Err(CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' grew while it was being hashed"
+                )));
+            }
+            hasher.update(&digest_buffer[..read]);
+        }
+    }
+    if digested_bytes != metadata.len() {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' changed size while it was being hashed"
+        )));
+    }
+    let metadata_after_digest = file.metadata().map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' metadata not readable after hashing: {e}"
+        ))
+    })?;
+    if CountryMmdbFileVersion::from_metadata(path, &metadata_after_digest) != file_version {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' changed while it was being hashed"
+        )));
+    }
+    verify_country_mmdb_path_still_matches(path, &file_version)?;
+
+    let digest: CountryMmdbDigest = hasher.finalize().into();
+    {
+        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
+            CountryMmdbLoadError::Invalid(
+                "MaxMind database snapshot cache is unavailable".to_string(),
+            )
+        })?;
+        cache.retain_live();
+        if let Some(reader) = cache.get_by_digest(&digest) {
+            return Ok(cache.prepare_snapshot_return(path, reader, validation_generation));
+        }
+    }
+
+    let mut allocation_reservation =
+        CountryMmdbAllocationReservation::reserve(path, metadata.len())?;
     let initial_capacity = usize::try_from(metadata.len()).map_err(|_| {
         CountryMmdbLoadError::Invalid(format!(
             "MaxMind database file '{path}' is too large for this platform"
+        ))
+    })?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' could not be rewound after hashing: {e}"
         ))
     })?;
     let mut bytes = Vec::new();
@@ -5459,7 +5640,7 @@ fn load_validated_country_mmdb_inner(
         ))
     })?;
     {
-        let mut bounded_reader = (&mut file).take(metadata.len());
+        let mut bounded_reader = (&mut file).take(metadata.len() + 1);
         bounded_reader.read_to_end(&mut bytes).map_err(|e| {
             CountryMmdbLoadError::Invalid(format!(
                 "MaxMind database file '{path}' could not be read consistently: {e}"
@@ -5483,20 +5664,14 @@ fn load_validated_country_mmdb_inner(
     }
     verify_country_mmdb_path_still_matches(path, &file_version)?;
 
-    let digest: CountryMmdbDigest = Sha256::digest(&bytes).into();
+    let loaded_digest: CountryMmdbDigest = Sha256::digest(&bytes).into();
+    if loaded_digest != digest {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' changed between identity and snapshot reads"
+        )));
+    }
     #[cfg(not(unix))]
     verify_country_mmdb_path_digest(path, &file_version, &digest)?;
-    {
-        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
-            CountryMmdbLoadError::Invalid(
-                "MaxMind database snapshot cache is unavailable".to_string(),
-            )
-        })?;
-        cache.retain_live();
-        if let Some(reader) = cache.get_by_digest(&digest) {
-            return Ok(cache.prepare_snapshot_return(path, reader, validation_generation));
-        }
-    }
 
     let reader = maxminddb::Reader::from_source(bytes).map_err(|e| {
         CountryMmdbLoadError::Invalid(format!(
@@ -5574,9 +5749,15 @@ fn load_validated_country_mmdb_inner(
     })?;
     cache.retain_live();
     if let Some(cached) = cache.get_by_digest(&digest) {
+        // The concurrently published snapshot wins. Drop our duplicate owned
+        // buffer before releasing its reservation so another loader cannot
+        // admit against bytes that are still physically retained.
+        drop(reader);
+        allocation_reservation.release_with_cache(&mut cache);
         return Ok(cache.prepare_snapshot_return(path, cached, validation_generation));
     }
     cache.by_digest.insert(digest, Arc::downgrade(&reader));
+    allocation_reservation.release_with_cache(&mut cache);
     Ok(cache.prepare_snapshot_return(path, reader, validation_generation))
 }
 

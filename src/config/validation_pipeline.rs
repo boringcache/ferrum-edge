@@ -72,6 +72,24 @@ pub(crate) struct ValidationPipeline<'a> {
     steps: Vec<ValidationStep<'a>>,
 }
 
+/// Run the potentially large MMDB read, verification, and full-record scan on
+/// Tokio's blocking pool. Async database and reload paths pass ownership of the
+/// candidate config through this helper so runtime workers never perform the
+/// synchronous node-local dependency work.
+pub(crate) async fn validate_plugin_file_dependencies_off_thread(
+    mut config: GatewayConfig,
+    action: ValidationAction<'static>,
+) -> Result<GatewayConfig, anyhow::Error> {
+    tokio::task::spawn_blocking(move || -> Result<GatewayConfig, anyhow::Error> {
+        ValidationPipeline::new(&mut config)
+            .validate_plugin_file_dependencies(action)
+            .run()?;
+        Ok(config)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("MaxMind database validation worker failed: {error}"))?
+}
+
 /// Collect the rejecting runtime-config validation contract shared by
 /// database full loads and CP incremental updates.
 ///

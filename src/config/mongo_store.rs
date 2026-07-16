@@ -55,6 +55,7 @@ mod inner {
     };
     use crate::config::validation_pipeline::{
         ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
+        validate_plugin_file_dependencies_off_thread,
     };
     use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
@@ -4134,9 +4135,11 @@ mod inner {
             // validation has passed so an invalid Mongo snapshot cannot leave
             // a claimable MMDB handoff behind.
             if purpose.loads_node_local_plugin_files() {
-                ValidationPipeline::new(&mut config)
-                    .validate_plugin_file_dependencies(ValidationAction::Warn)
-                    .run()?;
+                config = validate_plugin_file_dependencies_off_thread(
+                    config,
+                    ValidationAction::Warn,
+                )
+                .await?;
             }
 
             Ok(config)
@@ -12295,7 +12298,7 @@ mod inner {
                 .find("if !validation_errors.is_empty() {")
                 .expect("load_full_config non-empty validation guard");
             let plugin_file_dependencies = load_body
-                .find("validate_plugin_file_dependencies(ValidationAction::Warn)")
+                .find("validate_plugin_file_dependencies_off_thread(")
                 .expect("load_full_config database-mode plugin file dependency validation");
             let runtime_file_guard = load_body
                 .find("if purpose.loads_node_local_plugin_files() {")

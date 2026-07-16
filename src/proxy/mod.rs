@@ -4310,6 +4310,24 @@ fn spawn_backend_svid_rotation_task(
 }
 
 impl ProxyState {
+    /// Apply a full snapshot on Tokio's blocking pool. DP snapshots cannot
+    /// carry a CP-side node-local MMDB handoff, so their plugin-cache build may
+    /// synchronously hash, verify, and scan the configured database.
+    pub async fn update_config_off_thread(
+        &self,
+        new_config: GatewayConfig,
+    ) -> ConfigApplyOutcome {
+        let proxy_state = self.clone();
+        match tokio::task::spawn_blocking(move || proxy_state.update_config(new_config)).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = format!("configuration update worker failed: {error}");
+                error!("Config reload rejected: {}", message);
+                ConfigApplyOutcome::rejected_one(message)
+            }
+        }
+    }
+
     /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
     ///
     /// If the gateway already has a file-loaded SVID, rebuild the SVID bundle

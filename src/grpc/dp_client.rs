@@ -1203,7 +1203,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 continue;
                             }
                         };
-                        match proxy_state.update_config(config) {
+                        match proxy_state.update_config_off_thread(config).await {
                             ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
                                 commit_frontend_tls_snapshot(
                                     frontend_tls_update,
