@@ -10903,7 +10903,7 @@ mod h3_request_body_timeout_tests {
         );
         let mut headers = std::collections::HashMap::from([
             ("content-type".to_string(), "application/json".to_string()),
-            ("x-backend".to_string(), "discard-me".to_string()),
+            ("x-correlation-id".to_string(), "request-123".to_string()),
         ]);
         let mut body = b"backend response".to_vec();
 
@@ -10916,7 +10916,12 @@ mod h3_request_body_timeout_tests {
         );
 
         assert_eq!(status, http::StatusCode::OK);
-        assert_eq!(headers.len(), 3);
+        assert_eq!(headers.len(), 4);
+        assert_eq!(
+            headers.get("x-correlation-id").map(String::as_str),
+            Some("request-123"),
+            "deadline replacement must preserve existing decorator headers"
+        );
         assert_eq!(
             headers.get("content-type").map(String::as_str),
             Some("application/grpc")
