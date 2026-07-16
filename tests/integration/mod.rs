@@ -70,6 +70,7 @@ mod mesh_telemetry_tracing_tests;
 mod mesh_test_support;
 mod mesh_topology_hbone_tests;
 mod scripted_backend_smoke_tests;
+mod spec_expose_integration_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;
 mod vendor_integrity_tests;

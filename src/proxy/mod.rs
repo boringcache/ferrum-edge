@@ -192,6 +192,14 @@ pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_
 /// precise signal; the normal buffered backend-response path never sets it.
 pub(crate) const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
 
+/// One-shot request-method override used only while synthetic response-body
+/// hooks inspect a plugin-generated representation. `spec_expose` sets `GET`
+/// for canonical HEAD responses so response guards evaluate the representation
+/// exactly as they do for GET; the real method is restored before rejection
+/// `after_proxy` hooks normalize the final wire response.
+pub(crate) const SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY: &str =
+    "ferrum:synthetic_response_method_override";
+
 /// Internal marker carried only on a response-decision context clone while an
 /// effective retry policy is active. It never reaches transaction metadata.
 const RETRY_RESPONSE_BUFFERING_METADATA_KEY: &str = "ferrum:retry_response_buffering";
@@ -2389,6 +2397,32 @@ pub(crate) fn request_body_requirements_before_authorize(
     requirements
 }
 
+pub(crate) fn request_body_requirements_before_before_proxy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> RequestBodyPhaseRequirements {
+    let mut requirements = RequestBodyPhaseRequirements::default();
+    for plugin in plugins {
+        if !plugin.requires_request_body_before_before_proxy()
+            || !plugin.should_buffer_request_body(ctx)
+        {
+            continue;
+        }
+        requirements.required = true;
+        requirements.needs_text |= plugin.needs_request_body_text();
+        requirements.needs_bytes |= plugin.needs_request_body_bytes();
+        requirements.needs_digests |= plugin.needs_request_body_digests();
+        if let Some(limit) = plugin.request_body_buffer_limit() {
+            requirements.plugin_limit = Some(
+                requirements
+                    .plugin_limit
+                    .map_or(limit, |current| current.min(limit)),
+            );
+        }
+    }
+    requirements
+}
+
 pub(crate) fn request_body_requirements_before_authenticate(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
@@ -3357,7 +3391,13 @@ fn reject_result_to_backend_response(
         headers: reject.headers,
         connection_error: false,
         backend_resolved_ip,
-        error_class: (reject.status_code == 413).then_some(retry::ErrorClass::RequestBodyTooLarge),
+        // Final request-body hooks run before backend dispatch. Keep their
+        // synthetic responses terminal and neutral to backend health.
+        error_class: Some(if reject.status_code == 413 {
+            retry::ErrorClass::RequestBodyTooLarge
+        } else {
+            retry::ErrorClass::DispatchPolicyRejected
+        }),
     }
 }
 
@@ -6564,6 +6604,9 @@ impl ProxyState {
     ///     500 every request through that proxy.
     ///   - `validate_plugin_references` — dangling plugin IDs / wrong
     ///     scope.
+    ///   - `validate_unique_mtls_dns_identities` — case-variant identities
+    ///     would collapse into one `ConsumerIndex` DNS key when an effective
+    ///     `mtls_auth` `san_dns` policy is enabled.
     ///   - `validate_mesh_route_dispatch_upstream_references` — dangling
     ///     `mesh_route_dispatch.destination.upstream_id` references are
     ///     observationally identical to a dangling `Proxy.upstream_id`:
@@ -6627,6 +6670,9 @@ impl ProxyState {
             errors.extend(errs);
         }
         if let Err(errs) = config.validate_plugin_references() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_unique_mtls_dns_identities() {
             errors.extend(errs);
         }
         if let Err(errs) = validate_mesh_route_dispatch_upstream_references(config) {
@@ -13287,12 +13333,21 @@ async fn run_after_proxy_hooks_on_rejection(
                             })
                             .or_insert_with(|| "Origin".to_string());
                     }
-                    warn!(
-                        rejecting_plugin = plugin.name(),
-                        replacement_status = *status_code,
-                        replaced_status,
-                        "after_proxy plugin replaced an uncommitted rejection response"
-                    );
+                    if plugin.warn_on_rejection_response_replacement() {
+                        warn!(
+                            rejecting_plugin = plugin.name(),
+                            replacement_status = *status_code,
+                            replaced_status,
+                            "after_proxy plugin replaced an uncommitted rejection response"
+                        );
+                    } else {
+                        debug!(
+                            replacing_plugin = plugin.name(),
+                            replacement_status = *status_code,
+                            replaced_status,
+                            "after_proxy plugin normalized an uncommitted rejection response"
+                        );
+                    }
                     continue;
                 }
                 // The gateway is already committed to emitting this rejection
@@ -13590,6 +13645,10 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) {
+    let original_method = ctx
+        .metadata
+        .remove(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY)
+        .map(|method_override| std::mem::replace(&mut ctx.method, method_override));
     let applied_synthetic_body_hooks = !plugins.is_empty()
         && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx);
     if applied_synthetic_body_hooks {
@@ -13622,6 +13681,9 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         // The two requirements directly conflict; we keep the one-shot guarantee
         // and accept the minor body-transform divergence on the synthetic path.
         apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
+    }
+    if let Some(original_method) = original_method {
+        ctx.method = original_method;
     }
     // Apply the after_proxy reject hooks exactly once, over the final response
     // (the synthetic 2xx or the body-rejection response produced above), so
@@ -16090,36 +16152,26 @@ async fn handle_proxy_request_inner(
         && plugins
             .iter()
             .any(|plugin| plugin.should_buffer_request_body(&ctx));
-    let requires_request_body_before_before_proxy = requires_request_body_buffering
+    let before_proxy_body_requirements = if requires_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
-        && plugins.iter().any(|plugin| {
-            plugin.requires_request_body_before_before_proxy()
-                && plugin.should_buffer_request_body(&ctx)
-        });
-    let (needs_body_text, needs_body_bytes) = if requires_request_body_before_before_proxy {
-        let mut needs_text = false;
-        let mut needs_bytes = false;
-        for plugin in plugins.iter() {
-            if plugin.requires_request_body_before_before_proxy()
-                && plugin.should_buffer_request_body(&ctx)
-            {
-                needs_text |= plugin.needs_request_body_text();
-                needs_bytes |= plugin.needs_request_body_bytes();
-            }
-        }
-        (needs_text, needs_bytes)
+    {
+        request_body_requirements_before_before_proxy(&plugins, &ctx)
     } else {
-        (false, false)
+        RequestBodyPhaseRequirements::default()
     };
 
-    if requires_request_body_before_before_proxy {
+    if before_proxy_body_requirements.required {
+        let body_limit = effective_request_body_limit(
+            state.max_request_body_size_bytes,
+            before_proxy_body_requirements.plugin_limit,
+        );
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
                 match buffer_request_body_for_before_proxy(
                     *request,
                     &method,
                     &ctx.headers,
-                    state.max_request_body_size_bytes,
+                    body_limit,
                     proxy.backend_read_timeout_ms,
                 )
                 .await
@@ -16129,9 +16181,9 @@ async fn handle_proxy_request_inner(
                             store_request_body_metadata(
                                 &mut ctx,
                                 body,
-                                needs_body_text,
-                                needs_body_bytes,
-                                false,
+                                before_proxy_body_requirements.needs_text,
+                                before_proxy_body_requirements.needs_bytes,
+                                before_proxy_body_requirements.needs_digests,
                             );
                             // Seed bytes_sent_observed from the prebuffered
                             // body so before_proxy rejects (logged via
@@ -16179,12 +16231,19 @@ async fn handle_proxy_request_inner(
                 }
             }
             ClientRequestBody::Buffered(body) => {
+                if body_limit > 0 && body.len() > body_limit {
+                    record_request(&state, 413);
+                    return Ok(build_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                    ));
+                }
                 store_request_body_metadata(
                     &mut ctx,
                     &body,
-                    needs_body_text,
-                    needs_body_bytes,
-                    false,
+                    before_proxy_body_requirements.needs_text,
+                    before_proxy_body_requirements.needs_bytes,
+                    before_proxy_body_requirements.needs_digests,
                 );
                 ClientRequestBody::Buffered(body)
             }
@@ -16956,6 +17015,11 @@ async fn handle_proxy_request_inner(
             bodyless => bodyless,
         };
     }
+    // Build the lightweight mutable hook context before `proxy_headers` may
+    // borrow `ctx.headers`. The selected dispatch branch takes this one context;
+    // early-prepared bodies already ran their transform/final hooks above.
+    let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
+        .then(|| ctx.clone_for_final_request_body_hooks());
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
@@ -17389,10 +17453,17 @@ async fn handle_proxy_request_inner(
                 };
 
             // Store body metadata for plugins that read via ctx.metadata
+            let request_body_size_bytes = grpc_req_body.len().to_string();
             ctx.metadata.insert(
                 "request_body_size_bytes".to_string(),
-                grpc_req_body.len().to_string(),
+                request_body_size_bytes.clone(),
             );
+            if let Some(body_hook_ctx) = deferred_body_hook_ctx.as_mut() {
+                body_hook_ctx.metadata.insert(
+                    "request_body_size_bytes".to_string(),
+                    request_body_size_bytes,
+                );
+            }
 
             // Mirror pre-transform bytes into the shared request-bytes counter
             // so `TransactionSummary.bytes_sent` is populated on the gRPC
@@ -17413,11 +17484,7 @@ async fn handle_proxy_request_inner(
             );
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
-            let mut body_hook_ctx = if needs_final_request_body_context {
-                Some(ctx.clone_for_final_request_body_hooks())
-            } else {
-                None
-            };
+            let mut body_hook_ctx = deferred_body_hook_ctx.take();
             let final_body_result = run_final_request_body_hooks(
                 &plugins,
                 body_hook_ctx.as_mut(),
@@ -19833,11 +19900,7 @@ async fn handle_proxy_request_inner(
         let mut final_upstream_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
-        let mut body_hook_ctx = if needs_final_request_body_context {
-            Some(ctx.clone_for_final_request_body_hooks())
-        } else {
-            None
-        };
+        let mut body_hook_ctx = deferred_body_hook_ctx.take();
         let initial_dispatch = proxy_to_backend(
             &state,
             &proxy,
@@ -20227,11 +20290,7 @@ async fn handle_proxy_request_inner(
         }
         (result, current_cb_target_key, final_upstream_target)
     } else {
-        let mut body_hook_ctx = if needs_final_request_body_context {
-            Some(ctx.clone_for_final_request_body_hooks())
-        } else {
-            None
-        };
+        let mut body_hook_ctx = deferred_body_hook_ctx.take();
         let dispatch = proxy_to_backend(
             &state,
             &proxy,
@@ -29687,6 +29746,8 @@ mod tests {
 
     struct SyntheticNormalizationProbePlugin;
 
+    struct HeadSkippingSyntheticGuardPlugin;
+
     struct RejectHeaderPlugin;
 
     struct ReplaceRejectPlugin;
@@ -29735,6 +29796,51 @@ mod tests {
             _response_headers: &HashMap<String, String>,
         ) -> Option<Vec<u8>> {
             Some(b"incorrectly-normalized".to_vec())
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for HeadSkippingSyntheticGuardPlugin {
+        fn name(&self) -> &str {
+            "head_skipping_synthetic_guard"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+            !ctx.method.eq_ignore_ascii_case("HEAD")
+        }
+
+        async fn on_response_body(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            _response_headers: &HashMap<String, String>,
+            _body: &[u8],
+        ) -> PluginResult {
+            ctx.metadata
+                .insert("test:synthetic_body_method".to_string(), ctx.method.clone());
+            PluginResult::Reject {
+                status_code: 451,
+                body: "blocked synthetic representation".to_string(),
+                headers: HashMap::new(),
+            }
+        }
+
+        fn applies_after_proxy_on_reject(&self) -> bool {
+            true
+        }
+
+        async fn after_proxy(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            response_headers.insert("x-after-proxy-method".to_string(), ctx.method.clone());
+            PluginResult::Continue
         }
     }
 
@@ -30366,6 +30472,53 @@ mod tests {
 
         assert_eq!(response.http_status, StatusCode::OK);
         assert_eq!(response.body, body);
+    }
+
+    #[tokio::test]
+    async fn synthetic_head_representation_uses_get_guardrails_then_restores_head() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(HeadSkippingSyntheticGuardPlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "HEAD".to_string(),
+            "/api/specz".to_string(),
+        );
+        ctx.metadata.insert(
+            SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY.to_string(),
+            "GET".to_string(),
+        );
+        let mut status = 200;
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let mut body = br#"{"secret":"must be inspected"}"#.to_vec();
+
+        apply_reject_after_proxy_and_synthetic_body_hooks(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, 451);
+        assert_eq!(body, b"blocked synthetic representation");
+        assert_eq!(
+            ctx.metadata
+                .get("test:synthetic_body_method")
+                .map(String::as_str),
+            Some("GET")
+        );
+        assert_eq!(ctx.method, "HEAD");
+        assert_eq!(
+            headers.get("x-after-proxy-method").map(String::as_str),
+            Some("HEAD")
+        );
+        assert!(
+            !ctx.metadata
+                .contains_key(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY)
+        );
     }
 
     #[tokio::test]

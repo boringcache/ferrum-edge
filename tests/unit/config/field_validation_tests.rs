@@ -137,7 +137,7 @@ fn make_plugin_config(id: &str) -> PluginConfig {
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,

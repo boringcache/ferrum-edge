@@ -1965,6 +1965,87 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
 }
 
 #[test]
+fn cors_schema_matches_strict_runtime_and_istio_projection_surface() {
+    use ferrum_edge::plugins::cors::CorsPlugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/CorsConfig")
+        .expect("CorsConfig schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(["allowed_origins"]));
+    assert_eq!(
+        schema["properties"]["unmatched_preflights"]["enum"],
+        json!(["forward", "ignore"])
+    );
+
+    let cases = [
+        (json!({"allowed_origins": ["*"]}), true),
+        (json!({"allowed_origins": ["*.example.com"]}), true),
+        (
+            json!({"allowed_origins": ["https://app.example:443"]}),
+            true,
+        ),
+        (
+            json!({"allowed_origins": ["HTTPS://BÜCHER.EXAMPLE:443"]}),
+            true,
+        ),
+        (json!({"allowed_origins": [{"exact": "*"}]}), true),
+        (
+            json!({
+                "allowed_origins": ["https://app.example"],
+                "allowed_methods": [],
+                "allowed_headers": [],
+                "unmatched_preflights": "forward"
+            }),
+            true,
+        ),
+        (json!({}), false),
+        (json!(true), false),
+        (json!({"origins": ["*"]}), false),
+        (json!({"allowed_origins": null}), false),
+        (json!({"allowed_origins": ["not-an-origin"]}), false),
+        (
+            json!({"allowed_origins": ["https://app.example/path"]}),
+            false,
+        ),
+        (
+            json!({"allowed_origins": [{"exact": "*.example.com"}]}),
+            false,
+        ),
+        (
+            json!({"allowed_origins": ["*"], "allowed_methods": []}),
+            false,
+        ),
+        (json!({"allowed_origins": ["*"], "max_age": -1}), false),
+        (
+            json!({
+                "allowed_origins": ["*"],
+                "unmatched_preflights": "FORWARD"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "allowed_origins": ["*"],
+                "unmatched_preflights": "forward",
+                "preflight_continue": false
+            }),
+            false,
+        ),
+    ];
+    for (config, expected) in cases {
+        assert_component_validity(&spec, "CorsConfig", &config, expected);
+        assert_eq!(
+            CorsPlugin::new(&config).is_ok(),
+            expected,
+            "runtime/schema drift for {config}"
+        );
+    }
+}
+
+#[test]
 fn workload_metrics_schema_documents_runtime_tag_limits() {
     use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 
@@ -2472,6 +2553,83 @@ fn jwt_auth_schema_rejects_unknown_config_keys() {
 }
 
 #[test]
+fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::ai_prompt_compressor::AiPromptCompressor;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiPromptCompressorConfig")
+        .expect("missing AiPromptCompressorConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiPromptCompressorConfig schema compiles");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let schema_fields: BTreeSet<String> = schema["properties"]
+        .as_object()
+        .expect("config properties")
+        .keys()
+        .cloned()
+        .collect();
+    let runtime_fields: BTreeSet<String> = [
+        "compress_roles",
+        "target_ratio",
+        "min_content_tokens",
+        "max_scan_bytes",
+        "preserve_tag",
+        "request_family",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(schema_fields, runtime_fields);
+
+    for config in [
+        json!({}),
+        json!({"compress_roles": ["user", "system"]}),
+        json!({"target_ratio": 0.25}),
+        json!({"min_content_tokens": 131072}),
+        json!({"max_scan_bytes": 1048576}),
+        json!({"preserve_tag": "keep-this_1"}),
+        json!({"preserve_tag": "x".repeat(64)}),
+        json!({"request_family": "chat_completions"}),
+        json!({"request_family": "text_completions", "compress_roles": [" User "]}),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema rejected {config}"
+        );
+        assert!(
+            AiPromptCompressor::new(&config).is_ok(),
+            "runtime rejected {config}"
+        );
+    }
+
+    for config in [
+        json!(null),
+        json!({"compress_role": ["system"]}),
+        json!({"target_ratio": null}),
+        json!({"min_content_tokens": null}),
+        json!({"max_scan_bytes": 1048577}),
+        json!({"min_content_tokens": 131073}),
+        json!({"preserve_tag": null}),
+        json!({"preserve_tag": "x".repeat(65)}),
+        json!({"request_family": "images"}),
+        json!({"request_family": "text_completions", "compress_roles": ["system"]}),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema admitted {config}"
+        );
+        assert!(
+            AiPromptCompressor::new(&config).is_err(),
+            "runtime admitted {config}"
+        );
+    }
+}
+
+#[test]
 fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -2705,6 +2863,81 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
         true,
     );
     MeshRouteDispatch::new(&status_only_redirect).expect("status-only redirects are runtime-valid");
+}
+
+#[test]
+fn mtls_dns_admission_mutations_document_conflict_responses() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for pointer in [
+        "/paths/~1proxies/post/responses/409",
+        "/paths/~1proxies~1{id}/put/responses/409",
+        "/paths/~1proxies~1{id}/delete/responses/409",
+        "/paths/~1consumers/post/responses/409",
+        "/paths/~1consumers~1{id}/put/responses/409",
+        "/paths/~1consumers~1{id}/delete/responses/409",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/put/responses/409",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/post/responses/409",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/delete/responses/409",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}~1{index}/delete/responses/409",
+        "/paths/~1plugins~1config/post/responses/409",
+        "/paths/~1plugins~1config~1{id}/put/responses/409",
+        "/paths/~1plugins~1config~1{id}/delete/responses/409",
+        "/paths/~1api-specs/post/responses/409",
+        "/paths/~1api-specs~1{id}/put/responses/409",
+        "/paths/~1api-specs~1{id}/delete/responses/409",
+    ] {
+        assert!(
+            spec.pointer(pointer).is_some(),
+            "mTLS DNS admission mutation is missing 409 response: {pointer}"
+        );
+    }
+}
+
+#[test]
+fn namespace_admission_contention_is_documented_as_retryable() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for pointer in [
+        "/paths/~1batch/post/responses/503",
+        "/paths/~1proxies/post/responses/503",
+        "/paths/~1proxies~1{id}/put/responses/503",
+        "/paths/~1proxies~1{id}/delete/responses/503",
+        "/paths/~1consumers/post/responses/503",
+        "/paths/~1consumers~1{id}/put/responses/503",
+        "/paths/~1consumers~1{id}/delete/responses/503",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/put/responses/503",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/post/responses/503",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/delete/responses/503",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}~1{index}/delete/responses/503",
+        "/paths/~1plugins~1config/post/responses/503",
+        "/paths/~1plugins~1config~1{id}/put/responses/503",
+        "/paths/~1plugins~1config~1{id}/delete/responses/503",
+        "/paths/~1upstreams/post/responses/503",
+        "/paths/~1upstreams~1{id}/put/responses/503",
+        "/paths/~1upstreams~1{id}/delete/responses/503",
+        "/paths/~1api-specs/post/responses/503",
+        "/paths/~1api-specs~1{id}/put/responses/503",
+        "/paths/~1api-specs~1{id}/delete/responses/503",
+    ] {
+        assert_eq!(
+            spec.pointer(pointer)
+                .and_then(|value| value.get("$ref"))
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/responses/NamespaceAdmissionUnavailable"),
+            "namespace mutation is missing retryable 503 response: {pointer}"
+        );
+    }
+
+    let response = spec
+        .pointer("/components/responses/NamespaceAdmissionUnavailable")
+        .expect("missing namespace-admission response component");
+    assert_eq!(response["headers"]["Retry-After"]["required"], false);
+    assert_eq!(response["headers"]["Retry-After"]["schema"]["example"], 1);
+    assert_eq!(
+        response["content"]["application/json"]["example"]["error"],
+        "Namespace mutation is temporarily unavailable; retry later"
+    );
 }
 
 #[test]
@@ -2982,6 +3215,52 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
         json!({ "set": { "X-Policy": "caf\u{00e9}" } }),
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
+    }
+}
+
+#[test]
+fn spec_expose_schema_matches_strict_runtime_null_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/SpecExposeConfig")
+        .expect("SpecExposeConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(["spec_url"]));
+    for (field, scalar_type) in [
+        ("content_type", "string"),
+        ("tls_no_verify", "boolean"),
+        ("cache_ttl_seconds", "integer"),
+        ("max_response_body_bytes", "integer"),
+    ] {
+        assert_eq!(
+            schema["properties"][field]["type"],
+            json!([scalar_type, "null"]),
+            "{field} must document the runtime's explicit-null default"
+        );
+    }
+
+    assert_component_validity(
+        &spec,
+        "SpecExposeConfig",
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "content_type": null,
+            "tls_no_verify": null,
+            "cache_ttl_seconds": null,
+            "max_response_body_bytes": null
+        }),
+        true,
+    );
+    for invalid in [
+        json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verfy": true}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "content_type": 7}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verify": "false"}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": -1}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 0}),
+    ] {
+        assert_component_validity(&spec, "SpecExposeConfig", &invalid, false);
     }
 }
 

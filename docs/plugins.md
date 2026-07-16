@@ -48,7 +48,7 @@ plugin_configs:
     scope: proxy
     proxy_id: public-frontend
     config:
-      origins: ["https://app.example.com"]
+      allowed_origins: ["https://app.example.com"]
 
   # ProxyGroup — shared across a SUBSET of proxies
   # One instance, shared rate limit counters across the group
@@ -1331,7 +1331,7 @@ For UDP+DTLS frontends, the underlying DTLS library exposes only the client leaf
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
 
-For `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, and `san_email`, Ferrum selects only the **first matching value in certificate order**. Later subject attributes or SAN entries are not fallback identities. DNS SAN identities are normalized with ASCII lowercase and compared case-insensitively; every other identity field is compared exactly. Consumer mTLS identities are always exact-unique; while an enabled `san_dns` mTLS policy exists, they must also be unique under ASCII case folding so a DNS certificate cannot resolve ambiguously. Database snapshots that violate the DNS rule are rejected before runtime indexes are published.
+For `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, and `san_email`, Ferrum selects only the **first matching value in certificate order**. Later subject attributes or SAN entries are not fallback identities. DNS SAN identities are normalized with ASCII lowercase and compared case-insensitively; every other identity field is compared exactly. Consumer mTLS identities are always exact-unique; while an enabled `san_dns` mTLS policy exists, they must also be unique under ASCII case folding so a DNS certificate cannot resolve ambiguously. SQL and MongoDB backends serialize Consumer, plugin-policy, and proxy-association admission per namespace, including batch and restore imports, so concurrent admin processes cannot commit conflicting case variants or race a policy activation against a credential update. A restore holds one persistent owner-qualified guard from before its rollback snapshot through the destructive clear, every successful-import batch, and any compensating raw replay; all non-owning namespace resource writers fail closed for that full interval. Cancellation before a protected mutation is dispatched starts bounded owner-qualified cleanup. Cancellation, timeout, shutdown, or process failure after dispatch intentionally retains the fence when the write outcome or a multi-phase restore remains uncertain; definitive settlement releases it. If bounded owner-qualified cleanup itself cannot reach the datastore, the durable fence remains fail-closed, the failure is logged, and the same manual recovery procedure applies. MongoDB admission ownership uses majority-acknowledged, non-expiring writes: a paused writer can never resume after a successor has taken its lock, and an election cannot roll back ownership and reopen a stale writer. After verifying the former process is stopped and the durable outcome, an operator must remove that namespace's orphaned document from `mtls_dns_admission_locks`; an uncertain Mongo operation also pins its connection generation until this recovery. SQL uncertainty leaves `restore_owner` set in the namespace row, including interruption during a dispatched credential mutation, destructive restore phase, or rollback replay. After verifying the former process is stopped and the namespace state, clear that exact owner field before admission resumes. Ordinary identity conflicts return `409 Conflict`; namespace-fence contention returns a redacted `503 Service Unavailable` with `Retry-After: 1`. Batch and restore failures otherwise use those endpoints' documented per-item and rollback responses. File, database, CP/DP, and reload snapshots also reject ambiguity before publishing runtime indexes.
 
 > **`serial` format.** The serial identity is the lowercase hex serial number value — no separators, matching the lowercase of `openssl x509 -serial -noout -in cert.pem` output. DER may include a leading `00` sign-padding byte for positive serials whose high bit is set, but OpenSSL's serial value omits that DER-only pad and Ferrum strips it before lookup (for example, DER bytes `00 C0 01` match stored identity `c001`). Preserve real serial value zeros, but do not add DER sign padding and do not use the colon-separated form from `openssl x509 -text`.
 
@@ -2392,13 +2392,20 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_origins` | (String \| Object)[] | `["*"]` | Permitted origins. Each entry is a string (`"*"`, an exact `scheme://host[:port]` origin, or a `*.suffix.com` wildcard subdomain) or an Istio `StringMatch` object with one of `exact` / `prefix` / `regex` (literal prefix / RE2 full match). |
-| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Allowed methods |
-| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Allowed headers |
+| `allowed_origins` | (String \| Object)[] | required | Permitted origins. Use `["*"]` only for intentional allow-all. Exact origins are canonicalized at config load; `*.suffix.com` is the native wildcard-subdomain form. Istio objects use exactly one of `exact` / `prefix` / `regex`; exact `*` is Istio allow-all. |
+| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
+| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
 | `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` |
 | `max_age` | u64 | `86400` | Preflight cache duration in seconds |
-| `preflight_continue` | bool | `false` | Pass preflight requests to backend |
+| `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
+| `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |
+
+The root config must be an object. Unknown keys, explicit `null`, malformed
+values, and an omitted `allowed_origins` policy fail startup/reload instead of
+falling back to wildcard access. Multiple attached CORS instances compose
+origin/credential/exposure policy on actual requests and additionally
+intersect method/header/max-age policy on preflight.
 
 See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshooting.
 
@@ -2627,21 +2634,21 @@ Rules are evaluated in order — first match wins. Regex paths use the same `~` 
 
 ### `spec_expose`
 
-Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a `/specz` sub-path of each proxy's listen path. When a `GET` request arrives at `{listen_path}/specz`, the plugin fetches the specification from the configured upstream URL and returns it to the caller. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
+Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a canonical `/specz` sub-path of each proxy's listen path. `GET` returns the configured specification and `HEAD` carries that GET representation through response-body transforms and guards before returning the same final status and representation headers (including `Content-Type`, `Content-Length`, and `X-Content-Type-Options`) with no wire body. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
 
 Useful for providing a common, discoverable pattern for API specifications across enterprise-wide APIs.
 
 **Priority:** 210 | **Phase:** `on_request_received` | **Protocols:** HTTP only
 
-**Only works with prefix-based `listen_path` proxies.** Regex listen paths (`~` prefix) are skipped — the plugin continues without intercepting. Host-only or port-only routing is not supported.
+**Only works with prefix-based `listen_path` proxies.** Regex (`~`) and exact (`=`) listen paths are skipped — the plugin continues without intercepting. Host-only or port-only routing is not supported. A trailing separator is normalized when composing the resource: both `/api` and `/api/` expose `/api/specz`. The double-slash alias `/api//specz`, encoded separators, and extra path segments are deliberately not intercepted. Query strings do not change the canonical match.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https` scheme; other schemes (e.g., `file://`) are rejected at plugin load time. |
-| `content_type` | String | _(upstream)_ | Override the response `Content-Type`. When omitted, the upstream response's `Content-Type` is passed through (so YAML specs return as YAML, JSON as JSON, etc.). |
-| `tls_no_verify` | bool | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Defaults to the gateway's global `FERRUM_TLS_NO_VERIFY` setting. Useful for internal endpoints with self-signed certificates. |
-| `cache_ttl_seconds` | u64 | `300` | TTL for the in-process spec body cache. The first `/specz` request fetches the spec from `spec_url` and caches it in memory; subsequent requests within the TTL window are served directly from the cache without re-fetching. Failed fetches are never cached — every failure is retried on the next request. Set to `0` to disable caching entirely (every request re-fetches). |
-| `max_response_body_bytes` | u64 | `26214400` | Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
+| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https`; URL userinfo is rejected. Paths and queries may route or authorize the origin request, but diagnostics include only the credential-free origin. |
+| `content_type` | String or null | _(upstream)_ | Trusted response `Content-Type` override, not restricted by the upstream allow-list. When omitted or null, only the supported spec media types listed below are preserved; other or missing upstream values fall back to `application/octet-stream`. |
+| `tls_no_verify` | bool or null | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Omitted or null uses the gateway's global setting. When verification is enabled and a custom gateway CA bundle is configured, failure to load or parse it rejects the plugin generation rather than widening trust to public roots. |
+| `cache_ttl_seconds` | u64 or null | `300` | TTL for the in-process positive spec cache. Omitted or null uses 300 seconds. `0` disables durable positive caching, but callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay. Failed fetches are negatively cached with bounded exponential backoff for every TTL setting. |
+| `max_response_body_bytes` | u64 or null | `26214400` | Maximum upstream spec response body size to buffer and cache. Omitted or null uses 25 MiB. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
 
 ```yaml
 # Example: Expose an OpenAPI spec for an API behind /my/api/v1
@@ -2665,9 +2672,11 @@ config:
   cache_ttl_seconds: 0
 ```
 
-**Error handling:** If the upstream spec URL is unreachable or returns a non-2xx status, the plugin returns a `502` JSON error response. The `spec_url` hostname is pre-warmed via DNS at startup alongside other backend hostnames. Failed fetches are NOT cached, so a transient upstream error is retried on the very next request.
+**Content-Type handling:** Without an explicit override, the media type (case-insensitive, before any `;` parameters) must be one of `application/json`, `application/openapi+json`, `application/openapi+yaml`, `application/vnd.oai.openapi`, `application/vnd.oai.openapi+json`, `application/yaml`, `application/x-yaml`, `application/wsdl+xml`, `application/vnd.sun.wadl+xml`, `application/xml`, `text/yaml`, `text/xml`, or `text/plain`. Matching values are preserved verbatim, including parameters; all other or missing values become `application/octet-stream`. An explicit `content_type` is operator-trusted and bypasses this upstream allow-list. Every successful response includes `X-Content-Type-Options: nosniff`.
 
-**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting the gateway clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway.
+**Error handling and admission:** If the upstream spec URL is unreachable, oversized, unreadable, or returns a non-2xx status, the plugin returns a `502` JSON error with `Retry-After`. One outbound fetch is active per plugin instance, failed completions are negatively cached with exponential backoff from 1 to 30 seconds, and cached failures report the whole seconds remaining in that window. At most 32 cache-miss callers (including the fetcher) are admitted. Excess callers receive `503` with `Retry-After` immediately rather than accumulating behind the fetch. The `spec_url` hostname is pre-warmed via DNS; logs include only its credential-free origin, never the configured path, query, fragment, or URL userinfo.
+
+**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting or reloading the plugin clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway. With a zero TTL, there is no durable positive cache: callers admitted before a fetch completes share that completion by generation, while a later request immediately starts a new fetch.
 
 **Interaction with other plugins:** The plugin runs at priority 210 — after CORS (100), IP restriction (150), and bot detection (200), but before all authentication plugins (950+). This means blocked IPs and bots cannot access `/specz`, CORS preflight responses work correctly for browser-based spec consumers, and all authentication and authorization plugins are skipped for `/specz` requests.
 
@@ -3767,7 +3776,7 @@ Use this only when the normal backend has equivalent authentication, model allow
 - `ai_transcript_audit` (2924) stages transcript capture before guardrails; `ai_prompt_shield` (2925) scans/redacts PII before federation
 - `ai_semantic_firewall` (2968) blocks semantic prompt injection, exfiltration, tool-abuse, and topic-policy violations before semantic cache or federation
 - `ai_request_guard` (2975) validates model, tokens, temperature before federation
-- `ai_prompt_compressor` (4055) shortens plaintext prompt metadata for compatible direct dispatchers and compresses the standard backend-dispatch body after request decompression
+- `ai_prompt_compressor` (4055) boundedly shortens admitted OpenAI Chat/Text Completions plaintext, stages compatible direct-dispatch metadata while limiting private wire-result reuse to 65,536 bytes, records authoritative standard wire stats after request decompression, and uses a bounded representation-preserving fallback so configured preserve markers cannot bypass sanitation; successful compression rewrites reserialize the complete JSON body
 - `ai_federation` (4060) routes to provider, writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 
@@ -4378,12 +4387,12 @@ Request buffering is only enabled for matching JSON `POST` requests without a no
 | `compress_roles` | String[] | `["user"]` | Message roles whose `content` is compressed (case-insensitive; non-empty). When it includes `user`, the legacy top-level `prompt` is compressed too. |
 | `target_ratio` | Number | `0.5` | Fraction of word-tokens to keep. `0.5` ≈ 50% reduction; `0.3` is more aggressive. Strictly between 0 and 1. |
 | `min_content_tokens` | Integer | `200` | Estimated-token floor per content string; shorter content is passed through unchanged. |
-| `max_scan_bytes` | Integer | `1048576` | Skip compression when the request body exceeds this size. |
-| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` is kept verbatim and the markers are stripped. ASCII letters, digits, `-`, `_`. |
+| `max_scan_bytes` | Integer | `1048576` | Skip statistical compression when the request body exceeds this size; configured marker sanitation remains active through the hard 1 MiB body/output bound. |
+| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` is kept verbatim and the markers are stripped. At most 64 ASCII letters, digits, `-`, `_`. |
 
 The filter scores each word by stop-word membership, length, in-document rarity, and a proper-noun signal, then drops the lowest-scoring words until `target_ratio` is met. Fenced code blocks, inline code, URLs, numbers, `snake_case`/identifier tokens, uppercase acronyms, and negations (`not`, `never`, `cannot`, …) are always preserved. Token counts are estimated (~4 characters per token); no model tokenizer is embedded.
 
-Runs after `compression` so opt-in request decompression exposes plaintext prompt JSON before this plugin rewrites the standard backend-dispatch body. It rewrites `ctx.metadata["request_body"]` in `before_proxy` for already-plaintext JSON bodies and re-derives the wire body in `transform_request_body` (authoritative for the bytes sent upstream, including the HTTP/3 cross-protocol path). Direct `ai_federation` dispatch can consume the metadata rewrite for plaintext uploads; compressed client uploads must use the standard backend-dispatch path because federation returns before request-body transforms run. Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When a field is rewritten, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
+Runs after `compression` so opt-in request decompression exposes plaintext prompt JSON before this plugin rewrites the standard backend-dispatch body. Its per-request gate buffers candidate JSON `POST` bodies; `before_proxy` rewrites `ctx.metadata["request_body"]` for already-plaintext direct dispatch and stores bounded private stage state; `transform_request_body_with_context` owns the authoritative upstream bytes and counters; and `on_final_request_body_with_context` rejects an unsanitizable decoded marker-bearing surface before dispatch. Direct `ai_federation` dispatch can consume the metadata rewrite for plaintext uploads; compressed client uploads must use the standard backend-dispatch path because federation returns before request-body transforms run. Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When a field is statistically rewritten, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
 
 ```yaml
 plugin_name: ai_prompt_compressor

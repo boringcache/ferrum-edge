@@ -148,6 +148,7 @@ impl V001SqlBuilder {
             self.create_consumer_identity_index_sql(),
             self.create_proxies_sql(),
             self.create_proxy_route_locks_sql(),
+            self.create_mtls_dns_admission_locks_sql(),
             self.create_plugin_configs_sql(),
             self.create_proxy_plugins_sql(),
             self.create_config_change_locks_sql(),
@@ -682,6 +683,38 @@ impl V001SqlBuilder {
         }
     }
 
+    /// One durable lock row per namespace for conditional DNS-identity
+    /// admission. Consumer, plugin, and proxy-association writers lock this
+    /// row in the same transaction that they persist their candidate, then
+    /// validate the effective `san_dns` policy against that transaction's
+    /// authoritative snapshot. This preserves exact semantics while no DNS
+    /// policy is effective without leaving a cross-process TOCTOU window when
+    /// one is enabled. `restore_owner` is a logical fence that persists across
+    /// every transaction in a compensating restore replay.
+    ///
+    /// Build-out policy intentionally keeps this table in the current baseline
+    /// only. It must not be added to `ensure_compatibility_tables` as an
+    /// old-schema upgrade shim.
+    fn create_mtls_dns_admission_locks_sql(&self) -> &'static str {
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS mtls_dns_admission_locks (
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                updated_at VARCHAR(64) NOT NULL,
+                restore_owner VARCHAR(36) COLLATE utf8mb4_0900_as_cs NULL
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS mtls_dns_admission_locks (
+                namespace TEXT PRIMARY KEY,
+                updated_at TEXT NOT NULL,
+                restore_owner TEXT NULL
+            )
+            "#
+        }
+    }
+
     fn create_proxy_plugins_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"
@@ -1156,6 +1189,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_mtls_dns_admission_lock_table_is_namespace_scoped() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_mtls_dns_admission_locks_sql();
+            assert!(
+                sql.contains("mtls_dns_admission_locks"),
+                "{dialect} must create the mTLS DNS admission lock table"
+            );
+            assert!(
+                sql.contains("namespace") && sql.contains("PRIMARY KEY"),
+                "{dialect} must serialize mTLS DNS admission per namespace"
+            );
+            assert!(
+                sql.contains("restore_owner"),
+                "{dialect} must persist the whole-rollback guard owner"
+            );
+        }
+    }
+
     // ------------------------------------------------------------------
     // Collation regression tests
     //
@@ -1172,6 +1225,7 @@ mod tests {
                 format!("{col} VARCHAR(255) COLLATE utf8mb4_0900_as_cs"),
                 format!("{col} VARCHAR(50) COLLATE utf8mb4_0900_as_cs"),
                 format!("{col} VARCHAR(64) COLLATE utf8mb4_0900_as_cs"),
+                format!("{col} VARCHAR(36) COLLATE utf8mb4_0900_as_cs"),
             ];
             assert!(
                 needles.iter().any(|n| sql.contains(n)),
@@ -1291,6 +1345,17 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_mtls_dns_admission_locks_collation_on_namespace() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_mtls_dns_admission_locks_sql();
+        assert_columns_have_collation(
+            sql,
+            "mtls_dns_admission_locks",
+            &["namespace", "restore_owner"],
+        );
+    }
+
+    #[test]
     fn test_non_mysql_dialects_have_no_mysql_collation_clause() {
         for dialect in ["postgres", "sqlite"] {
             let builder = V001SqlBuilder::new(dialect);
@@ -1301,6 +1366,7 @@ mod tests {
                 builder.create_consumer_identity_index_sql(),
                 builder.create_proxies_sql(),
                 builder.create_proxy_route_locks_sql(),
+                builder.create_mtls_dns_admission_locks_sql(),
                 builder.create_plugin_configs_sql(),
                 builder.create_proxy_plugins_sql(),
                 builder.create_api_specs_sql(),

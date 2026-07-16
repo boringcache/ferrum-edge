@@ -519,6 +519,7 @@ jobs:
             filters: |
               integration::admin_api_specs_handler_tests
               integration::admin_db_api_specs_tests
+              integration::spec_expose_integration_tests
               integration::db_proxy_plugin_association_fail_closed_tests
               integration::admin_audit_rbac_tests
               integration::admin_backend_capabilities_tests
@@ -838,6 +839,7 @@ jobs:
               functional_plugin_test
               functional_example_plugin_test
               functional_plugins_network_test
+              functional_spec_expose_test
               functional_prometheus_test
               functional_serverless_mirror_test
               functional_ws_plugins_test
@@ -857,6 +859,7 @@ jobs:
               functional_client_ip_env_test
           - shard: protocols
             filters: |
+              functional_cors_protocol_test
               functional_grpc_test
               functional_key_auth_query_test
               functional_passthrough_test

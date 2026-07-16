@@ -3141,7 +3141,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Backup & Restore ────────────────────────────────────────────────
   /backup:
@@ -3221,8 +3221,11 @@ paths:
         **Replacement operation** — snapshots the current namespace, deletes
         all existing resources, and imports the provided configuration. If any
         import (or the delete) step fails, Ferrum clears the partial state and
-        reapplies the snapshot. Requires `?confirm=true` query parameter to
-        prevent accidental invocation.
+        reapplies the snapshot. One persistent namespace-scoped datastore guard
+        spans that compensating clear and every replay batch, so other
+        DNS-sensitive writers cannot interleave with the rollback-only raw
+        replay. Requires `?confirm=true` query parameter to prevent accidental
+        invocation.
 
         The recovery snapshot uses a **non-validating raw load** from the
         primary, so an already-invalid-but-present namespace (the case an
@@ -3346,10 +3349,19 @@ paths:
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
           description: >-
-            Restore aborted because the prior configuration could not be
-            snapshotted for rollback (database/connectivity failure). Existing
-            config was NOT deleted; retry once the database is reachable. Also
-            returned when the admin API is otherwise unavailable.
+            Restore aborted because the pre-snapshot namespace guard could not
+            be acquired or the prior configuration could not be snapshotted for
+            rollback. A database/connectivity failure has `failure_class:
+            connectivity`. Existing config was NOT deleted; retry once the
+            database is reachable. Guard contention or an intentionally retained
+            uncertain operation instead returns the stable retryable
+            namespace-admission error.
+          headers:
+            Retry-After:
+              description: Present as `1` for namespace-admission contention.
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/json:
               schema:
@@ -3361,12 +3373,12 @@ paths:
                   failure_class:
                     type: string
                     enum: [connectivity]
-                    description: Distinguishes a retryable snapshot availability failure from stored-data corruption.
+                    description: Distinguishes a retryable guard/snapshot availability failure from stored-data corruption.
                   restore_errors:
                     type: array
                     items:
                       type: string
-                    description: The snapshot/connectivity error that caused the abort
+                    description: The guard, snapshot, or connectivity error that caused the abort
 
   # ── Proxies ─────────────────────────────────────────────────────────
   /proxies:
@@ -3435,13 +3447,13 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnly"
         "409":
-          description: Conflict — `listen_path` already exists, or stream proxy `listen_port` conflicts with another proxy, a gateway reserved port, or is not available on the host
+          description: Conflict — `listen_path` already exists, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /proxies/{id}:
     parameters:
@@ -3501,13 +3513,13 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: Conflict — `listen_path` already exists on another proxy, or stream proxy `listen_port` conflicts with another proxy, a gateway reserved port, or is not available on the host
+          description: Conflict — `listen_path` already exists on another proxy, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteProxy
@@ -3522,8 +3534,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Consumers ───────────────────────────────────────────────────────
   /consumers:
@@ -3591,10 +3605,12 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /consumers/{id}:
     parameters:
@@ -3653,10 +3669,12 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteConsumer
@@ -3671,8 +3689,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /consumers/{consumer_id}/credentials/{cred_type}:
     parameters:
@@ -3737,7 +3757,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     post:
       operationId: appendConsumerCredential
@@ -3776,7 +3796,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteConsumerCredentials
@@ -3791,8 +3811,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /consumers/{consumer_id}/credentials/{cred_type}/{index}:
     parameters:
@@ -3839,8 +3861,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Plugins ─────────────────────────────────────────────────────────
   /plugins:
@@ -4011,8 +4035,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /plugins/config/{id}:
     parameters:
@@ -4067,8 +4093,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deletePluginConfig
@@ -4083,8 +4111,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Upstreams ────────────────────────────────────────────────────────
   /upstreams:
@@ -4149,7 +4179,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /upstreams/{id}:
     parameters:
@@ -4205,7 +4235,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
       operationId: deleteUpstream
       summary: Delete an upstream
@@ -4220,7 +4250,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Namespaces ──────────────────────────────────────────────────────
   /namespaces:
@@ -4514,7 +4544,7 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnly"
         "409":
-          description: A spec already exists for this proxy ID, or a resource name / listen_path conflicts
+          description: A spec already exists for this proxy ID, a resource name / listen_path conflicts, or the embedded plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -4546,7 +4576,7 @@ paths:
                   - $ref: "#/components/schemas/ApiSpecValidationError"
                   - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /api-specs/{id}:
     parameters:
@@ -4740,7 +4770,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle
+          description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle, or the replacement would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -4771,7 +4801,7 @@ paths:
                   - $ref: "#/components/schemas/ApiSpecValidationError"
                   - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteApiSpec
@@ -4811,8 +4841,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /api-specs/by-proxy/{proxy_id}:
     parameters:
@@ -5042,7 +5074,7 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Conflict:
-      description: Resource already exists or conflicts with an existing resource
+      description: Resource already exists, conflicts with an existing resource, or the mutation would make mTLS DNS identities ambiguous
       content:
         application/json:
           schema:
@@ -5065,6 +5097,28 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    NamespaceAdmissionUnavailable:
+      description: >-
+        The mutation is temporarily unavailable. For namespace contention, the
+        namespace is fenced by another mutation or an intentionally retained
+        uncertain operation; retry after the indicated delay. Operators must
+        recover a retained uncertain fence before retries can succeed.
+      headers:
+        Retry-After:
+          required: false
+          description: >-
+            Minimum delay in seconds before retrying; present for
+            namespace-admission contention.
+          schema:
+            type: integer
+            minimum: 1
+            example: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: Namespace mutation is temporarily unavailable; retry later
     NotImplemented:
       description: Capability is not available in this build
       content:
@@ -6602,8 +6656,12 @@ components:
             all other certificate fields are compared exactly. Identities are
             always exact-unique across consumers and, while an enabled san_dns
             mTLS policy exists, must also be unique under ASCII case folding.
-            Database snapshots that violate the DNS rule are rejected before
-            runtime indexes are published.
+            Persistent backends serialize Consumer, policy, and proxy-association
+            admission per namespace so concurrent case variants or policy races
+            cannot commit ambiguity; ordinary conflicting CRUD writes return
+            409. Batch and restore use their documented per-item and rollback
+            responses. File, database, CP/DP, and reload snapshots reject
+            violations before runtime indexes are published.
       description: >-
         mTLS auth credential for the `mtls_auth` plugin. Indexed for O(1)
         lookup by certificate identity.
@@ -7208,6 +7266,7 @@ components:
               plugin_name:
                 const: ai_prompt_compressor
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/AiPromptCompressorConfig"
@@ -13162,15 +13221,58 @@ components:
               default: 10000
               description: Maximum nonce cache entries before eviction sweep
 
+    CorsExactOrigin:
+      oneOf:
+        - type: string
+          const: "*"
+        - type: string
+          minLength: 1
+          pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?:\[[0-9A-Fa-f:.]+\]|[^:/?#@\s]+)(?::[0-9]+)?$'
+      description: >-
+        Exact HTTP(S) origin. The runtime URL parser additionally validates the
+        host and port and canonicalizes scheme/host case, default ports, IDNA,
+        IPv4, and IPv6. Exact `*` is Istio's allow-all value.
+
+    CorsAllowedOriginString:
+      oneOf:
+        - $ref: '#/components/schemas/CorsExactOrigin'
+        - type: string
+          minLength: 3
+          pattern: '^\*\.[^*/:\s]+$'
+          description: Native wildcard-subdomain matcher such as `*.example.com`.
+
     CorsConfig:
       type: object
-      description: "Plugin: cors — Cross-Origin Resource Sharing."
+      additionalProperties: false
+      required: [allowed_origins]
+      description: |
+        Plugin: cors — Cross-Origin Resource Sharing. Unknown keys, null values,
+        non-object configs, and an omitted origin policy are rejected. Actual
+        requests evaluate origin/credentials/exposure behavior; method/header
+        allow-lists and max age govern preflight only.
+      allOf:
+        - if:
+            not:
+              required: [unmatched_preflights]
+          then:
+            properties:
+              allowed_methods:
+                minItems: 1
+                default: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+              allowed_headers:
+                minItems: 1
+                default: ["Accept", "Authorization", "Content-Type", "Origin", "X-Requested-With"]
+              max_age:
+                default: 86400
+        - not:
+            required: [preflight_continue, unmatched_preflights]
       properties:
         allowed_origins:
           type: array
+          minItems: 1
           items:
             oneOf:
-              - type: string
+              - $ref: '#/components/schemas/CorsAllowedOriginString'
               - type: object
                 additionalProperties: false
                 minProperties: 1
@@ -13181,43 +13283,62 @@ components:
                   multi-key objects are rejected at config time.
                 properties:
                   exact:
-                    type: string
-                    description: Exact origin match (case-insensitive).
+                    $ref: '#/components/schemas/CorsExactOrigin'
+                    description: >-
+                      Exact origin, canonicalized at config time (scheme/host
+                      case, IDNA, IP serialization, and default ports). The
+                      exact value `*` has Istio's documented allow-all meaning.
                   prefix:
                     type: string
+                    minLength: 1
                     description: >-
                       Literal byte-prefix of the request Origin header
                       (case-sensitive), e.g. "https://app.".
                   regex:
                     type: string
+                    minLength: 1
                     description: >-
                       RE2 pattern that must FULLY match the request Origin
                       header. Compiled (and size-bounded) at config time; an
                       invalid pattern is rejected.
-          default: ["*"]
           description: >-
-            Permitted origins. Each entry is either a string (`"*"` for any
-            origin, an exact `scheme://host[:port]` origin matched
-            case-insensitively, or a `*.suffix.com` wildcard-subdomain pattern)
+            Required permitted-origin policy. Each entry is either a string
+            (`"*"` for intentional allow-all, an exact `scheme://host[:port]`
+            origin canonicalized on the cold config path, or a
+            `*.suffix.com` wildcard-subdomain pattern)
             or an Istio `StringMatch`-shaped object carrying exactly one of
-            `exact` / `prefix` / `regex`. A matching origin is reflected verbatim
-            into `Access-Control-Allow-Origin`.
+            `exact` / `prefix` / `regex`. Prefix and regex retain literal Istio
+            matcher semantics and are not broadened by exact canonicalization.
         allowed_methods:
           type: array
           items:
             type: string
-          default: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-          description: Allowed methods
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: >-
+            Preflight-only allowed methods returned in
+            Access-Control-Allow-Methods. This list is not evaluated against
+            the actual request method. Omission uses the native direct-plugin
+            default; with `unmatched_preflights`, omission/empty preserves
+            Istio's empty list.
         allowed_headers:
           type: array
           items:
             type: string
-          default: ["Accept", "Authorization", "Content-Type", "Origin", "X-Requested-With"]
-          description: Allowed headers
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: >-
+            Preflight-only allowed request headers returned in
+            Access-Control-Allow-Headers. This list is not evaluated against
+            headers on the actual request. Omission uses the native
+            direct-plugin default; with `unmatched_preflights`, omission/empty
+            preserves Istio's empty list.
         exposed_headers:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: []
           description: Response headers exposed to browser JavaScript
         allow_credentials:
@@ -13227,12 +13348,27 @@ components:
         max_age:
           type: integer
           format: uint64
-          default: 86400
-          description: Preflight cache duration in seconds
+          minimum: 0
+          description: >-
+            Preflight cache duration in seconds. Native direct-plugin omission
+            defaults to 86400; translated Istio omission remains absent.
         preflight_continue:
           type: boolean
           default: false
-          description: Pass preflight requests to backend
+          description: >-
+            Pass allowed preflights to the backend. Backend status/body are
+            retained, but every Access-Control response field is replaced by
+            the complete gateway-authoritative policy.
+        unmatched_preflights:
+          type: string
+          enum: [forward, ignore]
+          description: >-
+            Istio projection marker. `forward` preserves omitted,
+            `UNSPECIFIED`, and `FORWARD` behavior; `ignore` returns a local 200
+            without CORS authorization fields. Its presence also preserves
+            omitted/empty method and header lists and omitted max age instead
+            of applying native direct-plugin defaults. It is mutually exclusive
+            with `preflight_continue`.
 
     OpaPluginConfig:
       type: object
@@ -15156,30 +15292,32 @@ components:
 
     SpecExposeConfig:
       type: object
-      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) on a /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s) to avoid hitting the upstream document store on every /specz request; failures are not cached."
+      additionalProperties: false
+      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) for GET and HEAD on the canonical /specz sub-path. HEAD retains the GET representation through response-body policy, then returns the final status and representation headers without a wire body. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s). Failed fetches are coalesced and negatively cached with bounded exponential backoff; excess cache-miss waiters receive HTTP 503 with Retry-After."
       required:
         - spec_url
       properties:
         spec_url:
           type: string
-          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml)"
+          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml). URL userinfo is rejected. Paths and queries may be used for origin routing or signed access, but are omitted from gateway diagnostics."
         content_type:
-          type: string
-          description: "Override the response Content-Type. When omitted, the upstream response's Content-Type is passed through."
+          type: [string, "null"]
+          description: "Trusted response Content-Type override; it is not restricted by the upstream allow-list. When omitted or null, only supported spec media types are preserved from upstream (case-insensitive media-type comparison, with original parameters retained); every other or missing value falls back to application/octet-stream."
         tls_no_verify:
-          type: boolean
-          description: "Skip TLS certificate verification when fetching the spec. Defaults to the gateway's FERRUM_TLS_NO_VERIFY setting."
+          type: [boolean, "null"]
+          description: "Skip TLS certificate verification when fetching the spec. Omitted or null defaults to the gateway's FERRUM_TLS_NO_VERIFY setting. When verification is enabled and a gateway CA bundle is configured, load or parse failure rejects plugin construction instead of widening trust."
         cache_ttl_seconds:
-          type: integer
+          type: [integer, "null"]
           format: uint64
+          minimum: 0
           default: 300
-          description: "Time-to-live for the in-process spec body cache (seconds). The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Failed fetches are never cached. Set to 0 to disable caching entirely (every request re-fetches)."
+          description: "Time-to-live for the in-process spec body cache (seconds). Omitted or null defaults to 300. The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Set to 0 to disable durable positive caching; callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay, while later requests immediately re-fetch. Failed fetches use bounded negative-cache backoff regardless of this value."
         max_response_body_bytes:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           minimum: 1
           default: 26214400
-          description: "Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth."
+          description: "Maximum upstream spec response body size to buffer and cache. Omitted or null defaults to 26214400. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth."
 
     LoadTestingConfig:
       type: object
@@ -16601,7 +16739,20 @@ components:
 
     AiPromptCompressorConfig:
       type: object
-      description: "Plugin: ai_prompt_compressor — Shortens LLM prompt text to reduce token usage, cost, and latency using a model-free statistical (extractive) filter. Rewrites messages[].content (per role) and the legacy top-level prompt in OpenAI-shaped chat/completions bodies. Code blocks, inline code, URLs, numbers, and identifiers are preserved verbatim, and negations are always kept. No model files, network calls, or external services are used."
+      additionalProperties: false
+      allOf:
+        - if:
+            required: [request_family]
+            properties:
+              request_family:
+                const: text_completions
+          then:
+            properties:
+              compress_roles:
+                contains:
+                  type: string
+                  pattern: '^\s*[Uu][Ss][Ee][Rr]\s*$'
+      description: "Plugin: ai_prompt_compressor — Shortens LLM prompt text to reduce token usage, cost, and latency using a bounded model-free statistical (extractive) filter. Rewrites messages[].content (per role) and the legacy top-level prompt only for admitted OpenAI Chat Completions or Text Completions representations. Code blocks, inline code, URLs, Unicode numbers, common identifiers, and negations are preserved verbatim. Configured preserve markers use a bounded representation-preserving fallback whenever statistical compression is skipped. Successful compression rewrites reserialize the complete JSON body. No model files, network calls, or external services are used."
       properties:
         compress_roles:
           type: array
@@ -16621,18 +16772,26 @@ components:
         min_content_tokens:
           type: integer
           minimum: 0
+          maximum: 131072
           default: 200
           description: "Estimated-token floor per content string. Content below this is passed through unchanged so short prompts are not mangled. Token counts are estimated (~4 characters per token); no model tokenizer is embedded."
         max_scan_bytes:
           type: integer
           minimum: 1
+          maximum: 1048576
           default: 1048576
-          description: "Skip compression when the request body exceeds this size."
+          description: "Skip statistical compression when the request body exceeds this size. Configured preserve-marker sanitation remains active up to the immutable 1048576-byte hard body/output maximum and fails closed above it. Eligible prompt text is additionally capped at 524288 bytes, 32768 combined whitespace/tokenizer/marker work units, 256 rewritable fields, and 1024 preserve markers per body. A transformed body is staged beside request metadata for wire-path reuse only when it is at most 65536 bytes."
         preserve_tag:
           type: string
           minLength: 1
+          maxLength: 64
           pattern: '^[A-Za-z0-9_-]+$'
-          description: "Optional marker name. Text wrapped in <TAG>...</TAG> is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Name may contain ASCII letters, digits, '-', and '_'."
+          description: "Optional marker name. Text wrapped in <TAG>...</TAG> is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Nested spans are flattened while preserving their text; unmatched and JSON-escaped markers are stripped deterministically from every admitted request family even when statistical compression is skipped. Name may contain at most 64 ASCII letters, digits, '-', and '_'."
+        request_family:
+          type: string
+          enum: [auto, chat_completions, text_completions]
+          default: auto
+          description: "Request-family gate. 'auto' requires a body shape matching the standard endpoint path suffix (/chat/completions or /completions). A fixed family is an explicit opt-in for compatible custom endpoint paths and still rejects malformed, provider-native, or ambiguous body shapes."
 
     AiResponseGuardConfig:
       type: object

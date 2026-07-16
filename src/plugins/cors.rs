@@ -5,8 +5,9 @@
 //!
 //! Supports exact origin matching and wildcard subdomain patterns (e.g.,
 //! `"*.company.com"` matches `https://app.company.com`). When `allowed_origins`
-//! contains `"*"`, all origins are allowed. Preflight requests are short-circuited
-//! with a 204 response before reaching the backend.
+//! contains `"*"`, all origins are allowed. Native preflight requests are
+//! short-circuited with a 204 response unless forwarding is configured; Istio
+//! projections preserve that API's local-200 and unmatched-request behavior.
 //!
 //! In addition to the plain-string forms, `allowed_origins` entries may be
 //! Istio `StringMatch`-shaped objects — `{"exact": ...}`, `{"prefix": ...}`, or
@@ -23,6 +24,7 @@ use http::header::HeaderName;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, warn};
 use url::Url;
 
@@ -37,6 +39,133 @@ const DEFAULT_ALLOWED_HEADERS: &[&str] = &[
     "Origin",
     "X-Requested-With",
 ];
+
+pub(crate) const CORS_FINALIZER_NAME: &str = "__cors_finalizer";
+
+const CORS_CONFIG_KEYS: &[&str] = &[
+    "allowed_origins",
+    "allowed_methods",
+    "allowed_headers",
+    "exposed_headers",
+    "allow_credentials",
+    "max_age",
+    "preflight_continue",
+    "unmatched_preflights",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnmatchedPreflights {
+    /// Native direct-plugin behavior: reject an unmatched origin.
+    Reject,
+    /// Istio `UNSPECIFIED` / `FORWARD`: send an unmatched preflight upstream.
+    Forward,
+    /// Istio `IGNORE`: answer an unmatched preflight locally without CORS fields.
+    Ignore,
+}
+
+/// Private per-request aggregate used by a contiguous chain of CORS instances.
+///
+/// The plugin cache inserts one [`CorsFinalizer`] after the chain. Individual
+/// instances stage their decisions here, and the finalizer emits exactly one
+/// response policy after every instance has evaluated the request. Keeping the
+/// aggregate out of public metadata prevents internal policy details from
+/// entering transaction logs.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CorsRequestState {
+    policy_count: usize,
+    is_preflight: bool,
+    response_allowed: bool,
+    all_wildcard: bool,
+    allow_credentials: bool,
+    allowed_methods: Option<Arc<Vec<String>>>,
+    allowed_method_union: Option<Vec<String>>,
+    allowed_headers: Option<Arc<Vec<String>>>,
+    allowed_header_union: Option<Vec<String>>,
+    exposed_headers: Option<Arc<Vec<String>>>,
+    max_age: Option<Option<u64>>,
+    forward_preflight: bool,
+    ignore_preflight: bool,
+    istio_policy_seen: bool,
+    native_policy_seen: bool,
+    sanitize_response: bool,
+    pub(crate) defer_finalization: bool,
+}
+
+impl CorsRequestState {
+    fn begin_policy(&mut self, is_preflight: bool) {
+        if self.policy_count == 0 {
+            self.is_preflight = is_preflight;
+            self.response_allowed = true;
+            self.all_wildcard = true;
+            self.allow_credentials = true;
+        }
+        self.policy_count += 1;
+    }
+
+    fn stage_matching_policy(&mut self, plugin: &CorsPlugin, is_preflight: bool) {
+        self.sanitize_response = true;
+        self.all_wildcard &= matches!(&plugin.allowed_origins, AllowedOrigins::Wildcard);
+        self.allow_credentials &= plugin.allow_credentials;
+        intersect_only(&mut self.exposed_headers, &plugin.exposed_headers);
+        if is_preflight {
+            intersect_values(
+                &mut self.allowed_methods,
+                &mut self.allowed_method_union,
+                &plugin.allowed_methods,
+            );
+            intersect_values(
+                &mut self.allowed_headers,
+                &mut self.allowed_header_union,
+                &plugin.allowed_headers,
+            );
+            self.max_age = Some(match self.max_age.take() {
+                None => plugin.max_age,
+                Some(existing) => match (existing, plugin.max_age) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    _ => None,
+                },
+            });
+        }
+    }
+}
+
+fn intersect_only(intersection: &mut Option<Arc<Vec<String>>>, values: &Arc<Vec<String>>) {
+    match intersection.take() {
+        None => *intersection = Some(Arc::clone(values)),
+        Some(existing) => {
+            let mut narrowed = existing.as_ref().clone();
+            narrowed.retain(|value| contains_ascii_case(values, value));
+            *intersection = Some(Arc::new(narrowed));
+        }
+    }
+}
+
+fn contains_ascii_case(values: &[String], candidate: &str) -> bool {
+    values
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(candidate))
+}
+
+fn intersect_values(
+    intersection: &mut Option<Arc<Vec<String>>>,
+    union: &mut Option<Vec<String>>,
+    values: &Arc<Vec<String>>,
+) {
+    match intersection.take() {
+        None => *intersection = Some(Arc::clone(values)),
+        Some(existing) => {
+            let union = union.get_or_insert_with(|| existing.as_ref().clone());
+            for value in values.iter() {
+                if !contains_ascii_case(union, value) {
+                    union.push(value.clone());
+                }
+            }
+            let mut narrowed = existing.as_ref().clone();
+            narrowed.retain(|value| contains_ascii_case(values, value));
+            *intersection = Some(Arc::new(narrowed));
+        }
+    }
+}
 
 /// A single origin pattern entry.
 #[derive(Debug, Clone)]
@@ -79,13 +208,13 @@ enum AllowedOrigins {
 /// backend services do not need to implement CORS themselves.
 pub struct CorsPlugin {
     allowed_origins: AllowedOrigins,
-    allowed_methods: Vec<String>,
-    allowed_methods_header: String,
-    allowed_headers_header: String,
-    exposed_headers_header: Option<String>,
+    allowed_methods: Arc<Vec<String>>,
+    allowed_headers: Arc<Vec<String>>,
+    exposed_headers: Arc<Vec<String>>,
     allow_credentials: bool,
-    max_age: u64,
+    max_age: Option<u64>,
     preflight_continue: bool,
+    unmatched_preflights: UnmatchedPreflights,
 }
 
 impl CorsPlugin {
@@ -94,40 +223,71 @@ impl CorsPlugin {
     }
 
     pub fn new(config: &Value) -> Result<Self, String> {
+        let object = config
+            .as_object()
+            .ok_or_else(|| "cors: configuration must be a JSON object".to_string())?;
+        for (key, value) in object {
+            if !CORS_CONFIG_KEYS.contains(&key.as_str()) {
+                return Err(format!("cors: unknown configuration key '{key}'"));
+            }
+            if value.is_null() {
+                return Err(format!(
+                    "cors: '{key}' must not be null; omit the field to use its default"
+                ));
+            }
+        }
+
+        let unmatched_preflights = match object.get("unmatched_preflights") {
+            None => UnmatchedPreflights::Reject,
+            Some(Value::String(value)) if value == "forward" => UnmatchedPreflights::Forward,
+            Some(Value::String(value)) if value == "ignore" => UnmatchedPreflights::Ignore,
+            Some(Value::String(value)) => {
+                return Err(format!(
+                    "cors: 'unmatched_preflights' must be 'forward' or 'ignore', got: {value}"
+                ));
+            }
+            Some(other) => {
+                return Err(format!(
+                    "cors: 'unmatched_preflights' must be a string, got: {other}"
+                ));
+            }
+        };
+        let istio_semantics = unmatched_preflights != UnmatchedPreflights::Reject;
         let allowed_origins = Self::parse_origins(config)?;
 
         let allowed_methods = Self::parse_string_array(
             config,
             "allowed_methods",
             DEFAULT_ALLOWED_METHODS,
-            false,
+            istio_semantics,
             validate_method,
         )?;
-        let allowed_methods_header = allowed_methods.join(", ");
-
         let allowed_headers = Self::parse_string_array(
             config,
             "allowed_headers",
             DEFAULT_ALLOWED_HEADERS,
-            false,
+            istio_semantics,
             validate_header_name,
         )?;
-        let allowed_headers_header = allowed_headers.join(", ");
-
         let exposed_headers =
             Self::parse_string_array(config, "exposed_headers", &[], true, validate_header_name)?;
-        let exposed_headers_header = if exposed_headers.is_empty() {
-            None
-        } else {
-            Some(exposed_headers.join(", "))
-        };
 
         let mut allow_credentials = bool_config(config, "allow_credentials", false)?;
-        let max_age = u64_config(config, "max_age", 86400)?;
+        let max_age = match object.get("max_age") {
+            Some(_) => Some(u64_config(config, "max_age", 86400)?),
+            None if istio_semantics => None,
+            None => Some(86400),
+        };
         let preflight_continue = bool_config(config, "preflight_continue", false)?;
+        if istio_semantics && object.contains_key("preflight_continue") {
+            return Err(
+                "cors: 'preflight_continue' cannot be combined with Istio 'unmatched_preflights' semantics"
+                    .to_string(),
+            );
+        }
 
         // Per CORS spec: Access-Control-Allow-Origin: * cannot be used with credentials.
-        if allow_credentials && matches!(allowed_origins, AllowedOrigins::Wildcard) {
+        if allow_credentials && matches!(&allowed_origins, AllowedOrigins::Wildcard) {
             warn!(
                 "cors: allow_credentials=true is incompatible with wildcard origins; \
                  credentials will be disabled. Specify explicit origins to use credentials."
@@ -137,13 +297,13 @@ impl CorsPlugin {
 
         Ok(Self {
             allowed_origins,
-            allowed_methods,
-            allowed_methods_header,
-            allowed_headers_header,
-            exposed_headers_header,
+            allowed_methods: Arc::new(allowed_methods),
+            allowed_headers: Arc::new(allowed_headers),
+            exposed_headers: Arc::new(exposed_headers),
             allow_credentials,
             max_age,
             preflight_continue,
+            unmatched_preflights,
         })
     }
 
@@ -166,7 +326,10 @@ impl CorsPlugin {
     /// exactly one of `exact` / `prefix` / `regex`.
     fn parse_origins(config: &Value) -> Result<AllowedOrigins, String> {
         match config.get("allowed_origins") {
-            None | Some(Value::Null) => Ok(AllowedOrigins::Wildcard),
+            None => Err(
+                "cors: 'allowed_origins' is required; use ['*'] for intentional allow-all"
+                    .to_string(),
+            ),
             Some(Value::Array(arr)) => {
                 if arr.is_empty() {
                     return Err(
@@ -176,32 +339,42 @@ impl CorsPlugin {
                 }
 
                 let mut patterns = Vec::with_capacity(arr.len());
+                let mut wildcard = false;
                 for value in arr {
                     match value {
                         Value::String(_) => {
                             // Safe: matched `Value::String`.
-                            let origin = value.as_str().unwrap_or_default().trim();
+                            let raw_origin = value.as_str().unwrap_or_default();
+                            let origin = raw_origin.trim();
                             if origin.is_empty() {
                                 return Err(
                                     "cors: 'allowed_origins' entries must be non-empty strings"
                                         .to_string(),
                                 );
                             }
+                            if origin.len() != raw_origin.len() {
+                                return Err(
+                                    "cors: 'allowed_origins' string entries must not have leading or trailing whitespace"
+                                        .to_string(),
+                                );
+                            }
                             if origin == "*" {
-                                return Ok(AllowedOrigins::Wildcard);
+                                wildcard = true;
+                                continue;
                             }
                             if origin.starts_with('*') {
                                 patterns.push(OriginPattern::WildcardSubdomain(
                                     validate_wildcard_origin(origin)?,
                                 ));
                             } else {
-                                validate_exact_origin(origin)?;
-                                patterns.push(OriginPattern::Exact(origin.to_string()));
+                                patterns
+                                    .push(OriginPattern::Exact(canonicalize_exact_origin(origin)?));
                             }
                         }
-                        Value::Object(_) => {
-                            patterns.push(Self::parse_origin_matcher(value)?);
-                        }
+                        Value::Object(_) => match Self::parse_origin_matcher(value)? {
+                            Some(pattern) => patterns.push(pattern),
+                            None => wildcard = true,
+                        },
                         other => {
                             return Err(format!(
                                 "cors: 'allowed_origins' entries must be strings or \
@@ -211,7 +384,11 @@ impl CorsPlugin {
                     }
                 }
 
-                Ok(AllowedOrigins::List(patterns))
+                if wildcard {
+                    Ok(AllowedOrigins::Wildcard)
+                } else {
+                    Ok(AllowedOrigins::List(patterns))
+                }
             }
             Some(other) => Err(format!(
                 "cors: 'allowed_origins' must be an array of strings or \
@@ -225,7 +402,7 @@ impl CorsPlugin {
     /// the three keys must be present and a non-empty string. The `regex`
     /// pattern is compiled here (config time) so an invalid pattern is a config
     /// error, never a request-path panic.
-    fn parse_origin_matcher(value: &Value) -> Result<OriginPattern, String> {
+    fn parse_origin_matcher(value: &Value) -> Result<Option<OriginPattern>, String> {
         // Istio `StringMatch` contract: EXACTLY ONE recognized key, and nothing
         // else. Reject unknown keys, extra keys, or a non-string value rather
         // than silently coercing — mirrors
@@ -252,15 +429,24 @@ impl CorsPlugin {
 
         match (exact, prefix, regex) {
             (Some(exact), None, None) => {
-                let exact = exact.trim();
-                if exact.is_empty() {
+                let trimmed = exact.trim();
+                if trimmed.is_empty() {
                     return Err(
                         "cors: 'allowed_origins' exact matcher must be a non-empty string"
                             .to_string(),
                     );
                 }
-                validate_exact_origin(exact)?;
-                Ok(OriginPattern::Exact(exact.to_string()))
+                if trimmed.len() != exact.len() {
+                    return Err(
+                        "cors: 'allowed_origins' exact matcher must not have leading or trailing whitespace"
+                            .to_string(),
+                    );
+                }
+                if exact == "*" {
+                    return Ok(None);
+                }
+                let canonical = canonicalize_exact_origin(exact)?;
+                Ok(Some(OriginPattern::Exact(canonical)))
             }
             (None, Some(prefix), None) => {
                 // Istio prefix is a literal string prefix of the Origin header;
@@ -275,7 +461,7 @@ impl CorsPlugin {
                             .to_string(),
                     );
                 }
-                Ok(OriginPattern::Prefix(prefix.to_string()))
+                Ok(Some(OriginPattern::Prefix(prefix.to_string())))
             }
             (None, None, Some(regex)) => {
                 if regex.is_empty() {
@@ -299,7 +485,7 @@ impl CorsPlugin {
                 let compiled = Regex::new(&anchored).map_err(|e| {
                     format!("cors: 'allowed_origins' regex matcher '{regex}' is invalid: {e}")
                 })?;
-                Ok(OriginPattern::Regex(compiled))
+                Ok(Some(OriginPattern::Regex(compiled)))
             }
             (None, None, None) => Err(
                 "cors: 'allowed_origins' object matcher must specify one of \
@@ -323,7 +509,13 @@ impl CorsPlugin {
         validate: fn(&str, &str) -> Result<(), String>,
     ) -> Result<Vec<String>, String> {
         match config.get(key) {
-            None | Some(Value::Null) => Ok(defaults.iter().map(|s| (*s).to_string()).collect()),
+            None => {
+                if allow_empty {
+                    Ok(Vec::new())
+                } else {
+                    Ok(defaults.iter().map(|s| (*s).to_string()).collect())
+                }
+            }
             Some(Value::Array(arr)) => {
                 if arr.is_empty() && !allow_empty {
                     return Err(format!("cors: '{key}' must contain at least one value"));
@@ -333,9 +525,14 @@ impl CorsPlugin {
                     let value = value.as_str().ok_or_else(|| {
                         format!("cors: '{key}' entries must be strings, got: {value}")
                     })?;
-                    let value = value.trim();
-                    if value.is_empty() {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
                         return Err(format!("cors: '{key}' entries must be non-empty strings"));
+                    }
+                    if trimmed.len() != value.len() {
+                        return Err(format!(
+                            "cors: '{key}' entries must not have leading or trailing whitespace"
+                        ));
                     }
                     validate(key, value)?;
                     values.push(value.to_string());
@@ -380,96 +577,12 @@ impl CorsPlugin {
         }
     }
 
-    /// Build the common CORS response headers (used for both preflight and actual).
-    ///
-    /// Note: this returns the headers the plugin wants to ADD/SET on the response.
-    /// Vary is intentionally not included here — see `apply_cors_headers_to_response`
-    /// which merges Vary with any pre-existing value to avoid clobbering backend Vary
-    /// directives (e.g., `Vary: Accept-Encoding` from compression).
-    fn build_cors_headers(&self, origin: &str) -> HashMap<String, String> {
-        let mut headers = HashMap::new();
-
-        // Set Access-Control-Allow-Origin
-        match &self.allowed_origins {
-            AllowedOrigins::Wildcard if !self.allow_credentials => {
-                headers.insert("access-control-allow-origin".to_string(), "*".to_string());
-            }
-            _ => {
-                headers.insert(
-                    "access-control-allow-origin".to_string(),
-                    origin.to_string(),
-                );
-            }
+    fn maybe_finalize_request(&self, ctx: &mut RequestContext) -> PluginResult {
+        if ctx.cors_state.defer_finalization {
+            PluginResult::Continue
+        } else {
+            finalize_cors_request(ctx)
         }
-
-        if self.allow_credentials {
-            headers.insert(
-                "access-control-allow-credentials".to_string(),
-                "true".to_string(),
-            );
-        }
-
-        if let Some(exposed_headers) = &self.exposed_headers_header {
-            headers.insert(
-                "access-control-expose-headers".to_string(),
-                exposed_headers.clone(),
-            );
-        }
-
-        headers
-    }
-
-    /// Merge `Origin` into an existing `Vary` header value (case-insensitive).
-    /// Returns the merged Vary string. Preserves existing tokens (e.g., `Accept-Encoding`)
-    /// to avoid breaking caching layers that depend on them.
-    fn merge_vary_origin(existing: Option<&str>) -> String {
-        match existing {
-            None => "Origin".to_string(),
-            Some(value) => {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return "Origin".to_string();
-                }
-                // Per RFC 9110 §12.5.5, Vary: * means "vary on any header" — adding
-                // Origin is redundant. Preserve as-is.
-                if trimmed == "*" {
-                    return "*".to_string();
-                }
-                let already_present = trimmed
-                    .split(',')
-                    .any(|tok| tok.trim().eq_ignore_ascii_case("Origin"));
-                if already_present {
-                    return trimmed.to_string();
-                }
-                format!("{}, Origin", trimmed)
-            }
-        }
-    }
-
-    /// Build headers specific to preflight responses (superset of common headers).
-    fn build_preflight_headers(&self, origin: &str) -> HashMap<String, String> {
-        let mut headers = self.build_cors_headers(origin);
-
-        // Preflight 204 responses have no backend Vary to preserve, so set Origin
-        // directly. The actual-request response path uses merge_vary_origin().
-        headers.insert("vary".to_string(), "Origin".to_string());
-
-        headers.insert(
-            "access-control-allow-methods".to_string(),
-            self.allowed_methods_header.clone(),
-        );
-
-        headers.insert(
-            "access-control-allow-headers".to_string(),
-            self.allowed_headers_header.clone(),
-        );
-
-        headers.insert(
-            "access-control-max-age".to_string(),
-            self.max_age.to_string(),
-        );
-
-        headers
     }
 }
 
@@ -490,6 +603,12 @@ impl Plugin for CorsPlugin {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        if self.unmatched_preflights == UnmatchedPreflights::Reject {
+            ctx.cors_state.native_policy_seen = true;
+        } else {
+            ctx.cors_state.istio_policy_seen = true;
+        }
+
         // Only act on requests that include an Origin header
         let origin = match ctx.headers.get("origin") {
             Some(o) => o.clone(),
@@ -500,9 +619,17 @@ impl Plugin for CorsPlugin {
         let is_preflight =
             ctx.method == "OPTIONS" && ctx.headers.contains_key("access-control-request-method");
 
+        ctx.cors_state.begin_policy(is_preflight);
+        let origin_allowed = self.is_origin_allowed(&origin);
         if !is_preflight {
-            // Simple/actual CORS request — reject if origin is not allowed
-            if !self.is_origin_allowed(&origin) {
+            if !origin_allowed {
+                ctx.cors_state.response_allowed = false;
+                // Istio/Envoy forwards unmatched actual requests and leaves
+                // them without CORS response fields. Native direct-plugin
+                // policy retains its historical fail-closed 403.
+                if self.unmatched_preflights != UnmatchedPreflights::Reject {
+                    return self.maybe_finalize_request(ctx);
+                }
                 debug!("cors: request rejected for disallowed origin '{}'", origin);
                 return PluginResult::Reject {
                     status_code: 403,
@@ -510,24 +637,32 @@ impl Plugin for CorsPlugin {
                     headers: HashMap::new(),
                 };
             }
+            ctx.cors_state.stage_matching_policy(self, false);
             ctx.metadata
                 .insert("cors_origin".to_string(), origin.clone());
-            return PluginResult::Continue;
+            return self.maybe_finalize_request(ctx);
         }
 
         // --- Preflight handling ---
 
-        // If preflight_continue is set, let the request pass through to backend
-        if self.preflight_continue {
-            if self.is_origin_allowed(&origin) {
-                ctx.metadata
-                    .insert("cors_origin".to_string(), origin.clone());
+        if !origin_allowed {
+            ctx.cors_state.response_allowed = false;
+            if self.preflight_continue {
+                ctx.cors_state.sanitize_response = true;
+                ctx.cors_state.forward_preflight = true;
+                return self.maybe_finalize_request(ctx);
             }
-            return PluginResult::Continue;
-        }
-
-        // Check origin
-        if !self.is_origin_allowed(&origin) {
+            match self.unmatched_preflights {
+                UnmatchedPreflights::Forward => {
+                    ctx.cors_state.forward_preflight = true;
+                    return self.maybe_finalize_request(ctx);
+                }
+                UnmatchedPreflights::Ignore => {
+                    ctx.cors_state.ignore_preflight = true;
+                    return self.maybe_finalize_request(ctx);
+                }
+                UnmatchedPreflights::Reject => {}
+            }
             debug!(
                 "cors: preflight rejected for disallowed origin '{}'",
                 origin
@@ -539,13 +674,29 @@ impl Plugin for CorsPlugin {
             };
         }
 
-        // Check requested method
-        if let Some(requested_method) = ctx.headers.get("access-control-request-method") {
+        ctx.cors_state.stage_matching_policy(self, true);
+        ctx.metadata
+            .insert("cors_origin".to_string(), origin.clone());
+
+        // Native backend-handled preflights keep the backend's status/body,
+        // but the final response policy is rebuilt from the gateway config.
+        if self.preflight_continue {
+            ctx.cors_state.forward_preflight = true;
+            return self.maybe_finalize_request(ctx);
+        }
+
+        // Preserve the native direct-plugin's explicit method rejection.
+        // Istio/Envoy instead emits its configured list (possibly empty) and
+        // lets the browser decide whether that list authorizes the request.
+        if self.unmatched_preflights == UnmatchedPreflights::Reject
+            && let Some(requested_method) = ctx.headers.get("access-control-request-method")
+        {
             let method_allowed = self
                 .allowed_methods
                 .iter()
                 .any(|m| m.eq_ignore_ascii_case(requested_method));
             if !method_allowed {
+                ctx.cors_state.response_allowed = false;
                 debug!(
                     "cors: preflight rejected method '{}' for origin '{}'",
                     requested_method, origin
@@ -563,14 +714,8 @@ impl Plugin for CorsPlugin {
             }
         }
 
-        // Preflight approved — return 204 with CORS headers
-        let headers = self.build_preflight_headers(&origin);
         debug!("cors: preflight approved for origin '{}'", origin);
-        PluginResult::Reject {
-            status_code: 204,
-            body: String::new(),
-            headers,
-        }
+        self.maybe_finalize_request(ctx)
     }
 
     async fn after_proxy(
@@ -579,70 +724,11 @@ impl Plugin for CorsPlugin {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // When `after_proxy` is being run as part of a plugin *rejection*
-        // (`apply_after_proxy_hooks_to_rejection`), the response headers are
-        // plugin-supplied, not backend-supplied. The strip step exists to
-        // prevent backend-supplied `access-control-*` from leaking through —
-        // running it on a rejection erases this plugin's own preflight reply
-        // (e.g. the `204` headers from `on_request_received`). Skip the strip
-        // on the rejection path so the preflight headers survive, but keep
-        // running the re-inject pass below so the gateway can still attach
-        // CORS headers onto a *different* plugin's rejection (e.g.
-        // `request_termination` 503 → still gets `Allow-Origin` for allowed
-        // origins). See `crate::proxy::apply_after_proxy_hooks_to_rejection`
-        // for the marker.
-        let is_rejection_path = ctx
-            .metadata
-            .get(crate::proxy::REJECTION_RESPONSE_METADATA_KEY)
-            .is_some_and(|v| v == "true");
-        let origin = ctx.metadata.get("cors_origin").cloned();
-
-        // Keep CORS plugin preflight rejection headers intact: that path is a
-        // rejection without `cors_origin` metadata by design.
-        let preserve_rejection_headers = is_rejection_path && origin.is_none();
-        if !preserve_rejection_headers {
-            // Strip backend-supplied CORS policy headers so the gateway CORS
-            // policy remains authoritative.
-            Self::remove_access_control_headers(response_headers);
+        if ctx.cors_state.defer_finalization {
+            PluginResult::Continue
+        } else {
+            finalize_cors_response(ctx, response_headers)
         }
-
-        // Check if on_request_received marked this as a valid CORS request
-        let origin = match origin {
-            Some(o) => o,
-            None => return PluginResult::Continue,
-        };
-
-        match &self.allowed_origins {
-            AllowedOrigins::Wildcard if !self.allow_credentials => {
-                response_headers.insert("access-control-allow-origin".to_string(), "*".to_string());
-            }
-            _ => {
-                response_headers.insert("access-control-allow-origin".to_string(), origin);
-            }
-        }
-
-        if self.allow_credentials {
-            response_headers.insert(
-                "access-control-allow-credentials".to_string(),
-                "true".to_string(),
-            );
-        }
-
-        if let Some(exposed_headers) = &self.exposed_headers_header {
-            response_headers.insert(
-                "access-control-expose-headers".to_string(),
-                exposed_headers.clone(),
-            );
-        }
-
-        // Merge Origin into Vary rather than overwriting it. The backend may have
-        // returned `Vary: Accept-Encoding` (compression), `Vary: Accept-Language`,
-        // etc.; clobbering those would break downstream caches that segment by
-        // those dimensions.
-        let merged = Self::merge_vary_origin(response_headers.get("vary").map(|s| s.as_str()));
-        response_headers.insert("vary".to_string(), merged);
-
-        PluginResult::Continue
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {
@@ -650,7 +736,263 @@ impl Plugin for CorsPlugin {
     }
 }
 
-/// `pub(crate)` like [`validate_exact_origin`]: the K8s translator's
+/// Cache-internal boundary after a contiguous set of CORS instances.
+pub(crate) struct CorsFinalizer {
+    priority: u16,
+}
+
+impl CorsFinalizer {
+    pub(crate) fn new(priority: u16) -> Self {
+        Self { priority }
+    }
+}
+
+#[async_trait]
+impl Plugin for CorsFinalizer {
+    fn name(&self) -> &str {
+        CORS_FINALIZER_NAME
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_GRPC_PROTOCOLS
+    }
+
+    async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        finalize_cors_request(ctx)
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        finalize_cors_response(ctx, response_headers)
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+}
+
+fn cors_reject(body: String) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 403,
+        body,
+        headers: HashMap::new(),
+    }
+}
+
+fn finalize_cors_request(ctx: &mut RequestContext) -> PluginResult {
+    let state = &ctx.cors_state;
+    if state.policy_count == 0 {
+        return PluginResult::Continue;
+    }
+
+    // Requested methods and headers are preflight policy. For multiple
+    // policies, reject a preflight value one instance authorizes but the
+    // aggregate intersection does not. Actual requests evaluate only the
+    // origin/credentials/exposure policy appropriate to that phase; browsers
+    // do not repeat Access-Control-Request-* on the actual request.
+    if state.policy_count > 1 && state.is_preflight {
+        let methods = state
+            .allowed_methods
+            .as_ref()
+            .map(|values| values.as_slice())
+            .unwrap_or_default();
+        let method_union = state.allowed_method_union.as_deref().unwrap_or_default();
+        if let Some(requested_method) = ctx.headers.get("access-control-request-method")
+            && contains_ascii_case(method_union, requested_method)
+            && !contains_ascii_case(methods, requested_method)
+        {
+            let mut body =
+                String::with_capacity("CORS method not allowed: ".len() + requested_method.len());
+            body.push_str("CORS method not allowed: ");
+            body.push_str(requested_method);
+            return cors_reject(body);
+        }
+        if let Some(requested_headers) = ctx.headers.get("access-control-request-headers") {
+            let headers = state
+                .allowed_headers
+                .as_ref()
+                .map(|values| values.as_slice())
+                .unwrap_or_default();
+            let header_union = state.allowed_header_union.as_deref().unwrap_or_default();
+            for requested in requested_headers.split(',').map(str::trim) {
+                if !requested.is_empty()
+                    && contains_ascii_case(header_union, requested)
+                    && !contains_ascii_case(headers, requested)
+                {
+                    let mut body =
+                        String::with_capacity("CORS header not allowed: ".len() + requested.len());
+                    body.push_str("CORS header not allowed: ");
+                    body.push_str(requested);
+                    return cors_reject(body);
+                }
+            }
+        }
+    }
+
+    if !state.is_preflight {
+        return PluginResult::Continue;
+    }
+    if state.ignore_preflight {
+        return PluginResult::Reject {
+            status_code: 200,
+            body: String::new(),
+            headers: HashMap::new(),
+        };
+    }
+    if state.forward_preflight {
+        return PluginResult::Continue;
+    }
+
+    let headers = cors_headers(ctx, true);
+    PluginResult::Reject {
+        status_code: if state.istio_policy_seen { 200 } else { 204 },
+        body: String::new(),
+        headers,
+    }
+}
+
+fn finalize_cors_response(
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    let is_rejection_path = ctx
+        .metadata
+        .get(crate::proxy::REJECTION_RESPONSE_METADATA_KEY)
+        .is_some_and(|value| value == "true");
+
+    // Native CORS retains its established sanitization of every backend
+    // response. A matching translated Istio policy also owns the response
+    // fields. Pure Istio unmatched/no-Origin forwarding is different: Envoy
+    // leaves the upstream response untouched, so preserve that source
+    // behavior instead of silently taking ownership.
+    let should_sanitize = ctx.cors_state.native_policy_seen || ctx.cors_state.sanitize_response;
+    if should_sanitize && !(is_rejection_path && ctx.cors_state.policy_count == 0) {
+        CorsPlugin::remove_access_control_headers(response_headers);
+    }
+    if ctx.cors_state.policy_count == 0 || !ctx.cors_state.response_allowed {
+        return PluginResult::Continue;
+    }
+
+    let existing_vary = response_headers.get("vary").cloned();
+    let cors_headers = cors_headers(ctx, ctx.cors_state.is_preflight);
+    for (name, mut value) in cors_headers {
+        if name == "vary" {
+            let required = if ctx.cors_state.is_preflight {
+                &[
+                    "Origin",
+                    "Access-Control-Request-Method",
+                    "Access-Control-Request-Headers",
+                ][..]
+            } else {
+                &["Origin"][..]
+            };
+            value = merge_vary_tokens(existing_vary.as_deref(), required);
+        }
+        response_headers.insert(name, value);
+    }
+    PluginResult::Continue
+}
+
+fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String> {
+    let state = &ctx.cors_state;
+    let mut headers = HashMap::new();
+    let Some(origin) = ctx.metadata.get("cors_origin") else {
+        return headers;
+    };
+
+    headers.insert(
+        "access-control-allow-origin".to_string(),
+        if state.all_wildcard && !state.allow_credentials {
+            "*".to_string()
+        } else {
+            origin.clone()
+        },
+    );
+    if state.allow_credentials {
+        headers.insert(
+            "access-control-allow-credentials".to_string(),
+            "true".to_string(),
+        );
+    }
+    if let Some(exposed) = state
+        .exposed_headers
+        .as_ref()
+        .filter(|values| !values.is_empty())
+    {
+        headers.insert(
+            "access-control-expose-headers".to_string(),
+            exposed.join(", "),
+        );
+    }
+    if preflight {
+        if let Some(methods) = state
+            .allowed_methods
+            .as_ref()
+            .filter(|values| !values.is_empty())
+        {
+            headers.insert(
+                "access-control-allow-methods".to_string(),
+                methods.join(", "),
+            );
+        }
+        if let Some(allowed) = state
+            .allowed_headers
+            .as_ref()
+            .filter(|values| !values.is_empty())
+        {
+            headers.insert(
+                "access-control-allow-headers".to_string(),
+                allowed.join(", "),
+            );
+        }
+        if let Some(Some(max_age)) = state.max_age {
+            headers.insert("access-control-max-age".to_string(), max_age.to_string());
+        }
+    }
+
+    let vary_tokens = if preflight {
+        &[
+            "Origin",
+            "Access-Control-Request-Method",
+            "Access-Control-Request-Headers",
+        ][..]
+    } else {
+        &["Origin"][..]
+    };
+    let vary = merge_vary_tokens(headers.get("vary").map(String::as_str), vary_tokens);
+    headers.insert("vary".to_string(), vary);
+    headers
+}
+
+fn merge_vary_tokens(existing: Option<&str>, required: &[&str]) -> String {
+    let mut merged = existing.unwrap_or_default().trim().to_string();
+    if merged == "*" {
+        return merged;
+    }
+    for required in required {
+        let present = merged
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case(required));
+        if present {
+            continue;
+        }
+        if !merged.is_empty() {
+            merged.push_str(", ");
+        }
+        merged.push_str(required);
+    }
+    merged
+}
+
+/// `pub(crate)` like [`canonicalize_exact_origin`]: the K8s translator's
 /// `cors_policy_translatable` and the native/file mesh source's
 /// `validate_virtual_service_cors_policies` run the same method/header-name
 /// admission the plugin applies at construction, so a policy that passes those
@@ -687,16 +1029,35 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
     Ok(format!(".{}", suffix.to_ascii_lowercase()))
 }
 
-/// Validate one exact (plain-string, non-wildcard) allowed origin:
-/// `scheme://host[:port]` with an http(s) scheme and no path, query, fragment,
-/// or credentials. `pub(crate)` because it is the SHARED admission gate for
-/// every surface that projects Istio `StringMatch.exact` origins into this
-/// plugin's plain-string form — the K8s translator's
-/// `cors_origin_matcher_value` (defers non-translatable policies) and the
-/// native/file mesh source's `validate_virtual_service_cors_policies`
-/// (rejects the slice fail-closed) — so a value that passes those boundaries
-/// can never fail `CorsPlugin` construction later. Do not fork this predicate.
-pub(crate) fn validate_exact_origin(origin: &str) -> Result<(), String> {
+/// Validate and canonicalize an exact origin on the config/reload path.
+/// Request matching remains an allocation-free ASCII comparison against this
+/// browser-serialized form; no request-time URL parse is introduced.
+/// `pub(crate)` because this is the shared admission gate for the K8s Istio
+/// translator and native/file mesh validation as well as direct plugin
+/// configuration. Callers that preserve literal Istio `StringMatch.exact`
+/// semantics additionally require the returned serialization to equal the
+/// source value. Do not fork this predicate.
+pub(crate) fn canonicalize_exact_origin(origin: &str) -> Result<String, String> {
+    if origin.contains(char::is_whitespace) {
+        return Err(format!(
+            "cors: origin must not contain whitespace: {origin:?}"
+        ));
+    }
+
+    // `url::Url` applies the WHATWG path normalizer while parsing. Inspect the
+    // raw bytes first so `/foo/..`, encoded dot segments such as `/%2e%2e`, or
+    // backslash path separators cannot collapse to `/` and then be serialized
+    // as permission for the whole origin. An empty authority is left for the
+    // hostname-specific diagnostic below.
+    if let Some((authority, post_authority)) = split_raw_authority(origin)
+        && !authority.is_empty()
+        && !post_authority.is_empty()
+    {
+        return Err(format!(
+            "cors: origin must be scheme://host[:port] without path, query, or fragment: {origin}"
+        ));
+    }
+
     let url = Url::parse(origin).map_err(|e| format!("cors: invalid origin '{origin}': {e}"))?;
     match url.scheme() {
         "http" | "https" => {}
@@ -723,21 +1084,21 @@ pub(crate) fn validate_exact_origin(origin: &str) -> Result<(), String> {
             "cors: origin must be scheme://host[:port] without path, query, or fragment: {origin}"
         ));
     }
-    Ok(())
+    Ok(url.origin().ascii_serialization())
 }
 
 fn has_non_empty_authority(origin: &str) -> bool {
-    let Some((_, after_scheme)) = origin.split_once(':') else {
-        return false;
-    };
-    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
-        return false;
-    };
+    split_raw_authority(origin).is_some_and(|(authority, _)| !authority.is_empty())
+}
+
+fn split_raw_authority(origin: &str) -> Option<(&str, &str)> {
+    let (_, after_scheme) = origin.split_once(':')?;
+    let authority_and_path = after_scheme.strip_prefix("//")?;
     let authority_end = authority_and_path
-        .find(['/', '?', '#'])
+        .find(['/', '\\', '?', '#'])
         .unwrap_or(authority_and_path.len());
 
-    authority_end > 0
+    Some(authority_and_path.split_at(authority_end))
 }
 
 fn bool_config(config: &Value, key: &str, default: bool) -> Result<bool, String> {
@@ -762,7 +1123,7 @@ fn u64_config(config: &Value, key: &str, default: u64) -> Result<u64, String> {
 
 fn origin_host(origin: &str) -> Option<&str> {
     let (scheme, rest) = origin.split_once("://")?;
-    // Enforce the same http(s) scheme allow-list that `validate_exact_origin`
+    // Enforce the same http(s) scheme allow-list that `canonicalize_exact_origin`
     // applies to exact origins, so wildcard-subdomain matching is not looser
     // than exact matching. Without this, an Origin like `ftp://app.company.com`
     // would satisfy a `*.company.com` rule and be reflected into
@@ -770,11 +1131,29 @@ fn origin_host(origin: &str) -> Option<&str> {
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return None;
     }
-    if rest.starts_with('[') {
+    if rest.starts_with('[')
+        || rest.contains('@')
+        || rest.contains('?')
+        || rest.contains('#')
+        || rest.contains(char::is_whitespace)
+    {
         return None;
     }
-    let host_port = rest.split('/').next().unwrap_or(rest);
-    host_port.split(':').next().filter(|host| !host.is_empty())
+    if rest.contains('/') {
+        return None;
+    }
+    let (host, port) = match rest.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (rest, None),
+    };
+    if host.is_empty()
+        || host.contains(':')
+        || host.contains("..")
+        || port.is_some_and(|port| port.parse::<u16>().is_err())
+    {
+        return None;
+    }
+    Some(host)
 }
 
 fn ascii_ends_with_ignore_case(value: &str, suffix: &str) -> bool {
