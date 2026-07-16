@@ -1050,24 +1050,32 @@ UDP sessions are logged when the session is cleaned up after idle timeout.
 **Phases**: `log`, `on_stream_disconnect`
 **Protocols**: All (HTTP, gRPC, WebSocket, TCP, UDP)
 
-Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header.
+Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header. Config admission is strict: unknown top-level fields and explicit `null` values are rejected. Nested `labels` and `custom_headers` remain dynamic maps.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `endpoint_url` | string | (required) | Loki push API URL |
+| `endpoint_url` | string | (required) | HTTP(S) Loki push API URL; URL user information is rejected |
 | `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic) |
 | `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`) |
-| `labels` | object | `{"service":"ferrum-edge"}` | Static labels applied to every log stream |
+| `labels` | object | `{"service":"ferrum-edge"}` | Static labels; names beginning `__` and reserved `ferrum_emitter` are rejected; names are at most 1,024 characters and values at most 2,048 characters |
 | `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label |
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
 | `gzip` | bool | `true` | Gzip-compress request bodies |
-| `batch_size` | integer | `100` | Max entries per batch |
+| `batch_size` | integer | `100` | Max entries per batch (1–10,000) |
 | `flush_interval_ms` | integer | `1000` | Flush timer interval (minimum 100) |
-| `buffer_capacity` | integer | `10000` | Channel buffer capacity |
-| `max_retries` | integer | `3` | Retry attempts on failure |
-| `retry_delay_ms` | integer | `1000` | Delay between retries |
+| `buffer_capacity` | integer | `10000` | Channel buffer capacity (1–1,000,000) |
+| `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576) |
+| `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`) |
+| `max_retries` | integer | `3` | Retries after the initial attempt (0–10) |
+| `retry_delay_ms` | integer | `1000` | Initial exponential-backoff delay (1–60,000 ms) |
+| `schema` | object | (none) | Inline transaction-log schema |
+| `schema_ref` | string | (none) | Named `transaction_log_schema` reference; mutually exclusive with `schema` |
 
-Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, `authorization_header`, or tenant header rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests, which Loki uses for ingestion throttling) are transient signals and are retried within the configured budget.
+Only HTTP **204 No Content** is delivery success. Transport failures, 408, 429, 5xx, and an incomplete or oversized 204 response drain retry with capped exponential backoff and full jitter. Loki's blocked-ingestion status **260** is a terminal failure, as are every other 2xx, 3xx, and non-retryable 4xx status. Response bodies are never logged or retained: they are discarded with a 1 MiB cap and a one-second timeout, and diagnostics contain only status and bounded size/drain classifications.
+
+The outer Loki timestamp is assigned in the plugin's single flush order and is strictly increasing across batches. The original request/session timestamps remain in the structured JSON line, so completion-order batching does not invent event chronology. Ferrum Edge adds a unique `ferrum_emitter` label to each plugin instance; independently ordered replicas and reload generations therefore do not share a Loki stream.
+
+The channel slot is reserved before serialization. Serialization is capped by `max_entry_bytes`, and retained entry content remains charged to `buffer_max_bytes` until delivery, terminal loss, or shutdown drain completes. Pressure drops are non-blocking and diagnostics never contain entry content. Operational logs show only the endpoint scheme/host/port; path, query, authorization, and all custom-header values are redacted from audit records and non-admin config reads. Shared plugin HTTP clients ignore ambient proxy environment variables, while preserving configured DNS, TLS, redirect, and backend-egress policy.
 
 ### `transaction_debugger`
 

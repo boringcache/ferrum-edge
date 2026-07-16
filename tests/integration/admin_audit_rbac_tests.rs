@@ -461,6 +461,99 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
 }
 
 #[tokio::test]
+async fn loki_config_projection_redacts_endpoint_and_all_header_credentials() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let path_secret = "loki-private-path-canary";
+    let query_secret = "loki-query-canary";
+    let auth_secret = "loki-auth-canary";
+    let tenant_secret = "loki-tenant-canary";
+    let arbitrary_header_secret = "loki-arbitrary-header-canary";
+    let endpoint = format!(
+        "https://logs.example.com/{path_secret}/loki/api/v1/push?tenant_key={query_secret}"
+    );
+    let plugin = json!({
+        "id": "loki-redaction-config",
+        "plugin_name": "loki_logging",
+        "scope": "global",
+        "config": {
+            "endpoint_url": endpoint,
+            "authorization_header": format!("Bearer {auth_secret}"),
+            "custom_headers": {
+                "X-Scope-OrgID": tenant_secret,
+                "X-Arbitrary": arbitrary_header_secret
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "Loki plugin create failed: {body:?}");
+    assert_eq!(body["config"]["endpoint_url"], endpoint);
+    assert_eq!(body["config"]["authorization_header"], format!("Bearer {auth_secret}"));
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=loki-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config = &audit_body["items"].as_array().expect("audit items")[0]["diff"]
+        ["after"]["config"];
+    assert_loki_config_projection_redacted(audit_config);
+
+    for bearer in [&viewer, &operator] {
+        let (status, projected) =
+            get_json(&base, "/plugins/config/loki-redaction-config", bearer).await;
+        assert_eq!(status, 200, "projected Loki config read failed: {projected:?}");
+        assert_loki_config_projection_redacted(&projected["config"]);
+    }
+
+    let (status, list) = get_json(&base, "/plugins/config", &viewer).await;
+    assert_eq!(status, 200, "viewer Loki config list failed: {list:?}");
+    let listed = list["data"]
+        .as_array()
+        .expect("plugin list data")
+        .iter()
+        .find(|item| item["id"] == "loki-redaction-config")
+        .expect("listed Loki config");
+    assert_loki_config_projection_redacted(&listed["config"]);
+
+    let (status, raw) = get_json(&base, "/plugins/config/loki-redaction-config", &admin).await;
+    assert_eq!(status, 200, "admin Loki config read failed: {raw:?}");
+    assert_eq!(raw["config"]["endpoint_url"], endpoint);
+    assert_eq!(raw["config"]["custom_headers"]["X-Scope-OrgID"], tenant_secret);
+
+    for projection in [audit_config, &listed["config"]] {
+        let serialized = projection.to_string();
+        for secret in [
+            path_secret,
+            query_secret,
+            auth_secret,
+            tenant_secret,
+            arbitrary_header_secret,
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "Loki config projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_loki_config_projection_redacted(config: &Value) {
+    assert_eq!(config["endpoint_url"], "https://logs.example.com/redacted");
+    assert_eq!(config["authorization_header"], "[REDACTED]");
+    assert_eq!(config["custom_headers"]["X-Scope-OrgID"], "[REDACTED]");
+    assert_eq!(config["custom_headers"]["X-Arbitrary"], "[REDACTED]");
+}
+
+#[tokio::test]
 async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
