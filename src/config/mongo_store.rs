@@ -4135,11 +4135,9 @@ mod inner {
             // validation has passed so an invalid Mongo snapshot cannot leave
             // a claimable MMDB handoff behind.
             if purpose.loads_node_local_plugin_files() {
-                config = validate_plugin_file_dependencies_off_thread(
-                    config,
-                    ValidationAction::Warn,
-                )
-                .await?;
+                config =
+                    validate_plugin_file_dependencies_off_thread(config, ValidationAction::Warn)
+                        .await?;
             }
 
             Ok(config)

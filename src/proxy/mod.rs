@@ -4313,10 +4313,7 @@ impl ProxyState {
     /// Apply a full snapshot on Tokio's blocking pool. DP snapshots cannot
     /// carry a CP-side node-local MMDB handoff, so their plugin-cache build may
     /// synchronously hash, verify, and scan the configured database.
-    pub async fn update_config_off_thread(
-        &self,
-        new_config: GatewayConfig,
-    ) -> ConfigApplyOutcome {
+    pub async fn update_config_off_thread(&self, new_config: GatewayConfig) -> ConfigApplyOutcome {
         let proxy_state = self.clone();
         match tokio::task::spawn_blocking(move || proxy_state.update_config(new_config)).await {
             Ok(outcome) => outcome,

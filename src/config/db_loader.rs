@@ -1895,11 +1895,8 @@ impl DatabaseStore {
             .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)
             .run()?;
         if purpose.loads_node_local_plugin_files() {
-            config = validate_plugin_file_dependencies_off_thread(
-                config,
-                ValidationAction::Warn,
-            )
-            .await?;
+            config = validate_plugin_file_dependencies_off_thread(config, ValidationAction::Warn)
+                .await?;
         }
 
         // Hot-path isolation: strip api_spec_id from runtime config. The row
