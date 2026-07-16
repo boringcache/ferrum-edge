@@ -1002,14 +1002,7 @@ impl FunctionDestination {
         })
     }
 
-    fn has_sensitive_components(&self) -> bool {
-        self.sensitive_path.is_some() || !self.sensitive_query_pairs.is_empty()
-    }
-
     fn uri_reference_exposes_destination(&self, reference: &str) -> bool {
-        if !self.has_sensitive_components() {
-            return false;
-        }
         // If the accepted destination itself exceeds the bounded decoding
         // budget, no function-controlled URL-valued header can be proven
         // credential free. Keep accepting the provider URL, but strip such
@@ -1063,31 +1056,29 @@ impl FunctionDestination {
         let exposes_signed_path = self
             .sensitive_path
             .as_deref()
-            .is_some_and(|path| {
-                candidate_path == path
-                    || candidate_path
-                        .strip_prefix(path)
-                        .is_some_and(|suffix| path.ends_with('/') || suffix.starts_with('/'))
-            });
+            .is_some_and(|path| path_contains_segment_sequence(&candidate_path, path));
         // A signed path is credential material even if the function copies it
         // onto another authority. Restricting this comparison to same-origin
-        // references would disclose path-embedded tokens through an attacker
-        // controlled host. Match slash-delimited descendants as well: adding
-        // another path segment does not stop the configured signed path from
-        // being echoed, while lookalikes such as `/signed/triggered` remain
-        // distinct and avoid arbitrary substring matching.
+        // references would disclose path-embedded tokens through an attacker-
+        // controlled host. Match the complete configured path at segment
+        // boundaries anywhere in the candidate: adding a prefix or descendant
+        // segment does not stop the signed path from being echoed, while
+        // lookalikes such as `/signed/triggered` remain distinct.
         if exposes_signed_path {
             return true;
         }
 
-        // Query credentials are unsafe even when copied onto another host or
-        // path. Compare decoded pairs structurally so reordering and ordinary
-        // percent-encoding changes cannot evade the check.
-        if self
-            .sensitive_query_pairs
-            .iter()
-            .any(|pair| candidate_pairs.iter().any(|candidate| candidate == pair))
-        {
+        // Query credentials are unsafe even when copied onto another host,
+        // path, or parameter name. Compare decoded pairs and non-empty values
+        // exactly so reordering, renaming, and ordinary percent-encoding
+        // changes cannot evade the check without introducing substring false
+        // positives.
+        if self.sensitive_query_pairs.iter().any(|sensitive| {
+            candidate_pairs.iter().any(|candidate| {
+                candidate == sensitive
+                    || (!sensitive.1.is_empty() && candidate.1 == sensitive.1)
+            })
+        }) {
             return true;
         }
 
@@ -1147,9 +1138,6 @@ impl FunctionDestination {
         kind: UrlValuedResponseHeader,
         value: &str,
     ) -> bool {
-        if !self.has_sensitive_components() {
-            return false;
-        }
         if value.len() > MAX_URL_VALUED_RESPONSE_HEADER_BYTES {
             return true;
         }
@@ -1253,6 +1241,22 @@ fn nested_uri_reference(value: &str) -> Option<&str> {
         || trimmed.starts_with('?')
         || trimmed.starts_with('#'))
     .then_some(trimmed)
+}
+
+fn path_contains_segment_sequence(candidate: &str, sensitive: &str) -> bool {
+    if sensitive.is_empty() {
+        return false;
+    }
+    candidate.match_indices(sensitive).any(|(index, _)| {
+        let end = index + sensitive.len();
+        let starts_at_boundary = sensitive.starts_with('/')
+            || index == 0
+            || candidate.as_bytes().get(index - 1) == Some(&b'/');
+        let ends_at_boundary = sensitive.ends_with('/')
+            || end == candidate.len()
+            || candidate.as_bytes().get(end) == Some(&b'/');
+        starts_at_boundary && ends_at_boundary
+    })
 }
 
 fn nested_path_uri_reference(value: &str) -> Option<&str> {

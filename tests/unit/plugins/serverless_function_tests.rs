@@ -1265,12 +1265,14 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "decoded-path",
         "copied-path-other-host",
         "descendant-path-other-host",
+        "prefixed-path-other-host",
         "nested-double-encoded",
         "nested-depth-budget",
         "nested-over-decode-budget",
         "destination-over-decode-budget",
         "nested-path-encoded",
         "copied-query-other-host",
+        "renamed-query-other-host",
         "malformed",
         "userinfo",
         "benign-relative",
@@ -1278,6 +1280,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-external",
         "benign-external-label",
         "benign-path-lookalike",
+        "benign-query-value-lookalike",
     ] {
         let server = MockServer::start().await;
         let function_url = if case == "destination-over-decode-budget" {
@@ -1308,6 +1311,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "descendant-path-other-host" => {
                 "https://redirect.example/signed/trigger/continue?unrelated=1".to_string()
             }
+            "prefixed-path-other-host" => {
+                "https://redirect.example/collect/signed/trigger?unrelated=1".to_string()
+            }
             "nested-double-encoded" => {
                 let encoded: String =
                     url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
@@ -1336,6 +1342,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "copied-query-other-host" => {
                 "https://redirect.example/next?code=secret%2Fvalue".to_string()
             }
+            "renamed-query-other-host" => {
+                "https://redirect.example/next?leak=secret%2Fvalue".to_string()
+            }
             "malformed" => "http://[signed%2Ftrigger?code=secret%2Fvalue".to_string(),
             "userinfo" => "https://user:password@redirect.example/next".to_string(),
             "benign-relative" => "/next".to_string(),
@@ -1346,6 +1355,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-path-lookalike" => {
                 "https://redirect.example/signed/triggered?code=other".to_string()
+            }
+            "benign-query-value-lookalike" => {
+                "https://redirect.example/next?leak=secret%2Fvalue-extra".to_string()
             }
             _ => unreachable!(),
         };
@@ -1386,6 +1398,114 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
                 }
             }
             other => panic!("expected terminal redirect for case {case}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_strips_unsafe_url_headers_for_root_function_destination() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in [
+        "location-userinfo",
+        "content-location-userinfo",
+        "refresh-userinfo",
+        "link-userinfo",
+        "location-malformed",
+        "location-percent-budget",
+        "link-malformed",
+        "link-target-budget",
+        "benign-location",
+        "benign-link",
+    ] {
+        let server = MockServer::start().await;
+        let (header, value, should_strip) = match case {
+            "location-userinfo" => (
+                "location",
+                "https://user:password@redirect.example/next".to_string(),
+                true,
+            ),
+            "content-location-userinfo" => (
+                "content-location",
+                "https://user:password@redirect.example/content".to_string(),
+                true,
+            ),
+            "refresh-userinfo" => (
+                "refresh",
+                "0; url=https://user:password@redirect.example/next".to_string(),
+                true,
+            ),
+            "link-userinfo" => (
+                "link",
+                "<https://user:password@redirect.example/next>; rel=\"next\"".to_string(),
+                true,
+            ),
+            "location-malformed" => ("location", "http://[invalid".to_string(), true),
+            "location-percent-budget" => {
+                let mut encoded = "https://redirect.example/next".to_string();
+                for _ in 0..12 {
+                    encoded = url::form_urlencoded::byte_serialize(encoded.as_bytes()).collect();
+                }
+                ("location", encoded, true)
+            }
+            "link-malformed" => (
+                "link",
+                "<https://redirect.example/next; rel=\"next\"".to_string(),
+                true,
+            ),
+            "link-target-budget" => (
+                "link",
+                (0..33)
+                    .map(|index| format!("</safe/{index}>; rel=\"item\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                true,
+            ),
+            "benign-location" => (
+                "location",
+                "https://redirect.example/next".to_string(),
+                false,
+            ),
+            "benign-link" => (
+                "link",
+                "<https://redirect.example/next>; rel=\"next\"".to_string(),
+                false,
+            ),
+            _ => unreachable!(),
+        };
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).insert_header(header, value.as_str()))
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/", server.uri()),
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::RejectBinary { headers, .. } => {
+                if should_strip {
+                    assert!(
+                        !headers.contains_key(header),
+                        "unsafe {header} survived root destination case {case}: {headers:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        headers.get(header).map(String::as_str),
+                        Some(value.as_str()),
+                        "benign {header} changed in root destination case {case}"
+                    );
+                }
+            }
+            other => panic!("expected terminal response for case {case}, got {other:?}"),
         }
     }
 }

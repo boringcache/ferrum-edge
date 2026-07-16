@@ -579,6 +579,30 @@ impl RequestDeduplication {
         }
     }
 
+    fn matching_local_completed(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        now: Instant,
+    ) -> Option<CachedResponse> {
+        self.local_cache.get(key).and_then(|entry| {
+            let DeduplicationEntry::Completed {
+                cached,
+                fingerprint: cached_fingerprint,
+                ..
+            } = entry.value() else {
+                return None;
+            };
+            if cached_fingerprint == fingerprint
+                && now.duration_since(cached.inserted_at) < self.ttl
+            {
+                Some(cached.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     fn replace_expired_completed_with_inflight(
         &self,
         key: &str,
@@ -1726,6 +1750,26 @@ impl Plugin for RequestDeduplication {
                     redis_lock_token = Some(token);
                 }
                 RedisInFlightAction::Conflict(DeduplicationConflict::InFlight) => {
+                    // An owned terminal response can fit the local cache while
+                    // its base64 Redis representation exceeds the same entry
+                    // limit. In that case publication deliberately retains the
+                    // distributed lock so peers cannot re-execute the external
+                    // side effect. This gateway still has the completed value:
+                    // replay that matching entry before honoring its own
+                    // retained Redis lock. Peers without the local entry remain
+                    // blocked until the in-flight TTL.
+                    if let Some(cached) =
+                        self.matching_local_completed(&key, &fingerprint, Instant::now())
+                    {
+                        let mut response_headers = sanitize_cached_headers(&cached.headers);
+                        response_headers
+                            .insert("x-idempotent-replayed".to_string(), "true".to_string());
+                        return PluginResult::RejectBinary {
+                            status_code: cached.status_code,
+                            body: cached.body.clone(),
+                            headers: response_headers,
+                        };
+                    }
                     return PluginResult::Reject {
                         status_code: 409,
                         body:
