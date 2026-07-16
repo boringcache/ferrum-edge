@@ -7267,22 +7267,24 @@ impl ProxyState {
             |current| {
                 let delta = ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
-                    // No proxy / upstream / consumer / plugin delta. The mesh
-                    // block (`config.mesh`) is NOT diffed by `ConfigDelta`
-                    // (it carries no `id`/`updated_at`), and mesh endpoints
-                    // (`mesh.workloads`/`mesh.services`) are resolved at REQUEST
-                    // time from the live request-epoch's `config.mesh` (e.g. the
-                    // inbound HBONE relay destination guard, and the mesh
-                    // service discoverer) — NOT from any materialized
-                    // `Upstream.targets`. So a mesh-only change (a federation
-                    // bundle refresh, or a cross-cluster remote-cluster
-                    // scale-up/down merged in by
-                    // `merge_remote_endpoints_into_mesh`) leaves the delta empty
-                    // yet genuinely changes routable state. Republish the epoch
-                    // with the fresh config so the request path observes the new
-                    // `config.mesh`; the plugin/consumer/LB caches are unaffected
-                    // by a mesh-only change and reused as-is, and the route table
-                    // is reused UNLESS the mesh route inputs changed (see below).
+                    // ConfigDelta does not represent node-local plugin-file
+                    // contents or the mesh block. Claim an accepted MMDB
+                    // validation handoff before deciding this generation is a
+                    // no-op: a same-path file replacement must atomically
+                    // publish fresh geo readers even though every serialized
+                    // config field and timestamp is unchanged.
+                    let country_mmdb_plugin_cache = self
+                        .plugin_cache
+                        .build_country_mmdb_reload_inner(&current.plugin_cache, &new_config)?;
+                    let mesh_changed = current.config.mesh != new_config.mesh;
+                    if !mesh_changed && country_mmdb_plugin_cache.is_none() {
+                        return Ok(None);
+                    }
+
+                    // Mesh endpoints (`mesh.workloads`/`mesh.services`) are
+                    // resolved at REQUEST time from the request epoch's live
+                    // `config.mesh`, not materialized `Upstream.targets`. A
+                    // mesh-only change therefore also needs an epoch publish.
                     //
                     // Without this, the `Ok(None)` no-delta path below updates
                     // only `ProxyState.config` (the ArcSwap the request path
@@ -7290,31 +7292,28 @@ impl ProxyState {
                     // stale — so a remote scale-up / trust-bundle overlay never
                     // reaches the live proxy until an unrelated proxy/upstream
                     // delta forces a republish (codex F7.2 round-5, finding 3).
-                    if current.config.mesh == new_config.mesh {
-                        return Ok(None);
-                    }
-                    // The mesh block changed. The pre-computed plugin/consumer/LB
-                    // caches are unaffected by a mesh-only change and are reused,
-                    // but the route table snapshot materializes mesh-derived maps
+                    // When the mesh block changed, the route table snapshot
+                    // must also refresh because it materializes mesh-derived maps
                     // (raw-TCP inbound port map from the `#[serde(skip)]`
                     // `mesh.local_inbound_tcp_routes`, VIP egress tables, sibling
-                    // port groups), and the route table is a pure function of
-                    // `config.mesh`, so a mesh change rebuilds it here. Without this,
+                    // port groups). Without this,
                     // a mesh slice update that retargets/adds/removes a local
                     // stream-family port would leave the inbound accept loop relaying
                     // to a stale loopback backend (or falling through to Hyper for a
-                    // newly added port). `mesh_route_table_inputs_changed` is the same
-                    // whole-mesh signal the incremental path ORs into `route_changed`;
-                    // having already established the mesh differs, the rebuild is
-                    // unconditional here.
-                    route_changed.set(true);
+                    // newly added port). An MMDB-only publish reuses that table.
+                    route_changed.set(mesh_changed);
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
-                        route_table: RouterCache::build_route_table_snapshot(&new_config),
-                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        route_table: if mesh_changed {
+                            RouterCache::build_route_table_snapshot(&new_config)
+                        } else {
+                            Arc::clone(&current.route_table)
+                        },
+                        plugin_cache: country_mmdb_plugin_cache
+                            .unwrap_or_else(|| Arc::clone(&current.plugin_cache)),
                         consumer_index: Arc::clone(&current.consumer_index),
                         load_balancer: Arc::clone(&current.load_balancer),
-                        route_changed: true,
+                        route_changed: mesh_changed,
                         lb_changed: false,
                     }));
                 }
@@ -7351,16 +7350,13 @@ impl ProxyState {
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
-        // Mesh-only republish (no proxy/upstream/consumer/plugin delta — only
-        // `config.mesh` changed): the pre-computed caches were reused unchanged,
-        // so there is nothing to prune, warm, reconcile, or restart. The fresh
-        // epoch (and the mirrored `ProxyState.config`) already carry the new
-        // `config.mesh` for the request path. `mirror_request_epoch_wrappers`
-        // published the new config above. Return without running the
-        // delta-keyed maintenance below (it would all be a no-op anyway, and
-        // `applied_delta` is `None` here).
+        // Out-of-band republish (mesh-only and/or accepted MMDB-only reload):
+        // there is no resource delta to drive pruning, DNS warmup, listener
+        // reconciliation, or health-check restarts. The request epoch already
+        // carries the new mesh config and/or geo plugin snapshot, and
+        // `mirror_request_epoch_wrappers` published its wrapper views above.
         let Some(delta) = applied_delta else {
-            debug!("Config update: mesh-only change republished (caches reused)");
+            debug!("Config update: out-of-band mesh/MMDB generation republished");
             return ConfigApplyOutcome::Applied;
         };
         let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();

@@ -13,6 +13,7 @@ use ferrum_edge::plugins::{
 };
 use http::{HeaderMap, HeaderValue};
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -832,6 +833,113 @@ fn validated_mmdb_snapshots_are_shared_across_live_instances() {
     assert!(Arc::ptr_eq(&first, &second));
 }
 
+#[tokio::test]
+async fn delta_budget_counts_retained_and_rebuilt_mmdb_snapshots() {
+    let directory = TempDir::new().unwrap();
+    let original_bytes = country_mmdb_bytes();
+    let first_path = write_fixture(&directory, "country-one.mmdb", &original_bytes);
+    let second_path = write_fixture(&directory, "country-two.mmdb", &original_bytes);
+    let timestamp = "2026-01-01T00:00:00Z";
+    let mut config: GatewayConfig = serde_json::from_value(json!({
+        "proxies": [
+            {
+                "id": "p1",
+                "listen_path": "/one",
+                "backend_host": "127.0.0.1",
+                "backend_port": 9001,
+                "plugins": [{"plugin_config_id": "geo-one"}],
+                "created_at": timestamp,
+                "updated_at": timestamp
+            },
+            {
+                "id": "p2",
+                "listen_path": "/two",
+                "backend_host": "127.0.0.1",
+                "backend_port": 9002,
+                "plugins": [{"plugin_config_id": "geo-two"}],
+                "created_at": timestamp,
+                "updated_at": timestamp
+            }
+        ],
+        "plugin_configs": [
+            {
+                "id": "geo-one",
+                "plugin_name": "geo_restriction",
+                "config": {
+                    "db_path": path_text(&first_path),
+                    "deny_countries": ["SE"],
+                    "on_lookup_failure": "deny"
+                },
+                "scope": "proxy",
+                "proxy_id": "p1",
+                "created_at": timestamp,
+                "updated_at": timestamp
+            },
+            {
+                "id": "geo-two",
+                "plugin_name": "geo_restriction",
+                "config": {
+                    "db_path": path_text(&second_path),
+                    "deny_countries": ["SE"],
+                    "on_lookup_failure": "deny"
+                },
+                "scope": "proxy",
+                "proxy_id": "p2",
+                "created_at": timestamp,
+                "updated_at": timestamp
+            }
+        ]
+    }))
+    .unwrap();
+    config.normalize_fields();
+
+    let cache = PluginCache::new(&config).unwrap();
+    assert_eq!(
+        cache.country_mmdb_snapshot_bytes(),
+        original_bytes.len() as u64,
+        "identical content must share one live snapshot"
+    );
+
+    let replacement = replace_direct_country_with_supported_code(original_bytes.clone(), b"US");
+    assert_eq!(replacement.len(), original_bytes.len());
+    std::fs::write(&second_path, replacement).unwrap();
+    config.plugin_configs[1].updated_at = "2026-01-01T00:00:01Z".parse().unwrap();
+    cache
+        .apply_delta(
+            &config,
+            &HashSet::from(["p2".to_string()]),
+            &[],
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        cache.country_mmdb_snapshot_bytes(),
+        (original_bytes.len() as u64) * 2,
+        "the resulting generation budget includes p1's retained snapshot and p2's rebuilt snapshot"
+    );
+    let p1_plugins = cache.request_view("p1", ProxyProtocol::Http).plugins();
+    let p1_geo = p1_plugins
+        .iter()
+        .find(|plugin| plugin.name() == "geo_restriction")
+        .unwrap();
+    let mut p1 = request_context("89.160.20.112");
+    assert!(matches!(
+        p1_geo.on_request_received(&mut p1).await,
+        PluginResult::Reject { .. }
+    ));
+    let p2_plugins = cache.request_view("p2", ProxyProtocol::Http).plugins();
+    let p2_geo = p2_plugins
+        .iter()
+        .find(|plugin| plugin.name() == "geo_restriction")
+        .unwrap();
+    let mut p2 = request_context("89.160.20.112");
+    assert!(matches!(
+        p2_geo.on_request_received(&mut p2).await,
+        PluginResult::Continue
+    ));
+}
+
 #[test]
 fn validate_mmdb_file_rejects_structurally_valid_unsupported_country_code() {
     let directory = TempDir::new().unwrap();
@@ -938,14 +1046,16 @@ fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
     assert!(config_source.contains("MAX_COUNTRY_MMDB_SIZE_BYTES"));
     assert!(config_source.contains("MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES"));
     assert!(config_source.contains("aggregate_budget.admit(path, metadata.len())"));
-    assert!(
-        config_source.contains("verify_country_mmdb_path_still_matches(path, &file_version)")
-    );
+    assert!(config_source
+        .contains("verify_country_mmdb_path_still_matches(path, &file_version)"));
     assert_eq!(
         MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES,
         MAX_COUNTRY_MMDB_SIZE_BYTES
     );
     assert!(plugin_cache_source.contains("CountryMmdbLoadSession::claim"));
+    assert!(plugin_cache_source.contains("claimed_validation_generation"));
+    assert!(plugin_cache_source.contains("build_country_mmdb_reload_inner"));
+    assert!(plugin_cache_source.contains("country_mmdb_snapshot_bytes(&new_map, &new_globals)"));
     assert!(validation_source.contains("generation.commit()"));
 }
 

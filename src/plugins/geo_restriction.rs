@@ -511,6 +511,10 @@ impl Plugin for GeoRestriction {
         "geo_restriction"
     }
 
+    fn country_mmdb_snapshot(&self) -> Option<&CountryMmdbSnapshot> {
+        self.reader.as_deref()
+    }
+
     fn priority(&self) -> u16 {
         super::priority::GEO_RESTRICTION
     }

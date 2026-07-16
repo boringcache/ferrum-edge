@@ -4912,13 +4912,22 @@ impl CountryMmdbFileVersion {
 }
 
 /// Immutable, fully validated country MMDB snapshot shared by live plugins.
-pub struct CountryMmdbSnapshot(CountryMmdbReader);
+pub struct CountryMmdbSnapshot {
+    reader: CountryMmdbReader,
+    size_bytes: u64,
+}
+
+impl CountryMmdbSnapshot {
+    pub(crate) fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+}
 
 impl std::ops::Deref for CountryMmdbSnapshot {
     type Target = maxminddb::Reader<Vec<u8>>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.reader
     }
 }
 
@@ -5132,26 +5141,33 @@ struct CountryMmdbLoadSessionState {
 #[derive(Default)]
 pub(crate) struct CountryMmdbLoadSession {
     state: Mutex<CountryMmdbLoadSessionState>,
+    claimed_validation_generation: bool,
 }
 
 impl CountryMmdbLoadSession {
     pub(crate) fn claim(paths: &HashSet<PathBuf>) -> Result<Self, String> {
-        let state = {
+        let handoff = {
             let mut cache = country_mmdb_snapshot_cache()
                 .lock()
                 .map_err(|_| "MaxMind database snapshot cache is unavailable".to_string())?;
             cache.retain_live();
-            cache
-                .claim_validation_handoffs(paths)
-                .map(|handoff| CountryMmdbLoadSessionState {
-                    snapshots: handoff.snapshots,
-                    aggregate_budget: handoff.aggregate_budget,
-                })
-                .unwrap_or_default()
+            cache.claim_validation_handoffs(paths)
         };
+        let claimed_validation_generation = handoff.is_some();
+        let state = handoff
+            .map(|handoff| CountryMmdbLoadSessionState {
+                snapshots: handoff.snapshots,
+                aggregate_budget: handoff.aggregate_budget,
+            })
+            .unwrap_or_default();
         Ok(Self {
             state: Mutex::new(state),
+            claimed_validation_generation,
         })
+    }
+
+    pub(crate) fn claimed_validation_generation(&self) -> bool {
+        self.claimed_validation_generation
     }
 
     pub(crate) fn load(
@@ -5490,7 +5506,10 @@ fn load_validated_country_mmdb_inner(
         )));
     }
 
-    let reader = Arc::new(CountryMmdbSnapshot(reader));
+    let reader = Arc::new(CountryMmdbSnapshot {
+        reader,
+        size_bytes: metadata.len(),
+    });
     let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
         CountryMmdbLoadError::Invalid("MaxMind database snapshot cache is unavailable".to_string())
     })?;
@@ -5536,7 +5555,11 @@ mod country_mmdb_admission_tests {
         let error = budget
             .admit("second.mmdb", 2)
             .expect_err("the aggregate must reject before retaining a second snapshot");
-        assert!(error.to_string().contains("aggregate snapshot budget exceeded"));
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate snapshot budget exceeded")
+        );
         assert_eq!(
             budget.admitted_bytes,
             MAX_COUNTRY_MMDB_AGGREGATE_SIZE_BYTES - 1

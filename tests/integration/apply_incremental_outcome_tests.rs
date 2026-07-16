@@ -16,9 +16,11 @@
 
 use std::collections::HashMap;
 
+use base64::Engine;
 use chrono::{Duration, Utc};
 
 use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
+use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
@@ -26,6 +28,30 @@ use ferrum_edge::config::types::{
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
+use tempfile::TempDir;
+
+const COUNTRY_MMDB_B64: &str =
+    include_str!("../fixtures/maxmind/GeoIP2-Country-Test.mmdb.b64");
+
+fn country_mmdb_bytes() -> Vec<u8> {
+    let encoded: String = COUNTRY_MMDB_B64.lines().collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("MaxMind fixture base64 decodes")
+}
+
+fn country_mmdb_with_country(replacement: &[u8; 2]) -> Vec<u8> {
+    let mut bytes = country_mmdb_bytes();
+    let mut replacements = 0;
+    for offset in 0..bytes.len().saturating_sub(1) {
+        if &bytes[offset..offset + 2] == b"SE" {
+            bytes[offset..offset + 2].copy_from_slice(replacement);
+            replacements += 1;
+        }
+    }
+    assert!(replacements > 0, "fixture contains the SE country code");
+    bytes
+}
 
 /// Minimal test proxy with safe defaults.
 fn test_proxy(id: &str, listen_path: &str) -> Proxy {
@@ -340,6 +366,109 @@ async fn update_config_empty_candidate_returns_unchanged() {
         state.config.load().proxies.is_empty(),
         "unchanged full candidate must not mutate runtime config"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() {
+    let directory = TempDir::new().unwrap();
+    let mmdb_path = directory.path().join("country.mmdb");
+    let config_path = directory.path().join("ferrum.json");
+    let original_bytes = country_mmdb_bytes();
+    std::fs::write(&mmdb_path, &original_bytes).unwrap();
+
+    let config = GatewayConfig {
+        proxies: vec![test_proxy("geo-proxy", "/geo")],
+        plugin_configs: vec![
+            PluginConfig {
+                id: "geo-policy".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
+                plugin_name: "geo_restriction".to_string(),
+                config: serde_json::json!({
+                    "db_path": mmdb_path.to_str().unwrap(),
+                    "deny_countries": ["SE"],
+                    "on_lookup_failure": "deny"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            test_plugin_config("unrelated-logging", true),
+        ],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let load = || {
+        load_config_from_file(
+            config_path.to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .unwrap()
+    };
+
+    let state = proxy_state_with_config(load());
+    let plugins = state
+        .plugin_cache
+        .request_view("geo-proxy", ProxyProtocol::Http)
+        .plugins();
+    let geo = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "geo_restriction")
+        .unwrap();
+    let unrelated_before = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "stdout_logging")
+        .cloned()
+        .unwrap();
+    let mut before = RequestContext::new(
+        "89.160.20.112".to_string(),
+        "GET".to_string(),
+        "/geo".to_string(),
+    );
+    assert!(matches!(
+        geo.on_request_received(&mut before).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+
+    let replacement_bytes = country_mmdb_with_country(b"US");
+    assert_eq!(replacement_bytes.len(), original_bytes.len());
+    std::fs::write(&mmdb_path, replacement_bytes).unwrap();
+    assert_eq!(state.update_config(load()), ConfigApplyOutcome::Applied);
+
+    let plugins = state
+        .plugin_cache
+        .request_view("geo-proxy", ProxyProtocol::Http)
+        .plugins();
+    let geo = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "geo_restriction")
+        .unwrap();
+    let unrelated_after = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "stdout_logging")
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &unrelated_before,
+        unrelated_after
+    ));
+    let mut after = RequestContext::new(
+        "89.160.20.112".to_string(),
+        "GET".to_string(),
+        "/geo".to_string(),
+    );
+    assert!(matches!(
+        geo.on_request_received(&mut after).await,
+        PluginResult::Continue
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -3256,6 +3256,15 @@ pub trait Plugin: Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
 
+    /// Returns the immutable country-MMDB snapshot retained by this plugin.
+    ///
+    /// Plugin-cache generation construction uses this cold-path hook to enforce
+    /// the aggregate live-snapshot budget across both rebuilt and retained geo
+    /// instances. Ordinary plugins retain the allocation-free default.
+    fn country_mmdb_snapshot(&self) -> Option<&crate::config::types::CountryMmdbSnapshot> {
+        None
+    }
+
     /// Returns the execution priority (lower = runs first).
     ///
     /// Plugins are sorted by priority within each lifecycle phase.
