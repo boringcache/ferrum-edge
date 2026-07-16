@@ -73,7 +73,6 @@ use tracing::{debug, info, warn};
 use url::{Host, Url};
 
 use super::utils::aws_sigv4;
-use super::utils::body_transform::is_json_content_type;
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
@@ -577,23 +576,29 @@ impl ServerlessFunction {
                     "governed request body was unavailable before function invocation",
                 ));
             };
-            // Interpret the bytes according to the active hook headers. On the
-            // no-clone hot path the gateway temporarily moves ctx.headers into
-            // this map, so consulting ctx.headers here would miss even the
-            // original Content-Type and Content-Encoding values.
-            let content_type = proxy_headers.get("content-type");
-            if content_type.is_some_and(|content_type| is_json_content_type(content_type))
-                && let Ok(json_body) = serde_json::from_slice::<Value>(body)
-            {
-                payload.insert("body".into(), json_body);
-            } else if let Ok(text) = std::str::from_utf8(body) {
+            // Keep a single authoritative, lossless body representation. JSON
+            // parsing here would collapse duplicate object members and rewrite
+            // lexical number/whitespace forms before the external policy sees
+            // them, while the unchanged bytes continue to the backend. Valid
+            // UTF-8 has a unique byte encoding, so a JSON string round-trip is
+            // lossless; arbitrary bytes use base64. Always emit the encoding,
+            // and carry the active hook Content-Type separately as an
+            // interpretation hint rather than letting it change the bytes.
+            if let Ok(text) = std::str::from_utf8(body) {
                 payload.insert("body".into(), Value::String(text.to_string()));
+                payload.insert("body_encoding".into(), Value::String("utf8".into()));
             } else {
                 payload.insert(
                     "body".into(),
                     Value::String(base64::engine::general_purpose::STANDARD.encode(body)),
                 );
                 payload.insert("body_encoding".into(), Value::String("base64".into()));
+            }
+            if let Some(content_type) = proxy_headers.get("content-type") {
+                payload.insert(
+                    "body_content_type".into(),
+                    Value::String(content_type.clone()),
+                );
             }
         }
 
@@ -1139,18 +1144,17 @@ impl FunctionDestination {
 
     /// Credential-bearing scalar components from the configured query.
     ///
-    /// Ordinary signed URLs carry the secret in a non-empty value. A key-only
-    /// form such as `?SIGNED_TOKEN` or `?SIGNED_TOKEN=` carries it in the key
-    /// instead; treating an empty value as "nothing sensitive" would let a
-    /// redirect copy that token into another key, value, path, or fragment.
+    /// Both non-empty sides are protected. Although many signed URLs carry the
+    /// secret in a value, providers can place credential material in a query
+    /// key even when that key also has a value (for example
+    /// `?SIGNED_TOKEN=1`). Choosing only one side would let a redirect copy the
+    /// other into a renamed key, value, path, or fragment.
     fn sensitive_query_scalars(&self) -> impl Iterator<Item = &str> {
         self.sensitive_query_pairs
             .iter()
-            .filter_map(|(key, value)| {
-                let component = if value.is_empty() { key } else { value };
-                let component = component.trim_matches('/');
-                (!component.is_empty()).then_some(component)
-            })
+            .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+            .map(|component| component.trim_matches('/'))
+            .filter(|component| !component.is_empty())
     }
 
     fn nested_reference_exposes_destination(&self, reference: Option<&str>, depth: usize) -> bool {
