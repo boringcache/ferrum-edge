@@ -120,6 +120,84 @@ fn buffered_h3_deadline_replacements_keep_grpc_web_wire_flavor() {
 }
 
 #[test]
+fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let dispatch = source
+        .find("async fn dispatch_grpc<S>(")
+        .expect("buffered H3-to-gRPC dispatcher must remain present");
+    let body = &source[dispatch..];
+    let body_start = body
+        .find("let body = if let Some(buffered)")
+        .expect("H3 gRPC upload buffering must remain present");
+    let body = &body[body_start..];
+    let body_end = body
+        .find("// Build the backend-facing header map")
+        .expect("H3 gRPC upload buffering must remain bounded");
+    let body = &body[..body_end];
+    for error in ["H3RequestBodyReadError::TimedOut", "H3RequestBodyReadError::DeadlineExceeded"] {
+        let branch = body
+            .find(error)
+            .unwrap_or_else(|| panic!("missing {error} upload branch"));
+        let branch = &body[branch..];
+        let branch_end = branch[1..]
+            .find("H3RequestBodyReadError::")
+            .map_or(branch.len(), |offset| offset + 1);
+        let branch = &branch[..branch_end];
+        assert!(branch.contains("write_grpc_error_for_request("));
+        assert!(branch.contains("ctx,"));
+    }
+
+    let writer = source
+        .find("async fn write_grpc_error_for_request<S>(")
+        .expect("request-aware H3 gRPC error writer must remain present");
+    let writer = &source[writer..];
+    let writer_end = writer
+        .find("/// Send-only core of [`write_grpc_error`]")
+        .expect("request-aware H3 gRPC error writer must remain bounded");
+    let writer = &writer[..writer_end];
+    assert!(writer.contains("translated_error_response("));
+    assert!(writer.contains("write_reject_with_headers("));
+}
+
+#[test]
+fn native_h3_client_deadlines_remain_health_neutral() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let body_deadline = source
+        .find("_ = &mut grpc_deadline_sleep, if grpc_deadline_active && !stream_done =>")
+        .expect("native H3 body deadline branch must remain present");
+    let body_deadline = &source[body_deadline..];
+    let body_end = body_deadline
+        .find("if stream_done {")
+        .expect("native H3 body deadline branch must remain bounded");
+    let body_deadline = &body_deadline[..body_end];
+    assert_eq!(
+        body_deadline
+            .matches("Some(crate::retry::ErrorClass::ClientDisconnect)")
+            .count(),
+        3,
+        "clean trailer, send failure, and post-DATA abort must all stay neutral"
+    );
+    assert!(!body_deadline.contains("ErrorClass::ReadWriteTimeout"));
+
+    let trailer_deadline = source
+        .find("Err(_) if trailer_timeout_is_deadline =>")
+        .expect("native H3 trailer deadline branch must remain present");
+    let trailer_deadline = &source[trailer_deadline..];
+    let trailer_end = trailer_deadline
+        .find("Err(_) =>")
+        .expect("native H3 trailer deadline branch must remain bounded");
+    let trailer_deadline = &trailer_deadline[..trailer_end];
+    assert_eq!(
+        trailer_deadline
+            .matches("Some(crate::retry::ErrorClass::ClientDisconnect)")
+            .count(),
+        3,
+        "clean trailer, send failure, and post-DATA abort must all stay neutral"
+    );
+    assert!(!trailer_deadline.contains("ErrorClass::ReadWriteTimeout"));
+}
+
+#[test]
 fn preacquired_admission_has_exactly_once_outcome_and_release_ownership() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

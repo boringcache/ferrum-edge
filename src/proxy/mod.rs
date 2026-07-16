@@ -13845,6 +13845,22 @@ fn build_grpc_web_error_response(
     build_grpc_web_error_response_from_parts(response, status, message)
 }
 
+fn build_request_reject_response(
+    reject: NormalizedRejectResponse,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    if let (Some(content_type), Some(grpc_status)) =
+        (grpc_web_response_content_type, reject.grpc_status)
+    {
+        let message = reject
+            .grpc_message
+            .as_deref()
+            .unwrap_or_else(|| grpc_status_reason(grpc_status));
+        return build_grpc_web_error_response(content_type, grpc_status, message);
+    }
+    build_response_from_normalized_reject(reject)
+}
+
 fn build_grpc_web_error_response_from_parts(
     response: crate::plugins::grpc_web::GrpcWebErrorResponse,
     status: u32,
@@ -15093,21 +15109,6 @@ async fn handle_proxy_request_inner(
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
-            let grpc_web_response = if let (Some(content_type), Some(grpc_status)) =
-                (grpc_web_response_content_type, reject.grpc_status)
-            {
-                let message = reject
-                    .grpc_message
-                    .as_deref()
-                    .unwrap_or_else(|| grpc_status_reason(grpc_status));
-                Some(build_grpc_web_error_response(
-                    content_type,
-                    grpc_status,
-                    message,
-                ))
-            } else {
-                None
-            };
             log_rejected_request(
                 &plugins,
                 &ctx,
@@ -15118,10 +15119,10 @@ async fn handle_proxy_request_inner(
             )
             .await;
             record_request(&state, reject.http_status.as_u16());
-            if let Some(response) = grpc_web_response {
-                return Ok(response);
-            }
-            return Ok(build_response_from_normalized_reject(reject));
+            return Ok(build_request_reject_response(
+                reject,
+                grpc_web_response_content_type,
+            ));
         }
     }
     // Pre-computed capability bitset and phase-specific plugin lists — avoids
@@ -15173,7 +15174,10 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     record_request(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    return Ok(build_request_reject_response(
+                        reject,
+                        grpc_web_response_content_type,
+                    ));
                 }
             }
         }

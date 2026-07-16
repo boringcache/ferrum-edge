@@ -7746,8 +7746,9 @@ async fn dispatch_grpc_native_h3(
             // the buffered remainder and synthesizing clean trailers would hand the
             // client a TRUNCATED message it surfaces as a protocol/internal error.
             // In that case RESET instead: the client sees a transport abort and its
-            // own (equal) RPC deadline fires. Either way the outcome is recorded as
-            // a `ReadWriteTimeout` and the gRPC status lands in the metadata.
+            // own (equal) RPC deadline fires. Either way this client-owned expiry is
+            // health-neutral (`ClientDisconnect`) and the gRPC status lands in the
+            // metadata.
             _ = &mut grpc_deadline_sleep, if grpc_deadline_active && !stream_done => {
                 coalesce_buf.clear();
                 if bytes_streamed == 0 {
@@ -7765,10 +7766,7 @@ async fn dispatch_grpc_native_h3(
                         grpc_trailer_status =
                             Some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
                         body_completed = true;
-                        // Post-wire timeout class so CB / passive-health count the
-                        // slow backend (the H2 path's `TotalDeadlineBody` reports the
-                        // same `ReadWriteTimeout`).
-                        body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                     } else {
                         client_disconnected = true;
                         body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
@@ -7779,7 +7777,7 @@ async fn dispatch_grpc_native_h3(
                          (a partial gRPC message would be truncated by synthesized trailers)"
                     );
                     crate::http3::stream_util::abort_response_stream(stream);
-                    body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                 }
                 // Record the gRPC status in metadata so observability reflects the
                 // deadline on both the clean-trailer and reset paths.
@@ -7860,7 +7858,7 @@ async fn dispatch_grpc_native_h3(
                                     );
                                     body_completed = true;
                                     body_error_class =
-                                        Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                                        Some(crate::retry::ErrorClass::ClientDisconnect);
                                 } else {
                                     client_disconnected = true;
                                     body_error_class =
@@ -7872,7 +7870,7 @@ async fn dispatch_grpc_native_h3(
                                      after body bytes; resetting (gRPC frame completeness unverified)"
                                 );
                                 crate::http3::stream_util::abort_response_stream(stream);
-                                body_error_class = Some(crate::retry::ErrorClass::ReadWriteTimeout);
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                             }
                             crate::proxy::insert_grpc_error_metadata(
                                 &mut ctx.metadata,

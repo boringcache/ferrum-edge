@@ -636,3 +636,52 @@ async fn unpolled_empty_streaming_body_is_not_client_disconnect() {
     );
     assert_eq!(got.bytes_received, 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_deadline_terminal_data_logs_deadline_exceeded() {
+    use futures_util::stream;
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(200);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    let inner = StreamBody::new(stream::pending::<
+        Result<Frame<Bytes>, ferrum_edge::proxy::body::ProxyBodyError>,
+    >());
+    let body = ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(inner));
+    let deadline = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("one second before now is representable");
+    let mut body = ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test(
+        body,
+        deadline,
+        Some("application/grpc-web+proto"),
+    )
+    .with_logger(logger);
+
+    let frame = body
+        .frame()
+        .await
+        .expect("deadline must emit a terminal gRPC-Web DATA frame")
+        .expect("terminal deadline frame must be readable");
+    let data = frame
+        .data_ref()
+        .expect("gRPC-Web terminal metadata is encoded as DATA");
+    assert!(!data.is_empty());
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "terminal DATA must fire one log entry");
+    let got = &captures[0];
+    assert!(got.body_completed);
+    assert!(!got.client_disconnected);
+    assert!(got.body_error_class.is_none());
+    assert_eq!(got.bytes_received, data.len() as u64);
+    assert_eq!(
+        got.metadata.get("grpc_status").map(String::as_str),
+        Some("4"),
+        "the delivered terminal gRPC-Web frame must log DEADLINE_EXCEEDED"
+    );
+}

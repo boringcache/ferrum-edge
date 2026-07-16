@@ -3173,8 +3173,9 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                return write_grpc_error(
+                return write_grpc_error_for_request(
                     stream,
+                    ctx,
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Request body read timed out",
                     backend_start,
@@ -3189,8 +3190,9 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                return write_grpc_error(
+                return write_grpc_error_for_request(
                     stream,
+                    ctx,
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Deadline exceeded at gateway",
                     backend_start,
@@ -5624,6 +5626,43 @@ where
     // its spawned pump owns and halts the recv half.
     crate::http3::stream_util::halt_request_body(stream);
     Ok(outcome)
+}
+
+/// Write an early gRPC error using the original client wire flavor. A request
+/// translated by `grpc_web` must receive its terminal status in an encoded DATA
+/// trailer frame; native gRPC retains the trailers-only header response.
+async fn write_grpc_error_for_request<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &RequestContext,
+    grpc_status: u32,
+    grpc_message: &str,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let Some(response) =
+        crate::plugins::grpc_web::translated_error_response(ctx, grpc_status, grpc_message)
+    else {
+        return write_grpc_error(
+            stream,
+            grpc_status,
+            grpc_message,
+            backend_start,
+            bytes_sent,
+        )
+        .await;
+    };
+    write_reject_with_headers(
+        stream,
+        StatusCode::OK,
+        &response.body,
+        &response.headers,
+        backend_start,
+        bytes_sent,
+    )
+    .await
 }
 
 /// Send-only core of [`write_grpc_error`]: writes the trailers-only gRPC error

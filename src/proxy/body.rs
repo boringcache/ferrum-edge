@@ -914,6 +914,13 @@ impl http_body::Body for ProxyBody {
                         .fetch_add(data.len() as u64, Ordering::Relaxed);
                 }
                 let is_trailers = frame.trailers_ref().is_some();
+                // A client-deadline wrapper emits gRPC-Web terminal metadata as
+                // an encoded DATA frame rather than native HTTP trailers. The
+                // shared fired flag is set before that frame is returned, and a
+                // partial-body expiry returns an error instead, so this signal
+                // uniquely identifies the successful terminal deadline frame.
+                let is_grpc_web_deadline_terminal =
+                    client_deadline_fired && frame.data_ref().is_some();
                 let grpc_status = frame
                     .trailers_ref()
                     .and_then(|trailers| trailers.get("grpc-status"))
@@ -946,12 +953,17 @@ impl http_body::Body for ProxyBody {
                         outcome.grpc_trailer_http_status = Some(status);
                     }
                 }
-                if is_trailers {
+                if is_trailers || is_grpc_web_deadline_terminal {
                     if let Some(logger) = this.logger.take() {
                         let bytes = this.bytes_streamed.load(Ordering::Relaxed);
+                        let terminal_grpc_status = if is_grpc_web_deadline_terminal {
+                            Some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED)
+                        } else {
+                            grpc_status
+                        };
                         logger.fire(
                             crate::proxy::deferred_log::BodyOutcome::success(bytes)
-                                .with_grpc_status(grpc_status),
+                                .with_grpc_status(terminal_grpc_status),
                         );
                     }
                     let terminal_class =

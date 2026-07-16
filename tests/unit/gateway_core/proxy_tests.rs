@@ -148,6 +148,32 @@ fn test_build_backend_url_target_path_overrides_backend_path() {
 }
 
 #[test]
+fn request_phase_deadline_rejects_preserve_grpc_web_framing() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let phase = source
+        .find("// Execute on_request_received hooks")
+        .expect("request hook phase must remain present");
+    let phase = &source[phase..];
+    let end = phase
+        .find("// Materialize query params before authentication")
+        .expect("request hook phase must remain bounded");
+    let phase = &phase[..end];
+    assert!(phase.contains("build_request_reject_response("));
+    assert!(phase.contains("grpc_web_response_content_type,"));
+
+    let helper = source
+        .find("fn build_request_reject_response(")
+        .expect("request rejection writer must remain flavor-aware");
+    let helper = &source[helper..];
+    let helper_end = helper
+        .find("fn build_grpc_web_error_response_from_parts(")
+        .expect("request rejection helper must remain bounded");
+    let helper = &helper[..helper_end];
+    assert!(helper.contains("build_grpc_web_error_response("));
+    assert!(helper.contains("build_response_from_normalized_reject(reject)"));
+}
+
+#[test]
 fn test_build_backend_url_target_path_none_uses_backend_path() {
     let mut proxy = test_proxy();
     proxy.backend_path = Some("/v1".into());
