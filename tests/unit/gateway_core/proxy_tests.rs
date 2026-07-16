@@ -418,9 +418,7 @@ fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
         .find("let request_protocol = match flavor")
         .expect("route-level protocol selection must remain present");
 
-    assert!(
-        flavor < websocket_precedence && websocket_precedence < routed && routed < protocol
-    );
+    assert!(flavor < websocket_precedence && websocket_precedence < routed && routed < protocol);
     assert!(
         !handler[routed..protocol].contains("let grpc_web_response_content_type"),
         "route-level rejects must reuse the WebSocket-safe strict classification"

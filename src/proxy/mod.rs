@@ -15526,13 +15526,9 @@ async fn handle_proxy_request_inner(
             initial_response_header_policy_plugins.as_ref(),
         );
         restore_authoritative_allow_header(&mut reject.headers, &allow_header);
-        let grpc_web_response = build_grpc_web_reject_response(
-            &[],
-            &mut ctx,
-            grpc_web_response_content_type,
-            &reject,
-        )
-        .await;
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
         record_status(&state, reject.http_status.as_u16());
         if let Some(response) = grpc_web_response {
             return Ok(response);
@@ -15563,13 +15559,9 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
-        let grpc_web_response = build_grpc_web_reject_response(
-            &[],
-            &mut ctx,
-            grpc_web_response_content_type,
-            &reject,
-        )
-        .await;
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
         record_status(&state, reject.http_status.as_u16());
         if let Some(response) = grpc_web_response {
             return Ok(response);

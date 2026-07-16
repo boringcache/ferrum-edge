@@ -688,14 +688,31 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
         ),
     ];
     let state = create_test_proxy_state_with_plugins(
-        vec![allowed, non_post, terminated, authenticate, authorize, before_proxy],
+        vec![
+            allowed,
+            non_post,
+            terminated,
+            authenticate,
+            authorize,
+            before_proxy,
+        ],
         plugins,
     );
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
     let cases = [
-        (Method::POST, "/missing/pkg.Service/Call", "route miss", 5u32),
-        (Method::PUT, "/allowed/pkg.Service/Call", "allowed methods", 12),
+        (
+            Method::POST,
+            "/missing/pkg.Service/Call",
+            "route miss",
+            5u32,
+        ),
+        (
+            Method::PUT,
+            "/allowed/pkg.Service/Call",
+            "allowed methods",
+            12,
+        ),
         (Method::GET, "/non-post/pkg.Service/Call", "non-POST", 3),
         (
             Method::POST,
@@ -709,12 +726,7 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
             "authenticate",
             16,
         ),
-        (
-            Method::POST,
-            "/authorize/pkg.Service/Call",
-            "authorize",
-            16,
-        ),
+        (Method::POST, "/authorize/pkg.Service/Call", "authorize", 16),
         (
             Method::POST,
             "/before-proxy/pkg.Service/Call",
@@ -747,7 +759,11 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
                 Some(*grpc_status),
                 "{version:?} {phase} grpc-status header"
             );
-            assert_eq!(body.first(), Some(&0x80), "{version:?} {phase} trailer flag");
+            assert_eq!(
+                body.first(),
+                Some(&0x80),
+                "{version:?} {phase} trailer flag"
+            );
             let expected = format!("grpc-status: {grpc_status}\r\n");
             assert!(
                 body.windows(expected.len())
@@ -787,7 +803,10 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
         Some("application/grpc")
     );
     assert_eq!(headers.get("grpc-status").map(String::as_str), Some("5"));
-    assert!(body.is_empty(), "native gRPC reject must remain trailers-only");
+    assert!(
+        body.is_empty(),
+        "native gRPC reject must remain trailers-only"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

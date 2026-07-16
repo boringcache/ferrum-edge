@@ -39,8 +39,8 @@ fn grpc_web_frames(body: &[u8]) -> Vec<(u8, &[u8])> {
     let mut remaining = body;
     while remaining.len() >= 5 {
         let flag = remaining[0];
-        let len = u32::from_be_bytes([remaining[1], remaining[2], remaining[3], remaining[4]])
-            as usize;
+        let len =
+            u32::from_be_bytes([remaining[1], remaining[2], remaining[3], remaining[4]]) as usize;
         if remaining.len() < 5 + len {
             break;
         }
@@ -50,11 +50,7 @@ fn grpc_web_frames(body: &[u8]) -> Vec<(u8, &[u8])> {
     frames
 }
 
-fn assert_grpc_web_error(
-    response: &Http3Response,
-    grpc_status: &str,
-    expected_content_type: &str,
-) {
+fn assert_grpc_web_error(response: &Http3Response, grpc_status: &str, expected_content_type: &str) {
     assert_eq!(
         response.status,
         StatusCode::OK,
@@ -88,7 +84,12 @@ fn assert_grpc_web_error(
     let trailer_payload = grpc_web_frames(wire_body)
         .into_iter()
         .find_map(|(flag, payload)| (flag == 0x80).then_some(payload))
-        .unwrap_or_else(|| panic!("missing gRPC-Web trailer frame in {:?}", response.body_bytes));
+        .unwrap_or_else(|| {
+            panic!(
+                "missing gRPC-Web trailer frame in {:?}",
+                response.body_bytes
+            )
+        });
     let trailer_text = String::from_utf8_lossy(trailer_payload);
     assert!(
         trailer_text.contains(&format!("grpc-status: {grpc_status}\r\n")),
@@ -140,11 +141,7 @@ async fn spawn_h3_gateway(config: Value) -> (GatewayHarness, u16, tempfile::Temp
     panic!("failed to spawn H3 gRPC-Web gateway after retries: {last_error}");
 }
 
-async fn request_with_retry(
-    client: &Http3Client,
-    url: &str,
-    options: GetOptions,
-) -> Http3Response {
+async fn request_with_retry(client: &Http3Client, url: &str, options: GetOptions) -> Http3Response {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         match client.get_with_options(url, options.clone()).await {
@@ -305,11 +302,7 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
             .body(Bytes::from(BASE64.encode(grpc_frame(b"ping")))),
     )
     .await;
-    assert_grpc_web_error(
-        &authenticate,
-        "16",
-        "application/grpc-web-text+proto",
-    );
+    assert_grpc_web_error(&authenticate, "16", "application/grpc-web-text+proto");
 
     let authorize = request_with_retry(
         &client,
@@ -390,7 +383,9 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
     .step(TcpStep::Drop)
     .spawn()
     .expect("spawn pass-through backend");
-    let unavailable_port = unbound_port().await.expect("reserve unavailable backend port");
+    let unavailable_port = unbound_port()
+        .await
+        .expect("reserve unavailable backend port");
 
     let config = json!({
         "version": "1",
@@ -515,25 +510,21 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
     let backend_ca = TestCa::new("h3-grpc-web-backend").expect("backend CA");
     let (backend_cert, backend_key) = backend_ca.valid().expect("backend leaf");
-    let backend = ScriptedGrpcBackend::builder_tls(
-        backend_listener,
-        &backend_cert,
-        &backend_key,
-    )
-    .expect("backend TLS")
-    .step(GrpcStep::AcceptRpc(MatchRpc::custom(|request| {
-        request.method == "POST"
-            && request.path == "/echo.Echo/Unary"
-            && request.header("content-type") == Some("application/grpc")
-    })))
-    .step(GrpcStep::SendInitialHeaders)
-    .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
-    .step(GrpcStep::RespondStatus {
-        code: 0,
-        message: "",
-    })
-    .spawn()
-    .expect("spawn gRPC backend");
+    let backend = ScriptedGrpcBackend::builder_tls(backend_listener, &backend_cert, &backend_key)
+        .expect("backend TLS")
+        .step(GrpcStep::AcceptRpc(MatchRpc::custom(|request| {
+            request.method == "POST"
+                && request.path == "/echo.Echo/Unary"
+                && request.header("content-type") == Some("application/grpc")
+        })))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .spawn()
+        .expect("spawn gRPC backend");
 
     let config = json!({
         "version": "1",

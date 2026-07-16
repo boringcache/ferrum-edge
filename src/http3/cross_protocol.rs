@@ -2206,13 +2206,8 @@ where
         );
         let reject_status =
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let (normalized, translated) = normalize_reject_for_client(
-            ctx,
-            reject_status,
-            &reject.body,
-            &reject.headers,
-            false,
-        );
+        let (normalized, translated) =
+            normalize_reject_for_client(ctx, reject_status, &reject.body, &reject.headers, false);
         if has_response_committed_hook {
             for plugin in plugins {
                 if let Some(translated) = translated.as_ref() {
@@ -5273,12 +5268,8 @@ fn normalize_reject_for_client(
     Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) {
     let grpc_web = crate::plugins::grpc_web::client_uses_grpc_web(ctx);
-    let normalized = crate::proxy::normalize_reject_response(
-        status,
-        body,
-        headers,
-        native_grpc || grpc_web,
-    );
+    let normalized =
+        crate::proxy::normalize_reject_response(status, body, headers, native_grpc || grpc_web);
     if native_grpc || grpc_web {
         apply_h3_grpc_reject_metadata(ctx, &normalized);
     }
@@ -5341,8 +5332,7 @@ async fn write_plain_gateway_reject<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let (normalized, translated) =
-        normalize_reject_for_client(ctx, status, body, headers, false);
+    let (normalized, translated) = normalize_reject_for_client(ctx, status, body, headers, false);
     if let Some(translated) = translated {
         return write_reject_with_headers(
             stream,

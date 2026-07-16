@@ -242,13 +242,12 @@ fn valid_grpc_web_parameters(mut value: &[u8]) -> bool {
                             return false;
                         }
                     }
-                    byte
-                        if byte == b'\t'
-                            || byte == b' '
-                            || byte == b'!'
-                            || (b'#'..=b'[').contains(&byte)
-                            || (b']'..=b'~').contains(&byte)
-                            || byte >= 0x80 => {}
+                    byte if byte == b'\t'
+                        || byte == b' '
+                        || byte == b'!'
+                        || (b'#'..=b'[').contains(&byte)
+                        || (b']'..=b'~').contains(&byte)
+                        || byte >= 0x80 => {}
                     _ => return false,
                 }
                 index += 1;
@@ -343,10 +342,7 @@ pub fn request_is_grpc_web_translated(ctx: &RequestContext) -> bool {
 /// policy and error shaping remain gRPC-Web-aware, while backend dispatch
 /// stays on the original plain-HTTP transport because the mode marker above is
 /// absent.
-pub(crate) fn retain_client_content_type_for_errors(
-    ctx: &mut RequestContext,
-    content_type: &str,
-) {
+pub(crate) fn retain_client_content_type_for_errors(ctx: &mut RequestContext, content_type: &str) {
     if grpc_web_media_type(content_type).is_some() {
         ctx.metadata.insert(
             META_GRPC_WEB_ORIGINAL_CT.to_string(),

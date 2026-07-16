@@ -9347,11 +9347,7 @@ async fn send_h3_grpc_web_reject(
         grpc_status,
         grpc_message.as_ref(),
     );
-    crate::proxy::finalize_grpc_web_error_response_headers(
-        &mut translated,
-        &[],
-        Some(headers),
-    );
+    crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, &[], Some(headers));
     send_h3_finalized_reject_response(
         stream,
         StatusCode::OK,
@@ -9385,11 +9381,7 @@ pub(crate) async fn run_h3_reject_response_committed_hooks(
             grpc_status,
             grpc_message.as_ref(),
         );
-        crate::proxy::finalize_grpc_web_error_response_headers(
-            &mut translated,
-            &[],
-            Some(headers),
-        );
+        crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, &[], Some(headers));
         for plugin in plugins {
             plugin
                 .on_response_committed(ctx, 200, &translated.headers, &translated.body)
@@ -10532,8 +10524,7 @@ mod h3_streaming_outcome_tests {
 #[cfg(test)]
 mod h3_plugin_protocol_tests {
     use super::{
-        h3_grpc_reject_signal, h3_plugin_protocol_for_flavor,
-        h3_reject_log_status_and_metadata,
+        h3_grpc_reject_signal, h3_plugin_protocol_for_flavor, h3_reject_log_status_and_metadata,
     };
     use crate::config::types::HttpFlavor;
     use crate::plugins::ProxyProtocol;
