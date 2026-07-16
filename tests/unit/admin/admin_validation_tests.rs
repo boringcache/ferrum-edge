@@ -80,8 +80,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "restore graph construction must run off the Tokio worker"
     );
     assert!(
-        batch_source[restore_handler..]
-            .contains("validate_restore_candidate_on_blocking_pool("),
+        batch_source[restore_handler..].contains("validate_restore_candidate_on_blocking_pool("),
         "restore must use the blocking candidate validator"
     );
     assert!(
