@@ -2,9 +2,10 @@
 //!
 //! Producers reserve both a record slot and the configured maximum record
 //! budget before formatting, then shrink the byte reservation to the actual
-//! serialized length before enqueue. A dedicated OS thread owns the blocking
-//! writer; request/runtime threads only perform atomic admission plus a
-//! fixed-queue push.
+//! serialized length before enqueue. Queued records use exact-sized boxed
+//! slices so spare `Vec` capacity cannot escape the byte budget. A dedicated
+//! OS thread owns the blocking writer; request/runtime threads only perform
+//! atomic admission plus a fixed-queue push.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -344,7 +345,7 @@ impl SinkState {
 
 #[derive(Clone)]
 pub struct NonBlockingSink {
-    queue: Arc<ArrayQueue<Vec<u8>>>,
+    queue: Arc<ArrayQueue<Box<[u8]>>>,
     state: Arc<SinkState>,
 }
 
@@ -543,12 +544,15 @@ impl RecordWriter {
             return EnqueueResult::RecordTooLarge;
         }
 
-        let bytes = std::mem::take(&mut self.bytes);
+        // Vec growth can retain substantially more capacity than its length.
+        // Convert to an exact-sized allocation before enqueueing so the byte
+        // reservation remains a hard bound on retained queue payloads.
+        let bytes = std::mem::take(&mut self.bytes).into_boxed_slice();
         let len = bytes.len();
         // Admission reserves max_record_bytes before attacker-shaped data is
         // serialized. Once serialization succeeds, retain only the actual
-        // record length so the aggregate byte budget reflects queued memory
-        // instead of pessimistically reducing record capacity until I/O ends.
+        // record length so the aggregate byte budget reflects queued payload
+        // memory instead of pessimistically reducing capacity until I/O ends.
         self.sink.state.shrink_reservation(self.reserved_bytes, len);
         self.reserved_bytes = len;
         self.sink
@@ -673,7 +677,7 @@ impl Drop for WorkerGuard {
     }
 }
 
-fn run_worker<W>(mut writer: W, queue: Arc<ArrayQueue<Vec<u8>>>, state: Arc<SinkState>)
+fn run_worker<W>(mut writer: W, queue: Arc<ArrayQueue<Box<[u8]>>>, state: Arc<SinkState>)
 where
     W: Write,
 {
@@ -700,9 +704,9 @@ where
     state.completion.finish();
 }
 
-fn write_record<W: Write>(writer: &mut W, bytes: Vec<u8>, state: &SinkState) {
+fn write_record<W: Write>(writer: &mut W, bytes: Box<[u8]>, state: &SinkState) {
     let len = bytes.len();
-    match writer.write_all(&bytes) {
+    match writer.write_all(bytes.as_ref()) {
         Ok(()) => state.healthy.store(true, Ordering::Release),
         Err(error) => {
             state.record_failure("write", io_error_kind(&error));

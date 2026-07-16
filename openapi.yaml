@@ -9461,7 +9461,7 @@ components:
           description: Hard admitted-record limit; the byte budget may limit admission first.
         queue_capacity_bytes:
           type: integer
-          description: Aggregate per-sink reservation limit for admitted records.
+          description: Aggregate per-sink serialized-payload reservation limit for admitted records.
         max_record_bytes:
           type: integer
           description: Per-record serialization limit and provisional pre-serialization reservation.
@@ -9472,8 +9472,8 @@ components:
           type: integer
           description: >-
             Current byte reservations. A producer initially reserves
-            max_record_bytes; after serialization this shrinks to the actual
-            record length until write completion.
+            max_record_bytes; after serialization an exact-sized payload is
+            queued and this shrinks to the record length until write completion.
         queued_bytes:
           type: integer
           description: Actual serialized bytes admitted but not yet completed by the writer.

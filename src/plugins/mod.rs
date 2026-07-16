@@ -2825,6 +2825,7 @@ impl TransactionSummary {
             || self.client_disconnected
             || (self.response_streamed && !self.body_completed)
             || self.metadata.contains_key("rejection_phase")
+            || self.metadata.contains_key("mirror_error")
             || self.grpc_status().is_some_and(|status| status != 0)
     }
 
@@ -2852,6 +2853,22 @@ impl TransactionSummary {
         mirror.error_class = None;
         mirror.body_error_class = None;
         mirror.body_completed = false;
+        // The cloned metadata describes the primary response. Clear every
+        // response-only key that participates in terminal classification or
+        // mirror serialization before applying the mirror task's own outcome.
+        // In particular, retaining request_protocol="grpc" without a mirror
+        // grpc-status would synthesize UNKNOWN, while retaining grpc_status
+        // would report and filter on the primary backend's status.
+        for key in [
+            "request_protocol",
+            "grpc_status",
+            "grpc_message",
+            "rejection_phase",
+            "mirror_error",
+            "response_size_bytes",
+        ] {
+            mirror.metadata.remove(key);
+        }
         // Mirror traffic is fire-and-forget from the client's perspective — body
         // byte counters from the primary transaction are not meaningful on the
         // mirror summary. Mirror response size goes into metadata instead.

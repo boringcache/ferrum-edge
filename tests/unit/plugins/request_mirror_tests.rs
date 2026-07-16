@@ -105,6 +105,59 @@ async fn test_mirror_result_logging_is_detached_from_primary_path() {
     assert_eq!(summaries[1].response_status_code, 204);
 }
 
+#[test]
+fn test_mirror_summary_uses_its_own_terminal_outcome() {
+    let mut primary = TransactionSummary {
+        response_status_code: 200,
+        body_completed: true,
+        ..TransactionSummary::default()
+    };
+    primary
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    primary
+        .metadata
+        .insert("grpc_status".to_string(), "14".to_string());
+    primary
+        .metadata
+        .insert("grpc_message".to_string(), "primary failed".to_string());
+    primary
+        .metadata
+        .insert("rejection_phase".to_string(), "primary".to_string());
+
+    let successful_mirror = primary.as_mirror_entry(MirrorResponseMeta {
+        mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
+        mirror_response_status_code: Some(204),
+        mirror_response_size_bytes: Some(0),
+        mirror_latency_ms: 10.0,
+        mirror_error: None,
+    });
+    assert!(successful_mirror.grpc_status().is_none());
+    assert!(!successful_mirror.is_terminal_failure());
+    assert!(!successful_mirror.metadata.contains_key("grpc_message"));
+    assert!(!successful_mirror.metadata.contains_key("rejection_phase"));
+    let successful_json = serde_json::to_value(&successful_mirror).unwrap();
+    assert!(successful_json.get("grpc_status").is_none());
+
+    primary
+        .metadata
+        .insert("grpc_status".to_string(), "0".to_string());
+    primary.metadata.remove("rejection_phase");
+    let failed_mirror = primary.as_mirror_entry(MirrorResponseMeta {
+        mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
+        mirror_response_status_code: None,
+        mirror_response_size_bytes: None,
+        mirror_latency_ms: 10.0,
+        mirror_error: Some("connection refused".to_string()),
+    });
+    assert!(failed_mirror.grpc_status().is_none());
+    assert!(failed_mirror.is_terminal_failure());
+    assert_eq!(
+        failed_mirror.metadata.get("mirror_error").map(String::as_str),
+        Some("connection refused")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Plugin metadata
 // ---------------------------------------------------------------------------

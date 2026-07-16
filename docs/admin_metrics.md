@@ -35,8 +35,9 @@ minute; stderr failure never reports into stderr.
 
 Alert on any increase in a dropped-record, I/O-failure, or shutdown-timeout
 counter, or on `ferrum_log_sink_healthy == 0`. Increase record/byte capacity only after
-checking collector throughput and memory headroom: retained queue memory is
-bounded by `FERRUM_LOG_BUFFER_BYTES` per sink, and larger records still obey
+checking collector throughput and memory headroom: retained serialized payload
+memory is bounded by `FERRUM_LOG_BUFFER_BYTES` per sink, and larger records
+still obey
 `FERRUM_LOG_MAX_RECORD_BYTES`. `queue_capacity_records` is the hard record-slot
 limit, not a promise that the byte budget can hold that many records. Before
 serialization, each producer provisionally reserves the maximum record size;

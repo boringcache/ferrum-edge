@@ -166,6 +166,12 @@ fn test_errors_only_uses_authoritative_terminal_failure_predicate() {
         .metadata
         .insert("grpc_status".to_string(), "14".to_string());
     assert!(plugin.should_log_transaction(&summary));
+
+    summary.metadata.remove("grpc_status");
+    summary
+        .metadata
+        .insert("mirror_error".to_string(), "connection refused".to_string());
+    assert!(plugin.should_log_transaction(&summary));
 }
 
 #[test]
