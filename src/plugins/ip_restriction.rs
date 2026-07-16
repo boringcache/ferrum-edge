@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -24,6 +24,15 @@ const CONFIG_KEYS: &[&str] = &["allow", "deny", "mode"];
 enum Mode {
     AllowFirst,
     DenyFirst,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowFirst => "allow_first",
+            Self::DenyFirst => "deny_first",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +135,18 @@ impl IpRestriction {
                 ));
             }
         };
+
+        debug!(
+            plugin = "ip_restriction",
+            mode = mode.as_str(),
+            allow_intervals = allow.v4.len() + allow.v6.len(),
+            allow_ipv4_intervals = allow.v4.len(),
+            allow_ipv6_intervals = allow.v6.len(),
+            deny_intervals = deny.v4.len() + deny.v6.len(),
+            deny_ipv4_intervals = deny.v4.len(),
+            deny_ipv6_intervals = deny.v6.len(),
+            "compiled IP restriction policy"
+        );
 
         Ok(Self { allow, deny, mode })
     }
@@ -316,9 +337,8 @@ fn parse_cidr_rule(network: &str, prefix: u8) -> Option<ParsedRule> {
     match parse_rule_ip(network)? {
         IpAddr::V4(ip) => v4_range(u32::from(ip), prefix),
         IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped()
-                && let Some(v4_prefix) = prefix.checked_sub(96)
-            {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                let v4_prefix = prefix.checked_sub(96)?;
                 return v4_range(u32::from(mapped), v4_prefix);
             }
             if prefix > 128 {
@@ -358,7 +378,28 @@ fn v4_range(value: u32, prefix: u8) -> Option<ParsedRule> {
 }
 
 fn parse_rule_ip(ip: &str) -> Option<IpAddr> {
-    super::parse_client_ip_literal(ip)
+    match super::parse_client_ip_literal(ip)? {
+        IpAddr::V4(ipv4) if is_canonical_ipv4_literal(ip, ipv4) => Some(IpAddr::V4(ipv4)),
+        IpAddr::V4(_) => None,
+        IpAddr::V6(ipv6) => Some(IpAddr::V6(ipv6)),
+    }
+}
+
+fn is_canonical_ipv4_literal(literal: &str, ipv4: std::net::Ipv4Addr) -> bool {
+    let mut parts = literal.split('.');
+    for expected in ipv4.octets() {
+        let Some(part) = parts.next() else {
+            return false;
+        };
+        if part.is_empty()
+            || (part.len() > 1 && part.starts_with('0'))
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+            || part.parse::<u8>().ok() != Some(expected)
+        {
+            return false;
+        }
+    }
+    parts.next().is_none()
 }
 
 /// Check if an IP address matches one exact-IP/CIDR rule.
@@ -367,7 +408,7 @@ fn parse_rule_ip(ip: &str) -> Option<IpAddr> {
 /// plugin hooks use the context-cached typed client IP and compiled range set.
 #[allow(dead_code)]
 pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
-    let client_ip = parse_rule_ip(client_ip).map(|ip| ip.to_canonical());
+    let client_ip = super::parse_client_ip_literal(client_ip).map(|ip| ip.to_canonical());
     match (client_ip, parse_rule(rule)) {
         (Some(client_ip), Some(rule)) => rule.matches(client_ip),
         _ => false,

@@ -104,6 +104,13 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     // snapshot or delta can be accepted and broadcast. This intentionally
     // invokes the same side-effect-free constructor used by file/admin/DP
     // admission rather than duplicating its allowed-key contract.
+    //
+    // Do not generalize this from PluginFailurePolicy::FailClosed alone. That
+    // policy describes data-plane cache publication, not a pure CP schema
+    // contract: some registered constructors intentionally depend on node-local
+    // resources (for example geo_restriction's MMDB), while adaptive_concurrency
+    // requires gateway/cache state. Broader CP parity needs explicit shape-only
+    // validators and mode/resource contracts for each such plugin.
     for plugin_config in &config.plugin_configs {
         if plugin_config.enabled
             && plugin_config.plugin_name == "ip_restriction"

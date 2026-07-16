@@ -13571,8 +13571,12 @@ components:
         creation. Request lookup is allocation-free, lock-free, and logarithmic
         in the number of non-overlapping intervals. The authoritative client IP
         is parsed/canonicalized once per request or stream session and reused by
-        every plugin instance. Supports IPv4 exact and CIDR (`/0`-`/32`) and
-        IPv6 exact and CIDR (`/0`-`/128`); IPv6 zone identifiers (e.g. `%eth0`)
+        every plugin instance. IPv4 octets must use canonical unsigned decimal
+        notation (for example, `010.1.2.3` and `+10.1.2.3` are rejected).
+        Supports IPv4 exact and CIDR (`/0`-`/32`) and native IPv6 exact and CIDR
+        (`/0`-`/128`). IPv4-mapped IPv6 rules normalize to IPv4, so mapped CIDRs
+        accept only `/96`-`/128` (equivalent to IPv4 `/0`-`/32`); shorter mapped
+        prefixes are rejected as ambiguous. IPv6 zone identifiers (e.g. `%eth0`)
         on rules or client IPs are stripped before matching. Runs on every
         protocol — HTTP, gRPC, WebSocket, TCP, UDP, and DTLS. Config must be an
         object, unknown properties and null values are rejected, and at least

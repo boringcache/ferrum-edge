@@ -3793,6 +3793,7 @@ jobs:
           set -euo pipefail
 
           run_benchmark=true
+          run_ip_restriction_benchmark=false
           reason="Performance regression checks always run for ${EVENT_NAME} events."
           changed_files=""
 
@@ -3812,6 +3813,10 @@ jobs:
             fi
           fi
 
+          if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/plugins/ip_restriction\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ip_restriction\.rs))$' <<<"${changed_files}"; then
+            run_ip_restriction_benchmark=true
+          fi
+
           if [ -n "${changed_files}" ]; then
             printf '%s\n' "${changed_files}" > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
           else
@@ -3820,6 +3825,7 @@ jobs:
 
           {
             echo "run=${run_benchmark}"
+            echo "run_ip_restriction_benchmark=${run_ip_restriction_benchmark}"
             echo "reason=${reason}"
           } >> "${GITHUB_OUTPUT}"
 
@@ -3827,6 +3833,10 @@ jobs:
         if: steps.perf_changes.outputs.run == 'true'
         with:
           shared-key: "ci-perf"
+
+      - name: Run IP restriction worst-case microbenchmark
+        if: steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true'
+        run: cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench ip_restriction
 
       - name: Build release binaries
         if: steps.perf_changes.outputs.run == 'true'
@@ -3906,7 +3916,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: performance-results
-          path: tests/performance/ci_results/
+          path: |
+            tests/performance/ci_results/
+            tests/performance/mesh/target/criterion/ip_restriction_lookup/
           retention-days: 30
 
       - name: Post performance summary

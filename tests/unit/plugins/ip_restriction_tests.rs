@@ -712,6 +712,73 @@ async fn deny_mode_ipv4_mapped_ipv6_cidr_rule_rejects_canonicalized_ipv4_client(
     plugin_utils::assert_reject(result, Some(403));
 }
 
+#[test]
+fn mapped_ipv6_cidr_prefixes_below_96_reject_construction() {
+    for prefix in [0, 64, 95] {
+        let config = json!({"allow": [format!("::ffff:192.0.2.44/{prefix}")]});
+        let error = IpRestriction::new(&config)
+            .err()
+            .expect("mapped IPv6 CIDRs below /96 must be rejected");
+        assert!(error.contains("invalid allow rule"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn mapped_ipv6_cidr_prefix_boundaries_map_to_ipv4() {
+    let all_ipv4 = IpRestriction::new(&json!({
+        "allow": ["::ffff:192.0.2.44/96"]
+    }))
+    .unwrap();
+    let mut ipv4 = create_context_with_ip("203.0.113.9");
+    plugin_utils::assert_continue(all_ipv4.on_request_received(&mut ipv4).await);
+    let mut ipv6 = create_context_with_ip("2001:db8::1");
+    plugin_utils::assert_reject(
+        all_ipv4.on_request_received(&mut ipv6).await,
+        Some(403),
+    );
+
+    let exact_ipv4 = IpRestriction::new(&json!({
+        "allow": ["::ffff:192.0.2.44/128"]
+    }))
+    .unwrap();
+    let mut exact = create_context_with_ip("192.0.2.44");
+    plugin_utils::assert_continue(exact_ipv4.on_request_received(&mut exact).await);
+    let mut adjacent = create_context_with_ip("192.0.2.45");
+    plugin_utils::assert_reject(
+        exact_ipv4.on_request_received(&mut adjacent).await,
+        Some(403),
+    );
+}
+
+#[test]
+fn noncanonical_ipv4_rule_literals_reject_construction() {
+    for rule in [
+        "010.1.2.3",
+        "+10.1.2.3",
+        "10.01.2.3",
+        "10.1.2.03",
+        "010.1.2.3/24",
+        "+10.1.2.3/24",
+    ] {
+        let config = json!({"deny": [rule]});
+        assert!(
+            IpRestriction::new(&config).is_err(),
+            "non-canonical IPv4 rule must be rejected: {rule}"
+        );
+    }
+}
+
+#[test]
+fn canonical_ipv4_rule_literals_remain_valid() {
+    for rule in ["0.0.0.0", "10.1.2.3", "255.255.255.255/32"] {
+        let config = json!({"deny": [rule]});
+        assert!(
+            IpRestriction::new(&config).is_ok(),
+            "canonical IPv4 rule must remain valid: {rule}"
+        );
+    }
+}
+
 // ── Fail closed on unparseable client IP (finding #10) ──────────────
 // An unparseable client IP (e.g. a malformed X-Forwarded-For token that
 // survives upstream sourcing) must NOT bypass a deny rule. Before the fix,

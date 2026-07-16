@@ -1557,6 +1557,11 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
     assert_eq!(component["additionalProperties"], false);
     assert_eq!(component["anyOf"][0]["properties"]["allow"]["minItems"], 1);
     assert_eq!(component["anyOf"][1]["properties"]["deny"]["minItems"], 1);
+    let description = component["description"]
+        .as_str()
+        .expect("IpRestrictionConfig has a description");
+    assert!(description.contains("canonical unsigned decimal"));
+    assert!(description.contains("mapped CIDRs accept only `/96`-`/128`"));
 
     for config in [
         json!({"allow": ["10.0.0.0/8"]}),
