@@ -18,9 +18,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
-use tokio_tungstenite::tungstenite::protocol::Message;
 
 const MAX_FRAME_BYTES: &str = "16";
 
@@ -108,8 +108,7 @@ async fn functional_ws_message_size_limit_h2_sends_1009_to_both_peers() {
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
-    let (backend_port, mut backend_closes, backend_task) =
-        spawn_recording_close_ws_backend().await;
+    let (backend_port, mut backend_closes, backend_task) = spawn_recording_close_ws_backend().await;
     let mut gateway = plugin_frame_limit_gateway_builder(backend_port)
         .spawn()
         .await
@@ -144,12 +143,7 @@ async fn functional_ws_message_size_limit_h2_sends_1009_to_both_peers() {
     let upgraded = hyper::upgrade::on(response)
         .await
         .expect("upgrade H2 CONNECT");
-    let mut ws = WebSocketStream::from_raw_socket(
-        TokioIo::new(upgraded),
-        Role::Client,
-        None,
-    )
-    .await;
+    let mut ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, None).await;
 
     ws.send(Message::Frame(Frame::message(
         vec![1u8; 16],
@@ -229,8 +223,7 @@ async fn functional_ws_message_size_limit_h2_sends_1009_to_both_peers() {
 async fn functional_ws_message_size_limit_h3_sends_1009_to_both_peers() {
     use crate::scaffolding::H3WebSocketFrame;
 
-    let (backend_port, mut backend_closes, backend_task) =
-        spawn_recording_close_ws_backend().await;
+    let (backend_port, mut backend_closes, backend_task) = spawn_recording_close_ws_backend().await;
     let https_port = reserve_https_port().await;
     let mut gateway = plugin_frame_limit_gateway_builder(backend_port)
         .env("FERRUM_ENABLE_HTTP3", "true")
@@ -372,8 +365,11 @@ fn plugin_frame_limit_config(backend_port: u16) -> String {
     serde_yaml::to_string(&config).expect("serialize plugin WebSocket frame-limit config")
 }
 
-async fn spawn_recording_close_ws_backend(
-) -> (u16, mpsc::UnboundedReceiver<(CloseCode, String)>, JoinHandle<()>) {
+async fn spawn_recording_close_ws_backend() -> (
+    u16,
+    mpsc::UnboundedReceiver<(CloseCode, String)>,
+    JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind recording WebSocket backend");

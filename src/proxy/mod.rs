@@ -111,8 +111,7 @@ use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
     PluginResult, ProxyProtocol, RequestContext, TransactionSummary, WebSocketFrameDirection,
-    WebSocketSizeLimits, is_builtin_plugin_name,
-    mesh_route_dispatch::MeshRouteDispatchConfig,
+    WebSocketSizeLimits, is_builtin_plugin_name, mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
 use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
@@ -8597,10 +8596,8 @@ async fn handle_websocket_request_authenticated(
     // framer is born with the same per-proxy bounds as the client-side framer.
     // This precedes every retry attempt and uses the immutable request plugin
     // generation, so target rotation cannot change policy mid-upgrade.
-    let ws_size_limits = EffectiveWsSizeLimits::from_plugins(
-        state.max_websocket_frame_size_bytes,
-        &plugins,
-    );
+    let ws_size_limits =
+        EffectiveWsSizeLimits::from_plugins(state.max_websocket_frame_size_bytes, &plugins);
     // The client-sent Host: the mesh egress Extended CONNECT `:authority` is
     // derived from it (the egress route is `preserve_host_header`) so the peer's
     // inbound route matches on the SERVICE host, exactly like HTTP egress. Read
@@ -10843,10 +10840,7 @@ pub(crate) struct EffectiveWsSizeLimits {
 }
 
 impl EffectiveWsSizeLimits {
-    pub(crate) fn from_plugins(
-        global_frame_bytes: usize,
-        plugins: &[Arc<dyn Plugin>],
-    ) -> Self {
+    pub(crate) fn from_plugins(global_frame_bytes: usize, plugins: &[Arc<dyn Plugin>]) -> Self {
         let mut plugin_frame: Option<WsSizeLimitRule> = None;
         let mut plugin_message: Option<WsSizeLimitRule> = None;
 
@@ -11466,8 +11460,7 @@ where
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_ctb = cancel.clone();
     let cancel_btc = cancel.clone();
-    let policy_close: Arc<std::sync::OnceLock<CloseFrame>> =
-        Arc::new(std::sync::OnceLock::new());
+    let policy_close: Arc<std::sync::OnceLock<CloseFrame>> = Arc::new(std::sync::OnceLock::new());
     let policy_close_ctb = Arc::clone(&policy_close);
     let policy_close_btc = policy_close;
 

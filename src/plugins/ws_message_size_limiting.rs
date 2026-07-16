@@ -42,11 +42,9 @@ impl WsMessageSizeLimiting {
         let max_frame_bytes =
             required_positive_usize(config, "max_frame_bytes", "ws_message_size_limiting")?;
         let max_message_bytes = match config.get("max_message_bytes") {
-            Some(_) => required_positive_usize(
-                config,
-                "max_message_bytes",
-                "ws_message_size_limiting",
-            )?,
+            Some(_) => {
+                required_positive_usize(config, "max_message_bytes", "ws_message_size_limiting")?
+            }
             None => max_frame_bytes.saturating_mul(4),
         };
         if max_message_bytes < max_frame_bytes {

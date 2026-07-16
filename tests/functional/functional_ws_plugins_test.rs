@@ -16,9 +16,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
-use tokio_tungstenite::tungstenite::protocol::Message;
 
 // ============================================================================
 // Helpers
@@ -432,15 +432,16 @@ async fn test_ws_message_size_limiting_e2e() {
         panic!("offending client did not receive detailed close");
     };
     assert_eq!(client_close.code, CloseCode::Size);
-    assert_eq!(client_close.reason.as_str(), "payload exceeds gateway limit");
+    assert_eq!(
+        client_close.reason.as_str(),
+        "payload exceeds gateway limit"
+    );
 
-    let (backend_code, backend_reason) = tokio::time::timeout(
-        Duration::from_secs(2),
-        backend_close_rx.recv(),
-    )
-    .await
-    .expect("backend close timed out")
-    .expect("backend close channel ended");
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("backend close timed out")
+            .expect("backend close channel ended");
     assert_eq!(backend_code, CloseCode::Size);
     assert_eq!(backend_reason, "payload exceeds gateway limit");
 
@@ -510,13 +511,11 @@ async fn test_ws_message_size_limiting_backend_direction_and_instances_e2e() {
     assert_eq!(client_close.code, CloseCode::Size);
     assert_eq!(client_close.reason.as_str(), "strict proxy limit");
 
-    let (backend_code, backend_reason) = tokio::time::timeout(
-        Duration::from_secs(2),
-        backend_close_rx.recv(),
-    )
-    .await
-    .expect("offending backend close timed out")
-    .expect("backend close channel ended");
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("offending backend close timed out")
+            .expect("backend close channel ended");
     assert_eq!(backend_code, CloseCode::Size);
     assert_eq!(backend_reason, "strict proxy limit");
 
@@ -585,13 +584,11 @@ async fn test_ws_message_size_limiting_reassembly_bound_e2e() {
     assert_eq!(close.code, CloseCode::Size);
     assert_eq!(close.reason.as_str(), "reassembly limit");
 
-    let (backend_code, backend_reason) = tokio::time::timeout(
-        Duration::from_secs(2),
-        backend_close_rx.recv(),
-    )
-    .await
-    .expect("backend close timed out")
-    .expect("backend close channel ended");
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_close_rx.recv())
+            .await
+            .expect("backend close timed out")
+            .expect("backend close channel ended");
     assert_eq!(backend_code, CloseCode::Size);
     assert_eq!(backend_reason, "reassembly limit");
 

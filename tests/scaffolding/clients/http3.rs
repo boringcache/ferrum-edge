@@ -706,7 +706,8 @@ impl Http3WebSocket {
         payload: &[u8],
         masked: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.send_frame_with_fin(opcode, payload, masked, true).await
+        self.send_frame_with_fin(opcode, payload, masked, true)
+            .await
     }
 
     async fn send_frame_with_fin(
