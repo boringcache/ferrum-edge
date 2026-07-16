@@ -390,6 +390,7 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
 
     for plugin_source in [
         include_str!("../../../src/plugins/fault_injection.rs"),
+        include_str!("../../../src/plugins/grpc_deadline.rs"),
         include_str!("../../../src/plugins/request_mirror.rs"),
         include_str!("../../../src/plugins/response_mock.rs"),
         include_str!("../../../src/plugins/serverless_function.rs"),

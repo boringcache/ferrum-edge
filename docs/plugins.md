@@ -3326,6 +3326,11 @@ Manages the `grpc-timeout` metadata header at the gateway. Can enforce maximum d
 **Priority:** 3050
 **Protocol:** gRPC only
 
+When backend-effective method policy such as `grpc_method_router` is active,
+deadline injection and terminal deadline rejection run after that finalized
+method-policy boundary. Without a backend-path policy, `grpc_deadline` retains
+its ordinary `before_proxy` position and behavior.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_deadline_ms` | u64 (optional) | *(none)* | Cap incoming deadlines to this value (milliseconds). Must be positive — `0` is rejected at plugin load time (it would reject every request). |

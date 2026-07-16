@@ -807,6 +807,131 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
+    let backend_port = 9;
+
+    let mut method_policy =
+        create_grpc_proxy("grpc-method-before-deadline", "/method-policy", backend_port);
+    method_policy.plugins = ["method-policy-router", "method-policy-deadline"]
+        .into_iter()
+        .map(|plugin_config_id| ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: plugin_config_id.to_string(),
+        })
+        .collect();
+
+    let mut deadline_only =
+        create_grpc_proxy("grpc-deadline-only", "/deadline-only", backend_port);
+    attach_test_plugin(&mut deadline_only, "deadline-only");
+
+    let plugins = vec![
+        test_plugin_config(
+            "method-policy-router",
+            "grpc_method_router",
+            "grpc-method-before-deadline",
+            serde_json::json!({
+                "allow_methods": ["pkg.Service/Allowed", "pkg.Service/RateLimited"],
+                "deny_methods": ["pkg.Service/Denied"],
+                "method_rate_limits": {
+                    "pkg.Service/RateLimited": {
+                        "max_requests": 1,
+                        "window_seconds": 60
+                    }
+                }
+            }),
+        ),
+        test_plugin_config(
+            "method-policy-deadline",
+            "grpc_deadline",
+            "grpc-method-before-deadline",
+            serde_json::json!({"reject_no_deadline": true}),
+        ),
+        test_plugin_config(
+            "deadline-only",
+            "grpc_deadline",
+            "grpc-deadline-only",
+            serde_json::json!({"reject_no_deadline": true}),
+        ),
+    ];
+    let state = create_test_proxy_state_with_plugins(
+        vec![method_policy, deadline_only],
+        plugins,
+    );
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
+        for (path, expected_grpc_status, case) in [
+            (
+                "/method-policy/pkg.Service/Denied",
+                "7",
+                "backend-effective method denial",
+            ),
+            (
+                "/deadline-only/pkg.Service/Allowed",
+                "3",
+                "deadline-only control",
+            ),
+        ] {
+            let (status, headers, body) = send_http_request(
+                gateway_addr,
+                version,
+                Method::POST,
+                path,
+                "application/grpc-web+proto",
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{version:?} {case} request failed: {error}"));
+            assert_eq!(status, 200, "{version:?} {case} HTTP status");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/grpc-web+proto"),
+                "{version:?} {case} content type"
+            );
+            let expected = format!("grpc-status: {expected_grpc_status}\r\n");
+            assert!(
+                body.windows(expected.len())
+                    .any(|window| window == expected.as_bytes()),
+                "{version:?} {case} must contain {expected:?}"
+            );
+        }
+    }
+
+    // The first request consumes the finalized method bucket before the
+    // missing-deadline rejection. The second must therefore be rejected by
+    // method policy instead of bypassing that stateful boundary again.
+    for expected_grpc_status in ["3", "8"] {
+        let (status, _headers, body) = send_http_request(
+            gateway_addr,
+            TestHttpVersion::H2,
+            Method::POST,
+            "/method-policy/pkg.Service/RateLimited",
+            "application/grpc-web+proto",
+        )
+        .await
+        .expect("H2 rate/deadline ordering request");
+        assert_eq!(status, 200);
+        let expected = format!("grpc-status: {expected_grpc_status}\r\n");
+        assert!(
+            body.windows(expected.len())
+                .any(|window| window == expected.as_bytes()),
+            "rate/deadline ordering response must contain {expected:?}"
+        );
+    }
+
+    let (status, headers, body) = send_http_request(
+        gateway_addr,
+        TestHttpVersion::H2,
+        Method::POST,
+        "/method-policy/pkg.Service/Denied",
+        "application/grpc",
+    )
+    .await
+    .expect("native H2 method/deadline ordering request");
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
+    assert!(body.is_empty(), "native gRPC rejection must remain bodyless");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_grpc_unary_proxy_through_gateway() {
     // Start mock gRPC backend
     let (backend_addr, _backend_handle) = start_mock_grpc_backend().await;

@@ -197,6 +197,20 @@ fn reject_config(backend_port: u16) -> Value {
                 "/authorize",
                 &["grpc-web-authorize", "authorize-reject"],
             ),
+            proxy(
+                "h3-grpc-web-method-before-deadline",
+                "/method-policy",
+                &[
+                    "grpc-web-method-policy",
+                    "grpc-method-policy",
+                    "grpc-method-deadline",
+                ],
+            ),
+            proxy(
+                "h3-grpc-web-deadline-only",
+                "/deadline-only",
+                &["grpc-web-deadline-only", "grpc-deadline-only"],
+            ),
         ],
         "consumers": [],
         "upstreams": [],
@@ -260,6 +274,46 @@ fn reject_config(backend_port: u16) -> Value {
                 "proxy_id": "h3-grpc-web-authorize",
                 "enabled": true,
                 "config": {"allowed_consumers": ["allowed-user"]},
+            },
+            {
+                "id": "grpc-web-method-policy",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-method-before-deadline",
+                "enabled": true,
+                "config": {},
+            },
+            {
+                "id": "grpc-method-policy",
+                "plugin_name": "grpc_method_router",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-method-before-deadline",
+                "enabled": true,
+                "config": {"deny_methods": ["pkg.Service/Denied"]},
+            },
+            {
+                "id": "grpc-method-deadline",
+                "plugin_name": "grpc_deadline",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-method-before-deadline",
+                "enabled": true,
+                "config": {"reject_no_deadline": true},
+            },
+            {
+                "id": "grpc-web-deadline-only",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-deadline-only",
+                "enabled": true,
+                "config": {},
+            },
+            {
+                "id": "grpc-deadline-only",
+                "plugin_name": "grpc_deadline",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-deadline-only",
+                "enabled": true,
+                "config": {"reject_no_deadline": true},
             },
         ],
     })
@@ -346,6 +400,36 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
     )
     .await;
     assert_grpc_web_error(&authorize, "16", "application/grpc-web+proto");
+
+    let method_policy = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/method-policy/pkg.Service/Denied"),
+        grpc_web(Method::POST),
+    )
+    .await;
+    assert_grpc_web_error(&method_policy, "7", "application/grpc-web+proto");
+
+    let deadline_only = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/deadline-only/pkg.Service/Allowed"),
+        grpc_web(Method::POST),
+    )
+    .await;
+    assert_grpc_web_error(&deadline_only, "3", "application/grpc-web+proto");
+
+    let native_method_policy = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/method-policy/pkg.Service/Denied"),
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/grpc")
+            .body(Bytes::from(grpc_frame(b"ping"))),
+    )
+    .await;
+    assert_eq!(native_method_policy.status, StatusCode::OK);
+    assert_eq!(native_method_policy.grpc_status(), Some(7));
+    assert!(native_method_policy.body_bytes.is_empty());
+    assert!(native_method_policy.trailers.is_none());
 
     // Negative control: the same received-phase reject remains ordinary HTTP
     // for an unrelated content type.
