@@ -7794,6 +7794,15 @@ mod inner {
             Ok(owner)
         }
 
+        fn drop_settled_persistent_admission_pin(&self, guard_owner: &str) {
+            // Once every protected mutation has a known outcome, a durable
+            // fence may remain for owner-qualified operator cleanup, but it no
+            // longer needs to pin this process to a dead connection bundle.
+            // Releasing the generation read guard lets reconnect/failover
+            // recover without routing any still-uncertain mutation elsewhere.
+            let _ = self.persistent_admission_pins.remove(guard_owner);
+        }
+
         async fn release_mtls_dns_admission_guard(
             &self,
             namespace: &str,
@@ -7827,13 +7836,18 @@ mod inner {
                 .delete_one(doc! { "_id": namespace, "owner": guard_owner })
                 .write_concern(WriteConcern::majority())
                 .await;
+            // The mutation outcome was checked as settled above. Drop the
+            // process-local generation pin regardless of cleanup status; the
+            // owner-qualified durable document remains the fail-closed fence
+            // when the delete failed or its acknowledgement was lost.
+            self.drop_settled_persistent_admission_pin(guard_owner);
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
                     // Every borrowed mutation explicitly settled before this
-                    // cleanup. Preserve its known response and retain the pin
-                    // for an owner-qualified operator cleanup instead of
-                    // reporting a false write failure.
+                    // cleanup. Preserve its known response, surface cleanup
+                    // status in the error log, and leave any durable fence for
+                    // owner-qualified operator cleanup.
                     error!(
                         namespace = %namespace,
                         error = %error,
@@ -7849,7 +7863,6 @@ mod inner {
                 );
                 return Ok(());
             }
-            let _ = self.persistent_admission_pins.remove(guard_owner);
             Ok(())
         }
 
@@ -11510,12 +11523,33 @@ mod inner {
                 .install_reconnected_bundle(connection_bundle("after_failover"), false)
                 .expect("the bundle may swap after the admission generation pin is released");
 
+            let guard_owner = "settled-owner".to_string();
+            let generation_guard = store.connection_generation.clone().read_owned().await;
+            let _ = store.persistent_admission_pins.insert(
+                guard_owner.clone(),
+                MongoPersistentAdmissionPin {
+                    namespace: "ferrum".to_string(),
+                    pin: MongoAdmissionConnectionPin {
+                        connection: store.connection(),
+                        _generation_guard: generation_guard,
+                    },
+                    uncertain_outcome: Arc::new(AtomicBool::new(false)),
+                },
+            );
+            store
+                .install_reconnected_bundle(connection_bundle("still_blocked"), false)
+                .expect_err("a persistent admission pin must block bundle replacement");
+            store.drop_settled_persistent_admission_pin(&guard_owner);
+            store
+                .install_reconnected_bundle(connection_bundle("recovered_failover"), false)
+                .expect("settled cleanup failure must release the local generation pin");
+
             // Accessor must now return the swapped handle. If it kept a
             // captured copy of the original `db` field (the pre-fix bug),
             // this assertion fails.
             assert_eq!(
                 store.db().name(),
-                "after_failover",
+                "recovered_failover",
                 "db() must reflect the swapped handle — collection accessors \
                  (proxies/consumers/plugin_configs/upstreams) all flow through \
                  db(), so a stale handle would mean every read still goes to \

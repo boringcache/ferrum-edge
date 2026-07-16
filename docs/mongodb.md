@@ -267,6 +267,11 @@ stop or restart that admin process, and only then remove the exact
 owner-qualified mutex document. Definitive server rejections (including a
 duplicate-key loser) and definitively aborted transactions explicitly settle
 and release the mutex; they do not create a permanent operator-recovery fence.
+A settled operation also releases its process-local connection-generation pin
+when owner-qualified mutex cleanup fails or loses its acknowledgement. The
+durable document remains fail-closed when it still exists, cleanup status is
+logged for operator recovery, and reconnect/failover can recover the process;
+only an uncertain protected mutation retains both the fence and local pin.
 A restore keeps one pin and owner from its pre-clear rollback snapshot through
 the clear, all import batches, and any compensating replay. Credential endpoints
 likewise acquire that owner before reading the Consumer and borrow it for the
