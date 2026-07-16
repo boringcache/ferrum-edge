@@ -1138,6 +1138,14 @@ impl Plugin for ServerlessFunction {
         self.forward_body
     }
 
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        true
+    }
+
+    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
+        self.mode == InvocationMode::PreProxy
+    }
+
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.requires_body
     }
