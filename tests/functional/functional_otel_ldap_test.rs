@@ -3,13 +3,23 @@
 //! - **OTel Tracing**: Verifies the plugin injects a `traceparent` response header
 //!   (W3C Trace Context) when configured in propagation-only mode.
 //! - **LDAP Auth**: Verifies the plugin fails closed when the configured LDAP
-//!   server is unreachable (no silent bypass of authentication) — returning a
-//!   500 (backend failure) rather than a 401 (bad credentials), per finding #32.
+//!   server is unreachable or its hostname rebinds to denied space (no silent
+//!   bypass of authentication) — returning a 500 backend failure rather than a
+//!   401 bad-credential result.
 //!
 //! Both tests use file mode with ephemeral ports.
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_otel_ldap
 
+use hickory_resolver::proto::{
+    op::Message,
+    rr::{RData, Record, RecordType},
+};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,6 +51,77 @@ async fn start_echo_server_on(listener: TcpListener) {
     }
 }
 
+struct RebindingDnsServer {
+    addr: SocketAddr,
+    answers: Arc<RwLock<Vec<IpAddr>>>,
+    query_count: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RebindingDnsServer {
+    async fn spawn(initial_answers: Vec<IpAddr>) -> Self {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind functional DNS server");
+        let addr = socket.local_addr().expect("functional DNS address");
+        let answers = Arc::new(RwLock::new(initial_answers));
+        let query_count = Arc::new(AtomicUsize::new(0));
+        let task_answers = Arc::clone(&answers);
+        let task_query_count = Arc::clone(&query_count);
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; 2_048];
+            loop {
+                let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
+                    break;
+                };
+                let Ok(request) = Message::from_vec(&buffer[..length]) else {
+                    continue;
+                };
+                let Some(query) = request.queries.first().cloned() else {
+                    continue;
+                };
+                task_query_count.fetch_add(1, Ordering::Relaxed);
+                let current_answers = task_answers
+                    .read()
+                    .expect("read functional DNS answers")
+                    .clone();
+                let mut response = request.into_response();
+                for address in current_answers {
+                    let data = match (query.query_type(), address) {
+                        (RecordType::A, IpAddr::V4(address)) => RData::A(address.into()),
+                        _ => continue,
+                    };
+                    response.add_answer(Record::from_rdata(query.name().clone(), 1, data));
+                }
+                let Ok(encoded) = response.to_vec() else {
+                    continue;
+                };
+                let _ = socket.send_to(&encoded, peer).await;
+            }
+        });
+        Self {
+            addr,
+            answers,
+            query_count,
+            task,
+        }
+    }
+
+    fn rebind_to(&self, address: IpAddr) {
+        *self.answers.write().expect("write functional DNS answer") = vec![address];
+    }
+
+    fn queries(&self) -> usize {
+        self.query_count.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for RebindingDnsServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 // ============================================================================
 // Gateway Helpers
 // ============================================================================
@@ -55,14 +136,16 @@ fn gateway_binary_path() -> &'static str {
 }
 
 /// Start the gateway in file mode with the given config and ports.
-fn start_gateway(
+fn start_gateway_with_dns(
     config_path: &str,
     proxy_port: u16,
     admin_port: u16,
+    dns_resolver: Option<SocketAddr>,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let binary_path = gateway_binary_path();
 
-    let child = std::process::Command::new(binary_path)
+    let mut command = std::process::Command::new(binary_path);
+    command
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
@@ -70,10 +153,23 @@ fn start_gateway(
         .env("FERRUM_LOG_LEVEL", "debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    if let Some(resolver) = dns_resolver {
+        command
+            .env("FERRUM_DNS_RESOLVER_ADDRESS", resolver.to_string())
+            .env("FERRUM_DNS_TRY_TCP_ON_ERROR", "false");
+    }
+    let child = command.spawn()?;
 
     Ok(child)
+}
+
+fn start_gateway(
+    config_path: &str,
+    proxy_port: u16,
+    admin_port: u16,
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    start_gateway_with_dns(config_path, proxy_port, admin_port, None)
 }
 
 /// Wait for the gateway health endpoint to respond.
@@ -436,6 +532,85 @@ async fn start_ldap_gateway_with_retry(
     panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
 }
 
+async fn start_ldap_rebinding_gateway_with_retry(
+    config_template: &str,
+    ldap_port: u16,
+    dns_resolver: SocketAddr,
+) -> (
+    std::process::Child,
+    tokio::task::JoinHandle<()>,
+    u16,
+    u16,
+    TempDir,
+) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rebind-test backend");
+        let backend_port = backend_listener.local_addr().unwrap().port();
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind admin");
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+
+        let temp_dir = TempDir::new().expect("create rebind-test temp directory");
+        let config_path = temp_dir.path().join("config.yaml");
+        let config_content = config_template
+            .replace("{backend_port}", &backend_port.to_string())
+            .replace("{ldap_port}", &ldap_port.to_string());
+        std::fs::write(&config_path, config_content.as_bytes()).expect("write rebind-test config");
+
+        let echo_handle = tokio::spawn(start_echo_server_on(backend_listener));
+        sleep(Duration::from_millis(200)).await;
+        let mut gateway_process = match start_gateway_with_dns(
+            &config_path.to_string_lossy(),
+            proxy_port,
+            admin_port,
+            Some(dns_resolver),
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                eprintln!(
+                    "Gateway rebind-test spawn attempt {attempt}/{MAX_ATTEMPTS} failed: {error}"
+                );
+                echo_handle.abort();
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
+                }
+                continue;
+            }
+        };
+
+        match wait_for_health(admin_port).await {
+            Ok(()) => {
+                return (
+                    gateway_process,
+                    echo_handle,
+                    proxy_port,
+                    admin_port,
+                    temp_dir,
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "Gateway rebind-test startup attempt {attempt}/{MAX_ATTEMPTS} failed: {error}"
+                );
+                let _ = gateway_process.kill();
+                let _ = gateway_process.wait();
+                echo_handle.abort();
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    panic!("Gateway did not start after {MAX_ATTEMPTS} rebind-test attempts");
+}
+
 #[ignore]
 #[tokio::test]
 async fn test_ldap_auth_returns_500_when_server_unreachable() {
@@ -566,6 +741,85 @@ plugin_configs:
     );
 
     // Cleanup
+    let _ = gateway_process.kill();
+    let _ = gateway_process.wait();
+    echo_handle.abort();
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_ldap_auth_blocks_dial_time_dns_rebind() {
+    let ldap_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind LDAP rebind sentinel");
+    let ldap_port = ldap_listener
+        .local_addr()
+        .expect("LDAP sentinel addr")
+        .port();
+    let dns = RebindingDnsServer::spawn(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
+    let config_template = r#"
+version: "1"
+proxies:
+  - id: "auth-proxy"
+    listen_path: "/secure"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "ldap-1"
+
+consumers: []
+
+plugin_configs:
+  - id: "ldap-1"
+    proxy_id: "auth-proxy"
+    plugin_name: "ldap_auth"
+    scope: "proxy"
+    enabled: true
+    config:
+      ldap_url: "ldap://directory.test:{ldap_port}"
+      bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
+      allow_plaintext: true
+      connect_timeout_seconds: 1
+"#;
+
+    let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
+        start_ldap_rebinding_gateway_with_retry(config_template, ldap_port, dns.addr).await;
+    let queries_before_rebind = dns.queries();
+    dns.rebind_to("169.254.169.254".parse().expect("metadata IP"));
+
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{proxy_port}/secure/resource");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let response = loop {
+        let response = client
+            .get(&url)
+            .basic_auth("testuser", Some("end-user-secret"))
+            .send()
+            .await
+            .expect("send LDAP rebind request");
+        if response.status().as_u16() != 404 || tokio::time::Instant::now() >= deadline {
+            break response;
+        }
+        sleep(Duration::from_millis(250)).await;
+    };
+
+    assert_eq!(response.status().as_u16(), 500);
+    let body = response.text().await.expect("read LDAP rebind response");
+    assert!(body.contains("temporarily unavailable"));
+    assert!(!body.contains("end-user-secret"));
+    assert!(
+        dns.queries() >= queries_before_rebind + 2,
+        "the request must issue fresh A and AAAA queries after warmup"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), ldap_listener.accept())
+            .await
+            .is_err(),
+        "the LDAP listener must not receive a connection after the denied rebind"
+    );
+
     let _ = gateway_process.kill();
     let _ = gateway_process.wait();
     echo_handle.abort();

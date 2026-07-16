@@ -4,14 +4,26 @@ Ferrum Edge executes plugins in a deterministic order based on two dimensions: *
 
 ## Lifecycle Phases
 
-Every HTTP-family request passes through the request/header phases in strict order. Buffered responses then run the body phases before logging; streamed non-buffered responses skip the buffered body phases and run a terminal stream hook before logging. WebSocket connections optionally enter a frame phase after the HTTP upgrade completes. Plugins only run in the phases they implement:
+HTTP-family routing and per-proxy allowed-method admission occur before the
+ordinary plugin lifecycle begins. Native gRPC requests also pass a POST-only
+admission gate at this boundary. Requests admitted by those checks then pass
+through the request/header phases in strict order. Buffered responses run the
+body phases before logging; streamed non-buffered responses skip the buffered
+body phases and run a terminal stream hook before logging. WebSocket
+connections optionally enter a frame phase after the HTTP upgrade completes.
+Plugins only run in the phases they implement:
 
 ```
 Request In
     │
     ▼
 ┌─────────────────────────┐
-│ 1. on_request_received  │  Pre-processing: CORS preflight
+│ Route + method admission│  Unmatched: 404; disallowed: 405; gRPC non-POST: reject
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 1. on_request_received  │  Matched-request processing: CORS preflight
 └────────────┬────────────┘
              │
              ▼
@@ -94,9 +106,22 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 13. log                 │  Logging & observability (fire-and-forget)
+│ 13. log                 │  Logging & observability (timing depends on body owner)
 └─────────────────────────┘
 ```
+
+`on_request_received` is therefore a post-route, post-allowed-method hook, not
+a pre-routing receipt hook. Once it runs, `ctx.matched_proxy` is populated and
+the plugin list is the resolved view for that proxy: applicable global plugins
+plus proxy/proxy-group-scoped plugins. Unmatched 404 responses run neither
+global nor scoped hooks because there is no proxy view to select. Matched 405
+responses also return before either kind of hook runs.
+Native gRPC requests must also use `POST` before this hook runs.
+A matched request using a different method is rejected at its protocol
+admission gate before either kind of hook, even if `allowed_methods` permits
+that method. H1, H2, and H3 share these blind spots. Terminal transaction
+logging is separate from ordinary request hooks; whether a terminal summary
+exists must not be inferred from whether `on_request_received` ran.
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, a native direct CORS policy returns a `204` preflight response in phase 1 without ever reaching authentication (an Istio projection returns its source-compatible 200). Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
@@ -324,7 +349,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
-| **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
+| **Early** | 0–949 | Matched-request tracing, IDs, preflight, and short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `oauth2_introspection` (1050), `oidc_relying_party` (1075), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
 | **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `adaptive_concurrency` (2090), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_transcript_audit` (2924), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_tool_governor` (2978), `ai_semantic_cache` (2980), `ai_stream_router` (2984), `mcp_gateway` (2992), `a2a_gateway` (2993), `mesh_route_dispatch` (2995) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `load_testing` (3080), `response_size_limiting` (3490), `response_caching` (3500) |
@@ -561,7 +586,32 @@ The `compression` plugin runs at priority 4050 — after `response_transformer` 
 
 ### Logging runs last (9000+)
 
-Logging plugins run in phase 12 (`log`) and are fire-and-forget. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9300) does not impact behavior.
+Logging plugins run in phase 13 (`log`) in priority/config order, but the hook
+is not universally fire-and-forget. `log_with_mirror` awaits each primary
+transaction hook sequentially:
+
+- Buffered H1/H2/gRPC responses, synchronous rejection/error paths, and other
+  buffered terminal paths await all log hooks before the response is returned.
+  Direct network or filesystem I/O therefore adds client-visible handler
+  latency, with multiple hooks adding that latency serially.
+- Hyper-owned streamed H1/H2 and gRPC bodies return from the handler first.
+  Body completion fires a spawned task that awaits streaming terminal hooks and
+  then log hooks sequentially. The task can be lost when no Tokio runtime is
+  available during shutdown or when runtime shutdown cancels unfinished work.
+- Native H3 drives the response body to completion inside its handler. It then
+  synchronously awaits streaming terminal hooks and sequential log hooks before
+  the handler finishes; it does not use the detached hyper-body logger.
+
+Potentially slow sinks should use an explicitly bounded, plugin-owned handoff.
+Own the queue, worker, cancellation state, and retry budget in the plugin;
+start the worker from `start_background_tasks()` after cache acceptance; define
+queue-full behavior; and signal intake closure when the plugin is dropped. Do
+not spawn an unbounded task per transaction. Because `Drop` cannot await and
+runtime shutdown can still cancel a worker, durable delivery needs persistence
+or an external collector with an explicit drain protocol.
+
+Relative ordering within the logging band (9000–9300) determines invocation
+order but otherwise does not change lifecycle phase semantics.
 
 All logging plugins receive the `TransactionSummary` struct which includes an `error_class` field for failed transactions. This field classifies gateway-level errors (e.g., `ConnectionTimeout`, `TlsError`, `DnsLookupError`) to help operators quickly identify root causes. See [docs/error_classification.md](error_classification.md) for the full list of error classes and debugging guidance.
 
