@@ -7831,15 +7831,6 @@ mod inner {
             Ok(owner)
         }
 
-        fn drop_settled_persistent_admission_pin(&self, guard_owner: &str) {
-            // Once every protected mutation has a known outcome, a durable
-            // fence may remain for owner-qualified operator cleanup, but it no
-            // longer needs to pin this process to a dead connection bundle.
-            // Releasing the generation read guard lets reconnect/failover
-            // recover without routing any still-uncertain mutation elsewhere.
-            let _ = self.persistent_admission_pins.remove(guard_owner);
-        }
-
         async fn release_mtls_dns_admission_guard(
             &self,
             namespace: &str,
@@ -7877,7 +7868,7 @@ mod inner {
             // process-local generation pin regardless of cleanup status; the
             // owner-qualified durable document remains the fail-closed fence
             // when the delete failed or its acknowledgement was lost.
-            self.drop_settled_persistent_admission_pin(guard_owner);
+            let _ = self.persistent_admission_pins.remove(guard_owner);
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
@@ -11588,7 +11579,7 @@ mod inner {
             store
                 .install_reconnected_bundle(connection_bundle("still_blocked"), false)
                 .expect_err("a persistent admission pin must block bundle replacement");
-            store.drop_settled_persistent_admission_pin(&guard_owner);
+            let _ = store.persistent_admission_pins.remove(&guard_owner);
             store
                 .install_reconnected_bundle(connection_bundle("recovered_failover"), false)
                 .expect("settled cleanup failure must release the local generation pin");
