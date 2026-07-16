@@ -326,9 +326,11 @@ plugin_configs:
     assert!(metrics.contains(
         "ferrum_ai_completion_tokens_total{proxy_id=\"ai-metrics-proxy\",provider=\"openai\"} 7"
     ));
-    assert!(metrics.contains(
-        "ferrum_ai_tokens_total{proxy_id=\"ai-metrics-proxy\",provider=\"openai\"} 18"
-    ));
+    assert!(
+        metrics.contains(
+            "ferrum_ai_tokens_total{proxy_id=\"ai-metrics-proxy\",provider=\"openai\"} 18"
+        )
+    );
     assert!(metrics.contains(
         "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"ai-metrics-proxy\",provider=\"openai\"} 0.000025"
     ));

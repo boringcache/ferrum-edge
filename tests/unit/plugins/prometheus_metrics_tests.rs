@@ -1413,10 +1413,7 @@ async fn ai_token_metadata_records_and_renders_bounded_prometheus_families() {
         "POST".to_string(),
         "/responses".to_string(),
     );
-    let headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/json".to_string(),
-    )]);
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = serde_json::to_vec(&json!({
         "object": "response",
         "model": "must-not-be-a-label",
@@ -1462,14 +1459,9 @@ async fn multiple_ai_token_instances_select_one_complete_snapshot_without_double
         "POST".to_string(),
         "/chat".to_string(),
     );
-    let headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/json".to_string(),
-    )]);
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let body = br#"{"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#;
-    sparse
-        .on_response_body(&mut ctx, 200, &headers, body)
-        .await;
+    sparse.on_response_body(&mut ctx, 200, &headers, body).await;
     complete
         .on_response_body(&mut ctx, 200, &headers, body)
         .await;
@@ -1479,15 +1471,16 @@ async fn multiple_ai_token_instances_select_one_complete_snapshot_without_double
     summary.metadata = ctx.metadata;
     registry.record(&summary);
     let output = registry.render_uncached();
-    assert!(output.contains(
-        "ferrum_ai_prompt_tokens_total{proxy_id=\"multi-ai\",provider=\"openai\"} 7"
-    ));
-    assert!(output.contains(
-        "ferrum_ai_tokens_total{proxy_id=\"multi-ai\",provider=\"openai\"} 10"
-    ));
-    assert!(!output.contains(
-        "ferrum_ai_tokens_total{proxy_id=\"multi-ai\",provider=\"openai\"} 20"
-    ));
+    assert!(
+        output
+            .contains("ferrum_ai_prompt_tokens_total{proxy_id=\"multi-ai\",provider=\"openai\"} 7")
+    );
+    assert!(
+        output.contains("ferrum_ai_tokens_total{proxy_id=\"multi-ai\",provider=\"openai\"} 10")
+    );
+    assert!(
+        !output.contains("ferrum_ai_tokens_total{proxy_id=\"multi-ai\",provider=\"openai\"} 20")
+    );
 }
 
 #[test]
@@ -1504,7 +1497,10 @@ fn malformed_or_unproven_ai_metadata_is_ignored_safely() {
             ("bad_provider".to_string(), "openai".to_string()),
             ("bad_prompt_tokens".to_string(), "-1".to_string()),
             ("bad_completion_tokens".to_string(), "1.5".to_string()),
-            ("bad_total_tokens".to_string(), "18446744073709551616".to_string()),
+            (
+                "bad_total_tokens".to_string(),
+                "18446744073709551616".to_string(),
+            ),
             ("bad_estimated_cost".to_string(), "NaN".to_string()),
         ]),
         HashMap::from([

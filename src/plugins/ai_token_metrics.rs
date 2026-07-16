@@ -164,9 +164,7 @@ impl AiTokenMetrics {
         let streaming_key = metadata_key(&metadata_prefix, "streaming");
         let prometheus_export_key = format!("{metadata_prefix}{PROMETHEUS_EXPORT_SUFFIX}");
 
-        warn!(
-            "ai_token_metrics is HTTP-only; native gRPC protobuf responses are not inspected"
-        );
+        warn!("ai_token_metrics is HTTP-only; native gRPC protobuf responses are not inspected");
 
         Ok(Self {
             provider,

@@ -2584,8 +2584,14 @@ fn ai_token_metrics_runtime_and_openapi_contracts_match() {
         json!({"buffer_streaming_responses": true}),
         json!({"cost_per_prompt_token": 0.000003}),
     ] {
-        assert!(validator.validate(&config).is_ok(), "schema rejected {config}");
-        assert!(AiTokenMetrics::new(&config).is_ok(), "runtime rejected {config}");
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema rejected {config}"
+        );
+        assert!(
+            AiTokenMetrics::new(&config).is_ok(),
+            "runtime rejected {config}"
+        );
     }
 
     for config in [
@@ -2595,8 +2601,14 @@ fn ai_token_metrics_runtime_and_openapi_contracts_match() {
         json!({"metadata_prefix": "x".repeat(65)}),
         json!({"cost_per_prompt_token": -1}),
     ] {
-        assert!(validator.validate(&config).is_err(), "schema accepted {config}");
-        assert!(AiTokenMetrics::new(&config).is_err(), "runtime accepted {config}");
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema accepted {config}"
+        );
+        assert!(
+            AiTokenMetrics::new(&config).is_err(),
+            "runtime accepted {config}"
+        );
     }
 }
 

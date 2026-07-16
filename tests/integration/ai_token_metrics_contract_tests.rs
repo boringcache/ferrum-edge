@@ -19,11 +19,8 @@ fn registration_is_http_only_and_shared_validation_rejects_unknown_keys() {
     assert_eq!(plugin.supported_protocols(), &[ProxyProtocol::Http]);
     assert!(plugin.requires_response_body_buffering());
 
-    let error = validate_plugin_config(
-        "ai_token_metrics",
-        &json!({"cost_per_promt_token": 0.01}),
-    )
-    .expect_err("unknown cost key must fail shared reload validation");
+    let error = validate_plugin_config("ai_token_metrics", &json!({"cost_per_promt_token": 0.01}))
+        .expect_err("unknown cost key must fail shared reload validation");
     assert!(error.contains("cost_per_promt_token"), "got: {error}");
     assert!(error.contains("allowed keys"), "got: {error}");
 }

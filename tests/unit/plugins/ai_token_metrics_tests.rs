@@ -74,10 +74,7 @@ async fn test_plugin_name_and_priority() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ai_token_metrics");
     assert_eq!(plugin.priority(), 4100);
-    assert_eq!(
-        plugin.supported_protocols(),
-        &[ProxyProtocol::Http]
-    );
+    assert_eq!(plugin.supported_protocols(), &[ProxyProtocol::Http]);
     assert!(plugin.requires_response_body_buffering());
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type(
@@ -897,10 +894,7 @@ async fn anthropic_sse_merges_cumulative_terminal_usage_without_double_counting(
     }))
     .unwrap();
     let mut ctx = create_test_context();
-    let headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = concat!(
         "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n",
         "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n",
@@ -912,26 +906,41 @@ async fn anthropic_sse_merges_cumulative_terminal_usage_without_double_counting(
         .on_response_body(&mut ctx, 200, &headers, body.as_bytes())
         .await;
 
-    assert_eq!(ctx.metadata.get("ai_provider").map(String::as_str), Some("anthropic"));
-    assert_eq!(ctx.metadata.get("ai_prompt_tokens").map(String::as_str), Some("25"));
-    assert_eq!(ctx.metadata.get("ai_completion_tokens").map(String::as_str), Some("15"));
-    assert_eq!(ctx.metadata.get("ai_total_tokens").map(String::as_str), Some("40"));
-    assert_eq!(ctx.metadata.get("ai_estimated_cost").map(String::as_str), Some("0.550000"));
+    assert_eq!(
+        ctx.metadata.get("ai_provider").map(String::as_str),
+        Some("anthropic")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("25")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("15")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("40")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_estimated_cost").map(String::as_str),
+        Some("0.550000")
+    );
 }
 
 #[tokio::test]
 async fn anthropic_sse_without_message_start_keeps_explicit_partial_usage() {
     let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
     let mut ctx = create_test_context();
-    let headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n";
 
     plugin.on_response_body(&mut ctx, 200, &headers, body).await;
 
-    assert_eq!(ctx.metadata.get("ai_completion_tokens").map(String::as_str), Some("9"));
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("9")
+    );
     assert!(!ctx.metadata.contains_key("ai_prompt_tokens"));
     assert!(!ctx.metadata.contains_key("ai_total_tokens"));
 }
@@ -964,11 +973,26 @@ async fn openai_responses_buffered_and_completed_sse_are_supported() {
                 &serde_json::to_vec(&buffered).unwrap(),
             )
             .await;
-        assert_eq!(ctx.metadata.get("ai_provider").map(String::as_str), Some("openai"));
-        assert_eq!(ctx.metadata.get("ai_prompt_tokens").map(String::as_str), Some("36"));
-        assert_eq!(ctx.metadata.get("ai_completion_tokens").map(String::as_str), Some("87"));
-        assert_eq!(ctx.metadata.get("ai_total_tokens").map(String::as_str), Some("123"));
-        assert_eq!(ctx.metadata.get("ai_estimated_cost").map(String::as_str), Some("2.100000"));
+        assert_eq!(
+            ctx.metadata.get("ai_provider").map(String::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+            Some("36")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+            Some("87")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_total_tokens").map(String::as_str),
+            Some("123")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_estimated_cost").map(String::as_str),
+            Some("2.100000")
+        );
     }
 
     let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
@@ -977,14 +1001,20 @@ async fn openai_responses_buffered_and_completed_sse_are_supported() {
         "content-type".to_string(),
         "text/event-stream; charset=utf-8".to_string(),
     )]);
-    let event = format!("data: {}\n\ndata: [DONE]\n\n", json!({
-        "type": "response.completed",
-        "response": buffered
-    }));
+    let event = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "type": "response.completed",
+            "response": buffered
+        })
+    );
     plugin
         .on_response_body(&mut ctx, 200, &headers, event.as_bytes())
         .await;
-    assert_eq!(ctx.metadata.get("ai_total_tokens").map(String::as_str), Some("123"));
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("123")
+    );
 }
 
 #[tokio::test]
@@ -995,10 +1025,7 @@ async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
         "cost_per_prompt_token": 1.0
     }))
     .unwrap();
-    let headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     for event_type in ["response.incomplete", "response.failed"] {
         let mut ctx = create_test_context();
         let event = format!(
@@ -1026,10 +1053,7 @@ async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
 
 #[tokio::test]
 async fn google_sse_merges_repeated_partial_usage_for_auto_and_fixed_provider() {
-    let headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = concat!(
         "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}],\"modelVersion\":\"gemini-test\"}\n\n",
         "data: {\"usageMetadata\":{\"promptTokenCount\":11}}\n\n",
@@ -1045,11 +1069,26 @@ async fn google_sse_merges_repeated_partial_usage_for_auto_and_fixed_provider() 
         plugin
             .on_response_body(&mut ctx, 200, &headers, body.as_bytes())
             .await;
-        assert_eq!(ctx.metadata.get("ai_provider").map(String::as_str), Some("google"));
-        assert_eq!(ctx.metadata.get("ai_prompt_tokens").map(String::as_str), Some("11"));
-        assert_eq!(ctx.metadata.get("ai_completion_tokens").map(String::as_str), Some("7"));
-        assert_eq!(ctx.metadata.get("ai_total_tokens").map(String::as_str), Some("18"));
-        assert_eq!(ctx.metadata.get("ai_model").map(String::as_str), Some("gemini-test"));
+        assert_eq!(
+            ctx.metadata.get("ai_provider").map(String::as_str),
+            Some("google")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+            Some("11")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_total_tokens").map(String::as_str),
+            Some("18")
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_model").map(String::as_str),
+            Some("gemini-test")
+        );
     }
 }
 
@@ -1069,11 +1108,26 @@ async fn bedrock_titan_invoke_model_is_supported_without_ambiguous_result_summin
     plugin
         .on_response_body(&mut ctx, 200, &json_headers(), &body)
         .await;
-    assert_eq!(ctx.metadata.get("ai_provider").map(String::as_str), Some("bedrock"));
-    assert_eq!(ctx.metadata.get("ai_prompt_tokens").map(String::as_str), Some("21"));
-    assert_eq!(ctx.metadata.get("ai_completion_tokens").map(String::as_str), Some("8"));
-    assert_eq!(ctx.metadata.get("ai_total_tokens").map(String::as_str), Some("29"));
-    assert_eq!(ctx.metadata.get("ai_estimated_cost").map(String::as_str), Some("0.370000"));
+    assert_eq!(
+        ctx.metadata.get("ai_provider").map(String::as_str),
+        Some("bedrock")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("21")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("8")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("29")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_estimated_cost").map(String::as_str),
+        Some("0.370000")
+    );
 
     for results in [json!([]), json!([{"tokenCount": 2}, {"tokenCount": 3}])] {
         let mut ctx = create_test_context();
@@ -1085,7 +1139,10 @@ async fn bedrock_titan_invoke_model_is_supported_without_ambiguous_result_summin
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await;
-        assert_eq!(ctx.metadata.get("ai_prompt_tokens").map(String::as_str), Some("5"));
+        assert_eq!(
+            ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+            Some("5")
+        );
         assert!(!ctx.metadata.contains_key("ai_completion_tokens"));
         assert!(!ctx.metadata.contains_key("ai_total_tokens"));
     }
@@ -1108,7 +1165,10 @@ async fn encoded_json_supports_gzip_brotli_and_coding_chains_without_mutation() 
     for (encoding, encoded) in cases {
         let original = encoded.clone();
         let headers = HashMap::from([
-            ("Content-Type".to_string(), "application/json; charset=utf-8".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            ),
             ("Content-Encoding".to_string(), encoding.to_string()),
             ("Content-Length".to_string(), encoded.len().to_string()),
             ("ETag".to_string(), "encoded-validator".to_string()),
@@ -1117,16 +1177,25 @@ async fn encoded_json_supports_gzip_brotli_and_coding_chains_without_mutation() 
         plugin
             .on_response_body(&mut ctx, 200, &headers, &encoded)
             .await;
-        assert_eq!(ctx.metadata.get("ai_total_tokens").map(String::as_str), Some("15"));
+        assert_eq!(
+            ctx.metadata.get("ai_total_tokens").map(String::as_str),
+            Some("15")
+        );
         assert_eq!(encoded, original);
-        assert_eq!(headers.get("Content-Encoding").map(String::as_str), Some(encoding));
+        assert_eq!(
+            headers.get("Content-Encoding").map(String::as_str),
+            Some(encoding)
+        );
         assert_eq!(
             headers
                 .get("Content-Length")
                 .and_then(|value| value.parse::<usize>().ok()),
             Some(encoded.len())
         );
-        assert_eq!(headers.get("ETag").map(String::as_str), Some("encoded-validator"));
+        assert_eq!(
+            headers.get("ETag").map(String::as_str),
+            Some("encoded-validator")
+        );
     }
 }
 
@@ -1140,8 +1209,7 @@ async fn encoded_sse_is_inspected_only_when_stream_buffering_is_enabled() {
     ]);
 
     for (enabled, expected) in [(false, None), (true, Some("10"))] {
-        let plugin =
-            AiTokenMetrics::new(&json!({"buffer_streaming_responses": enabled})).unwrap();
+        let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": enabled})).unwrap();
         let mut ctx = create_test_context();
         plugin
             .on_response_body(&mut ctx, 200, &headers, &encoded)
@@ -1173,8 +1241,13 @@ async fn encoded_json_rejects_malformed_unsupported_concatenated_and_oversized_c
             ("content-encoding".to_string(), encoding.to_string()),
         ]);
         let mut ctx = create_test_context();
-        plugin.on_response_body(&mut ctx, 200, &headers, &body).await;
-        assert!(!ctx.metadata.contains_key("ai_total_tokens"), "encoding={encoding}");
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, &body)
+            .await;
+        assert!(
+            !ctx.metadata.contains_key("ai_total_tokens"),
+            "encoding={encoding}"
+        );
     }
 }
 
@@ -1189,8 +1262,14 @@ async fn checked_usage_arithmetic_never_saturates_into_invented_totals() {
     plugin
         .on_response_body(&mut ctx, 200, &json_headers(), &body)
         .await;
-    assert_eq!(ctx.metadata.get("ai_prompt_tokens").map(String::as_str), Some("18446744073709551615"));
-    assert_eq!(ctx.metadata.get("ai_completion_tokens").map(String::as_str), Some("1"));
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("18446744073709551615")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("1")
+    );
     assert!(!ctx.metadata.contains_key("ai_total_tokens"));
 }
 

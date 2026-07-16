@@ -121,7 +121,8 @@ fn ai_metadata_usage(
         if marker_value != "v1" {
             continue;
         }
-        let Some(prefix) = marker_key.strip_suffix(super::ai_token_metrics::PROMETHEUS_EXPORT_SUFFIX)
+        let Some(prefix) =
+            marker_key.strip_suffix(super::ai_token_metrics::PROMETHEUS_EXPORT_SUFFIX)
         else {
             continue;
         };

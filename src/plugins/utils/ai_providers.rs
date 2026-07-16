@@ -42,15 +42,11 @@ impl AiTokenUsage {
     /// because supported streaming providers report cumulative counts. A total
     /// is recomputed only with checked arithmetic when both components exist.
     pub fn merge_cumulative(&mut self, newer: Self) {
-        if self.provider.is_some()
-            && newer.provider.is_some()
-            && self.provider != newer.provider
-        {
+        if self.provider.is_some() && newer.provider.is_some() && self.provider != newer.provider {
             return;
         }
 
-        let component_updated =
-            newer.prompt_tokens.is_some() || newer.completion_tokens.is_some();
+        let component_updated = newer.prompt_tokens.is_some() || newer.completion_tokens.is_some();
         if newer.prompt_tokens.is_some() {
             self.prompt_tokens = newer.prompt_tokens;
         }
@@ -112,11 +108,9 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
     // OpenAI Responses objects use the same `input_tokens` spelling as
     // Anthropic but carry an unambiguous top-level object discriminator.
     if json.get("object").and_then(Value::as_str) == Some("response")
-        && json
-            .get("usage")
-            .is_some_and(|usage| {
-                usage.get("input_tokens").is_some() || usage.get("output_tokens").is_some()
-            })
+        && json.get("usage").is_some_and(|usage| {
+            usage.get("input_tokens").is_some() || usage.get("output_tokens").is_some()
+        })
     {
         return Some(AiProvider::OpenAi);
     }

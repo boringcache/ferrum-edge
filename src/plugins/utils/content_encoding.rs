@@ -132,9 +132,7 @@ fn decode_brotli_stream(input: &[u8], max_bytes: usize) -> Result<Vec<u8>, Strin
             .checked_add(output_offset)
             .is_none_or(|size| size > max_bytes)
         {
-            return Err(format!(
-                "brotli decoded content exceeds {max_bytes} bytes"
-            ));
+            return Err(format!("brotli decoded content exceeds {max_bytes} bytes"));
         }
         decoded.extend_from_slice(&chunk[..output_offset]);
 
@@ -156,11 +154,7 @@ fn decode_brotli_stream(input: &[u8], max_bytes: usize) -> Result<Vec<u8>, Strin
     }
 }
 
-fn read_bounded(
-    reader: &mut dyn Read,
-    max_bytes: usize,
-    coding: &str,
-) -> Result<Vec<u8>, String> {
+fn read_bounded(reader: &mut dyn Read, max_bytes: usize, coding: &str) -> Result<Vec<u8>, String> {
     let mut decoded = Vec::with_capacity(8192.min(max_bytes));
     let mut chunk = [0u8; 8192];
     loop {
@@ -175,7 +169,9 @@ fn read_bounded(
             .checked_add(read)
             .is_none_or(|size| size > max_bytes)
         {
-            return Err(format!("{coding} decoded content exceeds {max_bytes} bytes"));
+            return Err(format!(
+                "{coding} decoded content exceeds {max_bytes} bytes"
+            ));
         }
         decoded.extend_from_slice(&chunk[..read]);
     }
