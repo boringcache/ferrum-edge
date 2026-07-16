@@ -1,7 +1,7 @@
 //! Tests for the CORS plugin
 
 use ferrum_edge::plugins::cors::CorsPlugin;
-use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
+use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -45,7 +45,7 @@ async fn test_cors_plugin_creation_defaults() {
     assert_eq!(plugin.name(), "cors");
     assert_eq!(plugin.priority(), priority::CORS);
     assert_eq!(plugin.priority(), 100);
-    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
     assert!(!plugin.modifies_request_headers());
     assert!(plugin.applies_after_proxy_on_reject());
     assert!(!plugin.is_auth_plugin());
