@@ -7,8 +7,10 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, priority, validate_plugin_config,
+    ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
+    validate_plugin_config,
 };
+use ferrum_edge::PluginCache;
 use http::{HeaderMap, HeaderValue};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -685,9 +687,8 @@ fn plugin_shape_validation_does_not_scan_node_local_mmdb() {
     );
 }
 
-#[cfg(windows)]
 #[test]
-fn windows_rereads_same_length_timestamp_preserving_replacement() {
+fn reload_rereads_same_length_timestamp_preserving_replacement() {
     let directory = TempDir::new().unwrap();
     let valid = country_mmdb_bytes();
     let replacement = replace_direct_country_with_unsupported_code(valid.clone());
@@ -706,7 +707,7 @@ fn windows_rereads_same_length_timestamp_preserving_replacement() {
 
     assert!(
         load_validated_country_mmdb(path_text(&path)).is_err(),
-        "metadata-equivalent replacement must be re-digested on Windows"
+        "metadata-equivalent replacement must always be re-digested"
     );
     assert_eq!(old_snapshot.metadata.database_type, "GeoIP2-Country");
 }
@@ -756,6 +757,79 @@ fn rejected_config_generation_releases_mmdb_handoff() {
         1,
         "rejected generation must release its validation handoff"
     );
+}
+
+#[tokio::test]
+async fn accepted_generation_hands_every_distinct_mmdb_path_to_cache_build() {
+    let directory = TempDir::new().unwrap();
+    let first_path = write_fixture(&directory, "country-one.mmdb", &country_mmdb_bytes());
+    let second_path = write_fixture(&directory, "country-two.mmdb", &country_mmdb_bytes());
+    let config_path = directory.path().join("accepted.json");
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "http",
+            "listen_path": "/",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9000
+        }],
+        "consumers": [],
+        "plugin_configs": [
+            {
+                "id": "geo-one",
+                "plugin_name": "geo_restriction",
+                "config": {
+                    "db_path": path_text(&first_path),
+                    "deny_countries": ["SE"],
+                    "on_lookup_failure": "allow"
+                },
+                "scope": "global",
+                "enabled": true
+            },
+            {
+                "id": "geo-two",
+                "plugin_name": "geo_restriction",
+                "config": {
+                    "db_path": path_text(&second_path),
+                    "deny_countries": ["SE"],
+                    "on_lookup_failure": "allow"
+                },
+                "scope": "global",
+                "enabled": true
+            }
+        ]
+    });
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let loaded = load_config_from_file(
+        path_text(&config_path),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("both MMDB paths pass one accepted validation generation");
+    std::fs::remove_file(&first_path).unwrap();
+    std::fs::remove_file(&second_path).unwrap();
+
+    PluginCache::new(&GatewayConfig::default())
+        .expect("an unrelated cache build must not consume the accepted handoff");
+    let cache = PluginCache::new(&loaded).expect("cache build claims both validated snapshots");
+    let plugins = cache.request_view("http", ProxyProtocol::Http).plugins();
+    let geo_plugins = plugins
+        .iter()
+        .filter(|plugin| plugin.name() == "geo_restriction")
+        .collect::<Vec<_>>();
+    assert_eq!(geo_plugins.len(), 2);
+    for plugin in geo_plugins {
+        let mut ctx = request_context("89.160.20.112");
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ));
+    }
 }
 
 #[test]
@@ -854,10 +928,13 @@ fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
     assert!(!lookup_source.contains("is_supported"));
     assert!(config_source.contains("try_reserve_exact(initial_capacity)"));
     assert!(config_source.contains("validation_handoffs"));
-    assert!(config_source.contains("validation_handoff_bytes"));
     assert!(config_source.contains("CountryMmdbValidationGeneration"));
     assert!(config_source.contains("abort_validation_generation"));
-    assert!(config_source.contains("COUNTRY_MMDB_FILE_VERSION_IS_CONTENT_SAFE"));
+    assert!(config_source.contains("accepted_validation_generation"));
+    assert!(config_source.contains("active_validation_generations"));
+    assert!(config_source.contains("expected_paths"));
+    assert!(!config_source.contains("get_by_file_version"));
+    assert!(!config_source.contains("validation_handoff_bytes"));
     assert!(config_source.contains("MAX_COUNTRY_MMDB_SIZE_BYTES"));
     assert!(plugin_cache_source.contains("CountryMmdbLoadSession::claim"));
     assert!(validation_source.contains("generation.commit()"));

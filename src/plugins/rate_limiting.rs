@@ -628,8 +628,7 @@ fn prefixed_key(prefix: &str, value: &str) -> String {
 }
 
 fn ip_key(client_ip: &str) -> String {
-    let client_ip = super::utils::canonical_ip_text(client_ip);
-    prefixed_key("ip:", client_ip.as_ref())
+    prefixed_key("ip:", client_ip)
 }
 
 fn inject_rate_limit_headers_from_metadata(

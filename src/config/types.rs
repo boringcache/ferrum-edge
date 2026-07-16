@@ -4871,12 +4871,7 @@ pub enum CountryMmdbLoadError {
 type CountryMmdbReader = maxminddb::Reader<Vec<u8>>;
 type CountryMmdbDigest = [u8; 32];
 
-// Unix supplies device, inode, and ctime in addition to path/length/mtime.
-// Windows does not expose an equivalent content-change signal through the
-// metadata used here, so it must digest the file before cache reuse.
-const COUNTRY_MMDB_FILE_VERSION_IS_CONTENT_SAFE: bool = cfg!(unix);
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct CountryMmdbFileVersion {
     path: PathBuf,
     len: u64,
@@ -4910,36 +4905,32 @@ impl CountryMmdbFileVersion {
 }
 
 /// Immutable, fully validated country MMDB snapshot shared by live plugins.
-pub struct CountryMmdbSnapshot {
-    reader: CountryMmdbReader,
-    content_len: u64,
-}
+pub struct CountryMmdbSnapshot(CountryMmdbReader);
 
 impl std::ops::Deref for CountryMmdbSnapshot {
     type Target = maxminddb::Reader<Vec<u8>>;
 
     fn deref(&self) -> &Self::Target {
-        &self.reader
+        &self.0
     }
 }
 
-struct CountryMmdbValidationHandoff {
-    generation: u64,
-    snapshot: Arc<CountryMmdbSnapshot>,
+struct CountryMmdbGenerationHandoff {
+    expected_paths: HashSet<PathBuf>,
+    snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
 }
 
 #[derive(Default)]
 struct CountryMmdbCache {
     by_digest: HashMap<CountryMmdbDigest, Weak<CountryMmdbSnapshot>>,
-    by_file_version: HashMap<CountryMmdbFileVersion, CountryMmdbDigest>,
     /// Generation-owned strong references bridge dependency validation to the
     /// immediately following plugin-cache build. A failed validation pipeline
-    /// aborts its generation; construction claims the remaining references
-    /// into a build-scoped session. The aggregate byte cap prevents abandoned
-    /// successful loads outside the normal build path from growing without
-    /// bound.
-    validation_handoffs: HashMap<CountryMmdbFileVersion, CountryMmdbValidationHandoff>,
-    validation_handoff_bytes: u64,
+    /// aborts its generation; an accepted generation supersedes the previous
+    /// unclaimed generation atomically, and construction claims every snapshot
+    /// into a build-scoped session.
+    validation_handoffs: HashMap<u64, CountryMmdbGenerationHandoff>,
+    active_validation_generations: HashSet<u64>,
+    accepted_validation_generation: Option<u64>,
     next_validation_generation: u64,
 }
 
@@ -4947,118 +4938,69 @@ impl CountryMmdbCache {
     fn retain_live(&mut self) {
         self.by_digest
             .retain(|_, reader| reader.strong_count() > 0);
-        let by_digest = &self.by_digest;
-        self.by_file_version
-            .retain(|_, digest| by_digest.contains_key(digest));
     }
 
     fn get_by_digest(&self, digest: &CountryMmdbDigest) -> Option<Arc<CountryMmdbSnapshot>> {
         self.by_digest.get(digest).and_then(Weak::upgrade)
     }
 
-    fn get_by_file_version(
-        &self,
-        version: &CountryMmdbFileVersion,
-    ) -> Option<Arc<CountryMmdbSnapshot>> {
-        self.by_file_version
-            .get(version)
-            .and_then(|digest| self.get_by_digest(digest))
-    }
-
     fn prepare_snapshot_return(
         &mut self,
-        version: Option<&CountryMmdbFileVersion>,
+        path: &str,
         snapshot: Arc<CountryMmdbSnapshot>,
         validation_generation: Option<u64>,
     ) -> Arc<CountryMmdbSnapshot> {
-        let Some(version) = version else {
-            return snapshot;
-        };
-
         if let Some(generation) = validation_generation {
-            // A replaced file version must never keep the previous snapshot
-            // pinned. At most one validation handoff exists for each path, and
-            // total pending bytes never exceed one maximum-size MMDB.
-            let replaced = self
-                .validation_handoffs
-                .keys()
-                .filter(|candidate| candidate.path == version.path)
-                .cloned()
-                .collect::<Vec<_>>();
-            for candidate in replaced {
-                self.remove_validation_handoff(&candidate);
+            if let Some(handoff) = self.validation_handoffs.get_mut(&generation) {
+                handoff
+                    .snapshots
+                    .insert(PathBuf::from(path), Arc::clone(&snapshot));
             }
-            while self
-                .validation_handoff_bytes
-                .saturating_add(snapshot.content_len)
-                > MAX_COUNTRY_MMDB_SIZE_BYTES
-            {
-                let candidate = self
-                    .validation_handoffs
-                    .iter()
-                    .find(|(_, handoff)| handoff.generation != generation)
-                    .or_else(|| self.validation_handoffs.iter().next())
-                    .map(|(version, _)| version.clone());
-                let Some(candidate) = candidate else {
-                    break;
-                };
-                self.remove_validation_handoff(&candidate);
-            }
-            self.validation_handoff_bytes = self
-                .validation_handoff_bytes
-                .saturating_add(snapshot.content_len);
-            self.validation_handoffs.insert(
-                version.clone(),
-                CountryMmdbValidationHandoff {
-                    generation,
-                    snapshot: Arc::clone(&snapshot),
-                },
-            );
-        } else {
-            // Plugin construction has acquired its own strong reference.
-            self.remove_validation_handoff(version);
         }
 
         snapshot
     }
 
-    fn remove_validation_handoff(
-        &mut self,
-        version: &CountryMmdbFileVersion,
-    ) -> Option<Arc<CountryMmdbSnapshot>> {
-        let handoff = self.validation_handoffs.remove(version)?;
-        self.validation_handoff_bytes = self
-            .validation_handoff_bytes
-            .saturating_sub(handoff.snapshot.content_len);
-        Some(handoff.snapshot)
+    fn abort_validation_generation(&mut self, generation: u64) {
+        self.active_validation_generations.remove(&generation);
+        self.validation_handoffs.remove(&generation);
+        if self.accepted_validation_generation == Some(generation) {
+            self.accepted_validation_generation = None;
+        }
     }
 
-    fn abort_validation_generation(&mut self, generation: u64) {
-        let rejected = self
-            .validation_handoffs
-            .iter()
-            .filter(|(_, handoff)| handoff.generation == generation)
-            .map(|(version, _)| version.clone())
-            .collect::<Vec<_>>();
-        for version in rejected {
-            self.remove_validation_handoff(&version);
+    fn commit_validation_generation(&mut self, generation: u64) {
+        self.active_validation_generations.remove(&generation);
+        if let Some(previous) = self.accepted_validation_generation.replace(generation)
+            && previous != generation
+        {
+            self.validation_handoffs.remove(&previous);
         }
+        let active_generations = &self.active_validation_generations;
+        self.validation_handoffs.retain(|candidate, _| {
+            *candidate == generation || active_generations.contains(candidate)
+        });
     }
 
     fn claim_validation_handoffs(
         &mut self,
         paths: &HashSet<PathBuf>,
-    ) -> Vec<Arc<CountryMmdbSnapshot>> {
-        let claimed = self
+    ) -> HashMap<PathBuf, Arc<CountryMmdbSnapshot>> {
+        let Some(generation) = self.accepted_validation_generation.take() else {
+            return HashMap::new();
+        };
+        let matching_generation = self
             .validation_handoffs
-            .keys()
-            .filter(|version| paths.contains(&version.path))
-            .cloned()
-            .collect::<Vec<_>>();
-        claimed
-            .iter()
-            .filter_map(|version| self.remove_validation_handoff(version))
-            .collect()
+            .get(&generation)
+            .is_some_and(|handoff| &handoff.expected_paths == paths);
+        if !matching_generation {
+            self.accepted_validation_generation = Some(generation);
+            return HashMap::new();
+        }
+        self.validation_handoffs
+            .remove(&generation)
+            .map(|handoff| handoff.snapshots)
+            .unwrap_or_default()
     }
 }
 
@@ -5076,7 +5018,7 @@ pub(crate) struct CountryMmdbValidationGeneration {
 }
 
 impl CountryMmdbValidationGeneration {
-    pub(crate) fn begin() -> Result<Self, String> {
+    pub(crate) fn begin(expected_paths: HashSet<PathBuf>) -> Result<Self, String> {
         let mut cache = country_mmdb_snapshot_cache()
             .lock()
             .map_err(|_| "MaxMind database snapshot cache is unavailable".to_string())?;
@@ -5084,8 +5026,17 @@ impl CountryMmdbValidationGeneration {
         if cache.next_validation_generation == 0 {
             cache.next_validation_generation = 1;
         }
+        let id = cache.next_validation_generation;
+        cache.active_validation_generations.insert(id);
+        cache.validation_handoffs.insert(
+            id,
+            CountryMmdbGenerationHandoff {
+                expected_paths,
+                snapshots: HashMap::new(),
+            },
+        );
         Ok(Self {
-            id: cache.next_validation_generation,
+            id,
             committed: false,
         })
     }
@@ -5094,8 +5045,13 @@ impl CountryMmdbValidationGeneration {
         self.id
     }
 
-    pub(crate) fn commit(mut self) {
+    pub(crate) fn commit(mut self) -> Result<(), String> {
+        let mut cache = country_mmdb_snapshot_cache()
+            .lock()
+            .map_err(|_| "MaxMind database snapshot cache is unavailable".to_string())?;
+        cache.commit_validation_generation(self.id);
         self.committed = true;
+        Ok(())
     }
 }
 
@@ -5110,19 +5066,17 @@ impl Drop for CountryMmdbValidationGeneration {
     }
 }
 
-/// One plugin-cache build's MMDB ownership. Claimed validation handoffs keep
-/// their weak digest entries live until the first construction-time load; the
-/// per-path map then shares that verified snapshot across every geo instance
-/// in the build, including on platforms that must re-digest the file.
+/// One plugin-cache build's MMDB ownership. The accepted validation generation
+/// seeds this per-path map, so every geo instance consumes the exact snapshot
+/// that passed dependency validation without another read or record scan.
 #[derive(Default)]
 pub(crate) struct CountryMmdbLoadSession {
     snapshots: Mutex<HashMap<PathBuf, Arc<CountryMmdbSnapshot>>>,
-    _claimed_handoffs: Vec<Arc<CountryMmdbSnapshot>>,
 }
 
 impl CountryMmdbLoadSession {
     pub(crate) fn claim(paths: &HashSet<PathBuf>) -> Result<Self, String> {
-        let claimed_handoffs = {
+        let snapshots = {
             let mut cache = country_mmdb_snapshot_cache()
                 .lock()
                 .map_err(|_| "MaxMind database snapshot cache is unavailable".to_string())?;
@@ -5130,8 +5084,7 @@ impl CountryMmdbLoadSession {
             cache.claim_validation_handoffs(paths)
         };
         Ok(Self {
-            snapshots: Mutex::new(HashMap::new()),
-            _claimed_handoffs: claimed_handoffs,
+            snapshots: Mutex::new(snapshots),
         })
     }
 
@@ -5206,10 +5159,10 @@ fn is_supported_mmdb_country_code(code: &str) -> bool {
 /// Owning the bytes keeps live readers independent from external in-place file
 /// rewrites and truncation. Verification traverses the complete search tree and
 /// data section, while the record scan proves that the advertised product is
-/// structurally compatible with the fields used by `geo_restriction`. A weak,
-/// versioned, content-addressed cache shares an identical validated snapshot
-/// across live plugin instances without repeating reads or verification for an
-/// unchanged file and without keeping retired generations alive.
+/// structurally compatible with the fields used by `geo_restriction`. Every
+/// load digests the bounded contents because portable filesystem metadata does
+/// not prove content identity. A weak content-addressed cache then skips repeat
+/// verification and record enumeration for identical bytes.
 pub fn load_validated_country_mmdb(
     path: &str,
 ) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
@@ -5239,24 +5192,6 @@ fn load_validated_country_mmdb_inner(
         )));
     }
     let file_version = CountryMmdbFileVersion::from_metadata(path, &metadata);
-    {
-        let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
-            CountryMmdbLoadError::Invalid(
-                "MaxMind database snapshot cache is unavailable".to_string(),
-            )
-        })?;
-        cache.retain_live();
-        if COUNTRY_MMDB_FILE_VERSION_IS_CONTENT_SAFE
-            && let Some(file_version) = file_version.as_ref()
-            && let Some(reader) = cache.get_by_file_version(file_version)
-        {
-            return Ok(cache.prepare_snapshot_return(
-                Some(file_version),
-                reader,
-                validation_generation,
-            ));
-        }
-    }
 
     if metadata.len() > MAX_COUNTRY_MMDB_SIZE_BYTES {
         return Err(CountryMmdbLoadError::Invalid(format!(
@@ -5309,18 +5244,10 @@ fn load_validated_country_mmdb_inner(
         })?;
         cache.retain_live();
         if let Some(reader) = cache.get_by_digest(&digest) {
-            if let Some(file_version) = file_version.as_ref() {
-                cache.by_file_version.insert(file_version.clone(), digest);
-            }
-            return Ok(cache.prepare_snapshot_return(
-                file_version.as_ref(),
-                reader,
-                validation_generation,
-            ));
+            return Ok(cache.prepare_snapshot_return(path, reader, validation_generation));
         }
     }
 
-    let content_len = bytes.len() as u64;
     let reader = maxminddb::Reader::from_source(bytes).map_err(|e| {
         CountryMmdbLoadError::Invalid(format!(
             "MaxMind database file '{path}' is not a valid readable .mmdb: {e}"
@@ -5388,10 +5315,7 @@ fn load_validated_country_mmdb_inner(
         )));
     }
 
-    let reader = Arc::new(CountryMmdbSnapshot {
-        reader,
-        content_len,
-    });
+    let reader = Arc::new(CountryMmdbSnapshot(reader));
     let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
         CountryMmdbLoadError::Invalid(
             "MaxMind database snapshot cache is unavailable".to_string(),
@@ -5399,24 +5323,10 @@ fn load_validated_country_mmdb_inner(
     })?;
     cache.retain_live();
     if let Some(cached) = cache.get_by_digest(&digest) {
-        if let Some(file_version) = file_version.as_ref() {
-            cache.by_file_version.insert(file_version.clone(), digest);
-        }
-        return Ok(cache.prepare_snapshot_return(
-            file_version.as_ref(),
-            cached,
-            validation_generation,
-        ));
-    }
-    if let Some(file_version) = file_version.as_ref() {
-        cache.by_file_version.insert(file_version.clone(), digest);
+        return Ok(cache.prepare_snapshot_return(path, cached, validation_generation));
     }
     cache.by_digest.insert(digest, Arc::downgrade(&reader));
-    Ok(cache.prepare_snapshot_return(
-        file_version.as_ref(),
-        reader,
-        validation_generation,
-    ))
+    Ok(cache.prepare_snapshot_return(path, reader, validation_generation))
 }
 
 /// Validate that a MaxMind `.mmdb` database file exists, is fully intact, and
@@ -8025,6 +7935,21 @@ impl GatewayConfig {
     /// Deduplicates paths so each file is checked at most once.
     pub fn validate_plugin_file_dependencies(&self) -> Vec<String> {
         self.validate_plugin_file_dependencies_inner(None)
+    }
+
+    pub(crate) fn country_mmdb_file_dependency_paths(&self) -> HashSet<PathBuf> {
+        self.plugin_configs
+            .iter()
+            .filter(|plugin| plugin.enabled && plugin.plugin_name == "geo_restriction")
+            .filter_map(|plugin| {
+                plugin
+                    .config
+                    .get("db_path")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect()
     }
 
     pub(crate) fn validate_plugin_file_dependencies_for_generation(

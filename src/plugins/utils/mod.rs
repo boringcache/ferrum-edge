@@ -3,8 +3,6 @@
 //! This module contains infrastructure that plugins share, keeping plugin
 //! implementation files focused on their core logic.
 
-use std::borrow::Cow;
-
 pub mod ai_pii;
 pub mod ai_providers;
 pub mod auth_attempt;
@@ -55,16 +53,3 @@ pub use log_helpers::{
 pub use socket_host::{parse_socket_host, socket_addr_lookup_input};
 pub use tcp_endpoint::resolve_tcp_endpoint;
 pub use udp_endpoint::{UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, resolve_udp_endpoint};
-
-/// Return a stable textual identity for an IP address without allocating on
-/// the normal path. IPv4-mapped IPv6 is the sole representation rewritten, so
-/// native IPv4 and its mapped form cannot receive distinct policy budgets.
-pub(crate) fn canonical_ip_text(value: &str) -> Cow<'_, str> {
-    match value.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V6(ipv6)) => match ipv6.to_ipv4_mapped() {
-            Some(ipv4) => Cow::Owned(ipv4.to_string()),
-            None => Cow::Borrowed(value),
-        },
-        Ok(std::net::IpAddr::V4(_)) | Err(_) => Cow::Borrowed(value),
-    }
-}

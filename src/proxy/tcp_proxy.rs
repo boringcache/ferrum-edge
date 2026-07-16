@@ -1296,7 +1296,7 @@ async fn run_tcp_accept_loop(
 
                     let connected_at = Instant::now();
                     let connected_wall_at = chrono::Utc::now();
-                    let direct_client_ip = remote_addr.ip().to_string();
+                    let direct_client_ip = remote_addr.ip().to_canonical().to_string();
 
                     // Inbound PROXY protocol (v1 text / v2 binary) — opt-in per proxy.
                     // When `stream_proxy_protocol: true` is set on the Proxy config, every

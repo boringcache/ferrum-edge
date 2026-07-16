@@ -17,7 +17,6 @@
 
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -712,16 +711,6 @@ fn try_create_plugin(
             }
         }
     }
-}
-
-fn country_mmdb_paths(config: &GatewayConfig) -> HashSet<PathBuf> {
-    config
-        .plugin_configs
-        .iter()
-        .filter(|plugin| plugin.enabled && plugin.plugin_name == "geo_restriction")
-        .filter_map(|plugin| plugin.config.get("db_path").and_then(|path| path.as_str()))
-        .map(PathBuf::from)
-        .collect()
 }
 
 /// A list of plugins shared across requests via Arc.
@@ -2699,7 +2688,7 @@ impl PluginCache {
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         let country_mmdb_load_session =
-            CountryMmdbLoadSession::claim(&country_mmdb_paths(config))?;
+            CountryMmdbLoadSession::claim(&config.country_mmdb_file_dependency_paths())?;
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
@@ -3362,7 +3351,7 @@ impl PluginCache {
         String,
     > {
         let country_mmdb_load_session =
-            CountryMmdbLoadSession::claim(&country_mmdb_paths(config))?;
+            CountryMmdbLoadSession::claim(&config.country_mmdb_file_dependency_paths())?;
         // Step 1: Create all enabled global plugins (shared across proxies)
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
         let mut adaptive_concurrency_instances =

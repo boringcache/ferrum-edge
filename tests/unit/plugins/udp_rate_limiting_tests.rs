@@ -75,15 +75,18 @@ fn tracked_keys_count_starts_at_zero() {
 }
 
 #[test]
-fn udp_session_source_canonicalizes_once_before_datagram_hooks() {
+fn udp_ingress_source_canonicalizes_before_stream_and_datagram_hooks() {
     let session_source = include_str!("../../../src/proxy/udp_proxy.rs");
     let limiter_source = include_str!("../../../src/plugins/udp_rate_limiting.rs");
 
     assert_eq!(
         session_source
-            .matches("client_addr.ip().to_canonical().to_string()")
+            .matches("let client_ip = client_addr.ip().to_canonical().to_string();")
             .count(),
-        3
+        2
+    );
+    assert!(
+        session_source.contains("let datagram_client_ip: Arc<str> = Arc::from(client_ip);")
     );
     assert!(!limiter_source.contains("canonical_ip_text"));
     assert!(limiter_source.contains("Arc::clone(&ctx.client_ip)"));

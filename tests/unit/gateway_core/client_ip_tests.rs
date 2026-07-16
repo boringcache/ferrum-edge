@@ -429,6 +429,47 @@ fn absent_real_ip_header_falls_back_to_xff_resolution() {
 }
 
 #[test]
+fn forwarded_ipv4_mapped_address_is_canonicalized_before_plugins() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_forwarded_client_ip(
+            "10.0.0.1",
+            &socket_addr,
+            None,
+            Some("::ffff:192.0.2.10"),
+            &tp,
+        )
+        .as_deref(),
+        Some("192.0.2.10")
+    );
+    assert_eq!(
+        resolve_forwarded_client_ip(
+            "10.0.0.1",
+            &socket_addr,
+            Some("::ffff:192.0.2.10"),
+            None,
+            &tp,
+        )
+        .as_deref(),
+        Some("192.0.2.10")
+    );
+}
+
+#[test]
+fn ip_limiter_sources_consume_the_resolved_identity_without_reparsing() {
+    let sources = [
+        include_str!("../../../src/plugins/ai_rate_limiter.rs"),
+        include_str!("../../../src/plugins/rate_limiting.rs"),
+        include_str!("../../../src/plugins/tcp_connection_throttle.rs"),
+    ];
+    for source in sources {
+        assert!(!source.contains("canonical_ip_text"));
+    }
+}
+
+#[test]
 fn present_empty_real_ip_header_keeps_socket_ip_instead_of_xff() {
     let tp = TrustedProxies::parse("10.0.0.0/8");
     let socket_addr = "10.0.0.1".parse().unwrap();

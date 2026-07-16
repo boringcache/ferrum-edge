@@ -603,7 +603,7 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
         proxy_name: context.proxy_name.map(|name| name.to_string()),
-        client_ip: context.client_addr.ip().to_string(),
+        client_ip: context.client_addr.ip().to_canonical().to_string(),
         consumer_username: context.session.consumer_username.clone(),
         auth_method: context.session.auth_method,
         backend_target: context.session.backend_target.clone(),
@@ -669,7 +669,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
         proxy_name: context.proxy_name.map(|name| name.to_string()),
-        client_ip: context.client_addr.ip().to_string(),
+        client_ip: context.client_addr.ip().to_canonical().to_string(),
         consumer_username: context.consumer_username,
         auth_method: context.auth_method,
         backend_target: context.backend_target.to_string(),
@@ -2310,13 +2310,14 @@ async fn start_dtls_frontend_listener(
                 let proxy_name = proxy.name.clone();
                 let proxy_namespace = proxy.namespace.clone();
                 let backend_scheme = proxy.effective_scheme();
+                let client_ip = client_addr.ip().to_canonical().to_string();
 
                 // Run on_stream_connect plugins (with DTLS client cert if available)
                 let mut stream_ctx = StreamConnectionContext {
-                    client_ip: client_addr.ip().to_string(),
+                    client_ip: client_ip.clone(),
                     // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
                     // direct_client_ip always equals client_ip for UDP sessions.
-                    direct_client_ip: client_addr.ip().to_string(),
+                    direct_client_ip: client_ip,
                     proxy_id: proxy.id.clone(),
                     proxy_name: proxy_name.clone(),
                     listen_port: port,
@@ -3220,13 +3221,14 @@ async fn create_session(
     let proxy_namespace = proxy.namespace.clone();
     let backend_scheme = proxy.effective_scheme();
     let is_passthrough = proxy.passthrough;
+    let client_ip = client_addr.ip().to_canonical().to_string();
 
     // Run on_stream_connect plugins before creating backend connection
     let mut stream_ctx = StreamConnectionContext {
-        client_ip: client_addr.ip().to_string(),
+        client_ip: client_ip.clone(),
         // PROXY protocol is not supported on plain UDP (TCP-borne only);
         // direct_client_ip always equals client_ip for UDP sessions.
-        direct_client_ip: client_addr.ip().to_string(),
+        direct_client_ip: client_ip.clone(),
         proxy_id: proxy_id.to_string(),
         proxy_name: proxy_name.clone(),
         listen_port,
@@ -3466,7 +3468,7 @@ async fn create_session(
     let now = coarse_epoch_millis();
     let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
     let auth_method = stream_ctx.auth_method;
-    let datagram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_canonical().to_string());
+    let datagram_client_ip: Arc<str> = Arc::from(client_ip);
     let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let datagram_proxy_name: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
     let session = Arc::new(UdpSession {

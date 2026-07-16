@@ -775,7 +775,7 @@ async fn handle_h3_connection(
     // to avoid per-request String allocation from SocketAddr::ip().to_string().
     // Updated in-place when QUIC connection migration is detected.
     let mut cached_addr = quinn_conn.remote_address();
-    let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_string());
+    let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_canonical().to_string());
 
     loop {
         match h3_conn.accept().await {
@@ -790,7 +790,7 @@ async fn handle_h3_connection(
                         cached_addr, current_addr
                     );
                     cached_addr = current_addr;
-                    socket_ip = Arc::from(current_addr.ip().to_string());
+                    socket_ip = Arc::from(current_addr.ip().to_canonical().to_string());
                 }
 
                 let state = Arc::clone(&state);

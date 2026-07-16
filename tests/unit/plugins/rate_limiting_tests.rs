@@ -4,6 +4,7 @@ use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, priority, rate_limiting::RateLimiting,
 };
+use ferrum_edge::proxy::client_ip::{TrustedProxies, resolve_client_ip};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -137,7 +138,7 @@ async fn test_rate_limiting_plugin_ip_limiting() {
 }
 
 #[tokio::test]
-async fn test_rate_limiting_mapped_ipv4_shares_native_budget() {
+async fn test_rate_limiting_uses_canonical_ingress_identity() {
     let plugin = make_rate_limiter(json!({
         "window_seconds": 60,
         "max_requests": 1,
@@ -149,7 +150,11 @@ async fn test_rate_limiting_mapped_ipv4_shares_native_budget() {
     assert_continue(plugin.on_request_received(&mut native).await);
 
     let mut mapped = create_test_context();
-    mapped.client_ip = "::ffff:192.0.2.10".to_string();
+    mapped.client_ip = resolve_client_ip(
+        "::ffff:192.0.2.10",
+        None,
+        &TrustedProxies::parse(""),
+    );
     assert_reject(
         plugin.on_request_received(&mut mapped).await,
         Some(429),
