@@ -14315,12 +14315,12 @@ fn merge_grpc_web_expose_headers(
 
 /// Finalize the initial HEADERS for a gateway-generated gRPC-Web error.
 ///
-/// `error_response_for_content_type` temporarily keeps terminal gRPC metadata
-/// in its header map while constructing the body trailer frame. At the wire
-/// boundary those fields must remain body-only. The generated representation
-/// fields are also authoritative: neither a security policy nor headers from
-/// an already-finalized reject-hook chain may replace them or supply a stale
-/// content length.
+/// Terminal gRPC metadata remains body-only at the wire boundary. A finalized
+/// reject-hook chain may temporarily contribute terminal fields so the body
+/// trailer frame can be rebuilt, but those fields are removed from the initial
+/// headers before sending. The generated representation fields are also
+/// authoritative: neither a security policy nor reject headers may replace
+/// them or supply a stale content length.
 pub(crate) fn finalize_grpc_web_error_response_headers(
     response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],

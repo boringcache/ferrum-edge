@@ -389,17 +389,23 @@ pub fn error_response_for_content_type(
     message: &str,
 ) -> GrpcWebErrorResponse {
     let response_ct = response_content_type(response_ct);
-    let mut headers = HashMap::with_capacity(5);
+    let mut headers = HashMap::with_capacity(3);
     headers.insert("content-type".to_string(), response_ct.to_string());
     headers.insert("x-grpc-web".to_string(), "1".to_string());
     headers.insert(
         "access-control-expose-headers".to_string(),
         BASE_EXPOSE_HEADERS_VALUE.to_string(),
     );
-    headers.insert("grpc-status".to_string(), status.to_string());
-    headers.insert("grpc-message".to_string(), message.to_string());
 
-    let mut body = build_trailer_frame(&headers);
+    // gRPC-Web carries terminal metadata in its body trailer frame, never as
+    // native response headers. Keep a separate trailer map so an early gateway
+    // refusal has the same client-visible shape as a transformed backend
+    // response.
+    let trailer_headers = HashMap::from([
+        ("grpc-status".to_string(), status.to_string()),
+        ("grpc-message".to_string(), message.to_string()),
+    ]);
+    let mut body = build_trailer_frame(&trailer_headers);
     if is_grpc_web_text(response_ct) {
         body = BASE64.encode(&body).into_bytes();
     }

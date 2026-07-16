@@ -850,7 +850,7 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
+async fn grpc_deadline_preflight_precedes_method_policy_on_h1_and_h2() {
     let backend_port = 9;
 
     let mut method_policy = create_grpc_proxy(
@@ -903,15 +903,13 @@ async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
     for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
-        for (path, expected_grpc_status, case) in [
+        for (path, case) in [
             (
                 "/method-policy/pkg.Service/Denied",
-                "7",
-                "backend-effective method denial",
+                "method denial hidden by phase-zero deadline policy",
             ),
             (
                 "/deadline-only/pkg.Service/Allowed",
-                "3",
                 "deadline-only control",
             ),
         ] {
@@ -930,7 +928,7 @@ async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
                 Some("application/grpc-web+proto"),
                 "{version:?} {case} content type"
             );
-            let expected = format!("grpc-status: {expected_grpc_status}\r\n");
+            let expected = "grpc-status: 3\r\n";
             assert!(
                 body.windows(expected.len())
                     .any(|window| window == expected.as_bytes()),
@@ -939,10 +937,9 @@ async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
         }
     }
 
-    // The first request consumes the finalized method bucket before the
-    // missing-deadline rejection. The second must therefore be rejected by
-    // method policy instead of bypassing that stateful boundary again.
-    for expected_grpc_status in ["3", "8"] {
+    // Phase-zero deadline enforcement runs before stateful method policy, so
+    // missing-deadline requests neither consume nor reveal the method bucket.
+    for _ in 0..2 {
         let (status, _headers, body) = send_http_request(
             gateway_addr,
             TestHttpVersion::H2,
@@ -953,7 +950,7 @@ async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
         .await
         .expect("H2 rate/deadline ordering request");
         assert_eq!(status, 200);
-        let expected = format!("grpc-status: {expected_grpc_status}\r\n");
+        let expected = "grpc-status: 3\r\n";
         assert!(
             body.windows(expected.len())
                 .any(|window| window == expected.as_bytes()),
@@ -971,7 +968,7 @@ async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
     .await
     .expect("native H2 method/deadline ordering request");
     assert_eq!(status, 200);
-    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("3"));
     assert!(
         body.is_empty(),
         "native gRPC rejection must remain bodyless"

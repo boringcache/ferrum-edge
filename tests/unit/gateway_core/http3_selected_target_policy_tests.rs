@@ -236,8 +236,9 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         "H3 policy rejections must be emitted before dispatch"
     );
     assert!(
-        source.contains("let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);"),
-        "H3 plugin-chain selection must use the effective request flavor"
+        source.contains("let request_protocol = h3_plugin_protocol_for_request(")
+            && source.contains("grpc_web_response_content_type.is_some(),"),
+        "H3 plugin-chain selection must use the effective request policy flavor"
     );
     assert!(
         policy_block.contains("grpc_web_response_content_type.as_deref()"),
@@ -325,8 +326,8 @@ fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
         .find("if matches!(http_flavor, HttpFlavor::Grpc) && method != \"POST\"")
         .expect("H3 POST policy must use the effective flavor");
     let plugin_protocol = source
-        .find("let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);")
-        .expect("H3 plugin selection must use the effective flavor");
+        .find("let request_protocol = h3_plugin_protocol_for_request(")
+        .expect("H3 plugin selection must account for recognized gRPC-Web requests");
     let backend_flavor = source
         .find("let backend_http_flavor = if grpc_web_response_content_type.is_some()")
         .expect("H3 must derive backend transport flavor after request plugins");
@@ -516,14 +517,18 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
         "wire send helpers must not run committed hooks after rejection logging"
     );
 
-    let commit_occurrences = source
+    let unbounded_commit_occurrences = source
         .matches("run_h3_reject_response_committed_hooks(")
+        .count();
+    let deadline_bounded_commit_occurrences = source
+        .matches("run_h3_deadline_bounded_reject_committed_hooks(")
         .count();
     let send_occurrences = source
         .matches("send_h3_plugin_reject_flavor_aware(")
         .count();
     assert_eq!(
-        commit_occurrences, send_occurrences,
+        unbounded_commit_occurrences + deadline_bounded_commit_occurrences,
+        send_occurrences,
         "every plugin-aware reject send must have exactly one explicit committed-hook boundary"
     );
 
