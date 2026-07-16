@@ -1404,11 +1404,10 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     } else {
         None
     };
-    let previous_api_spec =
-        match R::late_delete_api_spec_snapshot(db, namespace, &existing).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return Ok(R::map_precheck_db_error(&error)),
-        };
+    let previous_api_spec = match R::late_delete_api_spec_snapshot(db, namespace, &existing).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Ok(R::map_precheck_db_error(&error)),
+    };
 
     let validation_ctx = ValidationCtx::from_state(state);
     if let Err(error) = R::before_delete(db, state, namespace, &existing, &validation_ctx).await {
@@ -3282,9 +3281,9 @@ impl AdminResource for Proxy {
                         && previous.upstream_id.as_deref() == Some(upstream.id.as_str())
                 })
                 .or_else(|| {
-                    affected_upstreams.iter().find(|upstream| {
-                        upstream.api_spec_id.as_deref() == Some(spec.id.as_str())
-                    })
+                    affected_upstreams
+                        .iter()
+                        .find(|upstream| upstream.api_spec_id.as_deref() == Some(spec.id.as_str()))
                 })
                 .cloned();
             for upstream in &affected_upstreams {
