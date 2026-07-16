@@ -1056,6 +1056,20 @@ impl FunctionDestination {
             return true;
         }
 
+        // URL normalization removes an explicit default port (`:443` for
+        // HTTPS and `:80` for HTTP). Inspect the supplied authority before
+        // normalization so a protected query scalar cannot be hidden there.
+        let exposes_explicit_port_scalar = explicit_uri_authority_port(reference)
+            .into_iter()
+            .chain(explicit_uri_authority_port(&decoded_reference.value))
+            .any(|port| {
+                self.sensitive_query_scalars()
+                    .any(|value| value == port)
+            });
+        if exposes_explicit_port_scalar {
+            return true;
+        }
+
         // A function can exfiltrate a DNS-compatible signed query component
         // through the authority even when the path/query/fragment are benign.
         // URL parsing lowercases ASCII domains and IDNA-normalizes Unicode, so
@@ -1128,10 +1142,11 @@ impl FunctionDestination {
             return true;
         }
 
-        // URL-bearing fields commonly embed their next destination as an
-        // encoded query value or fragment. Inspect those URI references
-        // recursively, but only when they are syntactically URI-like: treating
-        // every scalar as a relative path would remove benign values such as
+        // URL-bearing fields commonly embed their next destination in an
+        // encoded query value, path segment, or fragment. Inspect those URI
+        // references recursively, but only when they are syntactically
+        // URI-like: treating every scalar as a relative path would remove
+        // benign values such as
         // `https://example.test/next?label=signed/trigger`. When a structural
         // reference remains at the depth boundary, fail closed rather than
         // silently treating uninspected nesting as safe.
@@ -1142,10 +1157,14 @@ impl FunctionDestination {
                 return true;
             }
         }
-        if self
-            .nested_reference_exposes_destination(nested_path_uri_reference(&candidate_path), depth)
-        {
-            return true;
+        let mut nested_path_references = 0;
+        for reference in nested_path_uri_references(&candidate_path) {
+            nested_path_references += 1;
+            if nested_path_references > MAX_NESTED_PATH_URI_REFERENCES
+                || self.nested_reference_exposes_destination(Some(reference), depth)
+            {
+                return true;
+            }
         }
         if let Some(fragment) = candidate.fragment() {
             let decoded_fragment = decode_percent_layers(fragment);
@@ -1453,12 +1472,58 @@ fn is_uri_component_boundary(byte: u8) -> bool {
     !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
-fn nested_path_uri_reference(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    let without_slash = trimmed.strip_prefix('/')?;
-    (has_ascii_case_insensitive_prefix(without_slash, "http://")
-        || has_ascii_case_insensitive_prefix(without_slash, "https://"))
-    .then_some(without_slash)
+fn nested_path_uri_references(value: &str) -> impl Iterator<Item = &str> {
+    value.char_indices().filter_map(move |(index, _)| {
+        let reference = &value[index..];
+        let starts_at_boundary = index == 0
+            || value
+                .as_bytes()
+                .get(index - 1)
+                .copied()
+                .is_some_and(is_uri_component_boundary);
+        (starts_at_boundary
+            && (has_ascii_case_insensitive_prefix(reference, "http://")
+                || has_ascii_case_insensitive_prefix(reference, "https://")))
+        .then_some(reference)
+    })
+}
+
+fn explicit_uri_authority_port(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let authority_and_suffix = if let Some(authority) = value.strip_prefix("//") {
+        authority
+    } else {
+        let scheme_end = value.find(':')?;
+        let scheme = &value[..scheme_end];
+        if !is_valid_uri_scheme(scheme)
+            || !value
+                .get(scheme_end..)
+                .is_some_and(|suffix| suffix.starts_with("://"))
+        {
+            return None;
+        }
+        value.get(scheme_end + "://".len()..)?
+    };
+    let authority_end = authority_and_suffix
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_suffix.len());
+    let authority = &authority_and_suffix[..authority_end];
+    let host_and_port = authority.rsplit('@').next()?;
+    let port = if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        let closing_bracket = bracketed.find(']')? + 1;
+        host_and_port
+            .get(closing_bracket + 1..)?
+            .strip_prefix(':')?
+    } else {
+        host_and_port.rsplit_once(':')?.1
+    };
+    (!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())).then_some(port)
+}
+
+fn is_valid_uri_scheme(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
 fn has_ascii_case_insensitive_prefix(value: &str, prefix: &str) -> bool {
@@ -1472,6 +1537,7 @@ const MAX_REDIRECT_PERCENT_DECODE_LAYERS: usize = 8;
 const MAX_NESTED_DESTINATION_DEPTH: usize = 2;
 const MAX_URL_VALUED_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 const MAX_LINK_HEADER_TARGETS: usize = 32;
+const MAX_NESTED_PATH_URI_REFERENCES: usize = 32;
 
 #[derive(Clone, Copy)]
 enum UrlValuedResponseHeader {
@@ -1499,6 +1565,10 @@ impl UrlValuedResponseHeader {
             Self::Refresh => 2,
             Self::Link => 3,
         }
+    }
+
+    fn allows_combined_values(self) -> bool {
+        matches!(self, Self::Link)
     }
 }
 
@@ -1609,7 +1679,7 @@ fn sanitize_function_response_headers(
         crate::proxy::headers::parse_connection_listed_headers(headers)
             .into_iter()
             .collect();
-    let mut safe = HashMap::new();
+    let mut safe: HashMap<String, String> = HashMap::new();
     let mut destination_header_blocked = [false; 4];
     for (name, value) in headers {
         let lower = name.as_str();
@@ -1629,6 +1699,32 @@ fn sanitize_function_response_headers(
             {
                 safe.remove(lower);
                 destination_header_blocked[index] = true;
+                continue;
+            }
+            if safe.contains_key(lower) {
+                // Location, Content-Location, and Refresh are singleton
+                // fields. Folding duplicate lines can synthesize a new URI
+                // scalar that neither original line exposed, so fail closed.
+                // Link is list-valued; preserve it only after validating the
+                // exact combined field that Ferrum will return downstream.
+                let combined_is_unsafe = if kind.allows_combined_values() {
+                    match safe.get_mut(lower) {
+                        Some(existing) => {
+                            existing.push_str(", ");
+                            existing.push_str(value);
+                            function_destination.response_header_exposes_destination(
+                                kind, existing,
+                            )
+                        }
+                        None => true,
+                    }
+                } else {
+                    true
+                };
+                if combined_is_unsafe {
+                    safe.remove(lower);
+                    destination_header_blocked[index] = true;
+                }
                 continue;
             }
         }

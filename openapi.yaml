@@ -15447,13 +15447,18 @@ components:
         rejection normalization would drop the body, so terminate mode on
         gRPC requests is rejected with 500). Cloud credential fields fall
         back to well-known environment variables. Terminate mode forwards
-        applicable end-to-end response headers, preserving repeated Set-Cookie,
+        applicable end-to-end response headers, preserving repeated Set-Cookie
+        and list-valued Link while requiring Location, Content-Location, and
+        Refresh to remain singleton,
         while stripping hop-by-hop, Connection-listed, transport-managed,
         provider-control, and credential-bearing fields. URL-valued Location,
         Content-Location, Refresh (url= and bare URI forms after semicolon,
         comma, or ASCII-whitespace delay separators), and every Link target are removed
         when a relative, absolute, encoded, or nested target exposes the
-        configured signed function path/query. Complete signed paths match at
+        configured signed function path/query. Duplicate singleton URL-valued
+        fields fail closed instead of being comma-folded; repeated Link lines
+        are revalidated as the exact combined list returned downstream.
+        Complete signed paths match at
         slash-delimited segment boundaries even with added prefix or descendant
         segments, not inside arbitrary substrings. Both non-empty components
         of every configured query pair are protected credential scalars: a key
@@ -15467,9 +15472,11 @@ components:
         directly at URI-component boundaries even when they are scalar rather
         than URI-shaped. Query comparison
         percent-decodes generic URI components but preserves literal `+` characters
-        instead of applying form-data space conversion. Inspection is
-        bounded to 16 KiB per field, 32 Link targets, eight percent-decoding
-        transforms, and two nested URI-reference hops. URI userinfo, residual
+        instead of applying form-data space conversion. Inspection checks
+        explicit numeric authority ports before normalization can erase default
+        ports, and is bounded to 16 KiB per field, 32 Link targets, 32 embedded
+        path URI references, eight percent-decoding transforms, and two nested
+        URI-reference hops. URI userinfo, residual
         encoding, malformed target syntax, malformed percent triplets,
         percent-decoded non-UTF-8 bytes, budget overflow, or another structural
         URI reference at the nesting boundary fails closed even for root

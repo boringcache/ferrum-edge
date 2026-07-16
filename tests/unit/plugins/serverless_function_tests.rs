@@ -1296,6 +1296,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "nested-over-decode-budget",
         "destination-over-decode-budget",
         "nested-path-encoded",
+        "nested-path-after-base-directory",
         "copied-query-other-host",
         "renamed-query-other-host",
         "copied-query-path-other-host",
@@ -1321,6 +1322,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "authority-query-key",
         "authority-query-idna",
         "authority-query-port",
+        "authority-query-default-https-port",
+        "authority-query-default-network-port",
         "literal-plus-encoded-candidate",
         "encoded-plus-literal-candidate",
         "fragment-query-scalar",
@@ -1343,6 +1346,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-trailing-slash-scalar-without-slash",
         "benign-authority-label-lookalike",
         "benign-authority-substring",
+        "benign-nested-path-after-base-directory",
+        "benign-authority-default-port-lookalike",
         "benign-plus-space-distinct",
         "benign-fragment-lookalike",
         "benign-fragment-label",
@@ -1409,6 +1414,16 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "authority-query-port" => {
                 format!("{}/signed%2Ftrigger?code=18443", server.uri())
             }
+            "authority-query-default-https-port"
+            | "benign-authority-default-port-lookalike" => {
+                format!("{}/signed%2Ftrigger?code=443", server.uri())
+            }
+            "authority-query-default-network-port" => {
+                format!("{}/signed%2Ftrigger?code=80", server.uri())
+            }
+            "nested-path-after-base-directory" | "benign-nested-path-after-base-directory" => {
+                format!("{}/api/signed?code=secret", server.uri())
+            }
             _ => format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri()),
         };
         let location = match case {
@@ -1454,6 +1469,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
                 let encoded: String =
                     url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
                 format!("https://redirect.example/{encoded}")
+            }
+            "nested-path-after-base-directory" => {
+                url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect()
             }
             "copied-query-other-host" => {
                 "https://redirect.example/next?code=secret%2Fvalue".to_string()
@@ -1510,6 +1528,12 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "authority-query-key" => "https://signedkey.attacker.example/next".to_string(),
             "authority-query-idna" => "https://xn--bcher-kva.attacker.example/next".to_string(),
             "authority-query-port" => "https://attacker.example:18443/next".to_string(),
+            "authority-query-default-https-port" => {
+                "https://attacker.example:443/next".to_string()
+            }
+            "authority-query-default-network-port" => {
+                "//attacker.example:80/next".to_string()
+            }
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }
@@ -1559,6 +1583,13 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-authority-substring" => {
                 "https://prefixsignedtoken.attacker.example/next".to_string()
+            }
+            "benign-nested-path-after-base-directory" => {
+                let benign = "https://redirect.example/safe?other=1";
+                url::form_urlencoded::byte_serialize(benign.as_bytes()).collect()
+            }
+            "benign-authority-default-port-lookalike" => {
+                "https://attacker.example:8443/next".to_string()
             }
             "benign-plus-space-distinct" => {
                 "https://redirect.example/next?leak=token+part".to_string()
@@ -1961,6 +1992,111 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
                 }
             }
             other => panic!("expected terminal response for case {case}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_rejects_repeated_singleton_url_headers() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Each line is safe in isolation, but the old `", "` fold synthesized
+    // the protected `alpha, omega` scalar for a downstream URI parser.
+    for (header, first, second) in [
+        ("location", "alpha", "omega"),
+        ("content-location", "alpha", "omega"),
+        ("refresh", "0; alpha", "omega"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header(header, first)
+                    .append_header(header, second),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/signed/trigger?code=alpha%2C%20omega", server.uri()),
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::RejectBinary { headers, .. } => assert!(
+                !headers.contains_key(header),
+                "repeated singleton {header} survived: {headers:?}"
+            ),
+            other => panic!("expected terminal response for {header}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_revalidates_combined_link_headers() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for should_strip in [false, true] {
+        let server = MockServer::start().await;
+        let (first, second) = if should_strip {
+            (
+                (0..16)
+                    .map(|index| format!("</first/{index}>; rel=\"item\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                (0..17)
+                    .map(|index| format!("</second/{index}>; rel=\"item\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        } else {
+            (
+                "</safe/one>; rel=\"prev\"".to_string(),
+                "<https://redirect.example/safe/two>; rel=\"next\"".to_string(),
+            )
+        };
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("link", first.as_str())
+                    .append_header("link", second.as_str()),
+            )
+            .mount(&server)
+            .await;
+        let plugin = ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": format!("{}/signed/trigger?code=secret", server.uri()),
+                "mode": "terminate"
+            }),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+
+        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::RejectBinary { headers, .. } => {
+                if should_strip {
+                    assert!(
+                        !headers.contains_key("link"),
+                        "combined Link target budget was not enforced: {headers:?}"
+                    );
+                } else {
+                    let expected = format!("{first}, {second}");
+                    assert_eq!(
+                        headers.get("link").map(String::as_str),
+                        Some(expected.as_str())
+                    );
+                }
+            }
+            other => panic!("expected terminal Link response, got {other:?}"),
         }
     }
 }
