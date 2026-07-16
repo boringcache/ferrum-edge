@@ -559,7 +559,10 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
         .find(|plugin| plugin.name() == "stdout_logging")
         .cloned()
         .unwrap();
-    assert!(std::sync::Arc::ptr_eq(&unrelated_before, &unrelated_after_delta));
+    assert!(std::sync::Arc::ptr_eq(
+        &unrelated_before,
+        &unrelated_after_delta
+    ));
     let mut after = RequestContext::new(
         "89.160.20.112".to_string(),
         "GET".to_string(),
@@ -592,7 +595,10 @@ async fn dp_full_snapshots_refresh_mmdb_with_and_without_serialized_delta() {
         .iter()
         .find(|plugin| plugin.name() == "stdout_logging")
         .unwrap();
-    assert!(std::sync::Arc::ptr_eq(&unrelated_after_delta, unrelated_after_no_delta));
+    assert!(std::sync::Arc::ptr_eq(
+        &unrelated_after_delta,
+        unrelated_after_no_delta
+    ));
     let mut after_replacement = RequestContext::new(
         "89.160.20.112".to_string(),
         "GET".to_string(),
