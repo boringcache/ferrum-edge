@@ -1485,6 +1485,201 @@ async fn admin_delete(base_url: &str, path: &str, token: &str) -> (u16, Value) {
     (status, body)
 }
 
+#[tokio::test]
+async fn transaction_log_schema_admin_rejects_unknown_closed_object_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config, expected_path) in [
+        (
+            "unknown-outer",
+            json!({"schemas": {"audit": {}}, "strict": true}),
+            "config.strict",
+        ),
+        (
+            "unknown-derived",
+            json!({
+                "schemas": {"audit": {"derived_fields": [
+                    {"name": "outcome", "kind": "outcome", "from": "status"}
+                ]}}
+            }),
+            "derived_fields[0].from",
+        ),
+        (
+            "unknown-metadata",
+            json!({
+                "schemas": {"audit": {"metadata": {
+                    "mode": "flatten", "on_collison": "overwrite"
+                }}}
+            }),
+            "metadata.on_collison",
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "transaction_log_schema",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+        assert_eq!(status, 400, "unknown key was admitted: {body:?}");
+        assert!(
+            body.to_string().contains(expected_path),
+            "error did not identify {expected_path}: {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn transaction_log_schema_crud_validates_the_prospective_database_graph() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let schema = json!({
+        "id": "schema-owner",
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schemas": {"audit": {"summary_type": "both"}}}
+    });
+    let logger = json!({
+        "id": "schema-consumer",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schema_ref": "audit"}
+    });
+
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &schema).await;
+    assert_eq!(status, 201, "schema create failed: {body:?}");
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &logger).await;
+    assert_eq!(
+        status, 201,
+        "the DB schema must resolve before any live-registry reload: {body:?}"
+    );
+
+    let duplicate = json!({
+        "id": "duplicate-schema-owner",
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schemas": {"audit": {}}}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &duplicate).await;
+    assert_eq!(status, 400, "duplicate schema name was admitted: {body:?}");
+    assert!(body.to_string().contains("registered more than once"));
+
+    let mut renamed = schema.clone();
+    renamed["config"] = json!({"schemas": {"renamed": {}}});
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/schema-owner",
+        &token,
+        &renamed,
+    )
+    .await;
+    assert_eq!(status, 400, "dangling rename was admitted: {body:?}");
+    assert!(body.to_string().contains("unknown schema 'audit'"));
+
+    let (status, body) = admin_delete(
+        &base_url,
+        "/plugins/config/schema-owner",
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "dangling delete was admitted: {body:?}");
+    assert!(body.to_string().contains("unknown schema 'audit'"));
+}
+
+#[tokio::test]
+async fn transaction_log_schema_batch_and_restore_are_definition_order_independent() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let logger = json!({
+        "id": "ordered-logger",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schema_ref": "ordered"}
+    });
+    let schema = json!({
+        "id": "ordered-schema",
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schemas": {"ordered": {}}}
+    });
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({"plugin_configs": [logger, schema]}),
+    )
+    .await;
+    assert_eq!(status, 201, "definition-last batch failed: {body:?}");
+
+    let restore_logger = json!({
+        "id": "restore-logger",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schema_ref": "restored"}
+    });
+    let restore_schema = json!({
+        "id": "restore-schema",
+        "plugin_name": "transaction_log_schema",
+        "scope": "global",
+        "enabled": true,
+        "config": {"schemas": {"restored": {}}}
+    });
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &json!({"plugin_configs": [restore_logger, restore_schema]}),
+    )
+    .await;
+    assert_eq!(status, 200, "definition-last restore failed: {body:?}");
+
+    let invalid_restore = json!({
+        "plugin_configs": [{
+            "id": "dangling-restore-logger",
+            "plugin_name": "stdout_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": {"schema_ref": "missing"}
+        }]
+    });
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &invalid_restore,
+    )
+    .await;
+    assert_eq!(status, 400, "dangling restore was admitted: {body:?}");
+    assert!(body.to_string().contains("unknown schema 'missing'"));
+
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/plugins/config/restore-schema",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "invalid restore must leave the prior graph intact"
+    );
+}
+
 /// Create admin state with real SQLite DB and configurable db_available flag.
 async fn create_db_admin_state_with_availability(
     tc: &TestConfig,

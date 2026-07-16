@@ -43,6 +43,32 @@ fn test_batch_writes_run_hmac_transform_candidate_validation() {
 }
 
 #[test]
+fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
+    let crud_source = include_str!("../../../src/admin/crud.rs");
+    assert!(crud_source.contains("validate_transaction_log_schema_candidates("));
+    assert!(crud_source.contains("std::slice::from_ref(resource)"));
+    assert!(crud_source.contains("Some(&existing.id)"));
+
+    let graph_validation = crud_source
+        .rfind("validate_transaction_log_schema_candidates(")
+        .expect("delete candidate validation call must exist");
+    let persistence = crud_source
+        .rfind("resource.prepare_for_write()")
+        .expect("CRUD persistence boundary must exist");
+    assert!(
+        graph_validation < persistence,
+        "prospective graph validation must run before CRUD persistence"
+    );
+
+    let batch_source = include_str!("../../../src/admin/mod.rs");
+    assert!(batch_source.contains("crud::validate_transaction_log_schema_candidates("));
+    assert!(batch_source.contains("&batch.plugin_configs,"));
+
+    let pipeline_source = include_str!("../../../src/config/validation_pipeline.rs");
+    assert!(pipeline_source.contains("transaction_log_schema::validate_config_graph("));
+}
+
+#[test]
 fn test_batch_hmac_uniqueness_is_gated_on_submitted_hmac_consumers() {
     let source = include_str!("../../../src/admin/mod.rs");
     let gate = r#".any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())"#;
@@ -222,6 +248,61 @@ fn test_disabled_unknown_plugin_name_remains_invalid() {
     assert!(
         ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config).is_err()
     );
+}
+
+#[test]
+fn test_admin_transaction_log_schema_rejects_unknown_closed_object_keys() {
+    let now = chrono::Utc::now();
+    for (id, config, expected_path) in [
+        (
+            "outer-key",
+            json!({"schemas": {"audit": {}}, "strict": true}),
+            "config.strict",
+        ),
+        (
+            "derived-key",
+            json!({
+                "schemas": {
+                    "audit": {
+                        "derived_fields": [
+                            {"name": "outcome", "kind": "outcome", "from": "status"}
+                        ]
+                    }
+                }
+            }),
+            "derived_fields[0].from",
+        ),
+        (
+            "metadata-key",
+            json!({
+                "schemas": {
+                    "audit": {
+                        "metadata": {"mode": "flatten", "on_collison": "overwrite"}
+                    }
+                }
+            }),
+            "metadata.on_collison",
+        ),
+    ] {
+        let plugin_config = ferrum_edge::config::types::PluginConfig {
+            id: id.to_string(),
+            plugin_name: "transaction_log_schema".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            config,
+            scope: ferrum_edge::config::types::PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let error = ferrum_edge::_test_support::validate_admin_plugin_config_for_test(
+            &plugin_config,
+        )
+        .expect_err("admin constructor validation must reject unknown keys");
+        assert!(error.contains(expected_path), "unexpected error: {error}");
+    }
 }
 
 #[test]

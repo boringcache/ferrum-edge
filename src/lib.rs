@@ -312,6 +312,15 @@ pub mod _test_support {
         )
     }
 
+    pub fn validate_transaction_log_schema_graph_for_test(
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<(), Vec<String>> {
+        crate::plugins::transaction_log_schema::validate_config_graph(
+            config,
+            &crate::plugins::PluginHttpClient::default(),
+        )
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)

@@ -10017,7 +10017,9 @@ components:
         redaction always applies on every code path — sensitive
         substrings (`authorization`, `cookie`, `password`, `token`, …)
         cannot be introduced via `static_fields` or `derived_fields`
-        (rejected at construction). See docs/log_schema.md.
+        (rejected at construction). This object, each `derived_fields`
+        entry, and `metadata` are strict fixed shapes: unknown keys are
+        rejected with a nested path. See docs/log_schema.md.
       additionalProperties: false
       properties:
         summary_type:
@@ -10574,7 +10576,12 @@ components:
         scope is `global`; constructed by the loader BEFORE any plugin that
         uses `schema_ref:` so resolution always succeeds. The registry is
         atomically replaced on every config reload — renamed or removed
-        schemas do not leak. See docs/log_schema.md.
+        schemas do not leak. Config-only instances are discarded after
+        staging and never retained in runtime hook or protocol cache lists.
+        Admin create/update/delete, batch, and restore validate the complete
+        prospective namespace graph without consulting or modifying the live
+        registry. Unknown outer and nested fixed-shape keys are rejected.
+        See docs/log_schema.md.
       required: [schemas]
       additionalProperties: false
       properties:
@@ -10586,8 +10593,8 @@ components:
           description: >-
             Map of schema name → schema definition. Names are referenced
             by other plugins as `schema_ref: <name>`. Duplicate names
-            across multiple `transaction_log_schema` plugins in the same
-            config are rejected at load time.
+            across multiple enabled `transaction_log_schema` plugins in the
+            same namespace are rejected before persistence or load.
 
     TransactionDebuggerConfig:
       type: object

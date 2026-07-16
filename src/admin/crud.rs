@@ -221,6 +221,45 @@ pub(crate) async fn validate_hmac_request_transform_candidates(
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))
 }
 
+/// Validate the post-mutation named log-schema graph for one namespace.
+///
+/// The authoritative snapshot is overlaid exactly as plugin CRUD/batch
+/// persistence will change it, then definitions and referrers are validated in
+/// an isolated registry bracket. No live registry state participates.
+pub(crate) async fn validate_transaction_log_schema_candidates(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    plugins: &[PluginConfig],
+    removed_plugin_id: Option<&str>,
+) -> Result<(), AfterValidateError> {
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+
+    if let Some(removed_plugin_id) = removed_plugin_id {
+        candidate.plugin_configs.retain(|plugin| {
+            plugin.namespace != namespace || plugin.id != removed_plugin_id
+        });
+    }
+    for plugin in plugins {
+        if let Some(existing) = candidate
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.namespace == namespace && item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            candidate.plugin_configs.push(plugin.clone());
+        }
+    }
+
+    let http_client = super::plugin_validation_http_client(state);
+    crate::plugins::transaction_log_schema::validate_config_graph(&candidate, &http_client)
+        .map_err(AfterValidateError::BadRequest)
+}
+
 /// Validate the exact post-PUT API-spec replacement candidate.
 ///
 /// The persistence contract deletes plugin configs owned by the replaced spec,
@@ -1992,7 +2031,9 @@ impl AdminResource for PluginConfig {
             }
         }
 
-        if let Err(error) = validate_plugin_config_definition(state, resource) {
+        if !crate::plugins::transaction_log_schema::participates_in_config_graph(resource)
+            && let Err(error) = validate_plugin_config_definition(state, resource)
+        {
             return Err(AfterValidateError::BadRequest(vec![format!(
                 "Invalid plugin config: {}",
                 error
@@ -2040,6 +2081,20 @@ impl AdminResource for PluginConfig {
             None,
         )
         .await?;
+        if crate::plugins::transaction_log_schema::participates_in_config_graph(resource)
+            || existing.is_some_and(
+                crate::plugins::transaction_log_schema::participates_in_config_graph,
+            )
+        {
+            validate_transaction_log_schema_candidates(
+                db,
+                state,
+                namespace,
+                std::slice::from_ref(resource),
+                None,
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -2063,6 +2118,16 @@ impl AdminResource for PluginConfig {
             Some(&existing.id),
         )
         .await?;
+        if crate::plugins::transaction_log_schema::participates_in_config_graph(existing) {
+            validate_transaction_log_schema_candidates(
+                db,
+                state,
+                namespace,
+                &[],
+                Some(&existing.id),
+            )
+            .await?;
+        }
         Ok(())
     }
 }

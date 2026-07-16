@@ -4178,13 +4178,45 @@ async fn handle_batch_create(
                 plugin_config.id, plugin_config.plugin_name
             ));
         }
-        if let Err(err) =
-            validate_plugin_config_definition(plugin_config, plugin_validation_http_client(state))
+        if !crate::plugins::transaction_log_schema::participates_in_config_graph(plugin_config)
+            && let Err(err) = validate_plugin_config_definition(
+                plugin_config,
+                plugin_validation_http_client(state),
+            )
         {
             validation_errors.push(format!(
                 "PluginConfig '{}': invalid config: {}",
                 plugin_config.id, err
             ));
+        }
+    }
+
+    if batch
+        .plugin_configs
+        .iter()
+        .any(crate::plugins::transaction_log_schema::participates_in_config_graph)
+    {
+        match crud::validate_transaction_log_schema_candidates(
+            db.as_ref(),
+            state,
+            namespace,
+            &batch.plugin_configs,
+            None,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(crud::AfterValidateError::BadRequest(errors)) => {
+                validation_errors.extend(errors);
+            }
+            Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
+                "Failed to load config for transaction-log schema candidate validation: {}",
+                error
+            )),
+            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
+                "Transaction-log schema candidate validation returned an unexpected response"
+                    .to_string(),
+            ),
         }
     }
 

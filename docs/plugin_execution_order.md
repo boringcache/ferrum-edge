@@ -2,6 +2,13 @@
 
 Ferrum Edge executes plugins in a deterministic order based on two dimensions: **lifecycle phases** and **priority within each phase**.
 
+`transaction_log_schema` is a config-only exception to runtime ordering. Full
+and delta cache builds construct its global instances first to stage named
+schemas, then discard those instances after the registry owns the compiled
+definitions. It is absent from global/per-proxy lifecycle lists and all
+HTTP, gRPC, WebSocket, TCP, and UDP protocol snapshots, so it never runs a
+request, summary, connection, or frame hook.
+
 ## Lifecycle Phases
 
 Every HTTP-family request passes through the request/header phases in strict order. Buffered responses then run the body phases before logging; streamed non-buffered responses skip the buffered body phases and run a terminal stream hook before logging. WebSocket connections optionally enter a frame phase after the HTTP upgrade completes. Plugins only run in the phases they implement:

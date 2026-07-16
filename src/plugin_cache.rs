@@ -2723,7 +2723,9 @@ impl PluginCache {
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
                 ) {
-                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    // Config-only: construction stages the registry entry, but
+                    // the instance must never enter runtime hook/cache lists.
+                    Ok(Some(_)) => {}
                     Ok(None) => {}
                     Err(e) => {
                         error!("Config reload: {}", e);
@@ -3377,7 +3379,9 @@ impl PluginCache {
                 current_adaptive_states,
                 &mut adaptive_concurrency_instances,
             ) {
-                Ok(Some(plugin)) => global_plugins.push(plugin),
+                // Config-only: construction stages the registry entry, but
+                // the instance must never enter runtime hook/cache lists.
+                Ok(Some(_)) => {}
                 Ok(None) => {}
                 Err(e) => plugin_errors.push(e),
             }

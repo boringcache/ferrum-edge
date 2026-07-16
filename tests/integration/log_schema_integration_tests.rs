@@ -13,6 +13,8 @@
 //! * `transaction_log_schema` rejects non-global scopes via
 //!   `GatewayConfig::validate_plugin_references`.
 
+use chrono::Utc;
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugins::create_plugin;
 use ferrum_edge::plugins::utils::log_schema::registry;
 use serde_json::{Value, json};
@@ -44,6 +46,174 @@ fn create_ok(name: &str, config: Value) {
 /// mutex.
 fn registry_lock() -> registry::ReloadBracketTestGuard {
     registry::lock_for_tests()
+}
+
+fn graph_plugin(
+    id: &str,
+    namespace: &str,
+    plugin_name: &str,
+    config: Value,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        plugin_name: plugin_name.to_string(),
+        namespace: namespace.to_string(),
+        config,
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn validate_graph(plugin_configs: Vec<PluginConfig>) -> Result<(), Vec<String>> {
+    ferrum_edge::_test_support::validate_transaction_log_schema_graph_for_test(&GatewayConfig {
+        plugin_configs,
+        ..GatewayConfig::default()
+    })
+}
+
+#[test]
+fn prospective_graph_is_definition_first_and_does_not_mutate_live_registry() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+    registry::begin_reload();
+    create_ok(
+        "transaction_log_schema",
+        json!({"schemas": {"live_baseline": {}}}),
+    );
+    registry::commit_reload();
+
+    validate_graph(vec![
+        graph_plugin(
+            "logger",
+            "ferrum",
+            "stdout_logging",
+            json!({"schema_ref": "prospective"}),
+        ),
+        graph_plugin(
+            "schemas",
+            "ferrum",
+            "transaction_log_schema",
+            json!({"schemas": {"prospective": {"summary_type": "both"}}}),
+        ),
+    ])
+    .expect("referrers may precede their definition in a prospective config");
+
+    assert!(registry::lookup_named("live_baseline").is_some());
+    assert!(
+        registry::lookup_named("prospective").is_none(),
+        "validation staging must never publish into the live registry"
+    );
+}
+
+#[test]
+fn prospective_graph_rejects_duplicate_names_and_dangling_renames_or_deletes() {
+    let duplicate = validate_graph(vec![
+        graph_plugin(
+            "schemas-a",
+            "ferrum",
+            "transaction_log_schema",
+            json!({"schemas": {"audit": {}}}),
+        ),
+        graph_plugin(
+            "schemas-b",
+            "ferrum",
+            "transaction_log_schema",
+            json!({"schemas": {"audit": {}}}),
+        ),
+    ])
+    .expect_err("duplicate names across schema instances must be rejected");
+    assert!(
+        duplicate.iter().any(|error| error.contains("registered more than once")),
+        "unexpected duplicate errors: {duplicate:?}"
+    );
+
+    for plugins in [
+        vec![
+            graph_plugin(
+                "schemas",
+                "ferrum",
+                "transaction_log_schema",
+                json!({"schemas": {"renamed": {}}}),
+            ),
+            graph_plugin(
+                "logger",
+                "ferrum",
+                "stdout_logging",
+                json!({"schema_ref": "removed"}),
+            ),
+        ],
+        vec![graph_plugin(
+            "logger",
+            "ferrum",
+            "stdout_logging",
+            json!({"schema_ref": "deleted"}),
+        )],
+    ] {
+        let errors = validate_graph(plugins)
+            .expect_err("renamed or deleted definitions must leave no dangling referrers");
+        assert!(
+            errors.iter().any(|error| error.contains("unknown schema")),
+            "unexpected dangling-ref errors: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn prospective_graph_is_namespace_scoped_across_multiple_instances() {
+    validate_graph(vec![
+        graph_plugin(
+            "schemas-a",
+            "tenant-a",
+            "transaction_log_schema",
+            json!({"schemas": {"audit": {}}}),
+        ),
+        graph_plugin(
+            "logger-a",
+            "tenant-a",
+            "stdout_logging",
+            json!({"schema_ref": "audit"}),
+        ),
+        graph_plugin(
+            "schemas-b",
+            "tenant-b",
+            "transaction_log_schema",
+            json!({"schemas": {"audit": {}}}),
+        ),
+        graph_plugin(
+            "logger-b",
+            "tenant-b",
+            "stdout_logging",
+            json!({"schema_ref": "audit"}),
+        ),
+    ])
+    .expect("the same schema name is independent in separate namespaces");
+
+    let errors = validate_graph(vec![
+        graph_plugin(
+            "schemas-a",
+            "tenant-a",
+            "transaction_log_schema",
+            json!({"schemas": {"audit": {}}}),
+        ),
+        graph_plugin(
+            "logger-b",
+            "tenant-b",
+            "stdout_logging",
+            json!({"schema_ref": "audit"}),
+        ),
+    ])
+    .expect_err("a referrer must not resolve a definition from another namespace");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("namespace=tenant-b") && error.contains("unknown schema")),
+        "unexpected cross-namespace errors: {errors:?}"
+    );
 }
 
 #[test]

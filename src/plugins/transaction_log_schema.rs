@@ -24,7 +24,7 @@
 //!       static_fields: { source: "ferrum-edge" }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,19 +33,33 @@ use serde_json::Value;
 use super::Plugin;
 use crate::plugins::utils::log_schema::{SchemaCapabilities, SummarySchema, registry};
 
+/// Fixed-shape keys accepted by the outer plugin config. The `schemas` value
+/// itself remains an intentionally open map keyed by operator-defined names.
+pub const TRANSACTION_LOG_SCHEMA_CONFIG_KEYS: &[&str] = &["schemas"];
+
 #[derive(Debug)]
 pub struct TransactionLogSchema {
-    /// Per-plugin-instance handle to every schema it registered into the
-    /// process-global named-schemas registry. Held so the plugin owns at
-    /// least one strong reference and for future loader integrations
-    /// (e.g., an explicit post-construction publish step).
+    /// Per-construction handle to every compiled schema. The registry retains
+    /// its own `Arc`s after this config-only instance is discarded by cache
+    /// construction.
     #[allow(dead_code)]
     schemas: HashMap<String, Arc<SummarySchema>>,
 }
 
 impl TransactionLogSchema {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let schemas_value = config.get("schemas").ok_or_else(|| {
+        let config_object = config.as_object().ok_or_else(|| {
+            "transaction_log_schema: config must be an object containing 'schemas'".to_string()
+        })?;
+        for key in config_object.keys() {
+            if !TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.contains(&key.as_str()) {
+                return Err(format!(
+                    "transaction_log_schema: unknown config key '{key}' at 'config.{key}' (valid keys: {})",
+                    TRANSACTION_LOG_SCHEMA_CONFIG_KEYS.join(", ")
+                ));
+            }
+        }
+        let schemas_value = config_object.get("schemas").ok_or_else(|| {
             "transaction_log_schema: 'schemas' is required (an object mapping name -> schema definition)".to_string()
         })?;
         let obj = schemas_value
@@ -89,8 +103,9 @@ impl TransactionLogSchema {
                 ));
             }
 
-            // Register into the live staging area (no-op during validation;
-            // populates during a loader reload bracket).
+            // Register into the active staging area. Isolated constructor
+            // validation is a no-op; graph validation and cache reloads open
+            // explicit abort/commit brackets respectively.
             registry::register_named(name, raw, compiled)?;
         }
 
@@ -106,6 +121,93 @@ impl TransactionLogSchema {
     }
 }
 
+/// Whether a plugin config participates in the named log-schema graph.
+///
+/// Callers use this to avoid making unrelated plugin CRUD repair pre-existing
+/// graph defects while still validating every mutation that can change schema
+/// definitions or references.
+pub(crate) fn participates_in_config_graph(
+    plugin_config: &crate::config::types::PluginConfig,
+) -> bool {
+    plugin_config.plugin_name == "transaction_log_schema"
+        || plugin_config.config.get("schema_ref").is_some()
+}
+
+/// Validate enabled named schemas and all of their enabled referrers against
+/// the supplied prospective configuration, without publishing anything to the
+/// live registry.
+///
+/// Each namespace is staged independently because CP admin snapshots are
+/// distributed to namespace-scoped DPs. Within a namespace, definitions are
+/// always staged before referrers so declaration order is irrelevant. The
+/// staging bracket is aborted after validation, preserving the live registry.
+pub(crate) fn validate_config_graph(
+    config: &crate::config::types::GatewayConfig,
+    http_client: &crate::plugins::PluginHttpClient,
+) -> Result<(), Vec<String>> {
+    let namespaces: BTreeSet<&str> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.enabled && participates_in_config_graph(plugin))
+        .map(|plugin| plugin.namespace.as_str())
+        .collect();
+    let mut errors = Vec::new();
+
+    for namespace in namespaces {
+        registry::begin_reload();
+
+        for plugin in config.plugin_configs.iter().filter(|plugin| {
+            plugin.enabled
+                && plugin.namespace == namespace
+                && plugin.plugin_name == "transaction_log_schema"
+        }) {
+            if plugin.scope != crate::config::types::PluginScope::Global {
+                errors.push(format!(
+                    "Plugin '{}' (id={}, namespace={}): transaction_log_schema must have scope 'global'",
+                    plugin.plugin_name, plugin.id, namespace
+                ));
+                continue;
+            }
+            if let Err(error) = super::validate_plugin_config_with_http_client(
+                &plugin.plugin_name,
+                &plugin.config,
+                http_client.clone(),
+            ) {
+                errors.push(format!(
+                    "Plugin '{}' (id={}, namespace={}): {}",
+                    plugin.plugin_name, plugin.id, namespace, error
+                ));
+            }
+        }
+
+        for plugin in config.plugin_configs.iter().filter(|plugin| {
+            plugin.enabled
+                && plugin.namespace == namespace
+                && plugin.plugin_name != "transaction_log_schema"
+                && plugin.config.get("schema_ref").is_some()
+        }) {
+            if let Err(error) = super::validate_plugin_config_with_http_client(
+                &plugin.plugin_name,
+                &plugin.config,
+                http_client.clone(),
+            ) {
+                errors.push(format!(
+                    "Plugin '{}' (id={}, namespace={}): {}",
+                    plugin.plugin_name, plugin.id, namespace, error
+                ));
+            }
+        }
+
+        registry::abort_reload();
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 #[async_trait]
 impl Plugin for TransactionLogSchema {
     fn name(&self) -> &str {
@@ -114,10 +216,6 @@ impl Plugin for TransactionLogSchema {
 
     fn priority(&self) -> u16 {
         super::priority::TRANSACTION_LOG_SCHEMA
-    }
-
-    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::ALL_PROTOCOLS
     }
 }
 

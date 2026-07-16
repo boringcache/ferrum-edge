@@ -2101,6 +2101,102 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
 
 // ---- Protocol-filtered plugin lookup tests ----
 
+#[test]
+fn transaction_log_schema_only_cache_preserves_no_plugin_fast_path_for_all_protocols() {
+    use ferrum_edge::plugins::utils::log_schema::registry;
+
+    let _guard = registry::lock_for_tests();
+    registry::reset_for_tests();
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![
+            make_plugin_config_with_json(
+                "schemas-a",
+                "transaction_log_schema",
+                json!({"schemas": {"audit-a": {"summary_type": "both"}}}),
+                PluginScope::Global,
+                None,
+            ),
+            make_plugin_config_with_json(
+                "schemas-b",
+                "transaction_log_schema",
+                json!({"schemas": {"audit-b": {"summary_type": "both"}}}),
+                PluginScope::Global,
+                None,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("schema-only cache must build");
+
+    assert!(cache.get_plugins("p1").is_empty());
+    assert!(cache.get_plugins("unknown").is_empty());
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+        ProxyProtocol::Tcp,
+        ProxyProtocol::Udp,
+    ] {
+        assert!(
+            cache.get_plugins_for_protocol("p1", protocol).is_empty(),
+            "config-only schema instances leaked into the {protocol:?} runtime list"
+        );
+    }
+    assert!(registry::lookup_named("audit-a").is_some());
+    assert!(registry::lookup_named("audit-b").is_some());
+}
+
+#[test]
+fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries() {
+    use ferrum_edge::plugins::utils::log_schema::registry;
+
+    let _guard = registry::lock_for_tests();
+    registry::reset_for_tests();
+    let old_schema = make_plugin_config_with_json(
+        "schemas",
+        "transaction_log_schema",
+        json!({"schemas": {"before": {}}}),
+        PluginScope::Global,
+        None,
+    );
+    let old_config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![old_schema.clone()],
+    );
+    let cache = PluginCache::new(&old_config).expect("initial schema cache");
+
+    let mut new_schema = old_schema;
+    new_schema.config = json!({"schemas": {"after": {}}});
+    new_schema.updated_at += chrono::Duration::seconds(1);
+    let new_config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![new_schema],
+    );
+    let delta = ConfigDelta::compute(&old_config, &new_config);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+    cache
+        .apply_delta(
+            &new_config,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect("schema delta reload");
+
+    assert!(registry::lookup_named("before").is_none());
+    assert!(registry::lookup_named("after").is_some());
+    assert!(cache.get_plugins("p1").is_empty());
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+        ProxyProtocol::Tcp,
+        ProxyProtocol::Udp,
+    ] {
+        assert!(cache.get_plugins_for_protocol("p1", protocol).is_empty());
+    }
+}
+
 fn make_plugin_config_with_json(
     id: &str,
     plugin_name: &str,

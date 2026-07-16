@@ -18,6 +18,25 @@ use serde_json::Value;
 
 use crate::plugins::utils::metadata_redaction::is_sensitive_metadata_key;
 
+/// Fixed-shape keys accepted by [`SummarySchema::compile`]. Intentionally
+/// open maps (`rename` and `static_fields`) validate their values separately.
+pub const SUMMARY_LOG_SCHEMA_KEYS: &[&str] = &[
+    "summary_type",
+    "omit",
+    "rename",
+    "order",
+    "static_fields",
+    "derived_fields",
+    "metadata",
+    "timestamp_format",
+];
+
+/// Fixed-shape keys accepted for each `derived_fields` entry.
+pub const DERIVED_FIELD_KEYS: &[&str] = &["name", "kind"];
+
+/// Fixed-shape keys accepted by the `metadata` policy object.
+pub const METADATA_POLICY_KEYS: &[&str] = &["mode", "prefix", "on_collision"];
+
 pub mod fields;
 pub mod registry;
 pub mod view;
@@ -206,22 +225,12 @@ impl SummarySchema {
         }
 
         // Reject unknown top-level keys so typos surface immediately.
-        const KNOWN_KEYS: &[&str] = &[
-            "summary_type",
-            "omit",
-            "rename",
-            "order",
-            "static_fields",
-            "derived_fields",
-            "metadata",
-            "timestamp_format",
-        ];
         if let Some(obj) = raw.as_object() {
             for key in obj.keys() {
-                if !KNOWN_KEYS.contains(&key.as_str()) {
+                if !SUMMARY_LOG_SCHEMA_KEYS.contains(&key.as_str()) {
                     return Err(format!(
                         "{plugin_name}: unknown schema key '{key}' (valid keys: {})",
-                        KNOWN_KEYS.join(", ")
+                        SUMMARY_LOG_SCHEMA_KEYS.join(", ")
                     ));
                 }
             }
@@ -703,19 +712,33 @@ fn parse_derived_fields(
         .as_array()
         .ok_or_else(|| format!("{plugin_name}: schema 'derived_fields' must be an array"))?;
     let mut out = Vec::with_capacity(arr.len());
-    for entry in arr {
+    for (index, entry) in arr.iter().enumerate() {
         let obj = entry.as_object().ok_or_else(|| {
-            format!("{plugin_name}: schema 'derived_fields' entries must be objects")
+            format!(
+                "{plugin_name}: schema 'derived_fields[{index}]' entry must be an object"
+            )
         })?;
+        for key in obj.keys() {
+            if !DERIVED_FIELD_KEYS.contains(&key.as_str()) {
+                return Err(format!(
+                    "{plugin_name}: unknown schema key 'derived_fields[{index}].{key}' (valid entry keys: {})",
+                    DERIVED_FIELD_KEYS.join(", ")
+                ));
+            }
+        }
         let name = obj
             .get("name")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
-                format!("{plugin_name}: schema 'derived_fields' entry missing non-empty 'name'")
+                format!(
+                    "{plugin_name}: schema 'derived_fields[{index}]' entry missing non-empty 'name'"
+                )
             })?;
         let kind_str = obj.get("kind").and_then(Value::as_str).ok_or_else(|| {
-            format!("{plugin_name}: schema 'derived_fields' entry '{name}' missing 'kind'")
+            format!(
+                "{plugin_name}: schema 'derived_fields[{index}]' entry '{name}' missing 'kind'"
+            )
         })?;
         let kind = DerivedKind::parse(kind_str)?;
         if is_sensitive_metadata_key(name) {
@@ -738,7 +761,23 @@ fn parse_metadata_policy(
     let obj = v
         .as_object()
         .ok_or_else(|| format!("{plugin_name}: schema 'metadata' must be an object"))?;
-    let mode = obj.get("mode").and_then(Value::as_str).unwrap_or("nested");
+    for key in obj.keys() {
+        if !METADATA_POLICY_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "{plugin_name}: unknown schema key 'metadata.{key}' (valid metadata keys: {})",
+                METADATA_POLICY_KEYS.join(", ")
+            ));
+        }
+    }
+    let mode = match obj.get("mode") {
+        Some(Value::String(mode)) => mode.as_str(),
+        None => "nested",
+        Some(_) => {
+            return Err(format!(
+                "{plugin_name}: schema 'metadata.mode' must be a string"
+            ));
+        }
+    };
     match mode {
         "nested" => Ok(MetadataPolicy::Nested),
         "omit" => Ok(MetadataPolicy::Omit),

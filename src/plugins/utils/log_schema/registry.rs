@@ -176,10 +176,10 @@ pub fn begin_reload() {
 /// When called between [`begin_reload`] and [`commit_reload`] (the normal
 /// loader path), writes to the staging map and rejects duplicates.
 ///
-/// When called outside a reload pass (e.g., from admin-API single-plugin
-/// validation via `validate_plugin_config`), this is a no-op. Validation
-/// just needs `SummarySchema::compile` to succeed; the registry stays
-/// untouched and will be re-populated by the next config-reload pass.
+/// When called outside a reload pass (for example, isolated constructor
+/// validation via `validate_plugin_config`), this is a no-op. Prospective
+/// graph validation opens an abort-only bracket explicitly, so it detects
+/// duplicates and resolves referrers without changing the live registry.
 pub fn register_named(
     name: &str,
     raw: Arc<Value>,

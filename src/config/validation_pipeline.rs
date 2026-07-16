@@ -401,8 +401,29 @@ impl<'a> ValidationPipeline<'a> {
                     action,
                 } => {
                     let mut errors = Vec::new();
+                    let graph_http_client =
+                        crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
+                            backend_allow_ips.clone(),
+                        );
+                    if let Err(graph_errors) =
+                        crate::plugins::transaction_log_schema::validate_config_graph(
+                            config,
+                            &graph_http_client,
+                        )
+                    {
+                        errors.extend(graph_errors);
+                    }
                     for plugin_config in &config.plugin_configs {
                         if !plugin_config.enabled {
+                            continue;
+                        }
+                        // The prospective graph pass above validates schema
+                        // definitions and referrers in definition-first order.
+                        // Re-validating either one here would consult the live
+                        // registry after the isolated bracket was aborted.
+                        if crate::plugins::transaction_log_schema::participates_in_config_graph(
+                            plugin_config,
+                        ) {
                             continue;
                         }
                         if let Err(err) = crate::plugins::validate_plugin_config_with_policy(
