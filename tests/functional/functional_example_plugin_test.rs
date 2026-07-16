@@ -95,10 +95,15 @@ async fn serve_header_echo(listener: TcpListener, contract_requests: Arc<Mutex<V
                 name.eq_ignore_ascii_case(CONTRACT_REQUEST_HEADER)
                     .then(|| value.trim())
             }) {
-                contract_requests
-                    .lock()
-                    .expect("contract request lock")
-                    .push(contract_request.to_string());
+                let mut recorded = contract_requests.lock().expect("contract request lock");
+                if !recorded
+                    .iter()
+                    .any(|request| request.as_str() == contract_request)
+                {
+                    // Retries retain one ID because the contract is about the
+                    // logical client request, not backend transport attempts.
+                    recorded.push(contract_request.to_string());
+                }
             }
             let observed = observed.unwrap_or("missing");
             let response = format!(

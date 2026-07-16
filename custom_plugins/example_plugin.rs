@@ -114,6 +114,7 @@ impl Plugin for ExamplePlugin {
     }
 
     /// Called after a route matches and its allowed-method check succeeds.
+    /// Native gRPC requests must also use `POST` before this hook runs.
     /// On H1, H2, and H3, unmatched 404 and matched-proxy 405 responses invoke
     /// neither global nor scoped instances of this hook.
     /// Return `PluginResult::Reject` to short-circuit with an error response.

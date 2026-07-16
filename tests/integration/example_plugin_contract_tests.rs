@@ -33,6 +33,8 @@ fn h1_h2_route_miss_and_method_rejection_precede_request_hooks() {
             "StatusCode::NOT_FOUND",
             "// Per-proxy HTTP method filtering (checked before plugins to save work)",
             "StatusCode::METHOD_NOT_ALLOWED",
+            "// gRPC spec mandates POST method.",
+            "StatusCode::BAD_REQUEST",
             "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);",
             "match plugin.on_request_received(&mut ctx).await",
         ],
@@ -48,6 +50,8 @@ fn h3_route_miss_and_method_rejection_precede_request_hooks() {
             "StatusCode::NOT_FOUND",
             "// Per-proxy HTTP method filtering (checked before plugins to save work)",
             "StatusCode::METHOD_NOT_ALLOWED",
+            "// gRPC spec mandates POST.",
+            "StatusCode::BAD_REQUEST",
             "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);",
             "match plugin.on_request_received(&mut ctx).await",
         ],
@@ -112,6 +116,16 @@ fn trait_example_and_guides_describe_the_same_request_boundary() {
         EXECUTION_ORDER_GUIDE
             .contains("`on_request_received` is therefore a post-route, post-allowed-method hook")
     );
+    for source in [
+        TRAIT_SOURCE,
+        EXAMPLE_SOURCE,
+        CUSTOM_PLUGIN_GUIDE,
+        EXECUTION_ORDER_GUIDE,
+    ] {
+        assert!(
+            source.contains("Native gRPC requests must also use `POST` before this hook runs.")
+        );
+    }
 }
 
 #[test]

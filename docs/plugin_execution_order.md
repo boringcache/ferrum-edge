@@ -5,10 +5,11 @@ Ferrum Edge executes plugins in a deterministic order based on two dimensions: *
 ## Lifecycle Phases
 
 HTTP-family routing and per-proxy allowed-method admission occur before the
-ordinary plugin lifecycle begins. Every matched, method-allowed request then
-passes through the request/header phases in strict order. Buffered responses
-run the body phases before logging; streamed non-buffered responses skip the
-buffered body phases and run a terminal stream hook before logging. WebSocket
+ordinary plugin lifecycle begins. Native gRPC requests also pass a POST-only
+admission gate at this boundary. Requests admitted by those checks then pass
+through the request/header phases in strict order. Buffered responses run the
+body phases before logging; streamed non-buffered responses skip the buffered
+body phases and run a terminal stream hook before logging. WebSocket
 connections optionally enter a frame phase after the HTTP upgrade completes.
 Plugins only run in the phases they implement:
 
@@ -17,7 +18,7 @@ Request In
     │
     ▼
 ┌─────────────────────────┐
-│ Route + method admission│  Unmatched: 404; matched disallowed method: 405
+│ Route + method admission│  Unmatched: 404; disallowed: 405; gRPC non-POST: reject
 └────────────┬────────────┘
              │
              ▼
@@ -114,10 +115,13 @@ a pre-routing receipt hook. Once it runs, `ctx.matched_proxy` is populated and
 the plugin list is the resolved view for that proxy: applicable global plugins
 plus proxy/proxy-group-scoped plugins. Unmatched 404 responses run neither
 global nor scoped hooks because there is no proxy view to select. Matched 405
-responses also return before either kind of hook runs. H1, H2, and H3 share
-these blind spots. Terminal transaction logging is separate from ordinary
-request hooks; whether a terminal summary exists must not be inferred from
-whether `on_request_received` ran.
+responses also return before either kind of hook runs.
+Native gRPC requests must also use `POST` before this hook runs.
+A matched request using a different method is rejected at its protocol
+admission gate before either kind of hook, even if `allowed_methods` permits
+that method. H1, H2, and H3 share these blind spots. Terminal transaction
+logging is separate from ordinary request hooks; whether a terminal summary
+exists must not be inferred from whether `on_request_received` ran.
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 

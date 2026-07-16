@@ -3142,6 +3142,7 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Called after routing and per-proxy allowed-method admission succeed.
+    /// Native gRPC requests must also use `POST` before this hook runs.
     ///
     /// The hook receives a context whose `matched_proxy` is populated and runs
     /// over the resolved plugin view for that proxy (applicable global plugins
