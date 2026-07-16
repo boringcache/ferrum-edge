@@ -302,6 +302,7 @@ impl LokiLogging {
         validate_batch_config(config, "loki_logging", batch_defaults)?;
         let (max_entry_bytes, buffer_max_bytes, retry) =
             validate_loki_resource_config(config, batch_defaults)?;
+        validate_static_label_budget(&label_config.static_labels, max_entry_bytes)?;
         let mut batch_config = build_batch_config(config, "loki_logging", batch_defaults);
         batch_config.retry = retry;
         let schema = resolve_schema(config, "loki_logging", SchemaCapabilities::BASE)?;
@@ -604,6 +605,22 @@ fn validate_loki_label_name(name: &str) -> Result<(), String> {
         return Err(format!(
             "loki_logging: invalid or reserved label name '{name}'"
         ));
+    }
+    Ok(())
+}
+
+fn validate_static_label_budget(
+    labels: &BTreeMap<String, String>,
+    max_entry_bytes: usize,
+) -> Result<(), String> {
+    let retained_bytes = labels.iter().try_fold(0_usize, |total, (key, value)| {
+        total.checked_add(key.len())?.checked_add(value.len())
+    });
+    if retained_bytes.is_none_or(|bytes| bytes >= max_entry_bytes) {
+        return Err(
+            "loki_logging: configured and reserved labels must collectively use fewer bytes than 'max_entry_bytes'"
+                .to_string(),
+        );
     }
     Ok(())
 }

@@ -222,6 +222,25 @@ async fn test_loki_logging_strict_config_admission_and_bounds() {
 }
 
 #[tokio::test]
+async fn test_loki_logging_rejects_static_labels_that_exhaust_entry_budget() {
+    let labels = (0..40)
+        .map(|index| (format!("label_{index}"), json!("x".repeat(2048))))
+        .collect::<serde_json::Map<_, _>>();
+    let result = LokiLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",
+            "labels": labels,
+        }),
+        default_client(),
+    );
+
+    let error = result
+        .err()
+        .expect("labels that leave no entry budget must be rejected");
+    assert!(error.contains("collectively use fewer bytes than 'max_entry_bytes'"));
+}
+
+#[tokio::test]
 async fn test_loki_logging_rejects_url_userinfo_without_echoing_credentials() {
     let secret = "userinfo-secret-canary";
     let result = LokiLogging::new(

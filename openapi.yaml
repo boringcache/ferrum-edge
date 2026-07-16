@@ -10557,7 +10557,9 @@ components:
           maximum: 1048576
           description: >-
             Maximum retained bytes for one serialized JSON line plus its Loki
-            labels. Oversized entries are dropped before enqueue.
+            labels. Configuration is rejected when static and reserved labels
+            alone exhaust this budget. Oversized entries are dropped before
+            enqueue.
         buffer_max_bytes:
           type: integer
           default: 16777216
