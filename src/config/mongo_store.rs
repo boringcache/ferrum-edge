@@ -1074,10 +1074,7 @@ mod inner {
         /// The lease is (re)claimed only when it is missing, server-expired, or
         /// already owned by us; otherwise every field is left untouched so an
         /// active owner is never stomped.
-        fn server_time_lease_acquire_pipeline(
-            owner: &str,
-            duration_millis: i64,
-        ) -> Vec<Document> {
+        fn server_time_lease_acquire_pipeline(owner: &str, duration_millis: i64) -> Vec<Document> {
             vec![
                 doc! {
                     "$set": {
@@ -1127,7 +1124,9 @@ mod inner {
             response
                 .get_datetime("localTime")
                 .cloned()
-                .map_err(|error| anyhow::anyhow!("MongoDB hello response omitted localTime: {error}"))
+                .map_err(|error| {
+                    anyhow::anyhow!("MongoDB hello response omitted localTime: {error}")
+                })
         }
 
         /// The migration-lease duration in milliseconds (exposed for tests that
@@ -3310,9 +3309,7 @@ mod inner {
                         "owner": owner,
                         "$expr": { "$gt": [ "$expires_at", "$$NOW" ] },
                     },
-                    Self::server_time_lease_renew_pipeline(
-                        CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
-                    ),
+                    Self::server_time_lease_renew_pipeline(CONFIG_ADMISSION_LEASE_DURATION_MILLIS),
                 )
                 .await;
             let result = match result {
