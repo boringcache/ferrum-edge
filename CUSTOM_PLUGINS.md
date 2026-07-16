@@ -57,7 +57,7 @@ on_response_committed()         ── observe-only final buffered status/body
 log()                           ── awaited sequentially on buffered responses
   │
   ▼
-Buffered response returned to the server
+Buffered response returned to the embedded HTTP server, then sent to the client
 ```
 
 Streamed responses have a different terminal path. For hyper-owned H1/H2 and

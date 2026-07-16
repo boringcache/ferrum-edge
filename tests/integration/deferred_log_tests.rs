@@ -227,7 +227,7 @@ async fn wait_for_events(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn buffered_logging_is_awaited_and_plugins_run_sequentially() {
+async fn log_with_mirror_awaits_plugins_sequentially() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());

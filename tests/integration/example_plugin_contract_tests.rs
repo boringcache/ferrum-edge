@@ -3,12 +3,13 @@
 //! Runtime behavior is exercised by the hosted-only functional protocol matrix;
 //! these guards make the routing and logging boundaries fail visibly if the
 //! H1/H2 or H3 control-flow markers move without the public contract changing.
+//! The separate `example_audit_plugin` persistence/lifecycle work owns its own
+//! contracts, so this module deliberately does not pin that file's text.
 
 const PROXY_SOURCE: &str = include_str!("../../src/proxy/mod.rs");
 const H3_SOURCE: &str = include_str!("../../src/http3/server.rs");
 const TRAIT_SOURCE: &str = include_str!("../../src/plugins/mod.rs");
 const EXAMPLE_SOURCE: &str = include_str!("../../custom_plugins/example_plugin.rs");
-const AUDIT_EXAMPLE_SOURCE: &str = include_str!("../../custom_plugins/example_audit_plugin.rs");
 const CUSTOM_PLUGIN_GUIDE: &str = include_str!("../../CUSTOM_PLUGINS.md");
 const EXECUTION_ORDER_GUIDE: &str = include_str!("../../docs/plugin_execution_order.md");
 
@@ -49,6 +50,40 @@ fn h3_route_miss_and_method_rejection_precede_request_hooks() {
             "StatusCode::METHOD_NOT_ALLOWED",
             "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);",
             "match plugin.on_request_received(&mut ctx).await",
+        ],
+    );
+}
+
+#[test]
+fn h1_h2_buffered_terminal_logging_precedes_response_construction() {
+    assert_markers_in_order(
+        PROXY_SOURCE,
+        "H1/H2 buffered terminal path",
+        &[
+            "let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =",
+            "if body_will_stream {",
+            "DeferredTransactionLogger::new_with_start_time(",
+            "} else {",
+            "crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;",
+            "record_request(&state, response_status);",
+            "// Build final response",
+            "let mut resp_builder = Response::builder()",
+        ],
+    );
+}
+
+#[test]
+fn h3_buffered_terminal_logging_precedes_response_construction_and_send() {
+    assert_markers_in_order(
+        H3_SOURCE,
+        "H3 buffered terminal path",
+        &[
+            "// ===== BUFFERED RESPONSE PATH =====",
+            "let summary = TransactionSummary {",
+            "crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;",
+            "// Build and send buffered response",
+            "apply_response_headers(Response::builder().status(status), &response_headers);",
+            "stream.send_response(resp).await?;",
         ],
     );
 }
@@ -96,8 +131,6 @@ fn trait_example_and_guides_describe_buffered_streaming_and_h3_log_timing() {
         );
     }
     assert!(EXAMPLE_SOURCE.contains("Hyper-owned streamed bodies spawn logging"));
-    assert!(AUDIT_EXAMPLE_SOURCE.contains("bounded, plugin-owned queue"));
-    assert!(!AUDIT_EXAMPLE_SOURCE.contains("logging hook (fire-and-forget)"));
     assert!(H3_SOURCE.contains("# Why H3 does not use `DeferredTransactionLogger`"));
     assert!(H3_SOURCE.contains("drives the\n/// QUIC send stream to completion synchronously"));
 }

@@ -89,8 +89,8 @@ impl Plugin for ExamplePlugin {
     }
 
     /// Execution priority. See `src/plugins/mod.rs` for the priority band guide:
-    ///   - 0–999:    Matched-request preflight (CORS, IP filtering, correlation IDs)
-    ///   - 1000–1999: Authentication (identity verification)
+    ///   - 0–949:    Matched-request preflight (CORS, IP filtering, correlation IDs)
+    ///   - 950–1999: Authentication (identity verification)
     ///   - 2000–2999: Authorization (access control, rate limiting)
     ///   - 3000–3999: Request transformation
     ///   - 4000–4999: Response transformation
