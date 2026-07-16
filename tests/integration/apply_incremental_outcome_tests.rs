@@ -606,8 +606,8 @@ async fn correlation_id_malformed_reload_keeps_last_known_good_plugin_generation
     );
 
     let request_view = state.plugin_cache.request_view("p1", ProxyProtocol::Http);
-    let correlations: Vec<_> = request_view
-        .plugins()
+    let request_plugins = request_view.plugins();
+    let correlations: Vec<_> = request_plugins
         .iter()
         .filter(|plugin| plugin.name() == "correlation_id")
         .collect();
