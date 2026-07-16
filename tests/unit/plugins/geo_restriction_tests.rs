@@ -1048,6 +1048,8 @@ fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
     assert!(config_source.contains("CountryMmdbAllocationReservation"));
     assert!(config_source.contains("inflight_snapshot_bytes"));
     assert!(config_source.contains("live_snapshot_bytes"));
+    assert!(config_source.contains("record_validation_failure"));
+    assert!(config_source.contains("failures: HashMap<PathBuf, CountryMmdbLoadError>"));
     assert!(config_source.contains("live + in-flight + candidate"));
     let loader_source = config_source
         .split("fn load_validated_country_mmdb_inner(")

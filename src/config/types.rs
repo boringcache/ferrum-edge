@@ -4918,7 +4918,7 @@ fn validate_pkcs11_key_source(
 /// configured request-time lookup-failure policy. A file that was read but is
 /// corrupt, the wrong MaxMind product, or incompatible with country lookups is
 /// rejected instead of being published as an apparently working policy.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum CountryMmdbLoadError {
     Unavailable(String),
     Invalid(String),
@@ -4983,6 +4983,7 @@ impl std::ops::Deref for CountryMmdbSnapshot {
 struct CountryMmdbGenerationHandoff {
     expected_paths: HashSet<PathBuf>,
     snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
+    failures: HashMap<PathBuf, CountryMmdbLoadError>,
     aggregate_budget: CountryMmdbAggregateBudget,
 }
 
@@ -5143,6 +5144,24 @@ impl CountryMmdbCache {
         handoff.aggregate_budget.admit(path, size)
     }
 
+    fn record_validation_failure(
+        &mut self,
+        generation: u64,
+        path: &str,
+        error: CountryMmdbLoadError,
+    ) -> Result<(), CountryMmdbLoadError> {
+        let handoff = self
+            .validation_handoffs
+            .get_mut(&generation)
+            .ok_or_else(|| {
+                CountryMmdbLoadError::Invalid(
+                    "MaxMind database validation generation is no longer active".to_string(),
+                )
+            })?;
+        handoff.failures.insert(PathBuf::from(path), error);
+        Ok(())
+    }
+
     fn abort_validation_generation(&mut self, generation: u64) {
         self.active_validation_generations.remove(&generation);
         self.validation_handoffs.remove(&generation);
@@ -5257,6 +5276,7 @@ impl CountryMmdbValidationGeneration {
             CountryMmdbGenerationHandoff {
                 expected_paths,
                 snapshots: HashMap::new(),
+                failures: HashMap::new(),
                 aggregate_budget: CountryMmdbAggregateBudget::default(),
             },
         );
@@ -5297,6 +5317,7 @@ impl Drop for CountryMmdbValidationGeneration {
 #[derive(Default)]
 struct CountryMmdbLoadSessionState {
     snapshots: HashMap<PathBuf, Arc<CountryMmdbSnapshot>>,
+    failures: HashMap<PathBuf, CountryMmdbLoadError>,
     aggregate_budget: CountryMmdbAggregateBudget,
 }
 
@@ -5319,6 +5340,7 @@ impl CountryMmdbLoadSession {
         let state = handoff
             .map(|handoff| CountryMmdbLoadSessionState {
                 snapshots: handoff.snapshots,
+                failures: handoff.failures,
                 aggregate_budget: handoff.aggregate_budget,
             })
             .unwrap_or_default();
@@ -5355,6 +5377,9 @@ impl CountryMmdbLoadSession {
         })?;
         if let Some(snapshot) = state.snapshots.get(&path_key) {
             return Ok(Arc::clone(snapshot));
+        }
+        if let Some(error) = state.failures.get(&path_key) {
+            return Err(error.clone());
         }
 
         let loaded =
@@ -5776,9 +5801,18 @@ fn validate_mmdb_file_for_generation(
     path: &str,
     generation: &CountryMmdbValidationGeneration,
 ) -> Result<(), String> {
-    load_validated_country_mmdb_inner(path, Some(generation.id()), None)
-        .map(|_| ())
-        .map_err(|error| format!("{field_name}: {error}"))
+    match load_validated_country_mmdb_inner(path, Some(generation.id()), None) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let mut cache = country_mmdb_snapshot_cache()
+                .lock()
+                .map_err(|_| "MaxMind database snapshot cache is unavailable".to_string())?;
+            cache
+                .record_validation_failure(generation.id(), path, error.clone())
+                .map_err(|record_error| record_error.to_string())?;
+            Err(format!("{field_name}: {error}"))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -118,26 +118,38 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     }
     // Serving modes reject malformed fail-closed plugins while staging the
     // PluginCache. CP mode has no runtime PluginCache, so validate the
-    // security-critical ip_restriction shape here as well before a database
-    // snapshot or delta can be accepted and broadcast. This intentionally
-    // invokes the same side-effect-free constructor used by file/admin/DP
-    // admission rather than duplicating its allowed-key contract.
+    // security-critical ip_restriction and geo_restriction shapes here as well
+    // before a database snapshot or delta can be accepted and broadcast. This
+    // intentionally invokes the same side-effect-free validators used by
+    // file/admin/DP admission rather than duplicating their allowed-key
+    // contracts. Geo shape validation never opens its node-local MMDB.
     //
     // Do not generalize this from PluginFailurePolicy::FailClosed alone. That
     // policy describes data-plane cache publication, not a pure CP schema
     // contract: some registered constructors intentionally depend on node-local
-    // resources (for example geo_restriction's MMDB), while adaptive_concurrency
-    // requires gateway/cache state. Broader CP parity needs explicit shape-only
-    // validators and mode/resource contracts for each such plugin.
+    // resources, while adaptive_concurrency requires gateway/cache state.
+    // Broader CP parity needs explicit shape-only validators and mode/resource
+    // contracts for each such plugin.
     for plugin_config in &config.plugin_configs {
-        if plugin_config.enabled
-            && plugin_config.plugin_name == "ip_restriction"
-            && let Err(error) =
+        if !plugin_config.enabled {
+            continue;
+        }
+        let shape_error = match plugin_config.plugin_name.as_str() {
+            "ip_restriction" => {
                 crate::plugins::ip_restriction::IpRestriction::new(&plugin_config.config)
-        {
+                    .map(|_| ())
+            }
+            "geo_restriction" => {
+                crate::plugins::geo_restriction::GeoRestriction::validate_config(
+                    &plugin_config.config,
+                )
+            }
+            _ => continue,
+        };
+        if let Err(error) = shape_error {
             errors.push(format!(
-                "Plugin 'ip_restriction' (id={}): {error}",
-                plugin_config.id
+                "Plugin '{}' (id={}): {error}",
+                plugin_config.plugin_name, plugin_config.id
             ));
         }
     }
@@ -713,6 +725,35 @@ mod tests {
         };
 
         assert_single_rejecting_error(config, "unknown configuration field 'alow'");
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_includes_invalid_geo_restriction_shape() {
+        let config = GatewayConfig {
+            plugin_configs: vec![PluginConfig {
+                id: "broadened-geo-policy".to_string(),
+                namespace: default_namespace(),
+                plugin_name: "geo_restriction".to_string(),
+                config: json!({
+                    "db_path": "/data/GeoLite2-Country.mmdb",
+                    "allow_countries": null,
+                    "on_lookup_failure": "deny"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(
+            config,
+            "'allow_countries' must be an array of ISO country codes",
+        );
     }
 
     #[test]

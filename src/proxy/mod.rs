@@ -7794,6 +7794,34 @@ impl ProxyState {
             return ConfigApplyOutcome::rejected(errors);
         }
 
+        // Incremental database and CP/DP deltas stage plugin caches directly
+        // on this async call path. Preload every MMDB that the prospective
+        // delta would reconstruct on the blocking pool, then let the cache
+        // stage claim the generation handoff without synchronous file work.
+        let prospective_delta =
+            crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+        let prospective_proxy_rebuilds =
+            prospective_delta.proxy_ids_needing_plugin_rebuild(&new_config);
+        if crate::plugin_cache::country_mmdb_preload_required(
+            &new_config,
+            &prospective_proxy_rebuilds,
+            prospective_delta.global_plugin_configs_changed,
+        ) {
+            new_config = match crate::config::validation_pipeline::validate_plugin_file_dependencies_off_thread(
+                new_config,
+                crate::config::validation_pipeline::ValidationAction::Warn,
+            )
+            .await
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    let message = format!("incremental plugin file validation failed: {error}");
+                    error!("Incremental config rejected: {}", message);
+                    return ConfigApplyOutcome::rejected_one(message);
+                }
+            };
+        }
+
         let mut applied_delta = None;
         // See `update_config` rustdoc nearby for why this is a `Cell` and not
         // a plain `let mut bool`.
@@ -7803,7 +7831,29 @@ impl ProxyState {
             |current| {
                 let delta = crate::config_delta::ConfigDelta::compute(&current.config, &new_config);
                 if delta.is_empty() {
-                    return Ok(None);
+                    // A concurrent writer can make the prospective delta above
+                    // disappear after its off-thread MMDB generation was
+                    // accepted. Claim and publish that handoff rather than
+                    // leaving it unowned or retaining stale geo readers.
+                    let Some(plugin_cache) = self
+                        .plugin_cache
+                        .build_country_mmdb_reload_inner(
+                            &current.plugin_cache,
+                            &new_config,
+                            false,
+                        )?
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&staged_config),
+                        route_table: Arc::clone(&current.route_table),
+                        plugin_cache,
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: false,
+                        lb_changed: false,
+                    }));
                 }
                 let staged = self.stage_incremental_request_epoch(
                     current,
@@ -7830,7 +7880,10 @@ impl ProxyState {
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
-        let delta = applied_delta.expect("delta captured when publish_result is Some");
+        let Some(delta) = applied_delta else {
+            debug!("Incremental config: accepted MMDB-only generation republished");
+            return ConfigApplyOutcome::Applied;
+        };
 
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {

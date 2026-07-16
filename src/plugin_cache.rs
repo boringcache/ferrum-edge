@@ -888,6 +888,34 @@ fn country_mmdb_plugin_is_active(config: &GatewayConfig, plugin_config: &PluginC
     }
 }
 
+/// Whether an incremental cache stage would construct at least one active geo
+/// plugin and therefore needs an off-thread MMDB validation handoff first.
+pub(crate) fn country_mmdb_preload_required(
+    config: &GatewayConfig,
+    proxy_ids_to_rebuild: &HashSet<String>,
+    rebuild_globals: bool,
+) -> bool {
+    config.plugin_configs.iter().any(|plugin_config| {
+        if !country_mmdb_plugin_is_active(config, plugin_config) {
+            return false;
+        }
+        match &plugin_config.scope {
+            PluginScope::Global => rebuild_globals,
+            PluginScope::Proxy => plugin_config
+                .proxy_id
+                .as_ref()
+                .is_some_and(|proxy_id| proxy_ids_to_rebuild.contains(proxy_id)),
+            PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+                proxy_ids_to_rebuild.contains(&proxy.id)
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == plugin_config.id)
+            }),
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_create_plugin_for_cache(
     plugin_config: &PluginConfig,
