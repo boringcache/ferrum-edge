@@ -80,11 +80,157 @@ pub use router_cache::{RouteMatch, RouterCache};
 pub mod _test_support {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use hyper::StatusCode;
 
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
+
+    pub fn bind_authorized_backend_path_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        path: &str,
+    ) {
+        ctx.bind_authorized_backend_path(path.to_string());
+    }
+
+    // ── adaptive_concurrency lifecycle ──────────────────────────────────────
+    pub struct AdaptiveConcurrencyDecreaseHarness {
+        limit: AtomicU64,
+        config: crate::adaptive_concurrency::AdaptiveConcurrencyConfig,
+    }
+
+    impl AdaptiveConcurrencyDecreaseHarness {
+        pub fn new(
+            initial_limit: u64,
+            min_limit: u64,
+            max_limit: u64,
+            decrease_ratio: f64,
+        ) -> Self {
+            Self {
+                limit: AtomicU64::new(initial_limit),
+                config: crate::adaptive_concurrency::AdaptiveConcurrencyConfig {
+                    key_by: crate::adaptive_concurrency::AdaptiveConcurrencyKeyBy::Proxy,
+                    max_tracked_keys: 1,
+                    min_limit,
+                    initial_limit,
+                    max_limit,
+                    min_samples: 1,
+                    target_latency_multiplier: 1.5,
+                    decrease_ratio,
+                    increase_step: 1,
+                    shadow_mode: false,
+                    expose_headers: false,
+                },
+            }
+        }
+
+        pub fn limit(&self) -> u64 {
+            self.limit.load(Ordering::Acquire)
+        }
+
+        pub fn decrease_from_observed_limit(&self, observed_limit: u64) {
+            crate::adaptive_concurrency::decrease_limit(&self.limit, &self.config, observed_limit);
+        }
+    }
+
+    pub struct AdaptiveConcurrencyTransitionHarness {
+        transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition,
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct AdaptiveConcurrencyResetToken {
+        reset: crate::adaptive_concurrency::AdaptiveConcurrencyResetEpoch,
+    }
+
+    impl AdaptiveConcurrencyTransitionHarness {
+        pub fn new() -> Self {
+            Self {
+                transition: crate::adaptive_concurrency::AdaptiveConcurrencyPolicyTransition::new(),
+            }
+        }
+
+        pub fn observe(&self) -> u64 {
+            self.transition.load()
+        }
+
+        pub fn begin_structural_reset(&self) -> AdaptiveConcurrencyResetToken {
+            AdaptiveConcurrencyResetToken {
+                reset: self.transition.begin_structural_reset(),
+            }
+        }
+
+        pub fn try_begin_structural_reset(&self) -> Option<AdaptiveConcurrencyResetToken> {
+            self.transition
+                .try_begin_structural_reset()
+                .map(|reset| AdaptiveConcurrencyResetToken { reset })
+        }
+
+        pub fn try_begin_observed_drain_reset(
+            &self,
+            observed: u64,
+        ) -> Option<AdaptiveConcurrencyResetToken> {
+            self.transition
+                .try_begin_drain_reset(observed)
+                .map(|reset| AdaptiveConcurrencyResetToken { reset })
+        }
+
+        pub fn finish_reset(&self, reset: AdaptiveConcurrencyResetToken, drain: bool) -> bool {
+            self.transition.finish_reset(reset.reset, drain)
+        }
+
+        pub fn is_active(&self) -> bool {
+            self.transition.is_active()
+        }
+    }
+
+    impl Default for AdaptiveConcurrencyTransitionHarness {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[allow(dead_code)] // owning the guard is the behavior exercised by cancellation tests
+    pub struct JwksDiscoveryCandidateForTest(
+        crate::plugins::utils::jwks_cache::DiscoveryStoreCandidate,
+    );
+
+    pub fn jwks_discovery_candidate_for_test(
+        jwks_uri: &str,
+        http_client: crate::plugins::PluginHttpClient,
+        refresh_interval: Duration,
+    ) -> JwksDiscoveryCandidateForTest {
+        JwksDiscoveryCandidateForTest(
+            crate::plugins::utils::jwks_cache::DiscoveryStoreCandidate::acquire(
+                jwks_uri,
+                &http_client,
+                refresh_interval,
+            ),
+        )
+    }
+
+    pub fn oidc_sealed_refresh_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        claims: serde_json::Value,
+        refresh_token: Option<String>,
+        refresh_due: bool,
+        rolling_due: bool,
+    ) -> Result<String, String> {
+        plugin.sealed_refresh_session_cookie_for_tests(
+            claims,
+            refresh_token,
+            refresh_due,
+            rolling_due,
+        )
+    }
+
+    pub fn oidc_open_session_cookie_for_test(
+        plugin: &crate::plugins::oidc_relying_party::OidcRelyingParty,
+        cookie: &str,
+    ) -> Option<serde_json::Value> {
+        plugin.open_session_cookie_for_tests(cookie)
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     pub struct OidcSessionStateForTest {
@@ -660,6 +806,39 @@ pub mod _test_support {
 
     pub fn response_content_type(original_ct: &str) -> &'static str {
         crate::plugins::grpc_web::response_content_type(original_ct)
+    }
+
+    pub fn finalize_grpc_web_error_response_headers(
+        response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
+        initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+        finalized_reject_headers: Option<&HashMap<String, String>>,
+    ) {
+        crate::proxy::finalize_grpc_web_error_response_headers(
+            response,
+            initial_response_header_policy_plugins,
+            finalized_reject_headers,
+        );
+    }
+
+    pub async fn run_h3_reject_response_committed_hooks(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        flavor: crate::config::types::HttpFlavor,
+        grpc_web_response_content_type: Option<&str>,
+        http_status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) {
+        crate::http3::server::run_h3_reject_response_committed_hooks(
+            plugins,
+            ctx,
+            flavor,
+            grpc_web_response_content_type,
+            http_status,
+            body,
+            headers,
+        )
+        .await;
     }
 
     // ── proxy/mod ────────────────────────────────────────────────────────────

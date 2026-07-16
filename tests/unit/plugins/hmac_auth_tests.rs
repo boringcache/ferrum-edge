@@ -5,19 +5,22 @@ use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::{
-    HTTP_FAMILY_PROTOCOLS, Plugin, RequestContext, hmac_auth::HmacAuth, priority,
+    HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, hmac_auth::HmacAuth, priority,
 };
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use super::plugin_utils::{assert_continue, assert_reject};
+use super::plugin_utils::{assert_continue, assert_reject, create_test_proxy};
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
 
-const TEST_SECRET: &str = "my-hmac-secret-key";
+const TEST_SECRET: &str = "my-hmac-secret-key-at-least-32-bytes";
+const TEST_USERNAME: &str = "hmacuser";
+const TEST_AUTHORITY: &str = "api.example.com";
 
 fn default_config() -> Value {
     json!({})
@@ -25,18 +28,22 @@ fn default_config() -> Value {
 
 /// Create a consumer with hmac_auth credentials.
 fn create_hmac_consumer() -> Consumer {
+    create_hmac_consumer_named("hmac-consumer", TEST_USERNAME, TEST_SECRET)
+}
+
+fn create_hmac_consumer_named(id: &str, username: &str, secret: &str) -> Consumer {
     let mut credentials = HashMap::new();
     let mut hmac_creds = Map::new();
-    hmac_creds.insert("secret".to_string(), Value::String(TEST_SECRET.to_string()));
+    hmac_creds.insert("secret".to_string(), Value::String(secret.to_string()));
     credentials.insert(
         "hmac_auth".to_string(),
         Value::Array(vec![Value::Object(hmac_creds)]),
     );
 
     Consumer {
-        id: "hmac-consumer".to_string(),
+        id: id.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
-        username: "hmacuser".to_string(),
+        username: username.to_string(),
         custom_id: None,
         credentials,
         acl_groups: Vec::new(),
@@ -76,7 +83,10 @@ fn make_ctx(method: &str, path: &str) -> RequestContext {
     let empty_body = bytes::Bytes::new();
     ctx.headers
         .insert("digest".to_string(), sha256_digest_header(&empty_body));
-    ctx.request_body_bytes = Some(empty_body);
+    ctx.request_body_sha256 = Some(Sha256::digest(&empty_body).into());
+    ctx.request_body_sha512 = Some(Sha512::digest(&empty_body).into());
+    ctx.request_authority = Some(TEST_AUTHORITY.to_string());
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     ctx
 }
 
@@ -88,25 +98,32 @@ fn make_ctx_with_query(method: &str, path: &str, query: &str) -> RequestContext 
     ctx
 }
 
+fn set_ctx_namespace(ctx: &mut RequestContext, namespace: &str) {
+    let mut proxy = create_test_proxy();
+    proxy.namespace = namespace.to_string();
+    ctx.matched_proxy = Some(Arc::new(proxy));
+}
+
 /// Generate a current RFC 2822 date string.
 fn current_date() -> String {
     Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
-/// The signing string binds the query string between PATH and DATE:
-/// `METHOD\nPATH\nQUERY\nDATE\nDIGEST`. `make_ctx` produces requests with no
+/// Version 1 binds credential identity and authority before the request fields.
+/// `make_ctx` produces requests with no
 /// query, so the helpers below sign an empty query by default; tests that set
 /// a query string use `sign_sha256_with_query`.
-fn build_signing_string(
-    method: &str,
-    path: &str,
-    query: &str,
-    date: &str,
-    digest_header: &str,
-) -> String {
+fn build_signing_string(input: HmacSigningInput<'_>) -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}",
-        method, path, query, date, digest_header
+        "ferrum-hmac-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        input.namespace,
+        input.username,
+        input.authority,
+        input.method,
+        input.path,
+        input.query,
+        input.date,
+        input.digest_header
     )
 }
 
@@ -118,14 +135,23 @@ fn sign_sha256(secret: &str, method: &str, path: &str, date: &str) -> String {
 /// Compute an HMAC-SHA512 signature over an empty-body, no-query request.
 fn sign_sha512(secret: &str, method: &str, path: &str, date: &str) -> String {
     let digest_header = sha256_digest_header(&[]);
-    let signing_string = build_signing_string(method, path, "", date, &digest_header);
+    let signing_string = build_signing_string(HmacSigningInput {
+        namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+        username: TEST_USERNAME,
+        authority: TEST_AUTHORITY,
+        method,
+        path,
+        query: "",
+        date,
+        digest_header: &digest_header,
+    });
     let mut mac = HmacSha512::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
-/// Compute an HMAC-SHA256 signature over the 5-field signing string with an
-/// empty query (`METHOD\nPATH\n\nDATE\nDIGEST`).
+/// Compute an HMAC-SHA256 signature over version 1 with the default test
+/// identity, authority, and an empty query.
 fn sign_sha256_with_digest(
     secret: &str,
     method: &str,
@@ -133,7 +159,34 @@ fn sign_sha256_with_digest(
     date: &str,
     digest_header: &str,
 ) -> String {
-    let signing_string = build_signing_string(method, path, "", date, digest_header);
+    sign_sha256_for_identity(
+        secret,
+        HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            username: TEST_USERNAME,
+            authority: TEST_AUTHORITY,
+            method,
+            path,
+            query: "",
+            date,
+            digest_header,
+        },
+    )
+}
+
+struct HmacSigningInput<'a> {
+    namespace: &'a str,
+    username: &'a str,
+    authority: &'a str,
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+    date: &'a str,
+    digest_header: &'a str,
+}
+
+fn sign_sha256_for_identity(secret: &str, input: HmacSigningInput<'_>) -> String {
+    let signing_string = build_signing_string(input);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
@@ -148,10 +201,19 @@ fn sign_sha256_with_query(
     date: &str,
 ) -> String {
     let digest_header = sha256_digest_header(&[]);
-    let signing_string = build_signing_string(method, path, query, date, &digest_header);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-    mac.update(signing_string.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    sign_sha256_for_identity(
+        secret,
+        HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            username: TEST_USERNAME,
+            authority: TEST_AUTHORITY,
+            method,
+            path,
+            query,
+            date,
+            digest_header: &digest_header,
+        },
+    )
 }
 
 /// Build a `Digest:` (RFC 3230) header value of the form `sha-256=<base64>`
@@ -161,6 +223,15 @@ fn sha256_digest_header(body: &[u8]) -> String {
     hasher.update(body);
     let b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
     format!("sha-256={}", b64)
+}
+
+/// Build an RFC 9530 `Content-Digest` SHA-256 structured field.
+fn sha256_content_digest_header(body: &[u8]) -> String {
+    let digest = Sha256::digest(body);
+    format!(
+        "sha-256=:{}:",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    )
 }
 
 /// Build a `Digest:` header value of the form `sha-512=<base64>`.
@@ -229,7 +300,8 @@ async fn test_hmac_auth_default_requires_digest() {
     let plugin = HmacAuth::new(&json!({})).unwrap();
     assert!(plugin.requires_request_body_before_authenticate());
     assert!(plugin.requires_request_body_buffering());
-    assert!(plugin.needs_request_body_bytes());
+    assert!(!plugin.needs_request_body_bytes());
+    assert!(plugin.needs_request_body_digests());
 }
 
 #[tokio::test]
@@ -237,7 +309,10 @@ async fn test_hmac_auth_always_requires_body() {
     let plugin = HmacAuth::new(&default_config()).unwrap();
     assert!(plugin.requires_request_body_before_authenticate());
     assert!(plugin.requires_request_body_buffering());
-    assert!(plugin.needs_request_body_bytes());
+    assert!(!plugin.needs_request_body_bytes());
+    assert!(plugin.needs_request_body_digests());
+    assert!(!plugin.needs_request_body_text());
+    assert_eq!(plugin.request_body_buffer_limit(), Some(10 * 1024 * 1024));
 }
 
 #[tokio::test]
@@ -287,6 +362,453 @@ async fn test_valid_hmac_sha256() {
         ctx.identified_consumer.as_ref().unwrap().username,
         "hmacuser"
     );
+}
+
+#[tokio::test]
+async fn test_auth_params_accept_quoted_commas_escapes_and_mixed_case_names() {
+    let username = "ops,\"blue\\team";
+    let consumer = create_hmac_consumer_named("quoted-user", username, TEST_SECRET);
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let method = "GET";
+    let path = "/quoted";
+    let date = current_date();
+    let digest = sha256_digest_header(&[]);
+    let signature = sign_sha256_for_identity(
+        TEST_SECRET,
+        HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            username,
+            authority: TEST_AUTHORITY,
+            method,
+            path,
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
+    );
+    let mut ctx = make_ctx(method, path);
+    ctx.headers.insert(
+        "authorization".to_string(),
+        format!(
+            r#"hmac UserName="ops,\"blue\\team", ALGORITHM="hmac-sha256", Signature="{}""#,
+            signature
+        ),
+    );
+    ctx.headers.insert("date".to_string(), date);
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, username);
+}
+
+#[tokio::test]
+async fn test_auth_params_reject_unclosed_quotes_and_duplicates() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    for authorization in [
+        r#"hmac username="hmacuser, algorithm="hmac-sha256", signature="abc""#,
+        r#"hmac username="hmacuser", Username="other", signature="abc""#,
+        r#"hmac username="hmacuser", signature="abc", Signature="def""#,
+    ] {
+        let mut ctx = make_ctx("GET", "/test");
+        ctx.headers
+            .insert("authorization".to_string(), authorization.to_string());
+        ctx.headers.insert("date".to_string(), current_date());
+        assert_reject(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            Some(401),
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_signature_binds_authority_and_username() {
+    let shared = "shared-hmac-secret-at-least-32-characters";
+    let consumers = [
+        create_hmac_consumer_named("alice-id", "alice", shared),
+        create_hmac_consumer_named("bob-id", "bob", shared),
+    ];
+    let consumer_index = ConsumerIndex::new(&consumers);
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let date = current_date();
+    let digest = sha256_digest_header(&[]);
+    let signature = sign_sha256_for_identity(
+        shared,
+        HmacSigningInput {
+            namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            username: "alice",
+            authority: TEST_AUTHORITY,
+            method: "GET",
+            path: "/bound",
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
+    );
+
+    let mut relabeled = make_ctx("GET", "/bound");
+    relabeled.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("bob", Some("hmac-sha256"), &signature),
+    );
+    relabeled.headers.insert("date".to_string(), date.clone());
+    assert_reject(
+        plugin.authenticate(&mut relabeled, &consumer_index).await,
+        Some(401),
+    );
+
+    let mut cross_host = make_ctx("GET", "/bound");
+    cross_host.request_authority = Some("other.example.com".to_string());
+    cross_host.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("alice", Some("hmac-sha256"), &signature),
+    );
+    cross_host.headers.insert("date".to_string(), date);
+    assert_reject(
+        plugin.authenticate(&mut cross_host, &consumer_index).await,
+        Some(401),
+    );
+}
+
+#[tokio::test]
+async fn test_signature_and_identity_lookup_are_namespace_scoped() {
+    let shared = "cross-namespace-reused-hmac-secret-at-least-32-characters";
+    let mut tenant_a = create_hmac_consumer_named("tenant-a-id", "alice", shared);
+    tenant_a.namespace = "tenant-a".to_string();
+    let mut tenant_b = create_hmac_consumer_named("tenant-b-id", "bob", shared);
+    tenant_b.namespace = "tenant-b".to_string();
+    let consumer_index = ConsumerIndex::new(&[tenant_a, tenant_b]);
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let date = current_date();
+    let digest = sha256_digest_header(&[]);
+
+    let tenant_a_signature = sign_sha256_for_identity(
+        shared,
+        HmacSigningInput {
+            namespace: "tenant-a",
+            username: "alice",
+            authority: TEST_AUTHORITY,
+            method: "GET",
+            path: "/bound",
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
+    );
+    let mut replayed_in_tenant_b = make_ctx("GET", "/bound");
+    set_ctx_namespace(&mut replayed_in_tenant_b, "tenant-b");
+    replayed_in_tenant_b.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("alice", Some("hmac-sha256"), &tenant_a_signature),
+    );
+    replayed_in_tenant_b
+        .headers
+        .insert("date".to_string(), date.clone());
+    assert_reject(
+        plugin
+            .authenticate(&mut replayed_in_tenant_b, &consumer_index)
+            .await,
+        Some(401),
+    );
+
+    let tenant_b_wrong_identity = sign_sha256_for_identity(
+        shared,
+        HmacSigningInput {
+            namespace: "tenant-b",
+            username: "alice",
+            authority: TEST_AUTHORITY,
+            method: "GET",
+            path: "/bound",
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
+    );
+    let mut wrong_identity = make_ctx("GET", "/bound");
+    set_ctx_namespace(&mut wrong_identity, "tenant-b");
+    wrong_identity.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("alice", Some("hmac-sha256"), &tenant_b_wrong_identity),
+    );
+    wrong_identity
+        .headers
+        .insert("date".to_string(), date.clone());
+    assert_reject(
+        plugin
+            .authenticate(&mut wrong_identity, &consumer_index)
+            .await,
+        Some(401),
+    );
+
+    let tenant_b_signature = sign_sha256_for_identity(
+        shared,
+        HmacSigningInput {
+            namespace: "tenant-b",
+            username: "bob",
+            authority: TEST_AUTHORITY,
+            method: "GET",
+            path: "/bound",
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
+    );
+    let mut valid_tenant_b = make_ctx("GET", "/bound");
+    set_ctx_namespace(&mut valid_tenant_b, "tenant-b");
+    valid_tenant_b.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("bob", Some("hmac-sha256"), &tenant_b_signature),
+    );
+    valid_tenant_b.headers.insert("date".to_string(), date);
+    assert_continue(
+        plugin
+            .authenticate(&mut valid_tenant_b, &consumer_index)
+            .await,
+    );
+    assert_eq!(
+        valid_tenant_b.identified_consumer.unwrap().id,
+        "tenant-b-id"
+    );
+}
+
+#[tokio::test]
+async fn test_pre_auth_body_screening_requires_a_verified_signature() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let date = current_date();
+    let signature = sign_sha256(TEST_SECRET, "POST", "/upload", &date);
+    let mut valid = make_ctx("POST", "/upload");
+    valid.request_body_bytes = None;
+    valid.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+    );
+    valid.headers.insert("date".to_string(), date.clone());
+    assert!(plugin.should_buffer_request_body_before_authenticate(&valid, &consumer_index));
+
+    // A wrong-secret signature is still well-formed base64 with exactly the
+    // expected 32-byte decoded length. Knowing a real username must not be
+    // enough to opt into the 10 MiB pre-auth collection budget.
+    let wrong_signature = sign_sha256(
+        "wrong-secret-that-is-still-long-enough-for-the-test",
+        "POST",
+        "/upload",
+        &date,
+    );
+    let mut known_wrong = make_ctx("POST", "/upload");
+    known_wrong.request_body_bytes = None;
+    known_wrong.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &wrong_signature),
+    );
+    known_wrong.headers.insert("date".to_string(), date.clone());
+    let known_wrong_buffers =
+        plugin.should_buffer_request_body_before_authenticate(&known_wrong, &consumer_index);
+
+    let mut unknown = make_ctx("POST", "/upload");
+    unknown.request_body_bytes = None;
+    unknown.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("unknown", Some("hmac-sha256"), &wrong_signature),
+    );
+    unknown.headers.insert("date".to_string(), date.clone());
+    let unknown_buffers =
+        plugin.should_buffer_request_body_before_authenticate(&unknown, &consumer_index);
+
+    assert!(!known_wrong_buffers);
+    assert_eq!(known_wrong_buffers, unknown_buffers);
+
+    // Both non-buffered paths must also expose the same authentication result,
+    // independent of whether the username exists.
+    let known_wrong_reject = match plugin.authenticate(&mut known_wrong, &consumer_index).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => (status_code, body),
+        other => panic!("expected known wrong signature to reject, got {other:?}"),
+    };
+    let unknown_reject = match plugin.authenticate(&mut unknown, &consumer_index).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => (status_code, body),
+        other => panic!("expected unknown consumer to reject, got {other:?}"),
+    };
+    assert_eq!(known_wrong_reject, unknown_reject);
+
+    let mut malformed = make_ctx("POST", "/upload");
+    malformed.headers.insert(
+        "authorization".to_string(),
+        r#"hmac username="hmacuser", signature="not-base64""#.to_string(),
+    );
+    malformed.headers.insert("date".to_string(), date);
+    assert!(!plugin.should_buffer_request_body_before_authenticate(&malformed, &consumer_index));
+}
+
+#[tokio::test]
+async fn test_preverified_reuse_still_rejects_final_digest_mismatch() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let method = "POST";
+    let path = "/upload";
+    let date = current_date();
+    let signed_body = br#"{"amount":1}"#;
+    let digest = sha256_digest_header(signed_body);
+    let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
+
+    let mut tampered = make_ctx(method, path);
+    tampered.request_body_sha256 = None;
+    tampered.request_body_sha512 = None;
+    tampered.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+    );
+    tampered.headers.insert("date".to_string(), date.clone());
+    tampered
+        .headers
+        .insert("digest".to_string(), digest.clone());
+
+    assert!(
+        plugin.should_buffer_request_body_before_authenticate(&tampered, &consumer_index),
+        "a valid pre-body signature must enable body collection"
+    );
+    assert!(
+        format!("{tampered:?}").contains("HmacPrebufferState { staged: true }"),
+        "the request-scoped reuse path should be staged"
+    );
+    assert!(
+        format!("{:?}", tampered.clone()).contains("HmacPrebufferState { staged: false }"),
+        "request-context clones must not inherit staged HMAC credentials"
+    );
+
+    set_request_body(&mut tampered, br#"{"amount":999}"#);
+    assert_reject(
+        plugin.authenticate(&mut tampered, &consumer_index).await,
+        Some(401),
+    );
+    assert!(tampered.identified_consumer.is_none());
+
+    // Exercise the same staged path with matching bytes to prove the
+    // preverified signature remains sufficient to reach post-body auth.
+    let mut valid = make_ctx(method, path);
+    valid.request_body_sha256 = None;
+    valid.request_body_sha512 = None;
+    valid.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+    );
+    valid.headers.insert("date".to_string(), date);
+    valid.headers.insert("digest".to_string(), digest);
+    assert!(plugin.should_buffer_request_body_before_authenticate(&valid, &consumer_index));
+    set_request_body(&mut valid, signed_body);
+    assert_continue(plugin.authenticate(&mut valid, &consumer_index).await);
+    assert_eq!(valid.identified_consumer.unwrap().username, TEST_USERNAME);
+}
+
+#[tokio::test]
+async fn test_preverified_reuse_verifies_seeded_empty_body_digests() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        let path = "/empty";
+        let date = current_date();
+        let digest = sha256_content_digest_header(&[]);
+        let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
+        let mut ctx = make_ctx(method, path);
+        ctx.request_body_sha256 = None;
+        ctx.request_body_sha512 = None;
+        ctx.headers.remove("digest");
+        ctx.headers.insert(
+            "authorization".to_string(),
+            hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+        );
+        ctx.headers.insert("date".to_string(), date);
+        ctx.headers.insert("content-digest".to_string(), digest);
+
+        assert!(
+            plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
+            "{method} should stage a correctly signed empty-body request"
+        );
+        // Mirrors the shared proxy boundary after Incoming has definitively
+        // reported END_STREAM without requiring body collection.
+        set_request_body(&mut ctx, &[]);
+        assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+        assert_eq!(ctx.identified_consumer.unwrap().username, TEST_USERNAME);
+    }
+
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        let path = "/empty";
+        let date = current_date();
+        let incorrect_digest = sha256_content_digest_header(b"not empty");
+        let signature =
+            sign_sha256_with_digest(TEST_SECRET, method, path, &date, &incorrect_digest);
+        let mut ctx = make_ctx(method, path);
+        ctx.request_body_sha256 = None;
+        ctx.request_body_sha512 = None;
+        ctx.headers.remove("digest");
+        ctx.headers.insert(
+            "authorization".to_string(),
+            hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+        );
+        ctx.headers.insert("date".to_string(), date);
+        ctx.headers
+            .insert("content-digest".to_string(), incorrect_digest);
+
+        assert!(
+            plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
+            "{method} has a valid signature even though its body digest is wrong"
+        );
+        set_request_body(&mut ctx, &[]);
+        assert_reject(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            Some(401),
+        );
+        assert!(ctx.identified_consumer.is_none());
+    }
+}
+
+#[tokio::test]
+async fn test_preverified_reuse_discards_changed_authorization() {
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let method = "POST";
+    let path = "/upload";
+    let date = current_date();
+    let body = br#"{"amount":1}"#;
+    let digest = sha256_digest_header(body);
+    let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
+
+    let mut ctx = make_ctx(method, path);
+    ctx.request_body_sha256 = None;
+    ctx.request_body_sha512 = None;
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &signature),
+    );
+    ctx.headers.insert("date".to_string(), date.clone());
+    ctx.headers.insert("digest".to_string(), digest);
+    assert!(plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index));
+
+    // No plug-in hook runs between screening and authentication in H1/H2/H3,
+    // but bind the cache defensively so a future lifecycle change cannot reuse
+    // a preverified result after the credential header changes.
+    let wrong_signature = sign_sha256_with_digest(
+        "wrong-secret-that-cannot-authenticate",
+        method,
+        path,
+        &date,
+        ctx.headers.get("digest").unwrap(),
+    );
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &wrong_signature),
+    );
+    set_request_body(&mut ctx, body);
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+    assert!(ctx.identified_consumer.is_none());
 }
 
 // ── 2. Valid HMAC-SHA512 authentication (digest signing) ─────
@@ -1035,7 +1557,8 @@ async fn test_hmac_multi_secret_wrong_secret_rejected() {
 /// Helper to populate the buffered request body in a way that mirrors what
 /// the proxy hot path does in `store_request_body_metadata`.
 fn set_request_body(ctx: &mut RequestContext, body: &[u8]) {
-    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+    ctx.request_body_sha256 = Some(Sha256::digest(body).into());
+    ctx.request_body_sha512 = Some(Sha512::digest(body).into());
     if let Ok(s) = std::str::from_utf8(body) {
         ctx.metadata
             .insert("request_body".to_string(), s.to_string());
@@ -1223,7 +1746,7 @@ async fn test_digest_required_sha512_digest_accepted() {
 
 #[tokio::test]
 async fn test_digest_required_content_digest_header_accepted() {
-    // RFC 9421 Content-Digest header is also accepted.
+    // RFC 9530 Content-Digest structured-field form is accepted.
     let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -1232,7 +1755,8 @@ async fn test_digest_required_content_digest_header_accepted() {
     let path = "/api/data";
     let date = current_date();
     let body = br#"{"hello":"world"}"#;
-    let digest = sha256_digest_header(body);
+    let legacy_digest = sha256_digest_header(body);
+    let digest = format!("sha-256=:{}:", legacy_digest.trim_start_matches("sha-256="));
     let signature = sign_sha256_with_digest(TEST_SECRET, method, path, &date, &digest);
 
     let mut ctx = make_ctx(method, path);
@@ -1241,7 +1765,7 @@ async fn test_digest_required_content_digest_header_accepted() {
         hmac_auth_header("hmacuser", Some("hmac-sha256"), &signature),
     );
     ctx.headers.insert("date".to_string(), date);
-    // RFC 9421 header name (instead of RFC 3230 `Digest`).
+    // RFC 9530 header name and byte-sequence syntax (instead of legacy Digest).
     ctx.headers.insert("content-digest".to_string(), digest);
     set_request_body(&mut ctx, body);
     ctx.identified_consumer = None;
@@ -1272,7 +1796,7 @@ async fn test_digest_required_empty_body_with_digest() {
     );
     ctx.headers.insert("date".to_string(), date);
     ctx.headers.insert("digest".to_string(), digest);
-    // request_body_bytes is None — verify_body_digest treats absent body as empty.
+    // Empty-body hash snapshots were populated by `make_ctx`.
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;

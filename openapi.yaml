@@ -6455,7 +6455,7 @@ components:
               items:
                 $ref: "#/components/schemas/HmacAuthCredential"
               minItems: 1
-              description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username in Authorization header; all secrets tried.
+              description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username within the matched proxy namespace; all secrets tried.
             mtls_auth:
               type: array
               items:
@@ -6559,16 +6559,21 @@ components:
     HmacAuthCredential:
       type: object
       required: [secret]
+      additionalProperties: false
       properties:
         secret:
           type: string
+          minLength: 32
           writeOnly: true
           description: >-
-            Shared secret for HMAC signature computation and verification.
+            Shared secret for HMAC signature computation and verification. Must
+            contain at least 32 non-whitespace characters and must not be
+            shared by different Consumers within one namespace. Separate
+            namespaces may reuse the same secret.
       description: >-
         HMAC auth credential for the `hmac_auth` plugin. Consumer is looked up
-        by username in the Authorization header; all secrets are tried until one
-        verifies the signature.
+        by username within the matched proxy namespace; all secrets are tried
+        until one verifies the namespace-bound signature.
 
     MtlsAuthCredential:
       type: object
@@ -6945,6 +6950,7 @@ components:
               plugin_name:
                 const: bot_detection
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/BotDetectionConfig"
@@ -11196,6 +11202,7 @@ components:
 
     JwksAuthConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: jwks_auth — Multi-provider JWKS JWT validation with claim-based authorization."
       required: [providers]
       properties:
@@ -11203,10 +11210,11 @@ components:
           type: array
           items:
             type: object
+            additionalProperties: false
             properties:
               jwks_uri:
                 type: string
-                description: Direct URL to the IdP's JWKS endpoint
+                description: Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or localhost endpoints. URL userinfo is rejected.
               discovery_url:
                 type: string
                 description: >-
@@ -11214,7 +11222,8 @@ components:
                   jwks_uri must use the same origin as the discovery URL
                   (scheme, host, and effective port). For IdPs that serve JWKS
                   from a different origin than discovery, configure jwks_uri
-                  directly instead.
+                  directly instead. HTTPS is required except for literal
+                  loopback or localhost endpoints. URL userinfo is rejected.
               jwks:
                 oneOf:
                   - type: string
@@ -11235,6 +11244,7 @@ components:
                 type: array
                 items:
                   type: object
+                  additionalProperties: false
                   required: [name]
                   properties:
                     name:
@@ -11554,8 +11564,11 @@ components:
                     type: string
               redirect_uri:
                 type: string
+                description: Absolute callback URI registered with the provider. Before issuing a browser challenge, Ferrum requires its host to match the validated request Host/:authority; DNS comparison is case-insensitive, IP literals compare by address, and ports are ignored. Trailing-dot DNS callback hosts and missing, malformed, or cross-host request authorities fail closed before state or cookies are issued.
               callback_path:
                 type: string
+                default: /oauth/callback
+                description: Callback path handled by Ferrum; must equal the path in redirect_uri.
               logout_path:
                 type: string
                 default: /oauth/logout
@@ -11635,6 +11648,7 @@ components:
               default: lax
             domain:
               type: string
+              description: Optional Domain attribute for the durable session cookie. The short-lived browser correlation cookie always remains host-only and never inherits this value.
             path:
               type: string
               default: /
@@ -11771,6 +11785,9 @@ components:
         directory permits anonymous reads of group objects, so a service account
         is recommended. TLS connections (`ldaps://`/STARTTLS) honor the gateway
         CRL (`FERRUM_TLS_CRL_FILE_PATH`), rejecting revoked server certificates.
+        Every connection/reconnection performs an uncached A+AAAA lookup, screens
+        the complete candidate set and each imminent dial under the active backend
+        egress policy, and retains the configured hostname for TLS/SNI verification.
         Non-loopback plaintext `ldap://` is rejected unless the development-only
         `allow_plaintext` override is explicitly enabled. Search-then-bind requires
         a canonical identity attribute, rejects ambiguous searches, and exports the
@@ -11832,7 +11849,7 @@ components:
           pattern: "^ldaps?://"
           not:
             pattern: "^ldaps?://[^/?#]*@"
-          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected."
+          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected. Each connection freshly resolves and policy-screens all A/AAAA candidates while retaining this hostname for TLS/SNI verification."
           example: "ldaps://ldap.example.com:636"
         bind_dn_template:
           type: string
@@ -11897,7 +11914,7 @@ components:
           default: 5
           minimum: 1
           maximum: 300
-          description: "Per-connection and per-operation timeout in seconds; also applied as the server-side LDAP search time limit"
+          description: "Per-connection DNS resolution, candidate TCP/TLS establishment, and per-operation timeout in seconds; also applied as the server-side LDAP search time limit"
         request_timeout_seconds:
           type: integer
           format: uint64
@@ -11931,7 +11948,17 @@ components:
 
     HmacAuthConfig:
       type: object
-      description: "Plugin: hmac_auth — HMAC signature verification with mandatory request-body integrity protection (RFC 9421 / RFC 3230). Requests must include a Digest or Content-Digest header that matches the request body; the digest header value and the raw query string are folded into the HMAC signing string (METHOD\\nPATH\\nQUERY\\nDATE\\nDIGEST), so altering query parameters or the body invalidates the signature. Note: the signed Date header provides a bounded freshness window (now ± clock_skew_seconds), not single-use replay prevention — there is no nonce store, so a captured valid request can be replayed within the window. Consumer credentials store the shared secret."
+      description: >-
+        Plugin: hmac_auth — Ferrum-specific versioned HMAC authorization with
+        mandatory request-body integrity protection. RFC 9530 defines
+        Content-Digest; this is not RFC 9421 HTTP Message Signatures. Requests
+        must include Digest or Content-Digest matching the original body.
+        Version 1 signs the matched proxy namespace, credential identity,
+        normalized authority, method, path, raw query, Date, and literal digest
+        value. HBONE CONNECT and
+        request-body-transformer compositions fail closed. The
+        pre-authentication body path has a 10 MiB hard ceiling. Date provides a
+        bounded freshness window, not single-use replay prevention.
       properties:
         clock_skew_seconds:
           type: integer
@@ -13453,6 +13480,7 @@ components:
 
     AdaptiveConcurrencyConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: adaptive_concurrency — Target-aware backend admission for
         upstream survival. Runs after load balancing for HTTP, gRPC, native
@@ -13475,7 +13503,7 @@ components:
           format: uint64
           default: 10000
           minimum: 1
-          description: Maximum number of distinct target keys this plugin instance will track, bounding limiter memory for high-cardinality wildcard upstreams. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503), running unlimited until key churn or a config reload frees a tracked slot. Existing keys continue to be admitted subject to their adaptive limit.
+          description: Maximum number of distinct target keys this stable plugin policy will track, bounding limiter memory for high-cardinality wildcard upstreams. State is retained across compatible config reloads; lowering this value or changing the policy's effective subset-filtered backend targets, route-override destinations, or route execution order drains live permits and resets tracked target state before the new key space takes effect. Service-discovery changes outside the policy's selected subset remain compatible. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503) until the policy is removed/recreated, its route key space changes, or the process restarts. Existing keys continue to be admitted subject to their adaptive limit.
         min_limit:
           type: integer
           format: uint64
@@ -13577,8 +13605,22 @@ components:
 
     BotDetectionConfig:
       type: object
+      additionalProperties: false
+      allOf:
+        - if:
+            required: [blocked_patterns]
+            properties:
+              blocked_patterns:
+                type: array
+                maxItems: 0
+          then:
+            required: [allow_missing_user_agent]
+            properties:
+              allow_missing_user_agent:
+                const: false
       description: >-
         Plugin: bot_detection — case-insensitive User-Agent matching.
+        Configuration must be an object and unknown properties are rejected.
         `blocked_patterns` are substring matches; `allow_list` entries are
         word-boundary matches and are consulted before blocked patterns, so a
         User-Agent that contains a blocked substring can still pass if it also
@@ -13589,12 +13631,15 @@ components:
         (empty `blocked_patterns` while missing User-Agent headers are allowed)
         is rejected; an allow-list alone is not enforcement. The User-Agent is
         client-controlled and spoofable, so this is a coarse filter, not strong
-        bot verification. HTTP-family only.
+        bot verification. Pattern entry whitespace follows Rust `str::trim`
+        Unicode `White_Space` semantics. HTTP-family only.
       properties:
         blocked_patterns:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default:
             - curl
             - wget
@@ -13608,35 +13653,48 @@ components:
             - php/
           description: >-
             User-Agent substrings to reject (case-insensitive). Specifying this
-            field replaces the defaults entirely. Setting it to `[]` is valid
-            only when `allow_missing_user_agent: false` creates a missing-header
-            reject path; an allow-list alone is not enforcement.
+            field with an array replaces the defaults entirely. Entries are
+            trimmed and must contain a non-whitespace character. `null` is the
+            same as omission and installs the documented defaults. Setting the
+            field to `[]` is valid only when `allow_missing_user_agent: false`
+            creates a missing-header reject path; an allow-list alone is not
+            enforcement.
         allow_list:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             User-Agent tokens that always pass, evaluated before
             `blocked_patterns` (allow wins). Matching is case-insensitive and
             word-boundary anchored, so an entry only matches when it appears as
-            a standalone token in the User-Agent.
+            a standalone token in the User-Agent. Entries are trimmed and must
+            contain a non-whitespace character. `null` is the same as omission
+            and installs an empty allow list.
         allow_missing_user_agent:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: >-
             When true (default), requests with no User-Agent header pass — this
             keeps health-check and load-balancer probes working. Set to false
-            to reject them with `custom_response_code`.
+            to reject them with `custom_response_code`. `null` is the same as
+            omission and selects `true`.
         custom_response_code:
-          type: integer
+          type: [integer, "null"]
           format: uint16
-          minimum: 100
+          minimum: 400
           maximum: 599
           default: 403
           description: >-
-            HTTP status code returned for rejected requests. Values outside
-            100–599 (or non-numeric values) are silently coerced to 403.
+            For non-gRPC requests, the final 4xx or 5xx HTTP status returned
+            with the JSON rejection body. Native gRPC requests instead return
+            an empty-body HTTP 200 trailers-only error with this HTTP status
+            mapped to `grpc-status` and `Forbidden` in `grpc-message`. Values
+            outside 400–599, including informational and no-body status codes,
+            and non-integer values are rejected. `null` is the same as omission
+            and selects 403.
 
     RequestTransformerConfig:
       type: object
@@ -15376,33 +15434,64 @@ components:
       type: object
       description: >-
         Plugin: grpc_method_router — Per-method access control and rate limiting
-        for gRPC services. Parses the gRPC path (/package.Service/Method) and
-        populates grpc_service, grpc_method, grpc_full_method metadata. Rate-limit
-        counter storage supports only local memory and Redis; database-backed
-        counters are intentionally unsupported.
+        for gRPC services. Authorizes the backend-effective gRPC path after
+        route rewrites, listen-path stripping, backend-path composition, and
+        initial target selection, then populates grpc_service, grpc_method, and
+        grpc_full_method metadata with that final method. At least one access or
+        rate rule is required. Rate-limit counter storage supports only local
+        memory and Redis; database-backed counters are intentionally unsupported.
+      allOf:
+        - anyOf:
+            - required: [allow_methods]
+            - required: [deny_methods]
+              properties:
+                deny_methods:
+                  minItems: 1
+            - required: [method_rate_limits]
+              properties:
+                method_rate_limits:
+                  minProperties: 1
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
       properties:
         allow_methods:
           type: array
+          uniqueItems: true
           items:
             type: string
+            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
           description: >-
             Only these gRPC methods are permitted (allowlist). Each entry is a
-            full method path like /package.Service/Method.
+            full method path like /package.Service/Method. Leading/trailing
+            whitespace and one optional leading slash are normalized by the
+            runtime. Duplicate normalized forms are rejected at runtime; JSON
+            Schema uniqueItems can reject only byte-identical duplicates.
         deny_methods:
           type: array
+          uniqueItems: true
           items:
             type: string
+            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
           default: []
           description: >-
             These gRPC methods are explicitly blocked. Deny takes precedence
-            over allow.
+            over allow. Duplicate normalized forms are rejected at runtime;
+            JSON Schema uniqueItems can reject only byte-identical duplicates.
         method_rate_limits:
           type: object
+          propertyNames:
+            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
           additionalProperties:
             $ref: "#/components/schemas/RateSpec"
           description: >-
             Per-method rate limits keyed by full method path
-            (e.g., /myapp.UserService/CreateUser).
+            (e.g., /myapp.UserService/CreateUser). Duplicate normalized keys
+            cannot be expressed by JSON Schema and are rejected at runtime.
         limit_by:
           type: string
           enum: [ip, consumer]
@@ -15417,6 +15506,8 @@ components:
           description: "gRPC method rate-limit counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
         redis_url:
           type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
           description: "Redis connection URL. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
@@ -15424,10 +15515,12 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "ferrum:grpc_method_router"
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
           description: Number of multiplexed Redis connections
         redis_username:
@@ -15438,10 +15531,12 @@ components:
           description: Redis password
         redis_connect_timeout_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Redis connection timeout in seconds
         redis_health_check_interval_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Health check ping interval when Redis is unavailable
 
@@ -17950,6 +18045,7 @@ components:
         max_requests:
           type: integer
           format: uint64
+          minimum: 1
           description: Maximum requests allowed in the window
         window_seconds:
           type: integer

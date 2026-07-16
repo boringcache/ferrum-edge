@@ -15,15 +15,26 @@
 //!   reverse DNS or published IP ranges.
 //! - A no-op config (empty `blocked_patterns` while missing User-Agent headers
 //!   are allowed) is rejected at construction.
+//! - Configuration must be an object with only the four documented keys.
+//!   Field-level `null` selects that field's documented default.
+//! - Rejection statuses are restricted to body-capable 4xx and 5xx responses.
 
 use async_trait::async_trait;
 use regex::{RegexSet, RegexSetBuilder};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 use super::{Plugin, PluginResult, RequestContext};
 
 const FORBIDDEN_BODY: &str = r#"{"error":"Forbidden"}"#;
+
+/// Every accepted top-level configuration property.
+pub const BOT_DETECTION_CONFIG_KEYS: &[&str] = &[
+    "blocked_patterns",
+    "allow_list",
+    "allow_missing_user_agent",
+    "custom_response_code",
+];
 
 pub struct BotDetection {
     blocked_patterns: Option<RegexSet>,
@@ -36,6 +47,14 @@ pub struct BotDetection {
 
 impl BotDetection {
     pub fn new(config: &Value) -> Result<Self, String> {
+        let config = config.as_object().ok_or_else(|| {
+            format!(
+                "bot_detection: config must be a JSON object; allowed keys: {}",
+                BOT_DETECTION_CONFIG_KEYS.join(", ")
+            )
+        })?;
+        reject_unknown_config_keys(config)?;
+
         let blocked_patterns =
             parse_pattern_list(config, "blocked_patterns", Some(default_blocked_patterns()))?;
         let allow_list = parse_pattern_list(config, "allow_list", None)?;
@@ -65,6 +84,19 @@ impl BotDetection {
     }
 }
 
+fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String> {
+    if let Some(unknown) = config
+        .keys()
+        .find(|key| !BOT_DETECTION_CONFIG_KEYS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "bot_detection: unknown config key '{unknown}'; allowed keys: {}",
+            BOT_DETECTION_CONFIG_KEYS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 fn default_blocked_patterns() -> Vec<&'static str> {
     vec![
         "curl",
@@ -81,7 +113,7 @@ fn default_blocked_patterns() -> Vec<&'static str> {
 }
 
 fn parse_pattern_list(
-    config: &Value,
+    config: &Map<String, Value>,
     key: &str,
     default: Option<Vec<&'static str>>,
 ) -> Result<Vec<String>, String> {
@@ -101,19 +133,25 @@ fn parse_pattern_list(
     }
     let Value::Array(arr) = value else {
         return Err(format!(
-            "bot_detection: '{key}' must be an array of User-Agent substrings"
+            "bot_detection: '{key}' must be an array of User-Agent substrings or null, got {}",
+            json_type_name(value)
         ));
     };
 
     let mut patterns = Vec::with_capacity(arr.len());
-    for value in arr {
+    for (index, value) in arr.iter().enumerate() {
         let pattern = value
             .as_str()
-            .ok_or_else(|| format!("bot_detection: '{key}' entries must be strings"))?
+            .ok_or_else(|| {
+                format!(
+                    "bot_detection: '{key}' entry at index {index} must be a string, got {}",
+                    json_type_name(value)
+                )
+            })?
             .trim();
         if pattern.is_empty() {
             return Err(format!(
-                "bot_detection: '{key}' entries must be non-empty strings"
+                "bot_detection: '{key}' entry at index {index} must contain a non-whitespace character"
             ));
         }
         patterns.push(pattern.to_string());
@@ -166,37 +204,54 @@ fn compile_word_boundary_pattern_set(
         .map_err(|e| format!("bot_detection: failed to compile '{key}' patterns: {e}"))
 }
 
-fn parse_response_code(config: &Value) -> Result<u16, String> {
+fn parse_response_code(config: &Map<String, Value>) -> Result<u16, String> {
     match config.get("custom_response_code") {
         None | Some(Value::Null) => Ok(403),
         Some(Value::Number(value)) => {
-            let Some(code) = value.as_u64() else {
-                return Err(
-                    "bot_detection: 'custom_response_code' must be an integer from 100 to 599"
-                        .to_string(),
-                );
-            };
-            if !(100..=599).contains(&code) {
+            let code = value.as_u64().or_else(|| {
+                let code = value.as_f64()?;
+                (code.is_finite() && code.fract() == 0.0 && (400.0..=599.0).contains(&code))
+                    .then_some(code as u64)
+            });
+            let Some(code) = code else {
                 return Err(format!(
-                    "bot_detection: 'custom_response_code' must be from 100 to 599, got {code}"
+                    "bot_detection: 'custom_response_code' must be an integer from 400 to 599, got {value}"
+                ));
+            };
+            if !(400..=599).contains(&code) {
+                return Err(format!(
+                    "bot_detection: 'custom_response_code' must be from 400 to 599, got {code}"
                 ));
             }
             u16::try_from(code)
                 .map_err(|_| "bot_detection: 'custom_response_code' is too large".to_string())
         }
         Some(other) => Err(format!(
-            "bot_detection: 'custom_response_code' must be an integer from 100 to 599, got: {other}"
+            "bot_detection: 'custom_response_code' must be an integer from 400 to 599 or null, got {}",
+            json_type_name(other)
         )),
     }
 }
 
-fn parse_bool(config: &Value, key: &str, default: bool) -> Result<bool, String> {
+fn parse_bool(config: &Map<String, Value>, key: &str, default: bool) -> Result<bool, String> {
     match config.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
-            "bot_detection: '{key}' must be a boolean, got: {other}"
+            "bot_detection: '{key}' must be a boolean or null, got {}",
+            json_type_name(other)
         )),
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 

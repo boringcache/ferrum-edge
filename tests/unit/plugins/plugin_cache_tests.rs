@@ -781,6 +781,49 @@ fn test_registered_custom_plugin_is_resolved_before_unknown_rejection() {
 }
 
 #[test]
+fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "custom-1",
+            "example_plugin",
+            json!({"header_value": "accepted-generation"}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid example plugin cache");
+    let before = cache.get_plugins("p1");
+    assert_eq!(before.len(), 1);
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "custom-1",
+            "example_plugin",
+            json!({"header_value": 7}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("malformed example config must reject cache publication");
+    assert!(error.contains("example_plugin"), "got: {error}");
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted example plugin instance"
+    );
+}
+
+#[test]
 fn test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache() {
     let config1 = make_config(
         vec![make_proxy("p1", "/api", vec!["pc1"])],
@@ -2860,6 +2903,43 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
+#[test]
+fn test_grpc_backend_path_plugins_are_precomputed_with_priority_override() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["router"])],
+        vec![make_plugin_config_with_priority(
+            "router",
+            "grpc_method_router",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(300),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    assert!(
+        grpc_view
+            .capabilities()
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+    );
+    assert_eq!(grpc_view.backend_path_plugins().len(), 1);
+    assert_eq!(
+        grpc_view.backend_path_plugins()[0].name(),
+        "grpc_method_router"
+    );
+    assert_eq!(grpc_view.backend_path_plugins()[0].priority(), 300);
+
+    let http_view = cache.request_view("p1", ProxyProtocol::Http);
+    assert!(
+        !http_view
+            .capabilities()
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+    );
+    assert!(http_view.backend_path_plugins().is_empty());
+}
+
 #[tokio::test]
 async fn test_priority_override_delegates_response_stream_termination_hook() {
     let config = make_config(
@@ -3778,6 +3858,56 @@ fn test_modifies_request_headers_flag_computed() {
         caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS),
         "request_transformer should set MODIFIES_REQUEST_HEADERS"
     );
+}
+
+#[test]
+fn test_hmac_auth_rejects_request_body_transformer_composition() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["hmac", "transform"])],
+        vec![
+            make_plugin_config("hmac", "hmac_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "gateway",
+                        "value": "ferrum"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("composition must fail closed");
+    assert!(error.contains("hmac_auth cannot be combined"));
+    assert!(error.contains("request_transformer"));
+    assert!(error.contains("protocol Http"));
+}
+
+#[test]
+fn test_hmac_auth_allows_header_only_request_transformer() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["hmac", "transform"])],
+        vec![
+            make_plugin_config("hmac", "hmac_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "transform",
+                "request_transformer",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+
+    assert!(PluginCache::new(&config).is_ok());
 }
 
 #[test]

@@ -522,6 +522,81 @@ async fn claims_to_headers_and_forward_original_false_strip_authorization() {
         headers.get("x-user-email").map(String::as_str),
         Some("user@example.com")
     );
+    assert_eq!(
+        ctx.authenticated_identity_header.as_deref(),
+        Some("external-user")
+    );
+}
+
+#[tokio::test]
+async fn principal_less_introspection_attempt_does_not_mutate_later_key_auth_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "principal": "   ",
+            "display_name": "Header Without Principal",
+            "email": "unaccepted@example.com"
+        })))
+        .mount(&server)
+        .await;
+
+    let introspection = Arc::new(
+        Oauth2Introspection::new(
+            &json!({"providers": [{
+                "introspection_endpoint": format!("{}/introspect", server.uri()),
+                "client_auth": {"method": "none"},
+                "from_params": ["access_token"],
+                "forward_original_token": false,
+                "consumer_identity_claim": "principal",
+                "consumer_header_claim": "display_name",
+                "claim_headers": {"email": "X-User-Email"}
+            }]}),
+            PluginHttpClient::default(),
+        )
+        .expect("valid introspection config"),
+    );
+    let key_auth = Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![introspection.clone(), key_auth];
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
+    ctx.query_params
+        .insert("access_token".to_string(), "opaque-token".to_string());
+    ctx.headers
+        .insert("x-api-key".to_string(), "test-api-key".to_string());
+
+    assert!(
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index,)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        ctx.identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str()),
+        Some("testuser")
+    );
+    assert_eq!(ctx.auth_method, Some("key_auth"));
+    assert!(ctx.authenticated_identity.is_none());
+    assert!(ctx.authenticated_identity_header.is_none());
+    assert_eq!(
+        ctx.query_params.get("access_token").map(String::as_str),
+        Some("opaque-token")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("auth.strip_query_param.access_token")
+    );
+    assert!(
+        !ctx.metadata
+            .values()
+            .any(|value| value == "unaccepted@example.com")
+    );
+
+    let mut headers = ctx.headers.clone();
+    assert_continue(introspection.before_proxy(&mut ctx, &mut headers).await);
+    assert!(!headers.contains_key("x-user-email"));
 }
 
 #[tokio::test]

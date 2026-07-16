@@ -2817,11 +2817,39 @@ async fn ensure_mtls_consumer_candidate(
     }
 }
 
+async fn ensure_hmac_consumer_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match crud::hmac_consumer_candidate_errors(db, namespace, consumer).await {
+        Ok(errors) if errors.is_empty() => Ok(()),
+        Ok(errors) => Err(Box::new(json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": errors.join("; ")}),
+        ))),
+        Err(error) => Err(Box::new(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&error),
+        ))),
+    }
+}
+
 async fn persist_consumer_update(
     db: &dyn DatabaseBackend,
     mut consumer: Consumer,
     success_status: StatusCode,
 ) -> Response<Full<Bytes>> {
+    // Every credential endpoint rewrites the complete Consumer and rebuilds
+    // its credential index entries. Revalidate retained HMAC credentials even
+    // when the requested mutation targets another credential type, so stale or
+    // out-of-band duplicates fail before the datastore uniqueness backstop.
+    if !consumer.credential_entries("hmac_auth").is_empty()
+        && let Err(response) =
+            ensure_hmac_consumer_candidate(db, &consumer.namespace, &consumer).await
+    {
+        return *response;
+    }
     consumer.updated_at = Utc::now();
     match db.update_consumer(&consumer).await {
         // The consumer vanished between the namespace-scoped load and the
@@ -3119,7 +3147,10 @@ async fn persist_payload_resources(
     if should_continue(&errors) && !payload.consumers.is_empty() {
         match db.batch_create_consumers(&payload.consumers).await {
             Ok(n) => counts.consumers = n,
-            Err(e) => errors.push(format!("consumers: {}", e)),
+            Err(e) => errors.push(format!(
+                "consumers: {}",
+                crud::consumer_persist_error_message(&e)
+            )),
         }
     }
     if should_continue(&errors) && !payload.upstreams.is_empty() {
@@ -3411,7 +3442,6 @@ async fn handle_update_credentials(
     {
         return Ok(*resp);
     }
-
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
     if response.status().is_success() {
         let event = audit::AuditEvent::new(
@@ -3577,7 +3607,6 @@ async fn handle_append_credential(
     {
         return Ok(*resp);
     }
-
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
     if response.status().is_success() {
         let event = audit::AuditEvent::new(
@@ -4242,11 +4271,49 @@ async fn handle_batch_create(
             if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
                 validation_errors.extend(errors);
             }
+            // Match single-resource admission: legacy duplicates are already
+            // quarantined at load time and must not block unrelated batch
+            // writes. Re-evaluate the authoritative candidate only when this
+            // batch submits a Consumer that carries HMAC credentials.
+            if batch
+                .consumers
+                .iter()
+                .any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
+                && let Err(errors) = candidate_config.validate_unique_hmac_credentials()
+            {
+                validation_errors.extend(errors);
+            }
         }
         Err(error) => validation_errors.push(format!(
-            "Failed to load namespace config for mTLS candidate validation: {}",
+            "Failed to load namespace config for credential candidate validation: {}",
             error
         )),
+    }
+
+    if !batch.proxies.is_empty() || !batch.plugin_configs.is_empty() {
+        match crud::validate_hmac_request_transform_candidates(
+            db.as_ref(),
+            state,
+            namespace,
+            &batch.proxies,
+            &batch.plugin_configs,
+            None,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(crud::AfterValidateError::BadRequest(errors)) => {
+                validation_errors.extend(errors);
+            }
+            Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
+                "Failed to load config for HMAC request-transform candidate validation: {}",
+                error
+            )),
+            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
+                "HMAC request-transform candidate validation returned an unexpected response"
+                    .to_string(),
+            ),
+        }
     }
 
     match ValidationPipeline::new(&mut batch_config)
@@ -4853,6 +4920,27 @@ async fn handle_restore(
                     ));
                 }
             }
+        }
+        match crud::validate_hmac_request_transform_restore_candidate(state, &temp_config) {
+            Ok(()) => {}
+            Err(crud::AfterValidateError::BadRequest(errors)) => {
+                validation_errors.extend(errors);
+            }
+            Err(crud::AfterValidateError::Db(error)) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Restore aborted: HMAC request-transform composition could not be validated: {}. Existing config was NOT deleted.",
+                            error
+                        )
+                    }),
+                ));
+            }
+            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
+                "HMAC request-transform candidate validation returned an unexpected response"
+                    .to_string(),
+            ),
         }
         if !validation_errors.is_empty() {
             return Ok(json_response(
@@ -5561,6 +5649,20 @@ async fn handle_node_waypoint_identities_get(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_unique_conflict_response_redacts_mongo_credential_metadata() {
+        let secret = "must-not-escape-hmac-secret-at-least-32-characters";
+        let error = anyhow::anyhow!(
+            "E11000 duplicate key error dup key: {{ namespace: ferrum, credentials.hmac_auth.secret: {} }}",
+            secret
+        );
+
+        let message = crud::consumer_persist_error_message(&error);
+        assert!(message.contains("conflicts with another Consumer"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("credentials.hmac_auth.secret"));
+    }
 
     #[test]
     fn namespace_scoped_routes_cover_tenant_resources_only() {
