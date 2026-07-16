@@ -2146,10 +2146,21 @@ mod virtual_service_cors {
             "{errors:?}"
         );
 
-        // Valid lists pass (padding is fine — the plugin trims reflected
-        // values; unlike origin MATCHERS this is not a semantic change).
+        let mut padded_method =
+            policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        padded_method.cors.allowed_methods = vec!["GET".into(), " POST ".into()];
+        let errors = validate(vec![padded_method]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("leading/trailing whitespace")),
+            "{errors:?}"
+        );
+
+        // Valid token lists pass unchanged through the shared plugin
+        // admission gate.
         let mut ok = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
-        ok.cors.allowed_methods = vec!["GET".into(), " POST ".into()];
+        ok.cors.allowed_methods = vec!["GET".into(), "POST".into()];
         ok.cors.allowed_headers = vec!["x-requested-with".into()];
         ok.cors.exposed_headers = vec!["x-trace-id".into()];
         let errors = validate(vec![ok]);
