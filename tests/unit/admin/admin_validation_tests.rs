@@ -711,10 +711,9 @@ fn intervening_clear_recovery_keeps_current_ids_and_rejects_invalid_union() {
     assert!(same_id.config["schemas"].get("current-wins").is_some());
     assert!(same_id.config["schemas"].get("snapshot-only").is_none());
 
-    let errors = ferrum_edge::_test_support::validate_transaction_log_schema_graph_for_test(
-        &candidate,
-    )
-    .expect_err("duplicate names across the recovery union must fail closed");
+    let errors =
+        ferrum_edge::_test_support::validate_transaction_log_schema_graph_for_test(&candidate)
+            .expect_err("duplicate names across the recovery union must fail closed");
     assert!(errors.iter().any(|error| error.contains("duplicate")));
 }
 
@@ -722,12 +721,9 @@ fn intervening_clear_recovery_keeps_current_ids_and_rejects_invalid_union() {
 fn late_api_spec_post_compensation_preserves_intervening_proxy_plugins() {
     let api_spec_source = include_str!("../../../src/admin/api_specs/handlers.rs");
     assert!(api_spec_source.contains("late_api_spec_create_compensation_safe("));
+    assert!(api_spec_source.contains("current_proxy.plugins.len() != expected_associations.len()"));
     assert!(
-        api_spec_source.contains("current_proxy.plugins.len() != expected_associations.len()")
-    );
-    assert!(
-        api_spec_source
-            .contains("plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str())")
+        api_spec_source.contains("plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str())")
     );
 }
 
@@ -735,9 +731,9 @@ fn late_api_spec_post_compensation_preserves_intervening_proxy_plugins() {
 fn late_api_spec_put_reconciles_the_current_schema_graph() {
     let api_spec_source = include_str!("../../../src/admin/api_specs/handlers.rs");
     assert!(api_spec_source.contains("current_transaction_log_schema_graph_is_valid("));
-    assert!(api_spec_source.contains(
-        "validate_transaction_log_schema_api_spec_replacement_candidate("
-    ));
+    assert!(
+        api_spec_source.contains("validate_transaction_log_schema_api_spec_replacement_candidate(")
+    );
     let put_compensation = api_spec_source
         .rfind("compensate_late_api_spec_replace(")
         .expect("PUT must provide late-write graph reconciliation");
@@ -748,9 +744,7 @@ fn late_api_spec_put_reconciles_the_current_schema_graph() {
 fn ambiguous_namespace_admission_acquisition_has_owned_cleanup() {
     let crud_source = include_str!("../../../src/admin/crud.rs");
     assert!(crud_source.contains("struct PendingNamespaceConfigAdmissionClaim"));
-    assert!(
-        crud_source.contains("let (result_tx, result_rx) = tokio::sync::oneshot::channel()")
-    );
+    assert!(crud_source.contains("let (result_tx, result_rx) = tokio::sync::oneshot::channel()"));
     assert!(crud_source.contains("an ambiguous namespace config admission acquisition"));
     assert!(crud_source.contains("a cancelled namespace config admission acquisition"));
 }

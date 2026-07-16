@@ -3798,9 +3798,15 @@ fn intervening_clear_recovery_candidate(
     let missing = snapshot_resources_missing_after_intervening_write(snapshot, current);
     let mut candidate = current.clone();
     candidate.proxies.extend(missing.proxies.iter().cloned());
-    candidate.consumers.extend(missing.consumers.iter().cloned());
-    candidate.plugin_configs.extend(missing.plugin_configs.iter().cloned());
-    candidate.upstreams.extend(missing.upstreams.iter().cloned());
+    candidate
+        .consumers
+        .extend(missing.consumers.iter().cloned());
+    candidate
+        .plugin_configs
+        .extend(missing.plugin_configs.iter().cloned());
+    candidate
+        .upstreams
+        .extend(missing.upstreams.iter().cloned());
     (candidate, missing)
 }
 
