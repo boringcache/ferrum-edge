@@ -1329,25 +1329,27 @@ async fn delete_rejects_removing_last_global_tcp_throttle_target_with_422() {
         .await
         .expect("mixed global throttle graph must be valid");
 
-    let (delete_status, delete_body) = client
-        .delete_json(&format!("/api-specs/{spec_id}"))
-        .await;
+    let (delete_status, delete_body) = client.delete_json(&format!("/api-specs/{spec_id}")).await;
     assert_eq!(
         delete_status,
         reqwest::StatusCode::UNPROCESSABLE_ENTITY,
         "invalid API-spec cascade did not return 422: {delete_body}"
     );
     assert!(
-        delete_body["failures"]
-            .as_array()
-            .is_some_and(|failures| {
-                failures
-                    .iter()
-                    .any(|failure| failure["resource_type"] == "plugin_composition")
-            }),
+        delete_body["failures"].as_array().is_some_and(|failures| {
+            failures
+                .iter()
+                .any(|failure| failure["resource_type"] == "plugin_composition")
+        }),
         "422 response omitted the plugin-composition failure: {delete_body}"
     );
-    assert!(store.get_api_spec("ferrum", &spec_id).await.unwrap().is_some());
+    assert!(
+        store
+            .get_api_spec("ferrum", &spec_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert!(
         store
             .get_proxy("ferrum", &tcp_proxy_id)
