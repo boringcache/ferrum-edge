@@ -1514,7 +1514,8 @@ fn explicit_uri_authority_port(value: &str) -> Option<&str> {
     } else {
         host_and_port.rsplit_once(':')?.1
     };
-    (!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())).then_some(port)
+    (!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some(port)
 }
 
 fn is_valid_uri_scheme(value: &str) -> bool {
