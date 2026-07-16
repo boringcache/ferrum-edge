@@ -14444,6 +14444,68 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     StatusCode::OK
 }
 
+/// Run buffered response transforms under the request's absolute gRPC
+/// deadline. A transform that exhausts the deadline selects the same
+/// flavor-aware terminal response as every other buffered response phase.
+pub(crate) async fn transform_buffered_response_body_with_deadline(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+    grpc_web_response_content_type: Option<&str>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> (bool, bool) {
+    let content_type = response_headers.get("content-type").cloned();
+    let content_type = content_type.as_deref();
+    let mut body_transformed = false;
+    for plugin in plugins {
+        let transformed = match crate::plugins::await_grpc_deadline(
+            ctx.grpc_deadline_at(),
+            plugin.transform_response_body_with_context(
+                ctx,
+                response_body,
+                content_type,
+                response_headers,
+            ),
+        )
+        .await
+        {
+            Ok(transformed) => transformed,
+            Err(()) => {
+                *response_status = replace_buffered_grpc_response_with_deadline(
+                    ctx,
+                    grpc_web_response_content_type,
+                    response_headers,
+                    response_body,
+                    initial_response_header_policy_plugins,
+                )
+                .as_u16();
+                return (true, body_transformed);
+            }
+        };
+        if let Some(transformed) = transformed {
+            response_headers.insert("content-length".to_string(), transformed.len().to_string());
+            *response_body = transformed;
+            plugin.on_response_body_transformed(ctx, response_headers);
+            body_transformed = true;
+        }
+    }
+    (false, body_transformed)
+}
+
+/// A streaming deadline may replace the backend body with native trailers or
+/// a gRPC-Web trailer DATA frame before any backend DATA is forwarded. The
+/// backend's declared length therefore cannot remain authoritative.
+pub(crate) fn strip_content_length_for_streaming_grpc_deadline(
+    response_headers: &mut HashMap<String, String>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+) {
+    if grpc_deadline_at.is_some() {
+        response_headers.remove("content-length");
+    }
+}
+
 /// Poll a committed hook before the deadline branch so even an already-expired
 /// budget invokes the selected observer once before cancellation.
 async fn run_response_committed_hook_until_deadline(
@@ -19199,6 +19261,22 @@ async fn handle_proxy_request_inner(
 
                 record_request(&state, grpc_streaming.status);
 
+                // A client gRPC deadline is an absolute total-body bound. It
+                // may replace an unpolled backend body with terminal trailers,
+                // so the backend Content-Length cannot remain authoritative.
+                let (grpc_read_timeout_ms, grpc_total_deadline) =
+                    grpc_proxy::grpc_streaming_response_deadline(
+                        grpc_streaming.grpc_deadline_at,
+                        grpc_streaming.response_read_timeout_ms,
+                    );
+                strip_content_length_for_streaming_grpc_deadline(
+                    &mut response_headers,
+                    grpc_total_deadline,
+                );
+                let cl = response_headers
+                    .get("content-length")
+                    .and_then(|v| v.parse::<u64>().ok());
+
                 // Build the response with the live Incoming body — hyper will forward
                 // DATA frames and TRAILERS to the downstream client as they arrive.
                 // Split any newline-joined Set-Cookie into separate header lines.
@@ -19230,9 +19308,6 @@ async fn handle_proxy_request_inner(
                 // `proxy-connection`, and `keep-alive` are not blocked.
                 // Mirrors the buffered-path strip in `grpc_proxy.rs` so the
                 // two response paths cannot drift.
-                let cl = response_headers
-                    .get("content-length")
-                    .and_then(|v| v.parse::<u64>().ok());
                 // gRPC streaming body deadline (issue #1649): a client
                 // `grpc-timeout` is an end-to-end RPC deadline, honored as an
                 // ABSOLUTE deadline (`grpc_total_deadline`) anchored at request
@@ -19240,11 +19315,6 @@ async fn handle_proxy_request_inner(
                 // applies per frame. See `grpc_streaming_response_deadline` —
                 // shared with the mesh-mTLS `StreamingH2` relay so the two
                 // regimes cannot drift.
-                let (grpc_read_timeout_ms, grpc_total_deadline) =
-                    grpc_proxy::grpc_streaming_response_deadline(
-                        grpc_streaming.grpc_deadline_at,
-                        grpc_streaming.response_read_timeout_ms,
-                    );
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
@@ -19616,35 +19686,25 @@ async fn handle_proxy_request_inner(
                         plugin_response_headers
                             .insert("content-type".to_string(), grpc_web_ct.to_string());
                     }
-                    let content_type = plugin_response_headers.get("content-type").cloned();
-                    let ct_ref = content_type.as_deref();
-                    for plugin in plugins.iter() {
-                        let deadline = ctx.grpc_deadline_at();
-                        let transformed = match crate::plugins::await_grpc_deadline(
-                            deadline,
-                            plugin.transform_response_body_with_context(
-                                &mut ctx,
-                                &response_body,
-                                ct_ref,
+                    if transform_buffered_response_body_with_deadline(
+                        &plugins,
+                        &mut ctx,
+                        &mut response_status,
+                        &mut plugin_response_headers,
+                        &mut response_body,
+                        grpc_web_response_content_type,
+                        initial_response_header_policy_plugins.as_ref(),
+                    )
+                    .await
+                    .0
+                    {
+                        authoritative_trailers_only_terminal_metadata = Some(
+                            grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
                                 &plugin_response_headers,
                             ),
-                        )
-                        .await
-                        {
-                            Ok(transformed) => transformed,
-                            Err(()) => break,
-                        };
-                        if let Some(transformed) = transformed {
-                            plugin_response_headers.insert(
-                                "content-length".to_string(),
-                                transformed.len().to_string(),
-                            );
-                            response_body = transformed;
-                            plugin.on_response_body_transformed(
-                                &mut ctx,
-                                &mut plugin_response_headers,
-                            );
-                        }
+                        );
+                        response_trailers.clear();
+                        buffered_initial_response_header_policy_state = None;
                     }
                     if let Some(policy_state) =
                         buffered_initial_response_header_policy_state.as_mut()
@@ -21306,33 +21366,16 @@ async fn handle_proxy_request_inner(
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
-        // Clone content-type to avoid borrowing response_headers across the loop.
-        let content_type = response_headers.get("content-type").cloned();
-        let ct_ref = content_type.as_deref();
-        for plugin in plugins.iter() {
-            let deadline = ctx.grpc_deadline_at();
-            let transformed = match crate::plugins::await_grpc_deadline(
-                deadline,
-                plugin.transform_response_body_with_context(
-                    &mut ctx,
-                    data,
-                    ct_ref,
-                    &response_headers,
-                ),
-            )
-            .await
-            {
-                Ok(transformed) => transformed,
-                Err(()) => break,
-            };
-            if let Some(transformed) = transformed {
-                // Update Content-Length to reflect the new body size
-                response_headers
-                    .insert("content-length".to_string(), transformed.len().to_string());
-                *data = transformed;
-                plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
-            }
-        }
+        transform_buffered_response_body_with_deadline(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            data,
+            grpc_web_response_content_type,
+            initial_response_header_policy_plugins.as_ref(),
+        )
+        .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
@@ -21574,6 +21617,22 @@ async fn handle_proxy_request_inner(
         };
 
     record_request(&state, response_status);
+
+    // A streaming deadline can replace an as-yet-unpolled backend body with a
+    // differently sized gRPC-Web frame or native trailers. Strip the backend
+    // length before response headers are committed; the body builders below
+    // will then also receive `cl = None`.
+    let streaming_grpc_deadline = match &response_body {
+        ResponseBody::Streaming { .. } => ctx.grpc_deadline_at(),
+        ResponseBody::StreamingH2(_) if streaming_h2_native_grpc => grpc_request_deadline,
+        ResponseBody::Buffered(_)
+        | ResponseBody::StreamingH2(_)
+        | ResponseBody::StreamingH3(_) => None,
+    };
+    strip_content_length_for_streaming_grpc_deadline(
+        &mut response_headers,
+        streaming_grpc_deadline,
+    );
 
     // Build final response
     let mut resp_builder = Response::builder()

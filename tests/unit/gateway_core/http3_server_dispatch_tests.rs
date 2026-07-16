@@ -203,6 +203,43 @@ fn native_h3_client_deadlines_remain_health_neutral() {
 }
 
 #[test]
+fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let handler = source
+        .split("async fn handle_h3_grpc_streaming_response")
+        .nth(1)
+        .expect("H3 cross-protocol streaming gRPC response handler")
+        .split("/// Mesh-transport fail-closed guard")
+        .next()
+        .expect("bounded streaming handler body");
+    let strip = handler
+        .find("strip_content_length_for_streaming_grpc_deadline(")
+        .expect("deadline-capable relay must strip Content-Length");
+    let header_write = handler
+        .find("send_response_headers(")
+        .expect("streaming response header write");
+    assert!(
+        strip < header_write,
+        "Content-Length must be removed before H3 response headers commit"
+    );
+    assert!(handler.contains("streaming.response_read_timeout_ms,"));
+    assert!(handler.contains("streaming.grpc_deadline_at,"));
+
+    let relay = source
+        .split("async fn stream_hyper_incoming")
+        .nth(1)
+        .expect("H3 cross-protocol hyper body relay")
+        .split("fn should_finish_h3_stream_without_trailers")
+        .next()
+        .expect("bounded relay body");
+    assert!(relay.contains("_ = &mut grpc_deadline"));
+    assert!(relay.contains("GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER"));
+    assert!(relay.contains("if bytes_streamed == 0"));
+    assert!(relay.contains("abort_response_stream(stream)"));
+    assert!(relay.contains("_ = &mut read_deadline"));
+}
+
+#[test]
 fn h3_deadline_preflight_runs_committed_hooks_exactly_once() {
     let source = include_str!("../../../src/http3/server.rs");
     let preflight = source

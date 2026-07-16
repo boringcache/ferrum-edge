@@ -63,6 +63,9 @@ use crate::util::body_limit::is_length_limit_error;
 /// exact value; otherwise a wording change could let a later response replacer
 /// overwrite `DEADLINE_EXCEEDED` after the gateway has selected it.
 pub(crate) const GATEWAY_DEADLINE_EXCEEDED_MESSAGE: &str = "Deadline exceeded at gateway";
+/// Canonical percent-encoded `grpc-message` header representation.
+pub(crate) const GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER: &str =
+    "Deadline%20exceeded%20at%20gateway";
 /// Canonical serialized `grpc-status` paired with the gateway message above.
 pub(crate) const GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER: &str = "4";
 

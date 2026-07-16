@@ -1432,6 +1432,26 @@ fn direct_h2_response_header_wait_uses_earliest_client_or_operator_deadline() {
 }
 
 #[test]
+fn streaming_grpc_deadline_removes_backend_content_length_before_headers_commit() {
+    use ferrum_edge::_test_support::strip_content_length_for_streaming_grpc_deadline_for_test;
+
+    let mut deadline_headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("content-length".to_string(), "128".to_string()),
+    ]);
+    strip_content_length_for_streaming_grpc_deadline_for_test(&mut deadline_headers, true);
+    assert!(!deadline_headers.contains_key("content-length"));
+
+    let mut unbounded_headers =
+        HashMap::from([("content-length".to_string(), "128".to_string())]);
+    strip_content_length_for_streaming_grpc_deadline_for_test(&mut unbounded_headers, false);
+    assert_eq!(
+        unbounded_headers.get("content-length").map(String::as_str),
+        Some("128")
+    );
+}
+
+#[test]
 fn mesh_mtls_arms_operator_read_window_after_sender_readiness() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let function = source

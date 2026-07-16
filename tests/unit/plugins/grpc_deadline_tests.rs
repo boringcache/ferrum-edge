@@ -267,6 +267,25 @@ impl Plugin for StalledResponseNormalizer {
     }
 }
 
+struct StalledResponseTransformer;
+
+#[async_trait::async_trait]
+impl Plugin for StalledResponseTransformer {
+    fn name(&self) -> &str {
+        "stalled_response_transformer"
+    }
+
+    async fn transform_response_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        std::future::pending().await
+    }
+}
+
 struct CommittedHookProbe {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     observed_grpc_statuses: Arc<std::sync::Mutex<Vec<Option<String>>>>,
@@ -362,6 +381,74 @@ async fn committed_deadline_replacement_runs_remaining_hooks_exactly_once() {
         observed[2].lock().expect("third probe lock").as_slice(),
         &[Some("4".to_string())]
     );
+}
+
+#[tokio::test]
+async fn response_transform_deadline_replaces_native_and_grpc_web_responses() {
+    use base64::Engine as _;
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, parse_grpc_frames, set_grpc_deadline_budget_for_test,
+        transform_buffered_response_body_with_deadline_for_test,
+    };
+
+    for content_type in [
+        None,
+        Some("application/grpc-web+proto"),
+        Some("application/grpc-web-text+proto"),
+    ] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledResponseTransformer)];
+        let mut ctx = create_grpc_context_with_timeout(None);
+        set_grpc_deadline_budget_for_test(&mut ctx, Some(10));
+        let mut status = 200;
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("content-length".to_string(), "16".to_string()),
+        ]);
+        let mut body = b"backend response".to_vec();
+
+        assert!(
+            transform_buffered_response_body_with_deadline_for_test(
+                &plugins,
+                &mut ctx,
+                &mut status,
+                &mut headers,
+                &mut body,
+                content_type,
+            )
+            .await
+        );
+        assert_eq!(status, 200);
+
+        if let Some(content_type) = content_type {
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some(content_type)
+            );
+            assert!(!headers.contains_key("grpc-status"));
+            let decoded = if content_type.contains("-text") {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&body)
+                    .expect("text gRPC-Web deadline body must be base64")
+            } else {
+                body
+            };
+            let frames = parse_grpc_frames(&decoded);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
+            assert!(
+                frames[0]
+                    .1
+                    .windows(b"grpc-status: 4".len())
+                    .any(|window| window == b"grpc-status: 4")
+            );
+        } else {
+            assert_eq!(
+                headers.get("grpc-status").map(String::as_str),
+                Some("4")
+            );
+            assert!(body.is_empty());
+        }
+    }
 }
 
 #[tokio::test]

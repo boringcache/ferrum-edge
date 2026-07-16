@@ -118,8 +118,8 @@ use crate::plugins::{
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::{record_backend_outcome, record_backend_outcome_no_conn_end};
 use crate::proxy::grpc_proxy::{
-    self, GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
-    GrpcResponseKind,
+    self, GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+    GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind,
     proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
@@ -3010,6 +3010,14 @@ where
         &streaming.headers,
     );
 
+    // The body relay may replace an empty backend stream with terminal
+    // deadline trailers. Do not commit the backend's declared length across
+    // that protocol-level replacement.
+    crate::proxy::strip_content_length_for_streaming_grpc_deadline(
+        &mut streaming.headers,
+        streaming.grpc_deadline_at,
+    );
+
     if let Err(error) = send_response_headers(stream, streaming.status, &streaming.headers).await {
         debug!("cross-protocol H3 gRPC streaming response header write failed: {error}");
         record_cross_protocol_header_write_disconnect(
@@ -3037,8 +3045,22 @@ where
     }
     let coalesce = CoalesceConfig::from_state(state);
     let max_resp_bytes = state.max_response_body_size_bytes;
-    let (bytes_streamed, body_completed, client_disconnected, body_error_class, trailers) =
-        stream_hyper_incoming(stream, streaming.body, coalesce, max_resp_bytes).await;
+    let (
+        bytes_streamed,
+        body_completed,
+        client_disconnected,
+        body_error_class,
+        trailers,
+        client_deadline_expired,
+    ) = stream_hyper_incoming(
+        stream,
+        streaming.body,
+        coalesce,
+        max_resp_bytes,
+        streaming.response_read_timeout_ms,
+        streaming.grpc_deadline_at,
+    )
+    .await;
 
     let mut final_body_completed = body_completed;
     let mut final_client_disconnected = client_disconnected;
@@ -3152,6 +3174,8 @@ where
     );
     let terminal_grpc_status = if request_overflowed_late {
         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
+    } else if client_deadline_expired {
+        grpc_proxy::grpc_status::DEADLINE_EXCEEDED
     } else {
         grpc_trailer_status
             .or(client_header_grpc_status)
@@ -5133,13 +5157,23 @@ where
 
 /// Stream a hyper `Incoming` body into the H3 stream, separating trailer
 /// frames for `send_trailers`. Returns
-/// `(bytes_streamed, body_completed, client_disconnected, body_error_class, trailers)`.
+/// `(bytes_streamed, body_completed, client_disconnected, body_error_class,
+/// trailers, client_deadline_expired)`.
 async fn stream_hyper_incoming<S>(
     stream: &mut RequestStream<S, Bytes>,
     mut incoming: Incoming,
     coalesce: CoalesceConfig,
     max_response_body_size_bytes: usize,
-) -> (u64, bool, bool, Option<ErrorClass>, Option<HeaderMap>)
+    response_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+) -> (
+    u64,
+    bool,
+    bool,
+    Option<ErrorClass>,
+    Option<HeaderMap>,
+    bool,
+)
 where
     // Send-only: this loop writes the response (`send_data` / `finish` /
     // `abort_response_stream`) and never reads the request half, so it accepts
@@ -5156,12 +5190,60 @@ where
     let mut client_disconnected = false;
     let mut body_error_class: Option<ErrorClass> = None;
     let mut trailers: Option<HeaderMap> = None;
+    let mut clean_deadline_completion = false;
+    let mut client_deadline_expired = false;
+    let read_timeout_active = response_read_timeout_ms > 0 && grpc_deadline_at.is_none();
+    let read_deadline = tokio::time::sleep(std::time::Duration::from_millis(
+        response_read_timeout_ms.max(1),
+    ));
+    tokio::pin!(read_deadline);
+    let mut just_received_backend_frame = false;
+    let grpc_deadline_active = grpc_deadline_at.is_some();
+    let grpc_deadline = tokio::time::sleep_until(
+        grpc_deadline_at
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400)),
+    );
+    tokio::pin!(grpc_deadline);
 
     'outer: loop {
+        if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
+            read_deadline.as_mut().reset(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(response_read_timeout_ms),
+            );
+            just_received_backend_frame = false;
+        }
         tokio::select! {
+            biased;
+            // The absolute RPC ceiling owns a tie with a newly-ready backend
+            // frame. Otherwise a continuously-ready backend could forward DATA
+            // after the client deadline and change a clean trailers-only expiry
+            // into a partial-body reset.
+            _ = &mut grpc_deadline, if grpc_deadline_active && !stream_done => {
+                client_deadline_expired = true;
+                coalesce_buf.clear();
+                if bytes_streamed == 0 {
+                    let mut deadline_trailers = HeaderMap::new();
+                    deadline_trailers.insert(
+                        "grpc-status",
+                        HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER),
+                    );
+                    deadline_trailers.insert(
+                        "grpc-message",
+                        HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER),
+                    );
+                    trailers = Some(deadline_trailers);
+                    clean_deadline_completion = true;
+                } else {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                }
+                body_error_class = Some(ErrorClass::ClientDisconnect);
+                break 'outer;
+            }
             frame_result = incoming.frame(), if !stream_done => {
                 match frame_result {
                     Some(Ok(frame)) => {
+                        just_received_backend_frame = true;
                         if frame.is_data() {
                             let data = match frame.into_data() {
                                 Ok(d) => d,
@@ -5246,6 +5328,15 @@ where
                     .as_mut()
                     .reset(tokio::time::Instant::now() + coalesce.flush_interval);
             }
+            _ = &mut read_deadline, if read_timeout_active && !stream_done && coalesce_buf.is_empty() => {
+                warn!(
+                    "Backend read timeout ({}ms) during cross-protocol H3 gRPC response body; aborting",
+                    response_read_timeout_ms
+                );
+                crate::http3::stream_util::abort_response_stream(stream);
+                body_error_class = Some(ErrorClass::ReadWriteTimeout);
+                break 'outer;
+            }
         }
         if stream_done {
             if !coalesce_buf.is_empty() {
@@ -5272,13 +5363,15 @@ where
         }
     }
 
-    let body_completed = body_error_class.is_none() && !client_disconnected;
+    let body_completed = clean_deadline_completion
+        || (body_error_class.is_none() && !client_disconnected);
     (
         bytes_streamed,
         body_completed,
         client_disconnected,
         body_error_class,
         trailers,
+        client_deadline_expired,
     )
 }
 

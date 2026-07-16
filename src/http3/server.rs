@@ -38,7 +38,9 @@ use crate::proxy::headers::{
     is_proxy_generated_forwarding_header, parse_connection_listed_from_str_map,
     strip_response_hop_by_hop_trailers,
 };
-use crate::proxy::grpc_proxy::GATEWAY_DEADLINE_EXCEEDED_MESSAGE;
+use crate::proxy::grpc_proxy::{
+    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+};
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
     log_rejected_request, log_rejected_request_with_path, plugin_result_into_reject_parts,
@@ -5806,36 +5808,22 @@ async fn handle_h3_request(
         // transform_response_body hooks — only for buffered responses.
         if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
-            let content_type = response_headers.get("content-type").cloned();
-            let ct_ref = content_type.as_deref();
-            for plugin in plugins.iter() {
-                let deadline = ctx.grpc_deadline_at();
-                let transformed = match crate::plugins::await_grpc_deadline(
-                    deadline,
-                    plugin.transform_response_body_with_context(
-                        &mut ctx,
-                        &response_body,
-                        ct_ref,
-                        &response_headers,
-                    ),
+            let (deadline_replaced, body_transformed) =
+                crate::proxy::transform_buffered_response_body_with_deadline(
+                    &plugins,
+                    &mut ctx,
+                    &mut response_status,
+                    &mut response_headers,
+                    &mut response_body,
+                    grpc_web_response_content_type.as_deref(),
+                    initial_response_header_policy_plugins.as_ref(),
                 )
-                .await
-                {
-                    Ok(transformed) => transformed,
-                    Err(()) => break,
-                };
-                if let Some(transformed) = transformed {
-                    response_headers
-                        .insert("content-length".to_string(), transformed.len().to_string());
-                    response_body = transformed;
-                    plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
-                    // A plugin (response_transformer, compression, grpc_web, …)
-                    // replaced the bytes sent to the client. The backend's
-                    // trailers (digest/checksum/app-status) described the
-                    // ORIGINAL body, so they no longer apply — drop them, the
-                    // same way the reject paths above do (issue #1630).
-                    response_trailers = None;
-                }
+                .await;
+            if deadline_replaced || body_transformed {
+                // A transform or deadline replacement changes the bytes sent to
+                // the client. Backend trailers describing the original body no
+                // longer apply (issue #1630).
+                response_trailers = None;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
@@ -8436,7 +8424,7 @@ async fn dispatch_grpc_native_h3(
                     if send_h3_grpc_terminal_trailers(
                         stream,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                        "Deadline%20exceeded%20at%20gateway",
+                        GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
                     )
                     .await
                     {
@@ -8526,7 +8514,7 @@ async fn dispatch_grpc_native_h3(
                                 if send_h3_grpc_terminal_trailers(
                                     stream,
                                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-                                    "Deadline%20exceeded%20at%20gateway",
+                                    GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
                                 )
                                 .await
                                 {

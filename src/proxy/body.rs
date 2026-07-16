@@ -20,7 +20,8 @@ use tracing::debug;
 
 use crate::plugins::BackendAdmissionOutcome;
 use crate::proxy::grpc_proxy::{
-    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+    GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
 };
 use crate::retry::ErrorClass;
 
@@ -2617,7 +2618,7 @@ where
                 );
                 trailers.insert(
                     "grpc-message",
-                    http::HeaderValue::from_static("Deadline%20exceeded%20at%20gateway"),
+                    http::HeaderValue::from_static(GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER),
                 );
                 return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
             }
@@ -4742,7 +4743,7 @@ mod tests {
         assert_eq!(trailers.get("grpc-status").unwrap(), "4");
         assert_eq!(
             trailers.get("grpc-message").unwrap(),
-            "Deadline%20exceeded%20at%20gateway"
+            GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER
         );
         assert!(body.is_end_stream(), "deadline trailers terminate the body");
     }

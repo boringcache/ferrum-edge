@@ -964,6 +964,38 @@ pub mod _test_support {
         .await
     }
 
+    pub async fn transform_buffered_response_body_with_deadline_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+        grpc_web_response_content_type: Option<&str>,
+    ) -> bool {
+        crate::proxy::transform_buffered_response_body_with_deadline(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            grpc_web_response_content_type,
+            &[],
+        )
+        .await
+        .0
+    }
+
+    pub fn strip_content_length_for_streaming_grpc_deadline_for_test(
+        response_headers: &mut HashMap<String, String>,
+        deadline_enabled: bool,
+    ) {
+        let deadline = deadline_enabled.then(tokio::time::Instant::now);
+        crate::proxy::strip_content_length_for_streaming_grpc_deadline(
+            response_headers,
+            deadline,
+        );
+    }
+
     pub fn client_grpc_deadline_response_for_request_for_test(
         content_type: &str,
     ) -> DeadlineBackendResponse {
