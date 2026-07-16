@@ -635,8 +635,13 @@ async fn recover_late_resource_write<R: AdminResource>(
         &action,
         LateResourceWrite::Update { .. } | LateResourceWrite::Delete { .. }
     ) && matches!(
-        R::intervening_write_recovery(db.as_ref(), namespace, recovery.previous, http_client,)
-            .await?,
+        R::intervening_write_recovery(
+            db.as_ref(),
+            namespace,
+            recovery.previous,
+            http_client.clone(),
+        )
+        .await?,
         InterveningWriteRecovery::KeepCurrent
     ) {
         return Ok(false);
@@ -656,6 +661,7 @@ async fn recover_late_resource_write<R: AdminResource>(
                         &current,
                         written,
                         recovery.delete_snapshots.map(|snapshots| snapshots.config),
+                        http_client,
                     )
                     .await?
                     && !R::db_delete(db.as_ref(), namespace, written.id()).await?
@@ -1519,6 +1525,7 @@ pub(crate) trait AdminResource:
         current: &Self,
         written: &Self,
         _previous_snapshot: Option<&GatewayConfig>,
+        _http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<bool> {
         Ok(current.updated_at() == written.updated_at())
     }
@@ -3152,11 +3159,21 @@ impl AdminResource for PluginConfig {
         current: &Self,
         written: &Self,
         _previous_snapshot: Option<&GatewayConfig>,
+        http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<bool> {
         if current.updated_at != written.updated_at {
             return Ok(false);
         }
-        Ok(!plugin_has_proxy_association(db, namespace, &written.id).await?)
+        if plugin_has_proxy_association(db, namespace, &written.id).await? {
+            return Ok(false);
+        }
+        let mut candidate = db.load_namespace_snapshot(namespace).await?;
+        candidate
+            .plugin_configs
+            .retain(|plugin| plugin.namespace != namespace || plugin.id != written.id);
+        Ok(validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client)
+            .await
+            .is_ok())
     }
 
     async fn check_uniqueness(
@@ -3545,6 +3562,7 @@ impl AdminResource for Proxy {
         current: &Self,
         written: &Self,
         _previous_snapshot: Option<&GatewayConfig>,
+        _http_client: crate::plugins::PluginHttpClient,
     ) -> DbResult<bool> {
         if current.updated_at != written.updated_at {
             return Ok(false);
