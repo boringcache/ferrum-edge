@@ -132,7 +132,9 @@ namespace. File reloads, DB poll cycles, and control-plane snapshots use the
 same prospective graph rules before atomically publishing a new runtime cache.
 API-spec `POST` validates extracted plugins against the same authoritative
 namespace snapshot, and exact `PUT` first removes the plugins owned by the old
-spec before overlaying the replacement bundle.
+spec before overlaying the replacement bundle. API-spec `DELETE` validates the
+same removal-only candidate and rejects deletion when retained referrers would
+be left dangling.
 
 Graph participation never skips backend-egress admission: policy-only checks
 still run for every `schema_ref` consumer, including custom plugins and plugins

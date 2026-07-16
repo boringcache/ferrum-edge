@@ -1574,7 +1574,7 @@ async fn api_spec_writes_ignore_an_unchanged_invalid_persisted_schema_graph() {
 }
 
 #[tokio::test]
-async fn api_spec_exact_put_validates_removed_spec_owned_schema_definitions() {
+async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
@@ -1643,6 +1643,21 @@ async fn api_spec_exact_put_validates_removed_spec_owned_schema_definitions() {
     assert!(
         owned_plugins.iter().any(|plugin| plugin.id == schema_id),
         "rejected PUT must preserve the spec-owned schema definition"
+    );
+
+    let delete_status = client.delete(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(
+        delete_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "deleting a spec-owned definition must validate retained referrers"
+    );
+    let owned_plugins = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list spec-owned plugins after rejected DELETE");
+    assert!(
+        owned_plugins.iter().any(|plugin| plugin.id == schema_id),
+        "rejected DELETE must preserve the spec-owned schema definition"
     );
 }
 

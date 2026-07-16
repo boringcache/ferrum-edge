@@ -454,6 +454,27 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_replacement_candida
     validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
 }
 
+/// Validate the named log-schema graph produced by deleting an API spec.
+///
+/// API-spec deletion removes every plugin config owned by the spec. Model that
+/// as an exact replacement with no incoming plugins so retained manual
+/// referrers cannot be stranded by removing a spec-owned schema definition.
+pub(crate) async fn validate_transaction_log_schema_api_spec_deletion_candidate(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    existing_spec: &crate::config::types::ApiSpec,
+) -> Result<(), AfterValidateError> {
+    validate_transaction_log_schema_api_spec_replacement_candidate(
+        db,
+        state,
+        namespace,
+        existing_spec,
+        &[],
+    )
+    .await
+}
+
 /// Validate a wholesale namespace replacement without retaining resources that
 /// the restore will delete. Runtime plugin chains are namespace-scoped, so the
 /// normalized replacement is the complete authoritative candidate.

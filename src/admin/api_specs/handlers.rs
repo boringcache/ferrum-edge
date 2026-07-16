@@ -2781,6 +2781,33 @@ pub async fn handle_delete_api_spec(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
+    match crate::admin::crud::validate_transaction_log_schema_api_spec_deletion_candidate(
+        db.as_ref(),
+        state,
+        namespace,
+        &existing,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crate::admin::crud::AfterValidateError::BadRequest(errors)) => {
+            return Ok(error_response(ApiSpecError::ValidationFailures {
+                spec_version: existing.spec_version.clone(),
+                failures: vec![ValidationFailure {
+                    resource_type: "plugin_graph",
+                    id: existing.proxy_id.clone(),
+                    errors,
+                }],
+            }));
+        }
+        Err(crate::admin::crud::AfterValidateError::Db(error)) => {
+            return Ok(error_response(classify_db_error(error)));
+        }
+        Err(crate::admin::crud::AfterValidateError::Response(response)) => {
+            return Ok(*response);
+        }
+    }
+
     match db.delete_api_spec(namespace, id).await {
         Ok(true) => {
             let event = audit::AuditEvent::new(
