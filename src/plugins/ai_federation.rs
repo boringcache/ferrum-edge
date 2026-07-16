@@ -230,6 +230,36 @@ struct CachedToken {
     expires_at: std::time::Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthFailureImpact {
+    /// Local configuration, key parsing, or signing failed before any
+    /// provider-owned dependency was contacted.
+    CircuitNeutral,
+    /// The provider's OAuth dependency could not supply a usable token.
+    ProviderUnavailable,
+}
+
+struct AuthFailure {
+    impact: AuthFailureImpact,
+    message: String,
+}
+
+impl AuthFailure {
+    fn local(message: String) -> Self {
+        Self {
+            impact: AuthFailureImpact::CircuitNeutral,
+            message,
+        }
+    }
+
+    fn provider_unavailable(message: String) -> Self {
+        Self {
+            impact: AuthFailureImpact::ProviderUnavailable,
+            message,
+        }
+    }
+}
+
 /// Thread-safe OAuth2 token cache for Google Vertex AI.
 struct OAuth2Cache {
     cache: ArcSwapOption<CachedToken>,
@@ -274,7 +304,7 @@ impl OAuth2Cache {
         &self,
         http_client: &PluginHttpClient,
         latency_accumulator: &AtomicU64,
-    ) -> Result<String, String> {
+    ) -> Result<String, AuthFailure> {
         // Hot path: lock-free cache read. Refresh coordination only happens
         // when the cached token is absent or close to expiry.
         if let Some(token) = self.cache.load_full()
@@ -302,7 +332,7 @@ impl OAuth2Cache {
         &self,
         http_client: &PluginHttpClient,
         latency_accumulator: &AtomicU64,
-    ) -> Result<CachedToken, String> {
+    ) -> Result<CachedToken, AuthFailure> {
         let now = Utc::now().timestamp();
         let claims = json!({
             "iss": self.client_email,
@@ -314,9 +344,11 @@ impl OAuth2Cache {
 
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(self.private_key_pem.as_bytes())
-            .map_err(|e| format!("ai_federation: invalid RSA private key: {e}"))?;
+            .map_err(|e| {
+                AuthFailure::local(format!("ai_federation: invalid RSA private key: {e}"))
+            })?;
         let jwt = jsonwebtoken::encode(&header, &claims, &key)
-            .map_err(|e| format!("ai_federation: JWT signing failed: {e}"))?;
+            .map_err(|e| AuthFailure::local(format!("ai_federation: JWT signing failed: {e}")))?;
 
         let body = format!(
             "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={}",
@@ -336,42 +368,60 @@ impl OAuth2Cache {
                 latency_accumulator,
             )
             .await
-            .map_err(|e| format!("ai_federation: OAuth2 token request failed: {e}"))?;
+            .map_err(|e| {
+                AuthFailure::provider_unavailable(format!(
+                    "ai_federation: OAuth2 token request failed: {e}"
+                ))
+            })?;
 
         let status = resp.status().as_u16();
         let body_read_started = std::time::Instant::now();
         let body_result = read_response_body_bounded(resp, MAX_OAUTH_RESPONSE_BYTES).await;
         add_external_io_elapsed(latency_accumulator, body_read_started);
-        let resp_body = body_result.map_err(|error| match error {
-            BoundedReadError::LimitExceeded { .. } => format!(
-                "ai_federation: OAuth2 response exceeded {MAX_OAUTH_RESPONSE_BYTES} byte limit"
-            ),
-            BoundedReadError::Stream(error) => format!(
-                "ai_federation: OAuth2 response read failed: {}",
-                crate::retry::classify_reqwest_error(&error)
-            ),
+        let resp_body = body_result.map_err(|error| {
+            AuthFailure::provider_unavailable(match error {
+                BoundedReadError::LimitExceeded { .. } => format!(
+                    "ai_federation: OAuth2 response exceeded {MAX_OAUTH_RESPONSE_BYTES} byte limit"
+                ),
+                BoundedReadError::Stream(error) => format!(
+                    "ai_federation: OAuth2 response read failed: {}",
+                    crate::retry::classify_reqwest_error(&error)
+                ),
+            })
         })?;
 
         if status != 200 {
-            return Err(format!(
+            return Err(AuthFailure::provider_unavailable(format!(
                 "ai_federation: OAuth2 token endpoint returned status {status}"
-            ));
+            )));
         }
 
-        let token_resp: Value = serde_json::from_slice(&resp_body)
-            .map_err(|e| format!("ai_federation: OAuth2 response parse failed: {e}"))?;
+        let token_resp: Value = serde_json::from_slice(&resp_body).map_err(|e| {
+            AuthFailure::provider_unavailable(format!(
+                "ai_federation: OAuth2 response parse failed: {e}"
+            ))
+        })?;
 
         let access_token = token_resp["access_token"]
             .as_str()
             .filter(|value| !value.is_empty() && value.len() <= MAX_OAUTH_RESPONSE_BYTES)
-            .ok_or("ai_federation: OAuth2 response missing access_token")?
+            .ok_or_else(|| {
+                AuthFailure::provider_unavailable(
+                    "ai_federation: OAuth2 response missing access_token".to_string(),
+                )
+            })?
             .to_string();
         let expires_in = match token_resp.get("expires_in") {
             None => 3600,
             Some(value) => value
                 .as_u64()
                 .filter(|seconds| (1..=86_400).contains(seconds))
-                .ok_or("ai_federation: OAuth2 expires_in must be an integer between 1 and 86400")?,
+                .ok_or_else(|| {
+                    AuthFailure::provider_unavailable(
+                        "ai_federation: OAuth2 expires_in must be an integer between 1 and 86400"
+                            .to_string(),
+                    )
+                })?,
         };
 
         Ok(CachedToken {
@@ -413,6 +463,7 @@ struct ProviderCallFailure {
     kind: ProviderCallFailureKind,
     error_class: crate::retry::ErrorClass,
     headers: HashMap<String, String>,
+    circuit_failure: bool,
 }
 
 enum BoundedJsonSerializationError {
@@ -535,11 +586,42 @@ enum CircuitAdmission {
 /// Cancellation-safe lease for a half-open probe. Provider dispatch awaits
 /// DNS, connect, response headers, and body reads; dropping that future must
 /// not leave the circuit's single probe slot permanently occupied.
-struct HalfOpenProbeGuard<'a>(&'a ProviderCircuit);
+struct HalfOpenProbeGuard<'a> {
+    circuit: &'a ProviderCircuit,
+    release_on_drop: bool,
+}
+
+impl<'a> HalfOpenProbeGuard<'a> {
+    fn new(circuit: &'a ProviderCircuit) -> Self {
+        Self {
+            circuit,
+            release_on_drop: true,
+        }
+    }
+
+    /// An outcome was recorded by the circuit state machine, so dropping this
+    /// cancellation lease must not release a slot that a later probe acquired.
+    fn resolve(&mut self) {
+        self.release_on_drop = false;
+    }
+
+    /// Release an admitted probe that stopped before provider I/O produced a
+    /// circuit outcome, then disarm the cancellation fallback.
+    fn release(&mut self) {
+        if self.release_on_drop {
+            self.circuit
+                .release_probe(CircuitAdmission::HalfOpenProbe);
+            self.release_on_drop = false;
+        }
+    }
+}
 
 impl Drop for HalfOpenProbeGuard<'_> {
     fn drop(&mut self) {
-        self.0.release_probe(CircuitAdmission::HalfOpenProbe);
+        if self.release_on_drop {
+            self.circuit
+                .release_probe(CircuitAdmission::HalfOpenProbe);
+        }
     }
 }
 
@@ -4705,14 +4787,23 @@ impl AiFederation {
             kind: ProviderCallFailureKind::PreWire,
             error_class: crate::retry::ErrorClass::DispatchPolicyRejected,
             headers: HashMap::new(),
+            circuit_failure: false,
         })?;
         let auth_headers = self
             .build_auth_headers(provider, url, body, latency_accumulator)
             .await
-            .map_err(|_| ProviderCallFailure {
-                kind: ProviderCallFailureKind::PreWire,
-                error_class: crate::retry::ErrorClass::RequestError,
-                headers: HashMap::new(),
+            .map_err(|failure| {
+                debug!(
+                    provider = %provider.name,
+                    error = %failure.message,
+                    "ai_federation: provider authentication preparation failed"
+                );
+                ProviderCallFailure {
+                    kind: ProviderCallFailureKind::PreWire,
+                    error_class: crate::retry::ErrorClass::RequestError,
+                    headers: HashMap::new(),
+                    circuit_failure: failure.impact == AuthFailureImpact::ProviderUnavailable,
+                }
             })?;
 
         let mut req = self
@@ -4747,6 +4838,8 @@ impl AiFederation {
                 },
                 error_class: failure.error_class,
                 headers: HashMap::new(),
+                circuit_failure: failure.error_class
+                    != crate::retry::ErrorClass::DispatchPolicyRejected,
             })?;
 
         let status = resp.status().as_u16();
@@ -4759,11 +4852,13 @@ impl AiFederation {
                 kind: ProviderCallFailureKind::ResponseTooLarge,
                 error_class: crate::retry::ErrorClass::ResponseBodyTooLarge,
                 headers: headers.clone(),
+                circuit_failure: true,
             },
             BoundedReadError::Stream(error) => ProviderCallFailure {
                 kind: ProviderCallFailureKind::Ambiguous,
                 error_class: crate::retry::classify_reqwest_error(&error),
                 headers: headers.clone(),
+                circuit_failure: true,
             },
         })?;
 
@@ -4781,7 +4876,7 @@ impl AiFederation {
         url: &str,
         payload: &[u8],
         latency_accumulator: &AtomicU64,
-    ) -> Result<Vec<(String, String)>, String> {
+    ) -> Result<Vec<(String, String)>, AuthFailure> {
         match &provider.auth {
             AuthMethod::BearerToken { api_key } => Ok(vec![(
                 "authorization".to_string(),
@@ -4804,6 +4899,7 @@ impl AiFederation {
                     payload,
                     &now,
                 )
+                .map_err(AuthFailure::local)
             }
 
             AuthMethod::GoogleOAuth2 { cache } => {
@@ -5173,9 +5269,9 @@ impl Plugin for AiFederation {
                 .as_ref()
                 .map(ProviderCircuit::admit)
                 .unwrap_or(CircuitAdmission::Closed);
-            let _half_open_probe_guard = match (provider.circuit.as_ref(), admission) {
+            let mut half_open_probe_guard = match (provider.circuit.as_ref(), admission) {
                 (Some(circuit), CircuitAdmission::HalfOpenProbe) => {
-                    Some(HalfOpenProbeGuard(circuit))
+                    Some(HalfOpenProbeGuard::new(circuit))
                 }
                 _ => None,
             };
@@ -5218,8 +5314,8 @@ impl Plugin for AiFederation {
             if provider.multimodal_mode != MultimodalMode::TextOnlyWithWarning
                 && let Some(message) = &deferred_non_text_validation_error
             {
-                if let Some(circuit) = &provider.circuit {
-                    circuit.release_probe(admission);
+                if let Some(guard) = half_open_probe_guard.as_mut() {
+                    guard.release();
                 }
                 last_client_rejection = Some(message.clone());
                 if self.fallback_enabled && has_later_provider {
@@ -5273,8 +5369,8 @@ impl Plugin for AiFederation {
             if provider_embeds_model_in_url(provider.provider_type)
                 && !is_valid_url_model_component(&resolved_model)
             {
-                if let Some(circuit) = &provider.circuit {
-                    circuit.release_probe(admission);
+                if let Some(guard) = half_open_probe_guard.as_mut() {
+                    guard.release();
                 }
                 warn!(
                     provider = %provider.name,
@@ -5300,8 +5396,8 @@ impl Plugin for AiFederation {
                     non_text_parts = multimodal_usage.non_text_parts,
                     "ai_federation: provider cannot serve multimodal request, trying fallback"
                 );
-                if let Some(circuit) = &provider.circuit {
-                    circuit.release_probe(admission);
+                if let Some(guard) = half_open_probe_guard.as_mut() {
+                    guard.release();
                 }
                 last_client_rejection = Some(message);
                 if self.fallback_enabled && has_later_provider {
@@ -5334,8 +5430,8 @@ impl Plugin for AiFederation {
                         provider = %provider.name,
                         "ai_federation: request translation failed"
                     );
-                    if let Some(circuit) = &provider.circuit {
-                        circuit.release_probe(admission);
+                    if let Some(guard) = half_open_probe_guard.as_mut() {
+                        guard.release();
                     }
                     last_client_rejection = Some(e);
                     if self.fallback_enabled && has_later_provider {
@@ -5394,10 +5490,13 @@ impl Plugin for AiFederation {
                         );
                     }
                     if let Some(circuit) = &provider.circuit {
-                        if failure.error_class == crate::retry::ErrorClass::DispatchPolicyRejected {
-                            circuit.release_probe(admission);
-                        } else {
+                        if failure.circuit_failure {
                             circuit.record_failure(&provider.name, admission);
+                            if let Some(guard) = half_open_probe_guard.as_mut() {
+                                guard.resolve();
+                            }
+                        } else if let Some(guard) = half_open_probe_guard.as_mut() {
+                            guard.release();
                         }
                     }
                     warn!(
@@ -5481,6 +5580,9 @@ impl Plugin for AiFederation {
             if self.fallback_status_codes.contains(&status) {
                 if let Some(circuit) = &provider.circuit {
                     circuit.record_failure(&provider.name, admission);
+                    if let Some(guard) = half_open_probe_guard.as_mut() {
+                        guard.resolve();
+                    }
                 }
                 if self.fallback_enabled && has_later_provider {
                     warn!(
@@ -5501,6 +5603,9 @@ impl Plugin for AiFederation {
             } else if (300..400).contains(&status) {
                 if let Some(circuit) = &provider.circuit {
                     circuit.record_failure(&provider.name, admission);
+                    if let Some(guard) = half_open_probe_guard.as_mut() {
+                        guard.resolve();
+                    }
                 }
                 if self.fallback_enabled && self.fallback_on_protocol_errors && has_later_provider {
                     last_failure_result = Some(self.openai_error_response_with_headers(
@@ -5527,6 +5632,9 @@ impl Plugin for AiFederation {
                         && !(300..400).contains(&status)
                     {
                         circuit.record_success(&provider.name, admission);
+                        if let Some(guard) = half_open_probe_guard.as_mut() {
+                            guard.resolve();
+                        }
                     }
                     if (200..300).contains(&status) {
                         self.write_token_metadata(
@@ -5607,6 +5715,9 @@ impl Plugin for AiFederation {
                 Err(e) => {
                     if let Some(circuit) = &provider.circuit {
                         circuit.record_failure(&provider.name, admission);
+                        if let Some(guard) = half_open_probe_guard.as_mut() {
+                            guard.resolve();
+                        }
                     }
                     warn!(
                         provider = %provider.name,
@@ -5812,6 +5923,97 @@ pub mod test_helpers {
     /// the deterministic pre-I/O concurrency rejection path.
     pub fn close_request_slots_for_test(plugin: &AiFederation) {
         plugin.request_slots.close();
+    }
+
+    /// Resource-bound constants used by external runtime/schema parity tests.
+    pub fn resource_bounds_for_test() -> (usize, usize, usize, usize) {
+        (
+            DEFAULT_MAX_PROVIDER_RESPONSE_BYTES,
+            MAX_PROVIDER_RESPONSE_BYTES,
+            MAX_TRANSLATED_REQUEST_BYTES,
+            MAX_OAUTH_RESPONSE_BYTES,
+        )
+    }
+
+    /// Resolved response bound for a configured provider.
+    pub fn provider_response_limit_for_test(plugin: &AiFederation, index: usize) -> Option<usize> {
+        plugin
+            .providers
+            .get(index)
+            .map(|provider| provider.max_response_body_bytes)
+    }
+
+    /// Exercise the real Vertex token refresh path against a test-controlled
+    /// endpoint. Production construction still pins token_uri to Google; this
+    /// helper only substitutes the first-hop endpoint after validating the
+    /// supplied service-account key.
+    pub async fn vertex_oauth_exchange_for_test(
+        service_account_json: String,
+        token_uri: String,
+        http_client: PluginHttpClient,
+    ) -> Result<String, (String, bool)> {
+        let mut cache = OAuth2Cache::new(service_account_json)
+            .map_err(|message| (message, false))?;
+        cache.token_uri = token_uri;
+        let latency = AtomicU64::new(0);
+        cache
+            .get_token(&http_client, &latency)
+            .await
+            .map_err(|failure| {
+                (
+                    failure.message,
+                    failure.impact == AuthFailureImpact::ProviderUnavailable,
+                )
+            })
+    }
+
+    /// Force a post-construction local JWT key failure to verify that local
+    /// auth-build errors stay provider-circuit neutral.
+    pub async fn vertex_oauth_local_signing_failure_for_test(
+        service_account_json: String,
+        http_client: PluginHttpClient,
+    ) -> Result<String, (String, bool)> {
+        let mut cache = OAuth2Cache::new(service_account_json)
+            .map_err(|message| (message, false))?;
+        cache.private_key_pem = "invalid-test-key".to_string();
+        let latency = AtomicU64::new(0);
+        cache
+            .get_token(&http_client, &latency)
+            .await
+            .map_err(|failure| {
+                (
+                    failure.message,
+                    failure.impact == AuthFailureImpact::ProviderUnavailable,
+                )
+            })
+    }
+
+    /// Lock the SigV4 classification: signer/build errors are local and must
+    /// never count as evidence that the remote provider is unavailable.
+    pub fn sigv4_local_failure_is_circuit_neutral_for_test() -> bool {
+        let config = aws_sigv4::AwsSigV4Config {
+            region: "us-east-1".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret-key".to_string(),
+            session_token: None,
+        };
+        let result = aws_sigv4::sign_request(
+            &config,
+            "bedrock",
+            "POST",
+            "not a valid URL",
+            "application/json",
+            b"{}",
+            &Utc::now(),
+        )
+        .map_err(AuthFailure::local);
+        matches!(
+            result,
+            Err(AuthFailure {
+                impact: AuthFailureImpact::CircuitNeutral,
+                ..
+            })
+        )
     }
 
     /// Expose glob matching for tests.
@@ -6054,9 +6256,40 @@ pub mod test_helpers {
             if admission != CircuitAdmission::HalfOpenProbe {
                 return false;
             }
-            let _cancelled_dispatch = HalfOpenProbeGuard(&circuit);
+            let _cancelled_dispatch = HalfOpenProbeGuard::new(&circuit);
         }
         circuit.admit() == CircuitAdmission::HalfOpenProbe
+    }
+
+    /// Reproduce the completion/re-arm interleaving for a success threshold
+    /// greater than one. Once the second probe owns the slot, resolving the
+    /// first probe's guard must not allow a third concurrent probe.
+    pub fn completed_half_open_probe_does_not_release_successor_for_test() -> bool {
+        let circuit = ProviderCircuit::new(ProviderCircuitConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(60),
+            success_threshold: 2,
+        });
+        circuit
+            .open_until_epoch_ms
+            .store(epoch_millis().saturating_sub(1), Ordering::Release);
+
+        let first_admission = circuit.admit();
+        if first_admission != CircuitAdmission::HalfOpenProbe {
+            return false;
+        }
+        let mut first_guard = HalfOpenProbeGuard::new(&circuit);
+        circuit.record_success("test", first_admission);
+
+        let second_admission = circuit.admit();
+        if second_admission != CircuitAdmission::HalfOpenProbe {
+            return false;
+        }
+        let _second_guard = HalfOpenProbeGuard::new(&circuit);
+
+        first_guard.resolve();
+        drop(first_guard);
+        circuit.admit() == CircuitAdmission::Open
     }
 
     fn circuit_admission_label(admission: CircuitAdmission) -> &'static str {

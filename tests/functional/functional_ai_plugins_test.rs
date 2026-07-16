@@ -6,7 +6,10 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_ai_plugins
 
+use crate::common::TestGateway;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,6 +37,30 @@ async fn start_echo_server_on(listener: TcpListener) {
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    }
+}
+
+async fn start_counted_json_server_on(
+    listener: TcpListener,
+    status: u16,
+    body: &'static str,
+    hits: Arc<AtomicUsize>,
+) {
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let hits = Arc::clone(&hits);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16384];
+                let _ = stream.read(&mut buf).await;
+                hits.fetch_add(1, Ordering::Relaxed);
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
@@ -118,6 +145,145 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         }
     }
     panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
+}
+
+// ============================================================================
+// ai_federation request-path isolation
+// ============================================================================
+
+#[ignore]
+#[tokio::test]
+async fn test_ai_federation_terminal_dispatch_is_backend_accounting_neutral() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_hits = Arc::new(AtomicUsize::new(0));
+    let backend_task = tokio::spawn(start_counted_json_server_on(
+        backend_listener,
+        200,
+        r#"{"backend":true}"#,
+        Arc::clone(&backend_hits),
+    ));
+
+    let provider_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_port = provider_listener.local_addr().unwrap().port();
+    let provider_hits = Arc::new(AtomicUsize::new(0));
+    let provider_task = tokio::spawn(start_counted_json_server_on(
+        provider_listener,
+        503,
+        r#"{"error":"provider unavailable"}"#,
+        Arc::clone(&provider_hits),
+    ));
+
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "federation-isolation"
+    listen_path: "/federation-isolation"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    circuit_breaker:
+      failure_threshold: 1
+      success_threshold: 1
+      timeout_seconds: 60
+      failure_status_codes: [503]
+      half_open_max_requests: 1
+      trip_on_connection_errors: true
+    plugins:
+      - plugin_config_id: "federation-isolation-plugin"
+
+consumers: []
+upstreams: []
+
+plugin_configs:
+  - id: "federation-isolation-plugin"
+    proxy_id: "federation-isolation"
+    plugin_name: "ai_federation"
+    scope: "proxy"
+    enabled: true
+    config:
+      fallback_enabled: false
+      fail_on_no_matching_provider: false
+      providers:
+        - name: "mock-provider"
+          provider_type: "openai"
+          api_key: "test-key"
+          model_patterns: ["gpt-*"]
+          base_url: "http://127.0.0.1:{provider_port}/v1/chat/completions"
+          allow_plaintext: true
+  - id: "federation-isolation-metrics"
+    plugin_name: "prometheus_metrics"
+    scope: "global"
+    enabled: true
+    config:
+      render_cache_ttl_seconds: 0
+"#
+    );
+
+    let gateway = TestGateway::builder()
+        .mode_file(config)
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .spawn()
+        .await
+        .expect("start federation isolation gateway");
+    let client = reqwest::Client::new();
+
+    let provider_response = client
+        .post(gateway.proxy_url("/federation-isolation/chat"))
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("send federated request");
+    assert_eq!(provider_response.status().as_u16(), 503);
+    assert_eq!(provider_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        backend_hits.load(Ordering::Relaxed),
+        0,
+        "terminal federation dispatch must not enter backend transport"
+    );
+
+    let metrics = client
+        .get(gateway.admin_url("/metrics"))
+        .header("Authorization", gateway.auth_header())
+        .send()
+        .await
+        .expect("scrape metrics after synthetic provider response")
+        .text()
+        .await
+        .expect("read metrics body");
+    assert!(
+        !metrics.contains(
+            "ferrum_backend_duration_ms_count{proxy_id=\"federation-isolation\""
+        ),
+        "provider latency must not be recorded as backend latency: {metrics}"
+    );
+
+    let passthrough_response = client
+        .post(gateway.proxy_url("/federation-isolation/chat"))
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "local-only",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("send unmatched pass-through request");
+    assert_eq!(
+        passthrough_response.status().as_u16(),
+        200,
+        "the provider 503 must not open or penalize the backend circuit"
+    );
+    assert_eq!(backend_hits.load(Ordering::Relaxed), 1);
+    assert_eq!(provider_hits.load(Ordering::Relaxed), 1);
+
+    backend_task.abort();
+    provider_task.abort();
 }
 
 // ============================================================================

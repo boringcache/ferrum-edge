@@ -9,8 +9,10 @@ use ferrum_edge::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::method;
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 async fn run_federation_final_body(
     plugin: &ai_federation::AiFederation,
@@ -235,12 +237,64 @@ fn strict_config_rejects_unknown_root_provider_and_circuit_fields() {
 }
 
 #[test]
+fn provider_and_serialization_bounds_match_the_security_contract() {
+    let (default_provider, max_provider, max_translated, max_oauth) =
+        test_helpers::resource_bounds_for_test();
+    assert_eq!(default_provider, 8 * 1024 * 1024);
+    assert_eq!(max_provider, 64 * 1024 * 1024);
+    assert_eq!(max_translated, 64 * 1024 * 1024);
+    assert_eq!(max_oauth, 64 * 1024);
+
+    let provider = json!({
+        "name": "openai",
+        "provider_type": "openai",
+        "api_key": "sk-test"
+    });
+    let plugin = ai_federation::AiFederation::new(
+        &json!({"providers": [provider.clone()]}),
+        create_test_http_client(),
+    )
+    .unwrap();
+    assert_eq!(
+        test_helpers::provider_response_limit_for_test(&plugin, 0),
+        Some(default_provider)
+    );
+
+    for (limit, expected) in [
+        (0, "must be between 1 and 67108864"),
+        (67_108_865, "must be between 1 and 67108864"),
+    ] {
+        let mut bounded = provider.clone();
+        bounded["max_response_body_bytes"] = json!(limit);
+        let error = ai_federation::AiFederation::new(
+            &json!({"providers": [bounded]}),
+            create_test_http_client(),
+        )
+        .err()
+        .expect("out-of-range provider response bound must fail closed");
+        assert!(error.contains(expected), "got: {error}");
+    }
+}
+
+#[test]
 fn provider_url_credentials_and_endpoint_component_injection_are_rejected() {
-    for base_url in [
-        "https://user:secret@example.com/v1/chat",
-        "https://example.com/v1/chat?api_key=secret",
-        "https://example.com/v1/chat#secret",
-        "HTTPS://example.com/v1/chat",
+    for (base_url, expected) in [
+        (
+            "https://user:secret@example.com/v1/chat",
+            "must not contain URL userinfo",
+        ),
+        (
+            "https://example.com/v1/chat?api_key=secret",
+            "must not contain a query string",
+        ),
+        (
+            "https://example.com/v1/chat#secret",
+            "must not contain a fragment",
+        ),
+        (
+            "HTTPS://example.com/v1/chat",
+            "must use a lowercase explicit",
+        ),
     ] {
         let config = json!({"providers": [{
             "name": "openai",
@@ -248,10 +302,10 @@ fn provider_url_credentials_and_endpoint_component_injection_are_rejected() {
             "api_key": "sk-test",
             "base_url": base_url
         }]});
-        assert!(
-            ai_federation::AiFederation::new(&config, create_test_http_client()).is_err(),
-            "credential-bearing URL must be rejected"
-        );
+        let error = ai_federation::AiFederation::new(&config, create_test_http_client())
+            .err()
+            .expect("credential-bearing URL must be rejected");
+        assert!(error.contains(expected), "got: {error}");
     }
 
     let azure = json!({"providers": [{
@@ -262,7 +316,14 @@ fn provider_url_credentials_and_endpoint_component_injection_are_rejected() {
         "azure_deployment": "deploy",
         "base_url": "https://example.com/v1/chat"
     }]});
-    assert!(ai_federation::AiFederation::new(&azure, create_test_http_client()).is_err());
+    let azure_error = ai_federation::AiFederation::new(&azure, create_test_http_client())
+        .err()
+        .expect("unsafe Azure authority component must be rejected");
+    assert!(azure_error.contains("azure_resource"), "got: {azure_error}");
+    assert!(
+        azure_error.contains("ASCII DNS label"),
+        "got: {azure_error}"
+    );
 
     let vertex = json!({"providers": [{
         "name": "vertex",
@@ -276,7 +337,17 @@ fn provider_url_credentials_and_endpoint_component_injection_are_rejected() {
         }"#,
         "base_url": "https://example.com/v1/chat"
     }]});
-    assert!(ai_federation::AiFederation::new(&vertex, create_test_http_client()).is_err());
+    let vertex_error = ai_federation::AiFederation::new(&vertex, create_test_http_client())
+        .err()
+        .expect("unsafe Vertex path component must be rejected");
+    assert!(
+        vertex_error.contains("google_project_id"),
+        "got: {vertex_error}"
+    );
+    assert!(
+        vertex_error.contains("unsafe in a provider endpoint component"),
+        "got: {vertex_error}"
+    );
 }
 
 #[test]
@@ -298,6 +369,61 @@ fn google_oauth_token_authority_is_pinned() {
     assert!(
         error.contains("oauth2.googleapis.com/token"),
         "got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn vertex_oauth_exchange_stops_at_64_kib_and_is_provider_availability_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(64 * 1024 + 1)))
+        .mount(&server)
+        .await;
+
+    let service_account = json!({
+        "client_email": "vertex-test@example.iam.gserviceaccount.com",
+        "private_key": include_str!("../../fixtures/test_rsa_private.pem"),
+        "token_uri": "https://oauth2.googleapis.com/token"
+    })
+    .to_string();
+    let (message, circuit_failure) = test_helpers::vertex_oauth_exchange_for_test(
+        service_account,
+        format!("{}/token", server.uri()),
+        create_test_http_client(),
+    )
+    .await
+    .expect_err("oversized OAuth response must fail before JSON parsing");
+
+    assert!(
+        message.contains("OAuth2 response exceeded 65536 byte limit"),
+        "got: {message}"
+    );
+    assert!(
+        circuit_failure,
+        "an unavailable provider-owned OAuth dependency should affect provider availability"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    let service_account = json!({
+        "client_email": "vertex-test@example.iam.gserviceaccount.com",
+        "private_key": include_str!("../../fixtures/test_rsa_private.pem"),
+        "token_uri": "https://oauth2.googleapis.com/token"
+    })
+    .to_string();
+    let (message, circuit_failure) = test_helpers::vertex_oauth_local_signing_failure_for_test(
+        service_account,
+        create_test_http_client(),
+    )
+    .await
+    .expect_err("forced local JWT key failure must fail before OAuth I/O");
+    assert!(message.contains("invalid RSA private key"), "got: {message}");
+    assert!(
+        !circuit_failure,
+        "local configuration/signing failures must not trip provider availability circuits"
+    );
+    assert!(
+        test_helpers::sigv4_local_failure_is_circuit_neutral_for_test(),
+        "SigV4 request-build failures must remain provider-circuit neutral"
     );
 }
 
@@ -1140,19 +1266,75 @@ fn malformed_stop_and_tool_shapes_fail_explicitly() {
             json!(""),
         ] {
             let request = tool_round_trip_request(stop);
+            let error =
+                test_helpers::translate_request_test(provider, &request, "model", &config)
+                    .unwrap_err();
             assert!(
-                test_helpers::translate_request_test(provider, &request, "model", &config).is_err(),
-                "{provider} must reject malformed stop values"
+                error.contains("'stop'") || error.contains("stop sequence"),
+                "{provider} rejected through an unexpected path: {error}"
             );
         }
     }
 
     let mut malformed = tool_round_trip_request(Value::Null);
     malformed["messages"][1]["tool_calls"][0]["function"]["arguments"] = json!("not-json");
+    let error = test_helpers::translate_request_test(
+        "google_gemini",
+        &malformed,
+        "gemini",
+        &json!({}),
+    )
+    .unwrap_err();
     assert!(
-        test_helpers::translate_request_test("google_gemini", &malformed, "gemini", &json!({}))
-            .is_err()
+        error.contains("tool_calls[0]") && error.contains("arguments are not valid JSON"),
+        "malformed tool arguments rejected through an unexpected path: {error}"
     );
+}
+
+#[test]
+fn openai_scalar_stop_stays_scalar_while_array_only_providers_wrap_it() {
+    let request = tool_round_trip_request(json!("DONE"));
+
+    for (provider, config) in [
+        ("openai", json!({})),
+        (
+            "azure_openai",
+            json!({
+                "azure_resource": "resource",
+                "azure_deployment": "deployment"
+            }),
+        ),
+    ] {
+        let (_, _, body) =
+            test_helpers::translate_request_test(provider, &request, "model", &config).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["stop"], json!("DONE"), "{provider}");
+    }
+
+    for (provider, config, pointer) in [
+        ("anthropic", json!({}), "/stop_sequences"),
+        (
+            "google_gemini",
+            json!({}),
+            "/generationConfig/stopSequences",
+        ),
+        (
+            "google_vertex",
+            json!({}),
+            "/generationConfig/stopSequences",
+        ),
+        (
+            "aws_bedrock",
+            json!({"aws_region": "us-east-1"}),
+            "/inferenceConfig/stopSequences",
+        ),
+        ("cohere", json!({}), "/stop_sequences"),
+    ] {
+        let (_, _, body) =
+            test_helpers::translate_request_test(provider, &request, "model", &config).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body.pointer(pointer), Some(&json!(["DONE"])), "{provider}");
+    }
 }
 
 #[test]
@@ -3303,6 +3485,7 @@ async fn provider_redirect_status_and_safe_headers_are_preserved_without_followi
                 .insert_header("retry-after", "30")
                 .insert_header("x-request-id", "req-safe")
                 .insert_header("set-cookie", "secret=session")
+                .insert_header("x-evil", "must-not-cross")
                 .set_body_json(json!({"redirect": true})),
         )
         .mount(&server)
@@ -3336,6 +3519,7 @@ async fn provider_redirect_status_and_safe_headers_are_preserved_without_followi
             );
             assert!(!headers.contains_key("location"));
             assert!(!headers.contains_key("set-cookie"));
+            assert!(!headers.contains_key("x-evil"));
         }
         other => panic!("expected preserved redirect response, got {other:?}"),
     }
@@ -3439,6 +3623,7 @@ async fn final_and_fallback_exhaustion_responses_preserve_only_safe_headers() {
                 .insert_header("openai-request-id", "req-final")
                 .insert_header("set-cookie", "provider_secret=value")
                 .insert_header("authorization", "Bearer provider-secret")
+                .insert_header("x-evil", "must-not-cross")
                 .set_body_json(json!({"error": "secondary"})),
         )
         .mount(&secondary)
@@ -3471,6 +3656,7 @@ async fn final_and_fallback_exhaustion_responses_preserve_only_safe_headers() {
             );
             assert!(!headers.contains_key("set-cookie"));
             assert!(!headers.contains_key("authorization"));
+            assert!(!headers.contains_key("x-evil"));
         }
         other => panic!("expected final throttling response, got {other:?}"),
     }
@@ -3634,6 +3820,104 @@ fn provider_circuit_threshold_cooldown_and_half_open_recovery_are_deterministic(
 #[test]
 fn cancelled_half_open_provider_attempt_releases_probe_slot() {
     assert!(test_helpers::cancelled_half_open_probe_is_released_for_test());
+}
+
+#[tokio::test]
+async fn cancelled_half_open_dispatch_releases_the_real_provider_probe() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            if responder_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503).set_body_json(json!({"error": "open circuit"}))
+            } else {
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(500))
+                    .set_body_json(json!({
+                        "id": "chatcmpl-recovered",
+                        "object": "chat.completion",
+                        "model": "gpt-4o",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "recovered"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let config = json!({"providers": [{
+        "name": "primary",
+        "provider_type": "openai",
+        "api_key": "sk-test",
+        "model_patterns": ["gpt-*"],
+        "base_url": server.uri(),
+        "allow_plaintext": true,
+        "circuit_breaker": {
+            "failure_threshold": 1,
+            "cooldown_seconds": 1,
+            "success_threshold": 1
+        }
+    }]});
+    let plugin = Arc::new(
+        ai_federation::AiFederation::new(&config, create_test_http_client()).unwrap(),
+    );
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    let mut first_ctx = post_json_ctx(&request);
+    let first = run_federation_final_body(&plugin, &mut first_ctx, &json_headers()).await;
+    assert!(matches!(
+        first,
+        PluginResult::RejectBinary {
+            status_code: 503,
+            ..
+        }
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    let cancelled_plugin = Arc::clone(&plugin);
+    let cancelled_request = request.clone();
+    let cancelled = tokio::spawn(async move {
+        let mut ctx = post_json_ctx(&cancelled_request);
+        run_federation_final_body(&cancelled_plugin, &mut ctx, &json_headers()).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if calls.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("half-open provider request must start");
+    cancelled.abort();
+    let _ = cancelled.await;
+
+    let mut recovery_ctx = post_json_ctx(&request);
+    let recovery = run_federation_final_body(&plugin, &mut recovery_ctx, &json_headers()).await;
+    assert!(matches!(
+        recovery,
+        PluginResult::RejectBinary {
+            status_code: 200,
+            ..
+        }
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn completed_half_open_probe_cannot_release_an_active_successor() {
+    assert!(
+        test_helpers::completed_half_open_probe_does_not_release_successor_for_test(),
+        "resolving an earlier probe lease must leave the successor's single half-open slot held"
+    );
 }
 
 #[tokio::test]

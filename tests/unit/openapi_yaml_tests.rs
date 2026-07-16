@@ -993,6 +993,14 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         provider_properties["max_response_body_bytes"]["default"],
         8_388_608
     );
+    assert_eq!(
+        provider_properties["max_response_body_bytes"]["minimum"],
+        1
+    );
+    assert_eq!(
+        provider_properties["max_response_body_bytes"]["maximum"],
+        67_108_864
+    );
     assert!(provider_properties.get("circuit_breaker").is_some());
 
     let valid = json!({
@@ -1021,6 +1029,8 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         json!({"providers": [{"name": "p", "provider_type": "openai", "circuit_breaker": {"failure_treshold": 2}}]}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "base_url": "http://127.0.0.1/v1/chat"}]}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "model_mapping": {"gpt-../unsafe": "gpt-4o"}}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 0}]}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "api_key": "test", "max_response_body_bytes": 67_108_865}]}),
     ] {
         assert!(
             validator.validate(&invalid).is_err(),
