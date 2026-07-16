@@ -1948,27 +1948,22 @@ pub(crate) async fn wait_for_tcp_peer_reset(client_stream: &TcpStream) {
 const TCP_FAULT_ADMISSION_RETRY_INITIAL_MS: u64 = 1;
 const TCP_FAULT_ADMISSION_RETRY_MAX_MS: u64 = 50;
 
-struct TcpFaultAdmissionRetryBackoff {
+pub(crate) struct TcpFaultAdmissionRetryBackoff {
     next_ms: u64,
 }
 
 impl TcpFaultAdmissionRetryBackoff {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             next_ms: TCP_FAULT_ADMISSION_RETRY_INITIAL_MS,
         }
     }
 
-    fn next_delay(&mut self) -> Duration {
+    pub(crate) fn next_delay(&mut self) -> Duration {
         let delay = Duration::from_millis(self.next_ms);
         self.next_ms = (self.next_ms * 2).min(TCP_FAULT_ADMISSION_RETRY_MAX_MS);
         delay
     }
-}
-
-pub(crate) fn tcp_fault_admission_retry_delays(polls: usize) -> Vec<Duration> {
-    let mut backoff = TcpFaultAdmissionRetryBackoff::new();
-    (0..polls).map(|_| backoff.next_delay()).collect()
 }
 
 pub(crate) fn tcp_fault_admission_should_cancel(

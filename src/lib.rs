@@ -934,7 +934,8 @@ pub mod _test_support {
     }
 
     pub fn tcp_fault_admission_retry_delays_for_test(polls: usize) -> Vec<Duration> {
-        crate::proxy::tcp_proxy::tcp_fault_admission_retry_delays(polls)
+        let mut backoff = crate::proxy::tcp_proxy::TcpFaultAdmissionRetryBackoff::new();
+        (0..polls).map(|_| backoff.next_delay()).collect()
     }
 
     pub fn tcp_fault_admission_should_cancel_for_test(
