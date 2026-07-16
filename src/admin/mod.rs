@@ -5158,21 +5158,25 @@ async fn handle_restore(
             }),
         ));
     }
-    let mut namespace_config_admission_guard =
-        match crud::lock_namespace_config_admission(db.clone(), namespace).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": format!(
-                            "Restore aborted: config admission unavailable: {error}. Existing config was NOT deleted."
-                        ),
-                        "failure_class": "connectivity",
-                    }),
-                ));
-            }
-        };
+    let mut namespace_config_admission_guard = match crud::lock_namespace_config_admission(
+        db.clone(),
+        namespace,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": format!(
+                        "Restore aborted: config admission unavailable: {error}. Existing config was NOT deleted."
+                    ),
+                    "failure_class": "connectivity",
+                }),
+            ));
+        }
+    };
 
     // Phase 1: Parse all resources directly into typed structs before deleting
     // anything. This avoids an intermediate serde_json::Value copy (~50% less
