@@ -1887,6 +1887,45 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (index, (unknown_key, config)) in [
+        ("compress_role", json!({"compress_role": ["system"]})),
+        ("target_rato", json!({"target_rato": 0.9})),
+        (
+            "min_content_token",
+            json!({"min_content_token": 10}),
+        ),
+        ("max_scan_byte", json!({"max_scan_byte": 4096})),
+        ("preserve_tags", json!({"preserve_tags": "keep"})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let plugin = json!({
+            "id": format!("prompt-compressor-typo-{index}"),
+            "plugin_name": "ai_prompt_compressor",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(status, 400, "unknown compressor key was admitted: {body}");
+        assert!(
+            body.to_string().contains(&format!(
+                "ai_prompt_compressor: unknown config field(s): {unknown_key}"
+            )),
+            "unexpected admin validation response: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_admin_create_rejects_unknown_adaptive_concurrency_policy_keys() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

@@ -753,6 +753,14 @@ pub struct RequestContext {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Per-`ai_prompt_compressor`-instance source digest, transformed bytes, and
+    /// stats staged by `before_proxy`. Kept out of public metadata so a staged
+    /// prompt copy and prompt-derived digest cannot enter transaction logs.
+    pub(crate) ai_prompt_compressor_staged:
+        HashMap<u64, ai_prompt_compressor::StagedCompression>,
+    /// Whether the authoritative wire transform has reset provisional
+    /// `before_proxy` compressor counters for this request.
+    pub(crate) ai_prompt_compressor_wire_stats_started: bool,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -1075,6 +1083,8 @@ impl RequestContext {
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
+            ai_prompt_compressor_staged: HashMap::new(),
+            ai_prompt_compressor_wire_stats_started: false,
             gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
@@ -1227,6 +1237,10 @@ impl RequestContext {
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
+            // Final hooks consume the body argument and copied public metadata,
+            // never the compressor's potentially body-sized private stage.
+            ai_prompt_compressor_staged: HashMap::new(),
+            ai_prompt_compressor_wire_stats_started: false,
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),

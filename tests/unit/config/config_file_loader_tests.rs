@@ -866,6 +866,59 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_ai_prompt_compressor_policy_keys() {
+    for (id, config) in [
+        (
+            "prompt-compressor-role-typo",
+            serde_json::json!({"compress_role": ["system"]}),
+        ),
+        (
+            "prompt-compressor-ratio-typo",
+            serde_json::json!({"target_rato": 0.9}),
+        ),
+        (
+            "prompt-compressor-floor-typo",
+            serde_json::json!({"min_content_token": 10}),
+        ),
+        (
+            "prompt-compressor-cap-typo",
+            serde_json::json!({"max_scan_byte": 4096}),
+        ),
+        (
+            "prompt-compressor-marker-typo",
+            serde_json::json!({"preserve_tags": "keep"}),
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "ai_prompt_compressor",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let err = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file mode must reject unknown compressor config keys");
+        assert!(
+            format!("{err:#}").contains("1 plugin config error(s)"),
+            "unexpected file-load error: {err:#}"
+        );
+    }
+}
+
+#[test]
 fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
     let document = serde_json::json!({
         "version": "1",

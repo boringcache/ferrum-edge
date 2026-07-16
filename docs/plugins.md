@@ -3715,7 +3715,7 @@ Use this only when the normal backend has equivalent authentication, model allow
 - `ai_transcript_audit` (2924) stages transcript capture before guardrails; `ai_prompt_shield` (2925) scans/redacts PII before federation
 - `ai_semantic_firewall` (2968) blocks semantic prompt injection, exfiltration, tool-abuse, and topic-policy violations before semantic cache or federation
 - `ai_request_guard` (2975) validates model, tokens, temperature before federation
-- `ai_prompt_compressor` (4055) shortens plaintext prompt metadata for compatible direct dispatchers and compresses the standard backend-dispatch body after request decompression
+- `ai_prompt_compressor` (4055) boundedly shortens admitted OpenAI Chat/Text Completions plaintext, stages compatible direct-dispatch metadata, and records authoritative standard wire stats after request decompression; successful rewrites reserialize the complete JSON body
 - `ai_federation` (4060) routes to provider, writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 

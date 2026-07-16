@@ -2,9 +2,10 @@
 
 `ai_prompt_compressor` shortens the prompt text sent to an LLM backend to reduce
 token usage — and therefore cost and latency — while preserving meaning. It
-rewrites the prompt-bearing fields of an OpenAI-shaped chat/completions request
-body, replacing long content strings with shorter, statistically filtered
-versions before the request is forwarded upstream.
+rewrites prompt-bearing fields only in admitted OpenAI Chat Completions and
+legacy Text Completions request representations, replacing long content strings
+with shorter, statistically filtered versions before the request is forwarded
+upstream.
 
 - **Priority:** `4055` (Response band, immediately after `compression`).
 - **Protocols:** HTTP only. Native gRPC wire frames are not compressed.
@@ -20,10 +21,10 @@ score token importance, it uses a compact statistical **extractive** filter:
 
 1. **Tokenize** the content into words, preserving structure. Whitespace-run
    boundaries and paragraph breaks are tracked so the output stays readable.
-2. **Protect structural spans** that must never be altered — fenced code blocks
-   (```` ``` ````), inline code (`` ` ``), URLs (`http://`, `https://`), numbers,
-   `snake_case`/identifier tokens, and uppercase acronyms are always kept
-   verbatim.
+2. **Protect structural spans** that must never be altered — fenced/inline code
+   delimited by matching backtick runs of any length, URLs (`http://`,
+   `https://`), Unicode numbers, `snake_case`, `lowerCamelCase`, multi-capital
+   `PascalCase`, `kebab-case`, and uppercase acronyms are always kept verbatim.
 3. **Score each candidate word** by a handful of cheap features:
    - stop-word membership (common filler words score lowest),
    - length (longer words tend to carry more meaning),
@@ -40,17 +41,30 @@ enough to be worth compressing.
 
 ### What gets compressed
 
-- `messages[].content` for every message whose `role` is in `compress_roles`.
+- OpenAI Chat Completions `messages[].content` for every message whose `role` is
+  in `compress_roles`.
   Both the string form and the multimodal array form
   (`[{ "type": "text", "text": "…" }, …]`) are handled; non-text parts (e.g.
   `image_url`) are left untouched.
-- The legacy top-level `prompt` field (string or array of strings) — but only
-  when `"user"` is an eligible role, since a completions `prompt` is user text.
+- OpenAI legacy Text Completions `prompt` (string or array of strings) — but
+  only when `"user"` is an eligible role, since a completions prompt is user
+  text.
 
-Everything else in the body — `model`, `temperature`, tool definitions,
-metadata, and messages for non-eligible roles — is passed through byte-for-byte.
-Embeddings requests (`input`) and Anthropic top-level `system` strings are **not**
-compressed.
+With `request_family: auto` (the default), the parsed shape must agree with a
+standard operation path ending in `/chat/completions` or `/completions`.
+Image-generation paths, arbitrary JSON carrying a `prompt`, provider-native
+markers, mixed `messages`+`prompt` bodies, malformed content parts, and other
+ambiguous shapes pass through unchanged. A fixed request family is the explicit
+opt-in for a compatible custom endpoint path; shape validation still applies.
+
+Only the decoded values of targeted fields are intentionally changed. When at
+least one field changes, Ferrum serializes the **complete** parsed JSON value to
+new bytes. Non-target decoded values remain semantically equal, but lexical JSON
+details are not preserved: whitespace is compacted, equivalent escape spellings
+can normalize, duplicate object names collapse according to `serde_json`'s
+last-value behavior, and original numeric spelling/object-member byte order are
+outside the contract. Requests with no successful field rewrite retain their
+original bytes.
 
 ## Configuration
 
@@ -58,16 +72,29 @@ compressed.
 | --- | --- | --- | --- |
 | `compress_roles` | string[] | `["user"]` | Message roles whose `content` is compressed (case-insensitive). Must be non-empty. When it contains `user`, the legacy top-level `prompt` is compressed too. |
 | `target_ratio` | number | `0.5` | Fraction of word-tokens to keep. `0.5` targets ~50% reduction; `0.3` is more aggressive. Must be strictly between `0` and `1`. |
-| `min_content_tokens` | integer | `200` | Estimated-token floor per content string. Content below this is passed through unchanged so short prompts are not mangled. |
-| `max_scan_bytes` | integer | `1048576` | Skip compression entirely when the request body exceeds this many bytes. |
-| `preserve_tag` | string | _(unset)_ | Optional marker name. Text wrapped in `<TAG>…</TAG>` is copied through verbatim and the markers are stripped, letting you protect must-keep spans. May contain ASCII letters, digits, `-`, and `_`. |
+| `min_content_tokens` | integer | `200` | Estimated-token floor per content string. Range `0..=262144`; content below this is passed through unchanged so short prompts are not mangled. |
+| `max_scan_bytes` | integer | `1048576` | Skip compression entirely when the request body exceeds this many bytes. Range `1..=1048576`; the upper bound is immutable. |
+| `preserve_tag` | string | _(unset)_ | Optional marker name. Text wrapped in `<TAG>…</TAG>` is copied through verbatim and all markers are stripped. Nested spans are flattened; unmatched open text is preserved to the end; unmatched closes are stripped. May contain ASCII letters, digits, `-`, and `_`. |
+| `request_family` | string | `auto` | `auto` requires the body shape to agree with a standard `/chat/completions` or `/completions` path. Use `chat_completions` or `text_completions` only as an explicit assertion for a compatible custom endpoint. |
 
 Token counts are **estimated** with a ~4-characters-per-token heuristic; the
 plugin embeds no model tokenizer, so `min_content_tokens` and the reported
 savings are approximations.
 
-An empty config object (`{}`) is valid and applies the defaults: compress `user`
-content longer than ~200 tokens down to ~50%.
+The scan ceiling is only the outer bound. Before token allocation or scoring,
+the plugin rejects compression work for a body containing more than 524,288
+eligible prompt bytes, 32,768 whitespace-delimited units, or 256 rewritable
+text fields. Scoring uses linear-time partial selection rather than sorting all
+candidates, JSON output is capped at the smaller configured limit (with at most
+65,536 bytes of lexical growth), and a process-wide eight-job admission budget
+prevents concurrent compressors from multiplying intermediate allocations.
+Admitted jobs run on Tokio's blocking worker pool instead of request executors;
+over-budget work passes through unchanged.
+
+An empty config object (`{}`) is valid and applies the defaults: on standard
+OpenAI Chat/Text Completions paths, compress `user` content longer than ~200
+tokens down to ~50%. Unknown fields, explicit `null`, wrong types, and values
+outside the documented ranges reject the config instead of selecting defaults.
 
 ### Examples
 
@@ -118,15 +145,17 @@ plugins and after `compression` request decompression:
 - `compression` (4050) can decode opt-in gzip/brotli request bodies before the
   compressor rewrites the standard backend-dispatch body.
 
-On the standard backend-dispatch path, `transform_request_body` produces the
-compressed bytes actually sent upstream (this hook, not the metadata copy, is
-authoritative for the wire and is the only hook the HTTP/3 cross-protocol path
-invokes). For already-plaintext JSON uploads, `before_proxy` also rewrites
-`ctx.metadata["request_body"]` so direct dispatchers that consume that metadata
-can forward the compressed prompt. Compressed client uploads cannot be compressed
-for direct `ai_federation` dispatch because federation returns before
-request-body transforms run; use the standard backend-dispatch path for that
-combination.
+On the standard backend-dispatch path, the context-aware request-body transform
+produces the compressed bytes actually sent upstream. For already-plaintext JSON
+uploads, `before_proxy` also rewrites `ctx.metadata["request_body"]` so direct
+dispatchers that consume that metadata can forward the compressed prompt. The
+plugin stages that result privately and reuses it when the authoritative input
+is unchanged; if an earlier wire transform changed the bytes, it discards the
+stage and recomputes against the actual representation. Opt-in gzip/brotli
+decompression therefore compresses and measures the resulting plaintext once on
+the standard path. Compressed client uploads cannot be compressed for direct
+`ai_federation` dispatch because federation returns before request-body
+transforms run; use the standard backend-dispatch path for that combination.
 
 If `ai_prompt_shield` is redacting, the compressor operates on the already
 redacted text, so redaction is preserved and then compressed.
@@ -134,20 +163,33 @@ redacted text, so redaction is preserved and then compressed.
 ## Observability
 
 When compression rewrites a field, the plugin records log-safe counters on the
-request context, which flow into transaction summaries:
+request context. Standard dispatch clears provisional metadata-copy counters and
+records the authoritative wire transformation; direct metadata dispatch retains
+the counters for the exact body it consumes:
 
 - `ai_prompt_compressor.original_tokens`
 - `ai_prompt_compressor.compressed_tokens`
 - `ai_prompt_compressor.tokens_saved`
 - `ai_prompt_compressor.fields_compressed`
 
+The unsuffixed keys aggregate all configured compressor instances. Each instance
+also emits the same four counters under
+`ai_prompt_compressor.instances.<process_instance_id>.*`, so one instance never
+overwrites another or double-counts a retry. Context-free compatibility
+transforms cannot write request metadata and therefore emit no counters.
+
 ## Safety and limitations
 
 - **Only JSON POST bodies are touched.** Non-JSON content types, non-`POST`
   methods, unparseable JSON, and bodies over `max_scan_bytes` are forwarded
   unchanged.
-- **Transport-compressed bodies are skipped.** A request with a non-`identity`
-  `Content-Encoding` is opaque to the compressor and passes through untouched.
+- **Only admitted request families are touched.** `auto` requires a standard
+  Chat/Text Completions path and matching shape. Fixed-family mode is an
+  operator assertion for custom compatible endpoints; unsupported, ambiguous,
+  or malformed shapes still pass through unchanged.
+- **Encoded bytes are never parsed as JSON.** A non-`identity`
+  `Content-Encoding` stays untouched unless an earlier configured decompression
+  transform produces plaintext on the standard wire path.
 - **Extractive output is terse.** Compression removes filler words, so the
   rewritten prompt reads as clipped, keyword-dense text. LLMs handle this well,
   but review `target_ratio` for quality-sensitive workloads and prefer a higher
@@ -166,18 +208,21 @@ request context, which flow into transaction summaries:
   oversized token that may be kept or dropped wholesale. Do not enable
   compression for roles that routinely carry such content.
 - **Pasted structured data is scored as prose.** JSON/YAML/CSV embedded in a
-  message (outside code fences) can lose digitless keys and values. Wrap such
-  payloads in a fenced code block or a `preserve_tag` span.
+  message (outside code fences) can still lose ordinary digitless lowercase
+  keys and values. Wrap such payloads in a fenced code block or a
+  `preserve_tag` span.
 - **`preserve_tag` markers never reach the provider.** Markers are stripped
-  even when the content is below `min_content_tokens` or compression yields no
-  reduction.
+  from balanced, repeated, adjacent, nested, and malformed sequences, even when
+  content is below `min_content_tokens` or compression yields no reduction.
 
 ## Testing
 
 Unit tests live in `tests/unit/plugins/ai_prompt_compressor_tests.rs` and cover
-config validation, role targeting, thresholds, protected spans (code/URLs/
-numbers/identifiers), negation preservation, `preserve_tag`, multimodal parts,
-JSON safety/passthrough, and the `before_proxy` metadata rewrite.
+runtime/OpenAPI config parity, request-family admission, work budgets, protected
+spans (multi-backtick code/URLs/Unicode numbers/common identifiers), negation
+preservation, nested/malformed `preserve_tag` sequences, whole-body JSON
+reserialization, gzip/brotli composition, final-wire statistics, multimodal
+parts, JSON safety/passthrough, and the direct-dispatch metadata rewrite.
 
 Run them with:
 
