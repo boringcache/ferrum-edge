@@ -1058,6 +1058,17 @@ impl FunctionDestination {
             return true;
         }
 
+        // Query credentials can also be copied into an attacker-controlled
+        // redirect path. Match only complete slash-delimited components so a
+        // value such as `secret/value` is blocked at `/secret/value`, while
+        // `/secret/value-extra` remains distinct.
+        if self.sensitive_query_pairs.iter().any(|(_, value)| {
+            let value = value.trim_matches('/');
+            !value.is_empty() && path_contains_segment_sequence(&candidate_path, value)
+        }) {
+            return true;
+        }
+
         // Query credentials are unsafe even when copied onto another host,
         // path, or parameter name. Compare decoded pairs and non-empty values
         // exactly so reordering, renaming, and ordinary percent-encoding
@@ -1325,7 +1336,14 @@ fn refresh_uri_reference(value: &str) -> Result<Option<&str>, ()> {
     };
     let directive = directive.trim();
     if !has_ascii_case_insensitive_prefix(directive, "url") {
-        return Ok(None);
+        // Some Refresh consumers accept a bare URI after the semicolon even
+        // without `url=`. Any non-empty scalar is also a valid relative URI
+        // reference, so inspect it as a target; benign extensions still pass
+        // when they do not expose the signed destination.
+        if directive.is_empty() {
+            return Err(());
+        }
+        return Ok(Some(directive));
     }
     let after_name = &directive["url".len()..];
     if after_name
@@ -1333,7 +1351,7 @@ fn refresh_uri_reference(value: &str) -> Result<Option<&str>, ()> {
         .first()
         .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
     {
-        return Ok(None);
+        return Ok(Some(directive));
     }
     let Some(target) = after_name.trim_start().strip_prefix('=') else {
         return Err(());

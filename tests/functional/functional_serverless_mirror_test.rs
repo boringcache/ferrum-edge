@@ -64,12 +64,20 @@ async fn start_function_server(port: u16, invocations: Arc<AtomicUsize>) {
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 invocations.fetch_add(1, Ordering::SeqCst);
 
-                let is_partial_response = String::from_utf8_lossy(&buf[..n])
-                    .contains(r#""path":"/fn/range""#);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let is_partial_response = request.contains(r#""path":"/fn/range""#);
+                let is_delta_response = request.contains(r#""path":"/fn/delta""#);
                 let response = if is_partial_response {
                     let body = r#"{"source":"serverless-function","message":"partial"}"#;
                     format!(
                         "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Type: application/json\r\nContent-Range: bytes 0-51/100\r\nAccept-Ranges: bytes\r\nETag: \"partial-v1\"\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if is_delta_response {
+                    let body = r#"{"source":"serverless-function","message":"delta"}"#;
+                    format!(
+                        "HTTP/1.1 226 IM Used\r\nContent-Length: {}\r\nContent-Type: application/json\r\nIM: diffe\r\nDelta-Base: \"delta-v1\"\r\nETag: \"delta-v2\"\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     )
@@ -500,6 +508,38 @@ upstreams: []
     assert!(partial_body.contains("serverless-function"));
     assert!(!partial_body.contains("gateway-rewritten"));
     assert_eq!(function_invocations.load(Ordering::SeqCst), 4);
+
+    let delta = client
+        .get(format!("http://127.0.0.1:{}/fn/delta", proxy_port))
+        .send()
+        .await
+        .expect("delta response request failed");
+    assert_eq!(delta.status().as_u16(), 226);
+    assert_eq!(
+        delta
+            .headers()
+            .get("im")
+            .and_then(|value| value.to_str().ok()),
+        Some("diffe")
+    );
+    assert_eq!(
+        delta
+            .headers()
+            .get("delta-base")
+            .and_then(|value| value.to_str().ok()),
+        Some("\"delta-v1\"")
+    );
+    assert_eq!(
+        delta
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok()),
+        Some("\"delta-v2\"")
+    );
+    let delta_body = delta.text().await.unwrap();
+    assert!(delta_body.contains("serverless-function"));
+    assert!(!delta_body.contains("gateway-rewritten"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 5);
 
     let _ = gw.kill();
     let _ = gw.wait();

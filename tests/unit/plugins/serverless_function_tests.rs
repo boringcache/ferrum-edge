@@ -1273,6 +1273,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "nested-path-encoded",
         "copied-query-other-host",
         "renamed-query-other-host",
+        "copied-query-path-other-host",
         "literal-plus-encoded-candidate",
         "encoded-plus-literal-candidate",
         "malformed",
@@ -1283,6 +1284,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-external-label",
         "benign-path-lookalike",
         "benign-query-value-lookalike",
+        "benign-query-path-lookalike",
         "benign-plus-space-distinct",
     ] {
         let server = MockServer::start().await;
@@ -1358,6 +1360,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "renamed-query-other-host" => {
                 "https://redirect.example/next?leak=secret%2Fvalue".to_string()
             }
+            "copied-query-path-other-host" => {
+                "https://redirect.example/secret/value".to_string()
+            }
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }
@@ -1377,6 +1382,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-query-value-lookalike" => {
                 "https://redirect.example/next?leak=secret%2Fvalue-extra".to_string()
+            }
+            "benign-query-path-lookalike" => {
+                "https://redirect.example/secret/value-extra".to_string()
             }
             "benign-plus-space-distinct" => {
                 "https://redirect.example/next?leak=token+part".to_string()
@@ -1544,6 +1552,10 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
         "refresh-absolute",
         "refresh-relative",
         "refresh-encoded",
+        "refresh-bare-absolute",
+        "refresh-bare-relative",
+        "refresh-bare-path-segment",
+        "refresh-bare-encoded",
         "refresh-malformed-target",
         "link-absolute",
         "link-relative",
@@ -1552,6 +1564,7 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
         "link-malformed",
         "benign-content-location",
         "benign-refresh",
+        "benign-refresh-bare-target",
         "benign-refresh-delay-only",
         "benign-refresh-non-url-directive",
         "benign-link-multiple-targets",
@@ -1588,6 +1601,20 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
             "refresh-encoded" => {
                 ("refresh", format!("0; url={encoded_function_url}"), true)
             }
+            "refresh-bare-absolute" => {
+                ("refresh", format!("0; {function_url}"), true)
+            }
+            "refresh-bare-relative" => (
+                "refresh",
+                "0; /signed%2Ftrigger?code=secret%2Fvalue".to_string(),
+                true,
+            ),
+            "refresh-bare-path-segment" => {
+                ("refresh", "0; secret/value".to_string(), true)
+            }
+            "refresh-bare-encoded" => {
+                ("refresh", format!("0; {encoded_function_url}"), true)
+            }
             "refresh-malformed-target" => {
                 ("refresh", format!("0; url=\"{function_url}"), true)
             }
@@ -1623,6 +1650,11 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
             "benign-refresh" => {
                 ("refresh", "5; URL = '/safe?code=other'".to_string(), false)
             }
+            "benign-refresh-bare-target" => (
+                "refresh",
+                "5; https://redirect.example/safe?code=other".to_string(),
+                false,
+            ),
             "benign-refresh-delay-only" => ("refresh", "5".to_string(), false),
             "benign-refresh-non-url-directive" => {
                 ("refresh", "not-a-delay; token=value".to_string(), false)

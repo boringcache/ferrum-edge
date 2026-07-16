@@ -264,12 +264,13 @@ fn is_transform_invalidated_response_header(name: &str) -> bool {
 /// response status semantics.
 ///
 /// A `206 Partial Content` body is only the selected range, not a complete
-/// representation. Rewriting those bytes and merely removing `Content-Range`
-/// would leave either a malformed 206 or a misleading full-response status.
-/// Keep the range response untouched instead. All protocol paths and the
-/// provider/protocol normalization phase consult this shared gate.
+/// representation. A `226 IM Used` body is a delta whose interpretation
+/// depends on `IM` and `Delta-Base`. Rewriting either body while removing its
+/// representation metadata would leave the unchanged status incoherent. Keep
+/// both response forms untouched. All protocol paths and the provider/protocol
+/// normalization phase consult this shared gate.
 pub(crate) fn response_body_rewrite_allowed(response_status: u16) -> bool {
-    response_status != 206
+    !matches!(response_status, 206 | 226)
 }
 
 /// Finalize one successful buffered response-body transformation.
