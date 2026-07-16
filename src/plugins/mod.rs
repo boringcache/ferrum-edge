@@ -1322,8 +1322,7 @@ impl RequestContext {
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
-            grpc_deadline_had_valid_client_timeout: self
-                .grpc_deadline_had_valid_client_timeout,
+            grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
             grpc_deadline_received_at: self.grpc_deadline_received_at,
             grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,

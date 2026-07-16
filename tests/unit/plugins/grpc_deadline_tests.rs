@@ -1199,12 +1199,9 @@ async fn test_multiple_instances_share_one_absolute_deadline() {
 
 #[test]
 fn test_composed_reject_no_deadline_checks_original_header_before_default() {
-    let default = create_plugin(
-        "grpc_deadline",
-        &json!({"default_deadline_ms": 5000}),
-    )
-    .unwrap()
-    .unwrap();
+    let default = create_plugin("grpc_deadline", &json!({"default_deadline_ms": 5000}))
+        .unwrap()
+        .unwrap();
     let required = create_plugin("grpc_deadline", &json!({"reject_no_deadline": true}))
         .unwrap()
         .unwrap();

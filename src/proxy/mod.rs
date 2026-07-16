@@ -13584,11 +13584,7 @@ async fn run_after_proxy_hooks_on_rejection(
     }
 
     if terminal_gateway_deadline {
-        replace_rejection_with_gateway_deadline(
-            status_code,
-            response_body,
-            response_headers,
-        );
+        replace_rejection_with_gateway_deadline(status_code, response_body, response_headers);
     }
 
     if let Some(previous_marker) = previous_marker {
