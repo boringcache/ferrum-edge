@@ -535,8 +535,7 @@ async fn h3_grpc_web_without_translation_plugin_keeps_plain_backend_transport() 
     assert_eq!(backend.handshakes_completed(), pass_through_connections);
     let negotiated_alpn = backend.last_alpn().await;
     assert!(
-        negotiated_alpn.is_none()
-            || negotiated_alpn.as_deref() == Some(b"http/1.1".as_slice()),
+        negotiated_alpn.is_none() || negotiated_alpn.as_deref() == Some(b"http/1.1".as_slice()),
         "unexpected pass-through backend ALPN: {negotiated_alpn:?}"
     );
     let received = String::from_utf8_lossy(&backend.received_bytes().await).to_ascii_lowercase();
