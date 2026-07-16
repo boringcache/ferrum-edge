@@ -270,6 +270,10 @@ jobs:
         if: needs.coverage-plan.result != 'success'
         run: exit 1
 
+      - name: Fail when coverage mode is invalid
+        if: needs.coverage-plan.result == 'success' && !contains(fromJSON('["skip", "plugin", "full"]'), needs.coverage-plan.outputs.mode)
+        run: exit 1
+
       - name: Skip coverage for unrelated PR changes
         if: needs.coverage-plan.outputs.mode == 'skip'
         run: |

@@ -11785,6 +11785,9 @@ components:
         directory permits anonymous reads of group objects, so a service account
         is recommended. TLS connections (`ldaps://`/STARTTLS) honor the gateway
         CRL (`FERRUM_TLS_CRL_FILE_PATH`), rejecting revoked server certificates.
+        Every connection/reconnection performs an uncached A+AAAA lookup, screens
+        the complete candidate set and each imminent dial under the active backend
+        egress policy, and retains the configured hostname for TLS/SNI verification.
         Non-loopback plaintext `ldap://` is rejected unless the development-only
         `allow_plaintext` override is explicitly enabled. Search-then-bind requires
         a canonical identity attribute, rejects ambiguous searches, and exports the
@@ -11846,7 +11849,7 @@ components:
           pattern: "^ldaps?://"
           not:
             pattern: "^ldaps?://[^/?#]*@"
-          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected."
+          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected. Each connection freshly resolves and policy-screens all A/AAAA candidates while retaining this hostname for TLS/SNI verification."
           example: "ldaps://ldap.example.com:636"
         bind_dn_template:
           type: string
@@ -11911,7 +11914,7 @@ components:
           default: 5
           minimum: 1
           maximum: 300
-          description: "Per-connection and per-operation timeout in seconds; also applied as the server-side LDAP search time limit"
+          description: "Per-connection DNS resolution, candidate TCP/TLS establishment, and per-operation timeout in seconds; also applied as the server-side LDAP search time limit"
         request_timeout_seconds:
           type: integer
           format: uint64
