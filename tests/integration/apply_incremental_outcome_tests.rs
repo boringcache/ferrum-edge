@@ -376,6 +376,7 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
     std::fs::write(&mmdb_path, &original_bytes).unwrap();
 
     let config = GatewayConfig {
+        version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
         proxies: vec![test_proxy("geo-proxy", "/geo")],
         plugin_configs: vec![
             PluginConfig {
