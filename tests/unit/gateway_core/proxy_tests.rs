@@ -388,6 +388,48 @@ fn test_backend_path_bound_retries_abort_in_every_h1_h2_dispatch_family() {
 }
 
 #[test]
+fn test_deferred_grpc_body_context_preserves_buffered_size_metadata() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let metadata = source
+        .split_once("// Store body metadata for plugins that read via ctx.metadata")
+        .and_then(|(_, rest)| rest.split_once("// Mirror pre-transform bytes"))
+        .map(|(body, _)| body)
+        .expect("native gRPC request-body metadata region");
+    let size = metadata
+        .find("let request_body_size_bytes = grpc_req_body.len().to_string();")
+        .expect("buffered gRPC size must be computed once");
+    let primary = metadata[size..]
+        .find("ctx.metadata.insert(")
+        .map(|offset| size + offset)
+        .expect("primary request context must receive buffered gRPC size");
+    let deferred = metadata[primary..]
+        .find("body_hook_ctx.metadata.insert(")
+        .map(|offset| primary + offset)
+        .expect("deferred final-body context must receive buffered gRPC size");
+    assert!(size < primary && primary < deferred);
+}
+
+#[test]
+fn test_final_request_body_rejects_are_gateway_local_terminal_outcomes() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let conversion = source
+        .split_once("fn reject_result_to_backend_response(")
+        .and_then(|(_, rest)| rest.split_once("/// Outcome of applying"))
+        .map(|(body, _)| body)
+        .expect("final request-body rejection conversion");
+    assert!(conversion.contains("retry::ErrorClass::RequestBodyTooLarge"));
+    assert!(conversion.contains("retry::ErrorClass::DispatchPolicyRejected"));
+
+    let accounting = include_str!("../../../src/proxy/backend_dispatch.rs");
+    let neutral = accounting
+        .split_once("pub(crate) fn client_side_no_backend_signal(")
+        .and_then(|(_, rest)| rest.split_once("/// Whether a deferred streaming outcome"))
+        .map(|(body, _)| body)
+        .expect("backend-neutral error classification");
+    assert!(neutral.contains("ErrorClass::DispatchPolicyRejected"));
+}
+
+#[test]
 fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let path_policy = source

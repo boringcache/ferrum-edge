@@ -878,6 +878,21 @@ pub struct RequestContext {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Per-`ai_prompt_compressor`-instance source digest, transformed bytes, and
+    /// stats staged by `before_proxy`. Kept out of public metadata so a staged
+    /// prompt copy and prompt-derived digest cannot enter transaction logs.
+    pub(crate) ai_prompt_compressor_staged: HashMap<u64, ai_prompt_compressor::StagedCompression>,
+    /// Incoming request path captured once by the first auto-family compressor
+    /// before backend routing can rewrite `path`. All compressor instances share
+    /// this single bounded snapshot, and public metadata cannot spoof it.
+    pub(crate) ai_prompt_compressor_classification_path: Option<String>,
+    /// Whether the authoritative wire transform has reset provisional
+    /// `before_proxy` compressor counters for this request.
+    pub(crate) ai_prompt_compressor_wire_stats_started: bool,
+    /// Final-hook rejection staged when configured preserve-marker sanitation
+    /// cannot safely produce bounded provider-visible bytes. Kept private so
+    /// request metadata cannot spoof or clear the fail-closed decision.
+    pub(crate) ai_prompt_compressor_marker_reject_status: Option<u16>,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -1215,6 +1230,10 @@ impl RequestContext {
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
+            ai_prompt_compressor_staged: HashMap::new(),
+            ai_prompt_compressor_classification_path: None,
+            ai_prompt_compressor_wire_stats_started: false,
+            ai_prompt_compressor_marker_reject_status: None,
             gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
@@ -1383,10 +1402,14 @@ impl RequestContext {
 
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
-    /// transforms. Only `metadata` is copied back to the real context by the
-    /// proxy caller, so this deliberately skips raw headers, raw query strings,
-    /// parsed query maps, prebuffered body bytes, and mirror receivers.
-    pub(crate) fn clone_for_final_request_body_hooks(&self) -> Self {
+    /// transforms. The compressor's private staged representation and incoming
+    /// classification path are moved into this context so the authoritative
+    /// wire transform can consume them without recomputing or retaining a
+    /// prompt-sized copy on the real context. Only `metadata` and selected
+    /// policy state are copied back by the proxy caller, so this deliberately
+    /// skips raw headers, raw query strings, parsed query maps, prebuffered body
+    /// bytes, and mirror receivers.
+    pub(crate) fn clone_for_final_request_body_hooks(&mut self) -> Self {
         Self {
             client_ip: self.client_ip.clone(),
             direct_client_ip: self.direct_client_ip.clone(),
@@ -1444,6 +1467,19 @@ impl RequestContext {
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
+            // Transfer rather than clone the potentially body-sized compressor
+            // stage. The final wire hook consumes it from this compatibility
+            // context, while the live context no longer retains a second copy.
+            ai_prompt_compressor_staged: std::mem::take(&mut self.ai_prompt_compressor_staged),
+            ai_prompt_compressor_classification_path: std::mem::take(
+                &mut self.ai_prompt_compressor_classification_path,
+            ),
+            ai_prompt_compressor_wire_stats_started: std::mem::take(
+                &mut self.ai_prompt_compressor_wire_stats_started,
+            ),
+            ai_prompt_compressor_marker_reject_status: std::mem::take(
+                &mut self.ai_prompt_compressor_marker_reject_status,
+            ),
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),

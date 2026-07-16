@@ -2405,6 +2405,83 @@ fn jwt_auth_schema_rejects_unknown_config_keys() {
 }
 
 #[test]
+fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::ai_prompt_compressor::AiPromptCompressor;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiPromptCompressorConfig")
+        .expect("missing AiPromptCompressorConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiPromptCompressorConfig schema compiles");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let schema_fields: BTreeSet<String> = schema["properties"]
+        .as_object()
+        .expect("config properties")
+        .keys()
+        .cloned()
+        .collect();
+    let runtime_fields: BTreeSet<String> = [
+        "compress_roles",
+        "target_ratio",
+        "min_content_tokens",
+        "max_scan_bytes",
+        "preserve_tag",
+        "request_family",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(schema_fields, runtime_fields);
+
+    for config in [
+        json!({}),
+        json!({"compress_roles": ["user", "system"]}),
+        json!({"target_ratio": 0.25}),
+        json!({"min_content_tokens": 131072}),
+        json!({"max_scan_bytes": 1048576}),
+        json!({"preserve_tag": "keep-this_1"}),
+        json!({"preserve_tag": "x".repeat(64)}),
+        json!({"request_family": "chat_completions"}),
+        json!({"request_family": "text_completions", "compress_roles": [" User "]}),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema rejected {config}"
+        );
+        assert!(
+            AiPromptCompressor::new(&config).is_ok(),
+            "runtime rejected {config}"
+        );
+    }
+
+    for config in [
+        json!(null),
+        json!({"compress_role": ["system"]}),
+        json!({"target_ratio": null}),
+        json!({"min_content_tokens": null}),
+        json!({"max_scan_bytes": 1048577}),
+        json!({"min_content_tokens": 131073}),
+        json!({"preserve_tag": null}),
+        json!({"preserve_tag": "x".repeat(65)}),
+        json!({"request_family": "images"}),
+        json!({"request_family": "text_completions", "compress_roles": ["system"]}),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema admitted {config}"
+        );
+        assert!(
+            AiPromptCompressor::new(&config).is_err(),
+            "runtime admitted {config}"
+        );
+    }
+}
+
+#[test]
 fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

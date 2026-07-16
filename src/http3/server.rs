@@ -2254,43 +2254,33 @@ async fn handle_h3_request(
         && plugins
             .iter()
             .any(|plugin| plugin.should_buffer_request_body(&ctx));
-    let needs_request_body_before_before_proxy = plugin_needs_request_buffering
+    let before_proxy_body_requirements = if plugin_needs_request_buffering
         && capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
-        && plugins.iter().any(|plugin| {
-            plugin.requires_request_body_before_before_proxy()
-                && plugin.should_buffer_request_body(&ctx)
-        });
-    let (h3_needs_body_text, h3_needs_body_bytes) = if needs_request_body_before_before_proxy {
-        let mut needs_text = false;
-        let mut needs_bytes = false;
-        for plugin in plugins.iter() {
-            if plugin.requires_request_body_before_before_proxy()
-                && plugin.should_buffer_request_body(&ctx)
-            {
-                needs_text |= plugin.needs_request_body_text();
-                needs_bytes |= plugin.needs_request_body_bytes();
-            }
-        }
-        (needs_text, needs_bytes)
+    {
+        crate::proxy::request_body_requirements_before_before_proxy(&plugins, &ctx)
     } else {
-        (false, false)
+        crate::proxy::RequestBodyPhaseRequirements::default()
     };
+    let protocol_body_limit = if matches!(http_flavor, HttpFlavor::Grpc) {
+        state.max_grpc_recv_size_bytes
+    } else {
+        state.max_request_body_size_bytes
+    };
+    let before_proxy_body_limit = crate::proxy::effective_request_body_limit(
+        protocol_body_limit,
+        before_proxy_body_requirements.plugin_limit,
+    );
 
     // If we already buffered above for the body-before-authenticate path, the
     // body is already drained from the stream — no extra recv_data work here.
-    if needs_request_body_before_before_proxy && prebuffered_body_data.is_none() {
+    if before_proxy_body_requirements.required && prebuffered_body_data.is_none() {
         let mut body_data = Vec::new();
-        // For gRPC requests, enforce the gRPC-specific recv ceiling (matches
-        // H1/H2 gRPC). Other flavors use the shared HTTP body limit.
-        let max_body = if matches!(http_flavor, HttpFlavor::Grpc) {
-            state.max_grpc_recv_size_bytes
-        } else {
-            state.max_request_body_size_bytes
-        };
         let collect = async {
             while let Some(chunk) = stream.recv_data().await? {
                 let bytes = chunk.chunk();
-                if max_body > 0 && body_data.len() + bytes.len() > max_body {
+                if before_proxy_body_limit > 0
+                    && body_data.len() + bytes.len() > before_proxy_body_limit
+                {
                     return Ok::<_, h3::error::StreamError>(false);
                 }
                 body_data.extend_from_slice(bytes);
@@ -2362,15 +2352,30 @@ async fn handle_h3_request(
         }
         prebuffered_body_data = Some(body_data);
     }
-    if needs_request_body_before_before_proxy
+    if before_proxy_body_requirements.required
         && let Some(body_data) = prebuffered_body_data.as_ref()
     {
+        if before_proxy_body_limit > 0 && body_data.len() > before_proxy_body_limit {
+            record_h3_flavor_aware_reject(&state, http_flavor, 413);
+            send_h3_error_flavor_aware_with_policy(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type.as_deref(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                r#"{"error":"Request body exceeds maximum size"}"#,
+                crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                "Request body exceeds maximum size",
+                initial_response_header_policy_plugins.as_ref(),
+            )
+            .await?;
+            return Ok(());
+        }
         crate::proxy::store_request_body_metadata(
             &mut ctx,
             body_data,
-            h3_needs_body_text,
-            h3_needs_body_bytes,
-            false,
+            before_proxy_body_requirements.needs_text,
+            before_proxy_body_requirements.needs_bytes,
+            before_proxy_body_requirements.needs_digests,
         );
     }
 

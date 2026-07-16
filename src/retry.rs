@@ -64,9 +64,9 @@ pub enum ErrorClass {
     ///
     /// Used for terminal gateway decisions where replaying would produce the
     /// same policy response (for example a backend TLS SNI override on a path
-    /// that cannot honor per-request SNI). Classified as non-connection-error
-    /// so `retry_on_connect_failure` does not fire, and `should_retry` rejects
-    /// it before status-code retry checks.
+    /// that cannot honor per-request SNI, or a final request-body hook reject).
+    /// Classified as non-connection-error so `retry_on_connect_failure` does
+    /// not fire, and `should_retry` rejects it before status-code retry checks.
     DispatchPolicyRejected,
     /// Catch-all for unclassified request errors.
     RequestError,
