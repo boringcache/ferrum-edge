@@ -938,15 +938,8 @@ async fn finish_write_success<R: AdminResource>(
     existing: Option<&R>,
     action: WriteAction<'_>,
 ) {
-    if let Err(error) = R::after_write(
-        db.as_ref(),
-        state,
-        namespace,
-        resource,
-        existing,
-        action,
-    )
-    .await
+    if let Err(error) =
+        R::after_write(db.as_ref(), state, namespace, resource, existing, action).await
     {
         tracing::warn!(
             "Post-write hook failed for {} '{}': {}",
@@ -959,9 +952,7 @@ async fn finish_write_success<R: AdminResource>(
     let (audit_action, diff) = match action {
         WriteAction::Create => ("create", audit::create_diff(R::audit_body(resource))),
         WriteAction::Update { .. } => {
-            let before = existing
-                .map(R::audit_body)
-                .unwrap_or_else(|| json!(null));
+            let before = existing.map(R::audit_body).unwrap_or_else(|| json!(null));
             (
                 "update",
                 audit::update_diff(before, R::audit_body(resource)),
