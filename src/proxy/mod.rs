@@ -167,12 +167,12 @@ pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
     "ferrum:replaceable_rejection_response";
 
 /// One-shot handoff for requester-owned auth session state that changed before
-/// authentication attempts rejected. Distinct cookie names are newline-joined;
-/// a later attempt replaces an earlier candidate with the same exact name. The
-/// authentication phase removes this key on every exit: it attaches the cookies
-/// only to the final rejection and discards them when a later credential
-/// succeeds. The key contains "cookie" so metadata serialization still redacts
-/// the sealed values defensively.
+/// authentication attempts rejected. Distinct cookie storage keys are
+/// newline-joined; a later attempt replaces an earlier candidate with the same
+/// exact name/domain/path scope. The authentication phase removes this key on
+/// every exit: it attaches the cookies only to the final rejection and discards
+/// them when a later credential succeeds. The key contains "cookie" so metadata
+/// serialization still redacts the sealed values defensively.
 pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_set_cookie";
 
 /// Marker recorded in `ctx.metadata` for the duration of
@@ -14523,13 +14523,13 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     PluginResult::Continue
 }
 
-/// Return the RFC 6265 cookie-name from the leading cookie-pair only.
-/// Attributes, padded names, and lines without a valid token are not names.
+/// Return the RFC 6265 cookie-name from a valid leading cookie-pair.
+/// Attributes, padded names, and malformed cookie values are rejected.
 fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     let cookie_pair = set_cookie
         .split_once(';')
         .map_or(set_cookie, |(pair, _)| pair);
-    let (name, _) = cookie_pair.split_once('=')?;
+    let (name, value) = cookie_pair.split_once('=')?;
     if name.is_empty()
         || !name.bytes().all(|byte| {
             matches!(
@@ -14556,7 +14556,48 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     {
         return None;
     }
+
+    let value = if let Some(quoted) = value.strip_prefix('"') {
+        quoted.strip_suffix('"')?
+    } else {
+        value
+    };
+    if !value.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'!' | b'#'..=b'+' | b'-'..=b':' | b'<'..=b'[' | b']'..=b'~'
+        )
+    }) {
+        return None;
+    }
+
     Some(name)
+}
+
+/// RFC 6265 ignores one leading dot on Domain attributes and compares the
+/// resulting canonicalized domain case-insensitively. Return `None` for domain
+/// forms whose browser storage scope cannot be determined conservatively.
+fn canonical_set_cookie_domain(domain: &str) -> Option<&str> {
+    let domain = domain.strip_prefix('.').unwrap_or(domain);
+    if domain.is_empty() || domain.ends_with('.') {
+        return None;
+    }
+    for label in domain.split('.') {
+        if label.is_empty()
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return None;
+        }
+    }
+    Some(domain)
+}
+
+fn valid_set_cookie_path(path: &str) -> bool {
+    path.starts_with('/') && !path.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
 }
 
 /// Return the RFC 6265 cookie storage key components that are explicit in a
@@ -14565,8 +14606,8 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
 /// from explicit attributes instead of being collapsed by name alone.
 fn set_cookie_storage_key(set_cookie: &str) -> Option<(&str, Option<&str>, Option<&str>)> {
     let name = set_cookie_name(set_cookie)?;
-    let mut domain = None;
-    let mut path = None;
+    let mut domain_attribute = None;
+    let mut path_attribute = None;
 
     for attribute in set_cookie.split(';').skip(1) {
         let attribute = attribute.trim();
@@ -14576,11 +14617,24 @@ fn set_cookie_storage_key(set_cookie: &str) -> Option<(&str, Option<&str>, Optio
         let attribute_name = attribute_name.trim();
         let attribute_value = attribute_value.trim();
         if attribute_name.eq_ignore_ascii_case("domain") {
-            domain = Some(attribute_value);
+            domain_attribute = Some(attribute_value);
         } else if attribute_name.eq_ignore_ascii_case("path") {
-            path = Some(attribute_value);
+            path_attribute = Some(attribute_value);
         }
     }
+
+    // RFC 6265 uses the last Domain/Path attribute. Invalid or quoted scope
+    // values remain non-comparable so only byte-identical malformed lines can
+    // replace one another.
+    let domain = match domain_attribute {
+        Some(domain) => Some(canonical_set_cookie_domain(domain)?),
+        None => None,
+    };
+    let path = match path_attribute {
+        Some(path) if valid_set_cookie_path(path) => Some(path),
+        Some(_) => return None,
+        None => None,
+    };
 
     Some((name, domain, path))
 }
@@ -14677,7 +14731,7 @@ fn attach_auth_rejection_set_cookie(
     for candidate in staged_cookies {
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
-        // independently named requester-owned cookies from earlier rejects.
+        // independently scoped requester-owned cookies from earlier rejects.
         if !set_cookie_conflicts(&merged, &candidate) {
             merged.push(candidate);
         }
