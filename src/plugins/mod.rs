@@ -664,6 +664,7 @@ pub struct RequestContext {
     /// Whether the validated request host ended in a DNS dot before
     /// `request_authority` normalization. Cookie default-domain comparison
     /// preserves this distinction without allocating a second host string.
+    /// HTTP/2 and HTTP/3 derive it from the request URI's `:authority`.
     pub request_host_had_trailing_dot: bool,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization

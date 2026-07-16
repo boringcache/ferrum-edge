@@ -14593,11 +14593,16 @@ impl<'a> SetCookieDomain<'a> {
 
 /// RFC 6265 ignores one leading dot on Domain attributes and compares the
 /// resulting canonicalized domain case-insensitively. Ferrum accepts the full
-/// RFC 3986 reg-name character set at request admission, so apply the same
-/// validation here instead of narrowing comparable cookie scopes to LDH names.
+/// RFC 3986 reg-name and bracketed IP-literal forms at request admission, so
+/// apply the same validation here instead of narrowing comparable cookie
+/// scopes to LDH names.
 fn canonical_set_cookie_domain(domain: &str) -> Option<SetCookieDomain<'_>> {
     let domain = domain.strip_prefix('.').unwrap_or(domain);
-    if domain.ends_with('.') || !is_valid_reg_name(domain) {
+    let valid_ip_literal = domain
+        .strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+        .is_some_and(is_valid_ip_literal_contents);
+    if domain.ends_with('.') || (!is_valid_reg_name(domain) && !valid_ip_literal) {
         return None;
     }
     Some(SetCookieDomain {
@@ -14622,34 +14627,43 @@ fn default_set_cookie_path(request_path: &str) -> &str {
 
 fn request_cookie_default_domain(ctx: &RequestContext) -> Option<SetCookieDomain<'_>> {
     if let Some(host) = ctx
-        .raw_header_get("host")
+        .request_authority
+        .as_deref()
         .and_then(split_request_authority)
         .map(|(host, _)| host)
     {
         return Some(SetCookieDomain {
-            value: host.strip_suffix('.').unwrap_or(host),
-            trailing_dot: host.ends_with('.'),
+            value: host,
+            trailing_dot: ctx.request_host_had_trailing_dot,
         });
     }
 
-    ctx.request_authority
-        .as_deref()
+    ctx.raw_header_get("host")
         .and_then(split_request_authority)
         .map(|(host, _)| SetCookieDomain {
-            value: host,
-            trailing_dot: ctx.request_host_had_trailing_dot,
+            value: host.strip_suffix('.').unwrap_or(host),
+            trailing_dot: host.ends_with('.'),
         })
+}
+
+struct SetCookieStorageKey<'a> {
+    name: &'a str,
+    domain: Option<SetCookieDomain<'a>>,
+    path: &'a str,
+    host_only: bool,
+    partitioned: bool,
 }
 
 /// Return the effective RFC 6265 cookie storage key. Omitted Domain attributes
 /// use the request host, while omitted, empty, or non-absolute Path attributes
-/// use the request path's default directory. Partitioned cookies remain
-/// independent from unpartitioned cookies with the same name/domain/path.
+/// use the request path's default directory. Host-only and Partitioned cookies
+/// remain independent from otherwise equivalent domain and unpartitioned
+/// cookies.
 fn set_cookie_storage_key<'a>(
     set_cookie: &'a str,
     default_domain: Option<SetCookieDomain<'a>>,
     default_path: &'a str,
-) -> Option<(&'a str, Option<SetCookieDomain<'a>>, &'a str, bool)> {
+) -> Option<SetCookieStorageKey<'a>> {
     let name = set_cookie_name(set_cookie)?;
     let mut domain_attribute = None;
     let mut path_attribute = None;
@@ -14679,16 +14693,22 @@ fn set_cookie_storage_key<'a>(
     // RFC 6265 uses the last Domain/Path attribute. An empty Domain attribute
     // is ignored, and an invalid Path attribute falls back to the request's
     // default path. Other malformed domain forms remain non-comparable.
-    let domain = match domain_attribute {
-        Some(domain) => Some(canonical_set_cookie_domain(domain)?),
-        None => default_domain,
+    let (domain, host_only) = match domain_attribute {
+        Some(domain) => (Some(canonical_set_cookie_domain(domain)?), false),
+        None => (default_domain, true),
     };
     let path = match path_attribute {
         Some(path) if valid_set_cookie_path(path) => path,
         Some(_) | None => default_path,
     };
 
-    Some((name, domain, path, partitioned))
+    Some(SetCookieStorageKey {
+        name,
+        domain,
+        path,
+        host_only,
+        partitioned,
+    })
 }
 
 fn set_cookie_same_storage_key(
@@ -14697,21 +14717,20 @@ fn set_cookie_same_storage_key(
     default_domain: Option<SetCookieDomain<'_>>,
     default_path: &str,
 ) -> bool {
-    let Some((existing_name, existing_domain, existing_path, existing_partitioned)) =
-        set_cookie_storage_key(existing, default_domain, default_path)
+    let Some(existing_key) = set_cookie_storage_key(existing, default_domain, default_path)
     else {
         return false;
     };
-    let Some((candidate_name, candidate_domain, candidate_path, candidate_partitioned)) =
-        set_cookie_storage_key(candidate, default_domain, default_path)
+    let Some(candidate_key) = set_cookie_storage_key(candidate, default_domain, default_path)
     else {
         return false;
     };
 
-    existing_name == candidate_name
-        && existing_path == candidate_path
-        && existing_partitioned == candidate_partitioned
-        && match (existing_domain, candidate_domain) {
+    existing_key.name == candidate_key.name
+        && existing_key.path == candidate_key.path
+        && existing_key.host_only == candidate_key.host_only
+        && existing_key.partitioned == candidate_key.partitioned
+        && match (existing_key.domain, candidate_key.domain) {
             (Some(existing_domain), Some(candidate_domain)) => {
                 existing_domain.same_domain(candidate_domain)
             }
@@ -15369,9 +15388,15 @@ async fn handle_proxy_request_inner(
     // HTTP/1.1 uses the Host header; HTTP/2 uses the :authority pseudo-header
     // (exposed via req.uri().authority()). Strip port if present and lowercase.
     // Uses raw_header_get() to avoid materializing the full HashMap.
-    let raw_host = ctx
-        .raw_header_get("host")
-        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    let raw_host = if req.version() == hyper::Version::HTTP_2 {
+        req.uri()
+            .authority()
+            .map(|authority| authority.as_str())
+            .or_else(|| ctx.raw_header_get("host"))
+    } else {
+        ctx.raw_header_get("host")
+            .or_else(|| req.uri().authority().map(|authority| authority.as_str()))
+    };
     // One `split_request_authority` pass yields both the routing host (port
     // stripped, as before) and the request's EXPLICIT authority port —
     // consumed only by mesh inbound multi-port sibling selection below, where

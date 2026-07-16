@@ -446,6 +446,30 @@ fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
 }
 
 #[test]
+fn test_h2_request_origin_prefers_uri_authority_before_host_header() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let handler = source
+        .find("async fn handle_proxy_request_inner(")
+        .map(|start| &source[start..])
+        .expect("H1/H2 request handler must remain present");
+    let selection = handler
+        .find("let raw_host = if req.version() == hyper::Version::HTTP_2 {")
+        .map(|start| &handler[start..])
+        .expect("HTTP/2 request-origin authority selection must remain explicit");
+    let uri_authority = selection
+        .find("req.uri()")
+        .expect("HTTP/2 must inspect the request URI authority");
+    let host_fallback = selection
+        .find(".or_else(|| ctx.raw_header_get(\"host\"))")
+        .expect("HTTP/2 may fall back to Host when :authority is absent");
+
+    assert!(
+        uri_authority < host_fallback,
+        "HTTP/2 :authority must own cookie-origin trailing-dot semantics"
+    );
+}
+
+#[test]
 fn test_backend_path_bound_retries_preflight_before_backoff() {
     let source = include_str!("../../../src/proxy/mod.rs");
 
@@ -1244,7 +1268,7 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
     let selected: Arc<dyn Plugin> = Arc::new(MixedCaseCookieRejectingAuth);
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
-    let expected = "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nscoped=clear-root; Path=/\nscoped=clear-app; Path=/app\ndomain=selected; dOmAiN=.Example.COM; pAtH=/app\nhost_scope=selected; Domain=example.com; Path=/\nomitted=selected; Path=/\nduplicate=selected; Path=/ignored; PATH=/effective\nquoted=selected; Path=\"/quoted\"\nmalformed pair=selected; Path=/\nquoted_domain=selected; Domain=\".example.com\"; Path=/\ninvalid_path=selected; Path=\nvalue_space=selected ; Path=/\n name_space =selected; Path=/\nshared=1; Path=/\nlower_only=1; Path=/lower\nsession=selected-lower; Path=/lower; Secure; SameSite=Strict\nsession=staged; Path=/staged; HttpOnly\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged\ndomain=staged-other; Domain=api.example.com; Path=/app\nmalformed pair=staged; Path=/\nquoted_domain=staged; Domain=\".example.com\"; Path=/";
+    let expected = "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nscoped=clear-root; Path=/\nscoped=clear-app; Path=/app\ndomain=selected; dOmAiN=.Example.COM; pAtH=/app\nhost_scope=selected; Domain=example.com; Path=/\nomitted=selected; Path=/\nduplicate=selected; Path=/ignored; PATH=/effective\nquoted=selected; Path=\"/quoted\"\nmalformed pair=selected; Path=/\nquoted_domain=selected; Domain=\".example.com\"; Path=/\ninvalid_path=selected; Path=\nvalue_space=selected ; Path=/\n name_space =selected; Path=/\nshared=1; Path=/\nlower_only=1; Path=/lower\nsession=selected-lower; Path=/lower; Secure; SameSite=Strict\nsession=staged; Path=/staged; HttpOnly\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged\ndomain=staged-other; Domain=api.example.com; Path=/app\nhost_scope=staged; Path=/\nmalformed pair=staged; Path=/\nquoted_domain=staged; Domain=\".example.com\"; Path=/";
 
     for _ in 0..32 {
         let mut ctx = RequestContext::new(
@@ -1293,10 +1317,10 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
 #[tokio::test]
 async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
     let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
-        cookies: "non_ldh=staged; Domain=foo_bar.example; Path=/\npartitioned_same=staged; Secure; pArTiTiOnEd; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/",
+        cookies: "non_ldh=staged; Domain=foo_bar.example; Path=/\nip_literal=staged; Domain=[::1]; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_same=staged; Secure; pArTiTiOnEd; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/",
     });
     let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
-        cookies: "non_ldh=selected; Domain=foo_bar.example; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/",
+        cookies: "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/",
     });
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
@@ -1323,8 +1347,36 @@ async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some(
-            "non_ldh=selected; Domain=foo_bar.example; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/"
+            "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/"
         )
+    );
+}
+
+#[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_preserves_host_only_state() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "session=staged; Path=/",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "session=selected; Domain=example.com; Path=/",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cookie-scope".to_string(),
+    );
+    ctx.request_authority = Some("example.com".to_string());
+
+    let (_, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("both auth attempts must reject");
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("session=selected; Domain=example.com; Path=/\nsession=staged; Path=/")
     );
 }
 

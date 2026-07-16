@@ -369,6 +369,14 @@ fn http2_accepts_matching_host_authority_after_case_and_dot_normalization() {
 }
 
 #[test]
+fn http2_accepts_uri_trailing_dot_with_host_without_dot() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
+    let uri: hyper::Uri = "https://example.com./".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2).is_none());
+}
+
+#[test]
 fn http2_accepts_https_default_port_host_authority_equivalence() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("api.example:443"));
