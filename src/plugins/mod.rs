@@ -782,6 +782,10 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Aggregate CORS policy state staged across every attached CORS instance
+    /// and consumed by the cache-inserted CORS finalizer. Kept outside public
+    /// metadata so policy details never enter transaction logs.
+    pub(crate) cors_state: cors::CorsRequestState,
     /// Claim-derived upstream headers committed by the first accepted
     /// authentication attempt and held until `before_proxy`. Kept out of
     /// `metadata` so authorization-phase rejection logging can never serialize
@@ -1175,6 +1179,7 @@ impl RequestContext {
             auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
+            cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
@@ -1357,6 +1362,10 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            // Final request-body hooks cannot observe or mutate the real CORS
+            // aggregate. CORS has no body hook, and only metadata is copied
+            // back from this compatibility context.
+            cors_state: cors::CorsRequestState::default(),
             // Claim-header staging stays on the real request context. Final
             // body hooks never consume it, and copying raw claim values into a
             // compatibility clone would extend their lifetime unnecessarily.
@@ -3309,6 +3318,12 @@ pub trait Plugin: Send + Sync {
     /// not be inferred from whether this ordinary request hook ran.
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Identifies the cache-internal wrapper used to defer a composed CORS
+    /// chain. This prevents incremental cache rebuilds from nesting wrappers.
+    fn is_deferred_cors_wrapper(&self) -> bool {
+        false
     }
 
     /// Authentication phase. Uses ConsumerIndex for O(1) credential lookups.

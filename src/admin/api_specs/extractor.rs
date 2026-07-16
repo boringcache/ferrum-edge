@@ -2253,7 +2253,7 @@ x-ferrum-proxy:
             "id": "plugin-2",
             "plugin_name": "cors",
             "scope": "proxy",
-            "config": {"origins": ["https://example.com"]}
+            "config": {"allowed_origins": ["https://example.com"]}
         }
     ]
 }
@@ -2652,7 +2652,7 @@ x-ferrum-proxy:
                     "id": "grp-plugin",
                     "plugin_name": "cors",
                     "scope": "proxy_group",
-                    "config": {{}}
+                    "config": {{"allowed_origins": ["*"]}}
                 }}]
             }}"#,
             minimal_proxy()
@@ -2680,7 +2680,7 @@ x-ferrum-proxy:
                     "plugin_name": "cors",
                     "scope": "proxy",
                     "proxy_id": "some-other-proxy",
-                    "config": {{}}
+                    "config": {{"allowed_origins": ["*"]}}
                 }}]
             }}"#,
             minimal_proxy()
@@ -2720,7 +2720,7 @@ x-ferrum-proxy:
                         "id": "dup-id",
                         "plugin_name": "cors",
                         "scope": "proxy",
-                        "config": {{}}
+                        "config": {{"allowed_origins": ["*"]}}
                     }}
                 ]
             }}"#,
@@ -3111,7 +3111,7 @@ x-ferrum-proxy:
                 {
                     "id": "",
                     "plugin_name": "cors",
-                    "config": {}
+                    "config": {"allowed_origins": ["*"]}
                 }
             ]
         }"#;
@@ -3171,7 +3171,7 @@ x-ferrum-proxy:
             },
             "x-ferrum-plugins": [
                 {"id": "p1", "plugin_name": "rate_limiting", "config": {"limits": [{"scope": "default", "requests_per_minute": 100}]}},
-                {"id": "p2", "plugin_name": "cors", "config": {}}
+                {"id": "p2", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}
             ]
         }"#;
         let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
@@ -3208,7 +3208,7 @@ x-ferrum-proxy:
                 "plugins": [{"plugin_config_id": "existing-global-plugin"}]
             },
             "x-ferrum-plugins": [
-                {"id": "new-plugin", "plugin_name": "cors", "config": {}}
+                {"id": "new-plugin", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}
             ]
         }"#;
         let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
@@ -3715,7 +3715,7 @@ x-ferrum-proxy:
                     "plugin_name": "cors",
                     "scope": "proxy",
                     "proxy_id": "my-proxy",
-                    "config": {{}}
+                    "config": {{"allowed_origins": ["*"]}}
                 }}]
             }}"#,
             minimal_proxy()
@@ -4072,7 +4072,7 @@ x-ferrum-proxy:
                     "id": "hash-plugin",
                     "plugin_name": "cors",
                     "scope": "proxy",
-                    "config": {{"origins": ["https://example.com"]}}
+                    "config": {{"allowed_origins": ["https://example.com"]}}
                 }}]
             }}"#
         );
@@ -4196,7 +4196,7 @@ x-ferrum-proxy:
                 "id": "hash-plugin",
                 "plugin_name": "cors",
                 "scope": "proxy",
-                "config": {"origins": ["https://example.com"]}
+                "config": {"allowed_origins": ["https://example.com"]}
             }]
         }"#;
         let (bundle_without, _) =
@@ -4274,7 +4274,7 @@ x-ferrum-proxy:
                     "id": "ns-plugin",
                     "plugin_name": "cors",
                     "scope": "proxy",
-                    "config": {{}}
+                    "config": {{"allowed_origins": ["*"]}}
                 }}]
             }}"#,
             minimal_proxy()

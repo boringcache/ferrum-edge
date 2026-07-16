@@ -123,7 +123,7 @@ that method. H1, H2, and H3 share these blind spots. Terminal transaction
 logging is separate from ordinary request hooks; whether a terminal summary
 exists must not be inferred from whether `on_request_received` ran.
 
-Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
+Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, a native direct CORS policy returns a `204` preflight response in phase 1 without ever reaching authentication (an Istio projection returns its source-compatible 200). Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
 `on_backend_path_resolved` is an opt-in, route-sensitive boundary after
 route/header-shaping `before_proxy` hooks and load balancing, but before
@@ -494,6 +494,19 @@ OpenTelemetry tracing runs at priority 25 — the earliest of any plugin — so 
 ### CORS runs next (priority 100)
 
 Browser preflight (`OPTIONS`) requests must be answered before authentication. If an auth plugin ran first, it would reject the preflight with `401` and the browser would never complete the CORS handshake. CORS at priority 100 ensures preflight responses are returned immediately.
+
+When a proxy has multiple CORS instances, the cache keeps their equal-priority
+order stable, evaluates the whole contiguous CORS chain, and inserts one
+internal finalizer after it. Actual requests compose origin, credentials, and
+exposed-header policy; method/header lists and max age are preflight-only and
+are not evaluated on actual traffic. Preflights additionally intersect the
+requested-method/header policy and use the shortest max age, so an earlier
+approval cannot bypass a later restriction. A priority override that places a
+different HTTP/gRPC-capable plugin between CORS instances is rejected during
+cache construction; non-overlapping stream-only plugins are ignored because
+protocol filtering removes them from the CORS chain. This preserves the
+phase-1 short-circuit boundary on H1, H2, H3, and the gRPC-Web request-policy
+chain.
 
 ### Request termination runs immediately after CORS (priority 125)
 

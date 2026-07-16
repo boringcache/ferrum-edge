@@ -3159,7 +3159,7 @@ fn test_plugin_config_priority_override_serde_roundtrip() {
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
@@ -3181,7 +3181,7 @@ fn test_plugin_config_priority_override_absent_in_json() {
     let json = r#"{
         "id": "pc1",
         "plugin_name": "cors",
-        "config": {},
+        "config": {"allowed_origins": ["*"]},
         "scope": "global",
         "enabled": true
     }"#;
@@ -3194,7 +3194,7 @@ fn test_plugin_config_priority_override_null_in_json() {
     let json = r#"{
         "id": "pc1",
         "plugin_name": "cors",
-        "config": {},
+        "config": {"allowed_origins": ["*"]},
         "scope": "global",
         "enabled": true,
         "priority_override": null
@@ -3210,7 +3210,7 @@ fn test_validate_plugin_references_rejects_global_plugin_association() {
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
@@ -3270,7 +3270,7 @@ fn test_validate_plugin_references_accepts_proxy_group_association() {
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::ProxyGroup,
         proxy_id: None,
         enabled: true,
@@ -3296,7 +3296,7 @@ fn test_validate_plugin_references_proxy_group_shared_across_proxies() {
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::ProxyGroup,
         proxy_id: None,
         enabled: true,
@@ -3326,7 +3326,7 @@ fn test_validate_plugin_references_rejects_proxy_group_with_proxy_id() {
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::ProxyGroup,
         proxy_id: Some("p1".into()), // Invalid: proxy_group must not have proxy_id
         enabled: true,
@@ -3350,7 +3350,7 @@ fn test_plugin_scope_proxy_group_serde_round_trip() {
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::ProxyGroup,
         proxy_id: None,
         enabled: true,

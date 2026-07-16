@@ -1825,6 +1825,87 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
 }
 
 #[test]
+fn cors_schema_matches_strict_runtime_and_istio_projection_surface() {
+    use ferrum_edge::plugins::cors::CorsPlugin;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/CorsConfig")
+        .expect("CorsConfig schema");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(["allowed_origins"]));
+    assert_eq!(
+        schema["properties"]["unmatched_preflights"]["enum"],
+        json!(["forward", "ignore"])
+    );
+
+    let cases = [
+        (json!({"allowed_origins": ["*"]}), true),
+        (json!({"allowed_origins": ["*.example.com"]}), true),
+        (
+            json!({"allowed_origins": ["https://app.example:443"]}),
+            true,
+        ),
+        (
+            json!({"allowed_origins": ["HTTPS://BÜCHER.EXAMPLE:443"]}),
+            true,
+        ),
+        (json!({"allowed_origins": [{"exact": "*"}]}), true),
+        (
+            json!({
+                "allowed_origins": ["https://app.example"],
+                "allowed_methods": [],
+                "allowed_headers": [],
+                "unmatched_preflights": "forward"
+            }),
+            true,
+        ),
+        (json!({}), false),
+        (json!(true), false),
+        (json!({"origins": ["*"]}), false),
+        (json!({"allowed_origins": null}), false),
+        (json!({"allowed_origins": ["not-an-origin"]}), false),
+        (
+            json!({"allowed_origins": ["https://app.example/path"]}),
+            false,
+        ),
+        (
+            json!({"allowed_origins": [{"exact": "*.example.com"}]}),
+            false,
+        ),
+        (
+            json!({"allowed_origins": ["*"], "allowed_methods": []}),
+            false,
+        ),
+        (json!({"allowed_origins": ["*"], "max_age": -1}), false),
+        (
+            json!({
+                "allowed_origins": ["*"],
+                "unmatched_preflights": "FORWARD"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "allowed_origins": ["*"],
+                "unmatched_preflights": "forward",
+                "preflight_continue": false
+            }),
+            false,
+        ),
+    ];
+    for (config, expected) in cases {
+        assert_component_validity(&spec, "CorsConfig", &config, expected);
+        assert_eq!(
+            CorsPlugin::new(&config).is_ok(),
+            expected,
+            "runtime/schema drift for {config}"
+        );
+    }
+}
+
+#[test]
 fn workload_metrics_schema_documents_runtime_tag_limits() {
     use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 

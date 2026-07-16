@@ -48,7 +48,7 @@ plugin_configs:
     scope: proxy
     proxy_id: public-frontend
     config:
-      origins: ["https://app.example.com"]
+      allowed_origins: ["https://app.example.com"]
 
   # ProxyGroup — shared across a SUBSET of proxies
   # One instance, shared rate limit counters across the group
@@ -2386,13 +2386,20 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_origins` | (String \| Object)[] | `["*"]` | Permitted origins. Each entry is a string (`"*"`, an exact `scheme://host[:port]` origin, or a `*.suffix.com` wildcard subdomain) or an Istio `StringMatch` object with one of `exact` / `prefix` / `regex` (literal prefix / RE2 full match). |
-| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Allowed methods |
-| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Allowed headers |
+| `allowed_origins` | (String \| Object)[] | required | Permitted origins. Use `["*"]` only for intentional allow-all. Exact origins are canonicalized at config load; `*.suffix.com` is the native wildcard-subdomain form. Istio objects use exactly one of `exact` / `prefix` / `regex`; exact `*` is Istio allow-all. |
+| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
+| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
 | `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` |
 | `max_age` | u64 | `86400` | Preflight cache duration in seconds |
-| `preflight_continue` | bool | `false` | Pass preflight requests to backend |
+| `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
+| `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |
+
+The root config must be an object. Unknown keys, explicit `null`, malformed
+values, and an omitted `allowed_origins` policy fail startup/reload instead of
+falling back to wildcard access. Multiple attached CORS instances compose
+origin/credential/exposure policy on actual requests and additionally
+intersect method/header/max-age policy on preflight.
 
 See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshooting.
 
