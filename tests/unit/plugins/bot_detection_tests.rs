@@ -488,10 +488,7 @@ async fn test_field_nulls_intentionally_select_documented_defaults() {
     .expect("field-level nulls should select defaults");
 
     let mut blocked = make_ctx_with_ua("curl/7.88.1");
-    plugin_utils::assert_reject(
-        plugin.on_request_received(&mut blocked).await,
-        Some(403),
-    );
+    plugin_utils::assert_reject(plugin.on_request_received(&mut blocked).await, Some(403));
 
     let mut missing = make_ctx_without_ua();
     plugin_utils::assert_continue(plugin.on_request_received(&mut missing).await);
@@ -519,9 +516,18 @@ fn test_each_field_rejects_wrong_types() {
             json!({"allow_missing_user_agent": "false"}),
             "allow_missing_user_agent",
         ),
-        (json!({"custom_response_code": "451"}), "custom_response_code"),
-        (json!({"custom_response_code": 451.5}), "custom_response_code"),
-        (json!({"custom_response_code": false}), "custom_response_code"),
+        (
+            json!({"custom_response_code": "451"}),
+            "custom_response_code",
+        ),
+        (
+            json!({"custom_response_code": 451.5}),
+            "custom_response_code",
+        ),
+        (
+            json!({"custom_response_code": false}),
+            "custom_response_code",
+        ),
     ] {
         let err = BotDetection::new(&config)
             .err()

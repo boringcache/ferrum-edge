@@ -2438,14 +2438,8 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
         schema["properties"]["custom_response_code"]["type"],
         json!(["integer", "null"])
     );
-    assert_eq!(
-        schema["properties"]["custom_response_code"]["minimum"],
-        400
-    );
-    assert_eq!(
-        schema["properties"]["custom_response_code"]["maximum"],
-        599
-    );
+    assert_eq!(schema["properties"]["custom_response_code"]["minimum"], 400);
+    assert_eq!(schema["properties"]["custom_response_code"]["maximum"], 599);
 
     for valid in [
         json!({}),
