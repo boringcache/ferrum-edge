@@ -1403,7 +1403,7 @@ async fn test_ambiguous_query_fails_before_external_egress() {
         default_client(),
     )
     .unwrap();
-    assert!(plugin.requires_decoded_query_params());
+    assert!(!plugin.requires_decoded_query_params());
 
     for (raw_query, expected_code) in [
         ("role=user&role=admin", "duplicate_query_parameter"),

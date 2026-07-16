@@ -1162,10 +1162,6 @@ impl Plugin for ServerlessFunction {
         false
     }
 
-    fn requires_decoded_query_params(&self) -> bool {
-        self.forward_query_params
-    }
-
     fn warmup_hostnames(&self) -> Vec<String> {
         self.function_hostname
             .as_ref()

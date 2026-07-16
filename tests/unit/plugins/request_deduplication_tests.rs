@@ -428,13 +428,13 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
 }
 
 #[tokio::test]
-async fn terminal_serverless_side_effect_is_stored_and_replayed() {
+async fn terminal_serverless_non_2xx_is_stored_at_response_commit() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(201).set_body_string("created-once"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("executed-once"))
         .mount(&server)
         .await;
     let dedup = make_plugin(json!({}));
@@ -470,16 +470,11 @@ async fn terminal_serverless_side_effect_is_stored_and_replayed() {
         } => (status_code, headers, body),
         other => panic!("expected terminal serverless response, got {other:?}"),
     };
-    first_ctx.metadata.insert(
-        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
-        "true".to_string(),
-    );
-    assert!(matches!(
-        dedup
-            .on_final_response_body(&mut first_ctx, status, &response_headers, &body)
-            .await,
-        PluginResult::Continue
-    ));
+    assert_eq!(status, 429);
+    assert!(dedup.requires_response_committed_hook());
+    dedup
+        .on_response_committed(&mut first_ctx, status, &response_headers, &body)
+        .await;
 
     let mut retry_ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -494,8 +489,8 @@ async fn terminal_serverless_side_effect_is_stored_and_replayed() {
             body,
             headers,
         } => {
-            assert_eq!(status_code, 201);
-            assert_eq!(&body[..], b"created-once");
+            assert_eq!(status_code, 429);
+            assert_eq!(&body[..], b"executed-once");
             assert_eq!(
                 headers.get("x-idempotent-replayed").map(String::as_str),
                 Some("true")

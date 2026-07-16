@@ -153,7 +153,7 @@ fn cached_response_retained_size(body_len: usize, headers: &HashMap<String, Stri
 /// In-flight marker to handle concurrent duplicate requests.
 ///
 /// `InFlight` carries the timestamp it was inserted so stale markers (from
-/// requests that died after `before_proxy` but before `on_final_response_body`,
+/// requests that died after `before_proxy` but before response completion,
 /// e.g., backend timeout, downstream plugin reject, dropped connection) can be
 /// detected and replaced rather than indefinitely returning 409 Conflict. It
 /// also carries an owner token so a stale request's terminal hook cannot clear
@@ -1768,7 +1768,7 @@ impl Plugin for RequestDeduplication {
             LocalDeduplicationAction::Fresh => {}
         }
 
-        // Store the key in metadata so on_final_response_body can cache the response
+        // Store completion state for the final-body/committed response hooks.
         ctx.metadata.insert(DEDUP_KEY_METADATA.to_string(), key);
         ctx.metadata
             .insert(DEDUP_FINGERPRINT_METADATA.to_string(), fingerprint);
@@ -1833,6 +1833,14 @@ impl Plugin for RequestDeduplication {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // Terminal serverless responses are finalized through the committed
+        // hook below. That hook observes every rejection shape (including
+        // empty 2xx, HEAD, and non-2xx responses) after body validators and
+        // reject-path header hooks have settled the exact client response.
+        if ctx.serverless_external_side_effect {
+            return PluginResult::Continue;
+        }
+
         // Only cache if we have a dedup key from before_proxy
         let key = match ctx.metadata.get(DEDUP_KEY_METADATA) {
             Some(k) => k.clone(),
@@ -1868,16 +1876,9 @@ impl Plugin for RequestDeduplication {
         // RELEASE the in-flight locks so the marker transitions to a clean state
         // instead of dangling until `inflight_ttl`, which keeps duplicate
         // detection accurate once the synthetic short-circuit returns.
-        //
-        // A terminal serverless response is the deliberate exception: the
-        // external function has already executed and may have produced a side
-        // effect, so releasing the key would let the retry execute it again.
-        // Serverless records private provenance before invocation; in that case
-        // the ordinary completed-response path below stores a replay instead.
         if ctx
             .metadata
             .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
-            && !ctx.serverless_external_side_effect
         {
             self.remove_matching_local_inflight(&key, &fingerprint, &local_inflight_owner_token);
             if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
@@ -1985,6 +1986,38 @@ impl Plugin for RequestDeduplication {
         }
 
         PluginResult::Continue
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) {
+        if !ctx.serverless_external_side_effect {
+            return;
+        }
+
+        // Clear the provenance before reusing the ordinary publication path;
+        // this committed hook is the one and only terminal-serverless store.
+        ctx.serverless_external_side_effect = false;
+        let synthetic_marker = ctx
+            .metadata
+            .remove(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+        let _ = self
+            .on_final_response_body(ctx, response_status, response_headers, body)
+            .await;
+        if let Some(marker) = synthetic_marker {
+            ctx.metadata.insert(
+                crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+                marker,
+            );
+        }
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {

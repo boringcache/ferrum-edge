@@ -14,7 +14,7 @@ use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -51,16 +51,18 @@ async fn start_backend_server(port: u16) {
 }
 
 /// Start a mock serverless function endpoint that returns a custom response.
-async fn start_function_server(port: u16) {
+async fn start_function_server(port: u16, invocations: Arc<AtomicUsize>) {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
         .expect("Failed to bind function server");
 
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
+            let invocations = Arc::clone(&invocations);
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
                 let _n = stream.read(&mut buf).await.unwrap_or(0);
+                invocations.fetch_add(1, Ordering::SeqCst);
 
                 let body = r#"{"source":"serverless-function","message":"hello from function"}"#;
                 let response = format!(
@@ -215,11 +217,19 @@ proxies:
     backend_port: {backend_port}
     strip_listen_path: true
     plugins:
+      - plugin_config_id: "dedup-1"
       - plugin_config_id: "serverless-1"
 
 consumers: []
 
 plugin_configs:
+  - id: "dedup-1"
+    proxy_id: "serverless-proxy"
+    plugin_name: "request_deduplication"
+    scope: "proxy"
+    enabled: true
+    config:
+      applicable_methods: ["GET", "HEAD"]
   - id: "serverless-1"
     proxy_id: "serverless-proxy"
     plugin_name: "serverless_function"
@@ -241,7 +251,11 @@ upstreams: []
 
     // Start both backend and function servers
     let _backend = tokio::spawn(start_backend_server(backend_port));
-    let _function = tokio::spawn(start_function_server(function_port));
+    let function_invocations = Arc::new(AtomicUsize::new(0));
+    let _function = tokio::spawn(start_function_server(
+        function_port,
+        Arc::clone(&function_invocations),
+    ));
     sleep(Duration::from_millis(300)).await;
 
     // Start gateway with retry
@@ -252,6 +266,7 @@ upstreams: []
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("http://127.0.0.1:{}/fn/test", proxy_port))
+        .header("idempotency-key", "h1-terminal-key")
         .send()
         .await
         .expect("Request failed");
@@ -296,6 +311,24 @@ upstreams: []
         "Response should NOT come from the backend. Got: {}",
         body
     );
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 1);
+
+    let replay = client
+        .get(format!("http://127.0.0.1:{}/fn/test", proxy_port))
+        .header("idempotency-key", "h1-terminal-key")
+        .send()
+        .await
+        .expect("H1 replay request failed");
+    assert_eq!(replay.status().as_u16(), 429);
+    assert_eq!(
+        replay
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert!(replay.text().await.unwrap().contains("serverless-function"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 1);
 
     // Exercise the same terminate contract over an H2 frontend connection.
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
@@ -312,6 +345,7 @@ upstreams: []
         .method("GET")
         .uri("http://example.com/fn/h2")
         .header("host", "example.com")
+        .header("idempotency-key", "h2-terminal-key")
         .body(Full::new(Bytes::new()))
         .expect("build H2 request");
     let response = sender.send_request(request).await.expect("H2 request");
@@ -332,7 +366,63 @@ upstreams: []
         .expect("collect H2 response")
         .to_bytes();
     assert!(String::from_utf8_lossy(&h2_body).contains("serverless-function"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 2);
+
+    let replay_request = Request::builder()
+        .method("GET")
+        .uri("http://example.com/fn/h2")
+        .header("host", "example.com")
+        .header("idempotency-key", "h2-terminal-key")
+        .body(Full::new(Bytes::new()))
+        .expect("build H2 replay request");
+    let replay_response = sender
+        .send_request(replay_request)
+        .await
+        .expect("H2 replay request");
+    assert_eq!(replay_response.status().as_u16(), 429);
+    assert_eq!(
+        replay_response
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    let replay_body = replay_response
+        .into_body()
+        .collect()
+        .await
+        .expect("collect H2 replay response")
+        .to_bytes();
+    assert!(String::from_utf8_lossy(&replay_body).contains("serverless-function"));
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 2);
     connection_task.abort();
+
+    let head = client
+        .head(format!("http://127.0.0.1:{}/fn/head", proxy_port))
+        .header("idempotency-key", "head-terminal-key")
+        .send()
+        .await
+        .expect("HEAD request failed");
+    assert_eq!(head.status().as_u16(), 429);
+    assert!(head.bytes().await.unwrap().is_empty());
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 3);
+
+    let head_replay = client
+        .head(format!("http://127.0.0.1:{}/fn/head", proxy_port))
+        .header("idempotency-key", "head-terminal-key")
+        .send()
+        .await
+        .expect("HEAD replay request failed");
+    assert_eq!(head_replay.status().as_u16(), 429);
+    assert_eq!(
+        head_replay
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert!(head_replay.bytes().await.unwrap().is_empty());
+    assert_eq!(function_invocations.load(Ordering::SeqCst), 3);
 
     let _ = gw.kill();
     let _ = gw.wait();
