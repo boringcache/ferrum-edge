@@ -987,12 +987,8 @@ impl http_body::Body for ProxyBody {
                     let grpc_status = client_deadline_fired
                         .then_some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
                     logger.fire(
-                        crate::proxy::deferred_log::BodyOutcome::error(
-                            class,
-                            bytes,
-                            disconnected,
-                        )
-                        .with_grpc_status(grpc_status),
+                        crate::proxy::deferred_log::BodyOutcome::error(class, bytes, disconnected)
+                            .with_grpc_status(grpc_status),
                     );
                 }
                 this.record_deferred_backend_admission(Some(class), disconnected);

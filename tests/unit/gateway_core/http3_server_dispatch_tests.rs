@@ -429,7 +429,9 @@ fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
         .next()
         .expect("HTTP/3 backend request buffering must remain bounded");
     assert_eq!(
-        buffering.matches("collect_request_body_with_deadline(").count(),
+        buffering
+            .matches("collect_request_body_with_deadline(")
+            .count(),
         2,
         "limited and unlimited HTTP/3 upload buffering must share the deadline-aware collector"
     );
