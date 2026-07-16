@@ -3745,14 +3745,12 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
         cors.get("allowCredentials"),
         None | Some(Value::Null) | Some(Value::Bool(_))
     );
-    let credentialed_wildcard_ok = !matches!(
-        cors.get("allowCredentials"),
-        Some(Value::Bool(true))
-    ) || !allowed_origins.as_ref().is_some_and(|origins| {
-        origins
-            .iter()
-            .any(|origin| origin.as_str().is_some_and(|origin| origin == "*"))
-    });
+    let credentialed_wildcard_ok = !matches!(cors.get("allowCredentials"), Some(Value::Bool(true)))
+        || !allowed_origins.as_ref().is_some_and(|origins| {
+            origins
+                .iter()
+                .any(|origin| origin.as_str().is_some_and(|origin| origin == "*"))
+        });
     origins_ok
         && max_age_ok
         && allow_credentials_ok
