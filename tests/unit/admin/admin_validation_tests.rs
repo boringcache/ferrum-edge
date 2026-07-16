@@ -59,6 +59,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("run_to_completion_while_held"));
     assert!(crud_source.contains("NamespaceConfigAdmissionCompletion::Lost"));
     assert!(crud_source.contains("immediately_succeeds_generation"));
+    assert!(crud_source.contains("late_create_compensation_safe("));
+    assert!(crud_source.contains("late plugin delete compensation could not restore proxy"));
     assert!(crud_source.contains("task.abort();"));
     assert!(crud_source.contains("tokio::time::timeout("));
     assert!(crud_source.contains("drop(local);"));
@@ -116,6 +118,10 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(sql_store_source.contains("batch_create_plugin_configs_chunk(&graph_configs)"));
     assert!(sql_store_source.contains("partition(crate::plugins::transaction_log_schema::"));
     assert!(sql_store_source.contains("unrelated_configs.chunks(Self::BATCH_CHUNK_SIZE)"));
+    assert!(sql_store_source.contains(".bind(proxy.updated_at.to_rfc3339())"));
+    assert!(sql_store_source.contains(".bind(consumer.updated_at.to_rfc3339())"));
+    assert!(sql_store_source.contains(".bind(pc.updated_at.to_rfc3339())"));
+    assert!(sql_store_source.contains(".bind(upstream.updated_at.to_rfc3339())"));
     let mongo_store_source = include_str!("../../../src/config/mongo_store.rs");
     assert!(mongo_store_source.contains("config_admission_locks"));
     assert!(mongo_store_source.contains("server_time_lease_acquire_pipeline"));
@@ -140,6 +146,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     );
     assert!(api_spec_source.contains("run_api_spec_persistence_while_held("));
     assert!(api_spec_source.contains("error_response(ApiSpecError::NoDatabase)"));
+    assert!(api_spec_source.contains("base_bundle.proxy.plugins.retain("));
+    assert!(api_spec_source.contains("db.update_proxy(&previous_bundle.proxy)"));
     let post_lock = api_spec_source
         .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .expect("POST admission guard");

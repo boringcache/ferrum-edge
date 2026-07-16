@@ -280,7 +280,15 @@ async fn compensate_late_api_spec_delete(
     {
         return Ok(());
     }
-    db.submit_api_spec_bundle(&previous_bundle, &previous_spec)
+    let additional_plugin_ids = additional_plugins
+        .iter()
+        .map(|plugin| plugin.id.clone())
+        .collect::<HashSet<_>>();
+    let mut base_bundle = previous_bundle.clone();
+    base_bundle.proxy.plugins.retain(|association| {
+        !additional_plugin_ids.contains(association.plugin_config_id.as_str())
+    });
+    db.submit_api_spec_bundle(&base_bundle, &previous_spec)
         .await?;
     for plugin in additional_plugins {
         if db
@@ -290,6 +298,9 @@ async fn compensate_late_api_spec_delete(
         {
             db.create_plugin_config(&plugin).await?;
         }
+    }
+    if !additional_plugin_ids.is_empty() && !db.update_proxy(&previous_bundle.proxy).await? {
+        anyhow::bail!("late API-spec delete compensation could not restore proxy associations");
     }
     Ok(())
 }

@@ -409,6 +409,59 @@ where
     }
 }
 
+async fn plugin_has_proxy_association(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    plugin_id: &str,
+) -> DbResult<bool> {
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_proxies_paginated(namespace, PAGE_SIZE, offset)
+            .await?;
+        let items_len = page.items.len() as i64;
+        if page.items.iter().any(|proxy| {
+            proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == plugin_id)
+        }) {
+            return Ok(true);
+        }
+        if items_len == 0 || offset + items_len >= page.total {
+            return Ok(false);
+        }
+        offset += items_len;
+    }
+}
+
+async fn proxy_has_scoped_plugin(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy_id: &str,
+) -> DbResult<bool> {
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+            .await?;
+        let items_len = page.items.len() as i64;
+        if page
+            .items
+            .iter()
+            .any(|plugin| plugin.proxy_id.as_deref() == Some(proxy_id))
+        {
+            return Ok(true);
+        }
+        if items_len == 0 || offset + items_len >= page.total {
+            return Ok(false);
+        }
+        offset += items_len;
+    }
+}
+
 /// Reacquire namespace admission after a successful late write. With no
 /// intervening claimant, the original validation remains authoritative. If a
 /// writer did intervene, undo only the still-current late delta; a later
@@ -433,9 +486,16 @@ async fn recover_late_resource_write<R: AdminResource>(
                 let written = written.ok_or_else(|| {
                     anyhow::anyhow!("late create recovery is missing the written resource")
                 })?;
-                if R::db_get_for_write(db.as_ref(), namespace, written.id())
+                if let Some(current) =
+                    R::db_get_for_write(db.as_ref(), namespace, written.id()).await?
+                    && R::late_create_compensation_safe(
+                        db.as_ref(),
+                        namespace,
+                        &current,
+                        written,
+                        previous_snapshot,
+                    )
                     .await?
-                    .is_some_and(|current| current.updated_at() == written.updated_at())
                     && !R::db_delete(db.as_ref(), namespace, written.id()).await?
                 {
                     anyhow::bail!("late create compensation found no matching resource");
@@ -1106,6 +1166,16 @@ pub(crate) trait AdminResource:
         _previous_snapshot: Option<&GatewayConfig>,
     ) -> DbResult<()> {
         Self::db_create(db, previous).await
+    }
+
+    async fn late_create_compensation_safe(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        current: &Self,
+        written: &Self,
+        _previous_snapshot: Option<&GatewayConfig>,
+    ) -> DbResult<bool> {
+        Ok(current.updated_at() == written.updated_at())
     }
 
     async fn check_uniqueness(
@@ -2589,6 +2659,67 @@ impl AdminResource for PluginConfig {
         db.delete_plugin_config(namespace, id).await
     }
 
+    async fn compensate_late_delete(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        previous: &Self,
+        previous_snapshot: Option<&GatewayConfig>,
+    ) -> DbResult<()> {
+        let snapshot = previous_snapshot.ok_or_else(|| {
+            anyhow::anyhow!("late plugin delete recovery is missing the namespace snapshot")
+        })?;
+        db.create_plugin_config(previous).await?;
+        for prior_proxy in &snapshot.proxies {
+            let prior_associations = prior_proxy
+                .plugins
+                .iter()
+                .filter(|association| association.plugin_config_id == previous.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            if prior_associations.is_empty() {
+                continue;
+            }
+            let Some(mut current_proxy) = db.get_proxy_for_write(namespace, &prior_proxy.id).await?
+            else {
+                continue;
+            };
+            let mut changed = false;
+            for association in prior_associations {
+                if !current_proxy
+                    .plugins
+                    .iter()
+                    .any(|current| current.plugin_config_id == association.plugin_config_id)
+                {
+                    current_proxy.plugins.push(association);
+                    changed = true;
+                }
+            }
+            if changed {
+                current_proxy.updated_at = Utc::now();
+                if !db.update_proxy(&current_proxy).await? {
+                    anyhow::bail!(
+                        "late plugin delete compensation could not restore proxy '{}' associations",
+                        current_proxy.id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn late_create_compensation_safe(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        current: &Self,
+        written: &Self,
+        _previous_snapshot: Option<&GatewayConfig>,
+    ) -> DbResult<bool> {
+        if current.updated_at != written.updated_at {
+            return Ok(false);
+        }
+        Ok(!plugin_has_proxy_association(db, namespace, &written.id).await?)
+    }
+
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
         namespace: &str,
@@ -2966,6 +3097,32 @@ impl AdminResource for Proxy {
 
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
         db.delete_proxy(namespace, id).await
+    }
+
+    async fn late_create_compensation_safe(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        current: &Self,
+        written: &Self,
+        _previous_snapshot: Option<&GatewayConfig>,
+    ) -> DbResult<bool> {
+        if current.updated_at != written.updated_at {
+            return Ok(false);
+        }
+        let current_associations = current
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.as_str())
+            .collect::<HashSet<_>>();
+        let written_associations = written
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.as_str())
+            .collect::<HashSet<_>>();
+        if current_associations != written_associations {
+            return Ok(false);
+        }
+        Ok(!proxy_has_scoped_plugin(db, namespace, &written.id).await?)
     }
 
     async fn compensate_late_delete(
@@ -3582,7 +3739,6 @@ async fn handle_write<R: AdminResource>(
             }
         },
     };
-
     if let Some(guard) = namespace_config_admission_guard.as_ref()
         && let Err(error) = guard.ensure_held()
     {
