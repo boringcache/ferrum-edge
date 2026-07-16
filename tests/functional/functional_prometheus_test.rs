@@ -309,7 +309,10 @@ plugin_configs:
         .await
         .expect("send AI response request");
     assert_eq!(response.status(), 200);
-    response.bytes().await.expect("read AI response body before scraping metrics");
+    response
+        .bytes()
+        .await
+        .expect("read AI response body before scraping metrics");
     sleep(Duration::from_secs(1)).await;
 
     let metrics = client
