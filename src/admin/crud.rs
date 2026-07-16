@@ -464,13 +464,8 @@ async fn recover_late_resource_write<R: AdminResource>(
                     .await?
                     .is_none()
                 {
-                    R::compensate_late_delete(
-                        db.as_ref(),
-                        namespace,
-                        previous,
-                        previous_snapshot,
-                    )
-                    .await?;
+                    R::compensate_late_delete(db.as_ref(), namespace, previous, previous_snapshot)
+                        .await?;
                 }
             }
         }
@@ -3010,11 +3005,7 @@ impl AdminResource for Proxy {
         proxy_without_associations.plugins.clear();
         db.create_proxy(&proxy_without_associations).await?;
         for plugin in affected_plugins {
-            if db
-                .get_plugin_config(namespace, &plugin.id)
-                .await?
-                .is_none()
-            {
+            if db.get_plugin_config(namespace, &plugin.id).await?.is_none() {
                 db.create_plugin_config(&plugin).await?;
             }
         }

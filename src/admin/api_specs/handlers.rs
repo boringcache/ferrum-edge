@@ -157,7 +157,9 @@ where
                         .run_to_completion_while_held(compensation)
                         .await
                     {
-                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Ok(()))) => {}
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Ok(
+                            (),
+                        ))) => {}
                         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
                             result: Ok(()),
                             error: recovery_error,
@@ -204,7 +206,8 @@ async fn stored_api_spec_bundle_matches(
     let Some(current_spec) = db.get_api_spec(&spec.namespace, &spec.id).await? else {
         return Ok(false);
     };
-    if current_spec.updated_at != spec.updated_at || current_spec.content_hash != spec.content_hash {
+    if current_spec.updated_at != spec.updated_at || current_spec.content_hash != spec.content_hash
+    {
         return Ok(false);
     }
     let Some(current_proxy) = db
@@ -3016,10 +3019,7 @@ pub async fn handle_delete_api_spec(
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
-    let existing_proxy = match db
-        .get_proxy_for_write(namespace, &existing.proxy_id)
-        .await
-    {
+    let existing_proxy = match db.get_proxy_for_write(namespace, &existing.proxy_id).await {
         Ok(Some(proxy)) => proxy,
         Ok(None) => {
             return Ok(error_response(ApiSpecError::Internal(format!(
@@ -3041,8 +3041,10 @@ pub async fn handle_delete_api_spec(
         Ok(snapshot) => snapshot,
         Err(error) => return Ok(error_response(classify_db_error(error))),
     };
-    let owned_plugin_ids: HashSet<&str> =
-        existing_plugins.iter().map(|plugin| plugin.id.as_str()).collect();
+    let owned_plugin_ids: HashSet<&str> = existing_plugins
+        .iter()
+        .map(|plugin| plugin.id.as_str())
+        .collect();
     let proxy_plugin_ids: HashSet<&str> = existing_proxy
         .plugins
         .iter()
