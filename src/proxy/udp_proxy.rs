@@ -40,20 +40,22 @@ use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 /// Maximum datagram size for UDP forwarding.
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
-/// Smallest IPv4 UDP datagram on the wire: 20-byte IP header plus 8-byte UDP
-/// header. Payload-only accounting would give a legal zero-length datagram no
-/// response budget at all; this conservative floor keeps that session usable
-/// without granting more amplification than the traffic received on the wire.
-const MIN_UDP_REQUEST_WIRE_SIZE_BYTES: u64 = 28;
-
 /// Canonical identity used at every UDP/DTLS session-admission boundary.
 pub fn udp_session_client_ip(client_addr: SocketAddr) -> Arc<str> {
     Arc::from(client_addr.ip().to_canonical().to_string())
 }
 
-/// Request size charged to the UDP response-amplification budget.
-pub fn udp_amplification_request_size(payload_size: usize) -> u64 {
-    (payload_size as u64).max(MIN_UDP_REQUEST_WIRE_SIZE_BYTES)
+/// Maximum response payload allowed by the UDP amplification guard.
+///
+/// A zero-length request receives an explicit one-byte reply allowance so the
+/// legal datagram does not create a black-holed session. Nonempty requests keep
+/// the configured payload ratio exactly.
+pub fn udp_amplification_response_budget(request_size: u64, factor: f32) -> u64 {
+    if request_size == 0 {
+        1
+    } else {
+        (request_size as f64 * factor as f64) as u64
+    }
 }
 
 /// Metrics for a single UDP proxy listener.
@@ -2089,10 +2091,9 @@ async fn forward_client_datagram_to_backend(
     // being polled again; publishing only after send completion lets that first
     // response bypass the amplification guard. A failed send still leaves a
     // conservative budget based on bytes accepted from the client.
-    session.last_request_size.store(
-        udp_amplification_request_size(data.len()),
-        Ordering::Release,
-    );
+    session
+        .last_request_size
+        .store(data.len() as u64, Ordering::Release);
 
     let send_result = if let Some(ref dtls) = session.dtls_conn {
         dtls.send(data)
@@ -3077,7 +3078,7 @@ async fn handle_dtls_client_inner(
 
             // Publish before sending so a fast backend reply cannot observe a
             // zero or stale amplification budget.
-            last_request_size_fwd.store(udp_amplification_request_size(len), Ordering::Release);
+            last_request_size_fwd.store(len as u64, Ordering::Release);
             let send_ok = if let Some(ref dtls) = backend_dtls_write {
                 dtls.send(&data).await.map_err(|e| e.to_string())
             } else if let Some(ref sock) = backend_udp_write {
@@ -3142,9 +3143,9 @@ async fn handle_dtls_client_inner(
             // Amplification factor check for DTLS path
             if let Some(factor) = amplification_factor_rev {
                 let req_size = last_request_size_rev.load(Ordering::Acquire);
-                let max_response = (req_size as f64 * factor as f64) as u64;
+                let max_response = udp_amplification_response_budget(req_size, factor);
                 if len as u64 > max_response {
-                    continue; // Drop oversized or pre-request response
+                    continue; // Drop oversized response
                 }
             }
 
@@ -3508,7 +3509,7 @@ async fn create_session(
         bytes_received: AtomicU64::new(0),
         // Establish the first response budget before the reply task is spawned.
         // The caller has already accepted this datagram through policy hooks.
-        last_request_size: AtomicU64::new(udp_amplification_request_size(initial_data.len())),
+        last_request_size: AtomicU64::new(initial_data.len() as u64),
         backend_target: format!("{}:{}", backend_host, backend_port),
         backend_resolved_ip: resolved_ip.to_string(),
         sni_hostname: stream_ctx.sni_hostname.clone(),
@@ -3715,7 +3716,7 @@ async fn create_session(
             // the configured ratio relative to the last client request size.
             if let Some(factor) = reply_amplification_factor {
                 let req_size = reply_session.last_request_size.load(Ordering::Acquire);
-                let max_response = (req_size as f64 * factor as f64) as u64;
+                let max_response = udp_amplification_response_budget(req_size, factor);
                 if len as u64 > max_response {
                     warn!(
                         proxy_id = %reply_proxy_id,
@@ -3832,9 +3833,10 @@ async fn create_session(
                             if let Some(factor) = reply_amplification_factor {
                                 let req_size =
                                     reply_session.last_request_size.load(Ordering::Acquire);
-                                let max_response = (req_size as f64 * factor as f64) as u64;
+                                let max_response =
+                                    udp_amplification_response_budget(req_size, factor);
                                 if len2 as u64 > max_response {
-                                    continue; // Drop oversized or pre-request response
+                                    continue; // Drop oversized response
                                 }
                             }
                             // Backend→client plugin hooks on batched datagram
@@ -4435,7 +4437,7 @@ mod tests {
         );
         assert_eq!(
             session.last_request_size.load(Ordering::Relaxed),
-            super::udp_amplification_request_size(b"payload".len()),
+            b"payload".len() as u64,
             "accepted client datagrams must establish the amplification budget before send"
         );
     }

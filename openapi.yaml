@@ -6300,12 +6300,12 @@ components:
           description: |
             Maximum allowed response amplification factor for UDP proxies.
             When set, backend→client datagrams are dropped if their size exceeds
-            `max(payload_size, 28) * factor`; 28 bytes is the minimum IPv4+UDP
-            wire size, so a legal zero-length request retains a bounded response
-            budget. This protects against UDP amplification attacks (e.g.,
-            spoofed-source reflection). When omitted (default), no per-datagram
-            amplification cap is applied. Only applicable for `udp` / `dtls`
-            proxies.
+            `payload_size * factor`. A zero-length request receives an explicit
+            one-byte reply allowance so it cannot black-hole the session;
+            nonempty requests retain the exact configured payload ratio. This
+            protects against UDP amplification attacks (e.g., spoofed-source
+            reflection). When omitted (default), no per-datagram amplification
+            cap is applied. Only applicable for `udp` / `dtls` proxies.
         allowed_methods:
           oneOf:
             - type: array

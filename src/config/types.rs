@@ -2168,10 +2168,9 @@ pub struct Proxy {
     pub udp_idle_timeout_seconds: u64,
     /// Maximum allowed response amplification factor for UDP proxies.
     /// When set, backend→client datagrams are dropped if their size exceeds
-    /// `max(payload_size, 28) * factor`, where 28 bytes is the minimum IPv4+UDP
-    /// wire size. This preserves a bounded reply budget for legal zero-length
-    /// datagrams while protecting against UDP amplification attacks. `None`
-    /// (default) = no limit.
+    /// `payload_size * factor`. A zero-length request receives a one-byte reply
+    /// allowance so it cannot black-hole the session; nonempty requests retain
+    /// the exact configured payload ratio. `None` (default) = no limit.
     #[serde(default)]
     pub udp_max_response_amplification_factor: Option<f32>,
     /// TCP stream idle timeout in seconds. After this duration of no data

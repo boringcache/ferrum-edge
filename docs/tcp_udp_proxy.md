@@ -76,6 +76,7 @@ proxies:
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
 | `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol (v1 or v2) on this `tcp`/`tcp_tls` listener. See [Inbound PROXY Protocol](#inbound-proxy-protocol) below. |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
+| `udp_max_response_amplification_factor` | `f32` | unset | Drop backend response datagrams larger than `request_payload_size × factor`. A zero-length request receives only a one-byte response allowance; nonempty requests retain the exact configured payload ratio. |
 
 ### Synthetic `listen_path`
 
@@ -394,6 +395,7 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 - **Max sessions**: Limit of `FERRUM_UDP_MAX_SESSIONS` (default 10,000) concurrent sessions per proxy to prevent resource exhaustion
 - **Adaptive batching**: When `FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED=true` (default), the per-proxy recv drain limit moves across fixed internal tiers (64 / 256 / 2000 / 6000 datagrams) by observed per-proxy traffic via an EWMA — independent of `FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT`, which only sets the limit used when adaptation is disabled or before a proxy's first sample. TCP/WebSocket tunnel copy buffers similarly adapt between `FERRUM_ADAPTIVE_BUFFER_MIN_SIZE` (8 KiB) and `FERRUM_ADAPTIVE_BUFFER_MAX_SIZE` (256 KiB) when `FERRUM_ADAPTIVE_BUFFER_ENABLED=true`. See [configuration.md](configuration.md) for the full `FERRUM_ADAPTIVE_*` set.
 - **Reply routing**: Each session spawns a receiver task that forwards backend replies back to the correct client
+- **Response amplification guard**: When `udp_max_response_amplification_factor` is set, each backend datagram is limited to the latest client request payload size multiplied by the factor. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
 
 ## Compatible Plugins
