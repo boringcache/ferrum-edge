@@ -983,6 +983,7 @@ struct FunctionDestination {
     url: Url,
     sensitive_path: Option<String>,
     sensitive_query_pairs: Vec<(String, String)>,
+    sensitive_authority_scalars: Vec<String>,
     has_unresolved_encoding: bool,
 }
 
@@ -999,11 +1000,13 @@ impl FunctionDestination {
             None
         };
         let (sensitive_query_pairs, query_has_unresolved_encoding) = decoded_url_query_pairs(&url);
+        let sensitive_authority_scalars = normalized_authority_scalar_forms(&sensitive_query_pairs);
         has_unresolved_encoding |= query_has_unresolved_encoding;
         Ok(Self {
             url,
             sensitive_path,
             sensitive_query_pairs,
+            sensitive_authority_scalars,
             has_unresolved_encoding,
         })
     }
@@ -1041,6 +1044,25 @@ impl FunctionDestination {
         // credential-bearing URI surface and unnecessary for identifying a
         // benign redirect destination.
         if !candidate.username().is_empty() || candidate.password().is_some() {
+            return true;
+        }
+
+        // A function can exfiltrate a DNS-compatible signed query component
+        // through the authority even when the path/query/fragment are benign.
+        // URL parsing lowercases ASCII domains and IDNA-normalizes Unicode, so
+        // compare both original and normalized scalar forms at complete
+        // hostname-label (or IP-segment) boundaries.
+        let exposes_host_scalar = candidate.host_str().is_some_and(|host| {
+            self.sensitive_authority_scalars
+                .iter()
+                .any(|value| authority_contains_scalar_sequence(host, value))
+        });
+        let exposes_port_scalar = candidate.port().is_some_and(|port| {
+            let port = port.to_string();
+            self.sensitive_query_scalars()
+                .any(|value| value == port.as_str())
+        });
+        if exposes_host_scalar || exposes_port_scalar {
             return true;
         }
 
@@ -1300,6 +1322,79 @@ fn decoded_url_query_pairs(url: &Url) -> (Vec<(String, String)>, bool) {
         pairs.push((key.value, value.value));
     }
     (pairs, has_unresolved_encoding)
+}
+
+fn normalized_authority_scalar_forms(pairs: &[(String, String)]) -> Vec<String> {
+    let mut forms = Vec::new();
+    let mut seen = HashSet::new();
+    for component in pairs
+        .iter()
+        .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+        .filter(|component| !component.is_empty())
+    {
+        for form in [
+            Some(component.to_string()),
+            normalized_authority_scalar(component),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let dedup_key = form.to_ascii_lowercase();
+            if seen.insert(dedup_key) {
+                forms.push(form);
+            }
+        }
+    }
+    forms
+}
+
+fn normalized_authority_scalar(value: &str) -> Option<String> {
+    Some(match Host::parse(value).ok()? {
+        Host::Domain(hostname) => hostname,
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
+}
+
+fn authority_contains_scalar_sequence(candidate: &str, sensitive: &str) -> bool {
+    let candidate = candidate.as_bytes();
+    let sensitive = sensitive.as_bytes();
+    if sensitive.is_empty() || sensitive.len() > candidate.len() {
+        return false;
+    }
+
+    candidate
+        .windows(sensitive.len())
+        .enumerate()
+        .any(|(index, window)| {
+            if !window.eq_ignore_ascii_case(sensitive) {
+                return false;
+            }
+            let end = index + sensitive.len();
+            let starts_at_boundary = sensitive
+                .first()
+                .copied()
+                .is_some_and(is_authority_scalar_boundary)
+                || index == 0
+                || candidate
+                    .get(index - 1)
+                    .copied()
+                    .is_some_and(is_authority_scalar_boundary);
+            let ends_at_boundary = sensitive
+                .last()
+                .copied()
+                .is_some_and(is_authority_scalar_boundary)
+                || end == candidate.len()
+                || candidate
+                    .get(end)
+                    .copied()
+                    .is_some_and(is_authority_scalar_boundary);
+            starts_at_boundary && ends_at_boundary
+        })
+}
+
+fn is_authority_scalar_boundary(byte: u8) -> bool {
+    matches!(byte, b'.' | b':' | b'[' | b']')
 }
 
 fn path_contains_segment_sequence(candidate: &str, sensitive: &str) -> bool {

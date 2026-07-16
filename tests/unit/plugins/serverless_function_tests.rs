@@ -1293,6 +1293,10 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "valued-query-key-slash-boundaries",
         "query-value-trailing-slash",
         "query-value-slash-only",
+        "authority-query-value",
+        "authority-query-key",
+        "authority-query-idna",
+        "authority-query-port",
         "literal-plus-encoded-candidate",
         "encoded-plus-literal-candidate",
         "fragment-query-scalar",
@@ -1310,6 +1314,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-query-path-lookalike",
         "benign-query-path-parameter-lookalike",
         "benign-key-only-query-lookalike",
+        "benign-authority-label-lookalike",
+        "benign-authority-substring",
         "benign-plus-space-distinct",
         "benign-fragment-lookalike",
         "benign-fragment-label",
@@ -1353,6 +1359,20 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "query-value-slash-only" => {
                 format!("{}/signed%2Ftrigger?code=%2F", server.uri())
+            }
+            "authority-query-value"
+            | "benign-authority-label-lookalike"
+            | "benign-authority-substring" => {
+                format!("{}/signed%2Ftrigger?code=signedtoken", server.uri())
+            }
+            "authority-query-key" => {
+                format!("{}/signed%2Ftrigger?signedkey=1", server.uri())
+            }
+            "authority-query-idna" => {
+                format!("{}/signed%2Ftrigger?code=b%C3%BCcher", server.uri())
+            }
+            "authority-query-port" => {
+                format!("{}/signed%2Ftrigger?code=18443", server.uri())
             }
             _ => format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri()),
         };
@@ -1440,6 +1460,10 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
                 "https://redirect.example/next?leak=secret%2F".to_string()
             }
             "query-value-slash-only" => "https://redirect.example/next?leak=%2F".to_string(),
+            "authority-query-value" => "https://signedtoken.attacker.example/next".to_string(),
+            "authority-query-key" => "https://signedkey.attacker.example/next".to_string(),
+            "authority-query-idna" => "https://xn--bcher-kva.attacker.example/next".to_string(),
+            "authority-query-port" => "https://attacker.example:18443/next".to_string(),
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }
@@ -1474,6 +1498,12 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-key-only-query-lookalike" => {
                 "https://redirect.example/next?leak=SIGNED_TOKEN_EXTRA".to_string()
+            }
+            "benign-authority-label-lookalike" => {
+                "https://signedtoken-extra.attacker.example/next".to_string()
+            }
+            "benign-authority-substring" => {
+                "https://prefixsignedtoken.attacker.example/next".to_string()
             }
             "benign-plus-space-distinct" => {
                 "https://redirect.example/next?leak=token+part".to_string()
