@@ -614,7 +614,7 @@ async fn fixed_family_explicitly_supports_compatible_custom_paths() {
 async fn successful_rewrite_reserializes_complete_json_body() {
     let plugin = compressor(5, 0.4);
     let raw = format!(
-        "{{\n  \"model\": \"gpt-4o\",\n  \"metadata\": {{\"escaped\": \"\\u0061\"}},\n  \"messages\": [{{\"role\": \"user\", \"content\": {}}}]\n}}",
+        "{{\n  \"model\": \"gpt-4o\",\n  \"duplicate\": 1,\n  \"duplicate\": 2,\n  \"metadata\": {{\"escaped\": \"\\u0061\"}},\n  \"messages\": [{{\"role\": \"user\", \"content\": {}}}]\n}}",
         serde_json::to_string(&long_prompt_text()).unwrap()
     );
     let output = plugin
@@ -630,6 +630,11 @@ async fn successful_rewrite_reserializes_complete_json_body() {
     assert_ne!(output_text, raw);
     assert!(!output_text.contains("\n  "));
     assert!(output_text.contains(r#""escaped":"a""#));
+    assert_eq!(output_text.matches(r#""duplicate""#).count(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&output_text).unwrap()["duplicate"],
+        json!(2)
+    );
 }
 
 // ─── Passthrough / safety ────────────────────────────────────────────────────
