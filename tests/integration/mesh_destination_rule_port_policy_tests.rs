@@ -1721,6 +1721,58 @@ fn virtual_service_cors_policy_exact_star_projects_but_other_wildcards_defer() {
         serde_json::json!("forward")
     );
 
+    // The native cors plugin cannot combine `Access-Control-Allow-Origin: *`
+    // with credentials and would silently disable the credential flag. Keep
+    // both Istio spellings deferred until the concrete request origin can be
+    // reflected safely, rather than weakening the source policy in transit.
+    for cors_policy in [
+        serde_json::json!({
+            "allowOrigins": [{"exact": "*"}],
+            "allowCredentials": true
+        }),
+        serde_json::json!({
+            "allowOrigin": ["*"],
+            "allowCredentials": true
+        }),
+    ] {
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-credentialed-star",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": cors_policy
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("credentialed exact star leaves routing translated");
+        assert!(
+            translated
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+                .unwrap_or(true),
+            "credentialed exact star must not ride the mesh slice"
+        );
+        assert!(
+            !translated
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "cors"),
+            "credentialed exact star must not project a credential-stripping cors plugin"
+        );
+    }
+
     for wildcard in ["*.example.com", "**"] {
         let translated = translate_k8s_objects(
             &[k8s_object(
@@ -1923,6 +1975,8 @@ fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
         "https://app.example ",
         "https://app.example/",
         "https://app.example/path",
+        "https://app.example/foo/..",
+        "https://app.example/%2e%2e",
         "https://user:pw@app.example",
         "ftp://app.example",
         "not a url",

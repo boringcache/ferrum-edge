@@ -177,14 +177,21 @@ fn test_constructor_rejects_exact_origin_with_empty_authority() {
 }
 
 #[test]
-fn test_constructor_rejects_exact_origin_with_path() {
-    let err = CorsPlugin::new(&json!({
-        "allowed_origins": ["https://example.com/api"]
-    }))
-    .err()
-    .expect("origins with path must be rejected");
+fn test_constructor_rejects_exact_origin_with_raw_post_authority() {
+    for origin in [
+        "https://example.com/api",
+        "https://example.com/foo/..",
+        "https://example.com/%2e%2e",
+        "https://example.com\\foo\\..",
+    ] {
+        for allowed_origins in [json!([origin]), json!([{"exact": origin}])] {
+            let err = CorsPlugin::new(&json!({"allowed_origins": allowed_origins}))
+                .err()
+                .expect("origins with a raw post-authority component must be rejected");
 
-    assert!(err.contains("without path"), "got: {err}");
+            assert!(err.contains("without path"), "got: {err}");
+        }
+    }
 }
 
 #[test]

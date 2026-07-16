@@ -3726,13 +3726,16 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 /// (`allowOrigins[]` `exact`/`prefix`/`regex` `StringMatch` — `regex` must
 /// compile — or the legacy `allowOrigin` exact list), any `maxAge` parses as a
 /// duration, and every `allowMethods`/`allowHeaders`/`exposeHeaders` entry
-/// passes the plugin's own method/header-name admission. A malformed/unknown
+/// passes the plugin's own method/header-name admission. Credentialed exact `*`
+/// is deferred because the native wildcard representation cannot emit the
+/// concrete request origin required for credentialed CORS. A malformed/unknown
 /// origin matcher, an un-compilable `regex`, or an invalid method/header token
-/// makes the policy non-translatable so it is left unprojected (deferred)
-/// rather than silently approximated or failing `CorsPlugin` construction
-/// after translation.
+/// likewise makes the policy non-translatable so it is left unprojected
+/// (deferred) rather than silently approximated or failing `CorsPlugin`
+/// construction after translation.
 pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
-    let origins_ok = cors_allowed_origins(cors).is_some();
+    let allowed_origins = cors_allowed_origins(cors);
+    let origins_ok = allowed_origins.is_some();
     let max_age_ok = match cors.get("maxAge") {
         None | Some(Value::Null) => true,
         Some(Value::String(s)) => parse_istio_duration_secs(s).is_some(),
@@ -3742,9 +3745,18 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
         cors.get("allowCredentials"),
         None | Some(Value::Null) | Some(Value::Bool(_))
     );
+    let credentialed_wildcard_ok = !matches!(
+        cors.get("allowCredentials"),
+        Some(Value::Bool(true))
+    ) || !allowed_origins.as_ref().is_some_and(|origins| {
+        origins
+            .iter()
+            .any(|origin| origin.as_str().is_some_and(|origin| origin == "*"))
+    });
     origins_ok
         && max_age_ok
         && allow_credentials_ok
+        && credentialed_wildcard_ok
         && cors_unmatched_preflights(cors).is_ok()
         && cors_string_arrays_plugin_valid(cors)
 }
@@ -3954,7 +3966,8 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
             "VirtualService http[].corsPolicy is not faithfully translatable (allowOrigins[] \
              must be exact/prefix/regex StringMatch with a compilable regex, or the legacy \
              allowOrigin exact list, plus well-typed methods, headers, credentials, \
-             unmatched-preflight mode, and maxAge); leaving it unprojected. \
+             unmatched-preflight mode, and maxAge; credentialed exact '*' cannot be \
+             represented safely); leaving it unprojected. \
              Configure the `cors` plugin directly."
         );
         return None;
