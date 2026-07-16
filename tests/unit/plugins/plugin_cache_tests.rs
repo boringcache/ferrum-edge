@@ -683,8 +683,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
             &http_delta.removed_proxy_ids,
             http_delta.global_plugin_configs_changed,
         )
-        .err()
-        .expect("HTTP-overlapping interloper must reject delta reload");
+        .expect_err("HTTP-overlapping interloper must reject delta reload");
     assert!(
         err.contains("cors instances must remain contiguous in HTTP/gRPC chains"),
         "got: {err}"
