@@ -2850,7 +2850,7 @@ async fn persist_consumer_update(
     // out-of-band duplicates fail before the datastore uniqueness backstop.
     if !consumer.credential_entries("hmac_auth").is_empty()
         && let Err(response) =
-            ensure_hmac_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
+            ensure_hmac_consumer_candidate(db, &consumer.namespace, &consumer).await
     {
         return *response;
     }
@@ -4692,7 +4692,10 @@ async fn handle_batch_create(
         .await
         {
             Ok(()) => {}
-            Err(crud::AfterValidateError::BadRequest(errors)) => {
+            Err(
+                crud::AfterValidateError::BadRequest(errors)
+                | crud::AfterValidateError::Conflict(errors),
+            ) => {
                 validation_errors.extend(errors);
             }
             Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(

@@ -2009,7 +2009,10 @@ async fn validate_bundle(
         };
         match validation_result {
             Ok(()) => {}
-            Err(crate::admin::crud::AfterValidateError::BadRequest(errors)) => {
+            Err(
+                crate::admin::crud::AfterValidateError::BadRequest(errors)
+                | crate::admin::crud::AfterValidateError::Conflict(errors),
+            ) => {
                 failures.push(ValidationFailure {
                     resource_type: "plugin_graph",
                     id: bundle.proxy.id.clone(),
@@ -3114,7 +3117,10 @@ pub async fn handle_delete_api_spec(
     .await
     {
         Ok(()) => {}
-        Err(crate::admin::crud::AfterValidateError::BadRequest(errors)) => {
+        Err(
+            crate::admin::crud::AfterValidateError::BadRequest(errors)
+            | crate::admin::crud::AfterValidateError::Conflict(errors),
+        ) => {
             return Ok(error_response(ApiSpecError::ValidationFailures {
                 spec_version: existing.spec_version.clone(),
                 failures: vec![ValidationFailure {
