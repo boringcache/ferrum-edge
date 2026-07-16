@@ -5292,27 +5292,30 @@ async fn handle_restore(
                 "Restore: namespace admission was lost during import; reacquiring for rollback"
             );
             drop(_namespace_config_admission_guard);
-            let rollback_guard =
-                match crud::lock_namespace_config_admission(db.clone(), namespace).await {
-                    Ok(guard) => guard,
-                    Err(rollback_error) => {
-                        return Ok(json_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &json!({
-                                "error": format!(
-                                    "Config admission was lost during restore and could not be reacquired for rollback: {rollback_error}"
-                                ),
-                                "restore_errors": [error.to_string()],
-                            }),
-                        ));
-                    }
-                };
+            let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(rollback_error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was lost during restore and could not be reacquired for rollback: {rollback_error}"
+                            ),
+                            "restore_errors": [error.to_string()],
+                        }),
+                    ));
+                }
+            };
             let rollback = finish_failed_restore(
                 state,
                 db.clone(),
                 actor,
                 namespace,
-                vec![format!("namespace admission was lost during restore import: {error}")],
+                vec![format!(
+                    "namespace admission was lost during restore import: {error}"
+                )],
                 &snapshot,
             );
             return Ok(match rollback_guard.run_while_held(rollback).await {
@@ -5350,24 +5353,20 @@ async fn handle_restore(
             namespace,
             errors.join("; ")
         );
-        let rollback = finish_failed_restore(
-            state,
-            db.clone(),
-            actor,
-            namespace,
-            errors,
-            &snapshot,
+        let rollback =
+            finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot);
+        return Ok(
+            match _namespace_config_admission_guard
+                .run_while_held(rollback)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Config admission unavailable during restore rollback: {error}")}),
+                ),
+            },
         );
-        return Ok(match _namespace_config_admission_guard
-            .run_while_held(rollback)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("Config admission unavailable during restore rollback: {error}")}),
-            ),
-        });
     }
 
     let event = audit::AuditEvent::new(
