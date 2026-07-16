@@ -102,6 +102,22 @@ pub mod _test_support {
         ctx.set_grpc_deadline_budget(budget_ms);
     }
 
+    pub async fn await_request_plugin_deadline_for_test<F>(
+        deadline: Option<tokio::time::Instant>,
+        future: F,
+    ) -> crate::plugins::PluginResult
+    where
+        F: std::future::Future<Output = crate::plugins::PluginResult>,
+    {
+        match crate::plugins::await_request_plugin_deadline_with_provenance(deadline, future).await
+        {
+            crate::plugins::RequestPluginDeadlineResult::Completed(result) => result,
+            crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded => {
+                crate::plugins::grpc_deadline_exceeded_plugin_result()
+            }
+        }
+    }
+
     pub async fn finalize_plugin_rejection_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,

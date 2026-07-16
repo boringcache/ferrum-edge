@@ -2213,22 +2213,6 @@ where
     }
 }
 
-/// Await one request-phase plugin hook under the RPC's absolute deadline.
-/// Returning a normal plugin rejection keeps callers that do not need write
-/// provenance on their existing protocol-specific reject finalizer paths.
-pub async fn await_request_plugin_deadline<F>(
-    deadline: Option<tokio::time::Instant>,
-    future: F,
-) -> PluginResult
-where
-    F: std::future::Future<Output = PluginResult>,
-{
-    match await_request_plugin_deadline_with_provenance(deadline, future).await {
-        RequestPluginDeadlineResult::Completed(result) => result,
-        RequestPluginDeadlineResult::DeadlineExceeded => grpc_deadline_exceeded_plugin_result(),
-    }
-}
-
 pub(crate) async fn await_grpc_deadline<F, T>(
     deadline: Option<tokio::time::Instant>,
     future: F,

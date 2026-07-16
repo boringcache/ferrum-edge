@@ -2254,11 +2254,10 @@ where
                     tokio::pin!(send_future);
                     tokio::pin!(reader_future);
                     let grpc_web_deadline_active = grpc_web_deadline_at.is_some();
-                    let grpc_web_deadline = tokio::time::sleep_until(
-                        grpc_web_deadline_at.unwrap_or_else(|| {
+                    let grpc_web_deadline =
+                        tokio::time::sleep_until(grpc_web_deadline_at.unwrap_or_else(|| {
                             tokio::time::Instant::now() + Duration::from_secs(86_400)
-                        }),
-                    );
+                        }));
                     tokio::pin!(grpc_web_deadline);
                     let mut reader_done = false;
                     loop {

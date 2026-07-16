@@ -358,6 +358,39 @@ fn grpc_error_policy_preserves_gateway_terminal_and_transport_authority() {
 }
 
 #[test]
+fn grpc_web_reject_finalizer_preserves_synthesized_status_without_terminal_overrides() {
+    for (response_content_type, is_text) in [
+        ("application/grpc-web+proto", false),
+        ("application/grpc-web-text+proto", true),
+    ] {
+        let mut response = ferrum_edge::plugins::grpc_web::error_response_for_content_type(
+            response_content_type,
+            14,
+            "backend unavailable",
+        );
+        let finalized_headers = HashMap::from([(
+            "access-control-allow-origin".to_string(),
+            "https://app.example".to_string(),
+        )]);
+
+        ferrum_edge::_test_support::finalize_grpc_web_error_response_headers(
+            &mut response,
+            &[],
+            Some(&finalized_headers),
+        );
+
+        let wire_body = if is_text {
+            BASE64.decode(&response.body).expect("decode text response")
+        } else {
+            response.body
+        };
+        let trailer = String::from_utf8_lossy(&wire_body[5..]);
+        assert!(trailer.contains("grpc-status: 14\r\n"));
+        assert!(trailer.contains("grpc-message: backend unavailable\r\n"));
+    }
+}
+
+#[test]
 fn grpc_web_reject_finalizer_moves_rich_status_details_into_body_trailer() {
     for (response_content_type, is_text) in [
         ("application/grpc-web+proto", false),

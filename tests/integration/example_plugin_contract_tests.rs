@@ -36,7 +36,9 @@ fn h1_h2_route_miss_and_method_rejection_precede_request_hooks() {
             "// gRPC spec mandates POST method.",
             "StatusCode::BAD_REQUEST",
             "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);",
-            "match plugin.on_request_received(&mut ctx).await",
+            "// Execute on_request_received hooks",
+            "await_request_plugin_deadline_with_provenance(",
+            "plugin.on_request_received(&mut ctx),",
         ],
     );
 }
@@ -52,8 +54,9 @@ fn h3_route_miss_and_method_rejection_precede_request_hooks() {
             "StatusCode::METHOD_NOT_ALLOWED",
             "// gRPC spec mandates POST.",
             "StatusCode::BAD_REQUEST",
-            "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);",
-            "match plugin.on_request_received(&mut ctx).await",
+            "// Execute on_request_received hooks",
+            "await_request_plugin_deadline_with_provenance(",
+            "plugin.on_request_received(&mut ctx),",
         ],
     );
 }
@@ -77,17 +80,19 @@ fn h1_h2_buffered_terminal_logging_precedes_response_construction() {
 }
 
 #[test]
-fn h3_buffered_terminal_logging_precedes_response_construction_and_send() {
+fn h3_buffered_response_is_sent_before_terminal_logging() {
     assert_markers_in_order(
         H3_SOURCE,
         "H3 buffered terminal path",
         &[
             "// ===== BUFFERED RESPONSE PATH =====",
-            "let summary = TransactionSummary {",
-            "crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;",
+            "run_deadline_bounded_response_committed_hooks(",
             "// Build and send buffered response",
             "apply_response_headers(Response::builder().status(status), &response_headers);",
-            "stream.send_response(resp).await?;",
+            "let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));",
+            "// Transaction logging follows downstream response completion",
+            "let summary = TransactionSummary {",
+            "crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;",
         ],
     );
 }

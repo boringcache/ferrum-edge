@@ -1233,7 +1233,7 @@ async fn test_preflight_deadline_cancels_request_plugin_work_with_status_four() 
     );
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-    let result = ferrum_edge::plugins::await_request_plugin_deadline(
+    let result = ferrum_edge::_test_support::await_request_plugin_deadline_for_test(
         ctx.grpc_deadline_at(),
         std::future::pending(),
     )

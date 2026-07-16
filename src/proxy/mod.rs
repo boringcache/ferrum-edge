@@ -13484,9 +13484,8 @@ struct OwnedRejectionHookResult {
     result: PluginResult,
 }
 
-type OwnedRejectionHookFuture = std::pin::Pin<
-    Box<dyn std::future::Future<Output = OwnedRejectionHookResult> + Send + 'static>,
->;
+type OwnedRejectionHookFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = OwnedRejectionHookResult> + Send + 'static>>;
 
 fn owned_rejection_hook_future(
     plugin: Arc<dyn Plugin>,
@@ -13530,9 +13529,7 @@ fn adopt_owned_rejection_hook_result(
 ) -> PluginResult {
     *ctx = outcome.ctx;
     *status_code = outcome.status_code;
-    if let (Some(body), Some(owned_body)) =
-        (response_body.as_deref_mut(), outcome.response_body)
-    {
+    if let (Some(body), Some(owned_body)) = (response_body.as_deref_mut(), outcome.response_body) {
         *body = owned_body;
     }
     *response_headers = outcome.response_headers;
@@ -14912,9 +14909,8 @@ pub(crate) fn strip_content_length_for_streaming_grpc_deadline(
     }
 }
 
-pub(crate) type OwnedResponseCommittedHookFuture = std::pin::Pin<
-    Box<dyn std::future::Future<Output = RequestContext> + Send + 'static>,
->;
+pub(crate) type OwnedResponseCommittedHookFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = RequestContext> + Send + 'static>>;
 
 fn owned_response_committed_hook_future(
     plugin: Arc<dyn Plugin>,

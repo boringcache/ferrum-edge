@@ -908,7 +908,8 @@ impl Plugin for PendingDeadlineRejectCleanup {
         _response_status: u16,
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        self.started.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.release.notified().await;
         self.completed
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -994,7 +995,8 @@ impl Plugin for PendingDeadlineCommittedObserver {
         _response_headers: &HashMap<String, String>,
         _body: &[u8],
     ) {
-        self.started.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.release.notified().await;
         self.completed
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1894,7 +1896,7 @@ fn generic_retry_backoff_uses_request_aware_grpc_deadline_response() {
         "the generic retry backoff must not regress to native-only gRPC framing"
     );
     assert!(backoff.contains("&ctx,"));
-    assert!(backoff.contains("proxy_headers,"));
+    assert!(backoff.contains("owned_proxy_headers_ref.unwrap_or(&ctx.headers),"));
 }
 
 #[test]
