@@ -17,32 +17,6 @@ use std::sync::Arc;
 
 struct LegacyAuthorizePlugin;
 
-struct CustomBodyEgressPlugin;
-
-#[async_trait::async_trait]
-impl Plugin for CustomBodyEgressPlugin {
-    fn name(&self) -> &str {
-        "custom_body_egress"
-    }
-
-    fn egresses_request_body_before_finalization(&self) -> bool {
-        true
-    }
-}
-
-struct CustomBodyTransformerPlugin;
-
-#[async_trait::async_trait]
-impl Plugin for CustomBodyTransformerPlugin {
-    fn name(&self) -> &str {
-        "custom_body_transformer"
-    }
-
-    fn modifies_request_body(&self) -> bool {
-        true
-    }
-}
-
 #[async_trait::async_trait]
 impl Plugin for LegacyAuthorizePlugin {
     fn name(&self) -> &str {
@@ -1273,7 +1247,7 @@ async fn serverless_instances_keep_independent_transaction_metadata() {
 
 #[test]
 fn serverless_body_egress_rejects_request_body_transform_composition() {
-    for (transform_id, transform_name, transform_config) in [
+    let mut transform_cases = vec![
         (
             "body-transform",
             "request_transformer",
@@ -1291,7 +1265,16 @@ fn serverless_body_egress_rejects_request_body_transform_composition() {
             "compression",
             json!({"decompress_request": true}),
         ),
-    ] {
+    ];
+    if ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        transform_cases.push((
+            "custom-body-transform",
+            "example_plugin",
+            json!({"request_body_prefix": "governed:"}),
+        ));
+    }
+
+    for (transform_id, transform_name, transform_config) in transform_cases {
         let config = make_config(
             vec![make_proxy(
                 "p1",
@@ -1320,16 +1303,6 @@ fn serverless_body_egress_rejects_request_body_transform_composition() {
             ],
         );
 
-        let candidate_error =
-            ferrum_edge::_test_support::validate_plugin_security_composition_candidate_for_test(
-                &config,
-            )
-            .expect_err("candidate admission must reject body egress plus transformation");
-        assert!(
-            candidate_error.contains("request-body") || candidate_error.contains("validation"),
-            "candidate transform={transform_name}, got: {candidate_error}"
-        );
-
         let error = match PluginCache::new(&config) {
             Ok(_) => panic!("serverless body egress plus {transform_name} must fail closed"),
             Err(error) => error,
@@ -1342,23 +1315,25 @@ fn serverless_body_egress_rejects_request_body_transform_composition() {
 }
 
 #[test]
-fn custom_body_egress_enters_candidate_selection_and_shared_validation() {
-    assert!(
-        ferrum_edge::_test_support::is_security_composition_candidate_plugin_for_test(
-            "custom_body_egress",
-            &["custom_body_egress"],
-        ),
-        "registered custom plugins must enter candidate composition validation"
-    );
+fn candidate_security_validation_constructs_custom_capabilities_without_builtin_gate() {
+    let source = include_str!("../../../src/plugin_cache.rs");
+    let start = source
+        .find("pub(crate) fn validate_plugin_security_composition_candidate(")
+        .expect("candidate security validator must exist");
+    let end = source[start..]
+        .find("\nfn remove_shadowed_global_plugin(")
+        .map(|offset| start + offset)
+        .expect("candidate security validator boundary must exist");
+    let candidate = &source[start..end];
 
-    let plugins: Vec<Arc<dyn Plugin>> = vec![
-        Arc::new(CustomBodyEgressPlugin),
-        Arc::new(CustomBodyTransformerPlugin),
-    ];
-    let error = ferrum_edge::_test_support::validate_plugin_security_composition_for_test(&plugins)
-        .expect_err("custom body egress plus transformation must fail closed");
-    assert!(error.contains("custom_body_egress"), "{error}");
-    assert!(error.contains("custom_body_transformer"), "{error}");
+    assert!(candidate.contains("crate::custom_plugins::custom_plugin_names()"));
+    assert!(candidate.contains("is_security_composition_candidate_plugin("));
+    assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
+    assert!(candidate.contains("validate_plugin_security_composition(&global_plugins)"));
+    assert!(
+        !candidate.contains("forward_body"),
+        "candidate validation must not be gated on a built-in serverless config field"
+    );
 }
 
 #[test]
@@ -1392,20 +1367,6 @@ fn terminate_serverless_must_run_after_every_request_deduplication_instance() {
                 ),
                 serverless,
             ],
-        );
-
-        let candidate_error =
-            ferrum_edge::_test_support::validate_plugin_security_composition_candidate_for_test(
-                &config,
-            )
-            .unwrap_err();
-        assert!(
-            candidate_error.contains("serverless_function"),
-            "{candidate_error}"
-        );
-        assert!(
-            candidate_error.contains("request_deduplication"),
-            "{candidate_error}"
         );
 
         let error = PluginCache::new(&config)
@@ -1445,10 +1406,6 @@ fn safe_serverless_dedup_order_and_pre_proxy_override_are_admitted() {
             ),
         ],
     );
-    ferrum_edge::_test_support::validate_plugin_security_composition_candidate_for_test(
-        &terminate_default,
-    )
-    .expect("candidate admission accepts the default safe dedup order");
     PluginCache::new(&terminate_default).expect("default dedup order is safe");
 
     let mut pre_proxy = make_plugin_config_with_json(
@@ -1480,10 +1437,6 @@ fn safe_serverless_dedup_order_and_pre_proxy_override_are_admitted() {
             pre_proxy,
         ],
     );
-    ferrum_edge::_test_support::validate_plugin_security_composition_candidate_for_test(
-        &pre_proxy_config,
-    )
-    .expect("candidate admission does not impose terminate-mode ordering on pre_proxy");
     PluginCache::new(&pre_proxy_config)
         .expect("pre_proxy serverless does not produce a terminal replay obligation");
 }

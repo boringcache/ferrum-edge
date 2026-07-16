@@ -137,9 +137,7 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
 
 /// Reject security-sensitive plugin compositions whose ordering or body view
 /// cannot preserve the configured enforcement contract.
-pub(crate) fn validate_plugin_security_composition(
-    plugins: &[Arc<dyn Plugin>],
-) -> Result<(), String> {
+fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
     for protocol in ALL_PROXY_PROTOCOLS {
         let has_hmac = plugins
             .iter()
@@ -1863,7 +1861,7 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "ai_request_guard",
 ];
 
-pub(crate) fn is_security_composition_candidate_plugin(
+fn is_security_composition_candidate_plugin(
     plugin_name: &str,
     custom_plugin_names: &[&str],
 ) -> bool {
