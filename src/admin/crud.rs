@@ -63,6 +63,12 @@ enum LateResourceWrite<'a> {
     Delete { id: &'a str },
 }
 
+pub(crate) struct ApiSpecDeleteSnapshot {
+    spec: crate::config::types::ApiSpec,
+    upstreams: Vec<Upstream>,
+    plugins: Vec<PluginConfig>,
+}
+
 pub(crate) enum AfterValidateError {
     BadRequest(Vec<String>),
     Conflict(Vec<String>),
@@ -479,6 +485,7 @@ async fn recover_late_resource_write<R: AdminResource>(
     written: Option<&R>,
     previous: Option<&R>,
     previous_snapshot: Option<&GatewayConfig>,
+    previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
 ) -> Result<bool, anyhow::Error> {
     let recovery_guard = lock_namespace_config_admission(db.clone(), namespace).await?;
     if recovery_guard.immediately_succeeds_generation(lost_generation) {
@@ -529,8 +536,14 @@ async fn recover_late_resource_write<R: AdminResource>(
                     .await?
                     .is_none()
                 {
-                    R::compensate_late_delete(db.as_ref(), namespace, previous, previous_snapshot)
-                        .await?;
+                    R::compensate_late_delete(
+                        db.as_ref(),
+                        namespace,
+                        previous,
+                        previous_snapshot,
+                        previous_api_spec,
+                    )
+                    .await?;
                 }
             }
         }
@@ -1157,8 +1170,17 @@ pub(crate) trait AdminResource:
         _namespace: &str,
         previous: &Self,
         _previous_snapshot: Option<&GatewayConfig>,
+        _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
     ) -> DbResult<()> {
         Self::db_create(db, previous).await
+    }
+
+    async fn late_delete_api_spec_snapshot(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        _previous: &Self,
+    ) -> DbResult<Option<ApiSpecDeleteSnapshot>> {
+        Ok(None)
     }
 
     async fn late_create_compensation_safe(
@@ -1365,7 +1387,6 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     } else {
         None
     };
-
     let existing = match R::db_get_for_write(db, namespace, id).await {
         Ok(None) => {
             return Ok(not_found_response::<R>());
@@ -1383,6 +1404,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     } else {
         None
     };
+    let previous_api_spec =
+        match R::late_delete_api_spec_snapshot(db, namespace, &existing).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Ok(R::map_precheck_db_error(&error)),
+        };
 
     let validation_ctx = ValidationCtx::from_state(state);
     if let Err(error) = R::before_delete(db, state, namespace, &existing, &validation_ctx).await {
@@ -1411,6 +1437,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                     None,
                     Some(&existing),
                     previous_snapshot.as_ref(),
+                    previous_api_spec.as_ref(),
                 )
                 .await
                 {
@@ -2717,6 +2744,7 @@ impl AdminResource for PluginConfig {
         namespace: &str,
         previous: &Self,
         previous_snapshot: Option<&GatewayConfig>,
+        _previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
     ) -> DbResult<()> {
         let snapshot = previous_snapshot.ok_or_else(|| {
             anyhow::anyhow!("late plugin delete recovery is missing the namespace snapshot")
@@ -3184,6 +3212,7 @@ impl AdminResource for Proxy {
         namespace: &str,
         previous: &Self,
         previous_snapshot: Option<&GatewayConfig>,
+        previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
     ) -> DbResult<()> {
         let snapshot = previous_snapshot.ok_or_else(|| {
             anyhow::anyhow!("late proxy delete recovery is missing the namespace snapshot")
@@ -3200,7 +3229,7 @@ impl AdminResource for Proxy {
             .flat_map(|proxy| proxy.plugins.iter())
             .map(|association| association.plugin_config_id.as_str())
             .collect();
-        let affected_plugins = snapshot
+        let mut affected_plugins = snapshot
             .plugin_configs
             .iter()
             .filter(|plugin| {
@@ -3211,10 +3240,81 @@ impl AdminResource for Proxy {
             })
             .cloned()
             .collect::<Vec<_>>();
+        if let Some(api_spec_snapshot) = previous_api_spec {
+            for plugin in &api_spec_snapshot.plugins {
+                if !affected_plugins
+                    .iter()
+                    .any(|affected| affected.id == plugin.id)
+                {
+                    affected_plugins.push(plugin.clone());
+                }
+            }
+        }
 
-        let mut proxy_without_associations = previous.clone();
-        proxy_without_associations.plugins.clear();
-        db.create_proxy(&proxy_without_associations).await?;
+        let mut affected_upstreams = snapshot
+            .upstreams
+            .iter()
+            .filter(|upstream| previous.upstream_id.as_deref() == Some(upstream.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(api_spec_snapshot) = previous_api_spec {
+            for upstream in &api_spec_snapshot.upstreams {
+                if !affected_upstreams
+                    .iter()
+                    .any(|affected| affected.id == upstream.id)
+                {
+                    affected_upstreams.push(upstream.clone());
+                }
+            }
+        }
+
+        if let Some(api_spec_snapshot) = previous_api_spec {
+            let spec = &api_spec_snapshot.spec;
+            let spec_plugins = api_spec_snapshot.plugins.clone();
+            let spec_plugin_ids = spec_plugins
+                .iter()
+                .map(|plugin| plugin.id.as_str())
+                .collect::<HashSet<_>>();
+            let bundle_upstream = affected_upstreams
+                .iter()
+                .find(|upstream| {
+                    upstream.api_spec_id.as_deref() == Some(spec.id.as_str())
+                        && previous.upstream_id.as_deref() == Some(upstream.id.as_str())
+                })
+                .or_else(|| {
+                    affected_upstreams.iter().find(|upstream| {
+                        upstream.api_spec_id.as_deref() == Some(spec.id.as_str())
+                    })
+                })
+                .cloned();
+            for upstream in &affected_upstreams {
+                if bundle_upstream.as_ref().map(|item| item.id.as_str())
+                    != Some(upstream.id.as_str())
+                    && db.get_upstream(namespace, &upstream.id).await?.is_none()
+                {
+                    db.create_upstream(upstream).await?;
+                }
+            }
+            let mut base_proxy = previous.clone();
+            base_proxy.plugins.retain(|association| {
+                spec_plugin_ids.contains(association.plugin_config_id.as_str())
+            });
+            let bundle = crate::admin::api_specs::ExtractedBundle {
+                proxy: base_proxy,
+                upstream: bundle_upstream,
+                plugins: spec_plugins,
+            };
+            db.submit_api_spec_bundle(&bundle, spec).await?;
+        } else {
+            for upstream in &affected_upstreams {
+                if db.get_upstream(namespace, &upstream.id).await?.is_none() {
+                    db.create_upstream(upstream).await?;
+                }
+            }
+            let mut proxy_without_associations = previous.clone();
+            proxy_without_associations.plugins.clear();
+            db.create_proxy(&proxy_without_associations).await?;
+        }
         for plugin in affected_plugins {
             if db.get_plugin_config(namespace, &plugin.id).await?.is_none() {
                 db.create_plugin_config(&plugin).await?;
@@ -3224,6 +3324,25 @@ impl AdminResource for Proxy {
             anyhow::bail!("late proxy delete compensation could not restore associations");
         }
         Ok(())
+    }
+
+    async fn late_delete_api_spec_snapshot(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        previous: &Self,
+    ) -> DbResult<Option<ApiSpecDeleteSnapshot>> {
+        let Some(spec) = db.get_api_spec_by_proxy(namespace, &previous.id).await? else {
+            return Ok(None);
+        };
+        let upstreams = db.list_spec_owned_upstreams(namespace, &spec.id).await?;
+        let plugins = db
+            .list_spec_owned_plugin_configs(namespace, &spec.id)
+            .await?;
+        Ok(Some(ApiSpecDeleteSnapshot {
+            spec,
+            upstreams,
+            plugins,
+        }))
     }
 
     async fn check_uniqueness(
@@ -3919,6 +4038,7 @@ async fn handle_write<R: AdminResource>(
                             Some(&resource),
                             None,
                             None,
+                            None,
                         )
                         .await
                         {
@@ -3970,6 +4090,7 @@ async fn handle_write<R: AdminResource>(
                         LateResourceWrite::Update { id },
                         Some(&resource),
                         existing.as_ref(),
+                        None,
                         None,
                     )
                     .await

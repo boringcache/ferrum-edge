@@ -61,6 +61,10 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("immediately_succeeds_generation"));
     assert!(crud_source.contains("late_create_compensation_safe("));
     assert!(crud_source.contains("late plugin delete compensation could not restore proxy"));
+    assert!(crud_source.contains("late_delete_api_spec_snapshot("));
+    assert!(crud_source.contains("db.get_api_spec_by_proxy(namespace, &previous.id)"));
+    assert!(crud_source.contains("db.submit_api_spec_bundle(&bundle, spec)"));
+    assert!(crud_source.contains("affected_upstreams"));
     assert!(crud_source.contains("task.abort();"));
     assert!(crud_source.contains("tokio::time::timeout("));
     assert!(crud_source.contains("drop(local);"));
@@ -111,10 +115,18 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     );
     assert!(batch_source.contains("rollback_failed_batch_create("));
     assert!(batch_source.contains("immediately_succeeds_generation(lost_generation)"));
+    assert_eq!(
+        batch_source
+            .matches("acquire_credential_namespace_admission(db.clone(), namespace)")
+            .count(),
+        4,
+        "every credential read/modify/write endpoint must take namespace admission"
+    );
     let sql_store_source = include_str!("../../../src/config/db_loader.rs");
     assert!(sql_store_source.contains("config_admission_locks"));
     assert!(sql_store_source.contains("config_admission_lease_now_sql"));
     assert!(sql_store_source.contains("SELECT generation FROM config_admission_locks"));
+    assert!(sql_store_source.contains("additionally failed to release the claimed lease"));
     assert!(sql_store_source.contains("batch_create_plugin_configs_chunk(&graph_configs, mode)"));
     assert!(sql_store_source.contains("partition(crate::plugins::transaction_log_schema::"));
     assert!(sql_store_source.contains("unrelated_configs.chunks(Self::BATCH_CHUNK_SIZE)"));

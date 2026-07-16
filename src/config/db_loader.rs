@@ -7818,15 +7818,33 @@ impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
             "SELECT generation FROM config_admission_locks \
              WHERE namespace = ? AND owner = ? AND expires_at > {now}"
         ));
-        let generation = sqlx::query_scalar::<_, i64>(&generation_sql)
+        let generation_result = sqlx::query_scalar::<_, i64>(&generation_sql)
             .bind(namespace)
             .bind(owner)
             .fetch_optional(&self.pool())
-            .await?
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| anyhow::anyhow!("namespace config admission generation is negative"))?;
-        Ok(generation)
+            .await;
+        let generation_result = match generation_result {
+            Ok(generation) => generation
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("namespace config admission generation is negative")),
+            Err(error) => Err(error.into()),
+        };
+        match generation_result {
+            Ok(generation) => Ok(generation),
+            Err(error) => {
+                if let Err(release_error) = self
+                    .release_namespace_config_admission_lease(namespace, owner)
+                    .await
+                {
+                    return Err(anyhow::anyhow!(
+                        "namespace config admission generation lookup failed: {error}; \
+                         additionally failed to release the claimed lease: {release_error}"
+                    ));
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn renew_namespace_config_admission_lease(

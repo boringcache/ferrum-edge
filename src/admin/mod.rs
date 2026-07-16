@@ -2744,6 +2744,22 @@ async fn load_consumer_in_namespace(
     }
 }
 
+async fn acquire_credential_namespace_admission(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+) -> Result<crud::NamespaceConfigAdmissionGuard, Response<Full<Bytes>>> {
+    crud::lock_namespace_config_admission(db, namespace)
+        .await
+        .map_err(|error| {
+            warn!(
+                namespace = %namespace,
+                %error,
+                "Credential namespace config admission could not be acquired"
+            );
+            mtls_dns_admission_unavailable_response()
+        })
+}
+
 pub(crate) fn basic_auth_credential_error_status(
     error: &crate::config::types::BasicAuthCredentialPreparationError,
 ) -> StatusCode {
@@ -2843,6 +2859,7 @@ async fn persist_consumer_update(
     success_status: StatusCode,
     mode: &BatchConfigWriteMode,
     admission: &MtlsDnsAdmissionOperation,
+    namespace_admission: &crud::NamespaceConfigAdmissionGuard,
 ) -> Response<Full<Bytes>> {
     // Every credential endpoint rewrites the complete Consumer and rebuilds
     // its credential index entries. Revalidate retained HMAC credentials even
@@ -2855,6 +2872,14 @@ async fn persist_consumer_update(
         return *response;
     }
     consumer.updated_at = Utc::now();
+    if let Err(error) = namespace_admission.ensure_held() {
+        warn!(
+            namespace = %consumer.namespace,
+            %error,
+            "Credential namespace config admission was lost before persistence"
+        );
+        return mtls_dns_admission_unavailable_response();
+    }
     match admission
         .run_mutation(db.update_consumer(&consumer, mode))
         .await
@@ -3824,7 +3849,20 @@ async fn handle_update_credentials(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut cred_value) {
         return Ok(*resp);
     }
+    let namespace_admission =
+        match acquire_credential_namespace_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(response) => return Ok(response),
+        };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        if let Err(error) = namespace_admission.ensure_held() {
+            warn!(
+                namespace = %namespace,
+                %error,
+                "Credential namespace config admission was lost before the update read"
+            );
+            return mtls_dns_admission_unavailable_response();
+        }
         let mode = BatchConfigWriteMode::GuardedAdmission {
             guard_owner: admission.guard_owner().to_string(),
         };
@@ -3866,6 +3904,7 @@ async fn handle_update_credentials(
             StatusCode::OK,
             &mode,
             &admission,
+            &namespace_admission,
         )
         .await;
         if response.status().is_success() {
@@ -3914,7 +3953,20 @@ async fn handle_delete_credentials(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
+    let namespace_admission =
+        match acquire_credential_namespace_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(response) => return Ok(response),
+        };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        if let Err(error) = namespace_admission.ensure_held() {
+            warn!(
+                namespace = %namespace,
+                %error,
+                "Credential namespace config admission was lost before the delete read"
+            );
+            return mtls_dns_admission_unavailable_response();
+        }
         let mode = BatchConfigWriteMode::GuardedAdmission {
             guard_owner: admission.guard_owner().to_string(),
         };
@@ -3931,6 +3983,7 @@ async fn handle_delete_credentials(
             StatusCode::NO_CONTENT,
             &mode,
             &admission,
+            &namespace_admission,
         )
         .await;
         if response.status().is_success() {
@@ -3994,7 +4047,20 @@ async fn handle_append_credential(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut new_cred) {
         return Ok(*resp);
     }
+    let namespace_admission =
+        match acquire_credential_namespace_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(response) => return Ok(response),
+        };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        if let Err(error) = namespace_admission.ensure_held() {
+            warn!(
+                namespace = %namespace,
+                %error,
+                "Credential namespace config admission was lost before the append read"
+            );
+            return mtls_dns_admission_unavailable_response();
+        }
         let mode = BatchConfigWriteMode::GuardedAdmission {
             guard_owner: admission.guard_owner().to_string(),
         };
@@ -4057,6 +4123,7 @@ async fn handle_append_credential(
             StatusCode::OK,
             &mode,
             &admission,
+            &namespace_admission,
         )
         .await;
         if response.status().is_success() {
@@ -4118,7 +4185,20 @@ async fn handle_delete_credential_by_index(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
+    let namespace_admission =
+        match acquire_credential_namespace_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(response) => return Ok(response),
+        };
     let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        if let Err(error) = namespace_admission.ensure_held() {
+            warn!(
+                namespace = %namespace,
+                %error,
+                "Credential namespace config admission was lost before the indexed delete read"
+            );
+            return mtls_dns_admission_unavailable_response();
+        }
         let mode = BatchConfigWriteMode::GuardedAdmission {
             guard_owner: admission.guard_owner().to_string(),
         };
@@ -4168,6 +4248,7 @@ async fn handle_delete_credential_by_index(
             StatusCode::OK,
             &mode,
             &admission,
+            &namespace_admission,
         )
         .await;
         if response.status().is_success() {
