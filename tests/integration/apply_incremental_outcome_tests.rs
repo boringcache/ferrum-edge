@@ -609,6 +609,64 @@ async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("directory-policy", true);
+    plugin.plugin_name = "ldap_auth".to_string();
+    plugin.config = serde_json::json!({
+        "ldap_url": "ldaps://directory.example.test:636",
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test"
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "ldap_auth")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "ldap_url": "ldap://directory.example.test:389",
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test"
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let outcome = state.update_config(invalid);
+    let ConfigApplyOutcome::Rejected { errors } = outcome else {
+        panic!("remote plaintext LDAP reload must be rejected");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.contains("ldap_auth") && error.contains("STARTTLS or LDAPS") })
+    );
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["ldap_url"],
+        "ldaps://directory.example.test:636"
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "ldap_auth"),
+        "rejected LDAP reload must retain the last-known-good dial policy"
+    );
+}
+
 /// Empty incremental result returns `Unchanged` so the polling loop can still
 /// advance `last_poll_at` (no work to retry).
 #[tokio::test(flavor = "multi_thread")]
