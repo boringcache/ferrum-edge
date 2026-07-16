@@ -99,15 +99,15 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         batch_source
             .matches("crud::lock_namespace_config_admission(")
             .count()
-            >= 6,
-        "credential, batch, and restore mutations must share namespace admission"
+            >= 5,
+        "batch and restore mutations and their recovery paths must share namespace admission"
     );
     assert!(
         batch_source
             .matches(".run_to_completion_while_held(")
             .count()
             >= 5,
-        "credential, batch, and restore persistence must preserve concrete outcomes across lease loss"
+        "batch and restore persistence must preserve concrete outcomes across lease loss"
     );
     assert!(batch_source.contains("rollback_failed_batch_create("));
     assert!(batch_source.contains("immediately_succeeds_generation(lost_generation)"));
@@ -115,7 +115,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(sql_store_source.contains("config_admission_locks"));
     assert!(sql_store_source.contains("config_admission_lease_now_sql"));
     assert!(sql_store_source.contains("SELECT generation FROM config_admission_locks"));
-    assert!(sql_store_source.contains("batch_create_plugin_configs_chunk(&graph_configs)"));
+    assert!(sql_store_source.contains("batch_create_plugin_configs_chunk(&graph_configs, mode)"));
     assert!(sql_store_source.contains("partition(crate::plugins::transaction_log_schema::"));
     assert!(sql_store_source.contains("unrelated_configs.chunks(Self::BATCH_CHUNK_SIZE)"));
     assert!(sql_store_source.contains(".bind(proxy.updated_at.to_rfc3339())"));

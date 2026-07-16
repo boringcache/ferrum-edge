@@ -38,7 +38,8 @@ set -euo pipefail
 #   sidecar.virtual_service.cors_policy         VS-derived CORS on the client
 #                                               sidecar: allowed Origin
 #                                               reflected, preflight answered
-#                                               204, disallowed Origin 403
+#                                               200, unmatched actual/preflight
+#                                               forwarded without gateway ACAO
 #   sidecar.config.native_subscribe_delivered   a Ferrum CP (cp mode, sqlite,
 #                                               K8s pod discovery) serves the
 #                                               mesh model over native
@@ -739,6 +740,7 @@ mesh:
         allowed_methods: ["GET", "POST", "OPTIONS"]
         allowed_headers: ["content-type", "authorization"]
         max_age_seconds: 600
+        unmatched_preflights: forward
   destination_rules:
     - name: slowsvc-connect-timeout
       namespace: $NS
@@ -956,19 +958,20 @@ probe_request_auth() {
 
 # VirtualService-derived CORS on the client sidecar (issue #1973): the policy
 # rides the mesh slice and the sidecar synthesizes a `cors` plugin onto its
-# materialized svc outbound route. Three observations, one assertion:
+# materialized svc outbound route. Four observations, one assertion:
 #   a) GET with the ALLOWED Origin -> 200 + the app marker + the origin
 #      reflected in `access-control-allow-origin` (retried until the route
 #      settles);
 #   b) OPTIONS preflight (allowed Origin + Access-Control-Request-Method) ->
-#      204 answered BY THE SIDECAR with `access-control-allow-methods`
+#      200 answered BY THE SIDECAR with `access-control-allow-methods`
 #      containing GET — the preflight never reaches the destination;
-#   c) GET with a DISALLOWED Origin -> 403 "CORS origin not allowed" (the
-#      cors plugin's own body — distinct from mesh_authz's, proving the
-#      client-side plugin rejected it) and never the app marker.
+#   c) GET with an UNMATCHED Origin -> backend 200 + app marker, without a
+#      gateway-added access-control-allow-origin field; and
+#   d) unmatched OPTIONS preflight -> backend 200 + app marker, also without
+#      gateway-added CORS authorization (omitted/FORWARD semantics).
 probe_vs_cors() {
   log "probing VirtualService-derived CORS on the svc outbound route"
-  local out a_status a_acao b_status b_methods c_status c_body rest
+  local out a_status a_acao b_status b_methods c_status c_acao c_body d_status d_acao d_body rest
   # shellcheck disable=SC2016
   out="$(kubectl --context "$CONTEXT" -n "$NS" exec deploy/client -c curl -- \
     sh -c '
@@ -999,14 +1002,27 @@ probe_vs_cors() {
       b_methods=no
       grep -qi "^access-control-allow-methods:.*GET" /tmp/h2 && b_methods=yes
       : >/tmp/b3 2>/dev/null || true
-      c_status="$(curl -s -m 10 -o /tmp/b3 -w "%{http_code}" \
+      : >/tmp/h3 2>/dev/null || true
+      c_status="$(curl -s -m 10 -o /tmp/b3 -D /tmp/h3 -w "%{http_code}" \
         -H "Host: $host" -H "Origin: $evil" http://127.0.0.1:15001/ 2>/dev/null || true)"
       [ -n "$c_status" ] || c_status=000
+      c_acao=no
+      grep -qi "^access-control-allow-origin:" /tmp/h3 && c_acao=yes
       c_body="$(tr -d "\r\n" </tmp/b3 2>/dev/null || true)"
-      printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$a_status" "$a_acao" "$b_status" "$b_methods" "$c_status" "$c_body"
+      : >/tmp/b4 2>/dev/null || true
+      : >/tmp/h4 2>/dev/null || true
+      d_status="$(curl -s -m 10 -o /tmp/b4 -D /tmp/h4 -w "%{http_code}" \
+        -X OPTIONS -H "Host: $host" -H "Origin: $evil" \
+        -H "Access-Control-Request-Method: GET" http://127.0.0.1:15001/ 2>/dev/null || true)"
+      [ -n "$d_status" ] || d_status=000
+      d_acao=no
+      grep -qi "^access-control-allow-origin:" /tmp/h4 && d_acao=yes
+      d_body="$(tr -d "\r\n" </tmp/b4 2>/dev/null || true)"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$a_status" "$a_acao" "$b_status" "$b_methods" "$c_status" "$c_acao" \
+        "$c_body" "$d_status" "$d_acao" "$d_body"
     ' sh "$SVC_HOST" "https://fixture.example" "https://evil.example" "$APP_BODY" \
-    2>/dev/null || printf 'EXECFAIL\tno\t000\tno\t000\t')"
+    2>/dev/null || printf 'EXECFAIL\tno\t000\tno\t000\tyes\t\t000\tyes\t')"
   a_status="${out%%$'\t'*}"
   rest="${out#*$'\t'}"
   a_acao="${rest%%$'\t'*}"
@@ -1016,18 +1032,27 @@ probe_vs_cors() {
   b_methods="${rest%%$'\t'*}"
   rest="${rest#*$'\t'}"
   c_status="${rest%%$'\t'*}"
-  c_body="${rest#*$'\t'}"
-  log "VS CORS: allowed=$a_status/acao=$a_acao preflight=$b_status/methods=$b_methods denied=$c_status body=$c_body"
-  if [[ "$a_status" == "200" && "$a_acao" == "yes" && "$b_status" == "204" \
-    && "$b_methods" == "yes" && "$c_status" == "403" \
-    && "$c_body" == *"CORS origin not allowed"* && "$c_body" != *"$APP_BODY"* ]]; then
+  rest="${rest#*$'\t'}"
+  c_acao="${rest%%$'\t'*}"
+  rest="${rest#*$'\t'}"
+  c_body="${rest%%$'\t'*}"
+  rest="${rest#*$'\t'}"
+  d_status="${rest%%$'\t'*}"
+  rest="${rest#*$'\t'}"
+  d_acao="${rest%%$'\t'*}"
+  d_body="${rest#*$'\t'}"
+  log "VS CORS: allowed=$a_status/acao=$a_acao preflight=$b_status/methods=$b_methods unmatched=$c_status/acao=$c_acao/body=$c_body unmatched-preflight=$d_status/acao=$d_acao/body=$d_body"
+  if [[ "$a_status" == "200" && "$a_acao" == "yes" && "$b_status" == "200" \
+    && "$b_methods" == "yes" && "$c_status" == "200" && "$c_acao" == "no" \
+    && "$c_body" == *"$APP_BODY"* && "$d_status" == "200" && "$d_acao" == "no" \
+    && "$d_body" == *"$APP_BODY"* ]]; then
     record_live_assertion sidecar.virtual_service.cors_policy pass \
       client svc \
-      "allowed=200+acao preflight=204+methods denied=403-cors-plugin"
+      "allowed=200+acao preflight=200+methods unmatched-actual/preflight=backend-200-no-acao"
   else
     record_live_assertion sidecar.virtual_service.cors_policy fail \
       client svc \
-      "allowed=$a_status/acao=$a_acao preflight=$b_status/methods=$b_methods denied=$c_status body=$c_body"
+      "allowed=$a_status/acao=$a_acao preflight=$b_status/methods=$b_methods unmatched=$c_status/acao=$c_acao/body=$c_body unmatched-preflight=$d_status/acao=$d_acao/body=$d_body"
     return 1
   fi
 }

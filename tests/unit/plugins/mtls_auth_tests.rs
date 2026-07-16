@@ -455,6 +455,27 @@ async fn test_mtls_auth_san_dns_matching_is_ascii_case_insensitive() {
 }
 
 #[tokio::test]
+async fn test_mtls_auth_san_dns_rotation_accepts_certificate_case_variants() {
+    let mut consumer = create_mtls_consumer("c1", "alice", "old.api.example.com");
+    consumer.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([
+            {"identity": "old.api.example.com"},
+            {"identity": "New.API.Example.COM"}
+        ]),
+    );
+    let index = ConsumerIndex::new(&[consumer]);
+    let plugin = MtlsAuth::new(&json!({"cert_field": "san_dns"})).unwrap();
+
+    for certificate_dns in ["OLD.API.EXAMPLE.COM", "new.api.example.com"] {
+        let certificate = create_test_cert("unused-cn", None, Some(certificate_dns));
+        let mut ctx = create_ctx_with_cert(certificate);
+        assert_continue(plugin.authenticate(&mut ctx, &index).await);
+        assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "alice");
+    }
+}
+
+#[tokio::test]
 async fn test_mtls_auth_san_dns_uses_only_first_dns_value() {
     let cert_der =
         create_test_cert_with_dns_sans("unused-cn", &["first.example.com", "second.example.com"]);

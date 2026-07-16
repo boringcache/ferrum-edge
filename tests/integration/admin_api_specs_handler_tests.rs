@@ -19,7 +19,7 @@ use ferrum_edge::{
     },
     config::{
         db_loader::{DatabaseStore, DbPoolConfig},
-        types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream},
+        types::{Consumer, PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream},
     },
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -1821,6 +1821,67 @@ async fn post_rejects_hmac_request_body_transformer_composition() {
 }
 
 #[tokio::test]
+async fn post_mtls_dns_policy_conflict_returns_409() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let mut upper = Consumer {
+        id: uid("mtls-upper"),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: uid("mtls-upper-user"),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    upper.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut lower = upper.clone();
+    lower.id = uid("mtls-lower");
+    lower.username = uid("mtls-lower-user");
+    lower.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "api.example.com"}]),
+    );
+    store
+        .create_consumer(&upper)
+        .await
+        .expect("create exact-case upper identity");
+    store
+        .create_consumer(&lower)
+        .await
+        .expect("create exact-case lower identity before DNS policy activation");
+
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("mtls-dns-conflict-proxy");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "mTLS DNS conflict", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [{
+            "id": uid("mtls-dns-policy"),
+            "plugin_name": "mtls_auth",
+            "config": {"cert_field": "san_dns"}
+        }]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CONFLICT,
+        "mTLS DNS candidate conflict must use the documented 409 response: {body}"
+    );
+}
+
+#[tokio::test]
 async fn put_excludes_removed_spec_owned_global_hmac_before_adding_body_transformer() {
     assert_put_replaces_removed_spec_owned_global(
         "hmac_auth",
@@ -2754,7 +2815,7 @@ async fn post_with_invalid_plugin_id_returns_400() {
             "id": "has spaces and !@#",
             "plugin_name": "cors",
             "scope": "proxy",
-            "config": {}
+            "config": {"allowed_origins": ["*"]}
         }]
     });
 
@@ -3216,7 +3277,7 @@ async fn put_with_empty_plugin_ids_reuses_by_name() {
             "listen_path": listen_path
         },
         "x-ferrum-plugins": [
-            {"id": "", "plugin_name": "cors", "config": {}},
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}},
             {"id": "", "plugin_name": "correlation_id", "config": {}}
         ]
     });
@@ -3286,7 +3347,7 @@ async fn put_with_renamed_plugin_gets_new_id() {
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
     let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
     assert_eq!(
@@ -3362,7 +3423,7 @@ async fn put_with_explicit_plugin_id_overrides_match() {
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
     let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
     assert_eq!(
@@ -3383,7 +3444,7 @@ async fn put_with_explicit_plugin_id_overrides_match() {
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": explicit_id, "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": explicit_id, "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
     let (put_status, put_body) = client
         .put_json(&format!("/api-specs/{spec_id}"), &spec_v2)
@@ -3427,7 +3488,7 @@ async fn put_with_empty_plugin_reuse_and_explicit_duplicate_id_returns_422() {
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
 
     let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
@@ -3455,7 +3516,7 @@ async fn put_with_empty_plugin_reuse_and_explicit_duplicate_id_returns_422() {
             "listen_path": listen_path
         },
         "x-ferrum-plugins": [
-            {"id": "", "plugin_name": "cors", "config": {}},
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}},
             {"id": reused_plugin_id, "plugin_name": "correlation_id", "config": {}}
         ]
     });
@@ -3560,7 +3621,7 @@ async fn post_proxy_plugin_association_to_other_proxy_returns_422() {
             "plugin_name": "cors",
             "scope": "proxy",
             "proxy_id": other_proxy_id,
-            "config": {},
+            "config": {"allowed_origins": ["*"]},
             "enabled": true
         }))
         .expect("other plugin deserialization");
@@ -3614,7 +3675,7 @@ async fn post_proxy_plugin_association_to_other_namespace_returns_422() {
             "namespace": other_namespace,
             "plugin_name": "cors",
             "scope": "proxy_group",
-            "config": {},
+            "config": {"allowed_origins": ["*"]},
             "enabled": true
         }))
         .expect("shared plugin deserialization");
@@ -3684,7 +3745,7 @@ async fn post_proxy_plugin_association_to_global_plugin_returns_422() {
             "namespace": "ferrum",
             "plugin_name": "cors",
             "scope": "global",
-            "config": {},
+            "config": {"allowed_origins": ["*"]},
             "enabled": true
         }))
         .expect("global plugin deserialization");
@@ -3757,7 +3818,7 @@ async fn post_proxy_plugin_association_to_about_to_insert_plugin_succeeds() {
         "x-ferrum-plugins": [{
             "id": plugin_id,
             "plugin_name": "cors",
-            "config": {}
+            "config": {"allowed_origins": ["*"]}
         }]
     });
 
@@ -3800,7 +3861,7 @@ async fn put_keeps_manually_added_proxy_group_plugin_association() {
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": uid("spec-plugin-v1"), "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": uid("spec-plugin-v1"), "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
     let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
     assert_eq!(
@@ -3819,7 +3880,7 @@ async fn put_keeps_manually_added_proxy_group_plugin_association() {
             "namespace": "ferrum",
             "plugin_name": "cors",
             "scope": "proxy_group",
-            "config": {},
+            "config": {"allowed_origins": ["*"]},
             "enabled": true
         }))
         .expect("proxy-group plugin deserialization");
@@ -4255,7 +4316,7 @@ async fn post_spec_with_plugin_priority_override_too_high_returns_422() {
             "id": uid("plugin"),
             "plugin_name": "cors",
             "priority_override": 10001,
-            "config": {}
+            "config": {"allowed_origins": ["*"]}
         }]
     });
 
@@ -4314,7 +4375,7 @@ async fn post_spec_with_duplicate_proxy_plugin_association_returns_422() {
         "namespace": "ferrum",
         "plugin_name": "cors",
         "scope": "proxy_group",
-        "config": {}
+        "config": {"allowed_origins": ["*"]}
     }))
     .expect("plugin deserialization");
     store
@@ -4376,8 +4437,8 @@ async fn put_with_two_id_less_same_name_plugins_identical_configs_is_idempotent(
     // Both plugins have the same plugin_name AND identical config — the
     // extractor allows multiple proxy-scoped instances of the same plugin.
     let two_cors_plugins = json!([
-        {"id": "", "plugin_name": "cors", "config": {}},
-        {"id": "", "plugin_name": "cors", "config": {}}
+        {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}},
+        {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}
     ]);
 
     let spec = json!({
@@ -4464,7 +4525,7 @@ async fn put_with_two_id_less_same_name_plugins_different_configs_returns_422() 
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
     let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
     assert_eq!(
@@ -4485,8 +4546,8 @@ async fn put_with_two_id_less_same_name_plugins_different_configs_returns_422() 
             "listen_path": listen_path
         },
         "x-ferrum-plugins": [
-            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["a.example"]}},
-            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["b.example"]}}
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["https://a.example"]}},
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["https://b.example"]}}
         ]
     });
     let (put_status, put_body) = client
@@ -4547,7 +4608,7 @@ async fn put_adds_second_same_name_plugin_when_one_matches_canonically() {
             "listen_path": listen_path
         },
         "x-ferrum-plugins": [
-            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["a.example"]}}
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["https://a.example"]}}
         ]
     });
     let (s1, b1) = client.post_json("/api-specs", &spec_v1).await;
@@ -4567,8 +4628,8 @@ async fn put_adds_second_same_name_plugin_when_one_matches_canonically() {
             "listen_path": listen_path
         },
         "x-ferrum-plugins": [
-            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["a.example"]}},
-            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["b.example"]}}
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["https://a.example"]}},
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["https://b.example"]}}
         ]
     });
     let (s2, b2) = client
@@ -4963,7 +5024,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
         "x-ferrum-plugins": [{
             "id": uid("plugin"),
             "plugin_name": "cors",
-            "config": {},
+            "config": {"allowed_origins": ["*"]},
             "updated_at": "1970-01-01T00:00:00Z"
         }]
     });
@@ -5196,7 +5257,7 @@ async fn loaded_gateway_config_excludes_api_specs_after_submission() {
         "x-ferrum-plugins": [{
             "id": uid("plugin"),
             "plugin_name": "cors",
-            "config": {}
+            "config": {"allowed_origins": ["*"]}
         }]
     });
 
@@ -5438,7 +5499,7 @@ async fn post_with_duplicate_plugin_ids_returns_error() {
             {
                 "id": "same-id",
                 "plugin_name": "cors",
-                "config": {}
+                "config": {"allowed_origins": ["*"]}
             },
             {
                 "id": "same-id",

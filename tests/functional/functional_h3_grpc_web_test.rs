@@ -185,7 +185,12 @@ fn reject_config(backend_port: u16) -> Value {
             proxy(
                 "h3-grpc-web-received",
                 "/received",
-                &["grpc-web-received", "grpc-web-cors", "received-reject"],
+                &[
+                    "grpc-web-received",
+                    "grpc-web-cors",
+                    "grpc-web-cors-narrow",
+                    "received-reject",
+                ],
             ),
             proxy(
                 "h3-grpc-web-authenticate",
@@ -230,6 +235,20 @@ fn reject_config(backend_port: u16) -> Value {
                 "proxy_id": "h3-grpc-web-received",
                 "enabled": true,
                 "config": {"allowed_origins": ["https://app.example"]},
+            },
+            {
+                "id": "grpc-web-cors-narrow",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-received",
+                "enabled": true,
+                "config": {
+                    "allowed_origins": ["https://app.example"],
+                    "allowed_methods": [],
+                    "allowed_headers": [],
+                    "exposed_headers": [],
+                    "unmatched_preflights": "forward"
+                },
             },
             {
                 "id": "received-reject",
@@ -360,6 +379,9 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
         grpc_web(Method::POST).header("origin", "https://app.example"),
     )
     .await;
+    // The second CORS instance carries Istio's omitted method/header lists.
+    // Those empty preflight lists must not reject this actual gRPC-Web POST or
+    // its Content-Type header before request_termination shapes the response.
     assert_grpc_web_error(&received, "13", "application/grpc-web+proto");
     assert_eq!(
         received
