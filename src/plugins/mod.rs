@@ -201,6 +201,21 @@ pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
 /// WebSocket-only (plugins that operate on WebSocket frames, not HTTP request/response).
 pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
 
+/// Parser-level limits contributed by a WebSocket size-policy plugin.
+///
+/// The relay combines every applicable instance before either peer is read,
+/// so the strictest frame and reassembled-message ceilings are enforced by
+/// tungstenite itself rather than by a post-reassembly `on_ws_frame` hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSizeLimits {
+    /// Maximum payload bytes accepted in any one wire frame.
+    pub max_frame_bytes: usize,
+    /// Maximum payload bytes accepted after continuation reassembly.
+    pub max_message_bytes: usize,
+    /// RFC 6455 Close reason paired with code 1009 on either violation.
+    pub close_reason: Arc<str>,
+}
+
 /// gRPC-only (single protocol).
 pub const GRPC_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Grpc];
 
@@ -4433,7 +4448,20 @@ pub trait Plugin: Send + Sync {
         false
     }
 
-    /// Called for each WebSocket frame when at least one plugin on the proxy opts in.
+    /// Optional parser-level WebSocket size policy.
+    ///
+    /// Implementations must return immutable construction-time values. The
+    /// shared H1/H2/H3 relay evaluates this once per upgraded connection and
+    /// applies the strictest values before reading frames from either peer.
+    fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {
+        None
+    }
+
+    /// Called for each complete WebSocket message when a plugin opts in.
+    ///
+    /// Tungstenite reassembles Text/Binary continuation frames before this
+    /// hook. Plugins that require actual wire-frame enforcement must contribute
+    /// parser policy through [`Plugin::websocket_size_limits`] instead.
     ///
     /// `connection_id` is a unique per-connection identifier (monotonic counter) that
     /// stateful plugins (e.g., ws_rate_limiting) can use to track per-connection state.

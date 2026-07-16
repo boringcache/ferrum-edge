@@ -256,6 +256,41 @@ async fn test_lazy_timeout_bounds_polite_close() {
     );
 }
 
+/// Policy rejection must publish its detailed Close and cancellation before
+/// awaiting even the bounded polite write. Otherwise a backpressured
+/// destination can retain the opposite relay half until the send completes.
+#[test]
+fn test_policy_close_publishes_cancellation_before_bounded_writes() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    for (start_marker, state, cancel, send) in [
+        (
+            "Plugin triggered close on client->backend frame",
+            "policy_close_ctb.set",
+            "cancel_ctb.cancel();",
+            "send_bounded_ws_close(",
+        ),
+        (
+            "Plugin triggered close on backend->client frame",
+            "policy_close_btc.set",
+            "cancel_btc.cancel();",
+            "send_bounded_ws_close(",
+        ),
+    ] {
+        let branch = source
+            .split_once(start_marker)
+            .unwrap_or_else(|| panic!("missing policy-close branch: {start_marker}"))
+            .1;
+        let state_index = branch.find(state).expect("detailed Close publication");
+        let cancel_index = branch.find(cancel).expect("policy cancellation");
+        let send_index = branch.find(send).expect("bounded policy Close write");
+        assert!(
+            state_index < cancel_index && cancel_index < send_index,
+            "{start_marker}: required order is detailed state -> cancellation -> bounded write"
+        );
+    }
+}
+
 /// Paired happy-path assertion: when the inner future completes synchronously
 /// (the common case for a small Close frame on healthy TCP), `lazy_timeout`
 /// pays zero timer cost and returns immediately with the inner result.

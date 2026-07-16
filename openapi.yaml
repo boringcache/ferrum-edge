@@ -7564,10 +7564,11 @@ components:
     WsMessageSizeLimitingConfig:
       type: object
       description: |
-        Configuration for the `ws_message_size_limiting` plugin. Enforces a
-        maximum frame payload size on WebSocket connections. Frames exceeding
-        the limit trigger a close frame (RFC 6455 close code 1009 — Message
-        Too Big) sent to both client and backend.
+        Configuration for the `ws_message_size_limiting` plugin. Enforces an
+        actual wire-frame payload ceiling before payload reservation and an
+        independent reassembled-message ceiling. Violations trigger a bounded
+        close frame (RFC 6455 close code 1009 — Message Too Big) sent to both
+        client and backend after shared relay cancellation is published.
       required:
         - max_frame_bytes
       properties:
@@ -7583,13 +7584,23 @@ components:
             Ping/Pong are RFC 6455 control frames capped at 125 bytes by the
             protocol itself, so values below 125 will close the connection on
             heartbeat traffic.
+        max_message_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: >-
+            Maximum reassembled Text/Binary message payload in bytes. Defaults
+            to four times `max_frame_bytes` and must be greater than or equal to
+            `max_frame_bytes`. Continuation frames are still checked separately
+            against `max_frame_bytes`; a cumulative message larger than the
+            frame limit is valid until this independent bound is exceeded.
         close_reason:
           type: string
           default: "Message too large"
           description: >-
-            Close frame reason text sent when a frame exceeds the limit. Truncated
-            to 123 UTF-8 bytes (the WebSocket protocol close-frame reason limit)
-            on a UTF-8 char boundary.
+            Close frame reason text sent to both peers when either limit is
+            exceeded. Truncated to 123 UTF-8 bytes (the WebSocket protocol
+            close-frame reason limit) on a UTF-8 char boundary.
 
     WsFrameLoggingConfig:
       type: object

@@ -1,34 +1,34 @@
 //! WebSocket Message Size Limiting Plugin
 //!
-//! Enforces per-proxy maximum frame sizes on WebSocket connections.
-//! When a frame exceeds the configured `max_frame_bytes`, the connection
-//! is closed with WebSocket close code 1009 (Message Too Big).
+//! Enforces per-proxy frame and reassembled-message limits on WebSocket
+//! connections. The shared relay installs these limits in both tungstenite
+//! parsers before reads, so declared oversized frames are rejected before
+//! payload reservation and fragmented messages have an independent bound.
 //!
 //! This is the WebSocket equivalent of `request_size_limiting` for HTTP.
-//! It operates at the frame level via the `on_ws_frame` hook, inspecting
-//! every Text, Binary, and Ping frame in both directions.
+//! `requires_ws_frame_hooks()` keeps tunnel mode disabled; enforcement itself
+//! is parser-level because `on_ws_frame` receives reassembled messages.
 //!
 //! Config:
 //! ```json
 //! {
 //!   "max_frame_bytes": 65536,
+//!   "max_message_bytes": 262144,
 //!   "close_reason": "Message too large"
 //! }
 //! ```
 
-use async_trait::async_trait;
 use serde_json::Value;
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use std::sync::Arc;
 use tracing::warn;
 
-use super::utils::size_limit::{SizeLimiter, required_positive_usize};
-use super::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
+use super::utils::size_limit::required_positive_usize;
+use super::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketSizeLimits};
 
 pub struct WsMessageSizeLimiting {
     max_frame_bytes: usize,
-    close_reason: String,
+    max_message_bytes: usize,
+    close_reason: Arc<str>,
 }
 
 impl WsMessageSizeLimiting {
@@ -41,6 +41,20 @@ impl WsMessageSizeLimiting {
 
         let max_frame_bytes =
             required_positive_usize(config, "max_frame_bytes", "ws_message_size_limiting")?;
+        let max_message_bytes = match config.get("max_message_bytes") {
+            Some(_) => required_positive_usize(
+                config,
+                "max_message_bytes",
+                "ws_message_size_limiting",
+            )?,
+            None => max_frame_bytes.saturating_mul(4),
+        };
+        if max_message_bytes < max_frame_bytes {
+            return Err(
+                "ws_message_size_limiting: 'max_message_bytes' must be greater than or equal to 'max_frame_bytes'"
+                    .to_string(),
+            );
+        }
 
         let mut close_reason = optional_string(config, "close_reason")?
             .unwrap_or("Message too large")
@@ -58,7 +72,8 @@ impl WsMessageSizeLimiting {
 
         Ok(Self {
             max_frame_bytes,
-            close_reason,
+            max_message_bytes,
+            close_reason: Arc::from(close_reason),
         })
     }
 
@@ -68,16 +83,6 @@ impl WsMessageSizeLimiting {
             end -= 1;
         }
         end
-    }
-
-    /// Returns the byte length of a WebSocket message payload.
-    fn frame_size(message: &Message) -> usize {
-        match message {
-            Message::Text(s) => s.len(),
-            Message::Binary(b) => b.len(),
-            Message::Ping(d) | Message::Pong(d) => d.len(),
-            Message::Close(_) | Message::Frame(_) => 0,
-        }
     }
 }
 
@@ -91,17 +96,6 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
         .ok_or_else(|| format!("ws_message_size_limiting: '{field}' must be a string"))
 }
 
-impl SizeLimiter for WsMessageSizeLimiting {
-    fn plugin_name(&self) -> &'static str {
-        "ws_message_size_limiting"
-    }
-
-    fn max_size_bytes(&self) -> u128 {
-        self.max_frame_bytes as u128
-    }
-}
-
-#[async_trait]
 impl Plugin for WsMessageSizeLimiting {
     fn name(&self) -> &str {
         "ws_message_size_limiting"
@@ -119,37 +113,11 @@ impl Plugin for WsMessageSizeLimiting {
         true
     }
 
-    async fn on_ws_frame(
-        &self,
-        proxy_id: &str,
-        _connection_id: u64,
-        direction: WebSocketFrameDirection,
-        message: &Message,
-    ) -> Option<Message> {
-        if !self.is_enabled() {
-            return None;
-        }
-
-        let size = Self::frame_size(message);
-        if self.exceeds_limit(size as u128) {
-            let dir_label = match direction {
-                WebSocketFrameDirection::ClientToBackend => "client->backend",
-                WebSocketFrameDirection::BackendToClient => "backend->client",
-            };
-            warn!(
-                plugin = self.plugin_name(),
-                proxy_id = %proxy_id,
-                direction = dir_label,
-                frame_size = size,
-                max_frame_bytes = self.max_size_bytes(),
-                "WebSocket frame exceeds size limit, closing connection"
-            );
-            return Some(Message::Close(Some(CloseFrame {
-                code: CloseCode::Size,
-                reason: self.close_reason.clone().into(),
-            })));
-        }
-
-        None
+    fn websocket_size_limits(&self) -> Option<WebSocketSizeLimits> {
+        Some(WebSocketSizeLimits {
+            max_frame_bytes: self.max_frame_bytes,
+            max_message_bytes: self.max_message_bytes,
+            close_reason: Arc::clone(&self.close_reason),
+        })
     }
 }

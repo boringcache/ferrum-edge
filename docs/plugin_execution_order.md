@@ -269,7 +269,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 
 ## WebSocket Frame Lifecycle (`on_ws_frame`)
 
-WebSocket connections go through the normal HTTP plugin pipeline during the upgrade handshake — authentication, authorization, rate limiting, and all other HTTP phases execute before the connection is upgraded. Once the WebSocket upgrade completes, the frame-level hooks kick in.
+WebSocket connections go through the normal HTTP plugin pipeline during the upgrade handshake — authentication, authorization, rate limiting, and all other HTTP phases execute before the connection is upgraded. Once the WebSocket upgrade completes, parser policies and message-level hooks kick in.
 
 Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
 after both relay directions finish, including clean closes, typed errors, drain
@@ -281,7 +281,12 @@ diagnostic plus one WebSocket terminal diagnostic. Both expose the same
 selected `request_id` / `trace_id` correlation metadata when present, after
 central sensitivity classification; neither dumps raw metadata.
 
-The `on_ws_frame` phase fires for every **Text**, **Binary**, **Ping**, and **Pong** frame in both directions:
+The `on_ws_frame` phase fires for every complete **Text**, **Binary**, **Ping**,
+and **Pong** message yielded by tungstenite in both directions. Text/Binary
+continuations are reassembled before this ordinary hook. Parser-level size
+policy is the exception: `ws_message_size_limiting` installs the strictest
+configured actual-frame and reassembled-message ceilings before either parser
+reads, so continuation payloads are checked individually before allocation.
 
 ```
 WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy → ...)
@@ -307,7 +312,11 @@ Each WebSocket connection is assigned a `connection_id` — a monotonic `u64` co
 
 ### Frame Rejection
 
-Plugins can return `Some(Message::Close(...))` to close the connection in both directions. When a plugin returns a close frame, the gateway sends it to both client and backend and tears down the connection.
+Plugins can return `Some(Message::Close(...))` to close the connection in both
+directions. The relay records the first detailed policy Close, signals shared
+cancellation before any potentially backpressured write, then attempts the
+same protocol-valid Close to both peers under a short bound. Parser-level size
+rejections use the same path with code 1009.
 
 ### Execution Order
 
@@ -315,7 +324,7 @@ Plugins execute in priority order (lower number runs first):
 
 | # | Plugin | Priority | Behavior |
 |---|--------|----------|----------|
-| 1 | `ws_message_size_limiting` | 2810 | Rejects frames exceeding max payload size |
+| 1 | `ws_message_size_limiting` | 2810 | Pre-read actual-frame and bounded-reassembly policy; closes both peers with 1009 |
 | 2 | `ws_rate_limiting` | 2910 | Per-connection token-bucket frame rate limiting |
 | 3 | `ws_frame_logging` | 9050 | Logs frame metadata (direction, opcode, payload size) |
 
@@ -436,7 +445,7 @@ Given all built-in plugins enabled, the execution order is:
 | 28 | `adaptive_concurrency` | 2090 | backend_admission |
 | 29 | `request_deduplication` | 2750 | before_proxy, on_final_response_body, on_response_stream_terminated |
 | 30 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
-| 31 | `ws_message_size_limiting` | 2810 | on_ws_frame |
+| 31 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
 | 32 | `graphql` | 2850 | before_proxy |
 | 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
 | 34 | `ws_rate_limiting` | 2910 | on_ws_frame |
@@ -788,7 +797,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
 | `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |
 | `ai_rate_limiter` | ✓ | ✓ | | | | Parses JSON response bodies for token counts |
-| `ws_message_size_limiting` | | | ✓ | | | Enforces max frame size on WebSocket connections |
+| `ws_message_size_limiting` | | | ✓ | | | Enforces actual-frame and bounded-reassembly limits on WebSocket connections |
 | `ws_rate_limiting` | | | ✓ | | | Per-connection frame rate limiting for WebSocket |
 | `ws_frame_logging` | | | ✓ | | | Logs WebSocket frame metadata |
 | `udp_rate_limiting` | | | | | ✓ | Per-client-IP datagram and byte rate limiting for UDP proxies |
