@@ -284,5 +284,7 @@ async fn runtime_metrics_endpoint_returns_seeded_json_shape() {
         body["logs"]["by_level"]["warn"].as_u64().unwrap_or(0) >= 1,
         "seeded log counter missing: {body}"
     );
+    assert!(body["logs"]["sinks"]["stdout"].is_null());
+    assert!(body["logs"]["sinks"]["stderr"].is_null());
     assert_eq!(body["overload"]["level"].as_str(), Some("normal"));
 }

@@ -425,7 +425,7 @@ async fn high_latency_preserves_first_byte_latency_metrics() {
     // this signal (vs. `latency_total_ms`, which also includes plugin
     // post-processing).
     //
-    // Poll until the field flushes through tracing-appender's
+    // Poll until the field flushes through Ferrum's bounded
     // non-blocking writer instead of reading once after a fixed sleep:
     // the access-log line lags the client-visible response, so a single
     // snapshot races the flush and intermittently misses an

@@ -99,6 +99,10 @@ pub const HTTP_FIELDS: &[FieldMeta] = &[
         is_timestamp: false,
     },
     FieldMeta {
+        name: "grpc_status",
+        is_timestamp: false,
+    },
+    FieldMeta {
         name: "latency_total_ms",
         is_timestamp: false,
     },
@@ -567,7 +571,7 @@ mod tests {
         // tests/integration/log_schema_registry_tests.rs verifies the
         // actual serde output keys match these. This is the cheap
         // unit-test guard against accidental deletions.
-        assert_eq!(HTTP_FIELDS.len(), 29);
+        assert_eq!(HTTP_FIELDS.len(), 30);
     }
 
     #[test]

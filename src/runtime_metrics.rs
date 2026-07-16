@@ -654,6 +654,7 @@ pub struct TcpRstSnapshot {
 pub struct LogsSnapshot {
     pub by_level: BTreeMap<&'static str, u64>,
     pub by_category: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
+    pub sinks: crate::logging::LoggingSnapshot,
 }
 
 pub fn build_snapshot(
@@ -904,6 +905,7 @@ fn build_logs_snapshot(metrics: &RuntimeMetrics) -> LogsSnapshot {
     LogsSnapshot {
         by_level,
         by_category,
+        sinks: crate::logging::snapshot(),
     }
 }
 

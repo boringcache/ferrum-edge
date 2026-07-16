@@ -115,13 +115,22 @@ fn file_mode_yaml_for_h3_with_terminal_security(port: u16, remove_terminal: bool
         }],
         "consumers": [],
         "upstreams": [],
-        "plugin_configs": [{
-            "id": "native-h3-terminal-security",
-            "plugin_name": "security_headers",
-            "scope": "global",
-            "enabled": true,
-            "config": security_config,
-        }],
+        "plugin_configs": [
+            {
+                "id": "native-h3-terminal-security",
+                "plugin_name": "security_headers",
+                "scope": "global",
+                "enabled": true,
+                "config": security_config,
+            },
+            {
+                "id": "native-h3-errors-only",
+                "plugin_name": "stdout_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": {"filter": {"errors_only": true}},
+            }
+        ],
     });
     serde_yaml::to_string(&config).expect("yaml serialize")
 }
@@ -3097,6 +3106,31 @@ async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(remove_
             .and_then(|value| value.to_str().ok()),
         Some("AQID")
     );
+
+    let logs = harness
+        .wait_for_log_contains(
+            |logs| {
+                logs.lines().any(|line| {
+                    serde_json::from_str::<Value>(line).is_ok_and(|entry| {
+                        entry["proxy_id"] == "scripted-h3" && entry["grpc_status"] == 7
+                    })
+                })
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+    let access_logs: Vec<Value> = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["proxy_id"] == "scripted-h3")
+        .collect();
+    assert_eq!(
+        access_logs.len(),
+        1,
+        "native H3 errors_only must emit the status-7 terminal failure; logs:\n{logs}"
+    );
+    assert_eq!(access_logs[0]["response_status_code"], 200);
+    assert_eq!(access_logs[0]["grpc_status"], 7);
 
     let received = h3_backend.received_requests().await;
     assert!(

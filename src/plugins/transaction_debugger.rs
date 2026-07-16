@@ -98,11 +98,7 @@ impl TransactionDebugger {
             "body_incomplete"
         } else if summary.metadata.contains_key("rejection_phase") {
             "rejected"
-        } else if summary
-            .metadata
-            .get("grpc_status")
-            .is_some_and(|status| status != "0")
-        {
+        } else if summary.is_terminal_failure() {
             "grpc_error"
         } else {
             "completed"

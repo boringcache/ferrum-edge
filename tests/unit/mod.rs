@@ -4,6 +4,7 @@ mod config;
 mod env_lock;
 mod gateway_core;
 mod identity;
+mod logging_tests;
 mod notifications;
 mod openapi_yaml_tests;
 mod plugins;

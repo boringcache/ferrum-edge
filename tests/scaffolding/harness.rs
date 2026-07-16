@@ -868,7 +868,7 @@ impl GatewayHarness {
     /// snapshot or `timeout` elapses, then return the final snapshot (so the
     /// caller's assertion message still shows what WAS logged on timeout).
     ///
-    /// Necessary because the gateway routes logs through `tracing-appender`'s
+    /// Necessary because the gateway routes logs through its bounded
     /// non-blocking writer, whose worker thread lags the client-visible
     /// response by tens of ms; a single `captured_combined()` snapshot races
     /// that flush and intermittently misses a log line that the gateway has
@@ -899,7 +899,7 @@ impl GatewayHarness {
     /// The exact-count companion to [`Self::wait_for_log_contains`]. Use it
     /// for assertions that pin an EXACT line count rather than a presence
     /// substring. A bare poll-until-`at_least` would return the instant the
-    /// target line flushes through `tracing-appender`'s non-blocking writer —
+    /// target line flushes through the non-blocking process-log worker —
     /// but if a *spurious* extra line were still buffered, that early return
     /// would miss it and silently mask an over-count regression. Reaching the
     /// target clears the flush-race under-count; the stabilization re-read
