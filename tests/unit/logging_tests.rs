@@ -4,7 +4,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ferrum_edge::logging::{EnqueueResult, NonBlockingOptions, NonBlockingSink, SinkName};
+use ferrum_edge::logging::non_blocking::EnqueueResult;
+use ferrum_edge::logging::{NonBlockingOptions, NonBlockingSink, SinkName};
 use ferrum_edge::plugins::{TransactionSummary, stdout_logging::StdoutLogging};
 use ferrum_edge::retry::ErrorClass;
 use serde::Serialize;
@@ -291,7 +292,9 @@ fn saturation_is_non_blocking_and_stdout_stderr_counters_are_independent() {
     assert_eq!(stdout.try_write_bytes(b"three\n"), EnqueueResult::Saturated);
     assert!(started.elapsed() < Duration::from_millis(50));
     assert_eq!(stdout_errors.saturation_dropped_records(), 1);
-    assert_eq!(stderr_errors.dropped_records(), 0);
+    assert_eq!(stderr_errors.saturation_dropped_records(), 0);
+    assert_eq!(stderr_errors.oversized_dropped_records(), 0);
+    assert_eq!(stderr_errors.closed_dropped_records(), 0);
     let serialization_count = Arc::new(AtomicUsize::new(0));
     assert_eq!(
         stdout

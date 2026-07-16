@@ -101,12 +101,6 @@ pub struct ErrorCounter {
 }
 
 impl ErrorCounter {
-    pub fn dropped_records(&self) -> u64 {
-        self.saturation_dropped_records()
-            .saturating_add(self.oversized_dropped_records())
-            .saturating_add(self.closed_dropped_records())
-    }
-
     pub fn saturation_dropped_records(&self) -> u64 {
         self.state.saturation_dropped.load(Ordering::Relaxed)
     }

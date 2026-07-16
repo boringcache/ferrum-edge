@@ -15,8 +15,7 @@ pub mod non_blocking;
 pub mod runtime_overlay;
 
 pub use non_blocking::{
-    EnqueueResult, ErrorCounter, NonBlockingOptions, NonBlockingSink, SinkName, SinkSnapshot,
-    WorkerGuard,
+    ErrorCounter, NonBlockingOptions, NonBlockingSink, SinkName, SinkSnapshot, WorkerGuard,
 };
 
 /// Stable callback that knows how to rebuild the gateway-wide tracing
@@ -107,14 +106,6 @@ pub fn set_process_log_sinks(
 /// output; the gateway binary treats sink initialization failure as fatal.
 pub fn access_log_writer() -> Option<&'static NonBlockingSink> {
     PROCESS_LOG_SINKS.get().map(|sinks| &sinks.stdout)
-}
-
-/// Distinct retained producer-loss counter handles for stdout/access records
-/// and stderr diagnostics, respectively.
-pub fn process_error_counters() -> Option<(ErrorCounter, ErrorCounter)> {
-    PROCESS_LOG_SINKS
-        .get()
-        .map(|sinks| (sinks.stdout_errors.clone(), sinks.stderr_errors.clone()))
 }
 
 #[derive(Debug, Clone, Serialize)]
