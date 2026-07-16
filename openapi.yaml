@@ -13628,14 +13628,15 @@ components:
         (empty `blocked_patterns` while missing User-Agent headers are allowed)
         is rejected; an allow-list alone is not enforcement. The User-Agent is
         client-controlled and spoofable, so this is a coarse filter, not strong
-        bot verification. HTTP-family only.
+        bot verification. Pattern entry whitespace follows Rust `str::trim`
+        Unicode `White_Space` semantics. HTTP-family only.
       properties:
         blocked_patterns:
           type: [array, "null"]
           items:
             type: string
             minLength: 1
-            pattern: '.*\S.*'
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default:
             - curl
             - wget
@@ -13660,7 +13661,7 @@ components:
           items:
             type: string
             minLength: 1
-            pattern: '.*\S.*'
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             User-Agent tokens that always pass, evaluated before
@@ -13684,10 +13685,13 @@ components:
           maximum: 599
           default: 403
           description: >-
-            Final 4xx or 5xx HTTP status returned with the JSON rejection body.
-            Values outside 400–599, including informational and no-body status
-            codes, and non-integer values are rejected. `null` is the same as
-            omission and selects 403.
+            For non-gRPC requests, the final 4xx or 5xx HTTP status returned
+            with the JSON rejection body. Native gRPC requests instead return
+            an empty-body HTTP 200 trailers-only error with this HTTP status
+            mapped to `grpc-status` and `Forbidden` in `grpc-message`. Values
+            outside 400–599, including informational and no-body status codes,
+            and non-integer values are rejected. `null` is the same as omission
+            and selects 403.
 
     RequestTransformerConfig:
       type: object

@@ -2461,7 +2461,11 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
         }),
         json!({"blocked_patterns": [], "allow_missing_user_agent": false}),
         json!({"custom_response_code": 400}),
+        json!({"custom_response_code": 403.0}),
         json!({"custom_response_code": 599}),
+        // U+FEFF ZWNBSP is not in Rust's Unicode White_Space set.
+        json!({"blocked_patterns": ["\u{feff}"]}),
+        json!({"allow_list": ["\u{feff}"]}),
     ] {
         assert_component_validity(&spec, "BotDetectionConfig", &valid, true);
         BotDetection::new(&valid)
@@ -2484,9 +2488,12 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
         json!({"blocked_patterns": [42]}),
         json!({"blocked_patterns": [""]}),
         json!({"blocked_patterns": [" \t "]}),
+        // U+0085 NEL is in Rust's Unicode White_Space set.
+        json!({"blocked_patterns": ["\u{0085}"]}),
         json!({"allow_list": "TrustedBot"}),
         json!({"allow_list": [false]}),
         json!({"allow_list": ["\n"]}),
+        json!({"allow_list": ["\u{0085}"]}),
         json!({"allow_missing_user_agent": "false"}),
         json!({"custom_response_code": "451"}),
         json!({"custom_response_code": 451.5}),
@@ -2501,6 +2508,7 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
         json!({"custom_response_code": 304}),
         json!({"custom_response_code": 399}),
         json!({"custom_response_code": 600}),
+        json!({"custom_response_code": 1e100}),
     ] {
         assert_component_validity(&spec, "BotDetectionConfig", &invalid, false);
         assert!(
@@ -2514,4 +2522,5 @@ fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
     assert!(guide.contains("unknown keys are rejected instead of falling back to defaults"));
     assert!(guide.contains("Only 400–599 is accepted"));
     assert!(guide.contains("never reflect the client-controlled User-Agent"));
+    assert!(guide.contains("Native gRPC rejections instead use an empty-body HTTP 200"));
 }

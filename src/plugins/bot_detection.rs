@@ -208,7 +208,14 @@ fn parse_response_code(config: &Map<String, Value>) -> Result<u16, String> {
     match config.get("custom_response_code") {
         None | Some(Value::Null) => Ok(403),
         Some(Value::Number(value)) => {
-            let Some(code) = value.as_u64() else {
+            let code = value.as_u64().or_else(|| {
+                let code = value.as_f64()?;
+                (code.is_finite()
+                    && code.fract() == 0.0
+                    && (400.0..=599.0).contains(&code))
+                    .then_some(code as u64)
+            });
+            let Some(code) = code else {
                 return Err(format!(
                     "bot_detection: 'custom_response_code' must be an integer from 400 to 599, got {value}"
                 ));

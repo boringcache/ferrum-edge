@@ -1,11 +1,14 @@
 //! Tests for the Bot Detection plugin
 
+use ferrum_edge::_test_support::normalize_reject_response;
 use ferrum_edge::plugins::bot_detection::{
     BOT_DETECTION_CONFIG_KEYS, BOT_DETECTION_PRIORITY, BotDetection,
 };
 use ferrum_edge::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
 };
+use ferrum_edge::proxy::grpc_proxy::grpc_status;
+use hyper::StatusCode;
 use serde_json::{Value, json};
 
 use super::plugin_utils;
@@ -422,6 +425,17 @@ async fn test_custom_response_code_boundary_599() {
     plugin_utils::assert_reject(result, Some(599));
 }
 
+#[tokio::test]
+async fn test_custom_response_code_zero_fraction_is_accepted() {
+    let plugin = BotDetection::new(&json!({
+        "custom_response_code": 403.0
+    }))
+    .unwrap();
+    let mut ctx = make_ctx_with_ua("curl/7.88.1");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
 // ── Invalid config is rejected at construction ──────────────────────────
 
 #[test]
@@ -544,6 +558,14 @@ fn test_informational_no_body_and_out_of_range_statuses_are_rejected() {
             .expect("non-4xx/5xx status must be rejected");
         assert!(err.contains("400 to 599"), "status {code}: {err}");
     }
+}
+
+#[test]
+fn test_hostile_numeric_response_code_is_rejected() {
+    let err = BotDetection::new(&json!({"custom_response_code": 1e100}))
+        .err()
+        .expect("hostile numeric status must be rejected");
+    assert!(err.contains("400 to 599"), "got: {err}");
 }
 
 #[test]
@@ -741,4 +763,37 @@ async fn test_reject_body_is_json_error() {
         }
         _ => panic!("Expected Reject, got {:?}", result),
     }
+}
+
+#[tokio::test]
+async fn test_native_grpc_rejection_is_normalized_without_json_body() {
+    let plugin = BotDetection::new(&json!({"custom_response_code": 429})).unwrap();
+    let mut ctx = make_ctx_with_ua("curl/7.88.1");
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = plugin.on_request_received(&mut ctx).await
+    else {
+        panic!("blocked User-Agent must be rejected");
+    };
+
+    let normalized = normalize_reject_response(
+        StatusCode::from_u16(status_code).unwrap(),
+        body.as_bytes(),
+        &headers,
+        true,
+    );
+    assert_eq!(normalized.http_status, StatusCode::OK);
+    assert!(normalized.body.is_empty());
+    assert_eq!(normalized.grpc_status, Some(grpc_status::RESOURCE_EXHAUSTED));
+    assert_eq!(normalized.grpc_message.as_deref(), Some("Forbidden"));
+    assert_eq!(
+        normalized.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(
+        normalized.headers.get("grpc-status").map(String::as_str),
+        Some("8")
+    );
 }
