@@ -125,12 +125,14 @@ fn materialize_headers_folds_duplicate_connection_lines() {
 }
 
 #[test]
-fn materialize_headers_skips_reserved_identity_headers_even_when_repeated() {
+fn materialize_headers_skips_reserved_gateway_assertions_even_when_repeated() {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
     let mut raw = HeaderMap::new();
     raw.append("x-consumer-username", "spoofed".parse().unwrap());
     raw.append("x-consumer-username", "also-spoofed".parse().unwrap());
     raw.append("x-consumer-custom-id", "custom".parse().unwrap());
+    raw.append("x-geo-country", "attacker-first".parse().unwrap());
+    raw.append("x-geo-country", "attacker-second".parse().unwrap());
     raw.append("x-forwarded-for", "198.51.100.10".parse().unwrap());
     raw.append("x-forwarded-for", "203.0.113.77".parse().unwrap());
     ctx.set_raw_headers(raw);
@@ -139,6 +141,7 @@ fn materialize_headers_skips_reserved_identity_headers_even_when_repeated() {
 
     assert!(!ctx.headers.contains_key("x-consumer-username"));
     assert!(!ctx.headers.contains_key("x-consumer-custom-id"));
+    assert!(!ctx.headers.contains_key("x-geo-country"));
     assert_eq!(
         ctx.headers.get("x-forwarded-for").map(String::as_str),
         Some("198.51.100.10, 203.0.113.77")

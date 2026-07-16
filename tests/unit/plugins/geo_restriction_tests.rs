@@ -1,8 +1,8 @@
 use base64::Engine;
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    GatewayConfig, PluginConfig, PluginScope, default_namespace, load_validated_country_mmdb,
-    validate_mmdb_file,
+    GatewayConfig, MAX_COUNTRY_MMDB_SIZE_BYTES, PluginConfig, PluginScope, default_namespace,
+    load_validated_country_mmdb, validate_mmdb_file,
 };
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
@@ -41,6 +41,33 @@ fn replace_database_type(mut bytes: Vec<u8>) -> Vec<u8> {
         .position(|window| window == ORIGINAL)
         .expect("fixture contains its database type");
     bytes[offset..offset + ORIGINAL.len()].copy_from_slice(REPLACEMENT);
+    bytes
+}
+
+fn replace_direct_country_with_unsupported_code(mut bytes: Vec<u8>) -> Vec<u8> {
+    let mut replacements = 0;
+    for offset in 0..bytes.len().saturating_sub(1) {
+        if &bytes[offset..offset + 2] == b"SE" {
+            bytes[offset..offset + 2].copy_from_slice(b"ZZ");
+            replacements += 1;
+        }
+    }
+    assert!(replacements > 0, "fixture contains the SE country code");
+
+    let reader = maxminddb::Reader::from_source(bytes.as_slice())
+        .expect("country-code replacement preserves MMDB structure");
+    reader
+        .verify()
+        .expect("country-code replacement preserves comprehensive verification");
+    let lookup = reader
+        .lookup("89.160.20.112".parse().unwrap())
+        .expect("fixture address still resolves");
+    let country: Option<&str> = lookup
+        .decode_path(&maxminddb::path!["country", "iso_code"])
+        .expect("fixture country path still decodes");
+    assert_eq!(country, Some("ZZ"));
+    drop(reader);
+
     bytes
 }
 
@@ -471,13 +498,20 @@ async fn fail_open_never_forwards_client_country_assertion() {
 }
 
 #[tokio::test]
-async fn later_fail_open_instance_clears_an_earlier_instance_assertion() {
+async fn later_instances_preserve_an_earlier_authoritative_assertion() {
     let directory = TempDir::new().unwrap();
     let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
     let authoritative = GeoRestriction::new(&json!({
         "db_path": path_text(&path),
         "allow_countries": ["SE"],
         "inject_headers": true,
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let non_injecting = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "inject_headers": false,
         "on_lookup_failure": "deny"
     }))
     .unwrap();
@@ -488,18 +522,24 @@ async fn later_fail_open_instance_clears_an_earlier_instance_assertion() {
         "on_lookup_failure": "allow"
     }))
     .unwrap();
-    let mut ctx = materialized_spoofed_context("89.160.20.112");
 
-    assert!(matches!(
-        authoritative.on_request_received(&mut ctx).await,
-        PluginResult::Continue
-    ));
-    assert_eq!(ctx.headers.get("x-geo-country").unwrap(), "SE");
-    assert!(matches!(
-        fail_open.on_request_received(&mut ctx).await,
-        PluginResult::Continue
-    ));
-    assert!(!ctx.headers.contains_key("x-geo-country"));
+    for later in [&non_injecting, &fail_open] {
+        let mut ctx = materialized_spoofed_context("89.160.20.112");
+        assert!(matches!(
+            authoritative.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(ctx.headers.get("x-geo-country").unwrap(), "SE");
+        assert!(matches!(
+            later.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            ctx.headers.get("x-geo-country").map(String::as_str),
+            Some("SE"),
+            "a later non-authoritative instance must not erase an earlier assertion"
+        );
+    }
 }
 
 #[tokio::test]
@@ -580,6 +620,24 @@ fn validate_mmdb_file_accepts_verified_country_fixture() {
 }
 
 #[test]
+fn validate_mmdb_file_rejects_oversized_sparse_file_before_reading() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("oversized.mmdb");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(MAX_COUNTRY_MMDB_SIZE_BYTES + 1).unwrap();
+    drop(file);
+
+    let validation = validate_mmdb_file("geo_restriction.db_path", path_text(&path));
+    assert!(validation.is_err());
+    assert!(
+        validation
+            .err()
+            .unwrap()
+            .contains("maximum supported size")
+    );
+}
+
+#[test]
 fn validated_mmdb_snapshots_are_shared_across_live_instances() {
     let directory = TempDir::new().unwrap();
     let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
@@ -587,6 +645,26 @@ fn validated_mmdb_snapshots_are_shared_across_live_instances() {
     let first = load_validated_country_mmdb(path_text(&path)).unwrap();
     let second = load_validated_country_mmdb(path_text(&path)).unwrap();
     assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn validate_mmdb_file_rejects_structurally_valid_unsupported_country_code() {
+    let directory = TempDir::new().unwrap();
+    let bytes = replace_direct_country_with_unsupported_code(country_mmdb_bytes());
+    let path = write_fixture(&directory, "unsupported-country.mmdb", &bytes);
+
+    let validation = validate_mmdb_file("geo_restriction.db_path", path_text(&path));
+    assert!(validation.is_err());
+    assert!(validation.err().unwrap().contains("unsupported country code"));
+    assert!(
+        GeoRestriction::new(&json!({
+            "db_path": path_text(&path),
+            "deny_countries": ["US"],
+            "on_lookup_failure": "deny"
+        }))
+        .is_err(),
+        "constructor admission must reject unsupported MMDB country codes"
+    );
 }
 
 #[test]
@@ -638,12 +716,16 @@ fn validate_mmdb_file_rejects_partial_corruption_after_open() {
 #[test]
 fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
     let source = include_str!("../../../src/plugins/geo_restriction.rs");
+    let config_source = include_str!("../../../src/config/types.rs");
     assert!(!source.contains("open_mmap"));
     assert!(!source.contains("Reader<Mmap>"));
     assert!(!source.contains("HashSet<String>"));
     assert!(!source.contains("Option<String>"));
     assert!(source.contains("decode_path(&maxminddb::path!"));
     assert!(source.contains("CountrySet"));
+    assert!(config_source.contains("try_reserve_exact(initial_capacity)"));
+    assert!(config_source.contains("validation_handoffs"));
+    assert!(config_source.contains("retain_for_plugin_construction"));
 }
 
 // --- validate_plugin_file_dependencies tests ---

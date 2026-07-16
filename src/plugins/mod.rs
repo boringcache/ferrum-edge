@@ -1677,7 +1677,10 @@ impl RequestContext {
                     // clients. Identity headers are injected after
                     // authentication; path-param headers are injected after
                     // route matching from regex captures.
-                    if matches!(key, "x-consumer-username" | "x-consumer-custom-id")
+                    if matches!(
+                        key,
+                        "x-consumer-username" | "x-consumer-custom-id" | "x-geo-country"
+                    )
                         || key.starts_with("x-path-param-")
                     {
                         continue;

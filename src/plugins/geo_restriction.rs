@@ -27,7 +27,8 @@ use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
 use crate::config::types::{
-    CountryMmdbLoadError, CountryMmdbSnapshot, load_validated_country_mmdb,
+    CountryMmdbLoadError, CountryMmdbSnapshot, SUPPORTED_GEO_COUNTRY_CODES,
+    load_validated_country_mmdb,
 };
 
 const GEO_COUNTRY_HEADER: &str = "x-geo-country";
@@ -38,40 +39,6 @@ const CONFIG_KEYS: &[&str] = &[
     "inject_headers",
     "on_lookup_failure",
 ];
-
-// Current ISO 3166-1 alpha-2 assignments plus XK, the user-assigned Kosovo code
-// emitted by MaxMind country-capable products. Other user-assigned, reserved,
-// deleted, and compatibility aliases are deliberately excluded so a policy
-// typo cannot become an effective-but-impossible rule.
-const SUPPORTED_COUNTRY_CODES: &[u8] = concat!(
-    "ADAEAFAGAIALAMAOAQARASATAUAWAXAZ",
-    "BABBBDBEBFBGBHBIBJBLBMBNBOBQBRBSBTBVBWBYBZ",
-    "CACCCDCFCGCHCICKCLCMCNCOCRCUCVCWCXCYCZ",
-    "DEDJDKDMDODZ",
-    "ECEEEGEHERESET",
-    "FIFJFKFMFOFR",
-    "GAGBGDGEGFGGGHGIGLGMGNGPGQGRGSGTGUGWGY",
-    "HKHMHNHRHTHU",
-    "IDIEILIMINIOIQIRISIT",
-    "JEJMJOJP",
-    "KEKGKHKIKMKNKPKRKWKYKZ",
-    "LALBLCLILKLRLSLTLULVLY",
-    "MAMCMDMEMFMGMHMKMLMMMNMOMPMQMRMSMTMUMVMWMXMYMZ",
-    "NANCNENFNGNINLNONPNRNUNZ",
-    "OM",
-    "PAPEPFPGPHPKPLPMPNPRPSPTPWPY",
-    "QA",
-    "RERORSRURW",
-    "SASBSCSDSESGSHSISJSKSLSMSNSOSRSSSTSVSXSYSZ",
-    "TCTDTFTGTHTJTKTLTMTNTOTRTTTVTWTZ",
-    "UAUGUMUSUYUZ",
-    "VAVCVEVGVIVNVU",
-    "WFWS",
-    "XK",
-    "YEYT",
-    "ZAZMZW",
-)
-.as_bytes();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CountryCode(u16);
@@ -94,7 +61,7 @@ impl CountryCode {
 
     fn is_supported(self) -> bool {
         let code = self.bytes();
-        SUPPORTED_COUNTRY_CODES
+        SUPPORTED_GEO_COUNTRY_CODES
             .chunks_exact(2)
             .any(|assigned| assigned == code.as_slice())
     }
@@ -299,6 +266,11 @@ impl GeoRestriction {
         };
         let code = CountryCode::parse(raw_code)
             .ok_or_else(|| format!("invalid country code in MaxMind record: {raw_code:?}"))?;
+        if !code.is_supported() {
+            return Err(format!(
+                "unsupported country code in MaxMind record: {raw_code:?}"
+            ));
+        }
         Ok(Some(code))
     }
 
@@ -510,15 +482,12 @@ impl Plugin for GeoRestriction {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        // The client never owns this gateway assertion. Remove every materialized
-        // inbound value before lookup so fail-open and multi-instance paths omit
-        // it unless this instance produces an authoritative replacement.
-        ctx.headers.remove(GEO_COUNTRY_HEADER);
         let (result, country) = self.check_ip(&ctx.client_ip);
 
-        // Header materialization happens before the plugin chain. Writing the
-        // authoritative value here avoids metadata collisions across multiple
-        // instances and does not require the before_proxy header-map clone path.
+        // Header materialization centrally strips every client-supplied value
+        // before the plugin chain. Writing the authoritative value here avoids
+        // metadata collisions and lets later non-injecting or fail-open geo
+        // instances preserve an assertion produced by an earlier instance.
         if self.inject_headers
             && matches!(&result, PluginResult::Continue)
             && let Some(code) = country

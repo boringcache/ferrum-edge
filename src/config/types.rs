@@ -58,6 +58,11 @@ pub const MAX_TAG_LENGTH: usize = 255;
 pub const MAX_LOCALITY_LENGTH: usize = 255;
 /// Maximum size of plugin config JSON in bytes.
 pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
+/// Maximum size of an owned country-capable MaxMind database snapshot.
+///
+/// This accommodates current GeoIP2 Enterprise MMDB releases while bounding
+/// admission-time allocation before any untrusted file contents are parsed.
+pub const MAX_COUNTRY_MMDB_SIZE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 /// Maximum OpenAPI validator config JSON size in bytes.
 ///
 /// Generated validator configs embed resolved operation schemas, so they need
@@ -85,6 +90,40 @@ pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
 pub const MIN_JWT_SECRET_LENGTH: usize = 32;
 /// Minimum length for hmac_auth shared secrets.
 pub const MIN_HMAC_SECRET_LENGTH: usize = 32;
+
+// Current ISO 3166-1 alpha-2 assignments plus XK, the user-assigned Kosovo
+// code emitted by MaxMind country-capable products. Keeping this list in the
+// config layer lets policy admission and MMDB record validation share exactly
+// one supported-code contract.
+pub(crate) const SUPPORTED_GEO_COUNTRY_CODES: &[u8] = concat!(
+    "ADAEAFAGAIALAMAOAQARASATAUAWAXAZ",
+    "BABBBDBEBFBGBHBIBJBLBMBNBOBQBRBSBTBVBWBYBZ",
+    "CACCCDCFCGCHCICKCLCMCNCOCRCUCVCWCXCYCZ",
+    "DEDJDKDMDODZ",
+    "ECEEEGEHERESET",
+    "FIFJFKFMFOFR",
+    "GAGBGDGEGFGGGHGIGLGMGNGPGQGRGSGTGUGWGY",
+    "HKHMHNHRHTHU",
+    "IDIEILIMINIOIQIRISIT",
+    "JEJMJOJP",
+    "KEKGKHKIKMKNKPKRKWKYKZ",
+    "LALBLCLILKLRLSLTLULVLY",
+    "MAMCMDMEMFMGMHMKMLMMMNMOMPMQMRMSMTMUMVMWMXMYMZ",
+    "NANCNENFNGNINLNONPNRNUNZ",
+    "OM",
+    "PAPEPFPGPHPKPLPMPNPRPSPTPWPY",
+    "QA",
+    "RERORSRURW",
+    "SASBSCSDSESGSHSISJSKSLSMSNSOSRSSSTSVSXSYSZ",
+    "TCTDTFTGTHTJTKTLTMTNTOTRTTTVTWTZ",
+    "UAUGUMUSUYUZ",
+    "VAVCVEVGVIVNVU",
+    "WFWS",
+    "XK",
+    "YEYT",
+    "ZAZMZW",
+)
+.as_bytes();
 
 /// Effective strength of an hmac_auth secret: whitespace does not count
 /// toward [`MIN_HMAC_SECRET_LENGTH`]. Shared by admission-time field
@@ -4880,6 +4919,10 @@ impl std::ops::Deref for CountryMmdbSnapshot {
 struct CountryMmdbCache {
     by_digest: HashMap<CountryMmdbDigest, Weak<CountryMmdbSnapshot>>,
     by_file_version: HashMap<CountryMmdbFileVersion, CountryMmdbDigest>,
+    /// One-shot strong references bridge full configuration validation to the
+    /// immediately following plugin-cache build. Construction consumes the
+    /// handoff, after which live plugin instances are the only strong owners.
+    validation_handoffs: HashMap<CountryMmdbFileVersion, Arc<CountryMmdbSnapshot>>,
 }
 
 impl CountryMmdbCache {
@@ -4902,6 +4945,31 @@ impl CountryMmdbCache {
         self.by_file_version
             .get(version)
             .and_then(|digest| self.get_by_digest(digest))
+    }
+
+    fn prepare_snapshot_return(
+        &mut self,
+        version: Option<&CountryMmdbFileVersion>,
+        snapshot: Arc<CountryMmdbSnapshot>,
+        retain_for_plugin_construction: bool,
+    ) -> Arc<CountryMmdbSnapshot> {
+        let Some(version) = version else {
+            return snapshot;
+        };
+
+        if retain_for_plugin_construction {
+            // A replaced file version must never keep the previous snapshot
+            // pinned. At most one validation handoff exists for each path.
+            self.validation_handoffs
+                .retain(|candidate, _| candidate.path != version.path || candidate == version);
+            self.validation_handoffs
+                .insert(version.clone(), Arc::clone(&snapshot));
+        } else {
+            // Plugin construction has acquired its own strong reference.
+            self.validation_handoffs.remove(version);
+        }
+
+        snapshot
     }
 }
 
@@ -4935,6 +5003,20 @@ fn is_mmdb_country_code(code: &str) -> bool {
     code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
+fn is_supported_mmdb_country_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_alphabetic) {
+        return false;
+    }
+    let normalized = [
+        bytes[0].to_ascii_uppercase(),
+        bytes[1].to_ascii_uppercase(),
+    ];
+    SUPPORTED_GEO_COUNTRY_CODES
+        .chunks_exact(2)
+        .any(|supported| supported == normalized.as_slice())
+}
+
 /// Load and comprehensively validate a MaxMind country-capable database into
 /// an owned immutable buffer.
 ///
@@ -4947,6 +5029,13 @@ fn is_mmdb_country_code(code: &str) -> bool {
 /// unchanged file and without keeping retired generations alive.
 pub fn load_validated_country_mmdb(
     path: &str,
+) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
+    load_validated_country_mmdb_inner(path, false)
+}
+
+fn load_validated_country_mmdb_inner(
+    path: &str,
+    retain_for_plugin_construction: bool,
 ) -> Result<Arc<CountryMmdbSnapshot>, CountryMmdbLoadError> {
     use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
@@ -4977,16 +5066,45 @@ pub fn load_validated_country_mmdb(
         if let Some(file_version) = file_version.as_ref()
             && let Some(reader) = cache.get_by_file_version(file_version)
         {
-            return Ok(reader);
+            return Ok(cache.prepare_snapshot_return(
+                Some(file_version),
+                reader,
+                retain_for_plugin_construction,
+            ));
         }
     }
 
+    if metadata.len() > MAX_COUNTRY_MMDB_SIZE_BYTES {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' is {} bytes; maximum supported size is {} bytes",
+            metadata.len(),
+            MAX_COUNTRY_MMDB_SIZE_BYTES
+        )));
+    }
+    let initial_capacity = usize::try_from(metadata.len()).map_err(|_| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' is too large for this platform"
+        ))
+    })?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|e| {
+    bytes.try_reserve_exact(initial_capacity).map_err(|e| {
+        CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' cannot reserve its bounded snapshot buffer: {e}"
+        ))
+    })?;
+    let mut bounded_reader = (&mut file).take(MAX_COUNTRY_MMDB_SIZE_BYTES + 1);
+    bounded_reader.read_to_end(&mut bytes).map_err(|e| {
         CountryMmdbLoadError::Unavailable(format!(
             "MaxMind database file '{path}' not readable: {e}"
         ))
     })?;
+    drop(bounded_reader);
+    if bytes.len() as u64 > MAX_COUNTRY_MMDB_SIZE_BYTES {
+        return Err(CountryMmdbLoadError::Invalid(format!(
+            "MaxMind database file '{path}' grew beyond the maximum supported size of {} bytes while loading",
+            MAX_COUNTRY_MMDB_SIZE_BYTES
+        )));
+    }
     let metadata_after_read = file.metadata().map_err(|e| {
         CountryMmdbLoadError::Unavailable(format!(
             "MaxMind database file '{path}' metadata not readable after load: {e}"
@@ -5007,10 +5125,14 @@ pub fn load_validated_country_mmdb(
         })?;
         cache.retain_live();
         if let Some(reader) = cache.get_by_digest(&digest) {
-            if let Some(file_version) = file_version {
-                cache.by_file_version.insert(file_version, digest);
+            if let Some(file_version) = file_version.as_ref() {
+                cache.by_file_version.insert(file_version.clone(), digest);
             }
-            return Ok(reader);
+            return Ok(cache.prepare_snapshot_return(
+                file_version.as_ref(),
+                reader,
+                retain_for_plugin_construction,
+            ));
         }
     }
 
@@ -5066,6 +5188,11 @@ pub fn load_validated_country_mmdb(
                     "MaxMind database file '{path}' contains an invalid country code {code:?}"
                 )));
             }
+            if !is_supported_mmdb_country_code(code) {
+                return Err(CountryMmdbLoadError::Invalid(format!(
+                    "MaxMind database file '{path}' contains unsupported country code {code:?}"
+                )));
+            }
             found_country_code = true;
         }
     }
@@ -5084,16 +5211,24 @@ pub fn load_validated_country_mmdb(
     })?;
     cache.retain_live();
     if let Some(cached) = cache.get_by_digest(&digest) {
-        if let Some(file_version) = file_version {
-            cache.by_file_version.insert(file_version, digest);
+        if let Some(file_version) = file_version.as_ref() {
+            cache.by_file_version.insert(file_version.clone(), digest);
         }
-        return Ok(cached);
+        return Ok(cache.prepare_snapshot_return(
+            file_version.as_ref(),
+            cached,
+            retain_for_plugin_construction,
+        ));
     }
-    if let Some(file_version) = file_version {
-        cache.by_file_version.insert(file_version, digest);
+    if let Some(file_version) = file_version.as_ref() {
+        cache.by_file_version.insert(file_version.clone(), digest);
     }
     cache.by_digest.insert(digest, Arc::downgrade(&reader));
-    Ok(reader)
+    Ok(cache.prepare_snapshot_return(
+        file_version.as_ref(),
+        reader,
+        retain_for_plugin_construction,
+    ))
 }
 
 /// Validate that a MaxMind `.mmdb` database file exists, is fully intact, and
@@ -5101,7 +5236,7 @@ pub fn load_validated_country_mmdb(
 /// a failure is fatal (file mode) or a warning (database mode); CP/DP skip this
 /// node-local dependency check.
 pub fn validate_mmdb_file(field_name: &str, path: &str) -> Result<(), String> {
-    load_validated_country_mmdb(path)
+    load_validated_country_mmdb_inner(path, true)
         .map(|_| ())
         .map_err(|error| format!("{field_name}: {error}"))
 }
