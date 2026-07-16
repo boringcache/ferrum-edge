@@ -56,6 +56,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("renew_namespace_config_admission_lease("));
     assert!(crud_source.contains("release_namespace_config_admission_lease("));
     assert!(crud_source.contains("guard.ensure_held()"));
+    assert!(crud_source.contains("guard.run_while_held(future).await?"));
+    assert!(crud_source.contains("drop(local);"));
 
     let graph_validation = crud_source
         .rfind("validate_transaction_log_schema_candidates(")
@@ -95,8 +97,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "credential, batch, and restore mutations must share namespace admission"
     );
     assert!(
-        batch_source.contains("admission_guard.ensure_held()"),
-        "credential persistence must recheck namespace admission after async validation"
+        batch_source.matches(".run_while_held(").count() >= 3,
+        "credential persistence must remain fenced after async validation"
     );
     let sql_store_source = include_str!("../../../src/config/db_loader.rs");
     assert!(sql_store_source.contains("config_admission_locks"));

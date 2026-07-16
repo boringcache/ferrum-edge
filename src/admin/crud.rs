@@ -5,6 +5,7 @@ use hyper::{Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -128,7 +129,7 @@ pub(crate) async fn lock_local_namespace_config_admission(
 }
 
 pub(crate) struct NamespaceConfigAdmissionGuard {
-    _local: MutexGuard<'static, ()>,
+    local: Option<MutexGuard<'static, ()>>,
     db: Option<Arc<dyn DatabaseBackend>>,
     namespace: String,
     owner: String,
@@ -137,6 +138,7 @@ pub(crate) struct NamespaceConfigAdmissionGuard {
     valid: Arc<AtomicBool>,
     lease_started_at: Instant,
     valid_until_millis: Arc<AtomicU64>,
+    lease_state_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 impl NamespaceConfigAdmissionGuard {
@@ -149,6 +151,39 @@ impl NamespaceConfigAdmissionGuard {
             Ok(())
         } else {
             anyhow::bail!("namespace config admission lease was lost before persistence")
+        }
+    }
+
+    pub(crate) async fn run_while_held<F, T>(&self, future: F) -> Result<T, anyhow::Error>
+    where
+        F: Future<Output = T>,
+    {
+        self.ensure_held()?;
+        let mut lease_state_rx = self.lease_state_rx.clone();
+        tokio::pin!(future);
+        loop {
+            let valid_until_millis = *lease_state_rx.borrow_and_update();
+            let elapsed_millis =
+                u64::try_from(self.lease_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if valid_until_millis == 0 || elapsed_millis >= valid_until_millis {
+                anyhow::bail!("namespace config admission lease was lost during persistence");
+            }
+            let remaining = Duration::from_millis(valid_until_millis - elapsed_millis);
+            tokio::select! {
+                biased;
+                changed = lease_state_rx.changed() => {
+                    if changed.is_err() {
+                        anyhow::bail!("namespace config admission lease monitor stopped during persistence");
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    anyhow::bail!("namespace config admission lease expired during persistence");
+                }
+                result = &mut future => {
+                    self.ensure_held()?;
+                    return Ok(result);
+                }
+            }
         }
     }
 }
@@ -164,6 +199,7 @@ impl Drop for NamespaceConfigAdmissionGuard {
         let namespace = std::mem::take(&mut self.namespace);
         let owner = std::mem::take(&mut self.owner);
         let renew_task = self.renew_task.take();
+        let local = self.local.take();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Some(task) = renew_task {
@@ -179,6 +215,7 @@ impl Drop for NamespaceConfigAdmissionGuard {
                         "Failed to release namespace config admission lease; expiry will recover it"
                     );
                 }
+                drop(local);
             });
         }
     }
@@ -211,6 +248,7 @@ pub(crate) async fn lock_namespace_config_admission(
         u64::try_from(CONFIG_ADMISSION_LEASE_DURATION.as_millis()).unwrap_or(u64::MAX);
     let valid_until_millis = Arc::new(AtomicU64::new(lease_duration_millis));
     let renew_valid_until_millis = valid_until_millis.clone();
+    let (lease_state_tx, lease_state_rx) = tokio::sync::watch::channel(lease_duration_millis);
     let renew_task = tokio::spawn(async move {
         let mut valid_until = lease_started_at + CONFIG_ADMISSION_LEASE_DURATION;
         loop {
@@ -241,10 +279,13 @@ pub(crate) async fn lock_namespace_config_admission(
                             elapsed_millis.saturating_add(lease_duration_millis),
                             Ordering::Release,
                         );
+                        let _ = lease_state_tx
+                            .send(elapsed_millis.saturating_add(lease_duration_millis));
                         break;
                     }
                     Ok(false) => {
                         renew_valid.store(false, Ordering::Release);
+                        let _ = lease_state_tx.send(0);
                         tracing::error!(
                             namespace = %renew_namespace,
                             "Namespace config admission lease renewal lost ownership"
@@ -254,6 +295,7 @@ pub(crate) async fn lock_namespace_config_admission(
                     Err(error) => {
                         if Instant::now() + CONFIG_ADMISSION_LEASE_RETRY_INTERVAL >= valid_until {
                             renew_valid.store(false, Ordering::Release);
+                            let _ = lease_state_tx.send(0);
                             tracing::error!(
                                 namespace = %renew_namespace,
                                 %error,
@@ -281,7 +323,7 @@ pub(crate) async fn lock_namespace_config_admission(
     });
 
     Ok(NamespaceConfigAdmissionGuard {
-        _local: local,
+        local: Some(local),
         db: Some(db),
         namespace: namespace.to_string(),
         owner,
@@ -290,7 +332,21 @@ pub(crate) async fn lock_namespace_config_admission(
         valid,
         lease_started_at,
         valid_until_millis,
+        lease_state_rx,
     })
+}
+
+async fn run_db_write_while_held<T, F>(
+    guard: Option<&NamespaceConfigAdmissionGuard>,
+    future: F,
+) -> DbResult<T>
+where
+    F: Future<Output = DbResult<T>>,
+{
+    match guard {
+        Some(guard) => guard.run_while_held(future).await?,
+        None => future.await,
+    }
 }
 
 async fn validate_transaction_log_schema_graph_on_blocking_pool(
@@ -1098,12 +1154,12 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         return Ok(map_after_validate_error::<R>(error));
     }
 
-    if let Some(guard) = _namespace_config_admission_guard.as_ref()
-        && let Err(error) = guard.ensure_held()
+    match run_db_write_while_held(
+        _namespace_config_admission_guard.as_ref(),
+        R::db_delete(db, namespace, id),
+    )
+    .await
     {
-        return Ok(R::map_precheck_db_error(&error));
-    }
-    match R::db_delete(db, namespace, id).await {
         Ok(true) => {
             let event = AuditEvent::new(
                 actor,
@@ -3354,18 +3410,23 @@ async fn handle_write<R: AdminResource>(
         }
     }
 
-    if let Some(guard) = _namespace_config_admission_guard.as_ref()
-        && let Err(error) = guard.ensure_held()
-    {
-        return Ok(R::map_precheck_db_error(&error));
-    }
     match action {
         WriteAction::Create => {
-            if let Err(error) = R::db_create(db, &resource).await {
+            if let Err(error) = run_db_write_while_held(
+                _namespace_config_admission_guard.as_ref(),
+                R::db_create(db, &resource),
+            )
+            .await
+            {
                 return Ok(R::map_persist_db_error(&error, action));
             }
         }
-        WriteAction::Update { .. } => match R::db_update(db, &resource).await {
+        WriteAction::Update { .. } => match run_db_write_while_held(
+            _namespace_config_admission_guard.as_ref(),
+            R::db_update(db, &resource),
+        )
+        .await
+        {
             // The row vanished between the precheck and the write (concurrent
             // delete). The backend recorded no change — report not-found
             // rather than a phantom success (issue #2122 DB-M4).
