@@ -639,6 +639,15 @@ async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
     });
     let (status, body) = post_json(&base, "/consumers", &admin, &consumer).await;
     assert_eq!(status, 201, "consumer create failed: {body:?}");
+    // Audit persistence is asynchronous. Observe the consumer event before
+    // starting another write so the two-connection SQLite pool does not race.
+    wait_for_audit_total(
+        &base,
+        "/audit?resource_type=consumer&resource_id=audit-keyauth-consumer",
+        &admin,
+        1,
+    )
+    .await;
 
     let plaintext_key = "super-secret-keyauth-api-key-do-not-leak";
     let cred = json!([{ "key": plaintext_key }]);
