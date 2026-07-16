@@ -246,14 +246,28 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
         .expect("proxy port ready");
 
     // The binary harness disables pool warmup, so file-mode startup performs
-    // one asynchronous h2c capability probe against the shared backend. Wait
-    // for and classify that preface before asserting request-driven traffic;
-    // otherwise it races the first spec request and looks like a route leak.
+    // asynchronous h2c capability discovery against the shared backend. A
+    // refresh/pool lifecycle can open more than one prior-knowledge connection;
+    // wait until those prefaces have settled, then preserve that count as the
+    // startup baseline. The routing contract below is that spec requests add
+    // neither an HTTP/1 backend hit nor another h2c connection.
     let probe_deadline = Instant::now() + Duration::from_secs(5);
-    while backend.h2c_probes() == 0 && Instant::now() < probe_deadline {
+    let probe_quiet_period = Duration::from_millis(500);
+    let mut startup_h2c_probes = backend.h2c_probes();
+    let mut probes_stable_since = Instant::now();
+    while startup_h2c_probes == 0 || probes_stable_since.elapsed() < probe_quiet_period {
+        assert!(
+            Instant::now() < probe_deadline,
+            "startup h2c probes did not settle (observed {startup_h2c_probes})"
+        );
         sleep(Duration::from_millis(10)).await;
+        let observed = backend.h2c_probes();
+        if observed != startup_h2c_probes {
+            startup_h2c_probes = observed;
+            probes_stable_since = Instant::now();
+        }
     }
-    assert_eq!(backend.h2c_probes(), 1);
+    assert!(startup_h2c_probes > 0);
     assert_eq!(backend.hits(), 0);
 
     let h1 = reqwest::Client::builder()
@@ -272,6 +286,7 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
     assert!(h1_head.bytes().await.expect("H1 HEAD body").is_empty());
     assert_eq!(origin.hits(), 1);
     assert_eq!(backend.hits(), 0);
+    assert_eq!(backend.h2c_probes(), startup_h2c_probes);
 
     let h1_get = h1.get(&canonical).send().await.expect("H1 GET");
     assert_eq!(h1_get.status(), reqwest::StatusCode::OK);
@@ -359,6 +374,7 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
     assert_eq!(h3_blocked.status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(origin.hits(), 1);
     assert_eq!(backend.hits(), 1);
+    assert_eq!(backend.h2c_probes(), startup_h2c_probes);
 
     gateway.shutdown();
 }
