@@ -1292,10 +1292,10 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
 #[tokio::test]
 async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
     let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
-        cookies: "non_ldh=staged; Domain=foo_bar.example; Path=/\nip_literal=staged; Domain=[0:0:0:0:0:0:0:1]; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_same=staged; Secure; pArTiTiOnEd; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/",
+        cookies: "non_ldh=staged; Domain=foo_bar.example; Path=/\nip_literal=staged; Domain=[0:0:0:0:0:0:0:1]; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_same=staged; Secure; pArTiTiOnEd; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/\ntrailing_dot=staged; Path=/\ntrailing_dot_prior=staged; Domain=example.com; Path=/",
     });
     let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
-        cookies: "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/",
+        cookies: "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\ntrailing_dot=selected; Domain=example.com.; Path=/\ntrailing_dot_prior=selected; Domain=example.com; Domain=other.example.; Path=/",
     });
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
@@ -1313,7 +1313,7 @@ async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some(
-            "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/"
+            "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\ntrailing_dot=selected; Domain=example.com.; Path=/\ntrailing_dot_prior=selected; Domain=example.com; Domain=other.example.; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/"
         )
     );
 }
@@ -1376,10 +1376,10 @@ async fn test_auth_rejection_cookie_storage_key_matches_user_agent_value_parsing
 #[tokio::test]
 async fn test_auth_rejection_cookie_storage_key_uses_non_root_default_path_and_cookie_ows() {
     let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
-        cookies: "same=staged; Path=/app\nroot=staged; Path=/\nslash=staged; Path=/app/\nnbsp=staged; Path=/app",
+        cookies: "same=staged; Path=/app\nroot=staged; Path=/\nslash=staged; Path=/app/\nnbsp=staged; Path=/app\nbare=staged; Path=/app",
     });
     let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
-        cookies: "same=selected\nroot=selected\nslash=selected\nnbsp=selected; Path=\u{00a0}/ignored",
+        cookies: "same=selected\nroot=selected\nslash=selected\nnbsp=selected; Path=\u{00a0}/ignored\nbare=selected; Path=/other; Path",
     });
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
@@ -1397,7 +1397,7 @@ async fn test_auth_rejection_cookie_storage_key_uses_non_root_default_path_and_c
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some(
-            "same=selected\nroot=selected\nslash=selected\nnbsp=selected; Path=\u{00a0}/ignored\nroot=staged; Path=/\nslash=staged; Path=/app/"
+            "same=selected\nroot=selected\nslash=selected\nnbsp=selected; Path=\u{00a0}/ignored\nbare=selected; Path=/other; Path\nroot=staged; Path=/\nslash=staged; Path=/app/"
         )
     );
 }

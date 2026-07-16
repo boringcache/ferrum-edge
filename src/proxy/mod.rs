@@ -14661,19 +14661,22 @@ fn set_cookie_storage_key<'a>(
         } else if attribute_name.eq_ignore_ascii_case("domain")
             && let Some(attribute_value) = attribute_value
         {
-            if !attribute_value.is_empty() {
+            // Empty and trailing-dot Domain attributes are ignored by user
+            // agents, leaving any earlier valid Domain attribute effective.
+            if !attribute_value.is_empty() && !attribute_value.ends_with('.') {
                 domain_attribute = Some(attribute_value);
             }
-        } else if attribute_name.eq_ignore_ascii_case("path")
-            && let Some(attribute_value) = attribute_value
-        {
-            path_attribute = Some(attribute_value);
+        } else if attribute_name.eq_ignore_ascii_case("path") {
+            // A bare Path is the last Path attribute with an empty value, so
+            // it supersedes an earlier value and resolves to default_path.
+            path_attribute = Some(attribute_value.unwrap_or(""));
         }
     }
 
     // RFC 6265 uses the last Domain/Path attribute. An empty Domain attribute
-    // is ignored, and an invalid Path attribute falls back to the request's
-    // default path. Other malformed domain forms remain non-comparable.
+    // and a trailing-dot Domain attribute are ignored, and an invalid Path
+    // attribute falls back to the request's default path. Other malformed
+    // domain forms remain non-comparable.
     let (domain, host_only) = match domain_attribute {
         Some(domain) => (Some(canonical_set_cookie_domain(domain)?), false),
         None => (None, true),
