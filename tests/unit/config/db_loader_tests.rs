@@ -8,7 +8,7 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, is_incremental_full_reload_required,
     is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
-    is_tcp_connection_throttle_attachment_conflict,
+    tcp_connection_throttle_attachment_conflict,
 };
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
@@ -746,7 +746,7 @@ async fn deleting_last_tcp_proxy_rolls_back_authoritative_plugin_graph_candidate
         .await
         .expect_err("changing the final TCP target to HTTP must be rejected");
     assert!(
-        is_tcp_connection_throttle_attachment_conflict(&update_error),
+        tcp_connection_throttle_attachment_conflict(&update_error).is_some(),
         "unexpected proxy update rejection: {update_error:#}"
     );
     assert!(
@@ -763,7 +763,7 @@ async fn deleting_last_tcp_proxy_rolls_back_authoritative_plugin_graph_candidate
         .await
         .expect_err("deleting the final supported target must be rejected before commit");
     assert!(
-        is_tcp_connection_throttle_attachment_conflict(&error),
+        tcp_connection_throttle_attachment_conflict(&error).is_some(),
         "unexpected delete rejection: {error:#}"
     );
     assert!(
@@ -796,7 +796,7 @@ async fn enabling_global_tcp_throttle_rolls_back_for_unsupported_only_graph() {
         .await
         .expect_err("enabling a global throttle with only HTTP targets must be rejected");
     assert!(
-        is_tcp_connection_throttle_attachment_conflict(&error),
+        tcp_connection_throttle_attachment_conflict(&error).is_some(),
         "unexpected plugin update rejection: {error:#}"
     );
     assert!(
@@ -847,7 +847,7 @@ async fn independent_sqlite_stores_serialize_tcp_throttle_and_proxy_graph_admiss
     );
     let conflict = proxy_result.err().or_else(|| plugin_result.err()).unwrap();
     assert!(
-        is_tcp_connection_throttle_attachment_conflict(&conflict),
+        tcp_connection_throttle_attachment_conflict(&conflict).is_some(),
         "unexpected losing mutation: {conflict:#}"
     );
     let candidate = store_a.load_namespace_snapshot("ferrum").await.unwrap();

@@ -43,7 +43,7 @@ use ferrum_edge::{
     config::{
         db_backend::{
             ApiSpecListFilter, ApiSpecSortBy, SortOrder,
-            is_tcp_connection_throttle_attachment_conflict,
+            tcp_connection_throttle_attachment_conflict,
         },
         db_loader::{DatabaseStore, DbPoolConfig},
         types::{
@@ -1164,7 +1164,7 @@ async fn delete_api_spec_rejects_removing_last_global_tcp_throttle_target() {
         .await
         .expect_err("the API-spec cascade must not remove the final TCP target");
     assert!(
-        is_tcp_connection_throttle_attachment_conflict(&error),
+        tcp_connection_throttle_attachment_conflict(&error).is_some(),
         "unexpected API-spec delete rejection: {error:#}"
     );
     assert!(store.get_api_spec(ns, &spec_id).await.unwrap().is_some());

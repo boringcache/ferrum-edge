@@ -152,10 +152,6 @@ pub fn tcp_connection_throttle_attachment_conflict(
         .find_map(|cause| cause.downcast_ref::<TcpConnectionThrottleAttachmentConflict>())
 }
 
-pub fn is_tcp_connection_throttle_attachment_conflict(error: &anyhow::Error) -> bool {
-    tcp_connection_throttle_attachment_conflict(error).is_some()
-}
-
 // ---------------------------------------------------------------------------
 // ApiSpec list filter types (Wave 5)
 // ---------------------------------------------------------------------------
