@@ -1057,12 +1057,13 @@ pub(crate) fn canonicalize_exact_origin(origin: &str) -> Result<String, String> 
     // backslash path separators cannot collapse to `/` and then be serialized
     // as permission for the whole origin. An empty authority is left for the
     // hostname-specific diagnostic below.
-    if let Some((authority, post_authority)) = split_raw_authority(origin) {
-        if !authority.is_empty() && !post_authority.is_empty() {
-            return Err(format!(
-                "cors: origin must be scheme://host[:port] without path, query, or fragment: {origin}"
-            ));
-        }
+    if let Some((authority, post_authority)) = split_raw_authority(origin)
+        && !authority.is_empty()
+        && !post_authority.is_empty()
+    {
+        return Err(format!(
+            "cors: origin must be scheme://host[:port] without path, query, or fragment: {origin}"
+        ));
     }
 
     let url = Url::parse(origin).map_err(|e| format!("cors: invalid origin '{origin}': {e}"))?;
@@ -1099,12 +1100,8 @@ fn has_non_empty_authority(origin: &str) -> bool {
 }
 
 fn split_raw_authority(origin: &str) -> Option<(&str, &str)> {
-    let Some((_, after_scheme)) = origin.split_once(':') else {
-        return None;
-    };
-    let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
-        return None;
-    };
+    let (_, after_scheme) = origin.split_once(':')?;
+    let authority_and_path = after_scheme.strip_prefix("//")?;
     let authority_end = authority_and_path
         .find(['/', '\\', '?', '#'])
         .unwrap_or(authority_and_path.len());
