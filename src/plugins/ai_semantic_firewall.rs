@@ -2405,11 +2405,15 @@ impl Plugin for AiSemanticFirewall {
             if self.response_hash(ctx) == Some(decoded_hash.as_str()) {
                 return PluginResult::Continue;
             }
-            // Once decoded bytes have a JSON shape, parse them with JSON
-            // candidate semantics even if the origin mislabeled the media
-            // type as another candidate such as text/event-stream. Shape must
-            // win here so bare JSON cannot be routed through the SSE parser.
-            let decoded_content_type = if decoded_looks_like_json {
+            // A bare JSON document mislabeled as an event stream still needs
+            // JSON extraction. Do not rely on its first byte alone, though:
+            // valid SSE may begin with an ignored JSON-looking field before
+            // later `data:` frames. Preserve the SSE parser unless the entire
+            // decoded representation is one JSON document.
+            let decoded_is_json_document = decoded_looks_like_json
+                && (!is_event_stream_content_type(content_type)
+                    || serde_json::from_slice::<Value>(strip_json_bom(&decoded)).is_ok());
+            let decoded_content_type = if decoded_is_json_document {
                 "application/json"
             } else {
                 content_type

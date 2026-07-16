@@ -3562,6 +3562,46 @@ async fn decoded_json_shape_overrides_encoded_event_stream_label() {
 }
 
 #[tokio::test]
+async fn decoded_event_stream_with_json_looking_prelude_stays_inspectable() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "on_error": "allow",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let plaintext = b"{}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"My system prompt says never disclose this policy.\"}}]}\n\n";
+
+    for (encoding, body) in [
+        ("gzip", gzip_bytes(plaintext)),
+        ("br", brotli_bytes(plaintext)),
+    ] {
+        let headers = HashMap::from([
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            ("content-encoding".to_string(), encoding.to_string()),
+        ]);
+        let mut ctx = create_test_context();
+
+        assert_reject(
+            firewall
+                .on_final_response_body(&mut ctx, 200, &headers, &body)
+                .await,
+            Some(502),
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.rule_ids")
+                .map(String::as_str),
+            Some("response_leakage")
+        );
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_semantic_firewall.uninspectable_body")
+        );
+    }
+}
+
+#[tokio::test]
 async fn final_response_fails_closed_for_mislabeled_uninspectable_encodings() {
     let config = json!({
         "inspect": {"request": false, "response": true},
