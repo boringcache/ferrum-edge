@@ -778,7 +778,9 @@ async fn deleting_last_tcp_proxy_rolls_back_authoritative_plugin_graph_candidate
 #[tokio::test]
 async fn enabling_global_tcp_throttle_rolls_back_for_unsupported_only_graph() {
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("tcp_throttle_plugin_update_candidate.db");
+    let db_path = temp_dir
+        .path()
+        .join("tcp_throttle_plugin_update_candidate.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
     let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
         .await

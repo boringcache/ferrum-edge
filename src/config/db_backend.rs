@@ -147,9 +147,9 @@ impl std::error::Error for TcpConnectionThrottleAttachmentConflict {}
 pub fn tcp_connection_throttle_attachment_conflict(
     error: &anyhow::Error,
 ) -> Option<&TcpConnectionThrottleAttachmentConflict> {
-    error.chain().find_map(|cause| {
-        cause.downcast_ref::<TcpConnectionThrottleAttachmentConflict>()
-    })
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<TcpConnectionThrottleAttachmentConflict>())
 }
 
 pub fn is_tcp_connection_throttle_attachment_conflict(error: &anyhow::Error) -> bool {

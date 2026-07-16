@@ -250,9 +250,9 @@ pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(
     candidate
         .proxies
         .retain(|proxy| proxy.id != removed_proxy_id);
-    candidate.plugin_configs.retain(|plugin| {
-        plugin.proxy_id.as_deref() != Some(removed_proxy_id)
-    });
+    candidate
+        .plugin_configs
+        .retain(|plugin| plugin.proxy_id.as_deref() != Some(removed_proxy_id));
 
     let remaining_associations: HashSet<String> = candidate
         .proxies

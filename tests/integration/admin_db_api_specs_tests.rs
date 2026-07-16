@@ -1136,10 +1136,7 @@ async fn delete_api_spec_rejects_removing_last_global_tcp_throttle_target() {
         plugins: Vec::new(),
     };
     let spec = make_spec(&spec_id, &tcp_proxy_id, ns, b"tcp spec");
-    store
-        .submit_api_spec_bundle(&bundle, &spec)
-        .await
-        .unwrap();
+    store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
     store
         .create_proxy(&make_proxy(&http_proxy_id, ns))
         .await

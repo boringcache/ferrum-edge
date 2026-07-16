@@ -27,9 +27,7 @@ fn mongo_method(name: &str) -> &str {
     let marker = format!("        async fn {name}");
     let start = MONGO_STORE_SOURCE.find(&marker).unwrap();
     let tail = &MONGO_STORE_SOURCE[start + marker.len()..];
-    let end = tail
-        .find("\n        async fn ")
-        .unwrap_or(tail.len());
+    let end = tail.find("\n        async fn ").unwrap_or(tail.len());
     &MONGO_STORE_SOURCE[start..start + marker.len() + end]
 }
 
