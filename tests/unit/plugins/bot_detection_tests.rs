@@ -786,7 +786,10 @@ async fn test_native_grpc_rejection_is_normalized_without_json_body() {
     );
     assert_eq!(normalized.http_status, StatusCode::OK);
     assert!(normalized.body.is_empty());
-    assert_eq!(normalized.grpc_status, Some(grpc_status::RESOURCE_EXHAUSTED));
+    assert_eq!(
+        normalized.grpc_status,
+        Some(grpc_status::RESOURCE_EXHAUSTED)
+    );
     assert_eq!(normalized.grpc_message.as_deref(), Some("Forbidden"));
     assert_eq!(
         normalized.headers.get("content-type").map(String::as_str),

@@ -210,9 +210,7 @@ fn parse_response_code(config: &Map<String, Value>) -> Result<u16, String> {
         Some(Value::Number(value)) => {
             let code = value.as_u64().or_else(|| {
                 let code = value.as_f64()?;
-                (code.is_finite()
-                    && code.fract() == 0.0
-                    && (400.0..=599.0).contains(&code))
+                (code.is_finite() && code.fract() == 0.0 && (400.0..=599.0).contains(&code))
                     .then_some(code as u64)
             });
             let Some(code) = code else {
