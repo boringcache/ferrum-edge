@@ -2865,10 +2865,6 @@ impl DatabaseStore {
         Ok(())
     }
 
-    pub async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error> {
-        self.update_consumer_for_guard(consumer, None).await
-    }
-
     async fn update_consumer_for_guard(
         &self,
         consumer: &Consumer,

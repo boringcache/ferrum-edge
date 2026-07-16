@@ -465,7 +465,7 @@ async fn consumer_credential_index_enforces_namespace_scoped_hmac_uniqueness() {
         .credentials
         .insert("hmac_auth".to_string(), json!([{ "secret": secret }]));
     store
-        .update_consumer(&rotating)
+        .update_consumer(&rotating, &BatchConfigWriteMode::Admission)
         .await
         .expect_err("a conflicting HMAC update must roll back atomically");
     let stored = store.get_consumer("tenant-a", "c3").await.unwrap().unwrap();
@@ -496,7 +496,12 @@ async fn incremental_consumer_change_requires_full_reload_for_hmac_rehydration()
         "hmac_auth".to_string(),
         json!([{ "secret": "repaired-hmac-secret-at-least-32-characters" }]),
     );
-    assert!(store.update_consumer(&consumer).await.unwrap());
+    assert!(
+        store
+            .update_consumer(&consumer, &BatchConfigWriteMode::Admission)
+            .await
+            .unwrap()
+    );
 
     let error = match store
         .load_incremental_config("ferrum", accepted_sequence)
@@ -736,7 +741,9 @@ async fn independent_sqlite_stores_atomically_serialize_policy_association_and_i
         },
         async {
             barrier_b.wait().await;
-            store_b.update_consumer(&rotated_consumer).await
+            store_b
+                .update_consumer(&rotated_consumer, &BatchConfigWriteMode::Admission)
+                .await
         }
     );
 
@@ -1012,7 +1019,10 @@ async fn consumer_credential_index_updates_on_consumer_update() {
         "mtls_auth".to_string(),
         json!([{ "identity": "spiffe://example.test/ns/default/sa/alice-v2" }]),
     );
-    store.update_consumer(&consumer).await.unwrap();
+    store
+        .update_consumer(&consumer, &BatchConfigWriteMode::Admission)
+        .await
+        .unwrap();
 
     assert!(
         store
