@@ -1165,6 +1165,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     );
 
     for (plugin_name, config) in [
+        ("bot_detection", json!({})),
         ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
         (
             "fault_injection",
@@ -1192,6 +1193,9 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     }
 
     for (plugin_name, config) in [
+        ("bot_detection", None),
+        ("bot_detection", Some(serde_json::Value::Null)),
+        ("bot_detection", Some(json!([]))),
         ("udp_rate_limiting", None),
         ("udp_rate_limiting", Some(json!({}))),
         ("fault_injection", None),

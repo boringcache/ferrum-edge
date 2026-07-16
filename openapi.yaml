@@ -6950,6 +6950,7 @@ components:
               plugin_name:
                 const: bot_detection
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/BotDetectionConfig"
