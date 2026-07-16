@@ -1632,7 +1632,10 @@ async fn api_spec_exact_put_validates_removed_spec_owned_schema_definitions() {
         reqwest::StatusCode::UNPROCESSABLE_ENTITY,
         "removing the spec-owned definition must validate retained referrers: {put_body}"
     );
-    assert!(put_body.to_string().contains("unknown schema"), "{put_body}");
+    assert!(
+        put_body.to_string().contains("unknown schema"),
+        "{put_body}"
+    );
     let owned_plugins = store
         .list_spec_owned_plugin_configs("ferrum", &spec_id)
         .await
