@@ -535,13 +535,8 @@ async fn recover_late_resource_write<R: AdminResource>(
         &action,
         LateResourceWrite::Update { .. } | LateResourceWrite::Delete { .. }
     ) && matches!(
-        R::intervening_write_recovery(
-            db.as_ref(),
-            namespace,
-            recovery.previous,
-            http_client,
-        )
-        .await?,
+        R::intervening_write_recovery(db.as_ref(), namespace, recovery.previous, http_client,)
+            .await?,
         InterveningWriteRecovery::KeepCurrent
     ) {
         return Ok(false);
@@ -560,9 +555,7 @@ async fn recover_late_resource_write<R: AdminResource>(
                         namespace,
                         &current,
                         written,
-                        recovery
-                            .delete_snapshots
-                            .map(|snapshots| snapshots.config),
+                        recovery.delete_snapshots.map(|snapshots| snapshots.config),
                     )
                     .await?
                     && !R::db_delete(db.as_ref(), namespace, written.id()).await?
@@ -597,9 +590,7 @@ async fn recover_late_resource_write<R: AdminResource>(
                         db.as_ref(),
                         namespace,
                         previous,
-                        recovery
-                            .delete_snapshots
-                            .map(|snapshots| snapshots.config),
+                        recovery.delete_snapshots.map(|snapshots| snapshots.config),
                         recovery
                             .delete_snapshots
                             .and_then(|snapshots| snapshots.api_spec),
