@@ -16,18 +16,19 @@ pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
 
 /// Durable cross-process fence for namespace-scoped config admission.
 ///
-/// Implementations atomically claim a namespace for `owner`, renew only while
-/// that owner still holds the unexpired lease, and release only on an exact
-/// owner match. Admin validation keeps a process-local mutex as a cheap first
-/// tier, while this lease closes races between writable gateway instances that
-/// share the same datastore.
+/// Implementations atomically claim a namespace for `owner` and return the
+/// claim's persistent monotonic generation, renew only while that owner still
+/// holds the unexpired lease, and release only on an exact owner match. Admin
+/// validation keeps a process-local mutex as a cheap first tier, while this
+/// lease closes races between writable gateway instances that share the same
+/// datastore.
 #[async_trait]
 pub trait NamespaceConfigAdmissionLeaseBackend: Send + Sync {
     async fn try_acquire_namespace_config_admission_lease(
         &self,
         namespace: &str,
         owner: &str,
-    ) -> Result<bool, anyhow::Error>;
+    ) -> Result<Option<u64>, anyhow::Error>;
 
     async fn renew_namespace_config_admission_lease(
         &self,

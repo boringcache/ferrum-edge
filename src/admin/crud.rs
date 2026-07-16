@@ -133,6 +133,7 @@ pub(crate) struct NamespaceConfigAdmissionGuard {
     db: Option<Arc<dyn DatabaseBackend>>,
     namespace: String,
     owner: String,
+    generation: u64,
     stop_tx: Option<tokio::sync::watch::Sender<bool>>,
     renew_task: Option<tokio::task::JoinHandle<()>>,
     valid: Arc<AtomicBool>,
@@ -147,6 +148,14 @@ pub(crate) enum NamespaceConfigAdmissionCompletion<T> {
 }
 
 impl NamespaceConfigAdmissionGuard {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn immediately_succeeds_generation(&self, previous: u64) -> bool {
+        previous.checked_add(1) == Some(self.generation)
+    }
+
     pub(crate) fn ensure_held(&self) -> Result<(), anyhow::Error> {
         let elapsed_millis =
             u64::try_from(self.lease_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -156,39 +165,6 @@ impl NamespaceConfigAdmissionGuard {
             Ok(())
         } else {
             anyhow::bail!("namespace config admission lease was lost before persistence")
-        }
-    }
-
-    pub(crate) async fn run_while_held<F, T>(&self, future: F) -> Result<T, anyhow::Error>
-    where
-        F: Future<Output = T>,
-    {
-        self.ensure_held()?;
-        let mut lease_state_rx = self.lease_state_rx.clone();
-        tokio::pin!(future);
-        loop {
-            let valid_until_millis = *lease_state_rx.borrow_and_update();
-            let elapsed_millis =
-                u64::try_from(self.lease_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            if valid_until_millis == 0 || elapsed_millis >= valid_until_millis {
-                anyhow::bail!("namespace config admission lease was lost during persistence");
-            }
-            let remaining = Duration::from_millis(valid_until_millis - elapsed_millis);
-            tokio::select! {
-                biased;
-                changed = lease_state_rx.changed() => {
-                    if changed.is_err() {
-                        anyhow::bail!("namespace config admission lease monitor stopped during persistence");
-                    }
-                }
-                _ = tokio::time::sleep(remaining) => {
-                    anyhow::bail!("namespace config admission lease expired during persistence");
-                }
-                result = &mut future => {
-                    self.ensure_held()?;
-                    return Ok(result);
-                }
-            }
         }
     }
 
@@ -304,13 +280,13 @@ pub(crate) async fn lock_namespace_config_admission(
 ) -> Result<NamespaceConfigAdmissionGuard, anyhow::Error> {
     let local = lock_local_namespace_config_admission(namespace).await;
     let owner = Uuid::new_v4().to_string();
-    let lease_started_at = loop {
+    let (lease_started_at, generation) = loop {
         let attempt_started_at = Instant::now();
-        if db
+        if let Some(generation) = db
             .try_acquire_namespace_config_admission_lease(namespace, &owner)
             .await?
         {
-            break attempt_started_at;
+            break (attempt_started_at, generation);
         }
         tokio::time::sleep(CONFIG_ADMISSION_LEASE_RETRY_INTERVAL).await;
     };
@@ -404,6 +380,7 @@ pub(crate) async fn lock_namespace_config_admission(
         db: Some(db),
         namespace: namespace.to_string(),
         owner,
+        generation,
         stop_tx: Some(stop_tx),
         renew_task: Some(renew_task),
         valid,
@@ -421,7 +398,15 @@ where
     F: Future<Output = DbResult<T>>,
 {
     match guard {
-        Some(guard) => guard.run_while_held(future).await?,
+        Some(guard) => match guard.run_to_completion_while_held(future).await? {
+            NamespaceConfigAdmissionCompletion::Held(result) => result,
+            NamespaceConfigAdmissionCompletion::Lost { result, error } => match result {
+                Ok(_) => Err(error),
+                Err(persistence_error) => Err(anyhow::anyhow!(
+                    "{persistence_error}; namespace config admission was also lost: {error}"
+                )),
+            },
+        },
         None => future.await,
     }
 }

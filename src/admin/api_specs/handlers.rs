@@ -14,6 +14,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
+use std::future::Future;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -110,6 +111,37 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
         ApiSpecError::NotFound
     } else {
         ApiSpecError::Internal(msg.to_string())
+    }
+}
+
+async fn run_api_spec_persistence_while_held<T, F>(
+    guard: &crate::admin::crud::NamespaceConfigAdmissionGuard,
+    future: F,
+) -> Result<T, ApiSpecError>
+where
+    F: Future<Output = Result<T, anyhow::Error>>,
+{
+    match guard.run_to_completion_while_held(future).await {
+        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(result)) => {
+            result.map_err(classify_db_error)
+        }
+        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => {
+            tracing::warn!(
+                %error,
+                "API-spec persistence completed after namespace config admission was lost"
+            );
+            match result {
+                Ok(_) => Err(ApiSpecError::NoDatabase),
+                Err(error) => Err(classify_db_error(error)),
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "API-spec persistence could not start with namespace config admission held"
+            );
+            Err(ApiSpecError::NoDatabase)
+        }
     }
 }
 
@@ -2391,7 +2423,10 @@ pub async fn handle_post_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => return Ok(error_response(classify_db_error(error))),
+            Err(error) => {
+                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+                return Ok(error_response(ApiSpecError::NoDatabase));
+            }
         };
 
     // Validate: field checks + DB cross-checks (listen_path uniqueness, etc.)
@@ -2424,16 +2459,13 @@ pub async fn handle_post_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    let persistence = match _namespace_config_admission_guard
-        .run_while_held(db.submit_api_spec_bundle(&bundle, &spec))
-        .await
+    if let Err(error) = run_api_spec_persistence_while_held(
+        &_namespace_config_admission_guard,
+        db.submit_api_spec_bundle(&bundle, &spec),
+    )
+    .await
     {
-        Ok(result) => result,
-        Err(error) => return Ok(error_response(classify_db_error(error))),
-    };
-    match persistence {
-        Ok(()) => {}
-        Err(e) => return Ok(error_response(classify_db_error(e))),
+        return Ok(error_response(error));
     }
 
     let resp_body = json!({
@@ -2514,7 +2546,10 @@ pub async fn handle_put_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => return Ok(error_response(classify_db_error(error))),
+            Err(error) => {
+                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+                return Ok(error_response(ApiSpecError::NoDatabase));
+            }
         };
     let existing_spec = match db.get_api_spec(namespace, id).await {
         Ok(Some(spec)) => spec,
@@ -2611,16 +2646,13 @@ pub async fn handle_put_api_spec(
     // Preserve original created_at
     spec.created_at = existing_spec.created_at;
 
-    let persistence = match _namespace_config_admission_guard
-        .run_while_held(db.replace_api_spec_bundle(&bundle, &spec))
-        .await
+    if let Err(error) = run_api_spec_persistence_while_held(
+        &_namespace_config_admission_guard,
+        db.replace_api_spec_bundle(&bundle, &spec),
+    )
+    .await
     {
-        Ok(result) => result,
-        Err(error) => return Ok(error_response(classify_db_error(error))),
-    };
-    match persistence {
-        Ok(()) => {}
-        Err(e) => return Ok(error_response(classify_db_error(e))),
+        return Ok(error_response(error));
     }
 
     let resp_body = json!({
@@ -2795,7 +2827,10 @@ pub async fn handle_delete_api_spec(
     let _namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
-            Err(error) => return Ok(error_response(classify_db_error(error))),
+            Err(error) => {
+                tracing::warn!(%error, "Failed to acquire API-spec namespace admission lease");
+                return Ok(error_response(ApiSpecError::NoDatabase));
+            }
         };
 
     let existing = match db.get_api_spec(namespace, id).await {
@@ -2831,39 +2866,39 @@ pub async fn handle_delete_api_spec(
         }
     }
 
-    let persistence = match _namespace_config_admission_guard
-        .run_while_held(db.delete_api_spec(namespace, id))
-        .await
+    let persistence = match run_api_spec_persistence_while_held(
+        &_namespace_config_admission_guard,
+        db.delete_api_spec(namespace, id),
+    )
+    .await
     {
         Ok(result) => result,
-        Err(error) => return Ok(error_response(classify_db_error(error))),
+        Err(error) => return Ok(error_response(error)),
     };
-    match persistence {
-        Ok(true) => {
-            let event = audit::AuditEvent::new(
-                actor,
-                "delete",
-                "api_spec",
-                id,
-                namespace,
-                audit::delete_diff(json!({
-                    "id": existing.id,
-                    "proxy_id": existing.proxy_id,
-                    "content_hash": existing.content_hash,
-                    "spec_version": existing.spec_version,
-                })),
-            );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-                log_audit_enqueue_failure(&error);
-            }
-            Ok(Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .header("Cache-Control", "no-store")
-                .body(Full::new(Bytes::new()))
-                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))))
+    if persistence {
+        let event = audit::AuditEvent::new(
+            actor,
+            "delete",
+            "api_spec",
+            id,
+            namespace,
+            audit::delete_diff(json!({
+                "id": existing.id,
+                "proxy_id": existing.proxy_id,
+                "content_hash": existing.content_hash,
+                "spec_version": existing.spec_version,
+            })),
+        );
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            log_audit_enqueue_failure(&error);
         }
-        Ok(false) => Ok(error_response(ApiSpecError::NotFound)),
-        Err(e) => Ok(error_response(classify_db_error(e))),
+        Ok(Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("Cache-Control", "no-store")
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))))
+    } else {
+        Ok(error_response(ApiSpecError::NotFound))
     }
 }
 

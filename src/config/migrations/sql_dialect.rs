@@ -731,7 +731,8 @@ impl V001SqlBuilder {
             CREATE TABLE IF NOT EXISTS config_admission_locks (
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
                 owner VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                expires_at BIGINT NOT NULL
+                expires_at BIGINT NOT NULL,
+                generation BIGINT NOT NULL DEFAULT 1
             )
             "#
         } else {
@@ -739,7 +740,8 @@ impl V001SqlBuilder {
             CREATE TABLE IF NOT EXISTS config_admission_locks (
                 namespace TEXT PRIMARY KEY,
                 owner TEXT NOT NULL,
-                expires_at BIGINT NOT NULL
+                expires_at BIGINT NOT NULL,
+                generation BIGINT NOT NULL DEFAULT 1
             )
             "#
         }

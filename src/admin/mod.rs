@@ -2853,10 +2853,23 @@ async fn persist_consumer_update(
     }
     consumer.updated_at = Utc::now();
     let update = match admission_guard
-        .run_while_held(db.update_consumer(&consumer))
+        .run_to_completion_while_held(db.update_consumer(&consumer))
         .await
     {
-        Ok(update) => update,
+        Ok(crud::NamespaceConfigAdmissionCompletion::Held(update)) => update,
+        Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+            Ok(_) => {
+                return json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!(
+                        "Config admission was lost after consumer persistence completed; verify the stored consumer before retrying: {error}"
+                    )}),
+                );
+            }
+            Err(persistence_error) => Err(anyhow::anyhow!(
+                "{persistence_error}; namespace config admission was also lost: {error}"
+            )),
+        },
         Err(error) => {
             return json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -4855,6 +4868,7 @@ async fn handle_batch_create(
                 %error,
                 "Batch: namespace admission was lost during persistence; reacquiring for rollback"
             );
+            let lost_generation = _namespace_config_admission_guard.generation();
             drop(_namespace_config_admission_guard);
             let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
                 .await
@@ -4880,6 +4894,23 @@ async fn handle_batch_create(
                     ));
                 }
             };
+            if !rollback_guard.immediately_succeeds_generation(lost_generation) {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": "Config admission was lost during batch persistence; rollback was skipped because another writer acquired the namespace lease",
+                        "admission_error": error.to_string(),
+                        "persistence_errors": errors,
+                        "created": {
+                            "proxies": created.proxies,
+                            "consumers": created.consumers,
+                            "plugin_configs": created.plugin_configs,
+                            "upstreams": created.upstreams,
+                        },
+                        "rollback": "skipped_after_intervening_write",
+                    }),
+                ));
+            }
             let rollback = rollback_guard
                 .run_to_completion_while_held(rollback_failed_batch_create(
                     db.as_ref(),
@@ -5426,6 +5457,7 @@ async fn handle_restore(
             %error,
             "Restore: namespace admission was lost during clear; reacquiring for recovery"
         );
+        let lost_generation = namespace_config_admission_guard.generation();
         drop(namespace_config_admission_guard);
         namespace_config_admission_guard = match crud::lock_namespace_config_admission(
             db.clone(),
@@ -5446,6 +5478,16 @@ async fn handle_restore(
                 ));
             }
         };
+        if !namespace_config_admission_guard.immediately_succeeds_generation(lost_generation) {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Config admission was lost during restore clear; recovery was skipped because another writer acquired the namespace lease",
+                    "restore_errors": [error.to_string()],
+                    "rollback": "skipped_after_intervening_write",
+                }),
+            ));
+        }
         if delete_result.is_ok() {
             let rollback = finish_failed_restore(
                 state,
@@ -5592,6 +5634,7 @@ async fn handle_restore(
                 0,
                 format!("namespace admission was lost during restore import: {error}"),
             );
+            let lost_generation = namespace_config_admission_guard.generation();
             drop(namespace_config_admission_guard);
             let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
                 .await
@@ -5609,6 +5652,16 @@ async fn handle_restore(
                     ));
                 }
             };
+            if !rollback_guard.immediately_succeeds_generation(lost_generation) {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": "Config admission was lost during restore import; rollback was skipped because another writer acquired the namespace lease",
+                        "restore_errors": errors,
+                        "rollback": "skipped_after_intervening_write",
+                    }),
+                ));
+            }
             let rollback =
                 finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot);
             return Ok(

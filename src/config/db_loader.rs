@@ -691,15 +691,23 @@ impl DatabaseStore {
         match self.db_type.as_str() {
             "mysql" => format!(
                 "INSERT INTO config_admission_locks \
-                 (namespace, owner, expires_at) VALUES (?, ?, {now} + ?) \
+                 (namespace, owner, expires_at, generation) VALUES (?, ?, {now} + ?, 1) \
                  ON DUPLICATE KEY UPDATE \
+                 generation = IF(\
+                     expires_at <= {now} OR owner = VALUES(owner), \
+                     IF(owner = VALUES(owner), generation, generation + 1), \
+                     generation), \
                  owner = IF(expires_at <= {now} OR owner = VALUES(owner), VALUES(owner), owner), \
                  expires_at = IF(owner = VALUES(owner), VALUES(expires_at), expires_at)"
             ),
             _ => self.q(&format!(
                 "INSERT INTO config_admission_locks \
-                 (namespace, owner, expires_at) VALUES (?, ?, {now} + ?) \
+                 (namespace, owner, expires_at, generation) VALUES (?, ?, {now} + ?, 1) \
                  ON CONFLICT (namespace) DO UPDATE SET \
+                 generation = CASE \
+                     WHEN config_admission_locks.owner = excluded.owner \
+                     THEN config_admission_locks.generation \
+                     ELSE config_admission_locks.generation + 1 END, \
                  owner = excluded.owner, expires_at = excluded.expires_at \
                  WHERE config_admission_locks.expires_at <= {now} \
                     OR config_admission_locks.owner = excluded.owner"
@@ -7383,15 +7391,28 @@ impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
         &self,
         namespace: &str,
         owner: &str,
-    ) -> Result<bool, anyhow::Error> {
+    ) -> Result<Option<u64>, anyhow::Error> {
         let sql = self.config_admission_lease_acquire_sql();
-        let result = sqlx::query(&sql)
+        sqlx::query(&sql)
             .bind(namespace)
             .bind(owner)
             .bind(CONFIG_ADMISSION_LEASE_DURATION_MILLIS)
             .execute(&self.pool())
             .await?;
-        Ok(result.rows_affected() > 0)
+        let now = self.config_admission_lease_now_sql();
+        let generation_sql = self.q(&format!(
+            "SELECT generation FROM config_admission_locks \
+             WHERE namespace = ? AND owner = ? AND expires_at > {now}"
+        ));
+        let generation = sqlx::query_scalar::<_, i64>(&generation_sql)
+            .bind(namespace)
+            .bind(owner)
+            .fetch_optional(&self.pool())
+            .await?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("namespace config admission generation is negative"))?;
+        Ok(generation)
     }
 
     async fn renew_namespace_config_admission_lease(
@@ -7414,7 +7435,10 @@ impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
         namespace: &str,
         owner: &str,
     ) -> Result<bool, anyhow::Error> {
-        let sql = self.q("DELETE FROM config_admission_locks WHERE namespace = ? AND owner = ?");
+        let sql = self.q(
+            "UPDATE config_admission_locks SET expires_at = 0 \
+             WHERE namespace = ? AND owner = ?",
+        );
         let result = sqlx::query(&sql)
             .bind(namespace)
             .bind(owner)

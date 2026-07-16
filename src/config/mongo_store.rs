@@ -1078,6 +1078,7 @@ mod inner {
             vec![
                 doc! {
                     "$set": {
+                        "_ferrum_same_owner": { "$eq": [ "$owner", owner ] },
                         "_ferrum_claimable": {
                             "$or": [
                                 { "$eq": [ { "$type": "$expires_at" }, "missing" ] },
@@ -1097,13 +1098,26 @@ mod inner {
                                 "$expires_at",
                             ],
                         },
+                        "generation": {
+                            "$cond": [
+                                "$_ferrum_claimable",
+                                {
+                                    "$cond": [
+                                        "$_ferrum_same_owner",
+                                        { "$ifNull": [ "$generation", 1_i64 ] },
+                                        { "$add": [ { "$ifNull": [ "$generation", 0_i64 ] }, 1_i64 ] },
+                                    ],
+                                },
+                                "$generation",
+                            ],
+                        },
                         "updated_at": {
                             "$cond": [ "$_ferrum_claimable", "$$NOW", "$updated_at" ],
                         },
                         "created_at": { "$ifNull": [ "$created_at", "$$NOW" ] },
                     },
                 },
-                doc! { "$unset": "_ferrum_claimable" },
+                doc! { "$unset": [ "_ferrum_claimable", "_ferrum_same_owner" ] },
             ]
         }
 
@@ -3244,7 +3258,7 @@ mod inner {
             &self,
             namespace: &str,
             owner: &str,
-        ) -> Result<bool, anyhow::Error> {
+        ) -> Result<Option<u64>, anyhow::Error> {
             let collection = self.config_admission_locks();
             let result = collection
                 .find_one_and_update(
@@ -3263,35 +3277,59 @@ mod inner {
                     let expires_at = BsonDateTime::from_millis(
                         now.timestamp_millis() + CONFIG_ADMISSION_LEASE_DURATION_MILLIS,
                     );
-                    collection
+                    let retained = collection
                         .find_one_and_update(
-                            doc! {
-                                "_id": namespace,
-                                "$or": [
-                                    { "expires_at": { "$exists": false } },
-                                    { "expires_at": { "$lte": now } },
-                                    { "owner": owner },
-                                ],
-                            },
+                            doc! { "_id": namespace, "owner": owner },
                             doc! {
                                 "$set": {
-                                    "owner": owner,
                                     "expires_at": expires_at,
                                     "updated_at": now,
                                 },
-                                "$setOnInsert": { "created_at": now },
                             },
                         )
-                        .upsert(true)
                         .return_document(ReturnDocument::After)
-                        .await
+                        .await?;
+                    if retained.is_some() {
+                        Ok(retained)
+                    } else {
+                        collection
+                            .find_one_and_update(
+                                doc! {
+                                    "_id": namespace,
+                                    "$or": [
+                                        { "expires_at": { "$exists": false } },
+                                        { "expires_at": { "$lte": now } },
+                                        { "owner": owner },
+                                    ],
+                                },
+                                doc! {
+                                    "$set": {
+                                        "owner": owner,
+                                        "expires_at": expires_at,
+                                        "updated_at": now,
+                                    },
+                                    "$inc": { "generation": 1_i64 },
+                                    "$setOnInsert": { "created_at": now },
+                                },
+                            )
+                            .upsert(true)
+                            .return_document(ReturnDocument::After)
+                            .await
+                    }
                 }
                 result => result,
             };
             match result {
-                Ok(Some(document)) => Ok(document.get_str("owner").ok() == Some(owner)),
-                Ok(None) => Ok(false),
-                Err(error) if is_duplicate_key(&error) => Ok(false),
+                Ok(Some(document)) if document.get_str("owner").ok() == Some(owner) => {
+                    let generation = document
+                        .get_i64("generation")
+                        .map_err(anyhow::Error::new)?;
+                    Ok(Some(u64::try_from(generation).map_err(|_| {
+                        anyhow::anyhow!("namespace config admission generation is negative")
+                    })?))
+                }
+                Ok(Some(_)) | Ok(None) => Ok(None),
+                Err(error) if is_duplicate_key(&error) => Ok(None),
                 Err(error) => Err(error.into()),
             }
         }
@@ -3346,9 +3384,12 @@ mod inner {
         ) -> Result<bool, anyhow::Error> {
             let result = self
                 .config_admission_locks()
-                .delete_one(doc! { "_id": namespace, "owner": owner })
+                .update_one(
+                    doc! { "_id": namespace, "owner": owner },
+                    doc! { "$set": { "expires_at": BsonDateTime::from_millis(0) } },
+                )
                 .await?;
-            Ok(result.deleted_count == 1)
+            Ok(result.matched_count == 1)
         }
     }
 

@@ -56,9 +56,9 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("renew_namespace_config_admission_lease("));
     assert!(crud_source.contains("release_namespace_config_admission_lease("));
     assert!(crud_source.contains("guard.ensure_held()"));
-    assert!(crud_source.contains("guard.run_while_held(future).await?"));
     assert!(crud_source.contains("run_to_completion_while_held"));
     assert!(crud_source.contains("NamespaceConfigAdmissionCompletion::Lost"));
+    assert!(crud_source.contains("immediately_succeeds_generation"));
     assert!(crud_source.contains("task.abort();"));
     assert!(crud_source.contains("tokio::time::timeout("));
     assert!(crud_source.contains("drop(local);"));
@@ -101,24 +101,23 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "credential, batch, and restore mutations must share namespace admission"
     );
     assert!(
-        batch_source.matches(".run_while_held(").count() >= 1,
-        "credential persistence must remain fenced after async validation"
-    );
-    assert!(
         batch_source
             .matches(".run_to_completion_while_held(")
             .count()
-            >= 4,
-        "batch and restore persistence must preserve concrete outcomes across lease loss"
+            >= 5,
+        "credential, batch, and restore persistence must preserve concrete outcomes across lease loss"
     );
     assert!(batch_source.contains("rollback_failed_batch_create("));
+    assert!(batch_source.contains("immediately_succeeds_generation(lost_generation)"));
     let sql_store_source = include_str!("../../../src/config/db_loader.rs");
     assert!(sql_store_source.contains("config_admission_locks"));
     assert!(sql_store_source.contains("config_admission_lease_now_sql"));
+    assert!(sql_store_source.contains("SELECT generation FROM config_admission_locks"));
     assert!(sql_store_source.contains("self.batch_create_plugin_configs_chunk(configs).await?"));
     let mongo_store_source = include_str!("../../../src/config/mongo_store.rs");
     assert!(mongo_store_source.contains("config_admission_locks"));
     assert!(mongo_store_source.contains("server_time_lease_acquire_pipeline"));
+    assert!(mongo_store_source.contains("\"generation\""));
 
     let pipeline_source = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(pipeline_source.contains("transaction_log_schema::validate_config_graph("));
@@ -137,6 +136,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         3,
         "API-spec POST, PUT, and DELETE must serialize through persistence"
     );
+    assert!(api_spec_source.contains("run_api_spec_persistence_while_held("));
+    assert!(api_spec_source.contains("error_response(ApiSpecError::NoDatabase)"));
     let post_lock = api_spec_source
         .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .expect("POST admission guard");
