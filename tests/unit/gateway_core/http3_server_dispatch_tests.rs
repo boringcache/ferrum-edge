@@ -149,18 +149,16 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
         .find("// Build the backend-facing header map")
         .expect("H3 gRPC upload buffering must remain bounded");
     let body = &body[..body_end];
-    for error in ["H3RequestBodyReadError::TimedOut"] {
-        let branch = body
-            .find(error)
-            .unwrap_or_else(|| panic!("missing {error} upload branch"));
-        let branch = &body[branch..];
-        let branch_end = branch[1..]
-            .find("H3RequestBodyReadError::")
-            .map_or(branch.len(), |offset| offset + 1);
-        let branch = &branch[..branch_end];
-        assert!(branch.contains("write_grpc_error_for_request("));
-        assert!(branch.contains("ctx,"));
-    }
+    let timed_out = body
+        .find("H3RequestBodyReadError::TimedOut")
+        .expect("missing timed-out upload branch");
+    let timed_out = &body[timed_out..];
+    let timed_out_end = timed_out[1..]
+        .find("H3RequestBodyReadError::")
+        .map_or(timed_out.len(), |offset| offset + 1);
+    let timed_out = &timed_out[..timed_out_end];
+    assert!(timed_out.contains("write_grpc_error_for_request("));
+    assert!(timed_out.contains("ctx,"));
     let deadline = body
         .find("H3RequestBodyReadError::DeadlineExceeded")
         .expect("missing deadline upload branch");

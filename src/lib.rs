@@ -1270,12 +1270,13 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         grpc_web_response_content_type: Option<&str>,
     ) -> http::Response<crate::proxy::ProxyBody> {
-        crate::proxy::build_finalized_upload_deadline_response_for_test(
+        crate::proxy::build_finalized_upload_deadline_response(
             plugins,
             ctx,
             grpc_web_response_content_type,
         )
         .await
+        .0
     }
 
     pub fn inspected_proxy_body_for_test(

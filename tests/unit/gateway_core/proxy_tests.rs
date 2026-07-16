@@ -1478,7 +1478,7 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         .split("async fn build_finalized_upload_deadline_response(")
         .nth(1)
         .expect("shared upload-deadline response finalization")
-        .split("pub(crate) async fn build_finalized_upload_deadline_response_for_test(")
+        .split("async fn finalize_upload_deadline_rejection(")
         .next()
         .expect("bounded upload-deadline response finalization");
     assert!(

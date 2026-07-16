@@ -14941,7 +14941,7 @@ async fn handle_backend_admission_rejection(
 /// committed observers, and rejection logging must all see the canonical
 /// status-4 result. In particular, gRPC-Web needs the finalized header map so
 /// CORS decorators survive translation into its body-trailer representation.
-async fn build_finalized_upload_deadline_response(
+pub(crate) async fn build_finalized_upload_deadline_response(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     grpc_web_response_content_type: Option<&str>,
@@ -14964,16 +14964,6 @@ async fn build_finalized_upload_deadline_response(
     let response =
         grpc_web_response.unwrap_or_else(|| build_response_from_normalized_reject(reject));
     (response, log_status)
-}
-
-pub(crate) async fn build_finalized_upload_deadline_response_for_test(
-    plugins: &[Arc<dyn Plugin>],
-    ctx: &mut RequestContext,
-    grpc_web_response_content_type: Option<&str>,
-) -> Response<ProxyBody> {
-    build_finalized_upload_deadline_response(plugins, ctx, grpc_web_response_content_type)
-        .await
-        .0
 }
 
 #[allow(clippy::too_many_arguments)]
