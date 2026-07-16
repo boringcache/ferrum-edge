@@ -1290,6 +1290,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "valued-query-key-copied-key",
         "valued-query-key-path",
         "valued-query-key-fragment",
+        "valued-query-key-slash-boundaries",
+        "query-value-trailing-slash",
+        "query-value-slash-only",
         "literal-plus-encoded-candidate",
         "encoded-plus-literal-candidate",
         "fragment-query-scalar",
@@ -1341,6 +1344,15 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             | "valued-query-key-path"
             | "valued-query-key-fragment" => {
                 format!("{}/signed%2Ftrigger?SIGNED_TOKEN=1", server.uri())
+            }
+            "valued-query-key-slash-boundaries" => {
+                format!("{}/signed%2Ftrigger?%2FSIGNED%2F=1", server.uri())
+            }
+            "query-value-trailing-slash" => {
+                format!("{}/signed%2Ftrigger?code=secret%2F", server.uri())
+            }
+            "query-value-slash-only" => {
+                format!("{}/signed%2Ftrigger?code=%2F", server.uri())
             }
             _ => format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri()),
         };
@@ -1420,6 +1432,15 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "valued-query-key-fragment" => {
                 "https://redirect.example/#leak=SIGNED_TOKEN".to_string()
+            }
+            "valued-query-key-slash-boundaries" => {
+                "https://redirect.example/next?leak=%2FSIGNED%2F".to_string()
+            }
+            "query-value-trailing-slash" => {
+                "https://redirect.example/next?leak=secret%2F".to_string()
+            }
+            "query-value-slash-only" => {
+                "https://redirect.example/next?leak=%2F".to_string()
             }
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
@@ -2134,6 +2155,47 @@ async fn test_unambiguous_query_is_decoded_once_for_function_payload() {
     let payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(payload["query_params"]["name"], "alice bob");
     assert_eq!(payload["query_params"]["literal"], "+");
+}
+
+#[tokio::test]
+async fn test_query_forwarding_omits_credentials_marked_for_backend_stripping() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_query_params": true
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.set_raw_query_string(
+        "api_key=first-secret&keep=visible&api%5Fkey=second-secret&flag".to_string(),
+    );
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await,
+        PluginResult::Continue
+    ));
+    let requests = server.received_requests().await.unwrap();
+    let payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let params = payload["query_params"].as_object().unwrap();
+    assert_eq!(params.len(), 2);
+    assert_eq!(params.get("keep").and_then(Value::as_str), Some("visible"));
+    assert_eq!(params.get("flag").and_then(Value::as_str), Some(""));
+    assert!(!params.contains_key("api_key"));
 }
 
 #[tokio::test]

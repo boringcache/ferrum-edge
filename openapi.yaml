@@ -15417,7 +15417,7 @@ components:
         forward_query_params:
           type: boolean
           default: false
-          description: "Include decoded query parameters in the function payload. Duplicate decoded names, invalid percent-encoded UTF-8, raw '+' ambiguity, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
+          description: "Include decoded query parameters in the function payload after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw '+' ambiguity, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
         timeout_ms:
           type: integer
           format: uint64
