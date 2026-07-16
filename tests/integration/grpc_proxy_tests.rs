@@ -810,17 +810,21 @@ async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
 async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
     let backend_port = 9;
 
-    let mut method_policy =
-        create_grpc_proxy("grpc-method-before-deadline", "/method-policy", backend_port);
+    let mut method_policy = create_grpc_proxy(
+        "grpc-method-before-deadline",
+        "/method-policy",
+        backend_port,
+    );
     method_policy.plugins = ["method-policy-router", "method-policy-deadline"]
         .into_iter()
-        .map(|plugin_config_id| ferrum_edge::config::types::PluginAssociation {
-            plugin_config_id: plugin_config_id.to_string(),
-        })
+        .map(
+            |plugin_config_id| ferrum_edge::config::types::PluginAssociation {
+                plugin_config_id: plugin_config_id.to_string(),
+            },
+        )
         .collect();
 
-    let mut deadline_only =
-        create_grpc_proxy("grpc-deadline-only", "/deadline-only", backend_port);
+    let mut deadline_only = create_grpc_proxy("grpc-deadline-only", "/deadline-only", backend_port);
     attach_test_plugin(&mut deadline_only, "deadline-only");
 
     let plugins = vec![
@@ -852,10 +856,7 @@ async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
             serde_json::json!({"reject_no_deadline": true}),
         ),
     ];
-    let state = create_test_proxy_state_with_plugins(
-        vec![method_policy, deadline_only],
-        plugins,
-    );
+    let state = create_test_proxy_state_with_plugins(vec![method_policy, deadline_only], plugins);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
     for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
@@ -928,7 +929,10 @@ async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
     .expect("native H2 method/deadline ordering request");
     assert_eq!(status, 200);
     assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
-    assert!(body.is_empty(), "native gRPC rejection must remain bodyless");
+    assert!(
+        body.is_empty(),
+        "native gRPC rejection must remain bodyless"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
