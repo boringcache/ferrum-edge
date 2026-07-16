@@ -76,7 +76,10 @@ const LOKI_EMITTER_LABEL: &str = "ferrum_emitter";
 
 static LOKI_EMITTER_PREFIX: LazyLock<Result<[u8; 16], ()>> = LazyLock::new(|| {
     let mut bytes = [0_u8; 16];
-    SystemRandom::new().fill(&mut bytes).map(|()| bytes).map_err(|_| ())
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map(|()| bytes)
+        .map_err(|_| ())
 });
 static NEXT_LOKI_EMITTER_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -130,11 +133,12 @@ impl LokiByteBudget {
     }
 
     fn try_acquire(&self, bytes: usize) -> Option<Arc<LokiByteLease>> {
-        let reserved = self.used_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |used| used.checked_add(bytes).filter(|next| *next <= self.max_bytes),
-        );
+        let reserved = self
+            .used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.max_bytes)
+            });
         if reserved.is_err() {
             self.record_drop("retained-content byte budget exhausted");
             return None;
@@ -334,12 +338,8 @@ impl LokiLogging {
         })
     }
 
-    fn queue_entry<T, F>(
-        &self,
-        value: &T,
-        kind: &str,
-        build_labels: F,
-    ) where
+    fn queue_entry<T, F>(&self, value: &T, kind: &str, build_labels: F)
+    where
         T: serde::Serialize,
         F: FnOnce() -> BTreeMap<String, String>,
     {
@@ -350,7 +350,8 @@ impl LokiLogging {
         let mut writer = BoundedJsonWriter::new(self.max_entry_bytes);
         if let Err(error) = serde_json::to_writer(&mut writer, value) {
             if writer.limit_exceeded {
-                self.byte_budget.record_drop("serialized entry exceeded max_entry_bytes");
+                self.byte_budget
+                    .record_drop("serialized entry exceeded max_entry_bytes");
             } else {
                 warn!("Loki logging: failed to serialize {kind}: {error}");
             }
@@ -364,7 +365,8 @@ impl LokiLogging {
                 .sum::<usize>(),
         );
         if retained_bytes > self.max_entry_bytes {
-            self.byte_budget.record_drop("entry and labels exceeded max_entry_bytes");
+            self.byte_budget
+                .record_drop("entry and labels exceeded max_entry_bytes");
             return;
         }
         let Some(lease) = self.byte_budget.try_acquire(retained_bytes) else {
@@ -438,9 +440,7 @@ fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>
     }
 }
 
-fn validate_known_config_fields(
-    config: &serde_json::Map<String, Value>,
-) -> Result<(), String> {
+fn validate_known_config_fields(config: &serde_json::Map<String, Value>) -> Result<(), String> {
     let mut unknown = config
         .keys()
         .filter(|key| !LOKI_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
@@ -601,7 +601,9 @@ fn validate_loki_label_name(name: &str) -> Result<(), String> {
         || name.starts_with("__")
         || name == LOKI_EMITTER_LABEL
     {
-        return Err(format!("loki_logging: invalid or reserved label name '{name}'"));
+        return Err(format!(
+            "loki_logging: invalid or reserved label name '{name}'"
+        ));
     }
     Ok(())
 }
@@ -633,9 +635,11 @@ impl Plugin for LokiLogging {
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
         match self.schema.as_ref().filter(|s| s.applies_to_stream()) {
-            Some(schema) => self.queue_entry(&SchemaView { summary, schema }, "stream summary", || {
-                self.build_stream_labels(summary)
-            }),
+            Some(schema) => {
+                self.queue_entry(&SchemaView { summary, schema }, "stream summary", || {
+                    self.build_stream_labels(summary)
+                })
+            }
             None => self.queue_entry(summary, "stream summary", || {
                 self.build_stream_labels(summary)
             }),
@@ -661,10 +665,7 @@ impl Plugin for LokiLogging {
 }
 
 /// Group entries by label set and build the Loki push payload.
-fn build_loki_payload(
-    batch: &[LokiEntry],
-    last_timestamp_ns: &AtomicU64,
-) -> Result<Value, String> {
+fn build_loki_payload(batch: &[LokiEntry], last_timestamp_ns: &AtomicU64) -> Result<Value, String> {
     let mut streams: HashMap<BTreeMap<String, String>, Vec<(String, String)>> = HashMap::new();
 
     for entry in batch {
@@ -700,11 +701,10 @@ fn next_loki_timestamp_ns(last_timestamp_ns: &AtomicU64) -> Result<String, Strin
         .map_err(|_| "Loki logging: system clock exceeds Loki timestamp range".to_string())?;
     let mut previous = last_timestamp_ns.load(Ordering::Acquire);
     loop {
-        let next = now.max(
-            previous
-                .checked_add(1)
-                .ok_or_else(|| "Loki logging: monotonic timestamp counter exhausted".to_string())?,
-        );
+        let next =
+            now.max(previous.checked_add(1).ok_or_else(|| {
+                "Loki logging: monotonic timestamp counter exhausted".to_string()
+            })?);
         match last_timestamp_ns.compare_exchange_weak(
             previous,
             next,
@@ -1018,23 +1018,27 @@ mod tests {
         labels_b.insert("proxy_id".to_string(), "p-2".to_string());
 
         let budget = LokiByteBudget::new(4096);
-        let payload = build_loki_payload(&[
-            LokiEntry {
-                labels: Arc::new(labels_a.clone()),
-                line: Arc::from(r#"{"a":1}"#),
-                _lease: budget.try_acquire(10).expect("test byte lease"),
-            },
-            LokiEntry {
-                labels: Arc::new(labels_a),
-                line: Arc::from(r#"{"a":2}"#),
-                _lease: budget.try_acquire(10).expect("test byte lease"),
-            },
-            LokiEntry {
-                labels: Arc::new(labels_b),
-                line: Arc::from(r#"{"b":1}"#),
-                _lease: budget.try_acquire(10).expect("test byte lease"),
-            },
-        ], &AtomicU64::new(0)).expect("payload");
+        let payload = build_loki_payload(
+            &[
+                LokiEntry {
+                    labels: Arc::new(labels_a.clone()),
+                    line: Arc::from(r#"{"a":1}"#),
+                    _lease: budget.try_acquire(10).expect("test byte lease"),
+                },
+                LokiEntry {
+                    labels: Arc::new(labels_a),
+                    line: Arc::from(r#"{"a":2}"#),
+                    _lease: budget.try_acquire(10).expect("test byte lease"),
+                },
+                LokiEntry {
+                    labels: Arc::new(labels_b),
+                    line: Arc::from(r#"{"b":1}"#),
+                    _lease: budget.try_acquire(10).expect("test byte lease"),
+                },
+            ],
+            &AtomicU64::new(0),
+        )
+        .expect("payload");
 
         let Some(streams) = payload["streams"].as_array() else {
             panic!("payload should include streams array");

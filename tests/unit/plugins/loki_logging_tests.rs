@@ -3,8 +3,8 @@
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient,
     loki_logging::{
-        LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES,
-        LOKI_LOGGING_CONFIG_KEYS, LokiLogging,
+        LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES, LOKI_LOGGING_CONFIG_KEYS,
+        LokiLogging,
     },
 };
 use serde_json::json;
@@ -232,7 +232,10 @@ async fn test_loki_logging_rejects_url_userinfo_without_echoing_credentials() {
     );
     let error = result.err().expect("URL user information must be rejected");
     assert!(error.contains("must not contain user information"));
-    assert!(!error.contains(secret), "config error leaked URL credential: {error}");
+    assert!(
+        !error.contains(secret),
+        "config error leaked URL credential: {error}"
+    );
 }
 
 #[tokio::test]
@@ -280,11 +283,13 @@ async fn test_loki_timestamps_are_strictly_monotonic_within_and_across_batches()
             .as_str()
             .unwrap()
             .to_string();
-        assert_eq!(emitter.get_or_insert(stream_emitter.clone()), &stream_emitter);
+        assert_eq!(
+            emitter.get_or_insert(stream_emitter.clone()),
+            &stream_emitter
+        );
         for value in streams[0]["values"].as_array().unwrap() {
             outer.push(value[0].as_str().unwrap().parse::<u64>().unwrap());
-            let line: serde_json::Value =
-                serde_json::from_str(value[1].as_str().unwrap()).unwrap();
+            let line: serde_json::Value = serde_json::from_str(value[1].as_str().unwrap()).unwrap();
             inner.push(line["timestamp_received"].as_str().unwrap().to_string());
         }
     }
@@ -366,8 +371,7 @@ async fn test_loki_stream_disconnects_keep_source_time_in_line_and_emit_in_queue
     let inner = values
         .iter()
         .map(|value| {
-            let line: serde_json::Value =
-                serde_json::from_str(value[1].as_str().unwrap()).unwrap();
+            let line: serde_json::Value = serde_json::from_str(value[1].as_str().unwrap()).unwrap();
             line["timestamp_disconnected"].as_str().unwrap().to_string()
         })
         .collect::<Vec<_>>();
@@ -445,7 +449,10 @@ async fn test_loki_status_260_is_terminal_and_diagnostics_are_redacted() {
         header_secret,
         auth_secret,
     ] {
-        assert!(!logs.contains(secret), "Loki diagnostic leaked {secret}: {logs}");
+        assert!(
+            !logs.contains(secret),
+            "Loki diagnostic leaked {secret}: {logs}"
+        );
     }
 }
 

@@ -1454,9 +1454,9 @@ fn assert_component_validity(
 async fn loki_logging_schema_matches_strict_runtime_config_contract() {
     use ferrum_edge::plugins::PluginHttpClient;
     use ferrum_edge::plugins::loki_logging::{
-        LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES,
-        LOKI_LOGGING_CONFIG_KEYS, LOKI_MAX_BUFFER_MAX_BYTES, LOKI_MAX_MAX_ENTRY_BYTES,
-        LOKI_MAX_RETRIES, LOKI_MAX_RETRY_DELAY_MS, LokiLogging,
+        LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES, LOKI_LOGGING_CONFIG_KEYS,
+        LOKI_MAX_BUFFER_MAX_BYTES, LOKI_MAX_MAX_ENTRY_BYTES, LOKI_MAX_RETRIES,
+        LOKI_MAX_RETRY_DELAY_MS, LokiLogging,
     };
 
     let spec: serde_json::Value =
@@ -1465,7 +1465,10 @@ async fn loki_logging_schema_matches_strict_runtime_config_contract() {
         .pointer("/components/schemas/LokiLoggingConfig")
         .expect("LokiLoggingConfig exists");
     assert_eq!(schema["additionalProperties"], json!(false));
-    assert_eq!(schema["properties"]["labels"]["additionalProperties"]["type"], "string");
+    assert_eq!(
+        schema["properties"]["labels"]["additionalProperties"]["type"],
+        "string"
+    );
     assert!(schema["properties"]["custom_headers"]["additionalProperties"].is_object());
 
     let documented = schema["properties"]

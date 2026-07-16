@@ -264,9 +264,7 @@ fn build_dns_cached_fallback_client(
                         // has no fallible operator input. If reqwest ever
                         // breaks that invariant, refusing startup is safer
                         // than silently re-enabling ambient proxy routing.
-                        panic!(
-                            "Failed to build fail-closed minimal plugin HTTP client: {e3}"
-                        )
+                        panic!("Failed to build fail-closed minimal plugin HTTP client: {e3}")
                     })
             }
         }

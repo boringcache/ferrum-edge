@@ -1446,9 +1446,14 @@ fn redact_loki_logging_config_projection(config: &mut Value) {
     if let Some(endpoint) = config.get_mut("endpoint_url")
         && !endpoint.is_null()
     {
-        *endpoint = match endpoint.as_str().and_then(|value| url::Url::parse(value).ok()) {
+        *endpoint = match endpoint
+            .as_str()
+            .and_then(|value| url::Url::parse(value).ok())
+        {
             Some(endpoint) => {
-                json!(crate::plugins::loki_logging::redacted_endpoint_url(&endpoint))
+                json!(crate::plugins::loki_logging::redacted_endpoint_url(
+                    &endpoint
+                ))
             }
             None => json!(marker),
         };

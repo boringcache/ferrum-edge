@@ -494,7 +494,10 @@ async fn loki_config_projection_redacts_endpoint_and_all_header_credentials() {
     let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
     assert_eq!(status, 201, "Loki plugin create failed: {body:?}");
     assert_eq!(body["config"]["endpoint_url"], endpoint);
-    assert_eq!(body["config"]["authorization_header"], format!("Bearer {auth_secret}"));
+    assert_eq!(
+        body["config"]["authorization_header"],
+        format!("Bearer {auth_secret}")
+    );
 
     let audit_body = wait_for_audit_total(
         &base,
@@ -503,14 +506,17 @@ async fn loki_config_projection_redacts_endpoint_and_all_header_credentials() {
         1,
     )
     .await;
-    let audit_config = &audit_body["items"].as_array().expect("audit items")[0]["diff"]
-        ["after"]["config"];
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
     assert_loki_config_projection_redacted(audit_config);
 
     for bearer in [&viewer, &operator] {
         let (status, projected) =
             get_json(&base, "/plugins/config/loki-redaction-config", bearer).await;
-        assert_eq!(status, 200, "projected Loki config read failed: {projected:?}");
+        assert_eq!(
+            status, 200,
+            "projected Loki config read failed: {projected:?}"
+        );
         assert_loki_config_projection_redacted(&projected["config"]);
     }
 
@@ -527,7 +533,10 @@ async fn loki_config_projection_redacts_endpoint_and_all_header_credentials() {
     let (status, raw) = get_json(&base, "/plugins/config/loki-redaction-config", &admin).await;
     assert_eq!(status, 200, "admin Loki config read failed: {raw:?}");
     assert_eq!(raw["config"]["endpoint_url"], endpoint);
-    assert_eq!(raw["config"]["custom_headers"]["X-Scope-OrgID"], tenant_secret);
+    assert_eq!(
+        raw["config"]["custom_headers"]["X-Scope-OrgID"],
+        tenant_secret
+    );
 
     for projection in [audit_config, &listed["config"]] {
         let serialized = projection.to_string();
