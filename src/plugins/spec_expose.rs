@@ -1,9 +1,10 @@
 //! Spec Expose plugin — serves API specifications (OpenAPI, WSDL, WADL) on a
 //! `/specz` sub-path of each proxy's listen path.
 //!
-//! When a `GET` request arrives at `{listen_path}/specz`, the plugin fetches
-//! the specification document from the configured `spec_url` and returns it to
-//! the caller. The `/specz` endpoint is unauthenticated — it short-circuits
+//! When a `GET` or `HEAD` request arrives at `{listen_path}/specz`, the plugin
+//! fetches the specification document from the configured `spec_url` and
+//! returns it to the caller (`HEAD` returns representation headers only). The
+//! `/specz` endpoint is unauthenticated — it short-circuits
 //! before the authentication phase so consumers can discover API contracts
 //! without credentials. Because it is anonymous and the upstream may be a
 //! distinct, less-trusted service, the served response sets
@@ -21,11 +22,16 @@
 //! `/specz` requests do not re-fetch the upstream document on every call.
 //! The cache is opportunistic: the first request triggers a fetch and stores
 //! the body+content-type; subsequent requests within the TTL serve directly
-//! from memory. On TTL expiry, the next request re-fetches. Failures are not
-//! cached — every failed fetch is retried until a success populates the cache.
+//! from memory. On TTL expiry, the next request re-fetches. Failed fetches are
+//! negatively cached with bounded exponential backoff, and at most a fixed
+//! number of callers can wait for the single in-flight fetch. This keeps the
+//! anonymous endpoint from accumulating unbounded tasks during an origin
+//! outage. A zero TTL disables the durable positive cache, but concurrent
+//! callers still share a short-lived successful completion.
 //!
 //! TTL is controlled by `cache_ttl_seconds` (default 300s = 5 min).
-//! Set to 0 to disable caching entirely.
+//! Set to 0 to disable durable positive caching; a 100 ms completion window
+//! remains so callers in one burst can share the same fetch.
 //!
 //! # Configuration
 //!
@@ -46,11 +52,13 @@ use http::header::HeaderValue;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use url::{Host, Url};
 
 use crate::dns::DnsCacheResolver;
+use crate::retry::classify_reqwest_error;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 use super::utils::response_body::{
@@ -62,6 +70,23 @@ use super::{Plugin, PluginResult, RequestContext};
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
 /// Default maximum upstream spec body size (25 MiB).
 const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 25 * 1024 * 1024;
+/// Maximum number of anonymous cache-miss callers admitted per plugin
+/// instance, including the one performing the upstream fetch.
+const MAX_PENDING_FETCHES: usize = 32;
+/// A zero positive-cache TTL still retains a successful single-flight result
+/// just long enough for callers already in the same burst to reuse it.
+const ZERO_TTL_COALESCE_WINDOW: Duration = Duration::from_millis(100);
+/// Failed fetches back off from one second to a maximum of thirty seconds.
+const FAILURE_BACKOFF_BASE_SECONDS: u64 = 1;
+const FAILURE_BACKOFF_MAX_SECONDS: u64 = 30;
+
+const CONFIG_KEYS: [&str; 5] = [
+    "spec_url",
+    "content_type",
+    "tls_no_verify",
+    "cache_ttl_seconds",
+    "max_response_body_bytes",
+];
 
 /// A cached spec response (body + content-type + insertion time).
 #[derive(Clone)]
@@ -71,14 +96,51 @@ struct CachedSpec {
     inserted_at: Instant,
 }
 
+/// A sanitized failure response retained during the negative-cache window.
+/// It deliberately contains no origin URL or transport error text.
+#[derive(Clone)]
+struct FetchFailure {
+    status_code: u16,
+    body: String,
+    retry_after_seconds: u64,
+}
+
+impl FetchFailure {
+    fn into_plugin_result(self, is_head: bool) -> PluginResult {
+        let mut headers = HashMap::with_capacity(3);
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("content-length".to_string(), self.body.len().to_string());
+        headers.insert(
+            "retry-after".to_string(),
+            self.retry_after_seconds.max(1).to_string(),
+        );
+        PluginResult::Reject {
+            status_code: self.status_code,
+            body: if is_head { String::new() } else { self.body },
+            headers,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedFailure {
+    failure: FetchFailure,
+    retry_at: Instant,
+}
+
 /// Spec Expose plugin — serves API spec documents on `{listen_path}/specz`.
 pub struct SpecExpose {
     spec_url: String,
+    /// Credential-free origin label used for every diagnostic. The request URL
+    /// remains private even when its path/query contains a signed token.
+    spec_origin: String,
     content_type_override: Option<String>,
     warmup_hostname: Option<String>,
     cache_ttl: Duration,
     max_response_body_bytes: usize,
     cache: ArcSwap<Option<CachedSpec>>,
+    failure_cache: ArcSwap<Option<CachedFailure>>,
+    consecutive_failures: AtomicU32,
     /// Single-flight lock around the upstream fetch. Concurrent cache-miss
     /// callers serialize here; whoever acquires first does the upstream fetch
     /// and populates the cache, and the rest observe the fresh entry via
@@ -86,6 +148,9 @@ pub struct SpecExpose {
     /// flood from fanning out to the upstream document store (the exact DoS
     /// the cache was added to prevent).
     fetch_lock: Mutex<()>,
+    /// Bounds both the in-flight fetch and callers waiting for its completion.
+    /// Excess anonymous requests fail quickly instead of growing a mutex queue.
+    fetch_admission: Arc<Semaphore>,
     http_client: reqwest::Client,
 }
 
@@ -94,16 +159,42 @@ impl SpecExpose {
         config: &Value,
         plugin_http_client: super::PluginHttpClient,
     ) -> Result<Self, String> {
-        let spec_url = config["spec_url"]
-            .as_str()
+        let config_object = config.as_object().ok_or_else(|| {
+            "spec_expose: configuration must be an object with a 'spec_url' field".to_string()
+        })?;
+        let mut unknown_keys = config_object
+            .keys()
+            .filter(|key| !CONFIG_KEYS.contains(&key.as_str()))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if !unknown_keys.is_empty() {
+            unknown_keys.sort_unstable();
+            let unknown = unknown_keys
+                .into_iter()
+                .map(|key| format!("'{key}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "spec_expose: unsupported configuration key(s): {unknown}; supported keys are: {}",
+                CONFIG_KEYS
+                    .iter()
+                    .map(|key| format!("'{key}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let spec_url = config_object
+            .get("spec_url")
+            .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "default")
+            .filter(|value| !value.is_empty() && *value != "default")
             .ok_or_else(|| {
                 "spec_expose: 'spec_url' is required and must be a non-empty URL string".to_string()
             })?;
 
         // Validate URL format and require a fetchable scheme.
-        let parsed = Url::parse(spec_url)
+        let mut parsed = Url::parse(spec_url)
             .map_err(|e| format!("spec_expose: 'spec_url' is not a valid URL: {e}"))?;
         match parsed.scheme() {
             "http" | "https" => {}
@@ -118,6 +209,15 @@ impl SpecExpose {
                 "spec_expose: 'spec_url' must include a hostname or IP address".to_string(),
             );
         }
+        if url_has_userinfo(spec_url)
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(
+                "spec_expose: 'spec_url' must not contain URL userinfo; use a credential-free origin URL"
+                    .to_string(),
+            );
+        }
         // Screen a literal-IP spec_url against the egress policy at config-load
         // (the shared client's DNS-cache screen still applies at fetch time).
         crate::plugins::utils::log_helpers::screen_url_host_egress(
@@ -127,9 +227,14 @@ impl SpecExpose {
             plugin_http_client.backend_allow_ips(),
         )?;
         let warmup_hostname = Some(spec_url_hostname(&parsed)?);
+        let spec_origin = parsed.origin().ascii_serialization();
+        // URL fragments are never part of an HTTP request. Drop them before
+        // retaining the private fetch URL so fragment credentials cannot be
+        // propagated accidentally by future diagnostics or metadata.
+        parsed.set_fragment(None);
         let spec_url = parsed.to_string();
 
-        let content_type_override = match config.get("content_type") {
+        let content_type_override = match config_object.get("content_type") {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => {
                 let trimmed = s.trim();
@@ -152,7 +257,7 @@ impl SpecExpose {
             }
         };
 
-        let tls_no_verify = match config.get("tls_no_verify") {
+        let tls_no_verify = match config_object.get("tls_no_verify") {
             None | Some(Value::Null) => plugin_http_client.tls_no_verify(),
             Some(Value::Bool(value)) => *value,
             Some(other) => {
@@ -162,7 +267,7 @@ impl SpecExpose {
             }
         };
 
-        let cache_ttl_seconds = match config.get("cache_ttl_seconds") {
+        let cache_ttl_seconds = match config_object.get("cache_ttl_seconds") {
             None | Some(Value::Null) => DEFAULT_CACHE_TTL_SECONDS,
             Some(v) => v.as_u64().ok_or_else(|| {
                 format!("spec_expose: 'cache_ttl_seconds' must be a non-negative integer, got: {v}")
@@ -198,26 +303,32 @@ impl SpecExpose {
         // Load custom CA bundle when not skipping verification.
         if !tls_no_verify && let Some(ca_path) = plugin_http_client.tls_ca_bundle_path() {
             let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-            match load_material_blocking(&source, MaterialKind::CaBundle) {
-                Ok(ca_material) => {
-                    match reqwest::Certificate::from_pem(ca_material.bytes.expose_secret()) {
-                        Ok(cert) => {
-                            // reqwest 0.13: `tls_certs_only` replaces the trust
-                            // store entirely (CA exclusivity).
-                            builder = builder.tls_certs_only([cert]);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "spec_expose: failed to parse CA bundle at {}: {e}",
-                                ca_material.source_id
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("spec_expose: failed to load CA bundle: {e}");
-                }
+            let source_id = source.source_id();
+            let ca_material = load_material_blocking(&source, MaterialKind::CaBundle).map_err(
+                |error| {
+                    format!(
+                        "spec_expose: configured CA bundle '{source_id}' could not be loaded; refusing to widen trust: {error}"
+                    )
+                },
+            )?;
+            let certificates =
+                reqwest::Certificate::from_pem_bundle(ca_material.bytes.expose_secret()).map_err(
+                    |error| {
+                        format!(
+                            "spec_expose: configured CA bundle '{}' is invalid; refusing to widen trust: {error}",
+                            ca_material.source_id
+                        )
+                    },
+                )?;
+            if certificates.is_empty() {
+                return Err(format!(
+                    "spec_expose: configured CA bundle '{}' contains no certificates; refusing to widen trust",
+                    ca_material.source_id
+                ));
             }
+            // reqwest 0.13: `tls_certs_only` replaces the trust store entirely
+            // (CA exclusivity). All load/parse failures above abort construction.
+            builder = builder.tls_certs_only(certificates);
         }
 
         let http_client = builder
@@ -226,72 +337,114 @@ impl SpecExpose {
 
         Ok(Self {
             spec_url,
+            spec_origin,
             content_type_override,
             warmup_hostname,
             cache_ttl,
             max_response_body_bytes,
             cache: ArcSwap::from_pointee(None),
+            failure_cache: ArcSwap::from_pointee(None),
+            consecutive_failures: AtomicU32::new(0),
             fetch_lock: Mutex::new(()),
+            fetch_admission: Arc::new(Semaphore::new(MAX_PENDING_FETCHES)),
             http_client,
         })
     }
 
     /// Check whether the request path is exactly `{listen_path}/specz`.
     pub fn is_specz_request(path: &str, listen_path: &str) -> bool {
-        // For root listen_path "/", the specz path is "/specz"
-        if listen_path == "/" {
+        // RequestContext paths do not include queries on H1/H2/H3, but keep
+        // this public helper robust for callers that pass a full request target.
+        let path = path.split_once('?').map_or(path, |(path, _)| path);
+        let normalized_listen_path = listen_path.trim_end_matches('/');
+        // For root listen_path "/", the normalized prefix is empty.
+        if normalized_listen_path.is_empty() {
             return path == "/specz";
         }
-        // For other listen paths like "/api/v1", check for "/api/v1/specz"
-        if let Some(remainder) = path.strip_prefix(listen_path) {
+        // Trimming the configured suffix means both "/api" and "/api/" own
+        // the canonical "/api/specz" path. Requiring the exact remainder
+        // deliberately leaves "/api//specz" unintercepted.
+        if let Some(remainder) = path.strip_prefix(normalized_listen_path) {
             remainder == "/specz"
         } else {
             false
         }
     }
 
-    /// Returns a cached spec when present and not expired. Caching is disabled
-    /// (TTL = 0) → always returns None so the next call refetches from origin.
+    /// Returns a cached spec when present and not expired. A zero configured
+    /// TTL uses only the short single-flight completion window.
     fn cached_spec(&self) -> Option<CachedSpec> {
-        if self.cache_ttl.is_zero() {
-            return None;
-        }
         let snapshot = self.cache.load();
         let entry = snapshot.as_ref().as_ref()?;
-        if entry.inserted_at.elapsed() < self.cache_ttl {
+        let effective_ttl = if self.cache_ttl.is_zero() {
+            ZERO_TTL_COALESCE_WINDOW
+        } else {
+            self.cache_ttl
+        };
+        if entry.inserted_at.elapsed() < effective_ttl {
             Some(entry.clone())
         } else {
             None
         }
     }
 
-    /// Fetch the spec from the upstream and cache it on success. Returns the
-    /// fresh spec on success or a [`PluginResult::Reject`] describing the
-    /// upstream failure mode (502). Failures are NOT cached — the next call
-    /// will re-attempt the fetch.
-    async fn fetch_and_cache(&self) -> Result<CachedSpec, PluginResult> {
+    fn cached_failure(&self) -> Option<FetchFailure> {
+        let snapshot = self.failure_cache.load();
+        let entry = snapshot.as_ref().as_ref()?;
+        (Instant::now() < entry.retry_at).then(|| entry.failure.clone())
+    }
+
+    fn record_failure(&self, mut failure: FetchFailure) -> FetchFailure {
+        let previous = self
+            .consecutive_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_add(1))
+            })
+            .unwrap_or_else(|value| value);
+        let exponent = previous.min(5);
+        let retry_after_seconds = FAILURE_BACKOFF_BASE_SECONDS
+            .saturating_mul(1_u64 << exponent)
+            .min(FAILURE_BACKOFF_MAX_SECONDS);
+        failure.retry_after_seconds = retry_after_seconds;
+        self.failure_cache.store(Arc::new(Some(CachedFailure {
+            failure: failure.clone(),
+            retry_at: Instant::now() + Duration::from_secs(retry_after_seconds),
+        })));
+        failure
+    }
+
+    fn record_success(&self, entry: &CachedSpec) {
+        self.cache.store(Arc::new(Some(entry.clone())));
+        self.failure_cache.store(Arc::new(None));
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Fetch the spec from the upstream. The caller publishes either the fresh
+    /// success or a sanitized negative-cache completion.
+    async fn fetch_spec(&self) -> Result<CachedSpec, FetchFailure> {
         let response = self
             .http_client
             .get(&self.spec_url)
             .send()
             .await
             .map_err(|e| {
+                let error_class = classify_reqwest_error(&e);
                 tracing::warn!(
-                    spec_url = %self.spec_url,
-                    error = %e,
+                    spec_origin = %self.spec_origin,
+                    error_class = %error_class,
                     "spec_expose: failed to fetch spec document"
                 );
-                reject_502_json("Failed to fetch API specification from upstream")
+                fetch_failure(502, "Failed to fetch API specification from upstream")
             })?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
             tracing::warn!(
-                spec_url = %self.spec_url,
+                spec_origin = %self.spec_origin,
                 upstream_status = status,
                 "spec_expose: upstream returned non-success status"
             );
-            return Err(reject_502_json(format!(
+            return Err(fetch_failure(502, format!(
                 "Upstream spec endpoint returned status {status}"
             )));
         }
@@ -309,12 +462,12 @@ impl SpecExpose {
             && content_length > self.max_response_body_bytes as u64
         {
             tracing::warn!(
-                spec_url = %self.spec_url,
+                spec_origin = %self.spec_origin,
                 content_length,
                 max_response_body_bytes = self.max_response_body_bytes,
                 "spec_expose: upstream spec response body exceeds configured limit"
             );
-            return Err(body_too_large_reject());
+            return Err(body_too_large_failure());
         }
 
         // Determine content-type: plugin override > upstream response > default.
@@ -339,20 +492,21 @@ impl SpecExpose {
             .map_err(|e| match e {
                 BoundedReadError::LimitExceeded { read_so_far, .. } => {
                     tracing::warn!(
-                        spec_url = %self.spec_url,
+                        spec_origin = %self.spec_origin,
                         max_response_body_bytes = self.max_response_body_bytes,
                         read_so_far,
                         "spec_expose: upstream spec response body exceeded configured limit while streaming"
                     );
-                    body_too_large_reject()
+                    body_too_large_failure()
                 }
                 BoundedReadError::Stream(e) => {
+                    let error_class = classify_reqwest_error(&e);
                     tracing::warn!(
-                        spec_url = %self.spec_url,
-                        error = %e,
+                        spec_origin = %self.spec_origin,
+                        error_class = %error_class,
                         "spec_expose: failed to read spec response body"
                     );
-                    reject_502_json("Failed to read API specification response body")
+                    fetch_failure(502, "Failed to read API specification response body")
                 }
             })?;
 
@@ -362,9 +516,6 @@ impl SpecExpose {
             inserted_at: Instant::now(),
         };
 
-        if !self.cache_ttl.is_zero() {
-            self.cache.store(Arc::new(Some(entry.clone())));
-        }
         Ok(entry)
     }
 }
@@ -430,17 +581,25 @@ fn spec_url_hostname(parsed: &Url) -> Result<String, String> {
 }
 
 fn has_non_empty_authority(spec_url: &str) -> bool {
+    raw_url_authority(spec_url).is_some_and(|authority| !authority.is_empty())
+}
+
+fn url_has_userinfo(spec_url: &str) -> bool {
+    raw_url_authority(spec_url).is_some_and(|authority| authority.contains('@'))
+}
+
+fn raw_url_authority(spec_url: &str) -> Option<&str> {
     let Some((_, after_scheme)) = spec_url.split_once(':') else {
-        return false;
+        return None;
     };
     let Some(authority_and_path) = after_scheme.strip_prefix("//") else {
-        return false;
+        return None;
     };
     let authority_end = authority_and_path
         .find(['/', '?', '#'])
         .unwrap_or(authority_and_path.len());
 
-    authority_end > 0
+    Some(&authority_and_path[..authority_end])
 }
 
 /// Build a 502 rejection for an oversized upstream spec body.
@@ -453,24 +612,22 @@ fn has_non_empty_authority(spec_url: &str) -> bool {
 /// by adding the limit back — the tests at
 /// `tests/unit/plugins/spec_expose_tests.rs` explicitly assert the public body
 /// does NOT contain `max_response_body_bytes`.
-fn body_too_large_reject() -> PluginResult {
-    reject_502_json("API specification response too large")
+fn body_too_large_failure() -> FetchFailure {
+    fetch_failure(502, "API specification response too large")
 }
 
-/// Build a 502 `Reject` with a JSON `{"error": message}` body.
+/// Build a sanitized failure with a JSON `{"error": message}` body.
 ///
 /// Uses `serde_json::json!` to escape the message safely — never inline
 /// user-controlled or upstream-derived strings into the response with raw
 /// `format!`. Callers should keep operator-facing detail (URL, cap value,
 /// upstream status) in structured `tracing::warn!` logs rather than the
 /// response body, since `/specz` is unauthenticated.
-fn reject_502_json(message: impl Into<String>) -> PluginResult {
-    let mut headers = HashMap::with_capacity(1);
-    headers.insert("content-type".to_string(), "application/json".to_string());
-    PluginResult::Reject {
-        status_code: 502,
+fn fetch_failure(status_code: u16, message: impl Into<String>) -> FetchFailure {
+    FetchFailure {
+        status_code,
         body: json!({ "error": message.into() }).to_string(),
-        headers,
+        retry_after_seconds: 1,
     }
 }
 
@@ -493,8 +650,9 @@ impl Plugin for SpecExpose {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        // Only intercept GET requests
-        if ctx.method != "GET" {
+        // GET and HEAD own the same representation; all other methods continue.
+        let is_head = ctx.method == "HEAD";
+        if ctx.method != "GET" && !is_head {
             return PluginResult::Continue;
         }
 
@@ -517,47 +675,65 @@ impl Plugin for SpecExpose {
             return PluginResult::Continue;
         }
 
-        // Try the cache first; on miss or expiry, fetch and (when caching is
-        // enabled) serialize through the single-flight lock so a burst of
-        // cold-cache requests does not fan out to the upstream document store.
-        //
-        // When caching is disabled (TTL=0) we bypass the lock entirely — every
-        // request is expected to re-fetch, so serializing them would collapse
-        // throughput into strictly-sequential upstream calls.
-        let entry = if self.cache_ttl.is_zero() {
-            match self.fetch_and_cache().await {
-                Ok(entry) => entry,
-                Err(reject) => return reject,
+        // Fast paths are lock-free. A cached failure is the completion state
+        // shared by every caller during the backoff window.
+        if let Some(entry) = self.cached_spec() {
+            return spec_response(entry, is_head);
+        }
+        if let Some(failure) = self.cached_failure() {
+            return failure.into_plugin_result(is_head);
+        }
+
+        // Admit only a fixed number of cache-miss callers. One performs the
+        // fetch; the rest wait for the same completion. Excess callers receive
+        // a stable retry signal immediately instead of joining an anonymous,
+        // unbounded mutex queue.
+        let _admission = match Arc::clone(&self.fetch_admission).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return fetch_failure(
+                    503,
+                    "API specification fetch is busy; retry after the indicated delay",
+                )
+                .into_plugin_result(is_head);
             }
-        } else {
-            match self.cached_spec() {
-                Some(entry) => entry,
-                None => {
-                    let _guard = self.fetch_lock.lock().await;
-                    // Re-check the cache after acquiring the lock: another task
-                    // may have populated it while we were waiting.
-                    if let Some(entry) = self.cached_spec() {
-                        entry
-                    } else {
-                        match self.fetch_and_cache().await {
-                            Ok(entry) => entry,
-                            Err(reject) => return reject,
-                        }
-                    }
-                }
+        };
+        let _guard = self.fetch_lock.lock().await;
+
+        // Re-check both outcomes after acquiring the single-flight lock: the
+        // preceding caller may have completed successfully or failed.
+        if let Some(entry) = self.cached_spec() {
+            return spec_response(entry, is_head);
+        }
+        if let Some(failure) = self.cached_failure() {
+            return failure.into_plugin_result(is_head);
+        }
+
+        let entry = match self.fetch_spec().await {
+            Ok(entry) => {
+                self.record_success(&entry);
+                entry
+            }
+            Err(failure) => {
+                return self.record_failure(failure).into_plugin_result(is_head);
             }
         };
 
-        let mut headers = HashMap::new();
-        headers.insert("content-type".to_string(), entry.content_type);
-        // `/specz` is unauthenticated and serves an upstream-influenced body, so
-        // prevent browsers from MIME-sniffing it into HTML/JS execution in the
-        // gateway's own origin even if the (sanitized) content-type is permissive.
-        headers.insert("x-content-type-options".to_string(), "nosniff".to_string());
-        PluginResult::RejectBinary {
-            status_code: 200,
-            body: entry.body,
-            headers,
-        }
+        spec_response(entry, is_head)
+    }
+}
+
+fn spec_response(entry: CachedSpec, is_head: bool) -> PluginResult {
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), entry.content_type);
+    headers.insert("content-length".to_string(), entry.body.len().to_string());
+    // `/specz` is unauthenticated and serves an upstream-influenced body, so
+    // prevent browsers from MIME-sniffing it into HTML/JS execution in the
+    // gateway's own origin even if the (sanitized) content-type is permissive.
+    headers.insert("x-content-type-options".to_string(), "nosniff".to_string());
+    PluginResult::RejectBinary {
+        status_code: 200,
+        body: if is_head { Bytes::new() } else { entry.body },
+        headers,
     }
 }

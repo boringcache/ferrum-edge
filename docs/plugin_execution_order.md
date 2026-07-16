@@ -402,7 +402,7 @@ Browser preflight (`OPTIONS`) requests must be answered before authentication. I
 
 ### Spec expose runs after IP restriction and bot detection (priority 210)
 
-`spec_expose` intercepts `GET {listen_path}/specz` requests and returns the API specification document without proxying. It runs at priority 210 — after IP restriction (150) and bot detection (200) so blocked IPs and bots cannot access spec endpoints, but before all authentication plugins (950+). This makes the `/specz` endpoint unauthenticated by design, allowing legitimate API consumers to discover contracts without credentials while still enforcing network-level security policies.
+`spec_expose` intercepts `GET` and `HEAD` at the canonical `{listen_path}/specz` resource and returns the API specification without proxying (`HEAD` returns the GET representation headers with no body). It runs at priority 210 — after IP restriction (150) and bot detection (200) so blocked IPs and bots cannot access spec endpoints, but before all authentication plugins (950+). This makes the `/specz` endpoint unauthenticated by design, allowing legitimate API consumers to discover contracts without credentials while still enforcing network-level security policies. Route-level `allowed_methods` admission still runs before the plugin.
 
 ### Authentication before authorization (1000s before 2000s)
 

@@ -2591,21 +2591,21 @@ Rules are evaluated in order — first match wins. Regex paths use the same `~` 
 
 ### `spec_expose`
 
-Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a `/specz` sub-path of each proxy's listen path. When a `GET` request arrives at `{listen_path}/specz`, the plugin fetches the specification from the configured upstream URL and returns it to the caller. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
+Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a canonical `/specz` sub-path of each proxy's listen path. `GET` returns the configured specification and `HEAD` returns the same status and representation headers (including `Content-Type`, `Content-Length`, and `X-Content-Type-Options`) with no body. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
 
 Useful for providing a common, discoverable pattern for API specifications across enterprise-wide APIs.
 
 **Priority:** 210 | **Phase:** `on_request_received` | **Protocols:** HTTP only
 
-**Only works with prefix-based `listen_path` proxies.** Regex listen paths (`~` prefix) are skipped — the plugin continues without intercepting. Host-only or port-only routing is not supported.
+**Only works with prefix-based `listen_path` proxies.** Regex (`~`) and exact (`=`) listen paths are skipped — the plugin continues without intercepting. Host-only or port-only routing is not supported. A trailing separator is normalized when composing the resource: both `/api` and `/api/` expose `/api/specz`. The double-slash alias `/api//specz`, encoded separators, and extra path segments are deliberately not intercepted. Query strings do not change the canonical match.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https` scheme; other schemes (e.g., `file://`) are rejected at plugin load time. |
-| `content_type` | String | _(upstream)_ | Override the response `Content-Type`. When omitted, the upstream response's `Content-Type` is passed through (so YAML specs return as YAML, JSON as JSON, etc.). |
-| `tls_no_verify` | bool | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Defaults to the gateway's global `FERRUM_TLS_NO_VERIFY` setting. Useful for internal endpoints with self-signed certificates. |
-| `cache_ttl_seconds` | u64 | `300` | TTL for the in-process spec body cache. The first `/specz` request fetches the spec from `spec_url` and caches it in memory; subsequent requests within the TTL window are served directly from the cache without re-fetching. Failed fetches are never cached — every failure is retried on the next request. Set to `0` to disable caching entirely (every request re-fetches). |
-| `max_response_body_bytes` | u64 | `26214400` | Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
+| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https`; URL userinfo is rejected. Paths and queries may route or authorize the origin request, but diagnostics include only the credential-free origin. |
+| `content_type` | String or null | _(upstream)_ | Trusted response `Content-Type` override, not restricted by the upstream allow-list. When omitted or null, only the supported spec media types listed below are preserved; other or missing upstream values fall back to `application/octet-stream`. |
+| `tls_no_verify` | bool or null | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Omitted or null uses the gateway's global setting. When verification is enabled and a custom gateway CA bundle is configured, failure to load or parse it rejects the plugin generation rather than widening trust to public roots. |
+| `cache_ttl_seconds` | u64 or null | `300` | TTL for the in-process positive spec cache. Omitted or null uses 300 seconds. `0` disables durable positive caching, but concurrent callers still share a short-lived single-flight completion. Failed fetches are negatively cached with bounded exponential backoff for every TTL setting. |
+| `max_response_body_bytes` | u64 or null | `26214400` | Maximum upstream spec response body size to buffer and cache. Omitted or null uses 25 MiB. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
 
 ```yaml
 # Example: Expose an OpenAPI spec for an API behind /my/api/v1
@@ -2629,9 +2629,11 @@ config:
   cache_ttl_seconds: 0
 ```
 
-**Error handling:** If the upstream spec URL is unreachable or returns a non-2xx status, the plugin returns a `502` JSON error response. The `spec_url` hostname is pre-warmed via DNS at startup alongside other backend hostnames. Failed fetches are NOT cached, so a transient upstream error is retried on the very next request.
+**Content-Type handling:** Without an explicit override, the media type (case-insensitive, before any `;` parameters) must be one of `application/json`, `application/openapi+json`, `application/openapi+yaml`, `application/vnd.oai.openapi`, `application/vnd.oai.openapi+json`, `application/yaml`, `application/x-yaml`, `application/wsdl+xml`, `application/vnd.sun.wadl+xml`, `application/xml`, `text/yaml`, `text/xml`, or `text/plain`. Matching values are preserved verbatim, including parameters; all other or missing values become `application/octet-stream`. An explicit `content_type` is operator-trusted and bypasses this upstream allow-list. Every successful response includes `X-Content-Type-Options: nosniff`.
 
-**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting the gateway clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway.
+**Error handling and admission:** If the upstream spec URL is unreachable, oversized, unreadable, or returns a non-2xx status, the plugin returns a `502` JSON error with `Retry-After`. One outbound fetch is active per plugin instance, failed completions are negatively cached with exponential backoff from 1 to 30 seconds, and at most 32 cache-miss callers (including the fetcher) are admitted. Excess callers receive `503` with `Retry-After` immediately rather than accumulating behind the fetch. The `spec_url` hostname is pre-warmed via DNS; logs include only its credential-free origin, never the configured path, query, fragment, or URL userinfo.
+
+**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting or reloading the plugin clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway. With a zero TTL, successful results are retained only for a 100 ms single-flight completion window.
 
 **Interaction with other plugins:** The plugin runs at priority 210 — after CORS (100), IP restriction (150), and bot detection (200), but before all authentication plugins (950+). This means blocked IPs and bots cannot access `/specz`, CORS preflight responses work correctly for browser-based spec consumers, and all authentication and authorization plugins are skipped for `/specz` requests.
 

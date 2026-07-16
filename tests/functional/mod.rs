@@ -75,6 +75,7 @@ mod functional_serverless_mirror_test;
 mod functional_service_discovery_test;
 mod functional_shared_harness_smoke_test;
 mod functional_sse_test;
+mod functional_spec_expose_test;
 mod functional_stream_listener_failure_test;
 mod functional_streaming_latency_tracking_test;
 mod functional_streaming_outcome_accounting_test;

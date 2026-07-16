@@ -383,7 +383,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below groups the 59 test files into 5 logical buckets sized roughly by
+    # below groups the 60 test files into 5 logical buckets sized roughly by
     # test count (admin-api ~153, admin-config ~152, mesh-routing ~158,
     # mesh-platform ~60, protocols-data-plane ~150). Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
@@ -403,6 +403,7 @@ jobs:
             filters: |
               integration::admin_api_specs_handler_tests
               integration::admin_db_api_specs_tests
+              integration::spec_expose_integration_tests
               integration::db_proxy_plugin_association_fail_closed_tests
               integration::admin_audit_rbac_tests
               integration::admin_backend_capabilities_tests
@@ -835,6 +836,7 @@ jobs:
               functional_plugin_extended_test
               functional_plugin_test
               functional_plugins_network_test
+              functional_spec_expose_test
               functional_prometheus_test
               functional_serverless_mirror_test
               functional_ws_plugins_test
