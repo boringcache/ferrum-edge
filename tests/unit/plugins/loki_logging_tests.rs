@@ -263,11 +263,7 @@ fn minimum_accepted_entry_budget(
     let mut accepted = 4096_usize;
     assert!(
         LokiLogging::new(
-            &entry_budget_config(
-                accepted,
-                include_proxy_id_label,
-                include_status_class_label,
-            ),
+            &entry_budget_config(accepted, include_proxy_id_label, include_status_class_label,),
             default_client(),
         )
         .is_ok(),

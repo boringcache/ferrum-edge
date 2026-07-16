@@ -250,10 +250,7 @@ impl LabelConfig {
         labels
     }
 
-    fn build_stream_labels(
-        &self,
-        summary: &StreamTransactionSummary,
-    ) -> BTreeMap<String, String> {
+    fn build_stream_labels(&self, summary: &StreamTransactionSummary) -> BTreeMap<String, String> {
         let mut labels = self.static_labels.clone();
         if self.include_proxy_id {
             labels.insert("proxy_id".to_string(), summary.proxy_id.clone());
@@ -649,10 +646,7 @@ fn validate_loki_label_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn retained_entry_bytes(
-    line_bytes: usize,
-    labels: &BTreeMap<String, String>,
-) -> Option<usize> {
+fn retained_entry_bytes(line_bytes: usize, labels: &BTreeMap<String, String>) -> Option<usize> {
     labels.iter().try_fold(line_bytes, |total, (key, value)| {
         total.checked_add(key.len())?.checked_add(value.len())
     })
