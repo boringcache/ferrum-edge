@@ -588,6 +588,23 @@ fn test_transaction_debugger_classifies_nonzero_grpc_status_under_http_200() {
 }
 
 #[test]
+fn test_transaction_debugger_prioritizes_rejection_over_nonzero_grpc_status() {
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 200;
+    summary
+        .metadata
+        .insert("grpc_status".to_string(), "16".to_string());
+    summary
+        .metadata
+        .insert("rejection_phase".to_string(), "authenticate".to_string());
+
+    assert_eq!(
+        TransactionDebugger::classify_http_outcome(&summary),
+        "rejected"
+    );
+}
+
+#[test]
 fn test_transaction_debugger_classifies_typed_stream_teardown() {
     let mut summary = stream_summary();
     assert_eq!(
