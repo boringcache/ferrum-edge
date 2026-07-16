@@ -33,11 +33,8 @@ REQUIRED_JOBS = {
     "build-functional-tests-archive",
     "test-functional",
     "plugin-hardening-redis-regression",
-    "gateway-api-conformance",
-    "coverage-gate",
     "mesh-multicluster-federation",
     "mesh-e2e-sidecar",
-    "mesh-e2e-sidecar-live",
     "helm-chart",
     "lint",
     "detect-ebpf-live-changes",
@@ -66,15 +63,54 @@ DIRECT_FULL_CI_JOBS = {
     "test-vendor-patches",
     "build-gateway-binary",
     "build-functional-tests-archive",
-    "gateway-api-conformance",
-    "coverage-gate",
-    "mesh-e2e-sidecar-live",
     "lint",
     "detect-ebpf-live-changes",
     "build-ebpf",
     "build-ebpf-userspace",
     "performance-regression",
     "build-binaries",
+}
+
+REMOVED_MIRROR_JOBS = {
+    "coverage-gate",
+    "gateway-api-conformance",
+    "mesh-e2e-sidecar-live",
+}
+
+DEDICATED_REQUIRED_CHECKS = {
+    ".github/workflows/coverage.yml": {
+        "job": "coverage-merge",
+        "name": "Merge Coverage",
+        "needs": {"coverage-plan", "coverage-shard"},
+        "contract": {
+            "needs.coverage-plan.result != 'success'",
+            "needs.coverage-plan.outputs.mode == 'skip'",
+            "needs.coverage-plan.outputs.mode == 'full' && needs.coverage-shard.result != 'success'",
+            "!contains(fromJSON('[\"skip\", \"plugin\", \"full\"]'), needs.coverage-plan.outputs.mode)",
+        },
+    },
+    ".github/workflows/gateway-api-conformance.yml": {
+        "job": "gate",
+        "name": "Gateway API Conformance",
+        "needs": {"changes", "gateway-api-conformance"},
+        "contract": {
+            '${{ needs.changes.result }}" != "success"',
+            '${{ needs.changes.outputs.relevant }}" = "false"',
+            '${{ needs.changes.outputs.relevant }}" != "true"',
+            '${{ needs.gateway-api-conformance.result }}" != "success"',
+        },
+    },
+    ".github/workflows/mesh-e2e-sidecar-live.yml": {
+        "job": "gate",
+        "name": "Mesh E2E Sidecar Live",
+        "needs": {"changes", "mesh-e2e-sidecar-live"},
+        "contract": {
+            '${{ needs.changes.result }}" != "success"',
+            '${{ needs.changes.outputs.relevant }}" = "false"',
+            '${{ needs.changes.outputs.relevant }}" != "true"',
+            '${{ needs.mesh-e2e-sidecar-live.result }}" != "success"',
+        },
+    },
 }
 
 
@@ -105,6 +141,35 @@ def extract_job_body(ci_yml: str, job: str) -> str:
     return match.group("body")
 
 
+def extract_job_needs(job_body: str) -> set[str]:
+    list_match = re.search(
+        r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", job_body
+    )
+    if list_match:
+        return {
+            line.strip().removeprefix("- ").strip()
+            for line in list_match.group("needs").splitlines()
+            if line.strip().startswith("- ")
+        }
+
+    scalar_match = re.search(r"(?m)^    needs: ([A-Za-z0-9_-]+)$", job_body)
+    if scalar_match:
+        return {scalar_match.group(1)}
+    return set()
+
+
+def pull_request_trigger_is_unconditional(workflow_yml: str) -> bool:
+    workflow_header = workflow_yml.split("\njobs:\n", maxsplit=1)[0]
+    pull_request = re.search(
+        r"(?ms)^  pull_request:(?P<body>.*?)(?=^  [A-Za-z_]+:|\Z)",
+        workflow_header,
+    )
+    if not pull_request:
+        return False
+    body = pull_request.group("body")
+    return not re.search(r"(?m)^    paths(?:-ignore)?:", body)
+
+
 def extract_documentation_paths(workflow_yml: str) -> set[str]:
     paths = set(
         re.findall(
@@ -125,12 +190,52 @@ def main() -> int:
     extra = sorted(needs - REQUIRED_JOBS)
 
     planner_errors: list[str] = []
+    for job in sorted(REMOVED_MIRROR_JOBS):
+        if re.search(rf"(?m)^  {re.escape(job)}:$", ci_yml):
+            planner_errors.append(f"jobs.{job} must remain removed from ci.yml")
+    if "(CI mirror)" in ci_yml:
+        planner_errors.append("ci.yml must not contain runner-holding CI mirror jobs")
+
     for job in sorted(DIRECT_FULL_CI_JOBS):
         body = extract_job_body(ci_yml, job)
         if not re.search(r"(?m)^    needs: ci-plan$", body):
             planner_errors.append(f"jobs.{job} must directly need ci-plan")
         if "needs.ci-plan.outputs.mode == 'full'" not in body:
             planner_errors.append(f"jobs.{job} must require full CI mode")
+
+    for workflow_path, required_check in DEDICATED_REQUIRED_CHECKS.items():
+        workflow_yml = Path(workflow_path).read_text(encoding="utf-8")
+        if not pull_request_trigger_is_unconditional(workflow_yml):
+            planner_errors.append(
+                f"{workflow_path} must trigger on every pull request without path filters"
+            )
+
+        job = str(required_check["job"])
+        body = extract_job_body(workflow_yml, job)
+        expected_name = str(required_check["name"])
+        if not re.search(rf"(?m)^    name: {re.escape(expected_name)}$", body):
+            planner_errors.append(
+                f"{workflow_path} jobs.{job} must keep required check name `{expected_name}`"
+            )
+        if not re.search(r"(?m)^    if: always\(\)$", body):
+            planner_errors.append(f"{workflow_path} jobs.{job} must run with if: always()")
+        if not re.search(r"(?m)^    runs-on: ubuntu-latest$", body):
+            planner_errors.append(
+                f"{workflow_path} jobs.{job} must use the dedicated required-check runner"
+            )
+
+        expected_needs = set(required_check["needs"])
+        actual_needs = extract_job_needs(body)
+        if actual_needs != expected_needs:
+            planner_errors.append(
+                f"{workflow_path} jobs.{job}.needs must be {sorted(expected_needs)}"
+            )
+
+        for contract in sorted(required_check["contract"]):
+            if contract not in body:
+                planner_errors.append(
+                    f"{workflow_path} jobs.{job} is missing fail-closed contract `{contract}`"
+                )
 
     ci_plan_body = extract_job_body(ci_yml, "ci-plan")
     if 'git diff --name-only --no-renames "${base_ref}...HEAD"' not in ci_plan_body:
