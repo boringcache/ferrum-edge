@@ -7838,7 +7838,14 @@ impl DatabaseBackend for DatabaseStore {
         namespace: &str,
         purpose: FullConfigLoadPurpose,
     ) -> Result<GatewayConfig, anyhow::Error> {
-        DatabaseStore::load_full_config_for_purpose(self, namespace, purpose).await
+        match purpose {
+            FullConfigLoadPurpose::Runtime => {
+                DatabaseStore::load_full_config(self, namespace).await
+            }
+            FullConfigLoadPurpose::ControlPlane | FullConfigLoadPurpose::BackupExport => {
+                DatabaseStore::load_full_config_for_purpose(self, namespace, purpose).await
+            }
+        }
     }
 
     async fn load_namespace_snapshot(
