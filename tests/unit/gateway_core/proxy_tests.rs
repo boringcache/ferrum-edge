@@ -1541,7 +1541,7 @@ async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination()
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
     let trusted = TrustedProxies::parse("10.0.0.0/8");
-    let socket_peer = "10.0.0.8".parse().expect("valid trusted proxy IP");
+    let socket_peer: std::net::IpAddr = "10.0.0.8".parse().expect("valid trusted proxy IP");
     let mut ctx = RequestContext::new(
         socket_peer.to_string(),
         "GET".to_string(),
