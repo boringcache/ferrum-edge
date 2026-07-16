@@ -592,9 +592,11 @@ async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
     let ConfigApplyOutcome::Rejected { errors } = outcome else {
         panic!("remote plaintext LDAP reload must be rejected");
     };
-    assert!(errors.iter().any(|error| {
-        error.contains("ldap_auth") && error.contains("STARTTLS or LDAPS")
-    }));
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.contains("ldap_auth") && error.contains("STARTTLS or LDAPS") })
+    );
     assert_eq!(
         state.config.load().plugin_configs[0].config["ldap_url"],
         "ldaps://directory.example.test:636"

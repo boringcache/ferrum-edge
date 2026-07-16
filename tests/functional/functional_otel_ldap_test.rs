@@ -562,8 +562,7 @@ async fn start_ldap_rebinding_gateway_with_retry(
         let config_content = config_template
             .replace("{backend_port}", &backend_port.to_string())
             .replace("{ldap_port}", &ldap_port.to_string());
-        std::fs::write(&config_path, config_content.as_bytes())
-            .expect("write rebind-test config");
+        std::fs::write(&config_path, config_content.as_bytes()).expect("write rebind-test config");
 
         let echo_handle = tokio::spawn(start_echo_server_on(backend_listener));
         sleep(Duration::from_millis(200)).await;
@@ -753,7 +752,10 @@ async fn test_ldap_auth_blocks_dial_time_dns_rebind() {
     let ldap_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind LDAP rebind sentinel");
-    let ldap_port = ldap_listener.local_addr().expect("LDAP sentinel addr").port();
+    let ldap_port = ldap_listener
+        .local_addr()
+        .expect("LDAP sentinel addr")
+        .port();
     let dns = RebindingDnsServer::spawn(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
     let config_template = r#"
 version: "1"

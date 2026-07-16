@@ -42,9 +42,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use dashmap::DashMap;
 use hmac::{Hmac, KeyInit, Mac};
-use ldap3::{
-    Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions, StdStream,
-};
+use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions, StdStream};
 use ring::rand::SecureRandom;
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
@@ -693,8 +691,7 @@ impl LdapAuth {
                 "ldap_auth: all screened connection candidates failed; last dial to {socket_addr} failed: {error}"
             ))),
             None => Err(AuthError::Backend(
-                "ldap_auth: dial-time DNS resolution returned no connection candidates"
-                    .to_string(),
+                "ldap_auth: dial-time DNS resolution returned no connection candidates".to_string(),
             )),
         }
     }

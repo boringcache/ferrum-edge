@@ -679,10 +679,7 @@ impl DnsCache {
         };
 
         let mut seen = HashSet::new();
-        let addresses: Vec<IpAddr> = lookup
-            .iter()
-            .filter(|addr| seen.insert(*addr))
-            .collect();
+        let addresses: Vec<IpAddr> = lookup.iter().filter(|addr| seen.insert(*addr)).collect();
         if addresses.is_empty() {
             anyhow::bail!("DNS dial-time resolution returned no addresses for {hostname}");
         }

@@ -990,10 +990,7 @@ impl TestDnsServer {
                     continue;
                 };
                 task_query_count.fetch_add(1, Ordering::Relaxed);
-                let current_answers = task_answers
-                    .read()
-                    .expect("read test DNS answers")
-                    .clone();
+                let current_answers = task_answers.read().expect("read test DNS answers").clone();
                 let TestDnsAnswers::Addresses(addresses) = current_answers else {
                     continue;
                 };
@@ -1112,11 +1109,9 @@ async fn test_direct_bind_dials_fresh_screened_ipv4_answer() {
 
 #[tokio::test]
 async fn test_direct_bind_dials_fresh_screened_ipv6_answer() {
-    let (port, ldap_task) = spawn_bind_response_ldap_server_at(
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-        0,
-    )
-    .await;
+    let (port, ldap_task) =
+        spawn_bind_response_ldap_server_at(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0), 0)
+            .await;
     let dns = TestDnsServer::spawn(vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]).await;
     let plugin = LdapAuth::new(
         &json!({
@@ -1148,7 +1143,10 @@ async fn test_mixed_ipv4_ipv6_answer_fails_before_any_starttls_dial() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mixed-answer LDAP sentinel");
-    let port = listener.local_addr().expect("mixed-answer LDAP addr").port();
+    let port = listener
+        .local_addr()
+        .expect("mixed-answer LDAP addr")
+        .port();
     let dns = TestDnsServer::spawn(vec![
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         "fe80::1".parse().expect("link-local IPv6"),
@@ -1299,10 +1297,7 @@ async fn test_plaintext_localhost_exception_rejects_non_loopback_override() {
         }),
         http_client_with_dns_config(
             DnsConfig {
-                global_overrides: HashMap::from([(
-                    "localhost".to_string(),
-                    "0.0.0.0".to_string(),
-                )]),
+                global_overrides: HashMap::from([("localhost".to_string(), "0.0.0.0".to_string())]),
                 ..DnsConfig::default()
             },
             BackendEgressPolicy::unrestricted(),
@@ -1395,8 +1390,8 @@ async fn test_ldaps_keeps_configured_hostname_for_certificate_verification() {
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
 
-    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-        .expect("generate LDAP test CA key");
+    let ca_key =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate LDAP test CA key");
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("LDAP test CA params");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
@@ -1404,10 +1399,10 @@ async fn test_ldaps_keeps_configured_hostname_for_certificate_verification() {
         .self_signed(&ca_key)
         .expect("self-sign LDAP test CA");
     let issuer = Issuer::new(ca_params, ca_key);
-    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-        .expect("generate LDAP leaf key");
-    let leaf_params = CertificateParams::new(vec!["directory.test".to_string()])
-        .expect("LDAP leaf params");
+    let leaf_key =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate LDAP leaf key");
+    let leaf_params =
+        CertificateParams::new(vec!["directory.test".to_string()]).expect("LDAP leaf params");
     let leaf_cert = leaf_params
         .signed_by(&leaf_key, &issuer)
         .expect("sign LDAP leaf");
