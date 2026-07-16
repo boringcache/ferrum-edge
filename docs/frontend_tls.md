@@ -695,7 +695,7 @@ openssl s_client -connect localhost:8443 -cipher 'ALL' -tls1_2
 
 When using load balancers:
 
-1. **TLS Termination at Load Balancer**: Configure HTTP mode on gateway
+1. **TLS Termination at Load Balancer**: Configure HTTP mode on the gateway and include the load balancer in `FERRUM_TRUSTED_PROXIES` so its `X-Forwarded-Proto: https` preserves the browser-facing secure scheme
 2. **TLS Pass-Through**: Configure HTTPS/mTLS mode on gateway
 3. **Health Checks**: Ensure health checks work with your TLS configuration
 

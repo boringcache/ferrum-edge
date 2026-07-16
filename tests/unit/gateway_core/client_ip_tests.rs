@@ -2,6 +2,7 @@
 
 use ferrum_edge::proxy::client_ip::{
     TrustedProxies, resolve_client_ip, resolve_forwarded_client_ip, resolve_real_ip_header,
+    trusted_forwarded_request_is_https,
 };
 
 // ── TrustedProxies parsing ───────────────────────────────────────────
@@ -127,6 +128,34 @@ fn parse_strict_rejects_empty_comma_segments() {
     let err = TrustedProxies::parse_strict(",")
         .expect_err("strict parsing must reject comma-only configuration");
     assert!(err.contains("<empty>"));
+}
+
+#[test]
+fn forwarded_https_requires_the_nearest_value_from_a_trusted_peer() {
+    let trusted = TrustedProxies::parse("10.0.0.0/8");
+    let trusted_peer = "10.0.0.8".parse().expect("valid trusted peer IP");
+    let untrusted_peer = "203.0.113.8".parse().expect("valid untrusted peer IP");
+
+    assert!(trusted_forwarded_request_is_https(
+        &trusted_peer,
+        ["http", " HTTPS\t"],
+        &trusted,
+    ));
+    assert!(!trusted_forwarded_request_is_https(
+        &trusted_peer,
+        ["https, http"],
+        &trusted,
+    ));
+    assert!(!trusted_forwarded_request_is_https(
+        &trusted_peer,
+        ["https,"],
+        &trusted,
+    ));
+    assert!(!trusted_forwarded_request_is_https(
+        &untrusted_peer,
+        ["https"],
+        &trusted,
+    ));
 }
 
 // ── resolve_client_ip ────────────────────────────────────────────────

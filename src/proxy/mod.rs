@@ -14604,6 +14604,22 @@ fn canonical_set_cookie_domain(domain: &str) -> Option<CanonicalSetCookieDomain<
     Some(CanonicalSetCookieDomain::Text(domain))
 }
 
+fn canonical_set_cookie_domain_ip(domain: &CanonicalSetCookieDomain<'_>) -> Option<IpAddr> {
+    match domain {
+        CanonicalSetCookieDomain::Text(domain) => domain.parse().ok(),
+        CanonicalSetCookieDomain::Ipv6(domain) => Some(IpAddr::V6(*domain)),
+    }
+}
+
+fn set_cookie_request_host_ip(authority: Option<&str>) -> Option<IpAddr> {
+    let (host, _) = split_request_authority(authority?)?;
+    host.strip_prefix('[')
+        .and_then(|content| content.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
 fn valid_set_cookie_path(path: &str) -> bool {
     path.starts_with('/') && !path.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
 }
@@ -14674,6 +14690,7 @@ fn set_cookie_storage_key<'a>(
     set_cookie: &'a str,
     default_path: &'a str,
     request_is_secure: bool,
+    request_host_ip: Option<IpAddr>,
 ) -> Option<SetCookieStorageKey<'a>> {
     let name = set_cookie_name(set_cookie)?;
     let mut domain_attribute = None;
@@ -14707,11 +14724,11 @@ fn set_cookie_storage_key<'a>(
             same_site_none =
                 attribute_value.is_some_and(|value| value.eq_ignore_ascii_case("none"));
         } else if attribute_name.eq_ignore_ascii_case("domain") {
-            // A bare Domain is parsed with an empty value. The last Domain
-            // attribute wins, including an empty value that makes the cookie
-            // host-only. Invalid non-empty values make the whole line
-            // non-comparable below.
-            domain_attribute = Some(attribute_value.unwrap_or(""));
+            // User agents ignore empty and bare Domain cookie-avs. A later
+            // empty value therefore does not erase an earlier valid Domain.
+            if let Some(value) = attribute_value.filter(|value| !value.is_empty()) {
+                domain_attribute = Some(value);
+            }
         } else if attribute_name.eq_ignore_ascii_case("path") {
             // A bare Path is the last Path attribute with an empty value, so
             // it supersedes an earlier value and resolves to default_path.
@@ -14719,13 +14736,24 @@ fn set_cookie_storage_key<'a>(
         }
     }
 
-    // RFC 6265 uses the last Domain/Path attribute. An empty Domain value
-    // creates a host-only cookie, while a trailing-dot or otherwise malformed
-    // non-empty Domain rejects the cookie. An invalid Path value falls back to
-    // the request's default path.
+    // RFC 6265 uses the last effective Domain/Path attribute. Empty Domain
+    // values were ignored above, while a trailing-dot or otherwise malformed
+    // non-empty Domain rejects the cookie. Mainstream user agents treat an
+    // exact-IP Domain as a host cookie and reject a nonmatching IP Domain.
+    // An invalid Path value falls back to the request's default path.
     let (domain, host_only) = match domain_attribute {
-        Some("") | None => (None, true),
-        Some(domain) => (Some(canonical_set_cookie_domain(domain)?), false),
+        None => (None, true),
+        Some(domain) => {
+            let domain = canonical_set_cookie_domain(domain)?;
+            if let Some(domain_ip) = canonical_set_cookie_domain_ip(&domain) {
+                if request_host_ip != Some(domain_ip) {
+                    return None;
+                }
+                (None, true)
+            } else {
+                (Some(domain), false)
+            }
+        }
     };
     let path = match path_attribute {
         Some(path) if valid_set_cookie_path(path) => path,
@@ -14765,12 +14793,15 @@ fn set_cookie_same_storage_key(
     candidate: &str,
     default_path: &str,
     request_is_secure: bool,
+    request_host_ip: Option<IpAddr>,
 ) -> bool {
-    let Some(existing_key) = set_cookie_storage_key(existing, default_path, request_is_secure)
+    let Some(existing_key) =
+        set_cookie_storage_key(existing, default_path, request_is_secure, request_host_ip)
     else {
         return false;
     };
-    let Some(candidate_key) = set_cookie_storage_key(candidate, default_path, request_is_secure)
+    let Some(candidate_key) =
+        set_cookie_storage_key(candidate, default_path, request_is_secure, request_host_ip)
     else {
         return false;
     };
@@ -14801,11 +14832,18 @@ fn collect_later_set_cookies(
     joined: &str,
     default_path: &str,
     request_is_secure: bool,
+    request_host_ip: Option<IpAddr>,
 ) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
         if let Some(index) = cookies.iter().position(|existing| {
             existing == candidate
-                || set_cookie_same_storage_key(existing, candidate, default_path, request_is_secure)
+                || set_cookie_same_storage_key(
+                    existing,
+                    candidate,
+                    default_path,
+                    request_is_secure,
+                    request_host_ip,
+                )
         }) {
             cookies.remove(index);
         }
@@ -14818,10 +14856,17 @@ fn set_cookie_conflicts(
     candidate: &str,
     default_path: &str,
     request_is_secure: bool,
+    request_host_ip: Option<IpAddr>,
 ) -> bool {
     cookies.iter().any(|existing| {
         existing == candidate
-            || set_cookie_same_storage_key(existing, candidate, default_path, request_is_secure)
+            || set_cookie_same_storage_key(
+                existing,
+                candidate,
+                default_path,
+                request_is_secure,
+                request_host_ip,
+            )
     })
 }
 
@@ -14830,11 +14875,24 @@ fn set_cookie_conflicts(
 pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
     let default_path = default_set_cookie_path(&ctx.path);
     let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
+    let request_host_ip = set_cookie_request_host_ip(ctx.request_authority.as_deref());
     let mut staged = Vec::new();
     if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
-        collect_later_set_cookies(&mut staged, existing, default_path, can_store_secure_cookie);
+        collect_later_set_cookies(
+            &mut staged,
+            existing,
+            default_path,
+            can_store_secure_cookie,
+            request_host_ip,
+        );
     }
-    collect_later_set_cookies(&mut staged, &cookie, default_path, can_store_secure_cookie);
+    collect_later_set_cookies(
+        &mut staged,
+        &cookie,
+        default_path,
+        can_store_secure_cookie,
+        request_host_ip,
+    );
 
     if staged.is_empty() {
         ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
@@ -14855,6 +14913,7 @@ fn attach_auth_rejection_set_cookie(
     };
     let default_path = default_set_cookie_path(&ctx.path);
     let can_store_secure_cookie = request_can_store_secure_cookie(ctx);
+    let request_host_ip = set_cookie_request_host_ip(ctx.request_authority.as_deref());
 
     // A custom plugin can return multiple case variants because rejection
     // headers use a String-keyed HashMap. Sort the variants by their exact key
@@ -14871,7 +14930,13 @@ fn attach_auth_rejection_set_cookie(
 
     let mut merged = Vec::new();
     for (_, value) in selected_variants {
-        collect_later_set_cookies(&mut merged, &value, default_path, can_store_secure_cookie);
+        collect_later_set_cookies(
+            &mut merged,
+            &value,
+            default_path,
+            can_store_secure_cookie,
+            request_host_ip,
+        );
     }
 
     let mut staged_cookies = Vec::new();
@@ -14880,12 +14945,19 @@ fn attach_auth_rejection_set_cookie(
         &staged,
         default_path,
         can_store_secure_cookie,
+        request_host_ip,
     );
     for candidate in staged_cookies {
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
         // independently scoped requester-owned cookies from earlier rejects.
-        if !set_cookie_conflicts(&merged, &candidate, default_path, can_store_secure_cookie) {
+        if !set_cookie_conflicts(
+            &merged,
+            &candidate,
+            default_path,
+            can_store_secure_cookie,
+            request_host_ip,
+        ) {
             merged.push(candidate);
         }
     }
@@ -15378,6 +15450,12 @@ async fn handle_proxy_request_inner(
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref addr) = socket_addr {
+            let forwarded_request_is_https = client_ip::trusted_forwarded_request_is_https(
+                addr,
+                ctx.raw_header_values("x-forwarded-proto"),
+                &state.trusted_proxies,
+            );
+            ctx.request_is_secure |= forwarded_request_is_https;
             let real_ip_header_val =
                 state
                     .env_config

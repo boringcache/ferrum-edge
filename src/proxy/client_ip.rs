@@ -2,9 +2,9 @@
 //!
 //! When the gateway sits behind load balancers, CDNs, or reverse proxies, the
 //! TCP socket address (`remote_addr`) is the proxy's IP — not the real client's.
-//! This module resolves the true originating client IP by walking the
-//! `X-Forwarded-For` (XFF) chain from right to left, stripping entries that
-//! belong to trusted proxies.
+//! This module resolves the true originating client IP from `X-Forwarded-For`
+//! (XFF) and recognizes the original HTTPS scheme from `X-Forwarded-Proto`,
+//! but only when the direct peer belongs to the trusted-proxy set.
 //!
 //! # Security model
 //!
@@ -62,7 +62,7 @@ impl TrustedProxies {
         }
         if !cidrs.is_empty() {
             tracing::info!(
-                "Configured {} trusted proxy CIDR(s) for X-Forwarded-For resolution",
+                "Configured {} trusted proxy CIDR(s) for forwarded client metadata",
                 cidrs.len()
             );
         }
@@ -82,7 +82,7 @@ impl TrustedProxies {
         Ok(Self { cidrs })
     }
 
-    /// Returns an empty set (no trusted proxies — XFF headers will be ignored).
+    /// Returns an empty set (forwarded client metadata will be ignored).
     #[allow(dead_code)] // Used by tests
     pub fn none() -> Self {
         Self {
@@ -118,6 +118,31 @@ impl TrustedProxies {
             .0
             .permits_all_family()
     }
+}
+
+/// Return whether a trusted direct proxy reports an HTTPS client-facing
+/// request through `X-Forwarded-Proto`.
+///
+/// The rightmost value represents the proxy nearest Ferrum when multiple
+/// field lines or comma-separated values are present. Empty or unrecognized
+/// final values fail closed. Callers must never use this result for an
+/// untrusted socket peer because the header may then be client-controlled.
+pub fn trusted_forwarded_request_is_https<'a>(
+    socket_addr: &IpAddr,
+    forwarded_proto_values: impl IntoIterator<Item = &'a str>,
+    trusted_proxies: &TrustedProxies,
+) -> bool {
+    if !trusted_proxies.contains(socket_addr) {
+        return false;
+    }
+
+    let mut nearest_proto = None;
+    for value in forwarded_proto_values {
+        for proto in value.split(',') {
+            nearest_proto = Some(proto.trim_matches([' ', '\t']));
+        }
+    }
+    nearest_proto.is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
 }
 
 /// Resolve the real client IP from the request context.

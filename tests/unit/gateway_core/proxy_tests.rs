@@ -6,6 +6,9 @@ use ferrum_edge::proxy::{
     build_backend_effective_path, build_backend_url, build_backend_url_with_target,
     retry_target_preserves_backend_path,
 };
+use ferrum_edge::proxy::client_ip::{
+    TrustedProxies, trusted_forwarded_request_is_https,
+};
 use ferrum_edge::router_cache::RouterCache;
 use std::collections::HashMap;
 
@@ -1292,10 +1295,10 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
 #[tokio::test]
 async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
     let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
-        cookies: "non_ldh=staged; Domain=foo_bar.example; Path=/\nip_literal=staged; Domain=[0:0:0:0:0:0:0:1]; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_same=staged; Secure; pArTiTiOnEd; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/\ntrailing_dot=staged; Path=/\ntrailing_dot_prior=staged; Domain=example.com; Path=/\nempty_domain=staged; Path=/\nbare_domain=staged; Path=/",
+        cookies: "non_ldh=staged; Domain=foo_bar.example; Path=/\nip_literal=staged; Domain=[0:0:0:0:0:0:0:1]; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_same=staged; Secure; pArTiTiOnEd; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/\ntrailing_dot=staged; Path=/\ntrailing_dot_prior=staged; Domain=example.com; Path=/\nempty_domain=staged; Domain=example.com; Path=/\nbare_domain=staged; Domain=example.com; Path=/\nonly_empty=staged; Path=/\nonly_bare=staged; Path=/",
     });
     let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
-        cookies: "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\ntrailing_dot=selected; Domain=example.com.; Path=/\ntrailing_dot_prior=selected; Domain=example.com; Domain=other.example.; Path=/\nempty_domain=selected; Domain=example.com; Domain=; Path=/\nbare_domain=selected; Domain=example.com; Domain; Path=/",
+        cookies: "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\ntrailing_dot=selected; Domain=example.com.; Path=/\ntrailing_dot_prior=selected; Domain=example.com; Domain=other.example.; Path=/\nempty_domain=selected; Domain=example.com; Domain=; Path=/\nbare_domain=selected; Domain=example.com; Domain; Path=/\nonly_empty=selected; Domain=; Path=/\nonly_bare=selected; Domain; Path=/",
     });
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
@@ -1305,6 +1308,7 @@ async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
         "/cookie-scope".to_string(),
     );
     ctx.request_is_secure = true;
+    ctx.request_authority = Some("[::1]".to_string());
 
     let (_, _, headers) =
         run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
@@ -1314,8 +1318,76 @@ async fn test_auth_rejection_cookie_storage_key_preserves_extended_scopes() {
     assert_eq!(
         headers.get("set-cookie").map(String::as_str),
         Some(
-            "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\ntrailing_dot=selected; Domain=example.com.; Path=/\ntrailing_dot_prior=selected; Domain=example.com; Domain=other.example.; Path=/\nempty_domain=selected; Domain=example.com; Domain=; Path=/\nbare_domain=selected; Domain=example.com; Domain; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/\ntrailing_dot=staged; Path=/\ntrailing_dot_prior=staged; Domain=example.com; Path=/"
+            "non_ldh=selected; Domain=foo_bar.example; Path=/\nip_literal=selected; Domain=[::1]; Path=/\ninvalid_ip=selected; Domain=[not-an-ip]; Path=/\npartitioned_same=selected; Secure; Partitioned; Path=/\npartitioned_split=selected; Secure; Partitioned; Path=/\npartitioned_reverse=selected; Secure; Path=/\ndot_scope=selected; Domain=example.com; Path=/\ntrailing_dot=selected; Domain=example.com.; Path=/\ntrailing_dot_prior=selected; Domain=example.com; Domain=other.example.; Path=/\nempty_domain=selected; Domain=example.com; Domain=; Path=/\nbare_domain=selected; Domain=example.com; Domain; Path=/\nonly_empty=selected; Domain=; Path=/\nonly_bare=selected; Domain; Path=/\ninvalid_ip=staged; Domain=[not-an-ip]; Path=/\npartitioned_split=staged; Secure; Path=/\npartitioned_reverse=staged; Secure; PARTITIONED; Path=/\ndot_scope=staged; Path=/\ntrailing_dot=staged; Path=/\ntrailing_dot_prior=staged; Domain=example.com; Path=/"
         )
+    );
+}
+
+#[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_treats_matching_ip_domain_as_host_only() {
+    for (authority, selected_cookie) in [
+        (
+            "127.0.0.1",
+            "session=selected; Domain=127.0.0.1; Path=/",
+        ),
+        (
+            "[::1]",
+            "session=selected; Domain=[0:0:0:0:0:0:0:1]; Path=/",
+        ),
+    ] {
+        let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+            cookies: "session=staged; Path=/",
+        });
+        let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+            cookies: selected_cookie,
+        });
+        let auth_plugins = [staged, selected];
+        let consumer_index = ConsumerIndex::new(&[]);
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/cookie-scope".to_string(),
+        );
+        ctx.request_authority = Some(authority.to_string());
+
+        let (_, _, headers) =
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+                .await
+                .expect("both auth attempts must reject");
+
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some(selected_cookie),
+            "an exact-IP Domain must own the request host's host-only cookie"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_rejects_nonmatching_ip_domain() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "session=staged; Path=/",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "session=selected; Domain=127.0.0.2; Path=/",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cookie-scope".to_string(),
+    );
+    ctx.request_authority = Some("127.0.0.1".to_string());
+
+    let (_, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("both auth attempts must reject");
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("session=selected; Domain=127.0.0.2; Path=/\nsession=staged; Path=/")
     );
 }
 
@@ -1461,6 +1533,40 @@ async fn test_auth_rejection_cookie_storage_key_allows_secure_cookie_on_trustwor
             "untrustworthy HTTP authority {authority} must preserve the storable staged cookie"
         );
     }
+}
+
+#[tokio::test]
+async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination() {
+    let staged: Arc<dyn Plugin> = Arc::new(ScopedCookieStagingAuth {
+        cookies: "transport=staged; Path=/",
+    });
+    let selected: Arc<dyn Plugin> = Arc::new(ScopedCookieSelectedAuth {
+        cookies: "transport=selected; Secure; Path=/",
+    });
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let trusted = TrustedProxies::parse("10.0.0.0/8");
+    let socket_peer = "10.0.0.8".parse().expect("valid trusted proxy IP");
+    let mut ctx = RequestContext::new(
+        socket_peer.to_string(),
+        "GET".to_string(),
+        "/cookie-scope".to_string(),
+    );
+    ctx.request_is_secure = trusted_forwarded_request_is_https(
+        &socket_peer,
+        ["https"],
+        &trusted,
+    );
+
+    let (_, _, headers) =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+            .await
+            .expect("both auth attempts must reject");
+
+    assert_eq!(
+        headers.get("set-cookie").map(String::as_str),
+        Some("transport=selected; Secure; Path=/")
+    );
 }
 
 #[tokio::test]
