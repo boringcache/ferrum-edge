@@ -226,7 +226,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### TCP Connection Throttle
 
-**What it stores:** Process-local active TCP/TCP+TLS connection counts per consumer or canonical client IP. The map uses the normalized `FERRUM_POOL_SHARD_AMOUNT`. Every replica has an independent map, so aggregate deployment capacity is the configured per-key limit multiplied by the number of replicas receiving that key's connections.
+**What it stores:** Active TCP/TCP+TLS connection counts per consumer or canonical client IP. Accounting is process-local, and the map uses the normalized `FERRUM_POOL_SHARD_AMOUNT`. Every replica has an independent map, so aggregate deployment capacity is the configured per-key limit multiplied by the number of replicas receiving that key's connections.
 
 **Default limit:** No hard entry cap -- bounded by unique clients with active connections.
 
