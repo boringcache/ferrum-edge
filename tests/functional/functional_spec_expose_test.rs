@@ -321,6 +321,7 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
     let encoded_body = encoded.text().await.expect("encoded body");
     assert!(!encoded_body.contains("\"openapi\""));
     assert_eq!(origin.hits(), 1);
+    assert_eq!(backend.hits(), 2);
 
     // Route method admission runs before the plugin and can exclude HEAD.
     let blocked = h1
@@ -330,7 +331,7 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
         .expect("H1 blocked HEAD");
     assert_eq!(blocked.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(origin.hits(), 1);
-    assert_eq!(backend.hits(), 1);
+    assert_eq!(backend.hits(), 2);
 
     let h2 = reqwest::Client::builder()
         .http2_prior_knowledge()
@@ -373,7 +374,7 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
     let h3_blocked = h3_request_until_ready(&h3, &h3_blocked_url, Method::HEAD).await;
     assert_eq!(h3_blocked.status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(origin.hits(), 1);
-    assert_eq!(backend.hits(), 1);
+    assert_eq!(backend.hits(), 2);
     assert_eq!(backend.h2c_probes(), startup_h2c_probes);
 
     gateway.shutdown();
