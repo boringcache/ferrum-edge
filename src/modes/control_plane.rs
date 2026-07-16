@@ -443,7 +443,8 @@ fn prepare_cp_full_snapshot(mut config: GatewayConfig) -> Result<GatewayConfig, 
     // (including rejection). This preserves loader validation while preventing
     // a long-lived control plane from retaining up to the full MMDB budget.
     let _country_mmdb_handoff =
-        CountryMmdbLoadSession::claim(&config.country_mmdb_file_dependency_paths())?;
+        CountryMmdbLoadSession::claim(&config.country_mmdb_file_dependency_paths())
+            .map_err(anyhow::Error::msg)?;
     reject_invalid_cp_full_snapshot(&config)?;
     Ok(config)
 }
