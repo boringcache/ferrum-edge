@@ -180,6 +180,32 @@ The coalesce loop is identical across the two paths — source of bytes differs 
 - **Buffered gRPC response** — the gRPC pool extracts trailers into a `HashMap<String, String>` before returning; the bridge converts them to a `HeaderMap` and sends via `send_trailers()` after the data frames.
 - **Streaming gRPC response** — the bridge polls hyper `Incoming::frame()`; when a `Frame::trailers()` variant is seen, the `HeaderMap` is stashed, the data loop exits cleanly, and the stashed trailers are forwarded via `send_trailers()`.
 
+Buffered response hooks receive a compatibility view containing both initial
+headers and trailers. Before the H3 response is written, Ferrum restores the
+original provenance, reapplies the prefiltered `security_headers` policy to the
+initial header map, and keeps `grpc-status`, `grpc-message`, status details, and
+application metadata on the trailer channel whenever the backend supplied a
+real trailers frame, including split responses with an empty DATA body. A final
+security-policy removal is authoritative across both compatibility copies: it
+also suppresses trailer-only or header-shadowed application metadata, and runs
+after any hook-mutated trailer cookie is rehomed. A final policy set/override
+remains initial-header policy and preserves the backend's application trailer.
+A backend Trailers-Only response that already carries terminal status in its
+END_STREAM initial HEADERS and has no trailers frame keeps that status there;
+Ferrum snapshots the reserved terminal fields from the pristine backend
+headers before response hooks run, then restores that authoritative snapshot,
+so policy replay cannot remove or replace it. This is also the path used after
+gRPC-Web binary or text response framing, so security policy cannot disappear
+with the native trailer map.
+
+After route resolution, HTTP/3 method-filter errors and native-gRPC gateway
+errors (including request deadlines, size limits, backend unavailability, and
+mesh fail-closed responses) also apply the route's precomputed initial-response
+policy before the initial HEADERS write. gRPC status/message, content type, and
+transport framing are restored after policy. Errors rejected before a route is
+resolved have no plugin configuration and therefore remain outside this policy
+boundary.
+
 Either way, `grpc-status` reaches the H3 client intact.
 
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
@@ -192,6 +218,14 @@ gateway authenticates, authorizes, runs the `before_proxy` plugin chain,
 opens a backend WebSocket connection, replies `:status = 200`, and then
 bridges WebSocket frames between the QUIC stream and the backend
 WebSocket for the lifetime of the session.
+
+The `security_headers` initial-response policy runs on the RFC 9220 `200`
+handshake and on gateway-generated H3 WebSocket failures. Transport-managed
+fields are stripped at the final emission boundary after response hooks; JSON
+failures default `Content-Type: application/json` there when no intentional
+content type survives. The backend-negotiated `Sec-WebSocket-Protocol` is then
+restored on success. H3 never emits the HTTP/1.1-only `Upgrade`, `Connection`,
+or `Sec-WebSocket-Accept` fields.
 
 ### Wire-level handshake
 

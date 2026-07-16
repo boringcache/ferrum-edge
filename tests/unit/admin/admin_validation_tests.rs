@@ -66,7 +66,7 @@ fn make_consumer(
 }
 
 #[test]
-fn test_redact_basicauth_password_hash() {
+fn test_redact_basicauth_password_hash_by_omission() {
     let mut credentials = std::collections::HashMap::new();
     credentials.insert(
         "basicauth".to_string(),
@@ -75,9 +75,122 @@ fn test_redact_basicauth_password_hash() {
     let consumer = make_consumer(credentials);
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
-    let basic = redacted.credentials.get("basicauth").unwrap();
-    assert_eq!(basic["password_hash"], "[REDACTED]");
-    assert_eq!(basic["username"], "alice");
+    assert!(!redacted.credentials.contains_key("basicauth"));
+}
+
+#[test]
+fn test_redact_basicauth_plaintext_password_by_omission() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "basicauth".to_string(),
+        json!({"password": "must-not-escape"}),
+    );
+    let consumer = make_consumer(credentials);
+
+    let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
+    assert!(!redacted.credentials.contains_key("basicauth"));
+}
+
+#[test]
+fn test_basic_credential_user_shape_failure_is_bad_request() {
+    let mut credential = json!({
+        "password": "x".repeat(ferrum_edge::config::types::MAX_CREDENTIAL_VALUE_LENGTH + 1)
+    });
+
+    let status =
+        ferrum_edge::_test_support::prepare_basic_auth_credential_for_test(&mut credential)
+            .expect_err("oversized Basic password must be rejected");
+
+    assert_eq!(status, hyper::StatusCode::BAD_REQUEST);
+    assert!(credential.get("password").is_some());
+    assert!(credential.get("password_hash").is_none());
+}
+
+#[test]
+fn test_basic_credential_server_configuration_failures_are_internal_errors() {
+    assert_eq!(
+        ferrum_edge::_test_support::basic_auth_server_configuration_status_for_test(None),
+        Some(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::basic_auth_server_configuration_status_for_test(Some("weak")),
+        Some(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+    );
+}
+
+#[test]
+fn test_disabled_basic_auth_config_skips_plugin_construction() {
+    let now = chrono::Utc::now();
+    let mut plugin_config = ferrum_edge::config::types::PluginConfig {
+        id: "disabled-basic-auth".to_string(),
+        plugin_name: "basic_auth".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        // An unsupported field makes constructor invocation fail regardless of
+        // process environment, so this deterministically proves the disabled
+        // admin path does not construct the plugin.
+        config: json!({"realm": "staged-but-unused"}),
+        scope: ferrum_edge::config::types::PluginScope::Global,
+        proxy_id: None,
+        enabled: false,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    assert!(
+        ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config).is_ok()
+    );
+
+    plugin_config.enabled = true;
+    assert!(
+        ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config).is_err()
+    );
+}
+
+#[test]
+fn test_disabled_unknown_plugin_name_remains_invalid() {
+    let now = chrono::Utc::now();
+    let plugin_config = ferrum_edge::config::types::PluginConfig {
+        id: "disabled-unknown-plugin".to_string(),
+        plugin_name: "not_a_registered_plugin".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config: json!({"staged": true}),
+        scope: ferrum_edge::config::types::PluginScope::Global,
+        proxy_id: None,
+        enabled: false,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    assert!(
+        ferrum_edge::_test_support::validate_admin_plugin_config_for_test(&plugin_config).is_err()
+    );
+}
+
+#[test]
+fn test_basic_auth_audit_redaction_uses_one_shape_independent_marker() {
+    let password_hash = format!("hmac_sha256:{}", "a".repeat(64));
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "basicauth".to_string(),
+        json!([{
+            "password_hash": password_hash.clone(),
+            "credential_label": "must-not-escape"
+        }]),
+    );
+    let consumer = make_consumer(credentials);
+
+    let redacted = ferrum_edge::config::types::redact_consumer_credentials_for_audit(&consumer);
+    assert_eq!(redacted.credentials["basicauth"], "[REDACTED]");
+
+    let serialized = serde_json::to_string(&redacted).expect("redacted consumer serializes");
+    assert!(!serialized.contains("password_hash"));
+    assert!(!serialized.contains("credential_label"));
+    assert!(!serialized.contains("must-not-escape"));
+    assert!(!serialized.contains(&password_hash));
 }
 
 #[test]
@@ -137,10 +250,7 @@ fn test_redact_multiple_credential_types() {
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
 
-    assert_eq!(
-        redacted.credentials["basicauth"]["password_hash"],
-        "[REDACTED]"
-    );
+    assert!(!redacted.credentials.contains_key("basicauth"));
     assert_eq!(redacted.credentials["hmac_auth"]["secret"], "[REDACTED]");
     assert_eq!(redacted.credentials["keyauth"]["key"], "[REDACTED]");
 }
@@ -193,7 +303,7 @@ fn test_redact_array_jwt_secrets() {
 }
 
 #[test]
-fn test_redact_array_basicauth_passwords() {
+fn test_redact_array_basicauth_passwords_by_omission() {
     let mut credentials = std::collections::HashMap::new();
     credentials.insert(
         "basicauth".to_string(),
@@ -205,11 +315,7 @@ fn test_redact_array_basicauth_passwords() {
     let consumer = make_consumer(credentials);
 
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
-    let basic = redacted.credentials.get("basicauth").unwrap();
-    let arr = basic.as_array().unwrap();
-    assert_eq!(arr.len(), 2);
-    assert_eq!(arr[0]["password_hash"], "[REDACTED]");
-    assert_eq!(arr[1]["password_hash"], "[REDACTED]");
+    assert!(!redacted.credentials.contains_key("basicauth"));
 }
 
 #[test]

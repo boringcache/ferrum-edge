@@ -866,6 +866,37 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
+    let document = serde_json::json!({
+        "version": "1",
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [{
+            "id": "adaptive-limit-typo",
+            "plugin_name": "adaptive_concurrency",
+            "config": {"max_limt": 32},
+            "scope": "global",
+            "enabled": true
+        }]
+    });
+    let mut file = NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{document}").unwrap();
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file-mode load must reject unknown adaptive_concurrency keys");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("1 plugin config error(s)"),
+        "unexpected file-load error: {message}"
+    );
+}
+
+#[test]
 fn test_optional_fail_open_plugin_validation_is_non_fatal_in_file_mode() {
     let yaml = r#"
 version: "1"
@@ -1525,4 +1556,32 @@ plugin_configs: []
     assert_eq!(config.consumers.len(), 1);
     assert_eq!(config.consumers[0].username, "alice");
     assert_eq!(config.consumers[0].namespace, "prod");
+}
+
+#[test]
+fn test_file_config_rejects_plaintext_basicauth_password() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers:
+  - id: "plaintext-basic"
+    username: "alice"
+    credentials:
+      basicauth:
+        - password: "must-not-enter-runtime-config"
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let error = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file mode must reject plaintext Basic-auth passwords");
+    let message = format!("{error:#}");
+    assert!(message.contains("file-mode Basic-auth credentials"));
+    assert!(!message.contains("must-not-enter-runtime-config"));
 }

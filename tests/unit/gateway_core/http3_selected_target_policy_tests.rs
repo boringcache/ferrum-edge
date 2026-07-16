@@ -365,7 +365,7 @@ fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CommittedObservation {
     status: u16,
-    content_type: Option<String>,
+    headers: HashMap<String, String>,
     body: Vec<u8>,
 }
 
@@ -396,7 +396,7 @@ impl Plugin for CommittedCapturePlugin {
         self.committed_calls.fetch_add(1, Ordering::SeqCst);
         *self.observation.lock().expect("observation lock") = Some(CommittedObservation {
             status: response_status,
-            content_type: response_headers.get("content-type").cloned(),
+            headers: response_headers.clone(),
             body: body.to_vec(),
         });
     }
@@ -419,6 +419,17 @@ async fn h3_grpc_web_reject_commits_final_wire_shape_once_before_log() {
         "/pkg.Service/Denied".to_string(),
     );
 
+    let reject_headers = HashMap::from([
+        (
+            "access-control-allow-origin".to_string(),
+            "https://browser.example".to_string(),
+        ),
+        ("x-grpc-ratelimit-limit".to_string(), "10".to_string()),
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-length".to_string(), "999".to_string()),
+        ("grpc-status".to_string(), "7".to_string()),
+        ("connection".to_string(), "keep-alive".to_string()),
+    ]);
     ferrum_edge::_test_support::run_h3_reject_response_committed_hooks(
         &plugins,
         &mut ctx,
@@ -426,7 +437,7 @@ async fn h3_grpc_web_reject_commits_final_wire_shape_once_before_log() {
         Some("application/grpc-web-text+proto"),
         StatusCode::FORBIDDEN,
         br#"{"error":"blocked"}"#,
-        &HashMap::new(),
+        &reject_headers,
     )
     .await;
     capture.log(&TransactionSummary::default()).await;
@@ -441,9 +452,32 @@ async fn h3_grpc_web_reject_commits_final_wire_shape_once_before_log() {
         .expect("committed response observation");
     assert_eq!(observed.status, StatusCode::OK.as_u16());
     assert_eq!(
-        observed.content_type.as_deref(),
+        observed.headers.get("content-type").map(String::as_str),
         Some("application/grpc-web-text+proto")
     );
+    assert_eq!(
+        observed
+            .headers
+            .get("access-control-allow-origin")
+            .map(String::as_str),
+        Some("https://browser.example")
+    );
+    assert_eq!(
+        observed
+            .headers
+            .get("x-grpc-ratelimit-limit")
+            .map(String::as_str),
+        Some("10")
+    );
+    assert_eq!(
+        observed
+            .headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(observed.body.len())
+    );
+    assert!(!observed.headers.contains_key("grpc-status"));
+    assert!(!observed.headers.contains_key("connection"));
     let decoded = BASE64.decode(&observed.body).expect("decode text response");
     assert_eq!(decoded.first(), Some(&0x80));
     assert!(

@@ -1,15 +1,19 @@
 //! Tests for jwks_auth plugin
 
 use ferrum_edge::ConsumerIndex;
+use ferrum_edge::config::types::AuthMode;
 use ferrum_edge::plugins::{
     HTTP_FAMILY_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginHttpClient, RequestContext,
-    jwks_auth::JwksAuth, priority,
+    jwks_auth::JwksAuth, key_auth::KeyAuth, priority, validate_plugin_config,
+    validate_plugin_config_with_policy,
 };
+use ferrum_edge::proxy::run_authentication_phase;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::plugin_utils::{assert_continue, assert_reject};
+use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
 
 static JWKS_TEST_PATH_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -272,6 +276,18 @@ fn single_provider_config(jwks_uri: &str) -> serde_json::Value {
     })
 }
 
+fn endpoint_config(field: &str, value: &str) -> serde_json::Value {
+    let mut provider = serde_json::Map::new();
+    provider.insert(field.to_string(), json!(value));
+    json!({"providers": [provider]})
+}
+
+fn start_background_tasks(plugin: &JwksAuth) {
+    plugin
+        .start_background_tasks()
+        .expect("test runtime should start JWKS tasks");
+}
+
 // ─── Basic Plugin Tests ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -372,6 +388,156 @@ async fn test_jwks_auth_rejects_invalid_jwks_url() {
     );
     assert!(result.is_err());
     assert!(result.as_ref().err().unwrap().contains("http or https"));
+}
+
+#[test]
+fn synchronous_validation_of_remote_providers_is_runtime_free() {
+    use ferrum_edge::plugins::utils::jwks_cache::cached_refresh_state;
+
+    let direct_uri = "https://keys.example.com/.well-known/jwks.json";
+    validate_plugin_config(
+        "jwks_auth",
+        &json!({"providers": [{"jwks_uri": direct_uri}]}),
+    )
+    .expect("direct remote provider should validate without a Tokio runtime");
+    validate_plugin_config(
+        "jwks_auth",
+        &json!({
+            "providers": [{
+                "discovery_url": "https://issuer.example.com/.well-known/openid-configuration"
+            }]
+        }),
+    )
+    .expect("discovery provider should validate without a Tokio runtime");
+    assert!(
+        cached_refresh_state(direct_uri).is_none(),
+        "validation must not populate the process-wide refresh cache"
+    );
+
+    let staged = JwksAuth::new(
+        &json!({"providers": [{"jwks_uri": direct_uri}]}),
+        default_client(),
+    )
+    .expect("pure construction should succeed");
+    assert!(
+        staged.start_background_tasks().is_err(),
+        "only committed runtime generations may activate remote workers"
+    );
+
+    assert!(
+        validate_plugin_config(
+            "jwks_auth",
+            &json!({"providers": [{"jwks_uri": "not a URL"}]})
+        )
+        .is_err(),
+        "malformed providers must still return structured validation errors"
+    );
+}
+
+#[test]
+fn dpop_replay_cache_uses_published_default_capacity() {
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks": {"keys": []},
+                "require_dpop": true
+            }]
+        }),
+        default_client(),
+    )
+    .expect("valid inline provider");
+
+    assert_eq!(
+        plugin.dpop_jti_cache_capacities(),
+        vec![Some(
+            ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES
+        )]
+    );
+}
+
+#[test]
+fn unknown_security_control_fields_are_rejected() {
+    for config in [
+        json!({
+            "providers": [{"jwks": {"keys": []}}],
+            "required_scope": ["admin"]
+        }),
+        json!({
+            "providers": [{
+                "jwks": {"keys": []},
+                "required_dpop": true
+            }]
+        }),
+        json!({
+            "providers": [{
+                "jwks": {"keys": []},
+                "from_headers": [{"name": "x-token", "prefx": "Bearer "}]
+            }]
+        }),
+    ] {
+        let error = JwksAuth::new(&config, default_client())
+            .err()
+            .expect("unknown field must fail closed");
+        assert!(error.contains("unknown field"), "got: {error}");
+    }
+}
+
+#[test]
+fn remote_key_endpoints_require_https_and_reject_userinfo() {
+    for field in ["jwks_uri", "discovery_url"] {
+        let remote_http = endpoint_config(field, "http://idp.example.com/keys");
+        let error = JwksAuth::new(&remote_http, default_client())
+            .err()
+            .expect("remote cleartext endpoint must reject");
+        assert!(error.contains("must use https"), "got: {error}");
+
+        for local_endpoint in [
+            "http://127.0.0.1:8080/keys",
+            "http://[::1]:8080/keys",
+            "http://localhost:8080/keys",
+        ] {
+            JwksAuth::new(&endpoint_config(field, local_endpoint), default_client())
+                .expect("loopback and localhost remain available for local development");
+        }
+
+        let with_userinfo = endpoint_config(field, "https://user:secret@idp.example.com/keys");
+        let error = JwksAuth::new(&with_userinfo, default_client())
+            .err()
+            .expect("URL credentials must reject");
+        assert!(error.contains("userinfo"), "got: {error}");
+    }
+}
+
+#[test]
+fn policy_validation_screens_jwks_literal_ips_at_admission() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true)
+        .expect("valid default egress policy");
+    for field in ["jwks_uri", "discovery_url"] {
+        for denied in ["https://169.254.169.254/keys", "https://[fe80::1]/keys"] {
+            let config = endpoint_config(field, denied);
+            let error = validate_plugin_config_with_policy("jwks_auth", &config, &policy)
+                .expect_err("dangerous literal must be rejected at config admission");
+            assert!(error.contains(field), "got: {error}");
+            assert!(error.contains("denied by backend egress policy"));
+            validate_plugin_config_with_policy(
+                "jwks_auth",
+                &config,
+                &BackendEgressPolicy::unrestricted(),
+            )
+            .expect("explicit unrestricted policy should admit the literal");
+        }
+
+        for allowed in ["https://127.0.0.1/keys", "https://[::1]/keys"] {
+            validate_plugin_config_with_policy(
+                "jwks_auth",
+                &endpoint_config(field, allowed),
+                &policy,
+            )
+            .expect("loopback literal should remain allowed by the default policy");
+        }
+    }
 }
 
 #[tokio::test]
@@ -481,7 +647,8 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
     let server = wiremock::MockServer::start().await;
     let jwks_path = unique_jwks_path("oidc-jwks");
     let jwks_uri = format!("{}{}", server.uri(), jwks_path);
-    let discovery_url = format!("{}/.well-known/openid-configuration", server.uri());
+    let discovery_path = unique_jwks_path("oidc-discovery");
+    let discovery_url = format!("{}{}", server.uri(), discovery_path);
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(jwks_path))
@@ -492,16 +659,14 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
         .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
+        .and(wiremock::matchers::path(discovery_path))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "jwks_uri": jwks_uri
         })))
         .mount(&server)
         .await;
 
-    let _plugin = JwksAuth::new(
+    let plugin = JwksAuth::new(
         &json!({
             "providers": [{"discovery_url": discovery_url}],
             "jwks_refresh_interval_secs": 3600
@@ -509,6 +674,7 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
         default_client(),
     )
     .unwrap();
+    start_background_tasks(&plugin);
 
     let initial_count = wait_for_received_request_count(&server, 2).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -520,6 +686,181 @@ async fn test_jwks_auth_oidc_discovery_eager_fetches_without_duplicate_jwks_call
         .unwrap_or(0);
     assert_eq!(initial_count, 2);
     assert_eq!(final_count, 2);
+}
+
+#[tokio::test]
+async fn oversized_discovery_document_is_rejected_before_deserialization() {
+    let server = wiremock::MockServer::start().await;
+    let discovery_path = unique_jwks_path("oidc-discovery");
+    let discovery_url = format!("{}{}", server.uri(), discovery_path);
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_bytes(vec![b' '; 128 * 1024 + 1]),
+        )
+        .mount(&server)
+        .await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "discovery_url": discovery_url
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_background_tasks(&plugin);
+
+    wait_for_discovery_request(&server).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    assert!(plugin.active_jwks_uris().is_empty());
+}
+
+#[tokio::test]
+async fn equivalent_discovery_generation_reuses_last_good_store_during_outage() {
+    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let server = wiremock::MockServer::start().await;
+    let jwks_path = unique_jwks_path("reload-jwks");
+    let jwks_uri = format!("{}{}", server.uri(), jwks_path);
+    let discovery_path = unique_jwks_path("oidc-discovery");
+    let discovery_url = format!("{}{discovery_path}", server.uri());
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(jwks_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path.clone()))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jwks_uri": jwks_uri.clone()})),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path))
+        .respond_with(wiremock::ResponseTemplate::new(503))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let config = json!({
+        "providers": [{"discovery_url": discovery_url}],
+        "jwks_refresh_interval_secs": 3600
+    });
+    let original = JwksAuth::new(&config, default_client()).unwrap();
+    start_background_tasks(&original);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    while original.active_jwks_uris() != vec![jwks_uri.clone()] {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    original.warmup_jwks().await;
+
+    let replacement = JwksAuth::new(&config, default_client()).unwrap();
+    start_background_tasks(&replacement);
+    assert_eq!(
+        replacement.active_jwks_uris(),
+        vec![jwks_uri.clone()],
+        "the replacement generation must hold the resolved store before publication retention"
+    );
+    drop(original);
+
+    let token = create_rs256_token(&json!({"sub": "still-valid"}), private_key_pem);
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    let result = replacement
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("still-valid"));
+}
+
+#[tokio::test]
+async fn failed_discovery_replacement_retires_unpublished_candidate_store() {
+    use ferrum_edge::plugins::utils::jwks_cache::cached_refresh_state;
+
+    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let server = wiremock::MockServer::start().await;
+    let original_path = unique_jwks_path("original-jwks");
+    let candidate_path = unique_jwks_path("candidate-jwks");
+    let original_uri = format!("{}{}", server.uri(), original_path);
+    let candidate_uri = format!("{}{}", server.uri(), candidate_path);
+    let discovery_path = unique_jwks_path("oidc-discovery");
+    let discovery_url = format!("{}{discovery_path}", server.uri());
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(original_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(candidate_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(503).set_delay(tokio::time::Duration::from_millis(150)),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path.clone()))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jwks_uri": original_uri.clone()})),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jwks_uri": candidate_uri.clone()})),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let config = json!({
+        "providers": [{"discovery_url": discovery_url}],
+        "jwks_refresh_interval_secs": 3600
+    });
+    let original = JwksAuth::new(&config, default_client()).unwrap();
+    start_background_tasks(&original);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    while original.active_jwks_uris() != vec![original_uri.clone()] {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    original.warmup_jwks().await;
+
+    let replacement = JwksAuth::new(&config, default_client()).unwrap();
+    start_background_tasks(&replacement);
+    drop(original);
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    while cached_refresh_state(&candidate_uri).is_none() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    while cached_refresh_state(&candidate_uri).is_some() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(replacement.active_jwks_uris(), vec![original_uri]);
 }
 
 /// Wait until the OIDC discovery endpoint has been hit at least once, proving
@@ -548,19 +889,15 @@ async fn wait_for_discovery_request(server: &wiremock::MockServer) {
 /// `jwks_uri` value, and return `(server, discovery_url)`.
 async fn start_oidc_discovery_server(jwks_uri: &str) -> (wiremock::MockServer, String) {
     let discovery_server = wiremock::MockServer::start().await;
+    let discovery_path = unique_jwks_path("oidc-discovery");
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
+        .and(wiremock::matchers::path(discovery_path.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "jwks_uri": jwks_uri
         })))
         .mount(&discovery_server)
         .await;
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        discovery_server.uri()
-    );
+    let discovery_url = format!("{}{discovery_path}", discovery_server.uri());
     (discovery_server, discovery_url)
 }
 
@@ -585,6 +922,7 @@ async fn test_jwks_auth_oidc_discovery_rejects_metadata_endpoint_jwks_uri() {
         default_client(),
     )
     .unwrap();
+    start_background_tasks(&plugin);
 
     wait_for_discovery_request(&discovery_server).await;
     // Give any (incorrect) follow-on fetch a chance to publish a store.
@@ -617,6 +955,7 @@ async fn test_jwks_auth_oidc_discovery_rejects_userinfo_host_confusion_jwks_uri(
         default_client(),
     )
     .unwrap();
+    start_background_tasks(&plugin);
 
     wait_for_discovery_request(&discovery_server).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -643,6 +982,7 @@ async fn test_jwks_auth_oidc_discovery_rejects_non_http_scheme_jwks_uri() {
         default_client(),
     )
     .unwrap();
+    start_background_tasks(&plugin);
 
     wait_for_discovery_request(&discovery_server).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -672,6 +1012,7 @@ async fn test_jwks_auth_oidc_discovery_rejects_same_host_different_port_jwks_uri
         default_client(),
     )
     .unwrap();
+    start_background_tasks(&plugin);
 
     wait_for_discovery_request(&discovery_server).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -702,6 +1043,7 @@ async fn test_jwks_auth_oidc_discovery_does_not_follow_jwks_redirects() {
     let redirect_target = wiremock::MockServer::start().await;
     let redirect_path = unique_jwks_path("redirect-jwks");
     let jwks_uri = format!("{}{}", discovery_server.uri(), redirect_path);
+    let discovery_path = unique_jwks_path("oidc-discovery");
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(redirect_path))
@@ -712,9 +1054,7 @@ async fn test_jwks_auth_oidc_discovery_does_not_follow_jwks_redirects() {
         .mount(&discovery_server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
+        .and(wiremock::matchers::path(discovery_path.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "jwks_uri": jwks_uri.clone()
         })))
@@ -726,10 +1066,7 @@ async fn test_jwks_auth_oidc_discovery_does_not_follow_jwks_redirects() {
         .mount(&redirect_target)
         .await;
 
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        discovery_server.uri()
-    );
+    let discovery_url = format!("{}{discovery_path}", discovery_server.uri());
     let plugin = JwksAuth::new(
         &json!({
             "providers": [{"discovery_url": discovery_url}],
@@ -738,6 +1075,7 @@ async fn test_jwks_auth_oidc_discovery_does_not_follow_jwks_redirects() {
         default_client(),
     )
     .unwrap();
+    start_background_tasks(&plugin);
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
     loop {
@@ -775,6 +1113,7 @@ async fn test_jwks_auth_oidc_discovery_accepts_same_host_jwks_uri() {
     let server = wiremock::MockServer::start().await;
     let jwks_path = unique_jwks_path("same-host-jwks");
     let jwks_uri = format!("{}{}", server.uri(), jwks_path);
+    let discovery_path = unique_jwks_path("oidc-discovery");
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(jwks_path))
@@ -785,16 +1124,14 @@ async fn test_jwks_auth_oidc_discovery_accepts_same_host_jwks_uri() {
         .mount(&server)
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
+        .and(wiremock::matchers::path(discovery_path.clone()))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
             "jwks_uri": jwks_uri.clone()
         })))
         .mount(&server)
         .await;
 
-    let discovery_url = format!("{}/.well-known/openid-configuration", server.uri());
+    let discovery_url = format!("{}{discovery_path}", server.uri());
     let plugin = JwksAuth::new(
         &json!({
             "providers": [{"discovery_url": discovery_url}],
@@ -803,6 +1140,7 @@ async fn test_jwks_auth_oidc_discovery_accepts_same_host_jwks_uri() {
         default_client(),
     )
     .unwrap();
+    start_background_tasks(&plugin);
 
     // The store for the same-host jwks_uri must become active.
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
@@ -838,6 +1176,7 @@ async fn test_jwks_auth_does_not_fetch_jwks_on_auth_hot_path_when_cache_empty() 
         default_client(),
     )
     .unwrap();
+    start_background_tasks(&plugin);
     let initial_count = wait_for_received_request_count(&mock_server, 1).await;
 
     let consumers: Vec<ferrum_edge::config::types::Consumer> = Vec::new();
@@ -890,10 +1229,47 @@ async fn test_jwks_auth_non_bearer_scheme() {
         "Basic dXNlcjpwYXNz".to_string(),
     );
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
 }
 
 // ─── Single Provider JWKS Validation ───────────────────────────────────
+
+#[tokio::test]
+async fn test_mesh_request_auth_permissive_foreign_scheme_is_missing_token() {
+    let (_server, jwks_uri) = start_jwks_server(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ))
+    .await;
+    let mut config = single_provider_config(&jwks_uri);
+    config["emit_mesh_request_principal_metadata"] = json!(true);
+    let plugin: Arc<dyn Plugin> = Arc::new(JwksAuth::new(&config, default_client()).unwrap());
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Basic dXNlcjpwYXNz".to_string(),
+    );
+
+    let result = ferrum_edge::proxy::run_authentication_phase(
+        AuthMode::Single,
+        &[plugin],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await;
+
+    assert!(
+        result.is_none(),
+        "permissive mesh RequestAuthentication must treat a foreign scheme as no JWT"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_request_auth.permissive_missing_token")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(ctx.identified_consumer.is_none());
+    assert!(ctx.authenticated_identity.is_none());
+}
 
 #[tokio::test]
 async fn test_jwks_auth_validates_rs256_token() {
@@ -1046,6 +1422,18 @@ async fn claim_headers_writes_simple_and_array_claims_to_outbound_headers() {
         .insert("authorization".to_string(), format!("Bearer {}", token));
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
+    assert!(
+        !ctx.metadata
+            .keys()
+            .any(|key| key.starts_with("jwks_auth.claim_header.")),
+        "claim-derived headers must be staged outside log-visible metadata"
+    );
+    assert!(
+        !ctx.metadata
+            .values()
+            .any(|value| value == "idp@example.com"),
+        "claim values must not be available to authorization-phase rejection logs"
+    );
 
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -1057,6 +1445,168 @@ async fn claim_headers_writes_simple_and_array_claims_to_outbound_headers() {
     assert_eq!(
         headers.get("x-user-roles").map(String::as_str),
         Some("admin|editor")
+    );
+}
+
+#[tokio::test]
+async fn principal_less_jwks_attempt_is_discarded_before_later_key_auth_success() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let jwks_plugin = Arc::new(
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "jwks": jwks,
+                    "consumer_identity_claim": "principal",
+                    "forward_original_token": false,
+                    "claim_headers": {"email": "X-User-Email"}
+                }],
+                "emit_mesh_request_principal_metadata": true
+            }),
+            default_client(),
+        )
+        .expect("valid inline JWKS config"),
+    );
+    let key_plugin = Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![jwks_plugin.clone(), key_plugin.clone()];
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+
+    for claims in [
+        json!({
+            "iss": "https://issuer.example",
+            "sub": "token-subject",
+            "principal": "   ",
+            "email": "unaccepted@example.com"
+        }),
+        json!({
+            "iss": "https://issuer.example",
+            "sub": "token-subject",
+            "email": "unaccepted@example.com"
+        }),
+    ] {
+        let token = create_rs256_token(&claims, private_key_pem);
+        let authorization = format!("Bearer {token}");
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), authorization.clone());
+        ctx.headers
+            .insert("x-api-key".to_string(), "test-api-key".to_string());
+
+        assert!(
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index,)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            ctx.identified_consumer
+                .as_ref()
+                .map(|consumer| consumer.username.as_str()),
+            Some("testuser")
+        );
+        assert_eq!(ctx.auth_method, Some("key_auth"));
+        assert!(ctx.authenticated_identity.is_none());
+        assert!(ctx.authenticated_identity_header.is_none());
+        assert!(!ctx.metadata.contains_key("mesh.request_principal"));
+        assert!(ctx.mesh_request_auth_audiences.is_empty());
+        assert!(ctx.mesh_request_auth_claims.is_empty());
+        assert!(
+            !ctx.metadata
+                .values()
+                .any(|value| value == "unaccepted@example.com")
+        );
+
+        let mut headers = ctx.headers.clone();
+        assert_continue(jwks_plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_continue(key_plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some(authorization.as_str()),
+            "an unaccepted JWKS attempt must not strip its bearer token"
+        );
+        assert!(
+            !headers.contains_key("x-api-key"),
+            "the accepted key-auth credential must still be stripped"
+        );
+        assert!(!headers.contains_key("x-user-email"));
+    }
+}
+
+#[tokio::test]
+async fn first_accepted_jwks_instance_owns_identity_and_claim_headers() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let first = Arc::new(
+        JwksAuth::new(
+            &json!({"providers": [{
+                "jwks": jwks,
+                "from_headers": [{"name": "x-jwt-a"}],
+                "forward_original_token": false,
+                "consumer_header_claim": "display",
+                "claim_headers": {"email": "X-Selected-Email"}
+            }]}),
+            default_client(),
+        )
+        .expect("first JWKS config"),
+    );
+    let second = Arc::new(
+        JwksAuth::new(
+            &json!({"providers": [{
+                "jwks": build_rsa_jwks_from_pem(public_key_pem),
+                "from_headers": [{"name": "x-jwt-b"}],
+                "forward_original_token": false,
+                "consumer_header_claim": "display",
+                "claim_headers": {"email": "X-Selected-Email"}
+            }]}),
+            default_client(),
+        )
+        .expect("second JWKS config"),
+    );
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![first.clone(), second.clone()];
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "x-jwt-a".to_string(),
+        create_rs256_token(
+            &json!({"sub": "first", "display": "First Display", "email": "first@example.com"}),
+            private_key_pem,
+        ),
+    );
+    ctx.headers.insert(
+        "x-jwt-b".to_string(),
+        create_rs256_token(
+            &json!({"sub": "second", "display": "Second Display", "email": "second@example.com"}),
+            private_key_pem,
+        ),
+    );
+
+    assert!(
+        run_authentication_phase(
+            AuthMode::Single,
+            &auth_plugins,
+            &mut ctx,
+            &ConsumerIndex::new(&[]),
+        )
+        .await
+        .is_none()
+    );
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("first"));
+    assert_eq!(
+        ctx.authenticated_identity_header.as_deref(),
+        Some("First Display")
+    );
+
+    let mut headers = ctx.headers.clone();
+    assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        headers.get("x-selected-email").map(String::as_str),
+        Some("first@example.com")
+    );
+    assert!(!headers.contains_key("x-jwt-a"));
+    assert!(
+        headers.contains_key("x-jwt-b"),
+        "single auth must stop before the later plugin stages credential cleanup"
     );
 }
 
@@ -1398,6 +1948,103 @@ async fn test_jwks_auth_continues_without_consumer_in_index() {
     // No identified_consumer (not in index), but authenticated_identity is set
     assert!(ctx.identified_consumer.is_none());
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_signed_tokens_do_not_authenticate_blank_identity_claims() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(&single_provider_config(&jwks_uri), default_client()).unwrap();
+    plugin.warmup_jwks().await;
+
+    for claims in [
+        json!({}),
+        json!({"sub": null}),
+        json!({"sub": 42}),
+        json!({"sub": ""}),
+        json!({"sub": "   \t"}),
+    ] {
+        let token = create_rs256_token(&claims, private_key_pem);
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+
+        let result = plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await;
+        assert_continue(result);
+        assert!(ctx.identified_consumer.is_none());
+        assert!(ctx.authenticated_identity.is_none());
+        assert!(ctx.effective_identity().is_none());
+        assert!(ctx.auth_method.is_none());
+    }
+}
+
+#[tokio::test]
+async fn jwks_multi_auth_does_not_commit_failed_attempt_header_side_effects() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let jwks = Arc::new(
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "jwks_uri": jwks_uri,
+                    "forward_original_token": false,
+                    "claim_headers": {"email": "X-Untrusted-Email"}
+                }]
+            }),
+            default_client(),
+        )
+        .unwrap(),
+    );
+    jwks.warmup_jwks().await;
+    let key_auth: Arc<dyn Plugin> =
+        Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
+    let consumers = [create_test_consumer()];
+    let consumer_index = ConsumerIndex::new(&consumers);
+
+    let attempted_tokens = [
+        create_rs256_token(
+            &json!({"email": "missing-principal@example.test"}),
+            private_key_pem,
+        ),
+        create_rs256_token(
+            &json!({"sub": "  \t", "email": "blank-principal@example.test"}),
+            private_key_pem,
+        ),
+        "not-a-jwt".to_string(),
+    ];
+
+    for attempted_token in attempted_tokens {
+        let mut ctx = make_ctx();
+        let expected_authorization = format!("Bearer {attempted_token}");
+        ctx.headers
+            .insert("authorization".to_string(), expected_authorization.clone());
+        ctx.headers
+            .insert("x-api-key".to_string(), "test-api-key".to_string());
+
+        let jwks_plugin: Arc<dyn Plugin> = jwks.clone();
+        let auth_plugins: Vec<Arc<dyn Plugin>> = vec![jwks_plugin, Arc::clone(&key_auth)];
+        let rejection =
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+                .await;
+        assert!(rejection.is_none(), "later key_auth must authenticate");
+        assert_eq!(ctx.auth_method, Some("key_auth"));
+
+        let mut headers = ctx.headers.clone();
+        assert_continue(jwks.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some(expected_authorization.as_str()),
+            "an uncommitted JWKS attempt must not strip its credential"
+        );
+        assert!(
+            !headers.contains_key("x-untrusted-email"),
+            "an uncommitted JWKS attempt must not fan out claims"
+        );
+    }
 }
 
 #[tokio::test]

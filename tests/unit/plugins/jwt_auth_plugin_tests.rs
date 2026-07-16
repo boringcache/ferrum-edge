@@ -49,6 +49,36 @@ async fn test_jwt_auth_plugin_creation() {
     assert_eq!(plugin.name(), "jwt_auth");
 }
 
+#[tokio::test]
+async fn test_jwt_auth_skips_foreign_authorization_scheme() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Basic dXNlcjpwYXNz".to_string(),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_jwt_auth_rejects_empty_bearer_credential() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    for value in ["Bearer", "Bearer ", "bearer \t "] {
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), value.to_string());
+
+        let result = plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await;
+        assert_reject(result, Some(401));
+    }
+}
+
 #[test]
 fn test_jwt_auth_plugin_contract() {
     let plugin = JwtAuth::new(&json!({})).unwrap();

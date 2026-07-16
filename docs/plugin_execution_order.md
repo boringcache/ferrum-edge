@@ -129,9 +129,13 @@ Ferrum runs them in their normal relative priority order only after path policy.
 gRPC deny cannot be delayed, faulted, mirrored, invoked, mocked, or
 load-fanned-out before it is enforced. Proxies without a backend-path policy
 retain the ordinary single `before_proxy` pass.
-Deferred hooks observe the original client path, preserving their normal
-request semantics even when mesh routing rewrote the backend path. A deferred
-hook that can inject routing headers runs after the initial access preview; if
+Deferred hooks generally observe the original client path, preserving their
+normal request semantics even when mesh routing rewrote the backend path.
+`request_mirror` is the security-sensitive exception: when backend-path policy
+is active and `mirror_path` is unset, it mirrors the exact effective path that
+passed final authorization. An explicit operator-configured `mirror_path`
+still wins. A deferred hook that can inject routing headers runs after the
+initial access preview; if
 it changes the load-balancer hash key, Ferrum reselects the target and performs
 the single state-consuming enforcement against the settled effective path
 before any remaining external or synthetic hook. After each deferred pass, the
@@ -143,6 +147,8 @@ header-hash routing under a forged identity.
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
 
 For gateway-generated rejection responses, a small set of header-only `after_proxy` plugins opt in to still run. This preserves headers such as `Access-Control-Allow-Origin`, `traceparent`, and request IDs on rejected responses without treating them as backend responses.
+
+Post-routing method-filter responses and native-gRPC gateway errors also apply the resolved route's precomputed initial-response policy at the client HEADERS boundary. Pre-routing failures have no resolved plugin configuration. Protocol-owned gRPC terminal metadata and HTTP framing are restored after policy.
 
 `after_proxy` rejections are also honored before anything is sent downstream. This matters for plugins like `response_size_limiting`, whose `Content-Length` fast path now replaces oversized backend responses instead of only logging a warning.
 
@@ -181,6 +187,8 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_va
 
 **Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or a UDP/DTLS session expires, is cleaned up, or otherwise ends). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
 
+Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream proxy because it is relayed through a mesh CONNECT tunnel. Those handlers run only the `workload_metrics` connect/disconnect lifecycle, once per logical captured session, to produce the source-side outbound CLIENT span with final duration, bytes, and error state. They do not run authentication, authorization, throttling, or other policy plugins a second time; destination-side mesh authorization remains the enforcement point.
+
 ### Stream Hook Implementations by Plugin
 
 | Plugin | `on_stream_connect` | `on_stream_disconnect` | Behavior |
@@ -205,7 +213,7 @@ Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_va
 | `ws_logging` | | ✓ | Sends stream connection logs to WebSocket endpoint |
 | `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
 | `api_chargeback_sink` | | ✓ | Exports durable stream charge events or snapshot deltas to ClickHouse |
-| `workload_metrics` | ✓ | ✓ | Adds mesh workload/source labels to stream metadata and emits mesh spans when Telemetry providers are configured |
+| `workload_metrics` | ✓ | ✓ | Adds direction-aware mesh source/destination labels to stream metadata and emits mesh spans when Telemetry providers are configured |
 | `transaction_debugger` | | ✓ | Prints debug info for stream connections |
 
 ### When Hooks Fire
@@ -408,7 +416,7 @@ Given all built-in plugins enabled, the execution order is:
 | 60 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body |
 | 61 | `ai_federation` | 4060 | before_proxy |
 | 62 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
-| 63 | `security_headers` | 4080 | after_proxy |
+| 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
 | 66 | `stdout_logging` | 9000 | log, on_stream_disconnect |
@@ -425,7 +433,7 @@ Given all built-in plugins enabled, the execution order is:
 | 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect, on_ws_disconnect |
 | 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
 | 79 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
-| 80 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
+| 80 | `workload_metrics` | 9360 | on_request_received, before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
 | 81 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
 
 ## Why This Order Matters

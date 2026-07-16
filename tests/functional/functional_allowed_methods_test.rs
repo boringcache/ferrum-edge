@@ -73,7 +73,16 @@ proxies:
 {allowed_methods_yaml}
 
 consumers: []
-plugin_configs: []
+plugin_configs:
+  - id: "allowed-methods-security"
+    plugin_name: security_headers
+    scope: global
+    enabled: true
+    config:
+      set:
+        X-Synthetic-Policy: "enforced"
+        Allow: "DELETE"
+      remove: ["Content-Type"]
 "#
     )
 }
@@ -140,6 +149,11 @@ impl AllowedMethodsHarness {
 }
 
 fn assert_allow_header(headers: &HeaderMap, expected: &[&str]) {
+    assert_eq!(
+        headers.get_all(http::header::ALLOW).iter().count(),
+        1,
+        "405 response must carry exactly one authoritative Allow field"
+    );
     let actual = headers
         .get(http::header::ALLOW)
         .and_then(|v| v.to_str().ok())
@@ -176,6 +190,18 @@ async fn functional_allowed_methods_http1_and_h2_enforced_before_backend() {
     let h1_blocked = h1.post(&url).send().await.expect("h1 blocked POST");
     assert_eq!(h1_blocked.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     assert_allow_header(h1_blocked.headers(), &["GET", "HEAD"]);
+    assert!(
+        !h1_blocked
+            .headers()
+            .contains_key(http::header::CONTENT_TYPE)
+    );
+    assert_eq!(
+        h1_blocked
+            .headers()
+            .get("x-synthetic-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("enforced")
+    );
     let h1_body = h1_blocked.text().await.expect("h1 blocked body");
     assert!(
         h1_body.contains("Method Not Allowed"),
@@ -198,6 +224,18 @@ async fn functional_allowed_methods_http1_and_h2_enforced_before_backend() {
     assert_eq!(h2_blocked.version(), reqwest::Version::HTTP_2);
     assert_eq!(h2_blocked.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     assert_allow_header(h2_blocked.headers(), &["GET", "HEAD"]);
+    assert!(
+        !h2_blocked
+            .headers()
+            .contains_key(http::header::CONTENT_TYPE)
+    );
+    assert_eq!(
+        h2_blocked
+            .headers()
+            .get("x-synthetic-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("enforced")
+    );
     let h2_body = h2_blocked.text().await.expect("h2 blocked body");
     assert!(
         h2_body.contains("Method Not Allowed"),
@@ -245,6 +283,14 @@ async fn functional_allowed_methods_http3_rejects_before_backend() {
 
     assert_eq!(response.status, http::StatusCode::METHOD_NOT_ALLOWED);
     assert_allow_header(&response.headers, &["GET", "HEAD"]);
+    assert!(!response.headers.contains_key(http::header::CONTENT_TYPE));
+    assert_eq!(
+        response
+            .headers
+            .get("x-synthetic-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("enforced")
+    );
     let body = response.body_text();
     assert!(
         body.contains("Method Not Allowed"),

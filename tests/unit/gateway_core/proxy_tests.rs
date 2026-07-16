@@ -376,6 +376,9 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     assert!(source.contains("backend_dispatch::upstream_selection_hash_key("));
     assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
 
+    let mirror = include_str!("../../../src/plugins/request_mirror.rs");
+    assert!(mirror.contains("ctx.authorized_backend_path().unwrap_or(&ctx.path)"));
+
     for plugin_source in [
         include_str!("../../../src/plugins/fault_injection.rs"),
         include_str!("../../../src/plugins/request_mirror.rs"),
@@ -393,6 +396,38 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     assert!(
         serverless.contains("fn deferred_before_proxy_may_change_routing_headers(&self) -> bool")
     );
+}
+
+#[test]
+fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let handler = source
+        .find("async fn handle_proxy_request_inner(")
+        .map(|start| &source[start..])
+        .expect("H1/H2 request handler must remain present");
+    let flavor = handler
+        .find("let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);")
+        .expect("wire flavor classification must remain present");
+    let websocket_precedence = handler
+        .find("let grpc_web_response_content_type = if flavor == HttpFlavor::WebSocket")
+        .expect("WebSocket must suppress hostile gRPC-Web Content-Type promotion");
+    let routed = handler
+        .find("ctx.matched_proxy = Some(Arc::clone(&proxy));")
+        .expect("route selection must remain present");
+    let protocol = handler
+        .find("let request_protocol = match flavor")
+        .expect("route-level protocol selection must remain present");
+
+    assert!(
+        flavor < websocket_precedence && websocket_precedence < routed && routed < protocol
+    );
+    assert!(
+        !handler[routed..protocol].contains("let grpc_web_response_content_type"),
+        "route-level rejects must reuse the WebSocket-safe strict classification"
+    );
+    assert!(handler.contains(
+        "finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));"
+    ));
 }
 
 #[test]
@@ -534,7 +569,10 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, key_auth::KeyAuth};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, RequestContext, basic_auth::BasicAuth, jwt_auth::JwtAuth,
+    key_auth::KeyAuth,
+};
 use ferrum_edge::proxy::grpc_proxy::grpc_status;
 use ferrum_edge::proxy::run_authentication_phase;
 use hyper::StatusCode;
@@ -542,6 +580,31 @@ use serde_json::json;
 use std::sync::Arc;
 
 struct ExternalIdentityAuth;
+
+const BASIC_AUTH_TEST_SECRET: &str = "test-hmac-secret-for-basic-auth-unit-tests";
+
+fn basic_auth_dispatch_consumer() -> Consumer {
+    use hmac::{KeyInit, Mac};
+
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+    let mut mac = HmacSha256::new_from_slice(BASIC_AUTH_TEST_SECRET.as_bytes()).unwrap();
+    mac.update(b"password");
+    let password_hash = format!("hmac_sha256:{}", hex::encode(mac.finalize().into_bytes()));
+
+    Consumer {
+        id: "basic-dispatch-consumer".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: "alice".to_string(),
+        custom_id: None,
+        credentials: HashMap::from([(
+            "basicauth".to_string(),
+            json!([{"password_hash": password_hash}]),
+        )]),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
 
 #[async_trait]
 impl Plugin for ExternalIdentityAuth {
@@ -566,6 +629,10 @@ struct RejectingAuth {
     body: &'static str,
 }
 
+struct StagedCookieRejectingAuth;
+
+struct MixedCaseCookieRejectingAuth;
+
 #[async_trait]
 impl Plugin for RejectingAuth {
     fn name(&self) -> &str {
@@ -582,6 +649,95 @@ impl Plugin for RejectingAuth {
         PluginResult::Reject {
             status_code: 401,
             body: self.body.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for StagedCookieRejectingAuth {
+    fn name(&self) -> &str {
+        "staged_cookie_rejecting_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        ctx.metadata.insert(
+            "auth.rejection_set_cookie".to_string(),
+            "session=staged; Path=/staged; HttpOnly\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged"
+                .to_string(),
+        );
+        PluginResult::Reject {
+            status_code: 401,
+            body: r#"{"error":"staged rejection"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for MixedCaseCookieRejectingAuth {
+    fn name(&self) -> &str {
+        "mixed_case_cookie_rejecting_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"mixed-case rejection"}"#.to_string(),
+            headers: HashMap::from([
+                (
+                    "Set-Cookie".to_string(),
+                    "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nshared=1; Path=/"
+                        .to_string(),
+                ),
+                (
+                    "set-cookie".to_string(),
+                    "shared=1; Path=/\nlower_only=1; Path=/lower\nsession=selected-lower; Path=/lower; Secure; SameSite=Strict"
+                        .to_string(),
+                ),
+                ("X-Rejection".to_string(), "selected".to_string()),
+            ]),
+        }
+    }
+}
+
+struct IdentityThenRejectAuth;
+
+#[async_trait]
+impl Plugin for IdentityThenRejectAuth {
+    fn name(&self) -> &str {
+        "identity_then_reject_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        ctx.authenticated_identity = Some("disabled-user".to_string());
+        PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"account disabled"}"#.to_string(),
             headers: HashMap::new(),
         }
     }
@@ -804,6 +960,141 @@ async fn test_single_auth_missing_credentials_rejects_before_backend() {
 }
 
 #[tokio::test]
+async fn test_single_basic_auth_missing_credentials_uses_basic_challenge() {
+    unsafe {
+        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
+    }
+    let basic_auth: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/basic-auth".to_string(),
+    );
+
+    let result = run_authentication_phase(
+        AuthMode::Single,
+        &[basic_auth],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await;
+
+    let (status, _body, headers) = result.expect("missing Basic credentials must reject");
+    assert_eq!(status, 401);
+    assert_eq!(
+        headers.get("WWW-Authenticate").map(String::as_str),
+        Some(r#"Basic realm="ferrum-edge", charset="UTF-8""#)
+    );
+}
+
+#[tokio::test]
+async fn test_multi_auth_missing_credentials_uses_first_available_challenge() {
+    unsafe {
+        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
+    }
+    let jwt: Arc<dyn Plugin> = Arc::new(JwtAuth::new(&json!({})).unwrap());
+    let basic: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mixed-auth".to_string(),
+    );
+
+    let result = run_authentication_phase(
+        AuthMode::Multi,
+        &[jwt, basic],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await;
+
+    let (status, _body, headers) = result.expect("all-missing auth chain must reject");
+    assert_eq!(status, 401);
+    assert_eq!(
+        headers.get("WWW-Authenticate").map(String::as_str),
+        Some(r#"Basic realm="ferrum-edge", charset="UTF-8""#)
+    );
+}
+
+#[tokio::test]
+async fn test_single_auth_valid_basic_skips_earlier_jwt_scheme() {
+    use base64::Engine;
+
+    unsafe {
+        std::env::set_var("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET);
+    }
+    let jwt: Arc<dyn Plugin> = Arc::new(JwtAuth::new(&json!({})).unwrap());
+    let basic: Arc<dyn Plugin> = Arc::new(BasicAuth::new(&json!({})).unwrap());
+    let auth_plugins = vec![jwt, basic];
+    let consumer_index = ConsumerIndex::new(&[basic_auth_dispatch_consumer()]);
+    let encoded = base64::engine::general_purpose::STANDARD.encode("alice:password");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mixed-auth".to_string(),
+    );
+    ctx.headers
+        .insert("authorization".to_string(), format!("Basic {encoded}"));
+
+    let result =
+        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    assert!(result.is_none());
+    assert_eq!(
+        ctx.identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str()),
+        Some("alice")
+    );
+}
+
+#[tokio::test]
+async fn test_single_auth_stops_before_later_reject_after_success() {
+    let external: Arc<dyn Plugin> = Arc::new(ExternalIdentityAuth);
+    let rejecting: Arc<dyn Plugin> = Arc::new(RejectingAuth {
+        body: r#"{"error":"must not override success"}"#,
+    });
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mixed-auth".to_string(),
+    );
+
+    let result = run_authentication_phase(
+        AuthMode::Single,
+        &[external, rejecting],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await;
+
+    assert!(result.is_none());
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
+}
+
+#[tokio::test]
+async fn test_single_auth_preserves_reject_from_plugin_that_sets_identity() {
+    let plugin: Arc<dyn Plugin> = Arc::new(IdentityThenRejectAuth);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/mixed-auth".to_string(),
+    );
+
+    let result = run_authentication_phase(
+        AuthMode::Single,
+        &[plugin],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await;
+
+    let (status, body, _headers) = result.expect("same-plugin rejection must remain terminal");
+    assert_eq!(status, 403);
+    assert_eq!(body, br#"{"error":"account disabled"}"#);
+}
+
+#[tokio::test]
 async fn test_multi_auth_all_missing_credentials_rejects_before_backend() {
     let key_auth: Arc<dyn Plugin> = Arc::new(KeyAuth::new(&json!({})).unwrap());
     let rejecting: Arc<dyn Plugin> = Arc::new(
@@ -865,6 +1156,57 @@ async fn test_multi_auth_preserves_specific_reject_when_surrounded_by_missing() 
     assert!(ctx.authenticated_identity.is_none());
 }
 
+#[tokio::test]
+async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministically() {
+    let staged: Arc<dyn Plugin> = Arc::new(StagedCookieRejectingAuth);
+    let selected: Arc<dyn Plugin> = Arc::new(MixedCaseCookieRejectingAuth);
+    let auth_plugins = [staged, selected];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let expected = "upper_only=1; Path=/upper\nshared=1; Path=/\nlower_only=1; Path=/lower\nsession=selected-lower; Path=/lower; Secure; SameSite=Strict\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged";
+
+    for _ in 0..32 {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/mixed-cookie-rejection".to_string(),
+        );
+        let (status_code, body, headers) =
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+                .await
+                .expect("both auth attempts must reject");
+
+        assert_eq!(status_code, 403);
+        assert_eq!(body, br#"{"error":"mixed-case rejection"}"#);
+        assert_eq!(
+            headers.get("X-Rejection").map(String::as_str),
+            Some("selected")
+        );
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some(expected)
+        );
+        assert_eq!(
+            headers
+                .keys()
+                .filter(|name| name.eq_ignore_ascii_case("set-cookie"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            headers["set-cookie"]
+                .split('\n')
+                .filter(|cookie| *cookie == "shared=1; Path=/")
+                .count(),
+            1,
+            "identical cookie lines must not multiply"
+        );
+        assert!(
+            !ctx.metadata.contains_key("auth.rejection_set_cookie"),
+            "the staged cookies must be consumed exactly once"
+        );
+    }
+}
+
 #[test]
 fn test_request_context_effective_identity_prefers_consumer_then_external_identity() {
     let mut ctx = RequestContext::new(
@@ -876,6 +1218,11 @@ fn test_request_context_effective_identity_prefers_consumer_then_external_identi
 
     ctx.authenticated_identity = Some("external-user".to_string());
     assert_eq!(ctx.effective_identity(), Some("external-user"));
+
+    ctx.authenticated_identity = Some("   \t".to_string());
+    assert_eq!(ctx.effective_identity(), None);
+
+    ctx.authenticated_identity = Some("external-user".to_string());
 
     ctx.identified_consumer = Some(Arc::new(Consumer {
         id: "consumer-1".to_string(),
@@ -904,6 +1251,9 @@ fn test_request_context_backend_consumer_username_prefers_consumer_then_header_t
 
     ctx.authenticated_identity_header = Some("user@example.com".to_string());
     assert_eq!(ctx.backend_consumer_username(), Some("user@example.com"));
+
+    ctx.authenticated_identity_header = Some("   ".to_string());
+    assert_eq!(ctx.backend_consumer_username(), Some("external-user"));
 
     ctx.identified_consumer = Some(Arc::new(Consumer {
         id: "consumer-1".to_string(),

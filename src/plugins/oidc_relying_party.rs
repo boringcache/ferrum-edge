@@ -20,12 +20,16 @@ use url::{Host, Url};
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::PluginHttpClient;
-use super::utils::auth_flow::{VerifyOutcome, constant_time_eq};
+use super::utils::auth_attempt::AuthenticationAttempt;
+use super::utils::auth_flow::{
+    VerifyOutcome, authentication_attempt_can_commit, commit_authentication_attempt,
+    constant_time_eq, nonblank_identity,
+};
 use super::utils::claim_header_fanout::{
-    ClaimHeaderMapping, apply_claim_headers_from_metadata, emit_claim_headers_to_metadata,
+    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
     parse_claim_headers,
 };
-use super::utils::claim_resolver::extract_claim_string;
+use super::utils::claim_resolver::{extract_claim_string, extract_claim_string_exact};
 use super::utils::jwks_cache::get_or_create_jwks_store;
 use super::utils::jwks_store::JwksKeyStore;
 use super::utils::jwt_verifier::{JwtVerifyParams, verify_jwt_with_jwks};
@@ -111,7 +115,7 @@ const BEHAVIOR_FIELDS: &[&str] = &[
     "rp_initiated_logout",
     "post_login_default_path",
 ];
-/// Carries a re-sealed rolling-session cookie from `authenticate` to
+/// Carries a committed rolling-session cookie from `authenticate` to
 /// `after_proxy`, which appends it as `Set-Cookie` on the proxied response. The
 /// key contains "cookie" so transaction-log metadata redaction masks its value.
 const SESSION_SET_COOKIE_METADATA_KEY: &str = "oidc_rp.session_set_cookie";
@@ -136,6 +140,7 @@ struct ProviderRuntime {
     scopes: Vec<String>,
     audiences: Vec<String>,
     redirect_uri: String,
+    redirect_cookie_host: CorrelationCookieHost,
     callback_path: String,
     logout_path: String,
     post_logout_redirect_uri: Option<String>,
@@ -149,6 +154,16 @@ struct ProviderRuntime {
     id_token_clock_skew: Duration,
     http_client: PluginHttpClient,
     warmup_hostnames: Vec<String>,
+}
+
+/// Canonical host identity used for the host-only correlation cookie.
+///
+/// Cookies are not scoped by port, while DNS host matching is
+/// case-insensitive and IP literals can have multiple equivalent spellings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CorrelationCookieHost {
+    Domain(String),
+    Ip(IpAddr),
 }
 
 #[derive(Clone)]
@@ -497,6 +512,12 @@ impl OidcRelyingParty {
         }
         let redirect_uri = required_string(provider_obj, "redirect_uri", "provider[0]")?;
         validate_redirect_uri(&redirect_uri)?;
+        let redirect_cookie_host = Url::parse(&redirect_uri)
+            .ok()
+            .and_then(|url| correlation_cookie_host_from_url(&url))
+            .ok_or_else(|| {
+                "oidc_relying_party: redirect_uri must include a valid cookie host".to_string()
+            })?;
         let callback_path = optional_string(provider_obj, "callback_path", "provider[0]")?
             .unwrap_or_else(|| "/oauth/callback".to_string());
         validate_path_only(&callback_path, "callback_path")?;
@@ -619,13 +640,7 @@ impl OidcRelyingParty {
             cookie_attrs,
             context_id: session_context_id,
             correlation_cookie_name_prefix,
-            correlation_cookie_attrs: build_cookie_attrs(
-                secure,
-                true,
-                "Lax",
-                domain.as_deref(),
-                &callback_path,
-            ),
+            correlation_cookie_attrs: build_correlation_cookie_attrs(secure, &callback_path),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
@@ -734,6 +749,7 @@ impl OidcRelyingParty {
             scopes,
             audiences: parse_string_array(provider_obj, "audiences", "provider[0]")?,
             redirect_uri,
+            redirect_cookie_host,
             callback_path,
             logout_path,
             post_logout_redirect_uri,
@@ -1120,13 +1136,24 @@ impl OidcRelyingParty {
             payload.claims_expires_at_unix = claims_expires_at;
         }
         let claims_expired_before_refresh = now > claims_expires_at.saturating_add(leeway);
+
+        // Establish that this session can own the request before invoking the
+        // refresh-token grant or sliding the cookie. Both operations mutate
+        // requester-owned state that cannot safely be discarded after IdP
+        // rotation, nor published by a principal-less/rejected/later attempt.
+        let preflight_outcome = self.resolve_identity(&payload.claims, consumer_index);
+        if !authentication_attempt_can_commit(ctx, &preflight_outcome, true) {
+            return apply_verify_outcome(ctx, AuthenticationAttempt::new(), preflight_outcome);
+        }
+
         if claims_expired_before_refresh && payload.refresh_token_b64.is_some() {
             payload.refresh_after_unix = now;
         }
 
         // Keep the session live: refresh tokens when due (which also re-derives
         // claims from any new ID token), then slide the idle window. Any change
-        // is re-sealed and emitted as a `Set-Cookie` by `after_proxy`.
+        // is re-sealed now, but only the accepted first principal commits the
+        // cookie for `after_proxy` to emit as `Set-Cookie`.
         let refresh = self.maybe_refresh_session(&mut payload, now).await;
 
         // Token-freshness gate: the ID token was validly verified at login, but
@@ -1139,27 +1166,57 @@ impl OidcRelyingParty {
             return self.challenge(ctx, true);
         }
 
-        let mut mutated = refresh.mutated || refresh.refreshed || backfilled_claims_expiry;
-        mutated |= self.maybe_slide_session(&mut payload, now);
-        if mutated {
+        let mut session_mutated = refresh.mutated || refresh.refreshed || backfilled_claims_expiry;
+        session_mutated |= self.maybe_slide_session(&mut payload, now);
+        let rolling_cookie = if session_mutated {
             match self.seal_session_cookie(&payload) {
-                Ok(cookie) => {
-                    ctx.metadata
-                        .insert(SESSION_SET_COOKIE_METADATA_KEY.to_string(), cookie);
-                }
+                Ok(cookie) => Some(cookie),
                 Err(error) => {
                     warn!(
                         plugin = "oidc_relying_party",
                         error = %error,
                         "failed to re-seal rolling session cookie; serving with the existing session"
                     );
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
 
         // Authorize against the effective (possibly refreshed) claims.
-        if let Err((status, body)) = scope_role_check::check(
+        if let Err((status, body)) = self.check_session_authorization(&payload.claims) {
+            return self.reject_with_session_update(ctx, status, body, rolling_cookie);
+        }
+        let outcome = self.resolve_identity(&payload.claims, consumer_index);
+        let mut attempt = AuthenticationAttempt::new();
+        if authentication_attempt_can_commit(ctx, &outcome, true) {
+            if let Some(cookie) = rolling_cookie {
+                attempt
+                    .stage_principal_metadata(SESSION_SET_COOKIE_METADATA_KEY.to_string(), cookie);
+            }
+        } else if refresh.mutated
+            && let Some(cookie) = rolling_cookie
+        {
+            // A refreshed ID token can remove the configured identity claim
+            // after the grant has already rotated requester-owned state. Keep
+            // the cookie only on the authentication-rejection path; a later
+            // successful credential discards it with the other rejected
+            // attempt state.
+            crate::proxy::stage_auth_rejection_set_cookie(ctx, cookie);
+        }
+        emit_claim_headers_to_attempt(
+            &mut attempt,
             &payload.claims,
+            &self.provider.claim_headers,
+            ",",
+        );
+        apply_verify_outcome(ctx, attempt, outcome)
+    }
+
+    fn check_session_authorization(&self, claims: &Value) -> Result<(), (u16, String)> {
+        scope_role_check::check(
+            claims,
             &ScopeRoleRequirements {
                 required_scopes: &self.provider.required_scopes,
                 required_roles: &self.provider.required_roles,
@@ -1167,12 +1224,33 @@ impl OidcRelyingParty {
                 role_claim: &self.provider.role_claim,
                 plugin_name: "oidc_relying_party",
             },
-        ) {
-            return reject(status, body);
+        )
+    }
+
+    fn reject_with_session_update(
+        &self,
+        ctx: &mut RequestContext,
+        status_code: u16,
+        body: String,
+        rolling_cookie: Option<String>,
+    ) -> PluginResult {
+        let mut headers = HashMap::new();
+        if let Some(cookie) = rolling_cookie {
+            // The local rejection owns this response cookie, while the
+            // one-shot candidate lets multi-auth move the same sealed state
+            // onto a later final rejection. The phase discards the candidate
+            // if a later credential succeeds. Later rejected session attempts
+            // replace candidates with the same exact cookie name, while
+            // independently named session updates survive for the final
+            // rejection.
+            crate::proxy::stage_auth_rejection_set_cookie(ctx, cookie.clone());
+            headers.insert("set-cookie".to_string(), cookie);
         }
-        emit_claim_headers_to_metadata(ctx, &payload.claims, &self.provider.claim_headers, ",");
-        let outcome = self.resolve_identity(&payload.claims, consumer_index);
-        apply_verify_outcome(ctx, outcome)
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        }
     }
 
     /// Advance the sliding idle window. To keep the response `Set-Cookie` (and the
@@ -1321,12 +1399,15 @@ impl OidcRelyingParty {
     }
 
     fn resolve_identity(&self, claims: &Value, consumer_index: &ConsumerIndex) -> VerifyOutcome {
-        let identity = extract_claim_string(claims, &self.provider.consumer_identity_claim);
+        let identity = nonblank_identity(extract_claim_string(
+            claims,
+            &self.provider.consumer_identity_claim,
+        ));
         let header = if self.provider.consumer_header_claim == self.provider.consumer_identity_claim
         {
             identity.clone()
         } else {
-            extract_claim_string(claims, &self.provider.consumer_header_claim)
+            extract_claim_string_exact(claims, &self.provider.consumer_header_claim)
                 .or_else(|| identity.clone())
         };
         let consumer = identity
@@ -1337,6 +1418,23 @@ impl OidcRelyingParty {
 
     fn challenge(&self, ctx: &mut RequestContext, clear: bool) -> PluginResult {
         if is_browser_request(ctx, &self.behavior) {
+            // The correlation secret is deliberately host-only. Do not start a
+            // flow when the configured callback host differs from the host on
+            // which the browser would receive the cookie: the callback could
+            // never return the binding, and restoring a parent Domain would
+            // reintroduce sibling-host disclosure and overwrite attacks.
+            let Some(request_host) = correlation_cookie_host_from_request(ctx) else {
+                return reject(
+                    400,
+                    r#"{"error":"OIDC missing or malformed request authority"}"#.to_string(),
+                );
+            };
+            if request_host != self.provider.redirect_cookie_host {
+                return reject(
+                    400,
+                    r#"{"error":"OIDC callback host does not match request host"}"#.to_string(),
+                );
+            }
             let (state, flow, browser_binding) = match self.create_flow(ctx) {
                 Ok(flow) => flow,
                 Err(body) => return reject(503, body),
@@ -1439,6 +1537,104 @@ impl OidcRelyingParty {
         Ok(format!(
             "{}={}; {}",
             self.session.cookie_name, value, self.session.cookie_attrs
+        ))
+    }
+
+    // Reached only through the lib target's `_test_support` shim by external
+    // unit tests; the bin target recompiles this module without that caller.
+    #[allow(dead_code)]
+    pub(crate) fn sealed_refresh_session_cookie_for_tests(
+        &self,
+        claims: Value,
+        refresh_token: Option<String>,
+        refresh_due: bool,
+        rolling_due: bool,
+    ) -> Result<String, String> {
+        let payload = self.session_payload_for_tests(
+            claims,
+            rolling_due,
+            refresh_token.as_deref(),
+            refresh_due,
+        )?;
+        self.seal_session_cookie(&payload)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sealed_session_cookie_for_tests(
+        &self,
+        claims: Value,
+        require_rolling_update: bool,
+    ) -> Result<String, String> {
+        let payload =
+            self.session_payload_for_tests(claims, require_rolling_update, None, false)?;
+        self.seal_session_cookie(&payload)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sealed_due_refresh_session_cookie_for_tests(
+        &self,
+        claims: Value,
+        refresh_token: &str,
+    ) -> Result<String, String> {
+        let payload = self.session_payload_for_tests(claims, false, Some(refresh_token), true)?;
+        self.seal_session_cookie(&payload)
+    }
+
+    fn session_payload_for_tests(
+        &self,
+        claims: Value,
+        require_rolling_update: bool,
+        refresh_token: Option<&str>,
+        refresh_due: bool,
+    ) -> Result<SessionPayload, String> {
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = claim_expiry(&claims).unwrap_or(now + 3600);
+        let sub = required_subject(&claims, "ID token")?.to_string();
+        let touch_age = if require_rolling_update {
+            (self.session.idle_ttl.as_secs() as i64 / 2).max(1)
+        } else {
+            0
+        };
+        Ok(SessionPayload {
+            version: SESSION_PAYLOAD_VERSION,
+            context_id: self.session.context_id.clone(),
+            sub,
+            id_token_b64: "test-id-token".to_string(),
+            access_token_b64: "test-access-token".to_string(),
+            refresh_token_b64: refresh_token.map(str::to_string),
+            expires_at_unix: expires_at,
+            claims_expires_at_unix: expires_at,
+            refresh_after_unix: if refresh_due { now - 1 } else { expires_at },
+            issued_at_unix: now - touch_age,
+            last_touch_unix: now - touch_age,
+            nonce: "test-nonce".to_string(),
+            claims,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn open_session_cookie_for_tests(&self, cookie: &str) -> Option<Value> {
+        let cookie_pair = cookie.split(';').next()?;
+        let (_, value) = cookie_pair.split_once('=')?;
+        let payload = self.open_session(value)?;
+        serde_json::to_value(payload).ok()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn session_state_from_set_cookie_for_tests(
+        &self,
+        set_cookie: &str,
+    ) -> Option<(String, Option<String>, i64)> {
+        let prefix = format!("{}=", self.session.cookie_name);
+        let cookie = set_cookie
+            .split('\n')
+            .find(|cookie| cookie.trim_start().starts_with(&prefix))?;
+        let value = cookie.split(';').next()?.split_once('=')?.1;
+        let payload = self.open_session(value)?;
+        Some((
+            payload.access_token_b64,
+            payload.refresh_token_b64,
+            payload.refresh_after_unix,
         ))
     }
 
@@ -1602,7 +1798,7 @@ impl super::Plugin for OidcRelyingParty {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        apply_claim_headers_from_metadata(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
+        apply_claim_headers_from_context(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
         PluginResult::Continue
     }
     async fn after_proxy(
@@ -1626,9 +1822,11 @@ impl super::Plugin for OidcRelyingParty {
         PluginResult::Continue
     }
     fn applies_after_proxy_on_reject(&self) -> bool {
-        // A token refresh may have rotated the upstream refresh token before a
-        // later plugin rejected the request; the client must still receive the
-        // re-sealed cookie so it does not keep replaying a now-invalid token.
+        // A successful OIDC attempt may have rotated the upstream refresh token
+        // before a later plugin rejected the request; the client must still
+        // receive the staged cookie so it does not keep replaying a now-invalid
+        // token. OIDC's own scope/role rejection carries the same update in its
+        // attempt-scoped rejection headers instead.
         true
     }
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -1660,6 +1858,12 @@ impl super::Plugin for OidcRelyingParty {
             .filter(|store| store.is_refreshable())
             .map(|store| vec![store.jwks_uri().to_string()])
             .unwrap_or_default()
+    }
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+        self.active_jwks_uris()
+            .into_iter()
+            .map(|uri| (uri, DEFAULT_JWKS_REFRESH_INTERVAL))
+            .collect()
     }
 }
 
@@ -1961,38 +2165,22 @@ where
     serde_json::from_slice(&body).map_err(|error| error.to_string())
 }
 
-fn apply_verify_outcome(ctx: &mut RequestContext, outcome: VerifyOutcome) -> PluginResult {
-    match outcome {
-        VerifyOutcome::Success {
-            consumer,
-            external_identity,
-            external_identity_header,
-        } => {
-            let consumer_identified = consumer.is_some();
-            let external_identity_identified = external_identity.is_some();
-            if let Some(consumer) = consumer
-                && ctx.identified_consumer.is_none()
-            {
-                ctx.identified_consumer = Some(consumer);
-            }
-            if let Some(identity) = external_identity {
-                ctx.authenticated_identity = Some(identity);
-            }
-            if let Some(header) = external_identity_header {
-                ctx.authenticated_identity_header = Some(header);
-            }
-            if ctx.auth_method.is_none() && (consumer_identified || external_identity_identified) {
-                ctx.auth_method = Some("oidc_relying_party");
-            }
+fn apply_verify_outcome(
+    ctx: &mut RequestContext,
+    attempt: AuthenticationAttempt,
+    outcome: VerifyOutcome,
+) -> PluginResult {
+    match commit_authentication_attempt(ctx, attempt, outcome, "oidc_relying_party", true) {
+        Ok(_) => PluginResult::Continue,
+        Err(VerifyOutcome::Forbidden(body)) => reject(403, body),
+        Err(VerifyOutcome::Invalid(body))
+        | Err(VerifyOutcome::InvalidFormat(body))
+        | Err(VerifyOutcome::ConsumerNotFound(body))
+        | Err(VerifyOutcome::VerificationFailed(body)) => reject(401, body),
+        Err(VerifyOutcome::Internal(body)) => reject(500, body),
+        Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
             PluginResult::Continue
         }
-        VerifyOutcome::Forbidden(body) => reject(403, body),
-        VerifyOutcome::Invalid(body)
-        | VerifyOutcome::InvalidFormat(body)
-        | VerifyOutcome::ConsumerNotFound(body)
-        | VerifyOutcome::VerificationFailed(body) => reject(401, body),
-        VerifyOutcome::Internal(body) => reject(500, body),
-        VerifyOutcome::NotApplicable => PluginResult::Continue,
     }
 }
 
@@ -2412,6 +2600,42 @@ fn validate_redirect_uri(uri: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn correlation_cookie_host_from_url(url: &Url) -> Option<CorrelationCookieHost> {
+    match url.host()? {
+        Host::Domain(hostname) if hostname.ends_with('.') => None,
+        Host::Domain(hostname) => {
+            Some(CorrelationCookieHost::Domain(hostname.to_ascii_lowercase()))
+        }
+        Host::Ipv4(address) => Some(CorrelationCookieHost::Ip(IpAddr::V4(address))),
+        Host::Ipv6(address) => Some(CorrelationCookieHost::Ip(IpAddr::V6(address))),
+    }
+}
+
+fn correlation_cookie_host_from_request(ctx: &RequestContext) -> Option<CorrelationCookieHost> {
+    let raw = ctx.headers.get("host")?.trim();
+    // Reuse the proxy's admission parser so malformed ports, user-info,
+    // unbracketed IPv6, and ambiguous authority syntax fail closed here too.
+    crate::proxy::normalize_request_host_for_routing(raw)?;
+    let authority: http::uri::Authority = raw.parse().ok()?;
+    let host = authority.host();
+    if let Some(literal) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        return literal
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|address| CorrelationCookieHost::Ip(IpAddr::V6(address)));
+    }
+    if let Ok(address) = host.parse::<std::net::Ipv4Addr>() {
+        return Some(CorrelationCookieHost::Ip(IpAddr::V4(address)));
+    }
+    if host.ends_with('.') {
+        return None;
+    }
+    Some(CorrelationCookieHost::Domain(host.to_ascii_lowercase()))
+}
+
 fn validate_url_string(raw: &str, field: &str) -> Result<String, String> {
     let parsed =
         Url::parse(raw).map_err(|e| format!("oidc_relying_party: {field} invalid: {e}"))?;
@@ -2514,6 +2738,14 @@ fn build_cookie_attrs(
         attrs.push_str("; HttpOnly");
     }
     attrs
+}
+
+/// Build the fixed scope for the short-lived browser correlation secret.
+///
+/// Unlike the durable session cookie, this cookie must remain host-only: a
+/// parent `Domain` would let sibling hosts receive or overwrite the binding.
+fn build_correlation_cookie_attrs(secure: bool, callback_path: &str) -> String {
+    build_cookie_attrs(secure, true, "Lax", None, callback_path)
 }
 
 fn encoded_session_cookie_len(plaintext_len: usize) -> usize {
@@ -3117,6 +3349,33 @@ mod tests {
     }
 
     #[test]
+    fn oidc_identity_resolution_rejects_blank_principals() {
+        let config =
+            plugin_config_without_optional_defaults("https://app.example.com/oauth/callback");
+        let plugin = build_plugin_without_workers(&config);
+
+        for claims in [
+            json!({}),
+            json!({"sub": null}),
+            json!({"sub": 42}),
+            json!({"sub": ""}),
+            json!({"sub": "   \t"}),
+        ] {
+            let VerifyOutcome::Success {
+                consumer,
+                external_identity,
+                external_identity_header,
+            } = plugin.resolve_identity(&claims, &ConsumerIndex::new(&[]))
+            else {
+                panic!("identity resolution should remain non-rejecting");
+            };
+            assert!(consumer.is_none());
+            assert!(external_identity.is_none());
+            assert!(external_identity_header.is_none());
+        }
+    }
+
+    #[test]
     fn concurrent_browser_challenges_keep_distinct_state_bindings() {
         let config =
             plugin_config_without_optional_defaults("https://app.example.com/oauth/callback");
@@ -3124,6 +3383,8 @@ mod tests {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
         ctx.headers
             .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
 
         let mut issue_challenge = || {
             let PluginResult::Reject {
@@ -3348,6 +3609,35 @@ mod tests {
 
     fn build_plugin(token_endpoint: &str) -> OidcRelyingParty {
         build_plugin_with_client(token_endpoint, "client-1")
+    }
+
+    fn build_claim_identity_plugin(required_scopes: &[&str]) -> OidcRelyingParty {
+        OidcRelyingParty::new(
+            &json!({
+                "providers": [{
+                    "issuer": "https://idp.example.com",
+                    "client_id": "client-1",
+                    "authorization_endpoint": "https://idp.example.com/authorize",
+                    "token_endpoint": "https://idp.example.com/token",
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "scopes": ["openid"],
+                    "redirect_uri": "https://app.example.com/oauth/callback",
+                    "callback_path": "/oauth/callback",
+                    "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"},
+                    "consumer_identity_claim": "email",
+                    "consumer_header_claim": "display_name",
+                    "claim_headers": {"tenant": "X-Tenant"},
+                    "required_scopes": required_scopes
+                }],
+                "session": {
+                    "encryption_secret": "0123456789012345678901234567890123",
+                    "ttl_secs": 3600,
+                    "idle_ttl_secs": 1800
+                }
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("OIDC claim identity config is valid")
     }
 
     fn build_plugin_with_client(token_endpoint: &str, client_id: &str) -> OidcRelyingParty {
@@ -3600,7 +3890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_session_slides_and_emits_rolling_cookie() {
+    async fn accepted_principal_session_slides_and_emits_rolling_cookie() {
         let plugin = build_plugin("https://idp.example.com/token");
         let now = chrono::Utc::now().timestamp();
         // last_touch 1000s ago (> touch_interval 900) but within idle/absolute ttl;
@@ -3613,6 +3903,9 @@ mod tests {
                 .await,
             PluginResult::Continue
         ));
+        assert_eq!(ctx.authenticated_identity.as_deref(), Some("user-1"));
+        assert_eq!(ctx.auth_method, Some("oidc_relying_party"));
+        assert!(ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
         let mut response_headers = HashMap::new();
         plugin
             .after_proxy(&mut ctx, 200, &mut response_headers)
@@ -3620,6 +3913,39 @@ mod tests {
         let rolled = emitted_session_payload(&plugin, &response_headers)
             .expect("rolling session cookie emitted");
         assert!(rolled.last_touch_unix >= now);
+        assert!(!ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn later_accepted_session_does_not_commit_rolling_cookie() {
+        let plugin = build_plugin("https://idp.example.com/token");
+        let now = chrono::Utc::now().timestamp();
+        let payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        ctx.authenticated_identity = Some("first@example.com".to_string());
+        ctx.auth_method = Some("jwks_auth");
+
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some("first@example.com")
+        );
+        assert_eq!(ctx.auth_method, Some("jwks_auth"));
+        assert!(!ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
+
+        let mut response_headers = HashMap::new();
+        assert!(matches!(
+            plugin
+                .after_proxy(&mut ctx, 200, &mut response_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(!response_headers.contains_key("set-cookie"));
     }
 
     #[tokio::test]
@@ -4138,6 +4464,143 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn principal_less_session_discards_claim_and_rolling_cookie_state() {
+        let plugin = build_claim_identity_plugin(&[]);
+        let now = chrono::Utc::now().timestamp();
+
+        for email in [None, Some("   ")] {
+            let mut payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
+            payload.claims = json!({
+                "sub": "user-1",
+                "display_name": "Header Without Principal",
+                "tenant": "unaccepted-tenant"
+            });
+            if let Some(email) = email {
+                payload.claims["email"] = json!(email);
+            }
+            let mut ctx = ctx_with_session(&plugin, &payload);
+
+            assert!(matches!(
+                plugin
+                    .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                    .await,
+                PluginResult::Continue
+            ));
+            assert!(ctx.identified_consumer.is_none());
+            assert!(ctx.authenticated_identity.is_none());
+            assert!(ctx.authenticated_identity_header.is_none());
+            assert!(ctx.auth_method.is_none());
+            assert!(!ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
+            assert!(
+                !ctx.metadata
+                    .values()
+                    .any(|value| value == "unaccepted-tenant")
+            );
+
+            let mut headers = HashMap::new();
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+            assert!(!headers.contains_key("x-tenant"));
+
+            let mut response_headers = HashMap::new();
+            assert!(matches!(
+                plugin
+                    .after_proxy(&mut ctx, 200, &mut response_headers)
+                    .await,
+                PluginResult::Continue
+            ));
+            assert!(!response_headers.contains_key("set-cookie"));
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_session_preserves_identity_and_claim_header_exactly() {
+        let plugin = build_claim_identity_plugin(&[]);
+        let now = chrono::Utc::now().timestamp();
+        let mut payload = session_payload(now - 100, now - 100, None, now + 100_000);
+        payload.claims = json!({
+            "sub": "user-1",
+            "email": " accepted@example.com ",
+            "display_name": "   ",
+            "tenant": " tenant-original "
+        });
+        let mut ctx = ctx_with_session(&plugin, &payload);
+
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some(" accepted@example.com ")
+        );
+        assert!(ctx.authenticated_identity_header.is_none());
+        assert_eq!(
+            ctx.backend_consumer_username(),
+            Some(" accepted@example.com ")
+        );
+
+        let mut headers = HashMap::new();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            headers.get("x-tenant").map(String::as_str),
+            Some(" tenant-original ")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_session_authorization_leaves_no_claim_or_rolling_cookie_state() {
+        let plugin = build_claim_identity_plugin(&["admin"]);
+        let now = chrono::Utc::now().timestamp();
+        let mut payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
+        payload.claims = json!({
+            "sub": "user-1",
+            "email": "accepted@example.com",
+            "display_name": "Accepted User",
+            "tenant": "must-not-commit",
+            "scope": "read"
+        });
+        let mut ctx = ctx_with_session(&plugin, &payload);
+
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ));
+        assert!(ctx.authenticated_identity.is_none());
+        assert!(ctx.authenticated_identity_header.is_none());
+        assert!(ctx.auth_method.is_none());
+        assert!(!ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
+
+        let mut headers = HashMap::new();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert!(!headers.contains_key("x-tenant"));
+
+        let mut response_headers = HashMap::new();
+        assert!(matches!(
+            plugin
+                .after_proxy(&mut ctx, 403, &mut response_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(!response_headers.contains_key("set-cookie"));
+    }
+
     // Finding #36 regression: during a discovery outage a browser challenge must
     // fail closed with 503 rather than 302-redirecting to the relative
     // post_login_default_path (the protected app root), which would loop. The
@@ -4150,6 +4613,8 @@ mod tests {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
         ctx.headers
             .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
         let before = plugin.session.state_cache.entries.len();
         match plugin.challenge(&mut ctx, false) {
             PluginResult::Reject {
@@ -4181,6 +4646,8 @@ mod tests {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
         ctx.headers
             .insert("accept".to_string(), "text/html".to_string());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
         match plugin.challenge(&mut ctx, false) {
             PluginResult::Reject {
                 status_code,
