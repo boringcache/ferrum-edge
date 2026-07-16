@@ -2094,6 +2094,7 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
         json!({"min_content_tokens": 131072}),
         json!({"max_scan_bytes": 1048576}),
         json!({"preserve_tag": "keep-this_1"}),
+        json!({"preserve_tag": "x".repeat(64)}),
         json!({"request_family": "chat_completions"}),
         json!({"request_family": "text_completions", "compress_roles": [" User "]}),
     ] {
@@ -2115,6 +2116,7 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
         json!({"max_scan_bytes": 1048577}),
         json!({"min_content_tokens": 131073}),
         json!({"preserve_tag": null}),
+        json!({"preserve_tag": "x".repeat(65)}),
         json!({"request_family": "images"}),
         json!({"request_family": "text_completions", "compress_roles": ["system"]}),
     ] {

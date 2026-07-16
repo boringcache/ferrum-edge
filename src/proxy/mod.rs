@@ -2389,6 +2389,32 @@ pub(crate) fn request_body_requirements_before_authorize(
     requirements
 }
 
+pub(crate) fn request_body_requirements_before_before_proxy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> RequestBodyPhaseRequirements {
+    let mut requirements = RequestBodyPhaseRequirements::default();
+    for plugin in plugins {
+        if !plugin.requires_request_body_before_before_proxy()
+            || !plugin.should_buffer_request_body(ctx)
+        {
+            continue;
+        }
+        requirements.required = true;
+        requirements.needs_text |= plugin.needs_request_body_text();
+        requirements.needs_bytes |= plugin.needs_request_body_bytes();
+        requirements.needs_digests |= plugin.needs_request_body_digests();
+        if let Some(limit) = plugin.request_body_buffer_limit() {
+            requirements.plugin_limit = Some(
+                requirements
+                    .plugin_limit
+                    .map_or(limit, |current| current.min(limit)),
+            );
+        }
+    }
+    requirements
+}
+
 pub(crate) fn request_body_requirements_before_authenticate(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
@@ -16087,36 +16113,26 @@ async fn handle_proxy_request_inner(
         && plugins
             .iter()
             .any(|plugin| plugin.should_buffer_request_body(&ctx));
-    let requires_request_body_before_before_proxy = requires_request_body_buffering
+    let before_proxy_body_requirements = if requires_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
-        && plugins.iter().any(|plugin| {
-            plugin.requires_request_body_before_before_proxy()
-                && plugin.should_buffer_request_body(&ctx)
-        });
-    let (needs_body_text, needs_body_bytes) = if requires_request_body_before_before_proxy {
-        let mut needs_text = false;
-        let mut needs_bytes = false;
-        for plugin in plugins.iter() {
-            if plugin.requires_request_body_before_before_proxy()
-                && plugin.should_buffer_request_body(&ctx)
-            {
-                needs_text |= plugin.needs_request_body_text();
-                needs_bytes |= plugin.needs_request_body_bytes();
-            }
-        }
-        (needs_text, needs_bytes)
+    {
+        request_body_requirements_before_before_proxy(&plugins, &ctx)
     } else {
-        (false, false)
+        RequestBodyPhaseRequirements::default()
     };
 
-    if requires_request_body_before_before_proxy {
+    if before_proxy_body_requirements.required {
+        let body_limit = effective_request_body_limit(
+            state.max_request_body_size_bytes,
+            before_proxy_body_requirements.plugin_limit,
+        );
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
                 match buffer_request_body_for_before_proxy(
                     *request,
                     &method,
                     &ctx.headers,
-                    state.max_request_body_size_bytes,
+                    body_limit,
                     proxy.backend_read_timeout_ms,
                 )
                 .await
@@ -16126,9 +16142,9 @@ async fn handle_proxy_request_inner(
                             store_request_body_metadata(
                                 &mut ctx,
                                 body,
-                                needs_body_text,
-                                needs_body_bytes,
-                                false,
+                                before_proxy_body_requirements.needs_text,
+                                before_proxy_body_requirements.needs_bytes,
+                                before_proxy_body_requirements.needs_digests,
                             );
                             // Seed bytes_sent_observed from the prebuffered
                             // body so before_proxy rejects (logged via
@@ -16176,12 +16192,19 @@ async fn handle_proxy_request_inner(
                 }
             }
             ClientRequestBody::Buffered(body) => {
+                if body_limit > 0 && body.len() > body_limit {
+                    record_request(&state, 413);
+                    return Ok(build_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                    ));
+                }
                 store_request_body_metadata(
                     &mut ctx,
                     &body,
-                    needs_body_text,
-                    needs_body_bytes,
-                    false,
+                    before_proxy_body_requirements.needs_text,
+                    before_proxy_body_requirements.needs_bytes,
+                    before_proxy_body_requirements.needs_digests,
                 );
                 ClientRequestBody::Buffered(body)
             }

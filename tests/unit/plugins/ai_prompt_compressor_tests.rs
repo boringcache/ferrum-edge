@@ -1,12 +1,14 @@
 //! Tests for the ai_prompt_compressor plugin.
 
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, RequestContext, ai_prompt_compressor::AiPromptCompressor,
-    compression::CompressionPlugin, priority,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext,
+    ai_prompt_compressor::AiPromptCompressor, compression::CompressionPlugin, priority,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
+use tokio::sync::Barrier;
 
 use super::plugin_utils::{assert_continue, create_test_context};
 
@@ -101,6 +103,10 @@ fn plugin_metadata_matches_registration() {
     assert!(plugin.requires_request_body_buffering());
     assert!(plugin.requires_request_body_before_before_proxy());
     assert!(plugin.needs_final_request_body_context());
+    assert_eq!(plugin.request_body_buffer_limit(), None);
+
+    let marker_plugin = AiPromptCompressor::new(&json!({"preserve_tag": "keep"})).unwrap();
+    assert_eq!(marker_plugin.request_body_buffer_limit(), Some(1_048_576));
 }
 
 #[test]
@@ -135,6 +141,7 @@ fn invalid_configs_rejected() {
         json!({"preserve_tag": "keep "}),
         json!({"preserve_tag": "bad tag"}),
         json!({"preserve_tag": "no/slash"}),
+        json!({"preserve_tag": "x".repeat(65)}),
         json!({"request_family": "images"}),
         json!({"request_family": "text_completions", "compress_roles": ["system"]}),
         json!({"compress_role": ["system"]}),
@@ -161,6 +168,7 @@ fn valid_configs_accepted() {
         json!({"min_content_tokens": 131_072}),
         json!({"max_scan_bytes": 2048}),
         json!({"preserve_tag": "keep-this_1"}),
+        json!({"preserve_tag": "x".repeat(64)}),
         json!({"request_family": "auto"}),
         json!({"request_family": "chat_completions"}),
         json!({"request_family": "text_completions"}),
@@ -211,6 +219,20 @@ fn should_buffer_only_json_post() {
     assert!(
         fixed.should_buffer_request_body(&custom_ctx),
         "a fixed family is the explicit custom-path opt-in"
+    );
+
+    let marker_plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "max_scan_bytes": 64
+    }))
+    .unwrap();
+    let mut marker_ctx = post_ctx(&chat_body("user", "<keep>hello</keep>"));
+    marker_ctx
+        .headers
+        .insert("content-length".to_string(), "1000".to_string());
+    assert!(
+        marker_plugin.should_buffer_request_body(&marker_ctx),
+        "marker sanitation must remain buffered above the compression scan cap"
     );
 }
 
@@ -546,6 +568,23 @@ async fn multimodal_text_parts_compressed() {
 }
 
 #[tokio::test]
+async fn chat_multimodal_plain_string_parts_are_rejected_consistently() {
+    let plugin = compressor(1, 0.4);
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [long_prompt_text(), {"type": "text", "text": long_prompt_text()}]
+        }]
+    });
+
+    assert!(
+        transform(&plugin, &body).await.is_none(),
+        "measurement and mutation walkers must both reject plain strings in chat content arrays"
+    );
+}
+
+#[tokio::test]
 async fn legacy_prompt_field_compressed_for_user() {
     let plugin = compressor(5, 0.4);
     let original = long_prompt_text();
@@ -752,12 +791,248 @@ async fn adversarial_token_and_field_budgets_pass_through() {
     }))
     .unwrap();
     let too_many_markers = "a</x>".repeat(1_025);
-    assert!(
-        transform(&marker_plugin, &chat_body("user", &too_many_markers))
-            .await
-            .is_none(),
-        "preserve-marker segmentation must be rejected before repeated compression"
+    let sanitized = transform(
+        &marker_plugin,
+        &chat_body("user", &too_many_markers),
+    )
+    .await
+    .expect("over-budget preserve markers must take the sanitation fallback");
+    assert_eq!(
+        first_message_content(&sanitized),
+        "a".repeat(1_025),
+        "marker fallback must remove every configured marker"
     );
+}
+
+#[tokio::test]
+async fn preserve_markers_are_stripped_above_each_compression_work_budget() {
+    let marker_plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 1,
+        "max_scan_bytes": 128,
+        "target_ratio": 0.5
+    }))
+    .unwrap();
+
+    let over_scan = format!(
+        "prefix <keep>critical</keep> {}",
+        "ordinary filler language ".repeat(20)
+    );
+    let sanitized = transform(&marker_plugin, &chat_body("user", &over_scan))
+        .await
+        .expect("body-cap fallback must sanitize markers");
+    assert_eq!(
+        first_message_content(&sanitized),
+        over_scan.replace("<keep>", "").replace("</keep>", "")
+    );
+
+    let marker_plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 1,
+        "target_ratio": 0.5
+    }))
+    .unwrap();
+    let over_text = format!("<keep>critical</keep>{}", "a".repeat(524_289));
+    let sanitized = transform(&marker_plugin, &chat_body("user", &over_text))
+        .await
+        .expect("eligible-text fallback must sanitize markers");
+    assert_eq!(
+        first_message_content(&sanitized),
+        over_text.replace("<keep>", "").replace("</keep>", "")
+    );
+
+    let parts: Vec<Value> = (0..257)
+        .map(|index| {
+            json!({
+                "type": "text",
+                "text": if index == 0 {
+                    "<keep>critical</keep>".to_string()
+                } else {
+                    "ordinary prose".to_string()
+                }
+            })
+        })
+        .collect();
+    let field_body = json!({
+        "messages": [{"role": "user", "content": parts}]
+    });
+    let sanitized = transform(&marker_plugin, &field_body)
+        .await
+        .expect("field-count fallback must sanitize markers");
+    assert_eq!(sanitized["messages"][0]["content"][0]["text"], "critical");
+}
+
+#[tokio::test]
+async fn decoded_body_above_hard_marker_bound_fails_closed_in_final_hook() {
+    let plugin = AiPromptCompressor::new(&json!({"preserve_tag": "keep"})).unwrap();
+    let body = serde_json::to_vec(&chat_body(
+        "user",
+        &format!("<keep>critical</keep>{}", "x".repeat(1_048_576)),
+    ))
+    .unwrap();
+    let mut ctx = post_ctx(&chat_body("user", "placeholder"));
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none()
+    );
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), &body)
+            .await,
+        PluginResult::Reject {
+            status_code: 413,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn preserve_split_backticks_use_the_combined_token_work_bound() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 1,
+        "target_ratio": 0.2
+    }))
+    .unwrap();
+    let content = format!(
+        "`prefix<keep>critical</keep> {} `{}",
+        "x ".repeat(18_000),
+        "a`x`".repeat(15_000)
+    );
+    let expected = content.replace("<keep>", "").replace("</keep>", "");
+    let sanitized = transform(&plugin, &chat_body("user", &content))
+        .await
+        .expect("combined token-work overflow must use marker-only fallback");
+    assert_eq!(first_message_content(&sanitized), expected);
+}
+
+#[tokio::test]
+async fn escaped_preserve_markers_are_removed_without_json_canonicalization() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let raw = br#"{ "messages": [{"role":"user","content":"before \u003ckeep\u003ecritical\u003c\/keep\u003e after"}], "n": 1e8 }"#;
+    let output = plugin
+        .transform_request_body(raw, Some("application/json"), &json_headers())
+        .await
+        .expect("escaped markers must be sanitized");
+    assert_eq!(
+        output,
+        br#"{ "messages": [{"role":"user","content":"before critical after"}], "n": 1e8 }"#
+    );
+}
+
+#[tokio::test]
+async fn exponent_growth_within_hard_output_cap_keeps_successful_compression() {
+    let plugin = compressor(5, 0.5);
+    let padding = std::iter::repeat_n("1e8", 10_000)
+        .collect::<Vec<_>>()
+        .join(",");
+    let raw = format!(
+        r#"{{"padding":[{padding}],"messages":[{{"role":"user","content":{}}}]}}"#,
+        serde_json::to_string(&long_prompt_text()).unwrap()
+    );
+    let output = plugin
+        .transform_request_body(raw.as_bytes(), Some("application/json"), &json_headers())
+        .await
+        .expect("bounded exponent normalization must not abandon compression");
+    let parsed: Value = serde_json::from_slice(&output).unwrap();
+    assert!(first_message_content(&parsed).len() < long_prompt_text().len());
+    assert!(
+        output.len() > raw.len() + 65_536,
+        "fixture must exceed the retired 64 KiB lexical-growth allowance"
+    );
+}
+
+#[tokio::test]
+async fn output_overflow_falls_back_to_representation_preserving_marker_cleanup() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 5,
+        "target_ratio": 0.5
+    }))
+    .unwrap();
+    let padding = std::iter::repeat_n("1e8", 100_000)
+        .collect::<Vec<_>>()
+        .join(",");
+    let prompt = format!("<keep>critical</keep> {}", long_prompt_text());
+    let raw = format!(
+        r#"{{ "padding": [{padding}], "messages": [{{"role":"user","content":{}}}] }}"#,
+        serde_json::to_string(&prompt).unwrap()
+    );
+    assert!(raw.len() < 1_048_576);
+    let output = plugin
+        .transform_request_body(raw.as_bytes(), Some("application/json"), &json_headers())
+        .await
+        .expect("output overflow must retain a marker-safe fallback");
+    assert_eq!(
+        output,
+        raw.replace("<keep>", "")
+            .replace("</keep>", "")
+            .into_bytes(),
+        "fallback must preserve exponent spelling and all unrelated JSON bytes"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_saturation_never_turns_markers_into_passthrough() {
+    const TASKS: usize = 16;
+    let plugin = Arc::new(
+        AiPromptCompressor::new(&json!({
+            "preserve_tag": "keep",
+            "min_content_tokens": 1,
+            "target_ratio": 0.5
+        }))
+        .unwrap(),
+    );
+    let words = (0..12_000)
+        .map(|mut index| {
+            let mut suffix = ['a'; 4];
+            for character in suffix.iter_mut().rev() {
+                *character = char::from(b'a' + (index % 26) as u8);
+                index /= 26;
+            }
+            format!("meaningful{}", suffix.iter().collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let raw = Arc::new(
+        serde_json::to_vec(&chat_body(
+            "user",
+            &format!("<keep>critical</keep> {words}"),
+        ))
+        .unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(TASKS + 1));
+    let mut handles = Vec::with_capacity(TASKS);
+    for _ in 0..TASKS {
+        let plugin = Arc::clone(&plugin);
+        let raw = Arc::clone(&raw);
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            plugin
+                .transform_request_body(&raw, Some("application/json"), &json_headers())
+                .await
+                .expect("every admitted marker request must produce sanitized bytes")
+        }));
+    }
+    barrier.wait().await;
+    for handle in handles {
+        let output = handle.await.unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(!text.contains("<keep>") && !text.contains("</keep>"));
+    }
 }
 
 // ─── before_proxy integration ────────────────────────────────────────────────
@@ -1025,6 +1300,27 @@ async fn multiple_instances_keep_distinct_final_wire_stats() {
         .map(|value| value.parse::<usize>().unwrap())
         .sum();
     assert_eq!(aggregate, per_instance_total);
+}
+
+#[test]
+fn per_request_metadata_paths_do_not_format_instance_keys() {
+    let source = include_str!("../../../src/plugins/ai_prompt_compressor.rs");
+    assert!(
+        source.contains("metadata_keys: Arc<CompressionMetadataKeys>"),
+        "per-instance metadata keys must remain cold-path cached and shared by worker clones"
+    );
+    let record = source
+        .split_once("fn record_stats_metadata(")
+        .and_then(|(_, rest)| rest.split_once("fn begin_wire_stats"))
+        .map(|(body, _)| body)
+        .expect("record_stats_metadata source region");
+    let clear = source
+        .split_once("fn clear_instance_stats(")
+        .and_then(|(_, rest)| rest.split_once("fn metadata_usize"))
+        .map(|(body, _)| body)
+        .expect("clear_instance_stats source region");
+    assert!(!record.contains("format!("));
+    assert!(!clear.contains("format!("));
 }
 
 #[tokio::test]

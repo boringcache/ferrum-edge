@@ -780,6 +780,10 @@ pub struct RequestContext {
     /// Whether the authoritative wire transform has reset provisional
     /// `before_proxy` compressor counters for this request.
     pub(crate) ai_prompt_compressor_wire_stats_started: bool,
+    /// Final-hook rejection staged when configured preserve-marker sanitation
+    /// cannot safely produce bounded provider-visible bytes. Kept private so
+    /// request metadata cannot spoof or clear the fail-closed decision.
+    pub(crate) ai_prompt_compressor_marker_reject_status: Option<u16>,
     /// Encoding selected by the built-in compression plugin for the response it
     /// will create at the gateway. This is authoritative ownership state for
     /// distinguishing planned gateway compression from an already-encoded
@@ -1110,6 +1114,7 @@ impl RequestContext {
             ai_prompt_compressor_staged: HashMap::new(),
             ai_prompt_compressor_classification_path: None,
             ai_prompt_compressor_wire_stats_started: false,
+            ai_prompt_compressor_marker_reject_status: None,
             gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
@@ -1284,6 +1289,9 @@ impl RequestContext {
             ),
             ai_prompt_compressor_wire_stats_started: std::mem::take(
                 &mut self.ai_prompt_compressor_wire_stats_started,
+            ),
+            ai_prompt_compressor_marker_reject_status: std::mem::take(
+                &mut self.ai_prompt_compressor_marker_reject_status,
             ),
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,

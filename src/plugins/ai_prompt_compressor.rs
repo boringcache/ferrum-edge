@@ -19,7 +19,10 @@
 //! signal — protects structural spans (code, URLs, numbers, identifiers),
 //! always keeps negations, then drops the lowest-scoring words until the target
 //! ratio is met. Hard body/text/token/field/output and concurrent-work budgets
-//! bound the algorithm; it uses no model files or network calls.
+//! bound the algorithm; it uses no model files or network calls. When a
+//! `preserve_tag` is configured, a separate bounded sanitation lane removes
+//! markers from admitted JSON even when statistical work is over budget or
+//! saturated.
 //!
 //! The transformation is intentionally lossy (extractive compression removes
 //! filler words), so it only runs on roles the operator opts into and only on
@@ -29,14 +32,15 @@
 //! `preserve_tag` lets operators wrap nested must-keep spans that are copied
 //! through with every marker removed.
 //!
-//! A successful field change intentionally reserializes the complete JSON
+//! A normal admitted field change intentionally reserializes the complete JSON
 //! value. Non-target decoded values are semantically retained, but lexical
 //! whitespace, escapes, duplicate members, numeric spelling, and member-byte
-//! order are not preserved.
+//! order are not preserved. Marker-only bounded fallbacks instead preserve
+//! every unrelated source byte.
 //!
 //! # Request flow
 //!
-//! Like `ai_prompt_shield`, the plugin does its work in two places so both the
+//! Like `ai_prompt_shield`, the plugin composes multiple body phases so both the
 //! normal backend-dispatch path and the `ai_federation` direct-dispatch path
 //! forward the compressed body:
 //!
@@ -51,6 +55,9 @@
 //!   upstream and replaces provisional counters with authoritative wire
 //!   counters. Auto-family classification always uses the original incoming
 //!   path captured before routing can rewrite the backend path.
+//! * `on_final_request_body_with_context` fails closed if a decoded body exceeds
+//!   the immutable sanitation bound or the bounded sanitation worker cannot
+//!   complete. This keeps configured preserve markers off the provider wire.
 //!   Compression is gated to POST requests: the context-aware variant checks
 //!   `ctx.method` (H1/H2 and the H3 cross-protocol bridge), and the no-context
 //!   compatibility variant requires explicit `:method` and `:path` pseudo-
@@ -88,12 +95,30 @@ const MAX_TOKEN_UNITS: usize = 32_768;
 const MAX_TARGET_FIELDS: usize = 256;
 /// Maximum preserve markers admitted across eligible text in one body.
 const MAX_PRESERVE_MARKERS: usize = 1_024;
-/// Maximum lexical growth allowed while reserializing the complete JSON body.
-const MAX_JSON_OUTPUT_GROWTH_BYTES: usize = 65_536;
+/// Maximum configured marker-name length. This also bounds lexical matching
+/// work in the representation-preserving marker sanitizer.
+const MAX_PRESERVE_TAG_NAME_BYTES: usize = 64;
 /// Maximum transformed body retained beside request metadata for wire-path reuse.
 const MAX_STAGED_OUTPUT_BYTES: usize = 65_536;
 /// Maximum simultaneous statistical compression jobs across all plugin instances.
 const MAX_CONCURRENT_COMPRESSIONS: usize = 8;
+/// Maximum simultaneous parse/classify/sanitize jobs for configured preserve
+/// markers. Unlike optional statistical work, this lane waits for admission so
+/// saturation cannot turn marker removal into a passthrough.
+const MAX_CONCURRENT_MARKER_SANITIZATIONS: usize = 16;
+
+const STAT_SUFFIXES: [&str; 4] = [
+    "original_tokens",
+    "compressed_tokens",
+    "tokens_saved",
+    "fields_compressed",
+];
+const AGGREGATE_STAT_KEYS: [&str; 4] = [
+    "ai_prompt_compressor.original_tokens",
+    "ai_prompt_compressor.compressed_tokens",
+    "ai_prompt_compressor.tokens_saved",
+    "ai_prompt_compressor.fields_compressed",
+];
 
 const CONFIG_FIELDS: &[&str] = &[
     "compress_roles",
@@ -107,6 +132,8 @@ const CONFIG_FIELDS: &[&str] = &[
 static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 static COMPRESSION_BUDGET: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_COMPRESSIONS)));
+static MARKER_SANITIZATION_BUDGET: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_MARKER_SANITIZATIONS)));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequestFamily {
@@ -134,7 +161,8 @@ pub struct AiPromptCompressor {
     target_ratio: f64,
     /// Estimated-token floor: content below this is passed through unchanged.
     min_content_tokens: usize,
-    /// Skip the whole body when it exceeds this many bytes.
+    /// Skip statistical compression when the body exceeds this many bytes.
+    /// Configured preserve-marker sanitation continues to the hard ceiling.
     max_scan_bytes: usize,
     /// Optional `(open, close)` markers whose enclosed span is kept verbatim
     /// (the markers themselves are stripped from the outgoing content).
@@ -142,6 +170,27 @@ pub struct AiPromptCompressor {
     /// Request-family admission policy. `Auto` recognizes standard endpoint
     /// paths; fixed variants are an explicit opt-in for custom endpoints.
     request_family: RequestFamilyPolicy,
+    /// Exact per-instance metadata keys, constructed once with the instance and
+    /// shared by blocking-worker clones. Request paths never format key names.
+    metadata_keys: Arc<CompressionMetadataKeys>,
+}
+
+#[derive(Debug)]
+struct CompressionMetadataKeys {
+    instance: [String; 4],
+}
+
+impl CompressionMetadataKeys {
+    fn new(instance_id: u64) -> Self {
+        Self {
+            instance: std::array::from_fn(|index| {
+                format!(
+                    "ai_prompt_compressor.instances.{instance_id}.{}",
+                    STAT_SUFFIXES[index]
+                )
+            }),
+        }
+    }
 }
 
 /// Running totals accumulated while compressing one request body.
@@ -159,13 +208,19 @@ pub(crate) struct StagedCompression {
     source_len: usize,
     source_sha256: [u8; 32],
     output: Vec<u8>,
-    stats: CompressionStats,
+    stats: Option<CompressionStats>,
 }
 
 struct CompressionOutput {
     source_sha256: [u8; 32],
     output: Vec<u8>,
-    stats: CompressionStats,
+    stats: Option<CompressionStats>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkerSanitizationError {
+    BodyTooLarge,
+    WorkerUnavailable,
 }
 
 #[derive(Default)]
@@ -278,13 +333,14 @@ impl AiPromptCompressor {
                     );
                 }
                 if tag.is_empty()
+                    || tag.len() > MAX_PRESERVE_TAG_NAME_BYTES
                     || !tag
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
                 {
                     return Err(
                         "ai_prompt_compressor: 'preserve_tag' must be a non-empty name of ASCII \
-                         letters, digits, '-', or '_'"
+                         letters, digits, '-', or '_', at most 64 bytes long"
                             .to_string(),
                     );
                 }
@@ -312,8 +368,9 @@ impl AiPromptCompressor {
             );
         }
 
+        let instance_id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
-            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            instance_id,
             compress_roles,
             compress_prompt_field,
             target_ratio,
@@ -321,61 +378,112 @@ impl AiPromptCompressor {
             max_scan_bytes,
             preserve_tags,
             request_family,
+            metadata_keys: Arc::new(CompressionMetadataKeys::new(instance_id)),
         })
     }
 
-    /// Parse, compress in place, and re-serialize `body`. Returns the new bytes
-    /// plus stats when compression actually reduced the token estimate, or
-    /// `None` when the body is not JSON, is over the size cap, or nothing was
-    /// compressed (so callers forward the original bytes untouched).
+    /// Parse, compress in place, and re-serialize `body`. With no preserve tag,
+    /// saturated or over-budget statistical work remains a passthrough. With a
+    /// preserve tag, admitted bodies use a separate bounded lane and fall back
+    /// to representation-preserving marker removal on every compression skip.
     async fn compress_body(
         &self,
         body: &[u8],
         request_path: Option<&str>,
-    ) -> Option<CompressionOutput> {
-        if body.len() > self.max_scan_bytes || body.len() > HARD_MAX_SCAN_BYTES {
-            return None;
+    ) -> Result<Option<CompressionOutput>, MarkerSanitizationError> {
+        if body.len() > HARD_MAX_SCAN_BYTES {
+            return if self.preserve_tags.is_some() {
+                Err(MarkerSanitizationError::BodyTooLarge)
+            } else {
+                Ok(None)
+            };
         }
 
-        // JSON parsing, token scoring, and serialization are CPU work. Keep
-        // them off Tokio request executors and admit a process-wide bounded
-        // number of jobs before cloning the already-buffered input.
-        let permit = Arc::clone(&COMPRESSION_BUDGET).try_acquire_owned().ok()?;
+        if self.preserve_tags.is_none() && body.len() > self.max_scan_bytes {
+            return Ok(None);
+        }
+
+        // Marker sanitation is a correctness boundary, so configured instances
+        // wait on a separate bounded worker lane instead of converting pressure
+        // into marker-bearing passthrough. Optional statistical work still uses
+        // non-waiting admission and falls back to sanitation-only output.
+        let marker_permit = if self.preserve_tags.is_some() {
+            Some(
+                Arc::clone(&MARKER_SANITIZATION_BUDGET)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| MarkerSanitizationError::WorkerUnavailable)?,
+            )
+        } else {
+            None
+        };
+        let compression_permit = if body.len() <= self.max_scan_bytes {
+            Arc::clone(&COMPRESSION_BUDGET).try_acquire_owned().ok()
+        } else {
+            None
+        };
+        if self.preserve_tags.is_none() && compression_permit.is_none() {
+            return Ok(None);
+        }
+
         let worker = self.clone();
         let body = body.to_vec();
         let request_path = request_path.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            worker.compress_body_blocking(&body, request_path.as_deref())
+            let _marker_permit = marker_permit;
+            let allow_compression = compression_permit.is_some();
+            let _compression_permit = compression_permit;
+            worker.compress_body_blocking(&body, request_path.as_deref(), allow_compression)
         })
         .await
-        .ok()
-        .flatten()
+        .map_err(|_| MarkerSanitizationError::WorkerUnavailable)
     }
 
     fn compress_body_blocking(
         &self,
         body: &[u8],
         request_path: Option<&str>,
+        allow_compression: bool,
     ) -> Option<CompressionOutput> {
         let mut json: Value = serde_json::from_slice(body).ok()?;
         let family = self.classify_request(&json, request_path)?;
-        self.measure_work(&json, family)?;
-        let stats = self.compress_json(&mut json, family)?;
-        if !stats.changed() {
-            return None;
+        let fallback = || {
+            self.preserve_tags
+                .as_ref()
+                .and_then(|tags| strip_markers_from_json_strings(body, tags))
+                .map(|output| CompressionOutput {
+                    source_sha256: Sha256::digest(body).into(),
+                    output,
+                    stats: None,
+                })
+        };
+
+        if !allow_compression || self.measure_work(&json, family).is_none() {
+            return fallback();
         }
-        let output_limit = self.max_scan_bytes.min(
-            body.len()
-                .saturating_add(MAX_JSON_OUTPUT_GROWTH_BYTES)
-                .min(HARD_MAX_SCAN_BYTES),
-        );
-        let mut writer = BoundedWriter::new(body.len().min(output_limit), output_limit);
-        serde_json::to_writer(&mut writer, &json).ok()?;
+        let Some(stats) = self.compress_json(&mut json, family) else {
+            return fallback();
+        };
+        if !stats.changed() {
+            return fallback();
+        }
+        // The input scan cap and output cap are deliberately distinct. Complete
+        // JSON reserialization may expand short exponent spellings in untouched
+        // fields; admit that growth up to the immutable 1 MiB body ceiling.
+        let mut writer = BoundedWriter::new(body.len(), HARD_MAX_SCAN_BYTES);
+        if serde_json::to_writer(&mut writer, &json).is_err() {
+            return fallback();
+        }
+        let serialized = writer.into_inner();
+        let output = self
+            .preserve_tags
+            .as_ref()
+            .and_then(|tags| strip_markers_from_json_strings(&serialized, tags))
+            .unwrap_or(serialized);
         Some(CompressionOutput {
             source_sha256: Sha256::digest(body).into(),
-            output: writer.into_inner(),
-            stats,
+            output,
+            stats: Some(stats),
         })
     }
 
@@ -402,15 +510,15 @@ impl AiPromptCompressor {
         content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
         request_path: Option<&str>,
-    ) -> Option<CompressionOutput> {
+    ) -> Result<Option<CompressionOutput>, MarkerSanitizationError> {
         // Require an explicit JSON content type; a missing Content-Type is
         // treated as ineligible so a JSON-looking body without the header is
         // never rewritten (matches `should_buffer_request_body`'s JSON gate).
         if !content_type.is_some_and(is_json_content_type) {
-            return None;
+            return Ok(None);
         }
         if has_non_identity_content_encoding(request_headers) {
-            return None;
+            return Ok(None);
         }
         self.compress_body(body, request_path).await
     }
@@ -551,22 +659,29 @@ impl AiPromptCompressor {
             Value::Array(parts) => {
                 for part in parts.iter_mut() {
                     match part {
-                        // Multimodal text part: {type: "text", text: "..."}.
-                        Value::Object(obj)
-                            if allow_multimodal
-                                && obj.get("type").and_then(Value::as_str) == Some("text") =>
-                        {
-                            if let Some(Value::String(text)) = obj.get_mut("text")
-                                && let Some((compressed, orig, comp)) = self.compress_text(text)?
-                            {
-                                *text = compressed;
-                                stats.original_tokens += orig;
-                                stats.compressed_tokens += comp;
-                                stats.fields_compressed += 1;
+                        Value::Object(obj) if allow_multimodal => {
+                            // Keep this shape validation identical to
+                            // `measure_content`: every multimodal part needs a
+                            // string type, and text parts need a string payload.
+                            let is_text = obj.get("type").and_then(Value::as_str).ok_or(())?
+                                == "text";
+                            if is_text {
+                                let text = obj
+                                    .get_mut("text")
+                                    .and_then(Value::as_str_mut)
+                                    .ok_or(())?;
+                                if let Some((compressed, orig, comp)) = self.compress_text(text)? {
+                                    *text = compressed;
+                                    stats.original_tokens += orig;
+                                    stats.compressed_tokens += comp;
+                                    stats.fields_compressed += 1;
+                                }
                             }
                         }
-                        // Plain string element (array-of-strings `prompt`).
-                        Value::String(text) => {
+                        // Plain string element (array-of-strings `prompt`). Chat
+                        // multimodal arrays reject this shape during measurement,
+                        // so keep the mutation walker structurally identical.
+                        Value::String(text) if !allow_multimodal => {
                             if let Some((compressed, orig, comp)) = self.compress_text(text)? {
                                 *text = compressed;
                                 stats.original_tokens += orig;
@@ -574,7 +689,6 @@ impl AiPromptCompressor {
                                 stats.fields_compressed += 1;
                             }
                         }
-                        _ if allow_multimodal => {}
                         _ => return Err(()),
                     }
                 }
@@ -805,8 +919,13 @@ fn account_text(
             .preserve_markers
             .checked_add(count_preserve_markers(text, tags, remaining)?)?;
     }
+    // Preserve markers can split what the whole-text lexer saw as one matched
+    // backtick span. Bound the conservative sum so segment-local token vectors
+    // cannot collectively exceed the advertised work ceiling even when each
+    // individual counter remains below it.
     let segmented_tokens = estimate
-        .emitted_tokens
+        .token_units
+        .checked_add(estimate.emitted_tokens)?
         .checked_add(estimate.preserve_markers)?;
     (estimate.token_units <= MAX_TOKEN_UNITS
         && segmented_tokens <= MAX_TOKEN_UNITS
@@ -904,6 +1023,120 @@ fn strip_all_markers(text: &str, open: &str, close: &str) -> String {
     out
 }
 
+/// Remove configured markers from JSON string literals without reserializing
+/// the surrounding value. The caller first validates and classifies the JSON,
+/// so this lexical pass can preserve whitespace, duplicate members, numeric
+/// spellings, and member order on sanitation-only fallbacks. Marker characters
+/// are recognized through ordinary JSON escapes too (`\u003c`, `\/`, and mixed
+/// literal/escaped spellings), matching the decoded strings a provider sees.
+fn strip_markers_from_json_strings(body: &[u8], tags: &(String, String)) -> Option<Vec<u8>> {
+    let (open, close) = tags;
+    let mut output = Vec::with_capacity(body.len());
+    let mut cursor = 0usize;
+    let mut in_string = false;
+    let mut changed = false;
+
+    while cursor < body.len() {
+        if !in_string {
+            let byte = body[cursor];
+            output.push(byte);
+            cursor += 1;
+            in_string = byte == b'"';
+            continue;
+        }
+
+        if body[cursor] == b'"' {
+            output.push(b'"');
+            cursor += 1;
+            in_string = false;
+            continue;
+        }
+
+        if let Some(end) = match_json_string_ascii(body, cursor, open.as_bytes())
+            .or_else(|| match_json_string_ascii(body, cursor, close.as_bytes()))
+        {
+            cursor = end;
+            changed = true;
+            continue;
+        }
+
+        let end = json_string_scalar_end(body, cursor)?;
+        output.extend_from_slice(&body[cursor..end]);
+        cursor = end;
+    }
+
+    (changed && !in_string).then_some(output)
+}
+
+fn match_json_string_ascii(body: &[u8], start: usize, expected: &[u8]) -> Option<usize> {
+    let mut cursor = start;
+    for expected_byte in expected {
+        let (decoded, end) = decode_json_string_ascii(body, cursor)?;
+        if decoded != Some(*expected_byte) {
+            return None;
+        }
+        cursor = end;
+    }
+    Some(cursor)
+}
+
+fn decode_json_string_ascii(body: &[u8], start: usize) -> Option<(Option<u8>, usize)> {
+    let byte = *body.get(start)?;
+    if byte != b'\\' {
+        let end = json_string_scalar_end(body, start)?;
+        return Some(((byte.is_ascii()).then_some(byte), end));
+    }
+
+    let escaped = *body.get(start + 1)?;
+    let decoded = match escaped {
+        b'"' => b'"',
+        b'\\' => b'\\',
+        b'/' => b'/',
+        b'b' => 0x08,
+        b'f' => 0x0c,
+        b'n' => b'\n',
+        b'r' => b'\r',
+        b't' => b'\t',
+        b'u' => {
+            let digits = body.get(start + 2..start + 6)?;
+            let scalar = digits.iter().try_fold(0u16, |value, byte| {
+                Some(value.checked_mul(16)?.checked_add(hex_digit(*byte)? as u16)?)
+            })?;
+            return Some(((scalar <= u8::MAX as u16).then_some(scalar as u8), start + 6));
+        }
+        _ => return None,
+    };
+    Some((Some(decoded), start + 2))
+}
+
+fn json_string_scalar_end(body: &[u8], start: usize) -> Option<usize> {
+    let byte = *body.get(start)?;
+    if byte == b'\\' {
+        return match body.get(start + 1) {
+            Some(b'u') if body.get(start + 2..start + 6).is_some() => Some(start + 6),
+            Some(_) => Some(start + 2),
+            None => None,
+        };
+    }
+    if byte < 0x20 || byte == b'"' {
+        return None;
+    }
+    if byte.is_ascii() {
+        return Some(start + 1);
+    }
+    let character = std::str::from_utf8(body.get(start..)?).ok()?.chars().next()?;
+    Some(start + character.len_utf8())
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn append_preserved_piece(out: &mut String, piece: &str, started: &mut bool) {
     if piece.is_empty() {
         return;
@@ -976,6 +1209,12 @@ impl Plugin for AiPromptCompressor {
         true
     }
 
+    fn request_body_buffer_limit(&self) -> Option<usize> {
+        // Marker sanitation is fail-closed at the immutable body ceiling even
+        // when the gateway-wide request limit is configured as unlimited.
+        self.preserve_tags.is_some().then_some(HARD_MAX_SCAN_BYTES)
+    }
+
     fn needs_final_request_body_context(&self) -> bool {
         // The context-aware transform owns method/path admission, staged-result
         // reuse, and final-wire statistics. Opt in even when no other active
@@ -992,10 +1231,11 @@ impl Plugin for AiPromptCompressor {
                 .get("content-type")
                 .is_some_and(|ct| is_json_content_type(ct))
             && !has_non_identity_content_encoding(&ctx.headers)
-            // A body already over the scan cap can never be compressed, so do
-            // not force buffering (and lose the streaming / direct-backend fast
-            // path) just to return it unchanged.
-            && !content_length_exceeds(&ctx.headers, self.max_scan_bytes)
+            // Preserve-marker sanitation remains active above the operator's
+            // statistical scan cap. Without a preserve tag, keep the existing
+            // streaming/direct-backend fast path for declared oversized bodies.
+            && (self.preserve_tags.is_some()
+                || !content_length_exceeds(&ctx.headers, self.max_scan_bytes))
     }
 
     async fn before_proxy(
@@ -1029,39 +1269,44 @@ impl Plugin for AiPromptCompressor {
         }
         let source_len = body.len();
 
-        if let Some(compression) = self
+        let compression = match self
             .compress_body(body.as_bytes(), self.classification_path(ctx))
             .await
         {
-            // Direct dispatchers consume the metadata representation and can
-            // await a provider without ever running body transforms. Retain a
-            // second representation only below a strict ceiling; larger bodies
-            // are recomputed for normal wire dispatch under the same work
-            // budget instead of remaining duplicated across provider latency.
-            let staged_output = (compression.output.len() <= MAX_STAGED_OUTPUT_BYTES)
-                .then(|| compression.output.clone());
-            let Ok(serialized) = String::from_utf8(compression.output) else {
-                return PluginResult::Continue;
-            };
-            ctx.metadata.insert("request_body".to_string(), serialized);
-            if let Some(output) = staged_output {
-                ctx.ai_prompt_compressor_staged.insert(
-                    self.instance_id,
-                    StagedCompression {
-                        source_len,
-                        source_sha256: compression.source_sha256,
-                        output,
-                        stats: compression.stats.clone(),
-                    },
-                );
-            } else {
-                ctx.ai_prompt_compressor_staged.remove(&self.instance_id);
-            }
-            record_stats_metadata(ctx, self.instance_id, &compression.stats);
+            Ok(Some(compression)) => compression,
+            Ok(None) => return PluginResult::Continue,
+            Err(error) => return marker_sanitization_reject(error),
+        };
+
+        // Direct dispatchers consume the metadata representation and can await
+        // a provider without ever running body transforms. Retain a second
+        // representation only below a strict ceiling; larger bodies are
+        // recomputed for normal wire dispatch under the same work budget.
+        let staged_output = (compression.output.len() <= MAX_STAGED_OUTPUT_BYTES)
+            .then(|| compression.output.clone());
+        let Ok(serialized) = String::from_utf8(compression.output) else {
+            return PluginResult::Continue;
+        };
+        ctx.metadata.insert("request_body".to_string(), serialized);
+        if let Some(output) = staged_output {
+            ctx.ai_prompt_compressor_staged.insert(
+                self.instance_id,
+                StagedCompression {
+                    source_len,
+                    source_sha256: compression.source_sha256,
+                    output,
+                    stats: compression.stats.clone(),
+                },
+            );
+        } else {
+            ctx.ai_prompt_compressor_staged.remove(&self.instance_id);
+        }
+        if let Some(stats) = compression.stats.as_ref() {
+            record_stats_metadata(ctx, &self.metadata_keys, stats);
             debug!(
-                original_tokens = compression.stats.original_tokens,
-                compressed_tokens = compression.stats.compressed_tokens,
-                fields = compression.stats.fields_compressed,
+                original_tokens = stats.original_tokens,
+                compressed_tokens = stats.compressed_tokens,
+                fields = stats.fields_compressed,
                 "ai_prompt_compressor: compressed request prompt"
             );
         }
@@ -1092,6 +1337,8 @@ impl Plugin for AiPromptCompressor {
             request_headers.get(":path").map(String::as_str),
         )
         .await
+        .ok()
+        .flatten()
         .map(|compression| compression.output)
     }
 
@@ -1108,7 +1355,7 @@ impl Plugin for AiPromptCompressor {
             return None;
         }
         begin_wire_stats(ctx);
-        clear_instance_stats(ctx, self.instance_id);
+        clear_instance_stats(ctx, &self.metadata_keys);
 
         if content_type.is_some_and(is_json_content_type)
             && !has_non_identity_content_encoding(request_headers)
@@ -1117,23 +1364,78 @@ impl Plugin for AiPromptCompressor {
             if body.len() == staged.source_len
                 && self.body_digest(body).await == Some(staged.source_sha256)
             {
-                record_stats_metadata(ctx, self.instance_id, &staged.stats);
+                if let Some(stats) = staged.stats.as_ref() {
+                    record_stats_metadata(ctx, &self.metadata_keys, stats);
+                }
                 return Some(staged.output);
             }
         } else {
             ctx.ai_prompt_compressor_staged.remove(&self.instance_id);
         }
 
-        let compression = self
+        let compression = match self
             .compress_wire_body(
                 body,
                 content_type,
                 request_headers,
                 self.classification_path(ctx),
             )
-            .await?;
-        record_stats_metadata(ctx, self.instance_id, &compression.stats);
+            .await
+        {
+            Ok(Some(compression)) => compression,
+            Ok(None) => return None,
+            Err(error) => {
+                ctx.ai_prompt_compressor_marker_reject_status =
+                    Some(marker_sanitization_status(error));
+                return None;
+            }
+        };
+        if let Some(stats) = compression.stats.as_ref() {
+            record_stats_metadata(ctx, &self.metadata_keys, stats);
+        }
         Some(compression.output)
+    }
+
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        let Some(status_code) = ctx.ai_prompt_compressor_marker_reject_status.take() else {
+            return PluginResult::Continue;
+        };
+        ctx.ai_prompt_compressor_staged.clear();
+        PluginResult::Reject {
+            status_code,
+            body: if status_code == 413 {
+                r#"{"error":"Request body exceeds AI prompt marker sanitation limit"}"#
+                    .to_string()
+            } else {
+                r#"{"error":"AI prompt marker sanitation unavailable"}"#.to_string()
+            },
+            headers: HashMap::new(),
+        }
+    }
+}
+
+fn marker_sanitization_status(error: MarkerSanitizationError) -> u16 {
+    match error {
+        MarkerSanitizationError::BodyTooLarge => 413,
+        MarkerSanitizationError::WorkerUnavailable => 503,
+    }
+}
+
+fn marker_sanitization_reject(error: MarkerSanitizationError) -> PluginResult {
+    let status_code = marker_sanitization_status(error);
+    PluginResult::Reject {
+        status_code,
+        body: if status_code == 413 {
+            r#"{"error":"Request body exceeds AI prompt marker sanitation limit"}"#.to_string()
+        } else {
+            r#"{"error":"AI prompt marker sanitation unavailable"}"#.to_string()
+        },
+        headers: HashMap::new(),
     }
 }
 
@@ -1141,27 +1443,32 @@ impl Plugin for AiPromptCompressor {
 /// flow to transaction summaries. Per-instance keys prevent multiple configured
 /// compressors from overwriting each other; the historical unsuffixed keys are
 /// the sum across active instances and are replacement-safe on retries.
-fn record_stats_metadata(ctx: &mut RequestContext, instance_id: u64, stats: &CompressionStats) {
-    let instance_prefix = format!("ai_prompt_compressor.instances.{instance_id}");
-    for (suffix, value) in [
-        ("original_tokens", stats.original_tokens),
-        ("compressed_tokens", stats.compressed_tokens),
-        (
-            "tokens_saved",
-            stats
-                .original_tokens
-                .saturating_sub(stats.compressed_tokens),
-        ),
-        ("fields_compressed", stats.fields_compressed),
-    ] {
-        let instance_key = format!("{instance_prefix}.{suffix}");
-        let previous = metadata_usize(&ctx.metadata, &instance_key);
-        let aggregate_key = format!("ai_prompt_compressor.{suffix}");
-        let aggregate = metadata_usize(&ctx.metadata, &aggregate_key)
+fn record_stats_metadata(
+    ctx: &mut RequestContext,
+    keys: &CompressionMetadataKeys,
+    stats: &CompressionStats,
+) {
+    let values = [
+        stats.original_tokens,
+        stats.compressed_tokens,
+        stats
+            .original_tokens
+            .saturating_sub(stats.compressed_tokens),
+        stats.fields_compressed,
+    ];
+    for ((instance_key, aggregate_key), value) in keys
+        .instance
+        .iter()
+        .zip(AGGREGATE_STAT_KEYS)
+        .zip(values)
+    {
+        let previous = metadata_usize(&ctx.metadata, instance_key);
+        let aggregate = metadata_usize(&ctx.metadata, aggregate_key)
             .saturating_sub(previous)
             .saturating_add(value);
-        ctx.metadata.insert(instance_key, value.to_string());
-        ctx.metadata.insert(aggregate_key, aggregate.to_string());
+        ctx.metadata.insert(instance_key.clone(), value.to_string());
+        ctx.metadata
+            .insert(aggregate_key.to_string(), aggregate.to_string());
     }
 }
 
@@ -1174,23 +1481,16 @@ fn begin_wire_stats(ctx: &mut RequestContext) {
     ctx.ai_prompt_compressor_wire_stats_started = true;
 }
 
-fn clear_instance_stats(ctx: &mut RequestContext, instance_id: u64) {
-    let instance_prefix = format!("ai_prompt_compressor.instances.{instance_id}");
-    for suffix in [
-        "original_tokens",
-        "compressed_tokens",
-        "tokens_saved",
-        "fields_compressed",
-    ] {
-        let instance_key = format!("{instance_prefix}.{suffix}");
-        let previous = metadata_usize(&ctx.metadata, &instance_key);
-        ctx.metadata.remove(&instance_key);
-        let aggregate_key = format!("ai_prompt_compressor.{suffix}");
-        let aggregate = metadata_usize(&ctx.metadata, &aggregate_key).saturating_sub(previous);
+fn clear_instance_stats(ctx: &mut RequestContext, keys: &CompressionMetadataKeys) {
+    for (instance_key, aggregate_key) in keys.instance.iter().zip(AGGREGATE_STAT_KEYS) {
+        let previous = metadata_usize(&ctx.metadata, instance_key);
+        ctx.metadata.remove(instance_key);
+        let aggregate = metadata_usize(&ctx.metadata, aggregate_key).saturating_sub(previous);
         if aggregate == 0 {
-            ctx.metadata.remove(&aggregate_key);
+            ctx.metadata.remove(aggregate_key);
         } else {
-            ctx.metadata.insert(aggregate_key, aggregate.to_string());
+            ctx.metadata
+                .insert(aggregate_key.to_string(), aggregate.to_string());
         }
     }
 }
