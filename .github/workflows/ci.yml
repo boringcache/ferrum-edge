@@ -318,6 +318,21 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Run disabled-provider fail-closed checks (default features)
+        # The all-features build above compiles out every
+        # `#[cfg(not(feature = "secrets-*"))]` test in cross_backend, which
+        # asserts that provider suffixes fail closed when their feature is not
+        # compiled in — the shipped `default = []` posture. Run cross_backend
+        # once more without cloud features so that coverage survives the
+        # matrix consolidation.
+        run: |
+          cargo nextest run \
+            --test secrets_functional \
+            --no-fail-fast \
+            cross_backend
+        env:
+          RUST_BACKTRACE: 1
+
   test-service-integration:
     name: Service Integration
     needs: ci-plan
@@ -766,15 +781,16 @@ jobs:
 
       - name: Run reqwest connect-timeout patch smoke regressions
         # Reuse the prebuilt integration suite instead of compiling the leaf
-        # crate again under the vendored-patch cache key.
+        # crate again under the vendored-patch cache key. The two names are
+        # ordinary nextest positional filters (substring match, same as the
+        # integration shard runner) — args after `--` would be forwarded to
+        # the test binaries instead of selecting tests.
         run: |
           archive_file="integration-tests-${RUNNER_OS}-${RUNNER_ARCH}.tar.zst"
           cargo nextest run \
             --archive-file "$archive_file" \
             --workspace-remap . \
             --no-fail-fast \
-            -- \
-            --exact \
             integration::connection_pool_tests::test_connect_timeout_does_not_fragment_pool \
             integration::connection_pool_tests::test_pooled_client_exposes_per_request_connect_timeout
 
