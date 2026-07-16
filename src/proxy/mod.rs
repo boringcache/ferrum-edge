@@ -13284,12 +13284,21 @@ async fn run_after_proxy_hooks_on_rejection(
                             })
                             .or_insert_with(|| "Origin".to_string());
                     }
-                    warn!(
-                        rejecting_plugin = plugin.name(),
-                        replacement_status = *status_code,
-                        replaced_status,
-                        "after_proxy plugin replaced an uncommitted rejection response"
-                    );
+                    if plugin.warn_on_rejection_response_replacement() {
+                        warn!(
+                            rejecting_plugin = plugin.name(),
+                            replacement_status = *status_code,
+                            replaced_status,
+                            "after_proxy plugin replaced an uncommitted rejection response"
+                        );
+                    } else {
+                        debug!(
+                            replacing_plugin = plugin.name(),
+                            replacement_status = *status_code,
+                            replaced_status,
+                            "after_proxy plugin normalized an uncommitted rejection response"
+                        );
+                    }
                     continue;
                 }
                 // The gateway is already committed to emitting this rejection

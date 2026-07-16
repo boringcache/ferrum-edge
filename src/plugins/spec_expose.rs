@@ -829,6 +829,10 @@ impl Plugin for SpecExpose {
     fn may_replace_rejection_response(&self) -> bool {
         true
     }
+
+    fn warn_on_rejection_response_replacement(&self) -> bool {
+        false
+    }
 }
 
 fn spec_response(entry: CachedSpec) -> PluginResult {
