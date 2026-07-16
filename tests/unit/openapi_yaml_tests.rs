@@ -2239,6 +2239,35 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
 }
 
 #[test]
+fn mtls_dns_admission_mutations_document_conflict_responses() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for pointer in [
+        "/paths/~1proxies/post/responses/409",
+        "/paths/~1proxies~1{id}/put/responses/409",
+        "/paths/~1proxies~1{id}/delete/responses/409",
+        "/paths/~1consumers/post/responses/409",
+        "/paths/~1consumers~1{id}/put/responses/409",
+        "/paths/~1consumers~1{id}/delete/responses/409",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/put/responses/409",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/post/responses/409",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/delete/responses/409",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}~1{index}/delete/responses/409",
+        "/paths/~1plugins~1config/post/responses/409",
+        "/paths/~1plugins~1config~1{id}/put/responses/409",
+        "/paths/~1plugins~1config~1{id}/delete/responses/409",
+        "/paths/~1api-specs/post/responses/409",
+        "/paths/~1api-specs~1{id}/put/responses/409",
+        "/paths/~1api-specs~1{id}/delete/responses/409",
+    ] {
+        assert!(
+            spec.pointer(pointer).is_some(),
+            "mTLS DNS admission mutation is missing 409 response: {pointer}"
+        );
+    }
+}
+
+#[test]
 fn oidc_relying_party_schema_matches_strict_runtime_surface() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

@@ -780,6 +780,23 @@ pub mod _test_support {
         )
     }
 
+    pub fn mongo_mtls_dns_admission_lock_filter(
+        namespace: &str,
+        owner: &str,
+    ) -> mongodb::bson::Document {
+        crate::config::mongo_store::MongoStore::mtls_dns_admission_lock_filter(namespace, owner)
+    }
+
+    pub fn mongo_mtls_dns_admission_lock_update(
+        owner: &str,
+        client_now_millis: i64,
+    ) -> mongodb::bson::Document {
+        crate::config::mongo_store::MongoStore::mtls_dns_admission_lock_update(
+            owner,
+            mongodb::bson::DateTime::from_millis(client_now_millis),
+        )
+    }
+
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
     }

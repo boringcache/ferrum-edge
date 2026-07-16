@@ -35,8 +35,8 @@ use crate::admin::backup::{
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
-    AtomicClearVerification, DatabaseBackend, NamespaceResourceCounts, SnapshotDataIntegrityError,
-    classify_atomic_clear_verification,
+    AtomicClearVerification, BatchConfigWriteMode, DatabaseBackend, NamespaceResourceCounts,
+    SnapshotDataIntegrityError, classify_atomic_clear_verification,
 };
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
@@ -3139,6 +3139,7 @@ async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
     halt_on_error: bool,
+    mode: BatchConfigWriteMode,
 ) -> (PersistCounts, Vec<String>) {
     let mut counts = PersistCounts::default();
     let mut errors = Vec::new();
@@ -3170,7 +3171,7 @@ async fn persist_payload_resources(
     }
     if should_continue(&errors) && !payload.plugin_configs.is_empty() {
         match db
-            .batch_create_plugin_configs(&payload.plugin_configs)
+            .batch_create_plugin_configs(&payload.plugin_configs, mode)
             .await
         {
             Ok(n) => counts.plugin_configs = n,
@@ -3179,7 +3180,7 @@ async fn persist_payload_resources(
     }
     if should_continue(&errors)
         && !payload.proxies.is_empty()
-        && let Err(e) = db.batch_attach_proxy_plugins(&payload.proxies).await
+        && let Err(e) = db.batch_attach_proxy_plugins(&payload.proxies, mode).await
     {
         errors.push(format!("proxy_plugins: {}", e));
     }
@@ -3199,7 +3200,13 @@ async fn rollback_failed_restore(
         )]);
     }
 
-    let (_, errors) = persist_payload_resources(db, snapshot, false).await;
+    let (_, errors) = persist_payload_resources(
+        db,
+        snapshot,
+        false,
+        BatchConfigWriteMode::RestoreRollbackReplay,
+    )
+    .await;
     if errors.is_empty() {
         Ok(())
     } else {
@@ -4584,7 +4591,13 @@ async fn handle_batch_create(
         ));
     }
 
-    let (created, errors) = persist_payload_resources(db.as_ref(), &batch, true).await;
+    let (created, errors) = persist_payload_resources(
+        db.as_ref(),
+        &batch,
+        true,
+        BatchConfigWriteMode::Admission,
+    )
+    .await;
 
     let mut response = json!({
         "created": {
@@ -5098,7 +5111,13 @@ async fn handle_restore(
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
-    let (created, errors) = persist_payload_resources(db.as_ref(), &payload, false).await;
+    let (created, errors) = persist_payload_resources(
+        db.as_ref(),
+        &payload,
+        false,
+        BatchConfigWriteMode::Admission,
+    )
+    .await;
 
     info!(
         "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",

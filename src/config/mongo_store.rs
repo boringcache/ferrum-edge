@@ -42,9 +42,10 @@
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
     use crate::config::db_backend::{
-        ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
-        IncrementalResult, MtlsDnsIdentityConflict, NamespaceResourceCounts, NamespacedResourceId,
-        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
+        ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
+        DeleteAllResourcesError, DeleteMode, IncrementalResult, MtlsDnsIdentityConflict,
+        NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR,
+        PaginatedResult, SnapshotDataIntegrityError, SortOrder,
     };
     use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
     use crate::config::types::{
@@ -95,6 +96,7 @@ mod inner {
         MONGO_MIGRATION_LEASE_DURATION.as_millis() as i64;
     const MONGO_MIGRATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
     const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+    const MONGO_ADMISSION_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
     const HMAC_SECRET_HASHES_FIELD: &str = "_ferrum_hmac_secret_hashes";
     // Dedicated migration-lease pool size. Lease upkeep only issues tiny
     // update_one/delete_one operations, so a couple of connections is ample
@@ -322,12 +324,12 @@ mod inner {
         _tls_temp_paths: Vec<tempfile::TempPath>,
     }
 
-    /// How a migration lease stamps its expiry/renewal timestamps.
+    /// How a renewable MongoDB migration lease stamps expiry timestamps.
     ///
     /// A lease picks its mode once, on the FIRST acquire attempt, and keeps it
     /// for its whole lifecycle so acquire, renew, and release stay consistent.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum MigrationLeaseMode {
+    enum RenewableLeaseMode {
         /// Real MongoDB. Acquire/renew via aggregation-pipeline updates that
         /// evaluate expiry and stamp timestamps from MongoDB SERVER time
         /// (`$$NOW`), so client clock skew can never stomp an active lease.
@@ -341,7 +343,17 @@ mod inner {
         ClientTimeClassic,
     }
 
-    struct MongoMigrationLease {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MongoLockMode {
+        RenewableLease(RenewableLeaseMode),
+        /// Security-sensitive admission mutex. It has no expiry and cannot be
+        /// taken from a paused owner: only that owner's explicit release
+        /// removes the document. A crashed owner therefore leaves a lock that
+        /// must be removed by an operator after verifying the process is gone.
+        UntilExplicitRelease,
+    }
+
+    struct MongoLockGuard {
         // Collection handle bound to the reusable DEDICATED lease client/pool,
         // deliberately separate from the store's work pool so acquire, renew,
         // release, and Drop cleanup cannot be starved by a long operation.
@@ -352,7 +364,7 @@ mod inner {
         // The update mode chosen at acquisition, carried so release/diagnostics
         // stay consistent with how acquire/renew stamped the lock. Release is a
         // mode-independent `delete_one` by `_id`+`owner`, so it needs no branch.
-        mode: MigrationLeaseMode,
+        mode: MongoLockMode,
         stop_tx: Option<tokio::sync::watch::Sender<bool>>,
         renew_task: Option<tokio::task::JoinHandle<()>>,
         valid: Arc<AtomicBool>,
@@ -363,7 +375,7 @@ mod inner {
         _connection: Arc<MongoConnectionBundle>,
     }
 
-    impl MongoMigrationLease {
+    impl MongoLockGuard {
         async fn release(&mut self) -> Result<(), anyhow::Error> {
             if let Some(stop_tx) = self.stop_tx.take() {
                 let _ = stop_tx.send(true);
@@ -407,7 +419,7 @@ mod inner {
         }
     }
 
-    impl Drop for MongoMigrationLease {
+    impl Drop for MongoLockGuard {
         fn drop(&mut self) {
             if self.released {
                 return;
@@ -1191,7 +1203,7 @@ mod inner {
         /// Stamps the new owner plus a client-clock expiry/renewal, and sets
         /// `created_at` only on insert. Client-time stamping carries the
         /// accepted clock-skew degradation documented on
-        /// [`MigrationLeaseMode::ClientTimeClassic`].
+        /// [`RenewableLeaseMode::ClientTimeClassic`].
         pub(crate) fn migration_lease_acquire_update_classic(
             owner: &str,
             client_now: BsonDateTime,
@@ -1219,8 +1231,42 @@ mod inner {
             }
         }
 
-        async fn acquire_migration_lease(&self) -> Result<MongoMigrationLease, anyhow::Error> {
-            self.acquire_named_lease(
+        /// Acquire filter for the non-expiring mTLS DNS admission mutex.
+        /// Deliberately absent: any expiry/takeover clause. A retry may match
+        /// its own owner after an uncertain response, but another owner can
+        /// only observe duplicate-key contention on the fixed namespace `_id`.
+        pub(crate) fn mtls_dns_admission_lock_filter(
+            namespace: &str,
+            owner: &str,
+        ) -> Document {
+            doc! {
+                "_id": namespace,
+                "$or": [
+                    { "owner": { "$exists": false } },
+                    { "owner": owner },
+                ],
+            }
+        }
+
+        /// Update for the non-expiring admission mutex. `$unset` removes any
+        /// accidentally supplied expiry so lock ownership can never transfer
+        /// merely because an admin process pauses.
+        pub(crate) fn mtls_dns_admission_lock_update(
+            owner: &str,
+            client_now: BsonDateTime,
+        ) -> Document {
+            doc! {
+                "$set": {
+                    "owner": owner,
+                    "updated_at": client_now,
+                },
+                "$unset": { "expires_at": "" },
+                "$setOnInsert": { "created_at": client_now },
+            }
+        }
+
+        async fn acquire_migration_lease(&self) -> Result<MongoLockGuard, anyhow::Error> {
+            self.acquire_renewable_lease(
                 "_ferrum_migration_locks",
                 MONGO_MIGRATION_LOCK_ID,
                 "migration",
@@ -1231,8 +1277,8 @@ mod inner {
         async fn acquire_mtls_dns_admission_lease(
             &self,
             namespace: &str,
-        ) -> Result<MongoMigrationLease, anyhow::Error> {
-            self.acquire_named_lease(
+        ) -> Result<MongoLockGuard, anyhow::Error> {
+            self.acquire_durable_admission_lock(
                 "mtls_dns_admission_locks",
                 namespace,
                 "mTLS DNS admission",
@@ -1243,7 +1289,7 @@ mod inner {
         async fn acquire_mtls_dns_admission_leases<'a>(
             &self,
             namespaces: impl IntoIterator<Item = &'a str>,
-        ) -> Result<Vec<MongoMigrationLease>, anyhow::Error> {
+        ) -> Result<Vec<MongoLockGuard>, anyhow::Error> {
             let mut namespaces: Vec<&str> = namespaces.into_iter().collect();
             namespaces.sort_unstable();
             namespaces.dedup();
@@ -1255,7 +1301,7 @@ mod inner {
         }
 
         async fn release_mtls_dns_admission_leases(
-            leases: &mut Vec<MongoMigrationLease>,
+            leases: &mut Vec<MongoLockGuard>,
         ) -> Result<(), anyhow::Error> {
             while let Some(mut lease) = leases.pop() {
                 lease.release().await?;
@@ -1280,12 +1326,80 @@ mod inner {
                 .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
         }
 
-        async fn acquire_named_lease(
+        async fn acquire_durable_admission_lock(
             &self,
             collection_name: &str,
             lock_id: &str,
             label: &'static str,
-        ) -> Result<MongoMigrationLease, anyhow::Error> {
+        ) -> Result<MongoLockGuard, anyhow::Error> {
+            // A TTL lease is not a write fence on standalone MongoDB: a paused
+            // process could resume after expiry and write concurrently with a
+            // successor. Admission therefore uses a durable mutex document
+            // that another process can never reclaim. This deliberately trades
+            // automatic crash recovery for fail-closed uniqueness. Acquisition
+            // is bounded so an orphan produces an actionable error instead of
+            // hanging an admin request forever.
+            let connection = self.connection();
+            let collection = connection
+                .lease_client
+                .database(connection.db.name())
+                .collection::<Document>(collection_name);
+            let owner = Uuid::new_v4().to_string();
+            let lock_id = lock_id.to_string();
+            let deadline = tokio::time::Instant::now() + MONGO_ADMISSION_LOCK_WAIT_TIMEOUT;
+
+            loop {
+                let client_now = BsonDateTime::now();
+                let result = collection
+                    .find_one_and_update(
+                        Self::mtls_dns_admission_lock_filter(&lock_id, &owner),
+                        Self::mtls_dns_admission_lock_update(&owner, client_now),
+                    )
+                    .upsert(true)
+                    .return_document(ReturnDocument::After)
+                    .await;
+
+                match result {
+                    Ok(Some(document))
+                        if document.get_str("owner").ok() == Some(owner.as_str()) =>
+                    {
+                        return Ok(MongoLockGuard {
+                            collection,
+                            lock_id,
+                            label,
+                            owner,
+                            mode: MongoLockMode::UntilExplicitRelease,
+                            stop_tx: None,
+                            renew_task: None,
+                            valid: Arc::new(AtomicBool::new(true)),
+                            released: false,
+                            _connection: connection,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) if is_duplicate_key(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
+
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "MongoDB {label} lock '{lock_id}' remained held for {} seconds; \
+                         admission locks do not expire because reclaiming one could permit a \
+                         stale writer, so verify the prior owner is stopped before removing the \
+                         lock document",
+                        MONGO_ADMISSION_LOCK_WAIT_TIMEOUT.as_secs()
+                    );
+                }
+                tokio::time::sleep(MONGO_MIGRATION_LEASE_RETRY_INTERVAL).await;
+            }
+        }
+
+        async fn acquire_renewable_lease(
+            &self,
+            collection_name: &str,
+            lock_id: &str,
+            label: &'static str,
+        ) -> Result<MongoLockGuard, anyhow::Error> {
             // Lease upkeep uses the connection bundle's reusable dedicated
             // pool. This isolates tiny acquire/renew/release commands from the
             // datastore work pool without constructing a new driver client for
@@ -1303,11 +1417,11 @@ mod inner {
             // probe the backend: if that pipeline update is rejected as
             // unsupported (AWS DocumentDB), switch to the classic client-time
             // mode for this lease's whole lifecycle and retry immediately.
-            let mut mode = MigrationLeaseMode::ServerTimePipeline;
+            let mut mode = RenewableLeaseMode::ServerTimePipeline;
             let mut first_attempt = true;
             loop {
                 let result = match mode {
-                    MigrationLeaseMode::ServerTimePipeline => {
+                    RenewableLeaseMode::ServerTimePipeline => {
                         collection
                             .find_one_and_update(
                                 doc! { "_id": &lock_id },
@@ -1317,7 +1431,7 @@ mod inner {
                             .return_document(ReturnDocument::After)
                             .await
                     }
-                    MigrationLeaseMode::ClientTimeClassic => {
+                    RenewableLeaseMode::ClientTimeClassic => {
                         let client_now = BsonDateTime::now();
                         collection
                             .find_one_and_update(
@@ -1354,7 +1468,7 @@ mod inner {
                     // unchanged, so this is a capability fallback, not backoff.
                     Err(error)
                         if was_first_attempt
-                            && mode == MigrationLeaseMode::ServerTimePipeline
+                            && mode == RenewableLeaseMode::ServerTimePipeline
                             && is_pipeline_update_unsupported(&error) =>
                     {
                         warn!(
@@ -1363,7 +1477,7 @@ mod inner {
                              client-time lease for this operation: {error}",
                             label
                         );
-                        mode = MigrationLeaseMode::ClientTimeClassic;
+                        mode = RenewableLeaseMode::ClientTimeClassic;
                         continue;
                     }
                     Err(error) => return Err(error.into()),
@@ -1399,7 +1513,7 @@ mod inner {
                             "owner": &renew_owner,
                         };
                         let renewal = match mode {
-                            MigrationLeaseMode::ServerTimePipeline => {
+                            RenewableLeaseMode::ServerTimePipeline => {
                                 renew_collection
                                     .update_one(
                                         renew_filter,
@@ -1407,7 +1521,7 @@ mod inner {
                                     )
                                     .await
                             }
-                            MigrationLeaseMode::ClientTimeClassic => {
+                            RenewableLeaseMode::ClientTimeClassic => {
                                 renew_collection
                                     .update_one(
                                         renew_filter,
@@ -1464,12 +1578,12 @@ mod inner {
                 }
             });
 
-            Ok(MongoMigrationLease {
+            Ok(MongoLockGuard {
                 collection,
                 lock_id,
                 label,
                 owner,
-                mode,
+                mode: MongoLockMode::RenewableLease(mode),
                 stop_tx: Some(stop_tx),
                 renew_task: Some(renew_task),
                 valid,
@@ -6514,6 +6628,7 @@ mod inner {
         async fn batch_attach_proxy_plugins(
             &self,
             _proxies: &[Proxy],
+            _mode: BatchConfigWriteMode,
         ) -> Result<(), anyhow::Error> {
             // No-op for MongoDB — plugins are embedded in the proxy document.
             // The SQL backend uses this to populate the proxy_plugins junction table.
@@ -6698,6 +6813,7 @@ mod inner {
         async fn batch_create_plugin_configs(
             &self,
             configs: &[PluginConfig],
+            mode: BatchConfigWriteMode,
         ) -> Result<usize, anyhow::Error> {
             if configs.is_empty() {
                 return Ok(0);
@@ -6707,20 +6823,22 @@ mod inner {
                     configs.iter().map(|config| config.namespace.as_str()),
                 )
                 .await?;
-            let namespaces: HashSet<&str> = configs
-                .iter()
-                .map(|config| config.namespace.as_str())
-                .collect();
-            for namespace in namespaces {
-                self.validate_mtls_dns_candidate(namespace, |candidate| {
-                    candidate.plugin_configs.extend(
-                        configs
-                            .iter()
-                            .filter(|config| config.namespace == namespace)
-                            .cloned(),
-                    );
-                })
-                .await?;
+            if mode.validates_mtls_dns() {
+                let namespaces: HashSet<&str> = configs
+                    .iter()
+                    .map(|config| config.namespace.as_str())
+                    .collect();
+                for namespace in namespaces {
+                    self.validate_mtls_dns_candidate(namespace, |candidate| {
+                        candidate.plugin_configs.extend(
+                            configs
+                                .iter()
+                                .filter(|config| config.namespace == namespace)
+                                .cloned(),
+                        );
+                    })
+                    .await?;
+                }
             }
             let docs: Vec<Document> = configs
                 .iter()

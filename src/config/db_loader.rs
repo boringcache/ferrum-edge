@@ -49,9 +49,10 @@ use tracing::{debug, error, info, warn};
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, NamespaceResourceCounts,
-    MtlsDnsIdentityConflict, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
-    SnapshotDataIntegrityError, SortOrder, extract_db_hostname, redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, IncrementalResult,
+    MtlsDnsIdentityConflict, NamespaceResourceCounts, NamespacedResourceId,
+    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
+    extract_db_hostname, redact_url,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5039,7 +5040,11 @@ impl DatabaseStore {
         Ok(count)
     }
 
-    pub async fn batch_attach_proxy_plugins(&self, proxies: &[Proxy]) -> Result<(), anyhow::Error> {
+    pub async fn batch_attach_proxy_plugins(
+        &self,
+        proxies: &[Proxy],
+        mode: BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         if proxies.is_empty() {
             return Ok(());
@@ -5100,9 +5105,11 @@ impl DatabaseStore {
                         .await?;
                 }
             }
-            for namespace in &admission_namespaces {
-                self.validate_mtls_dns_admission_tx(&mut tx, namespace)
-                    .await?;
+            if mode.validates_mtls_dns() {
+                for namespace in &admission_namespaces {
+                    self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                        .await?;
+                }
             }
             for namespace in &touched_namespaces {
                 self.compact_config_changes_tx(&mut tx, namespace).await?;
@@ -5197,6 +5204,7 @@ impl DatabaseStore {
     pub async fn batch_create_plugin_configs(
         &self,
         configs: &[PluginConfig],
+        mode: BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let start = Instant::now();
         if configs.is_empty() {
@@ -5204,7 +5212,9 @@ impl DatabaseStore {
         }
         let mut total = 0usize;
         for chunk in configs.chunks(Self::BATCH_CHUNK_SIZE) {
-            total += self.batch_create_plugin_configs_chunk(chunk).await?;
+            total += self
+                .batch_create_plugin_configs_chunk(chunk, mode)
+                .await?;
         }
         self.check_slow_query("batch_create_plugin_configs", start);
         Ok(total)
@@ -5214,6 +5224,7 @@ impl DatabaseStore {
     async fn batch_create_plugin_configs_chunk(
         &self,
         configs: &[PluginConfig],
+        mode: BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         let mut admission_namespaces: Vec<&str> = configs
@@ -5268,9 +5279,11 @@ impl DatabaseStore {
             touched_namespaces.insert(pc.namespace.clone());
         }
 
-        for namespace in &admission_namespaces {
-            self.validate_mtls_dns_admission_tx(&mut tx, namespace)
-                .await?;
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
         }
         for namespace in &touched_namespaces {
             self.compact_config_changes_tx(&mut tx, namespace).await?;
@@ -7867,8 +7880,12 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::batch_create_proxies_without_plugins(self, proxies).await
     }
 
-    async fn batch_attach_proxy_plugins(&self, proxies: &[Proxy]) -> Result<(), anyhow::Error> {
-        DatabaseStore::batch_attach_proxy_plugins(self, proxies).await
+    async fn batch_attach_proxy_plugins(
+        &self,
+        proxies: &[Proxy],
+        mode: BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::batch_attach_proxy_plugins(self, proxies, mode).await
     }
 
     async fn batch_create_consumers(&self, consumers: &[Consumer]) -> Result<usize, anyhow::Error> {
@@ -7878,8 +7895,9 @@ impl DatabaseBackend for DatabaseStore {
     async fn batch_create_plugin_configs(
         &self,
         configs: &[PluginConfig],
+        mode: BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error> {
-        DatabaseStore::batch_create_plugin_configs(self, configs).await
+        DatabaseStore::batch_create_plugin_configs(self, configs, mode).await
     }
 
     async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error> {

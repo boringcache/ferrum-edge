@@ -11,6 +11,7 @@
 use ferrum_edge::_test_support::{
     mongo_migration_lease_acquire_filter_classic, mongo_migration_lease_acquire_update_classic,
     mongo_migration_lease_duration_millis, mongo_migration_lease_renew_update_classic,
+    mongo_mtls_dns_admission_lock_filter, mongo_mtls_dns_admission_lock_update,
     mongo_pipeline_update_unsupported,
 };
 
@@ -66,6 +67,31 @@ fn pipeline_update_rejection_excludes_contention_connectivity_and_auth() {
 fn migration_lease_duration_is_120_seconds() {
     // The classic fallback must keep the same 120s lease window as the pipeline.
     assert_eq!(mongo_migration_lease_duration_millis(), 120_000);
+}
+
+#[test]
+fn mtls_dns_admission_lock_has_no_expiry_takeover_path() {
+    let filter = mongo_mtls_dns_admission_lock_filter("default", OWNER);
+    assert_eq!(filter.get_str("_id").unwrap(), "default");
+    assert!(
+        !filter.contains_key("expires_at") && !format!("{filter:?}").contains("expires_at"),
+        "admission lock filter must never admit an expired-owner takeover: {filter:?}"
+    );
+    let clauses = filter.get_array("$or").unwrap();
+    assert_eq!(clauses.len(), 2);
+    assert_eq!(
+        clauses[1].as_document().unwrap().get_str("owner").unwrap(),
+        OWNER
+    );
+
+    let update = mongo_mtls_dns_admission_lock_update(OWNER, NOW_MILLIS);
+    let set = update.get_document("$set").unwrap();
+    assert_eq!(set.get_str("owner").unwrap(), OWNER);
+    assert!(set.get("expires_at").is_none());
+    assert!(
+        update.get_document("$unset").unwrap().contains_key("expires_at"),
+        "admission lock must erase any expiry field: {update:?}"
+    );
 }
 
 #[test]

@@ -3431,7 +3431,7 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnly"
         "409":
-          description: Conflict — `listen_path` already exists, or stream proxy `listen_port` conflicts with another proxy, a gateway reserved port, or is not available on the host
+          description: Conflict — `listen_path` already exists, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -3497,7 +3497,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: Conflict — `listen_path` already exists on another proxy, or stream proxy `listen_port` conflicts with another proxy, a gateway reserved port, or is not available on the host
+          description: Conflict — `listen_path` already exists on another proxy, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -3518,6 +3518,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3587,6 +3589,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -3649,6 +3653,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -3667,6 +3673,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3787,6 +3795,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3835,6 +3845,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -4007,6 +4019,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -4063,6 +4077,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -4079,6 +4095,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -4510,7 +4528,7 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnly"
         "409":
-          description: A spec already exists for this proxy ID, or a resource name / listen_path conflicts
+          description: A spec already exists for this proxy ID, a resource name / listen_path conflicts, or the embedded plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -4736,7 +4754,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle
+          description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle, or the replacement would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -4807,6 +4825,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -5038,7 +5058,7 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Conflict:
-      description: Resource already exists or conflicts with an existing resource
+      description: Resource already exists, conflicts with an existing resource, or the mutation would make mTLS DNS identities ambiguous
       content:
         application/json:
           schema:

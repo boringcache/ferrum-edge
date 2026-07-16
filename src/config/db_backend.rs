@@ -14,6 +14,24 @@ use std::collections::HashSet;
 pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
     "A proxy with overlapping hosts and listen_path already exists";
 
+/// Whether restore-oriented plugin batches run normal mTLS DNS admission.
+///
+/// `RestoreRollbackReplay` is intentionally narrow: it may only replay the
+/// exact raw snapshot captured immediately before a destructive restore. That
+/// snapshot can contain a pre-existing ambiguity the normal runtime rejects,
+/// so validating it during rollback could destroy the operator's prior state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchConfigWriteMode {
+    Admission,
+    RestoreRollbackReplay,
+}
+
+impl BatchConfigWriteMode {
+    pub(crate) fn validates_mtls_dns(self) -> bool {
+        self == Self::Admission
+    }
+}
+
 /// A datastore-serialized candidate would make an effective `mtls_auth`
 /// `san_dns` policy ambiguous under ASCII case folding.
 ///
@@ -709,11 +727,16 @@ pub trait DatabaseBackend: Send + Sync {
         &self,
         proxies: &[Proxy],
     ) -> Result<usize, anyhow::Error>;
-    async fn batch_attach_proxy_plugins(&self, proxies: &[Proxy]) -> Result<(), anyhow::Error>;
+    async fn batch_attach_proxy_plugins(
+        &self,
+        proxies: &[Proxy],
+        mode: BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error>;
     async fn batch_create_consumers(&self, consumers: &[Consumer]) -> Result<usize, anyhow::Error>;
     async fn batch_create_plugin_configs(
         &self,
         configs: &[PluginConfig],
+        mode: BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error>;
     async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error>;
     /// Clear all resources in a namespace and report the mode that actually ran.
