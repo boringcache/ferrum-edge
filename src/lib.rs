@@ -307,6 +307,46 @@ pub mod _test_support {
     }
 
     // ── plugins/request_deduplication ─────────────────────────────────────────
+    pub fn request_deduplication_with_instance_id_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        instance_id: &str,
+    ) -> Result<crate::plugins::request_deduplication::RequestDeduplication, String> {
+        crate::plugins::request_deduplication::RequestDeduplication::new_with_instance_id(
+            config,
+            http_client,
+            instance_id,
+        )
+    }
+
+    pub async fn finalize_plugin_rejection_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        rejection: crate::plugins::PluginResult,
+    ) -> crate::plugins::PluginResult {
+        let Some(parts) = crate::proxy::plugin_result_into_reject_parts(rejection) else {
+            return crate::plugins::PluginResult::Continue;
+        };
+        let mut status = parts.status_code;
+        let mut headers = parts.headers;
+        let mut body = parts.body;
+        crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+            plugins,
+            ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+        crate::plugins::PluginResult::RejectBinary {
+            status_code: status,
+            body: bytes::Bytes::from(body),
+            headers,
+        }
+    }
+
     pub fn request_deduplication_redis_cached_response_payload_is_valid(data: &[u8]) -> bool {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)
     }

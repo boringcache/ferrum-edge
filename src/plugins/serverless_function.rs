@@ -753,6 +753,19 @@ impl ServerlessFunction {
             }
         }
     }
+
+    fn pre_invocation_failure_result(
+        &self,
+        ctx: &mut RequestContext,
+        failure: InvocationFailure,
+    ) -> PluginResult {
+        let result = self.failure_result(ctx, failure);
+        if !matches!(&result, PluginResult::Continue) {
+            ctx.serverless_pre_invocation_rejection_owners
+                .extend(ctx.request_deduplication_states.keys().copied());
+        }
+        result
+    }
 }
 
 fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
@@ -1083,6 +1096,17 @@ impl FunctionDestination {
                 .any(|value| value == port.as_str())
         });
         if exposes_host_scalar || exposes_port_scalar {
+            return true;
+        }
+
+        // A protected query component can itself be a syntactically valid URI
+        // scheme. URL parsing normalizes schemes to ASCII lowercase, so compare
+        // exact components case-insensitively instead of allowing a function to
+        // echo a signed scalar as `secret://attacker.example`.
+        if self
+            .sensitive_query_scalars()
+            .any(|value| value.eq_ignore_ascii_case(candidate.scheme()))
+        {
             return true;
         }
 
@@ -1951,6 +1975,8 @@ impl Plugin for ServerlessFunction {
                     "serverless_function: terminate mode is not supported for gRPC requests — \
                      the gateway normalizes plugin rejects into trailers-only gRPC errors"
                 );
+                ctx.serverless_pre_invocation_rejection_owners
+                    .extend(ctx.request_deduplication_states.keys().copied());
                 return PluginResult::Reject {
                     status_code: 500,
                     body: r#"{"error":"serverless_function terminate mode is not supported for gRPC"}"#.to_string(),
@@ -1961,7 +1987,7 @@ impl Plugin for ServerlessFunction {
 
         let payload = match self.build_invocation_payload(ctx, headers) {
             Ok(payload) => payload,
-            Err(failure) => return self.failure_result(ctx, failure),
+            Err(failure) => return self.pre_invocation_failure_result(ctx, failure),
         };
 
         if self.mode == InvocationMode::Terminate {

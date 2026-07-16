@@ -13557,7 +13557,9 @@ async fn apply_synthetic_response_body_hooks(
 
     let content_type = response_headers.get("content-type").cloned();
     let ct_ref = content_type.as_deref();
-    if crate::plugins::response_body_rewrite_allowed(*response_status) {
+    if !ctx.deduplication_replay_response_finalized
+        && crate::plugins::response_body_rewrite_allowed(*response_status)
+    {
         for plugin in plugins.iter() {
             if let Some(transformed) = plugin
                 .transform_response_body_with_context(ctx, response_body, ct_ref, response_headers)

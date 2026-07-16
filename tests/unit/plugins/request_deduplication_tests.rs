@@ -1,10 +1,13 @@
+use async_trait::async_trait;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
+    finalize_plugin_rejection_for_test,
     request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
     request_deduplication_redis_payload_for_test, request_deduplication_request_identity_for_test,
+    request_deduplication_with_instance_id_for_test,
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
@@ -16,6 +19,54 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Barrier;
+
+struct AppendingResponseTransform;
+
+#[async_trait]
+impl Plugin for AppendingResponseTransform {
+    fn name(&self) -> &str {
+        "appending_response_transform"
+    }
+
+    fn priority(&self) -> u16 {
+        4000
+    }
+
+    fn supported_protocols(&self) -> &'static [ferrum_edge::plugins::ProxyProtocol] {
+        HTTP_ONLY_PROTOCOLS
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn on_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        ctx.metadata
+            .insert("test:replay-inspected".to_string(), "true".to_string());
+        PluginResult::Continue
+    }
+
+    async fn transform_response_body(
+        &self,
+        body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        let mut transformed = body.to_vec();
+        transformed.extend_from_slice(b"|transformed");
+        Some(transformed)
+    }
+}
 
 fn make_plugin(config: serde_json::Value) -> RequestDeduplication {
     RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap()
@@ -364,6 +415,72 @@ async fn test_first_request_passes_then_replay() {
     }
 }
 
+#[tokio::test]
+async fn committed_replay_skips_second_response_body_transform() {
+    let dedup = make_plugin(json!({}));
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "finalized".to_string())]);
+    assert!(matches!(
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(
+                &mut first_ctx,
+                200,
+                &HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+                b"presented-once",
+            )
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut replay_headers =
+        HashMap::from([("idempotency-key".to_string(), "finalized".to_string())]);
+    let replay = dedup.before_proxy(&mut replay_ctx, &mut replay_headers).await;
+    let transforms: Vec<Arc<dyn Plugin>> = vec![Arc::new(AppendingResponseTransform)];
+    match finalize_plugin_rejection_for_test(&transforms, &mut replay_ctx, replay).await {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"presented-once"),
+        other => panic!("expected finalized replay, got {other:?}"),
+    }
+    assert_eq!(
+        replay_ctx
+            .metadata
+            .get("test:replay-inspected")
+            .map(String::as_str),
+        Some("true"),
+        "finalized replays must still run response inspection"
+    );
+
+    let mut ordinary_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let ordinary = PluginResult::RejectBinary {
+        status_code: 200,
+        body: Bytes::from_static(b"presented-once"),
+        headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+    };
+    match finalize_plugin_rejection_for_test(&transforms, &mut ordinary_ctx, ordinary).await {
+        PluginResult::RejectBinary { body, .. } => {
+            assert_eq!(&body[..], b"presented-once|transformed")
+        }
+        other => panic!("expected ordinary transformed response, got {other:?}"),
+    }
+}
+
 // Marker set by the proxy on `ctx.metadata` while the response-body hooks run
 // over a synthetic 2xx plugin short-circuit body (mirrors
 // `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
@@ -607,6 +724,130 @@ async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
         }
     }
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_serverless_ambiguous_query_releases_every_dedup_owner() {
+    let first = make_plugin(json!({}));
+    let second = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://function.example/invoke",
+            "mode": "terminate",
+            "forward_query_params": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.set_raw_query_string("role=user&role=admin".to_string());
+    let mut headers =
+        HashMap::from([("idempotency-key".to_string(), "correctable".to_string())]);
+    for dedup in [&first, &second] {
+        assert!(matches!(
+            dedup.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("ambiguous query must reject before invocation, got {other:?}"),
+        };
+    assert!(body.contains("duplicate_query_parameter"));
+    for dedup in [&first, &second] {
+        dedup
+            .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+            .await;
+    }
+
+    for dedup in [&first, &second] {
+        let mut retry_ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        retry_ctx.set_raw_query_string("role=user&role=admin".to_string());
+        let mut retry_headers =
+            HashMap::from([("idempotency-key".to_string(), "correctable".to_string())]);
+        assert!(matches!(
+            dedup
+                .before_proxy(&mut retry_ctx, &mut retry_headers)
+                .await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+#[tokio::test]
+async fn terminal_serverless_encoded_body_releases_dedup_owner() {
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://function.example/invoke",
+            "mode": "terminate",
+            "forward_body": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let compressed = gzip_body(b"opaque");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&compressed));
+    let mut headers = HashMap::from([
+        ("idempotency-key".to_string(), "encoded".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+        ("content-length".to_string(), compressed.len().to_string()),
+    ]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("encoded body must reject before invocation, got {other:?}"),
+        };
+    assert!(body.contains("encoded_request_body_unsupported"));
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
+        .await;
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    retry_ctx.request_body_bytes = Some(Bytes::from(compressed.clone()));
+    let mut retry_headers = HashMap::from([
+        ("idempotency-key".to_string(), "encoded".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+        ("content-length".to_string(), compressed.len().to_string()),
+    ]);
+    assert!(matches!(
+        dedup
+            .before_proxy(&mut retry_ctx, &mut retry_headers)
+            .await,
+        PluginResult::Continue
+    ));
 }
 
 #[tokio::test]
@@ -2745,7 +2986,7 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
     assert!(matches!(result, PluginResult::Continue));
 
     let (logical_key, fingerprint) = request_identity(&plugin, &ctx).unwrap();
-    assert!(logical_key.starts_with("v2:"));
+    assert!(logical_key.starts_with("v3:"));
     assert!(fingerprint.starts_with("sha256-"));
     for secret in [
         "super-secret-body",
@@ -2757,6 +2998,53 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
         assert!(!logical_key.contains(secret));
         assert!(!fingerprint.contains(secret));
     }
+}
+
+#[tokio::test]
+async fn stable_plugin_config_identity_partitions_distributed_logical_keys() {
+    let config = json!({});
+    let first_gateway = request_deduplication_with_instance_id_for_test(
+        &config,
+        PluginHttpClient::default(),
+        "dedup-primary",
+    )
+    .unwrap();
+    let second_gateway = request_deduplication_with_instance_id_for_test(
+        &config,
+        PluginHttpClient::default(),
+        "dedup-primary",
+    )
+    .unwrap();
+    let sibling_instance = request_deduplication_with_instance_id_for_test(
+        &config,
+        PluginHttpClient::default(),
+        "dedup-secondary",
+    )
+    .unwrap();
+
+    let mut identities = Vec::new();
+    for plugin in [&first_gateway, &second_gateway, &sibling_instance] {
+        let mut ctx = body_ctx("POST", "/api/orders", b"{}");
+        let mut headers = keyed_headers("shared-key", "api.example", 2);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        identities.push(request_identity(plugin, &ctx).unwrap());
+    }
+
+    assert_eq!(
+        identities[0], identities[1],
+        "the same plugin_config_id must share Redis identity across gateways"
+    );
+    assert_ne!(
+        identities[0].0, identities[2].0,
+        "sibling plugin instances must not share completed or in-flight Redis keys"
+    );
+    assert_eq!(
+        identities[0].1, identities[2].1,
+        "plugin instance partitioning must not alter request fingerprints"
+    );
 }
 
 #[tokio::test]

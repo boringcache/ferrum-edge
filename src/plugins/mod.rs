@@ -925,6 +925,17 @@ pub struct RequestContext {
     /// bounded by the configured deduplication instances on the matched proxy.
     pub(crate) request_deduplication_states:
         HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
+    /// Whether `request_deduplication` supplied an already-finalized committed
+    /// representation for this request. The shared synthetic rejection path
+    /// must not run presentation transforms over it again. Inspection and
+    /// final-body validation still run over the replayed client representation.
+    /// Kept private so request metadata cannot suppress response inspection.
+    pub(crate) deduplication_replay_response_finalized: bool,
+    /// Deduplication instances whose in-flight ownership can be released after
+    /// a serverless rejection proven to occur before external invocation. Each
+    /// committed hook consumes only its own entry, preserving exactly-once
+    /// cleanup without weakening uncertain-side-effect retention.
+    pub(crate) serverless_pre_invocation_rejection_owners: HashSet<u64>,
     /// Deduplication instances that own protection for a terminal serverless
     /// invocation. Each committed/stream-terminal hook consumes or observes
     /// only its own entry, so one instance cannot publish into another cache or
@@ -1290,6 +1301,8 @@ impl RequestContext {
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
+            deduplication_replay_response_finalized: false,
+            serverless_pre_invocation_rejection_owners: HashSet::new(),
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
             serverless_owned_dedup_publication: None,
@@ -1483,6 +1496,10 @@ impl RequestContext {
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             request_deduplication_states: self.request_deduplication_states.clone(),
+            deduplication_replay_response_finalized: self.deduplication_replay_response_finalized,
+            serverless_pre_invocation_rejection_owners: self
+                .serverless_pre_invocation_rejection_owners
+                .clone(),
             serverless_external_side_effect_owners: self
                 .serverless_external_side_effect_owners
                 .clone(),

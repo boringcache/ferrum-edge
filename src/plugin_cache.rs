@@ -807,6 +807,13 @@ fn try_create_plugin(
             &pc.id,
         )
         .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
+    } else if pc.plugin_name == "request_deduplication" {
+        crate::plugins::request_deduplication::RequestDeduplication::new_with_instance_id(
+            &pc.config,
+            http_client.clone(),
+            &pc.id,
+        )
+        .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else {
         create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone())
     };

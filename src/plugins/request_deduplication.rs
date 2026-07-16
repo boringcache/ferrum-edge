@@ -53,9 +53,10 @@ const CLEANUP_INTERVAL_SECS: u64 = 30;
 /// run.
 const CLEANUP_NEVER: u64 = u64::MAX;
 
-const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v2";
+const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v3";
 const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
 const REDIS_INFLIGHT_KEY_COMPONENT: &str = "inflight";
+const DEFAULT_INSTANCE_ID: &str = "standalone";
 const DEFAULT_MAX_ENTRY_SIZE_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_CANONICAL_DECODED_BODY_BYTES: usize = 1024 * 1024;
@@ -259,6 +260,10 @@ static NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 pub struct RequestDeduplication {
     /// Process-unique ownership key for request-private completion state.
     instance_id: u64,
+    /// Stable plugin-config identity shared by the same configured instance on
+    /// every gateway. Included in logical keys so multiple Redis-backed
+    /// instances cannot contend in one another's distributed key space.
+    config_id: String,
     /// Header name to read the idempotency key from.
     header_name: String,
     /// Time-to-live for cached responses.
@@ -304,6 +309,14 @@ pub struct RequestDeduplication {
 
 impl RequestDeduplication {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_instance_id(config, http_client, DEFAULT_INSTANCE_ID)
+    }
+
+    pub(crate) fn new_with_instance_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
         if !config.is_object() {
             return Err("request_deduplication: config must be an object".to_string());
         }
@@ -347,6 +360,7 @@ impl RequestDeduplication {
 
         Ok(Self {
             instance_id: NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            config_id: config_id.to_string(),
             header_name,
             ttl,
             inflight_ttl,
@@ -472,6 +486,7 @@ impl RequestDeduplication {
 
         let mut hasher = Sha256::new();
         hash_framed(&mut hasher, "version", DEDUP_LOGICAL_KEY_VERSION.as_bytes());
+        hash_framed(&mut hasher, "plugin_config_id", self.config_id.as_bytes());
         hash_framed(&mut hasher, "proxy_id", proxy_id.as_bytes());
         if self.scope_by_consumer
             && let Some(identity) = ctx.effective_identity()
@@ -488,9 +503,23 @@ impl RequestDeduplication {
         hash_framed(&mut hasher, "idempotency_key", idempotency_value.as_bytes());
 
         let mut key = String::with_capacity(67);
-        key.push_str("v2:");
+        key.push_str("v3:");
         key.push_str(&hex::encode(hasher.finalize()));
         key
+    }
+
+    fn replay_response(&self, ctx: &mut RequestContext, cached: &CachedResponse) -> PluginResult {
+        // Stored bytes have already passed the final response-body lifecycle.
+        // Suppress only that lifecycle on this synthetic replay; ordinary
+        // rejection header hooks still run and cache headers are re-sanitized.
+        ctx.deduplication_replay_response_finalized = true;
+        let mut response_headers = sanitize_cached_headers(&cached.headers);
+        response_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
+        PluginResult::RejectBinary {
+            status_code: cached.status_code,
+            body: cached.body.clone(),
+            headers: response_headers,
+        }
     }
 
     fn build_request_fingerprint(
@@ -1781,14 +1810,7 @@ impl Plugin for RequestDeduplication {
                     // already strips. A stored entry written before this fix landed,
                     // or by a peer running an older binary against a shared Redis,
                     // could still carry session-bearing headers.
-                    let mut response_headers = sanitize_cached_headers(&cached.headers);
-                    response_headers
-                        .insert("x-idempotent-replayed".to_string(), "true".to_string());
-                    return PluginResult::RejectBinary {
-                        status_code: cached.status_code,
-                        body: cached.body.clone(),
-                        headers: response_headers,
-                    };
+                    return self.replay_response(ctx, &cached);
                 }
                 RedisDeduplicationAction::Conflict => {
                     return PluginResult::Reject {
@@ -1807,14 +1829,7 @@ impl Plugin for RequestDeduplication {
                         RedisDeduplicationAction::Replay(cached) => {
                             self.redis_release_inflight(&key, &fingerprint, &token)
                                 .await;
-                            let mut response_headers = sanitize_cached_headers(&cached.headers);
-                            response_headers
-                                .insert("x-idempotent-replayed".to_string(), "true".to_string());
-                            return PluginResult::RejectBinary {
-                                status_code: cached.status_code,
-                                body: cached.body.clone(),
-                                headers: response_headers,
-                            };
+                            return self.replay_response(ctx, &cached);
                         }
                         RedisDeduplicationAction::Conflict => {
                             self.redis_release_inflight(&key, &fingerprint, &token)
@@ -1843,14 +1858,7 @@ impl Plugin for RequestDeduplication {
                     if let Some(cached) =
                         self.matching_local_completed(&key, &fingerprint, Instant::now())
                     {
-                        let mut response_headers = sanitize_cached_headers(&cached.headers);
-                        response_headers
-                            .insert("x-idempotent-replayed".to_string(), "true".to_string());
-                        return PluginResult::RejectBinary {
-                            status_code: cached.status_code,
-                            body: cached.body.clone(),
-                            headers: response_headers,
-                        };
+                        return self.replay_response(ctx, &cached);
                     }
                     return PluginResult::Reject {
                         status_code: 409,
@@ -1891,13 +1899,7 @@ impl Plugin for RequestDeduplication {
                 // already strips. Cheap (single HashMap pass) and protects
                 // against any future code path that populates the cache without
                 // going through `on_final_response_body`.
-                let mut response_headers = sanitize_cached_headers(&cached.headers);
-                response_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
-                return PluginResult::RejectBinary {
-                    status_code: cached.status_code,
-                    body: cached.body.clone(),
-                    headers: response_headers,
-                };
+                return self.replay_response(ctx, &cached);
             }
             LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight) => {
                 if let Some(token) = redis_lock_token.as_deref() {
@@ -2209,6 +2211,25 @@ impl Plugin for RequestDeduplication {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) {
+        if ctx
+            .serverless_pre_invocation_rejection_owners
+            .remove(&self.instance_id)
+        {
+            let Some(state) = ctx.request_deduplication_states.remove(&self.instance_id) else {
+                return;
+            };
+            self.remove_matching_local_inflight(
+                &state.key,
+                &state.fingerprint,
+                &state.local_inflight_owner_token,
+            );
+            if let Some(token) = state.redis_lock_token.as_deref() {
+                self.redis_release_inflight(&state.key, &state.fingerprint, token)
+                    .await;
+            }
+            return;
+        }
+
         if !ctx
             .serverless_external_side_effect_owners
             .remove(&self.instance_id)

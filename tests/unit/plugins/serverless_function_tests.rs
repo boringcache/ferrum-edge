@@ -1324,6 +1324,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "authority-query-port",
         "authority-query-default-https-port",
         "authority-query-default-network-port",
+        "query-value-scheme",
+        "query-key-scheme",
         "literal-plus-encoded-candidate",
         "encoded-plus-literal-candidate",
         "fragment-query-scalar",
@@ -1348,6 +1350,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-authority-substring",
         "benign-nested-path-after-base-directory",
         "benign-authority-default-port-lookalike",
+        "benign-scheme-lookalike",
         "benign-plus-space-distinct",
         "benign-fragment-lookalike",
         "benign-fragment-label",
@@ -1419,6 +1422,12 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "authority-query-default-network-port" => {
                 format!("{}/signed%2Ftrigger?code=80", server.uri())
+            }
+            "query-value-scheme" | "benign-scheme-lookalike" => {
+                format!("{}/signed%2Ftrigger?code=secret", server.uri())
+            }
+            "query-key-scheme" => {
+                format!("{}/signed%2Ftrigger?secret=1", server.uri())
             }
             "nested-path-after-base-directory" | "benign-nested-path-after-base-directory" => {
                 format!("{}/api/signed?code=secret", server.uri())
@@ -1529,6 +1538,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "authority-query-port" => "https://attacker.example:18443/next".to_string(),
             "authority-query-default-https-port" => "https://attacker.example:443/next".to_string(),
             "authority-query-default-network-port" => "//attacker.example:80/next".to_string(),
+            "query-value-scheme" | "query-key-scheme" => {
+                "SeCrEt://attacker.example/next".to_string()
+            }
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }
@@ -1586,6 +1598,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "benign-authority-default-port-lookalike" => {
                 "https://attacker.example:8443/next".to_string()
             }
+            "benign-scheme-lookalike" => "secrets://attacker.example/next".to_string(),
             "benign-plus-space-distinct" => {
                 "https://redirect.example/next?leak=token+part".to_string()
             }
