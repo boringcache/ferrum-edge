@@ -4302,7 +4302,10 @@ async fn handle_batch_create(
         .await
         {
             Ok(()) => {}
-            Err(crud::AfterValidateError::BadRequest(errors)) => {
+            Err(
+                crud::AfterValidateError::BadRequest(errors)
+                | crud::AfterValidateError::Conflict(errors),
+            ) => {
                 validation_errors.extend(errors);
             }
             Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
@@ -4923,7 +4926,10 @@ async fn handle_restore(
         }
         match crud::validate_hmac_request_transform_restore_candidate(state, &temp_config) {
             Ok(()) => {}
-            Err(crud::AfterValidateError::BadRequest(errors)) => {
+            Err(
+                crud::AfterValidateError::BadRequest(errors)
+                | crud::AfterValidateError::Conflict(errors),
+            ) => {
                 validation_errors.extend(errors);
             }
             Err(crud::AfterValidateError::Db(error)) => {

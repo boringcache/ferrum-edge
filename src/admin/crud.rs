@@ -55,6 +55,7 @@ pub(crate) enum WriteAction<'a> {
 
 pub(crate) enum AfterValidateError {
     BadRequest(Vec<String>),
+    Conflict(Vec<String>),
     Db(anyhow::Error),
     Response(Box<Response<Full<Bytes>>>),
 }
@@ -159,18 +160,16 @@ async fn validate_mtls_auth_candidate(
     {
         return Ok(());
     }
-    let mut errors = config
+    let compatibility_errors = config
         .validate_mtls_auth_compatibility()
         .err()
         .unwrap_or_default();
-    if let Err(credential_errors) = config.validate_unique_mtls_credentials() {
-        errors.extend(credential_errors);
+    if !compatibility_errors.is_empty() {
+        return Err(AfterValidateError::BadRequest(compatibility_errors));
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(AfterValidateError::BadRequest(errors))
-    }
+    config
+        .validate_unique_mtls_credentials()
+        .map_err(AfterValidateError::Conflict)
 }
 
 pub(crate) async fn validate_hmac_request_transform_candidates(
@@ -2773,6 +2772,9 @@ fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
 fn map_after_validate_error<R: AdminResource>(error: AfterValidateError) -> Response<Full<Bytes>> {
     match error {
         AfterValidateError::BadRequest(field_errors) => R::map_after_validate_errors(&field_errors),
+        AfterValidateError::Conflict(errors) => {
+            super::json_response(StatusCode::CONFLICT, &json!({"error": errors.join("; ")}))
+        }
         AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
         AfterValidateError::Response(response) => *response,
     }
