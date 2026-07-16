@@ -996,6 +996,37 @@ pub mod _test_support {
         );
     }
 
+    /// Return true when an indefinitely stalled downstream H3 write is
+    /// cancelled by the supplied absolute deadline.
+    pub async fn stalled_h3_response_write_expires_for_test(
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let write = std::future::pending::<Result<(), ()>>();
+        matches!(
+            crate::http3::stream_util::await_response_write_before_deadline(
+                Some(deadline),
+                write,
+            )
+            .await,
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
+        )
+    }
+
+    /// Return true when a terminal H3 status that is immediately writable can
+    /// still complete after the timer selected the zero-DATA deadline path.
+    pub async fn ready_h3_terminal_write_wins_expired_deadline_for_test(
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        matches!(
+            crate::http3::stream_util::await_terminal_response_write_before_deadline(
+                Some(deadline),
+                std::future::ready(Ok::<(), ()>(())),
+            )
+            .await,
+            Ok(())
+        )
+    }
+
     pub fn client_grpc_deadline_response_for_request_for_test(
         content_type: &str,
     ) -> DeadlineBackendResponse {
@@ -1228,6 +1259,34 @@ pub mod _test_support {
         grpc_web_response_content_type: Option<&str>,
     ) -> crate::proxy::ProxyBody {
         body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
+    }
+
+    pub async fn finalized_upload_deadline_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        grpc_web_response_content_type: Option<&str>,
+    ) -> http::Response<crate::proxy::ProxyBody> {
+        crate::proxy::build_finalized_upload_deadline_response_for_test(
+            plugins,
+            ctx,
+            grpc_web_response_content_type,
+        )
+        .await
+    }
+
+    pub fn inspected_proxy_body_for_test(
+        body: crate::proxy::ProxyBody,
+        inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+    ) -> crate::proxy::ProxyBody {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
+            body,
+            inspector,
+            tx,
+            0,
+            crate::proxy::LoadBalancerConnectionGuard::new(None, None),
+        ));
+        crate::proxy::body::inspected_streaming_body(rx)
     }
 
     pub fn h3_plugin_protocol_for_request_for_test(

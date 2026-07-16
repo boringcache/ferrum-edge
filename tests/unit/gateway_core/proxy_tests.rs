@@ -615,7 +615,8 @@ fn test_no_match() {
 use async_trait::async_trait;
 use ferrum_edge::_test_support::{
     apply_request_body_plugins, can_dispatch_direct_http2_pool, can_use_direct_http2_pool,
-    extract_grpc_reject_message, finalize_plugin_rejection_for_test, insert_grpc_error_metadata,
+    extract_grpc_reject_message, finalize_plugin_rejection_for_test,
+    finalized_upload_deadline_response_for_test, insert_grpc_error_metadata,
     map_http_reject_status_to_grpc_status, normalize_reject_response, request_may_have_body,
     set_grpc_deadline_budget_for_test,
 };
@@ -865,6 +866,41 @@ impl Plugin for DeadlineRejectDecorator {
 }
 
 struct DeadlineRejectReplacer;
+
+struct DeadlineCommittedObserver {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    saw_decorator: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Plugin for DeadlineCommittedObserver {
+    fn name(&self) -> &str {
+        "deadline_committed_observer"
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if response_status == 200
+            && response_headers
+                .get("x-deadline-decorated")
+                .is_some_and(|value| value == "true")
+        {
+            self.saw_decorator
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
 
 #[async_trait]
 impl Plugin for DeadlineRejectReplacer {
@@ -1393,6 +1429,138 @@ async fn terminal_deadline_reject_runs_decorators_but_not_replacers() {
         !headers.contains_key("x-replaced"),
         "an expired fail-closed replacer must not override the terminal deadline"
     );
+}
+
+#[tokio::test]
+async fn grpc_web_upload_deadline_finalization_preserves_decorators_and_committed_cleanup() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let saw_decorator = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(DeadlineRejectDecorator),
+        Arc::new(DeadlineCommittedObserver {
+            calls: Arc::clone(&calls),
+            saw_decorator: Arc::clone(&saw_decorator),
+        }),
+    ];
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/my.Service/Unary".to_string(),
+    );
+    set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
+
+    let response = finalized_upload_deadline_response_for_test(
+        &plugins,
+        &mut ctx,
+        Some("application/grpc-web+proto"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-deadline-decorated")
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "gRPC-Web translation must preserve finalized rejection decorators"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        saw_decorator.load(std::sync::atomic::Ordering::SeqCst),
+        "the committed observer must see the translated decorated response exactly once"
+    );
+}
+
+#[test]
+fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let finalization = source
+        .split("async fn build_finalized_upload_deadline_response(")
+        .nth(1)
+        .expect("shared upload-deadline response finalization")
+        .split("pub(crate) async fn build_finalized_upload_deadline_response_for_test(")
+        .next()
+        .expect("bounded upload-deadline response finalization");
+    assert!(
+        finalization.contains("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
+    );
+    assert!(finalization.contains("build_grpc_web_reject_response("));
+
+    let helper = source
+        .split("async fn finalize_upload_deadline_rejection(")
+        .nth(1)
+        .expect("shared upload-deadline rejection finalizer")
+        .split("fn release_circuit_breaker_probe_on_admission_reject")
+        .next()
+        .expect("bounded upload-deadline finalizer");
+    assert!(helper.contains("build_finalized_upload_deadline_response("));
+    assert!(helper.contains("log_rejected_request_with_path("));
+    assert!(helper.contains("record_request(state,"));
+
+    for phase in [
+        "grpc_deadline_upload_before_authenticate",
+        "grpc_deadline_upload_before_authorize",
+        "grpc_deadline_upload_before_before_proxy",
+        "grpc_deadline_upload_before_dispatch",
+        "grpc_deadline_buffered_grpc_upload",
+    ] {
+        assert!(
+            source.contains(phase),
+            "missing finalized upload deadline phase {phase}"
+        );
+    }
+    assert_eq!(
+        source
+            .matches("finalize_upload_deadline_rejection(")
+            .count(),
+        7,
+        "the helper definition plus all six H1/H2 buffered upload exits must stay routed through cleanup"
+    );
+
+    let grpc_collect_deadline_branches: Vec<&str> = source
+        .split("Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {")
+        .skip(1)
+        .map(|branch| {
+            branch
+                .split("Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy")
+                .next()
+                .expect("bounded buffered gRPC deadline branch")
+        })
+        .collect();
+    assert_eq!(grpc_collect_deadline_branches.len(), 2);
+    for branch in grpc_collect_deadline_branches {
+        assert!(branch.contains("grpc_probe_guard.disarm()"));
+        assert!(branch.contains("release_circuit_breaker_probe_on_admission_reject("));
+        assert!(branch.contains("preacquired_backend_admission.take_if_acquired()"));
+    }
+}
+
+#[test]
+fn streaming_deadline_wraps_client_visible_body_after_inspection() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    for (arm, next_arm) in [
+        ("ResponseBody::StreamingH2(resp) => {", "ResponseBody::StreamingH3(h3_resp) => {"),
+        ("ResponseBody::StreamingH3(h3_resp) => {", "ResponseBody::Buffered(data) => {"),
+    ] {
+        let body = source
+            .split(arm)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing {arm}"))
+            .split(next_arm)
+            .next()
+            .expect("bounded streaming response arm");
+        let inspection = body
+            .find("run_proxy_body_response_inspection(")
+            .unwrap_or_else(|| panic!("missing inspector construction in {arm}"));
+        let deadline = body
+            .find("with_client_grpc_deadline(")
+            .unwrap_or_else(|| panic!("missing client-visible deadline wrapper in {arm}"));
+        assert!(
+            inspection < deadline,
+            "{arm} must base the deadline DATA decision on inspector output"
+        );
+    }
 }
 
 #[test]

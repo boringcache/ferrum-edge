@@ -136,10 +136,7 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
         .find("// Build the backend-facing header map")
         .expect("H3 gRPC upload buffering must remain bounded");
     let body = &body[..body_end];
-    for error in [
-        "H3RequestBodyReadError::TimedOut",
-        "H3RequestBodyReadError::DeadlineExceeded",
-    ] {
+    for error in ["H3RequestBodyReadError::TimedOut"] {
         let branch = body
             .find(error)
             .unwrap_or_else(|| panic!("missing {error} upload branch"));
@@ -151,6 +148,17 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
         assert!(branch.contains("write_grpc_error_for_request("));
         assert!(branch.contains("ctx,"));
     }
+    let deadline = body
+        .find("H3RequestBodyReadError::DeadlineExceeded")
+        .expect("missing deadline upload branch");
+    let deadline = &body[deadline..];
+    let deadline_end = deadline[1..]
+        .find("H3RequestBodyReadError::")
+        .map_or(deadline.len(), |offset| offset + 1);
+    let deadline = &deadline[..deadline_end];
+    assert!(deadline.contains("write_final_body_reject("));
+    assert!(deadline.contains("grpc_deadline_exceeded_plugin_result()"));
+    assert!(deadline.contains("log_rejected_request("));
 
     let writer = source
         .find("async fn write_grpc_error_for_request<S>(")
@@ -237,6 +245,123 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
     assert!(relay.contains("if bytes_streamed == 0"));
     assert!(relay.contains("abort_response_stream(stream)"));
     assert!(relay.contains("_ = &mut read_deadline"));
+    assert!(relay.contains("await_response_write_before_deadline("));
+    assert!(relay.contains("await_downstream_write!(stream.send_data"));
+}
+
+#[test]
+fn h3_cross_protocol_buffered_grpc_writes_and_fin_are_deadline_bounded() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let buffered = source
+        .split("Ok(GrpcResponseKind::Buffered(resp)) => {")
+        .nth(1)
+        .expect("buffered cross-protocol gRPC response arm")
+        .split("Ok(GrpcResponseKind::Streaming(streaming)) => {")
+        .next()
+        .expect("bounded buffered gRPC response arm");
+    assert!(buffered.contains("await_response_write_before_deadline("));
+    assert!(buffered.contains("await_terminal_response_write_before_deadline("));
+    assert!(buffered.contains("stream.send_data(Bytes::from(response_body))"));
+    assert!(buffered.contains("stream.send_trailers(trailer_map)"));
+    assert!(
+        buffered.matches("stream.finish()").count() >= 2,
+        "both trailer and no-trailer buffered responses must send a deadline-bounded FIN"
+    );
+}
+
+#[test]
+fn h3_native_buffered_response_writes_are_deadline_bounded() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let writer = source
+        .split("// Build and send buffered response")
+        .nth(1)
+        .expect("native H3 buffered response writer")
+        .split("pub(crate) fn h3_plugin_protocol_for_request")
+        .next()
+        .expect("bounded native H3 buffered response writer");
+    assert!(writer.contains("macro_rules! await_buffered_h3_write"));
+    assert!(writer.contains("await_buffered_h3_write!(stream.send_response(resp))"));
+    assert!(writer.contains("await_buffered_h3_write!(stream.send_data"));
+    assert!(writer.contains("await_response_write_before_deadline("));
+    assert!(writer.contains("await_terminal_response_write_before_deadline("));
+    assert!(writer.contains("await_buffered_h3_write!(stream.finish())"));
+}
+
+#[test]
+fn h3_native_grpc_write_deadlines_remain_client_owned_and_observable() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let relay = source
+        .split("async fn dispatch_grpc_native_h3(")
+        .nth(1)
+        .expect("native H3 gRPC relay")
+        .split("async fn log_h3_grpc_transaction(")
+        .next()
+        .expect("bounded native H3 gRPC relay");
+    assert!(relay.contains("await_downstream_grpc_write!(stream.send_data"));
+    assert!(relay.contains("let mut client_deadline_expired = false"));
+    assert!(relay.contains("H3GrpcResponseFinish::DeadlineExceeded"));
+    assert!(relay.contains("if client_deadline_expired"));
+    assert!(relay.contains("insert_grpc_error_metadata("));
+}
+
+#[tokio::test]
+async fn stalled_h3_flow_control_write_is_cancelled_by_rpc_deadline() {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(std::time::Duration::from_millis(10))
+        .expect("ten milliseconds after now is representable");
+    assert!(
+        ferrum_edge::_test_support::stalled_h3_response_write_expires_for_test(deadline).await,
+        "a permanently pending QUIC write must not outlive the absolute RPC deadline"
+    );
+}
+
+#[tokio::test]
+async fn ready_h3_terminal_status_can_finish_after_deadline_selection() {
+    let deadline = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("one millisecond before now is representable");
+    assert!(
+        ferrum_edge::_test_support::ready_h3_terminal_write_wins_expired_deadline_for_test(deadline)
+            .await,
+        "an immediately-ready status-4 trailer must retain the clean zero-DATA completion path"
+    );
+}
+
+#[test]
+fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let helper = source
+        .split("async fn finalize_h3_upload_deadline_rejection(")
+        .nth(1)
+        .expect("shared H3 upload-deadline finalizer")
+        .split("async fn send_h3_plugin_reject_flavor_aware(")
+        .next()
+        .expect("bounded H3 upload-deadline finalizer");
+    assert!(helper.contains("apply_reject_after_proxy_and_synthetic_body_hooks("));
+    assert!(helper.contains("run_h3_reject_response_committed_hooks("));
+    assert!(helper.contains("log_rejected_request("));
+    assert!(helper.contains("send_h3_plugin_reject_flavor_aware("));
+    assert!(helper.contains("await_terminal_response_write_before_deadline("));
+    for phase in [
+        "grpc_deadline_upload_before_authenticate",
+        "grpc_deadline_upload_before_authorize",
+        "grpc_deadline_upload_before_before_proxy",
+        "grpc_deadline_upload_before_dispatch",
+        "grpc_deadline_upload_before_cross_protocol_dispatch",
+        "grpc_deadline_buffered_h3_upload",
+    ] {
+        assert!(
+            source.contains(phase),
+            "missing finalized H3 upload deadline phase {phase}"
+        );
+    }
+    assert_eq!(
+        source
+            .matches("finalize_h3_upload_deadline_rejection(")
+            .count(),
+        7,
+        "the helper definition plus every native H3 buffered upload phase must remain finalized"
+    );
 }
 
 #[test]

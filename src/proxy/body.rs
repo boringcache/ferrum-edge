@@ -2670,6 +2670,12 @@ where
     fn size_hint(&self) -> http_body::SizeHint {
         if self.done {
             http_body::SizeHint::with_exact(0)
+        } else if self.deadline.is_some() {
+            // The deadline may replace the remaining body with native trailers
+            // or a differently-sized gRPC-Web terminal DATA frame. Do not let
+            // hyper reconstruct the stripped backend Content-Length from an
+            // exact inner size hint before that decision is known.
+            http_body::SizeHint::default()
         } else {
             self.inner
                 .as_ref()

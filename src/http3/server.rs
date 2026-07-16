@@ -1837,6 +1837,21 @@ async fn handle_h3_request(
                 return Ok(());
             }
             Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
+            Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                finalize_h3_upload_deadline_rejection(
+                    &mut stream,
+                    &state,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    start_time,
+                    "grpc_deadline_upload_before_authenticate",
+                    plugin_execution_ns,
+                )
+                .await?;
+                return Ok(());
+            }
             Err(timeout) => {
                 let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
                 record_request(
@@ -2012,6 +2027,21 @@ async fn handle_h3_request(
                     return Ok(());
                 }
                 Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
+                Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                    finalize_h3_upload_deadline_rejection(
+                        &mut stream,
+                        &state,
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        start_time,
+                        "grpc_deadline_upload_before_authorize",
+                        plugin_execution_ns,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 Err(timeout) => {
                     let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
                     record_request(
@@ -2249,6 +2279,21 @@ async fn handle_h3_request(
                 return Ok(());
             }
             Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
+            Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                finalize_h3_upload_deadline_rejection(
+                    &mut stream,
+                    &state,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    start_time,
+                    "grpc_deadline_upload_before_before_proxy",
+                    plugin_execution_ns,
+                )
+                .await?;
+                return Ok(());
+            }
             Err(timeout) => {
                 let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
                 record_request(
@@ -3095,6 +3140,28 @@ async fn handle_h3_request(
                     );
                     return Err(error.into());
                 }
+                Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                    release_h3_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                    );
+                    drop(preacquired_backend_admission.take_if_acquired());
+                    finalize_h3_upload_deadline_rejection(
+                        &mut stream,
+                        &state,
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        start_time,
+                        "grpc_deadline_upload_before_dispatch",
+                        plugin_execution_ns,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 Err(timeout) => {
                     let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
                     release_h3_circuit_breaker_probe_on_admission_reject(
@@ -3709,6 +3776,35 @@ async fn handle_h3_request(
                             );
                             return Err(error.into());
                         }
+                        Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+                                &state,
+                                &proxy,
+                                &epoch.load_balancer,
+                                upstream_balancer.as_ref(),
+                                upstream_target.as_deref(),
+                                cb_target_key.as_deref(),
+                                StatusCode::REQUEST_TIMEOUT.as_u16(),
+                                false,
+                                Some(crate::retry::ErrorClass::ClientDisconnect),
+                                cb_is_half_open_probe,
+                                false,
+                                backend_start.elapsed(),
+                            );
+                            finalize_h3_upload_deadline_rejection(
+                                &mut stream,
+                                &state,
+                                &plugins,
+                                &mut ctx,
+                                http_flavor,
+                                grpc_web_response_content_type.as_deref(),
+                                start_time,
+                                "grpc_deadline_upload_before_cross_protocol_dispatch",
+                                plugin_execution_ns,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
                         Err(timeout) => {
                             let (error_body, grpc_message) =
                                 h3_request_body_timeout_contract(&timeout);
@@ -3875,7 +3971,9 @@ async fn handle_h3_request(
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
-        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+        if !outcome.rejection_logged {
+            crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+        }
 
         return Ok(());
     }
@@ -4871,6 +4969,27 @@ async fn handle_h3_request(
                     cb_is_half_open_probe,
                 );
                 return Err(error.into());
+            }
+            Err(H3RequestBodyReadError::DeadlineExceeded) => {
+                release_h3_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                finalize_h3_upload_deadline_rejection(
+                    &mut stream,
+                    &state,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    start_time,
+                    "grpc_deadline_buffered_h3_upload",
+                    plugin_execution_ns,
+                )
+                .await?;
+                return Ok(());
             }
             Err(timeout) => {
                 let (error_body, grpc_message) = h3_request_body_timeout_contract(&timeout);
@@ -5962,8 +6081,51 @@ async fn handle_h3_request(
         let resp = resp_builder
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 proxy response: {}", e))?;
-        stream.send_response(resp).await?;
-        stream.send_data(Bytes::from(response_body)).await?;
+        let grpc_deadline_at = ctx.grpc_deadline_at();
+        let terminal_gateway_deadline = ctx
+            .metadata
+            .get("grpc_status")
+            .is_some_and(|status| status == GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER)
+            && ctx
+                .metadata
+                .get("grpc_message")
+                .is_some_and(|message| message == GATEWAY_DEADLINE_EXCEEDED_MESSAGE);
+        macro_rules! await_buffered_h3_write {
+            ($write:expr) => {
+                match if terminal_gateway_deadline {
+                    crate::http3::stream_util::await_terminal_response_write_before_deadline(
+                        grpc_deadline_at,
+                        $write,
+                    )
+                    .await
+                } else {
+                    crate::http3::stream_util::await_response_write_before_deadline(
+                        grpc_deadline_at,
+                        $write,
+                    )
+                    .await
+                } {
+                    Ok(()) => {}
+                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => {
+                        return Err(error.into());
+                    }
+                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                        crate::proxy::insert_grpc_error_metadata(
+                            &mut ctx.metadata,
+                            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                        );
+                        crate::http3::stream_util::abort_response_stream(&mut stream);
+                        crate::http3::stream_util::halt_request_body(&mut stream);
+                        return Ok(());
+                    }
+                }
+            };
+        }
+        await_buffered_h3_write!(stream.send_response(resp));
+        if !response_body.is_empty() {
+            await_buffered_h3_write!(stream.send_data(Bytes::from(response_body)));
+        }
 
         // Response-body plugins cannot inspect or transform trailers today.
         // Conservatively drop backend trailers whenever the buffered response
@@ -5983,25 +6145,48 @@ async fn handle_h3_request(
         match response_trailers {
             Some(mut trailers) => {
                 strip_response_hop_by_hop_trailers(&mut trailers);
-                if !trailers.is_empty()
-                    && let Err(err) = stream.send_trailers(trailers).await
-                {
-                    // The trailers are valid for the backend but the H3 client
-                    // could not accept them (e.g. they exceed its advertised
-                    // field-section size → HeaderTooBig). The body has already
-                    // been sent successfully, so DROP the trailers and still
-                    // emit a clean FIN rather than `?`-propagating and turning
-                    // an otherwise-complete buffered response into a downstream
-                    // stream error (issue #1630).
-                    debug!(
-                        error = %err,
-                        "H3 send_trailers failed on buffered response; dropping trailers and finishing cleanly"
-                    );
+                if !trailers.is_empty() {
+                    let trailer_write = if terminal_gateway_deadline {
+                        crate::http3::stream_util::await_terminal_response_write_before_deadline(
+                            grpc_deadline_at,
+                            stream.send_trailers(trailers),
+                        )
+                        .await
+                    } else {
+                        crate::http3::stream_util::await_response_write_before_deadline(
+                            grpc_deadline_at,
+                            stream.send_trailers(trailers),
+                        )
+                        .await
+                    };
+                    match trailer_write {
+                        Ok(()) => {}
+                        Err(crate::http3::stream_util::H3ResponseWriteError::Write(err)) => {
+                            // The trailers are valid for the backend but the H3
+                            // client could not accept them (e.g. HeaderTooBig).
+                            // The body was sent, so drop the trailers and still
+                            // try a clean FIN, preserving issue #1630 behavior.
+                            debug!(
+                                error = %err,
+                                "H3 send_trailers failed on buffered response; dropping trailers and finishing cleanly"
+                            );
+                        }
+                        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                            crate::proxy::insert_grpc_error_metadata(
+                                &mut ctx.metadata,
+                                crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                            );
+                            crate::http3::stream_util::abort_response_stream(&mut stream);
+                            crate::http3::stream_util::halt_request_body(&mut stream);
+                            return Ok(());
+                        }
+                    }
                 }
-                stream.finish().await?;
+                await_buffered_h3_write!(stream.finish());
             }
             None => {
-                stream.finish().await?;
+                await_buffered_h3_write!(stream.finish());
             }
         }
     }
@@ -8172,7 +8357,25 @@ async fn dispatch_grpc_native_h3(
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC response: {}", e))?;
-    if stream.send_response(resp).await.is_err() {
+    let response_header_write =
+        crate::http3::stream_util::await_response_write_before_deadline(
+            grpc_deadline_at,
+            stream.send_response(resp),
+        )
+        .await;
+    if let Err(write_error) = response_header_write {
+        let response_header_deadline_expired = matches!(
+            write_error,
+            crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
+        );
+        if response_header_deadline_expired {
+            crate::proxy::insert_grpc_error_metadata(
+                &mut ctx.metadata,
+                crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+            );
+            crate::http3::stream_util::abort_response_stream(stream);
+        }
         // A client disconnect at the header-write boundary must not mask a real
         // backend failure: when the backend returned a failure status (a raw HTTP
         // 5xx, or a configured breaker-failure status), clear the neutral
@@ -8209,12 +8412,14 @@ async fn dispatch_grpc_native_h3(
             health_error_class,
             backend_admission_response_elapsed,
         );
-        let grpc_status = wire_grpc_status.as_deref().map_or(
-            crate::proxy::grpc_proxy::grpc_status::UNKNOWN,
-            crate::proxy::grpc_proxy::parse_grpc_status_value,
-        );
-        ctx.metadata
-            .insert("grpc_status".to_string(), grpc_status.to_string());
+        if !response_header_deadline_expired {
+            let grpc_status = wire_grpc_status.as_deref().map_or(
+                crate::proxy::grpc_proxy::grpc_status::UNKNOWN,
+                crate::proxy::grpc_proxy::parse_grpc_status_value,
+            );
+            ctx.metadata
+                .insert("grpc_status".to_string(), grpc_status.to_string());
+        }
         log_h3_grpc_transaction(
             proxy,
             ctx,
@@ -8267,6 +8472,7 @@ async fn dispatch_grpc_native_h3(
     let mut client_disconnected = false;
     let mut body_completed = false;
     let mut body_error_class: Option<crate::retry::ErrorClass> = None;
+    let mut client_deadline_expired = false;
     let mut just_received_backend_frame = false;
     // Backend gRPC terminal status, captured from the trailer (or trailers-only
     // header) for the adaptive-concurrency sample below.
@@ -8282,6 +8488,36 @@ async fn dispatch_grpc_native_h3(
             .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400)),
     );
     tokio::pin!(grpc_deadline_sleep);
+
+    macro_rules! await_downstream_grpc_write {
+        ($write:expr) => {
+            match crate::http3::stream_util::await_response_write_before_deadline(
+                grpc_deadline_at,
+                $write,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    client_deadline_expired = true;
+                    coalesce_buf.clear();
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    crate::proxy::insert_grpc_error_metadata(
+                        &mut ctx.metadata,
+                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                        GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                    );
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    break 'outer;
+                }
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                    client_disconnected = true;
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    break 'outer;
+                }
+            }
+        };
+    }
 
     'outer: loop {
         if read_timeout_active && just_received_backend_frame && coalesce_buf.is_empty() {
@@ -8315,11 +8551,7 @@ async fn dispatch_grpc_native_h3(
                         ) {
                             let data =
                                 crate::http3::config::copy_remaining_response_chunk(&mut chunk);
-                            if stream.send_data(data).await.is_err() {
-                                client_disconnected = true;
-                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                                break 'outer;
-                            }
+                            await_downstream_grpc_write!(stream.send_data(data));
                             bytes_streamed += chunk_len as u64;
                             flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
                             continue;
@@ -8330,11 +8562,7 @@ async fn dispatch_grpc_native_h3(
                         if coalesce_buf.len() >= coalesce_min_bytes {
                             let data = coalesce_buf.split().freeze();
                             let data_len = data.len() as u64;
-                            if stream.send_data(data).await.is_err() {
-                                client_disconnected = true;
-                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                                break 'outer;
-                            }
+                            await_downstream_grpc_write!(stream.send_data(data));
                             bytes_streamed += data_len;
                             flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
                         }
@@ -8378,11 +8606,7 @@ async fn dispatch_grpc_native_h3(
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                if stream.send_data(data).await.is_err() {
-                    client_disconnected = true;
-                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                    break 'outer;
-                }
+                await_downstream_grpc_write!(stream.send_data(data));
                 bytes_streamed += data_len;
                 flush_timer.as_mut().reset(tokio::time::Instant::now() + flush_interval);
             }
@@ -8415,6 +8639,7 @@ async fn dispatch_grpc_native_h3(
             // health-neutral (`ClientDisconnect`) and the gRPC status lands in the
             // metadata.
             _ = &mut grpc_deadline_sleep, if grpc_deadline_active && !stream_done => {
+                client_deadline_expired = true;
                 coalesce_buf.clear();
                 if bytes_streamed == 0 {
                     warn!(
@@ -8425,6 +8650,7 @@ async fn dispatch_grpc_native_h3(
                         stream,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                         GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+                        grpc_deadline_at,
                     )
                     .await
                     {
@@ -8433,6 +8659,7 @@ async fn dispatch_grpc_native_h3(
                         body_completed = true;
                         body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                     } else {
+                        crate::http3::stream_util::abort_response_stream(stream);
                         client_disconnected = true;
                         body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
                     }
@@ -8458,11 +8685,7 @@ async fn dispatch_grpc_native_h3(
             if !coalesce_buf.is_empty() {
                 let data = coalesce_buf.split().freeze();
                 let data_len = data.len() as u64;
-                if stream.send_data(data).await.is_err() {
-                    client_disconnected = true;
-                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
-                    break 'outer;
-                }
+                await_downstream_grpc_write!(stream.send_data(data));
                 bytes_streamed += data_len;
             }
             // Terminal trailers carry the gRPC status. Capture `grpc-status`
@@ -8497,6 +8720,7 @@ async fn dispatch_grpc_native_h3(
                     match tokio::time::timeout_at(at, h3_resp.recv_stream.recv_trailers()).await {
                         Ok(result) => result,
                         Err(_) if trailer_timeout_is_deadline => {
+                            client_deadline_expired = true;
                             // `stream_done` only proves the H3 DATA stream reached
                             // FIN — NOT that the last length-prefixed gRPC message
                             // ended on a frame boundary (a backend can FIN mid-frame).
@@ -8515,6 +8739,7 @@ async fn dispatch_grpc_native_h3(
                                     stream,
                                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                                     GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
+                                    grpc_deadline_at,
                                 )
                                 .await
                                 {
@@ -8525,6 +8750,7 @@ async fn dispatch_grpc_native_h3(
                                     body_error_class =
                                         Some(crate::retry::ErrorClass::ClientDisconnect);
                                 } else {
+                                    crate::http3::stream_util::abort_response_stream(stream);
                                     client_disconnected = true;
                                     body_error_class =
                                         Some(crate::retry::ErrorClass::ClientDisconnect);
@@ -8565,14 +8791,18 @@ async fn dispatch_grpc_native_h3(
                         })
                     });
                     strip_response_hop_by_hop_trailers(&mut trailers);
-                    let finish_ok = if !trailers.is_empty() {
+                    let finish_outcome = if !trailers.is_empty() {
                         // `send_trailers` only writes the trailer HEADERS frame;
                         // `finish()` is required to FIN the QUIC send side so the
                         // client sees end-of-response (the shared
                         // `finish_h3_response_with_backend_trailers` helper does the
                         // same). Skipping it leaves the stream open until timeout.
-                        stream.send_trailers(trailers).await.is_ok()
-                            && stream.finish().await.is_ok()
+                        send_h3_grpc_trailers_and_finish_before_deadline(
+                            stream,
+                            trailers,
+                            grpc_deadline_at,
+                        )
+                        .await
                     } else {
                         // Real trailers were all hop-by-hop: if the backend put its
                         // terminal status only in the (stripped) initial headers,
@@ -8582,46 +8812,70 @@ async fn dispatch_grpc_native_h3(
                             wire_grpc_status.as_deref(),
                             wire_grpc_message.as_deref(),
                             wire_grpc_status_details.as_deref(),
+                            grpc_deadline_at,
                         )
                         .await
                     };
-                    if finish_ok {
-                        body_completed = true;
-                    } else {
-                        client_disconnected = true;
-                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    match finish_outcome {
+                        H3GrpcResponseFinish::Complete => body_completed = true,
+                        H3GrpcResponseFinish::DeadlineExceeded => {
+                            client_deadline_expired = true;
+                            crate::http3::stream_util::abort_response_stream(stream);
+                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        }
+                        H3GrpcResponseFinish::WriteFailed => {
+                            crate::http3::stream_util::abort_response_stream(stream);
+                            client_disconnected = true;
+                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        }
                     }
                 }
                 Ok(None) => {
                     // No terminal TRAILERS frame — a Trailers-Only response carries
                     // its status in the (stripped) initial headers; re-emit it.
-                    if finish_h3_grpc_stream_trailers_only(
+                    match finish_h3_grpc_stream_trailers_only(
                         stream,
                         wire_grpc_status.as_deref(),
                         wire_grpc_message.as_deref(),
                         wire_grpc_status_details.as_deref(),
+                        grpc_deadline_at,
                     )
                     .await
                     {
-                        body_completed = true;
-                    } else {
-                        client_disconnected = true;
-                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        H3GrpcResponseFinish::Complete => body_completed = true,
+                        H3GrpcResponseFinish::DeadlineExceeded => {
+                            client_deadline_expired = true;
+                            crate::http3::stream_util::abort_response_stream(stream);
+                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        }
+                        H3GrpcResponseFinish::WriteFailed => {
+                            crate::http3::stream_util::abort_response_stream(stream);
+                            client_disconnected = true;
+                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        }
                     }
                 }
                 Err(err) if crate::http3::client::is_h3_graceful_close(&err) => {
-                    if finish_h3_grpc_stream_trailers_only(
+                    match finish_h3_grpc_stream_trailers_only(
                         stream,
                         wire_grpc_status.as_deref(),
                         wire_grpc_message.as_deref(),
                         wire_grpc_status_details.as_deref(),
+                        grpc_deadline_at,
                     )
                     .await
                     {
-                        body_completed = true;
-                    } else {
-                        client_disconnected = true;
-                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        H3GrpcResponseFinish::Complete => body_completed = true,
+                        H3GrpcResponseFinish::DeadlineExceeded => {
+                            client_deadline_expired = true;
+                            crate::http3::stream_util::abort_response_stream(stream);
+                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        }
+                        H3GrpcResponseFinish::WriteFailed => {
+                            crate::http3::stream_util::abort_response_stream(stream);
+                            client_disconnected = true;
+                            body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        }
                     }
                 }
                 Err(err) => {
@@ -8727,15 +8981,23 @@ async fn dispatch_grpc_native_h3(
         body_outcome_error_class,
         backend_admission_response_elapsed,
     );
-    let grpc_status = grpc_trailer_status
-        .or_else(|| {
-            wire_grpc_status
-                .as_deref()
-                .map(crate::proxy::grpc_proxy::parse_grpc_status_value)
-        })
-        .unwrap_or(crate::proxy::grpc_proxy::grpc_status::UNKNOWN);
-    ctx.metadata
-        .insert("grpc_status".to_string(), grpc_status.to_string());
+    if client_deadline_expired {
+        crate::proxy::insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+        );
+    } else {
+        let grpc_status = grpc_trailer_status
+            .or_else(|| {
+                wire_grpc_status
+                    .as_deref()
+                    .map(crate::proxy::grpc_proxy::parse_grpc_status_value)
+            })
+            .unwrap_or(crate::proxy::grpc_proxy::grpc_status::UNKNOWN);
+        ctx.metadata
+            .insert("grpc_status".to_string(), grpc_status.to_string());
+    }
     log_h3_grpc_transaction(
         proxy,
         ctx,
@@ -9740,6 +10002,96 @@ async fn run_h3_deadline_bounded_reject_committed_hooks(
     false
 }
 
+/// Finalize and emit a client RPC deadline discovered while buffering an H3
+/// upload. The body wait is over, but the rejection lifecycle is not: response
+/// decorators, committed observers, and rejection logging must all run before
+/// the stream is closed. This is also the point where gRPC-Web CORS headers are
+/// folded into the translated body-trailer response.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_h3_upload_deadline_rejection(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &ProxyState,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
+    start_time: std::time::Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+) -> Result<(), anyhow::Error> {
+    let Some(mut reject) = plugin_result_into_reject_parts(
+        crate::plugins::grpc_deadline_exceeded_plugin_result(),
+    ) else {
+        return Err(anyhow::anyhow!(
+            "canonical gRPC deadline rejection could not be normalized"
+        ));
+    };
+    apply_reject_after_proxy_and_synthetic_body_hooks(
+        plugins,
+        ctx,
+        &mut reject.status_code,
+        &mut reject.headers,
+        &mut reject.body,
+        true,
+        false,
+    )
+    .await;
+    let http_status =
+        StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_REQUEST);
+    run_h3_reject_response_committed_hooks(
+        plugins,
+        ctx,
+        flavor,
+        grpc_web_response_content_type,
+        http_status,
+        &reject.body,
+        &reject.headers,
+    )
+    .await;
+    let log_status = h3_reject_log_status_and_metadata(
+        ctx,
+        flavor,
+        http_status,
+        &reject.body,
+        &reject.headers,
+    );
+    log_rejected_request(
+        plugins,
+        ctx,
+        log_status,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+    )
+    .await;
+    record_request(state, log_status);
+    let grpc_deadline_at = ctx.grpc_deadline_at();
+    let write = send_h3_plugin_reject_flavor_aware(
+        stream,
+        plugins,
+        ctx,
+        flavor,
+        grpc_web_response_content_type,
+        http_status,
+        &reject.body,
+        &reject.headers,
+    );
+    match crate::http3::stream_util::await_terminal_response_write_before_deadline(
+        grpc_deadline_at,
+        write,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+            crate::http3::stream_util::abort_response_stream(stream);
+            crate::http3::stream_util::halt_request_body(stream);
+            Ok(())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_h3_plugin_reject_flavor_aware(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
@@ -9805,6 +10157,7 @@ async fn send_h3_grpc_terminal_trailers(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     grpc_status: u32,
     grpc_message: &str,
+    grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> bool {
     let mut trailers = http::HeaderMap::new();
     if let Ok(value) = http::HeaderValue::from_str(&grpc_status.to_string()) {
@@ -9813,7 +10166,60 @@ async fn send_h3_grpc_terminal_trailers(
     if let Ok(value) = http::HeaderValue::from_str(grpc_message) {
         trailers.insert("grpc-message", value);
     }
-    stream.send_trailers(trailers).await.is_ok() && stream.finish().await.is_ok()
+    crate::http3::stream_util::await_terminal_response_write_before_deadline(
+        grpc_deadline_at,
+        stream.send_trailers(trailers),
+    )
+    .await
+    .is_ok()
+        && crate::http3::stream_util::await_terminal_response_write_before_deadline(
+            grpc_deadline_at,
+            stream.finish(),
+        )
+        .await
+        .is_ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum H3GrpcResponseFinish {
+    Complete,
+    WriteFailed,
+    DeadlineExceeded,
+}
+
+async fn send_h3_grpc_trailers_and_finish_before_deadline(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    trailers: http::HeaderMap,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+) -> H3GrpcResponseFinish {
+    match crate::http3::stream_util::await_response_write_before_deadline(
+        grpc_deadline_at,
+        stream.send_trailers(trailers),
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+            return H3GrpcResponseFinish::WriteFailed;
+        }
+        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+            return H3GrpcResponseFinish::DeadlineExceeded;
+        }
+    }
+    match crate::http3::stream_util::await_response_write_before_deadline(
+        grpc_deadline_at,
+        stream.finish(),
+    )
+    .await
+    {
+        Ok(()) => H3GrpcResponseFinish::Complete,
+        Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+            H3GrpcResponseFinish::WriteFailed
+        }
+        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+            H3GrpcResponseFinish::DeadlineExceeded
+        }
+    }
 }
 
 /// FIN an already-open native-H3 gRPC response stream that produced NO terminal
@@ -9821,15 +10227,16 @@ async fn send_h3_grpc_terminal_trailers(
 /// initial HEADERS (a genuine Trailers-Only response — which the dispatch path
 /// strips from the wire so the trailer is authoritative), re-emit it as a
 /// synthesized TRAILERS frame so the client still receives `grpc-status` in the
-/// canonical location; otherwise just FIN. Returns `true` if the FIN (and any
-/// synthesized trailers) reached the client. `grpc_status` / `grpc_message` are
-/// the raw stripped header values.
+/// canonical location; otherwise just FIN. The result preserves whether the
+/// absolute RPC deadline or a transport write failure prevented completion.
+/// `grpc_status` / `grpc_message` are the raw stripped header values.
 async fn finish_h3_grpc_stream_trailers_only(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     grpc_status: Option<&str>,
     grpc_message: Option<&str>,
     grpc_status_details: Option<&str>,
-) -> bool {
+    grpc_deadline_at: Option<tokio::time::Instant>,
+) -> H3GrpcResponseFinish {
     match grpc_status {
         Some(status) => {
             let mut trailers = http::HeaderMap::new();
@@ -9848,9 +10255,27 @@ async fn finish_h3_grpc_stream_trailers_only(
             {
                 trailers.insert("grpc-status-details-bin", value);
             }
-            stream.send_trailers(trailers).await.is_ok() && stream.finish().await.is_ok()
+            send_h3_grpc_trailers_and_finish_before_deadline(
+                stream,
+                trailers,
+                grpc_deadline_at,
+            )
+            .await
         }
-        None => stream.finish().await.is_ok(),
+        None => match crate::http3::stream_util::await_response_write_before_deadline(
+            grpc_deadline_at,
+            stream.finish(),
+        )
+        .await
+        {
+            Ok(()) => H3GrpcResponseFinish::Complete,
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                H3GrpcResponseFinish::WriteFailed
+            }
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                H3GrpcResponseFinish::DeadlineExceeded
+            }
+        },
     }
 }
 

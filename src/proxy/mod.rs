@@ -13815,8 +13815,24 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     {
         let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
         let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
+        let terminal_gateway_deadline = is_terminal_gateway_deadline_rejection(*status, headers);
         for (index, plugin) in plugins.iter().enumerate() {
             if !plugin.requires_response_committed_hook() {
+                continue;
+            }
+            // Upload collection can discover expiry only after the absolute
+            // timer has fired. The canonical terminal result is already fixed
+            // at that point, so observers and cleanup hooks must run exactly
+            // once without re-applying the expired request timer.
+            if terminal_gateway_deadline {
+                plugin
+                    .on_response_committed(
+                        ctx,
+                        normalized.http_status.as_u16(),
+                        &normalized.headers,
+                        &normalized.body,
+                    )
+                    .await;
                 continue;
             }
             let deadline = ctx.grpc_deadline_at();
@@ -14661,12 +14677,20 @@ async fn build_grpc_web_reject_response(
         &message,
     );
     finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));
+    let terminal_gateway_deadline = grpc_status == grpc_proxy::grpc_status::DEADLINE_EXCEEDED
+        && message == GATEWAY_DEADLINE_EXCEEDED_MESSAGE;
     if plugins
         .iter()
         .any(|plugin| plugin.requires_response_committed_hook())
     {
         for (index, plugin) in plugins.iter().enumerate() {
             if !plugin.requires_response_committed_hook() {
+                continue;
+            }
+            if terminal_gateway_deadline {
+                plugin
+                    .on_response_committed(ctx, 200, &translated.headers, &translated.body)
+                    .await;
                 continue;
             }
             if crate::plugins::await_grpc_deadline(
@@ -14896,6 +14920,84 @@ async fn handle_backend_admission_rejection(
         return response;
     }
     build_response_from_normalized_reject(reject)
+}
+
+/// Finalize a client RPC deadline discovered while buffering the upload.
+///
+/// These exits occur before a backend response exists, but they are still
+/// ordinary client-visible rejections: reject-path `after_proxy` decorators,
+/// committed observers, and rejection logging must all see the canonical
+/// status-4 result. In particular, gRPC-Web needs the finalized header map so
+/// CORS decorators survive translation into its body-trailer representation.
+async fn build_finalized_upload_deadline_response(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    grpc_web_response_content_type: Option<&str>,
+) -> (Response<ProxyBody>, u16) {
+    let deadline = normalized_grpc_deadline_exceeded();
+    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+        plugins,
+        ctx,
+        deadline.http_status,
+        &deadline.body,
+        deadline.headers,
+        true,
+        grpc_web_response_content_type.is_none(),
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &reject);
+    let grpc_web_response = build_grpc_web_reject_response(
+        plugins,
+        ctx,
+        grpc_web_response_content_type,
+        &reject,
+    )
+    .await;
+    let log_status = reject.http_status.as_u16();
+    let response =
+        grpc_web_response.unwrap_or_else(|| build_response_from_normalized_reject(reject));
+    (response, log_status)
+}
+
+pub(crate) async fn build_finalized_upload_deadline_response_for_test(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    build_finalized_upload_deadline_response(plugins, ctx, grpc_web_response_content_type)
+        .await
+        .0
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_upload_deadline_rejection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&str>,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    let (response, log_status) = build_finalized_upload_deadline_response(
+        plugins,
+        ctx,
+        grpc_web_response_content_type,
+    )
+    .await;
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        log_status,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        original_request_path,
+    )
+    .await;
+    record_request(state, log_status);
+    response
 }
 
 fn release_circuit_breaker_probe_on_admission_reject(
@@ -16415,14 +16517,17 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::DeadlineExceeded) => {
-                        let response = build_request_deadline_exceeded_response(
-                            is_grpc_request,
+                        let response = finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_upload_before_authenticate",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
                             grpc_web_response_content_type,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        );
-                        record_request(&state, response.status().as_u16());
+                        )
+                        .await;
                         return Ok(response);
                     }
                 }
@@ -16558,14 +16663,17 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::DeadlineExceeded) => {
-                        let response = build_request_deadline_exceeded_response(
-                            is_grpc_request,
+                        let response = finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_upload_before_authorize",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
                             grpc_web_response_content_type,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        );
-                        record_request(&state, response.status().as_u16());
+                        )
+                        .await;
                         return Ok(response);
                     }
                 }
@@ -16746,14 +16854,17 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     Err(RequestBodyBufferError::DeadlineExceeded) => {
-                        let response = build_request_deadline_exceeded_response(
-                            is_grpc_request,
+                        let response = finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_upload_before_before_proxy",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
                             grpc_web_response_content_type,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        );
-                        record_request(&state, response.status().as_u16());
+                        )
+                        .await;
                         return Ok(response);
                     }
                 }
@@ -17460,14 +17571,17 @@ async fn handle_proxy_request_inner(
                             cb_is_half_open_probe,
                         );
                         drop(preacquired_backend_admission.take_if_acquired());
-                        let response = build_request_deadline_exceeded_response(
-                            is_grpc_request,
+                        let response = finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_upload_before_dispatch",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
                             grpc_web_response_content_type,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        );
-                        record_request(&state, response.status().as_u16());
+                        )
+                        .await;
                         return Ok(response);
                     }
                 }
@@ -17982,14 +18096,28 @@ async fn handle_proxy_request_inner(
                         ));
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {
-                        record_request(&state, StatusCode::OK.as_u16());
-                        return Ok(build_request_deadline_exceeded_response(
-                            true,
+                        // Rejection decorators/logging may await external sinks.
+                        // Release the admitted HALF_OPEN probe and any body-phase
+                        // preacquisition before entering that cleanup pipeline.
+                        grpc_probe_guard.disarm();
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            grpc_cb_probe_slot,
+                        );
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        return Ok(finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_buffered_grpc_upload",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
                             grpc_web_response_content_type,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        ));
+                        )
+                        .await);
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(e)) => {
                         record_request(&state, 500);
@@ -18387,14 +18515,25 @@ async fn handle_proxy_request_inner(
                         ));
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {
-                        record_request(&state, StatusCode::OK.as_u16());
-                        return Ok(build_request_deadline_exceeded_response(
-                            true,
+                        grpc_probe_guard.disarm();
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            grpc_cb_probe_slot,
+                        );
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        return Ok(finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_buffered_grpc_upload",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
                             grpc_web_response_content_type,
-                            plugin_cache_view
-                                .initial_response_header_policy_plugins()
-                                .as_ref(),
-                        ));
+                        )
+                        .await);
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(error)) => {
                         (Err(error), Bytes::new())
@@ -20471,19 +20610,11 @@ async fn handle_proxy_request_inner(
     }
     let mut current_dispatch_h3 = !requires_response_stream_inspection
         && supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
-    // Client end-to-end gRPC deadline for a native-gRPC request riding the
-    // generic path (the mesh-mTLS relay; codex r2-2 finding 6). Parsed from
-    // the POST-PLUGIN outbound headers — the same view
-    // `proxy_grpc_request_streaming` parses after its proxy-header merge, so
-    // `before_proxy` plugins that add/replace/remove `grpc-timeout` are
-    // reflected. Captured HERE (pre-dispatch) because `proxy_headers` borrows
-    // `ctx.headers` and cannot outlive the `&mut ctx` plugin hooks below; the
-    // `StreamingH2` response arm anchors the absolute deadline at request
-    // receipt via `grpc_streaming_response_deadline`, exactly like the direct
-    // gRPC pool's streaming arm.
-    let grpc_request_deadline = request_uses_grpc_content_type
-        .then(|| ctx.grpc_deadline_at())
-        .flatten();
+    // Client end-to-end gRPC deadline for any gRPC-flavored request riding the
+    // generic path (native gRPC or gRPC-Web). The typed instant was anchored at
+    // receipt by policy preflight and survives representation/transport
+    // translation independently of the relative upstream header.
+    let grpc_request_deadline = ctx.grpc_deadline_at();
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
     let mut skip_final_cb_record = false;
@@ -21620,14 +21751,15 @@ async fn handle_proxy_request_inner(
 
     // A streaming deadline can replace an as-yet-unpolled backend body with a
     // differently sized gRPC-Web frame or native trailers. Strip the backend
-    // length before response headers are committed; the body builders below
-    // will then also receive `cl = None`.
+    // length before response headers are committed. H1/H2 builders below then
+    // receive `cl = None`; native-H3 keeps the backend length only for internal
+    // FIN/truncation validation, while the outer deadline wrapper suppresses
+    // that exact size hint so hyper cannot recreate a client Content-Length.
     let streaming_grpc_deadline = match &response_body {
-        ResponseBody::Streaming { .. } => ctx.grpc_deadline_at(),
-        ResponseBody::StreamingH2(_) if streaming_h2_native_grpc => grpc_request_deadline,
-        ResponseBody::Buffered(_)
+        ResponseBody::Streaming { .. }
         | ResponseBody::StreamingH2(_)
-        | ResponseBody::StreamingH3(_) => None,
+        | ResponseBody::StreamingH3(_) => ctx.grpc_deadline_at(),
+        ResponseBody::Buffered(_) => None,
     };
     strip_content_length_for_streaming_grpc_deadline(
         &mut response_headers,
@@ -21894,14 +22026,11 @@ async fn handle_proxy_request_inner(
             // client set no deadline.
             let effective_h2_read_timeout_ms =
                 streaming_h2_read_timeout_ms.unwrap_or(proxy.backend_read_timeout_ms);
-            let (h2_read_timeout_ms, h2_total_deadline) = if streaming_h2_native_grpc {
+            let (h2_read_timeout_ms, h2_total_deadline) =
                 grpc_proxy::grpc_streaming_response_deadline(
                     grpc_request_deadline,
                     effective_h2_read_timeout_ms,
-                )
-            } else {
-                (effective_h2_read_timeout_ms, None)
-            };
+                );
             let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
@@ -21909,7 +22038,7 @@ async fn handle_proxy_request_inner(
                     resp.into_body(),
                     cl,
                     h2_read_timeout_ms,
-                    h2_total_deadline,
+                    None,
                 )
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
@@ -21921,7 +22050,7 @@ async fn handle_proxy_request_inner(
                     cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
-                    h2_total_deadline,
+                    None,
                 )
             } else if use_passthrough {
                 // Response too large to benefit from coalescing — stream
@@ -21933,7 +22062,7 @@ async fn handle_proxy_request_inner(
                     resp.into_body(),
                     cl,
                     h2_read_timeout_ms,
-                    h2_total_deadline,
+                    None,
                 )
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -21941,7 +22070,7 @@ async fn handle_proxy_request_inner(
                     cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
-                    h2_total_deadline,
+                    None,
                 )
             };
             let mut body = if let Some(inspector) = response_inspector {
@@ -21957,6 +22086,16 @@ async fn handle_proxy_request_inner(
             } else {
                 body.with_lb_connection_guard(lb_connection_guard)
             };
+            // The absolute wrapper must observe the inspector's OUTPUT, not
+            // the backend frames it consumed. An inspector may hold a chunk by
+            // returning empty Forward; only bytes yielded by this outer body
+            // are client-visible for the clean-status-4 versus reset decision.
+            if let Some(deadline) = h2_total_deadline {
+                body = body.with_client_grpc_deadline(
+                    deadline,
+                    grpc_web_response_content_type,
+                );
+            }
             // Deferred admission/dispatch outcomes stay on the client-visible
             // body. The least-connections guard moves into the inspection task
             // on a hit so a client cancel cannot under-count a provider-blocked
@@ -22035,6 +22174,14 @@ async fn handle_proxy_request_inner(
             let success_on_drop_after_bytes =
                 h3_success_on_drop_after_response_bytes(inbound_version, client_content_length);
             let backend_content_length = streaming_h3_backend_content_length;
+            // Match the H2/native-H3 regime switch: a client RPC deadline is
+            // the sole response-phase timer. The outer wrapper below enforces
+            // it after inspection, so the inner per-frame idle timer is off.
+            let h3_read_timeout_ms = if grpc_request_deadline.is_some() {
+                0
+            } else {
+                proxy.backend_read_timeout_ms
+            };
             // Method + status thread into `H3FrameSource` so its graceful-close
             // recovery gate uses the same `is_response_body_complete` predicate
             // as the buffered path (HEAD/204/304 no-body responses included).
@@ -22049,7 +22196,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
-                    proxy.backend_read_timeout_ms,
+                    h3_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
@@ -22061,7 +22208,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
-                    proxy.backend_read_timeout_ms,
+                    h3_read_timeout_ms,
                 )
             } else {
                 crate::proxy::body::coalescing_h3_body(
@@ -22072,7 +22219,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
-                    proxy.backend_read_timeout_ms,
+                    h3_read_timeout_ms,
                 )
             };
             let mut body = if let Some(inspector) = response_inspector {
@@ -22088,6 +22235,12 @@ async fn handle_proxy_request_inner(
             } else {
                 body.with_lb_connection_guard(lb_connection_guard)
             };
+            if let Some(deadline) = grpc_request_deadline {
+                body = body.with_client_grpc_deadline(
+                    deadline,
+                    grpc_web_response_content_type,
+                );
+            }
             body = body.with_success_on_drop_after_response_bytes(success_on_drop_after_bytes);
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
@@ -25659,33 +25812,6 @@ fn build_request_body_timeout_response(
     build_response(
         StatusCode::REQUEST_TIMEOUT,
         r#"{"error":"Request body read timed out"}"#,
-    )
-}
-
-fn build_request_deadline_exceeded_response(
-    is_grpc_request: bool,
-    grpc_web_response_content_type: Option<&str>,
-    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
-) -> Response<ProxyBody> {
-    const MESSAGE: &str = GATEWAY_DEADLINE_EXCEEDED_MESSAGE;
-    if let Some(content_type) = grpc_web_response_content_type {
-        return build_grpc_web_error_response(
-            content_type,
-            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-            MESSAGE,
-            initial_response_header_policy_plugins,
-        );
-    }
-    if is_grpc_request {
-        return grpc_proxy::build_grpc_error_response_with_policy(
-            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
-            MESSAGE,
-            initial_response_header_policy_plugins,
-        );
-    }
-    build_response(
-        StatusCode::REQUEST_TIMEOUT,
-        r#"{"error":"Request deadline exceeded"}"#,
     )
 }
 

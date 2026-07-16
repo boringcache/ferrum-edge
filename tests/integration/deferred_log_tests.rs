@@ -685,3 +685,93 @@ async fn grpc_web_deadline_terminal_data_logs_deadline_exceeded() {
         "the delivered terminal gRPC-Web frame must log DEADLINE_EXCEEDED"
     );
 }
+
+struct HoldingResponseInspector {
+    saw_backend_chunk: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ResponseStreamInspector for HoldingResponseInspector {
+    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        self.saw_backend_chunk.notify_one();
+        ResponseStreamAction::Forward(Bytes::new())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_deadline_uses_bytes_emitted_after_stream_inspection() {
+    use futures_util::StreamExt as _;
+    use futures_util::stream;
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let source = stream::once(async {
+        Ok::<_, ferrum_edge::proxy::body::ProxyBodyError>(Frame::data(Bytes::from_static(
+            b"backend bytes held by inspector",
+        )))
+    })
+    .chain(stream::pending());
+    let backend_body = ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(
+        StreamBody::new(source),
+    ));
+    let saw_backend_chunk = Arc::new(tokio::sync::Notify::new());
+    let inspected = ferrum_edge::_test_support::inspected_proxy_body_for_test(
+        backend_body,
+        Box::new(HoldingResponseInspector {
+            saw_backend_chunk: Arc::clone(&saw_backend_chunk),
+        }),
+    );
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        saw_backend_chunk.notified(),
+    )
+    .await
+    .expect("inspector must consume and hold the backend chunk");
+
+    let deadline = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("one millisecond before now is representable");
+    let mut body = ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test(
+        inspected, deadline, None,
+    );
+    let frame = body
+        .frame()
+        .await
+        .expect("zero client-visible bytes must yield terminal deadline trailers")
+        .expect("deadline trailer frame must be readable");
+    let trailers = frame
+        .trailers_ref()
+        .expect("native gRPC deadline before emitted DATA uses trailers");
+    assert_eq!(
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("4")
+    );
+}
+
+#[tokio::test]
+async fn grpc_deadline_body_does_not_restore_stripped_content_length() {
+    use http_body_util::{BodyExt as _, Full};
+
+    let exact = Full::new(Bytes::from_static(b"backend representation")).map_err(
+        |never: std::convert::Infallible| -> ferrum_edge::proxy::body::ProxyBodyError {
+            match never {}
+        },
+    );
+    let body = ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(exact));
+    assert_eq!(body.size_hint().exact(), Some(22));
+
+    let deadline = tokio::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(1))
+        .expect("one second after now is representable");
+    let body = ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test(
+        body, deadline, None,
+    );
+    assert_eq!(
+        body.size_hint().exact(),
+        None,
+        "the deadline wrapper must not let hyper infer the backend Content-Length"
+    );
+}
