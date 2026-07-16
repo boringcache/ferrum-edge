@@ -1452,9 +1452,7 @@ async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
     // base64 Redis representation exceeds that limit and retains the owned
     // terminal in-flight lock.
     const LARGE_FUNCTION_BODY_LEN: usize = 800 * 1024;
-    let function_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let function_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let function_port = function_listener.local_addr().unwrap().port();
     let function_hits = Arc::new(AtomicUsize::new(0));
     let _function = start_counting_large_function_on(

@@ -666,11 +666,10 @@ fn test_response_buffering_skips_range_responses() {
             status,
             &no_range
         ));
-        assert!(plugin.should_release_response_body_before_content_type_rewrite(
-            &ctx,
-            status,
-            &no_range
-        ));
+        assert!(
+            plugin
+                .should_release_response_body_before_content_type_rewrite(&ctx, status, &no_range)
+        );
     }
 
     for status in [204, 205, 304] {
@@ -680,11 +679,10 @@ fn test_response_buffering_skips_range_responses() {
             status,
             &no_range
         ));
-        assert!(plugin.should_release_response_body_before_content_type_rewrite(
-            &ctx,
-            status,
-            &no_range
-        ));
+        assert!(
+            plugin
+                .should_release_response_body_before_content_type_rewrite(&ctx, status, &no_range)
+        );
     }
 
     // A Content-Range header on a non-206 status also opts out.
@@ -772,10 +770,7 @@ async fn test_skips_preserved_representation_responses() {
         resp_headers.insert("content-type".to_string(), "text/html".to_string());
         resp_headers.insert("content-length".to_string(), "100".to_string());
         if status == 206 {
-            resp_headers.insert(
-                "content-range".to_string(),
-                "bytes 0-99/5000".to_string(),
-            );
+            resp_headers.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
         } else {
             resp_headers.insert("im".to_string(), "vcdiff".to_string());
             resp_headers.insert("delta-base".to_string(), "\"version-1\"".to_string());

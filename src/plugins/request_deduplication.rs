@@ -596,7 +596,8 @@ impl RequestDeduplication {
                 cached,
                 fingerprint: cached_fingerprint,
                 ..
-            } = entry.value() else {
+            } = entry.value()
+            else {
                 return None;
             };
             if cached_fingerprint == fingerprint
@@ -1960,10 +1961,7 @@ impl Plugin for RequestDeduplication {
             return;
         }
 
-        let Some(state) = ctx
-            .request_deduplication_states
-            .remove(&self.instance_id)
-        else {
+        let Some(state) = ctx.request_deduplication_states.remove(&self.instance_id) else {
             return;
         };
 
@@ -2002,10 +2000,7 @@ impl Plugin for RequestDeduplication {
         // Only cache if this instance acquired a completion state in
         // `before_proxy`. Take it before any await so a later hook cannot reuse
         // or consume it a second time.
-        let state = match ctx
-            .request_deduplication_states
-            .remove(&self.instance_id)
-        {
+        let state = match ctx.request_deduplication_states.remove(&self.instance_id) {
             Some(state) => state,
             None => return PluginResult::Continue,
         };
@@ -2035,8 +2030,7 @@ impl Plugin for RequestDeduplication {
         {
             self.remove_matching_local_inflight(&key, &fingerprint, &local_inflight_owner_token);
             if let Some(token) = redis_lock_token.as_deref() {
-                self.redis_release_inflight(&key, &fingerprint, token)
-                    .await;
+                self.redis_release_inflight(&key, &fingerprint, token).await;
             }
             return PluginResult::Continue;
         }
@@ -2103,8 +2097,7 @@ impl Plugin for RequestDeduplication {
                                 &local_inflight_owner_token,
                             );
                             if let Some(token) = redis_lock_token.as_deref() {
-                                self.redis_release_inflight(&key, &fingerprint, token)
-                                    .await;
+                                self.redis_release_inflight(&key, &fingerprint, token).await;
                             }
                         }
                         RedisStoreAction::SkippedSize if !retain_inflight_on_storage_skip => {
@@ -2114,8 +2107,7 @@ impl Plugin for RequestDeduplication {
                                 &local_inflight_owner_token,
                             );
                             if let Some(token) = redis_lock_token.as_deref() {
-                                self.redis_release_inflight(&key, &fingerprint, token)
-                                    .await;
+                                self.redis_release_inflight(&key, &fingerprint, token).await;
                             }
                         }
                         // Nothing was retained locally. If Redis publication
@@ -2129,16 +2121,14 @@ impl Plugin for RequestDeduplication {
                 }
                 if !retain_inflight_on_storage_skip {
                     if let Some(token) = redis_lock_token.as_deref() {
-                        self.redis_release_inflight(&key, &fingerprint, token)
-                            .await;
+                        self.redis_release_inflight(&key, &fingerprint, token).await;
                     }
                 }
                 return PluginResult::Continue;
             }
             LocalCompletionAction::Stale => {
                 if let Some(token) = redis_lock_token.as_deref() {
-                    self.redis_release_inflight(&key, &fingerprint, token)
-                        .await;
+                    self.redis_release_inflight(&key, &fingerprint, token).await;
                 }
                 return PluginResult::Continue;
             }
@@ -2146,22 +2136,16 @@ impl Plugin for RequestDeduplication {
         // Also store in Redis if available. Release the distributed in-flight
         // lock only after the completed response is visible in Redis, so a peer
         // cannot miss both the lock and the replayable response.
-        let mut preserve_local_completion = self.redis_client.is_none()
-            && retain_inflight_on_storage_skip;
+        let mut preserve_local_completion =
+            self.redis_client.is_none() && retain_inflight_on_storage_skip;
         if self.redis_client.is_some() {
             match self.redis_set(&key, &fingerprint, &cached).await {
                 RedisStoreAction::Stored => {
                     // Redis now carries the replay, so ordinary LRU eviction is
                     // safe even for an externally executing terminal response.
-                    self.set_completed_inflight_retention(
-                        &key,
-                        &fingerprint,
-                        sequence,
-                        false,
-                    );
+                    self.set_completed_inflight_retention(&key, &fingerprint, sequence, false);
                     if let Some(token) = redis_lock_token.as_deref() {
-                        self.redis_release_inflight(&key, &fingerprint, token)
-                            .await;
+                        self.redis_release_inflight(&key, &fingerprint, token).await;
                     }
                 }
                 // The local replay is available, but a peer cannot see it. For
@@ -2172,15 +2156,9 @@ impl Plugin for RequestDeduplication {
                     preserve_local_completion = true;
                 }
                 RedisStoreAction::SkippedSize => {
-                    self.set_completed_inflight_retention(
-                        &key,
-                        &fingerprint,
-                        sequence,
-                        false,
-                    );
+                    self.set_completed_inflight_retention(&key, &fingerprint, sequence, false);
                     if let Some(token) = redis_lock_token.as_deref() {
-                        self.redis_release_inflight(&key, &fingerprint, token)
-                            .await;
+                        self.redis_release_inflight(&key, &fingerprint, token).await;
                     }
                 }
                 RedisStoreAction::Failed => {
@@ -2188,15 +2166,10 @@ impl Plugin for RequestDeduplication {
                     // in-flight lock, no distributed replay is known to exist.
                     // Keep the local replay when possible and retain a local
                     // tombstone if later capacity pressure must evict it.
-                    preserve_local_completion = retain_inflight_on_storage_skip
-                        || redis_lock_token.is_some();
+                    preserve_local_completion =
+                        retain_inflight_on_storage_skip || redis_lock_token.is_some();
                     if !preserve_local_completion {
-                        self.set_completed_inflight_retention(
-                            &key,
-                            &fingerprint,
-                            sequence,
-                            false,
-                        );
+                        self.set_completed_inflight_retention(&key, &fingerprint, sequence, false);
                     }
                 }
             }

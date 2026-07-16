@@ -3525,8 +3525,7 @@ async fn redact_args_findings_on_range_and_delta_responses_fail_closed() {
             }
         }
     }));
-    let governed =
-        response_with_tool_call("filesystem.write", "{\"token\":\"sk-SECRET123\"}");
+    let governed = response_with_tool_call("filesystem.write", "{\"token\":\"sk-SECRET123\"}");
     let clean = response_with_tool_call("filesystem.write", "{\"path\":\"/safe\"}");
 
     for status in [206, 226] {

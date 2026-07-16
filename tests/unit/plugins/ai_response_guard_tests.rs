@@ -2448,12 +2448,16 @@ async fn redaction_findings_on_range_and_delta_responses_fail_closed() {
             ),
             "status {status} forwarded governed bytes without an available redaction transform: {result:?}"
         );
-        assert!(governed_ctx
-            .metadata
-            .contains_key("ai_response_guard_rejected"));
-        assert!(!governed_ctx
-            .metadata
-            .contains_key("ai_response_guard_redacted"));
+        assert!(
+            governed_ctx
+                .metadata
+                .contains_key("ai_response_guard_rejected")
+        );
+        assert!(
+            !governed_ctx
+                .metadata
+                .contains_key("ai_response_guard_redacted")
+        );
 
         let mut clean_ctx = ctx_with_content_type("GET", "application/json");
         assert!(matches!(

@@ -1079,9 +1079,9 @@ impl FunctionDestination {
             self.sensitive_query_pairs
                 .iter()
                 .any(|sensitive| candidate == sensitive)
-                || self.sensitive_query_scalars().any(|component| {
-                    candidate.0 == component || candidate.1 == component
-                })
+                || self
+                    .sensitive_query_scalars()
+                    .any(|component| candidate.0 == component || candidate.1 == component)
         }) {
             return true;
         }
@@ -1095,18 +1095,14 @@ impl FunctionDestination {
         // silently treating uninspected nesting as safe.
         for (key, value) in &candidate_pairs {
             if self.nested_reference_exposes_destination(nested_uri_reference(key), depth)
-                || self.nested_reference_exposes_destination(
-                    nested_uri_reference(value),
-                    depth,
-                )
+                || self.nested_reference_exposes_destination(nested_uri_reference(value), depth)
             {
                 return true;
             }
         }
-        if self.nested_reference_exposes_destination(
-            nested_path_uri_reference(&candidate_path),
-            depth,
-        ) {
+        if self
+            .nested_reference_exposes_destination(nested_path_uri_reference(&candidate_path), depth)
+        {
             return true;
         }
         if let Some(fragment) = candidate.fragment() {
@@ -1123,13 +1119,10 @@ impl FunctionDestination {
             if self
                 .sensitive_path
                 .as_deref()
-                .is_some_and(|path| uri_component_contains_sequence(
-                    &decoded_fragment.value,
-                    path,
-                ))
-                || self.sensitive_query_scalars().any(|value| {
-                    uri_component_contains_sequence(&decoded_fragment.value, value)
-                })
+                .is_some_and(|path| uri_component_contains_sequence(&decoded_fragment.value, path))
+                || self
+                    .sensitive_query_scalars()
+                    .any(|value| uri_component_contains_sequence(&decoded_fragment.value, value))
             {
                 return true;
             }
@@ -1151,18 +1144,16 @@ impl FunctionDestination {
     /// instead; treating an empty value as "nothing sensitive" would let a
     /// redirect copy that token into another key, value, path, or fragment.
     fn sensitive_query_scalars(&self) -> impl Iterator<Item = &str> {
-        self.sensitive_query_pairs.iter().filter_map(|(key, value)| {
-            let component = if value.is_empty() { key } else { value };
-            let component = component.trim_matches('/');
-            (!component.is_empty()).then_some(component)
-        })
+        self.sensitive_query_pairs
+            .iter()
+            .filter_map(|(key, value)| {
+                let component = if value.is_empty() { key } else { value };
+                let component = component.trim_matches('/');
+                (!component.is_empty()).then_some(component)
+            })
     }
 
-    fn nested_reference_exposes_destination(
-        &self,
-        reference: Option<&str>,
-        depth: usize,
-    ) -> bool {
+    fn nested_reference_exposes_destination(&self, reference: Option<&str>, depth: usize) -> bool {
         let Some(reference) = reference else {
             return false;
         };
@@ -1743,9 +1734,8 @@ impl Plugin for ServerlessFunction {
             // distinguish an attempted externally executing terminal response
             // from other synthetic short-circuits that must not be cached.
             // Set it only after all plugin-local fail-closed inspection passes.
-            ctx.serverless_external_side_effect_owners.extend(
-                ctx.request_deduplication_states.keys().copied(),
-            );
+            ctx.serverless_external_side_effect_owners
+                .extend(ctx.request_deduplication_states.keys().copied());
         }
 
         let (status, response_headers, body) = match self.invoke(&payload, ctx).await {

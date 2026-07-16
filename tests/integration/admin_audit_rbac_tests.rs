@@ -552,12 +552,8 @@ async fn malformed_persisted_serverless_url_is_wholly_redacted_from_views_and_au
     let admin = token("security-admin", Some("admin"));
     let viewer = token("view-only", Some("viewer"));
 
-    let (status, viewer_body) = get_json(
-        &base,
-        &format!("/plugins/config/{plugin_id}"),
-        &viewer,
-    )
-    .await;
+    let (status, viewer_body) =
+        get_json(&base, &format!("/plugins/config/{plugin_id}"), &viewer).await;
     assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
     assert_eq!(viewer_body["config"]["function_url"], "[REDACTED]");
     assert!(!viewer_body.to_string().contains(nested_secret));

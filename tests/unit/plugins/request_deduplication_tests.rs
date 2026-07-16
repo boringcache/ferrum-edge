@@ -3,9 +3,8 @@ use ferrum_edge::_test_support::{
     request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_inflight_entries_for_test,
-    request_deduplication_request_identity_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
-    request_deduplication_redis_payload_for_test,
+    request_deduplication_redis_payload_for_test, request_deduplication_request_identity_for_test,
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
@@ -545,17 +544,15 @@ async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
         ));
     }
 
-    let (status, response_headers, body) = match serverless
-        .before_proxy(&mut ctx, &mut headers)
-        .await
-    {
-        PluginResult::RejectBinary {
-            status_code,
-            headers,
-            body,
-        } => (status_code, headers, body),
-        other => panic!("expected terminal serverless response, got {other:?}"),
-    };
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected terminal serverless response, got {other:?}"),
+        };
     assert_eq!(status, 503);
 
     // The ordinary final-body phase must leave both owners pending until the
@@ -645,9 +642,7 @@ async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
     let mut first_headers =
         HashMap::from([("idempotency-key".to_string(), "terminal-a".to_string())]);
     assert!(matches!(
-        dedup
-            .before_proxy(&mut first_ctx, &mut first_headers)
-            .await,
+        dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
         PluginResult::Continue
     ));
     let (status, response_headers, body) = match serverless

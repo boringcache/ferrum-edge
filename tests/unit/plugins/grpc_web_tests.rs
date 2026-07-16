@@ -684,11 +684,13 @@ async fn test_preserved_statuses_keep_native_headers_and_release_buffering() {
             status,
             &response_headers
         ));
-        assert!(plugin.should_release_response_body_before_content_type_rewrite(
-            &ctx,
-            status,
-            &response_headers
-        ));
+        assert!(
+            plugin.should_release_response_body_before_content_type_rewrite(
+                &ctx,
+                status,
+                &response_headers
+            )
+        );
         assert!(matches!(
             plugin
                 .after_proxy(&mut ctx, status, &mut response_headers)

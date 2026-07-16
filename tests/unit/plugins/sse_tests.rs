@@ -529,11 +529,9 @@ async fn test_preserved_non_sse_response_is_not_relabelled_without_body_wrap() {
             status,
             &headers
         ));
-        assert!(plugin.should_release_response_body_before_content_type_rewrite(
-            &ctx,
-            status,
-            &headers
-        ));
+        assert!(
+            plugin.should_release_response_body_before_content_type_rewrite(&ctx, status, &headers)
+        );
         plugin.after_proxy(&mut ctx, status, &mut headers).await;
 
         assert_eq!(

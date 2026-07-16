@@ -67,12 +67,12 @@ async fn start_function_server(port: u16, invocations: Arc<AtomicUsize>) {
                 let request = String::from_utf8_lossy(&buf[..n]);
                 let is_governed_partial_response =
                     request.contains(r#""path":"/fn/range-governed""#);
-                let is_governed_delta_response =
-                    request.contains(r#""path":"/fn/delta-governed""#);
+                let is_governed_delta_response = request.contains(r#""path":"/fn/delta-governed""#);
                 let is_partial_response = request.contains(r#""path":"/fn/range""#);
                 let is_delta_response = request.contains(r#""path":"/fn/delta""#);
                 let response = if is_governed_partial_response {
-                    let body = r#"{"choices":[{"message":{"content":"contact secret@example.com"}}]}"#;
+                    let body =
+                        r#"{"choices":[{"message":{"content":"contact secret@example.com"}}]}"#;
                     format!(
                         "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Type: application/json\r\nContent-Range: bytes 0-66/100\r\nAccept-Ranges: bytes\r\nETag: \"partial-sensitive-v1\"\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -582,10 +582,7 @@ upstreams: []
     assert_eq!(function_invocations.load(Ordering::SeqCst), 5);
 
     let governed_partial = client
-        .get(format!(
-            "http://127.0.0.1:{}/fn/range-governed",
-            proxy_port
-        ))
+        .get(format!("http://127.0.0.1:{}/fn/range-governed", proxy_port))
         .send()
         .await
         .expect("governed partial response request failed");
@@ -597,10 +594,7 @@ upstreams: []
     assert_eq!(function_invocations.load(Ordering::SeqCst), 6);
 
     let governed_delta = client
-        .get(format!(
-            "http://127.0.0.1:{}/fn/delta-governed",
-            proxy_port
-        ))
+        .get(format!("http://127.0.0.1:{}/fn/delta-governed", proxy_port))
         .send()
         .await
         .expect("governed delta response request failed");

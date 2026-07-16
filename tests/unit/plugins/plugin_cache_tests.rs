@@ -1352,11 +1352,7 @@ fn terminate_serverless_must_run_after_every_request_deduplication_instance() {
         );
         serverless.priority_override = Some(serverless_priority);
         let config = make_config(
-            vec![make_proxy(
-                "p1",
-                "/api",
-                vec!["dedup", "terminal-function"],
-            )],
+            vec![make_proxy("p1", "/api", vec!["dedup", "terminal-function"])],
             vec![
                 make_plugin_config(
                     "dedup",
@@ -1380,11 +1376,7 @@ fn terminate_serverless_must_run_after_every_request_deduplication_instance() {
 #[test]
 fn safe_serverless_dedup_order_and_pre_proxy_override_are_admitted() {
     let terminate_default = make_config(
-        vec![make_proxy(
-            "p1",
-            "/api",
-            vec!["dedup", "terminal-function"],
-        )],
+        vec![make_proxy("p1", "/api", vec!["dedup", "terminal-function"])],
         vec![
             make_plugin_config(
                 "dedup",
@@ -1421,11 +1413,7 @@ fn safe_serverless_dedup_order_and_pre_proxy_override_are_admitted() {
     );
     pre_proxy.priority_override = Some(2700);
     let pre_proxy_config = make_config(
-        vec![make_proxy(
-            "p1",
-            "/api",
-            vec!["dedup", "policy-function"],
-        )],
+        vec![make_proxy("p1", "/api", vec!["dedup", "policy-function"])],
         vec![
             make_plugin_config(
                 "dedup",

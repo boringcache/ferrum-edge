@@ -1326,10 +1326,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             | "benign-key-only-query-lookalike" => {
                 format!("{}/signed%2Ftrigger?SIGNED_TOKEN=", server.uri())
             }
-            _ => format!(
-                "{}/signed%2Ftrigger?code=secret%2Fvalue",
-                server.uri()
-            ),
+            _ => format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri()),
         };
         let location = match case {
             "relative-query" => "?code=secret%2Fvalue".to_string(),
@@ -1381,9 +1378,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "renamed-query-other-host" => {
                 "https://redirect.example/next?leak=secret%2Fvalue".to_string()
             }
-            "copied-query-path-other-host" => {
-                "https://redirect.example/secret/value".to_string()
-            }
+            "copied-query-path-other-host" => "https://redirect.example/secret/value".to_string(),
             "copied-query-path-parameter" => {
                 "https://redirect.example/next;leak=secret/value".to_string()
             }
@@ -1396,30 +1391,20 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "key-only-query-copied-key" => {
                 "https://redirect.example/next?SIGNED_TOKEN=other".to_string()
             }
-            "key-only-query-path" => {
-                "https://redirect.example/next;leak=SIGNED_TOKEN".to_string()
-            }
-            "key-only-query-fragment" => {
-                "https://redirect.example/#leak=SIGNED_TOKEN".to_string()
-            }
+            "key-only-query-path" => "https://redirect.example/next;leak=SIGNED_TOKEN".to_string(),
+            "key-only-query-fragment" => "https://redirect.example/#leak=SIGNED_TOKEN".to_string(),
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }
             "encoded-plus-literal-candidate" => {
                 "https://redirect.example/next?leak=token+part".to_string()
             }
-            "fragment-query-scalar" => {
-                "https://redirect.example/#secret/value".to_string()
-            }
+            "fragment-query-scalar" => "https://redirect.example/#secret/value".to_string(),
             "fragment-query-pair-scalar" => {
                 "https://redirect.example/#leak=secret/value".to_string()
             }
-            "fragment-path-scalar" => {
-                "https://redirect.example/#signed/trigger".to_string()
-            }
-            "fragment-double-encoded" => {
-                "https://redirect.example/#secret%252Fvalue".to_string()
-            }
+            "fragment-path-scalar" => "https://redirect.example/#signed/trigger".to_string(),
+            "fragment-double-encoded" => "https://redirect.example/#secret%252Fvalue".to_string(),
             "malformed" => "http://[signed%2Ftrigger?code=secret%2Fvalue".to_string(),
             "userinfo" => "https://user:password@redirect.example/next".to_string(),
             "benign-relative" => "/next".to_string(),
@@ -1449,9 +1434,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "benign-fragment-lookalike" => {
                 "https://redirect.example/#secret/value-extra".to_string()
             }
-            "benign-fragment-label" => {
-                "https://redirect.example/#release-notes".to_string()
-            }
+            "benign-fragment-label" => "https://redirect.example/#release-notes".to_string(),
             _ => unreachable!(),
         };
         let should_strip = !case.starts_with("benign-");
@@ -1635,10 +1618,7 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
         "benign-link-path-lookalike",
     ] {
         let server = MockServer::start().await;
-        let function_url = format!(
-            "{}/signed%2Ftrigger?code=secret%2Fvalue",
-            server.uri()
-        );
+        let function_url = format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri());
         let encoded_function_url: String =
             url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
         let (header, value, should_strip) = match case {
