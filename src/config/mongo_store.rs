@@ -1675,7 +1675,7 @@ mod inner {
             let prior_conflicts = if allow_existing_conflicts {
                 candidate.mtls_dns_identity_conflicts()
             } else {
-                Vec::new()
+                Default::default()
             };
             mutate(&mut candidate);
             candidate.normalize_fields();
