@@ -6,9 +6,11 @@
 //!
 //! Runs in the `before_proxy` phase for HTTP-family requests so it fires after
 //! authentication, authorization, and consumer rate limiting but before backend
-//! dispatch. Stream proxies run the same fault decision in `on_stream_connect`;
-//! stream rejects close the connection/session and do not deliver HTTP status
-//! bodies to clients.
+//! dispatch. When backend-effective path policy is active, the HTTP hook waits
+//! until the resolved backend path has been authorized, so a delay or abort
+//! cannot precede the route-sensitive denial. Stream proxies run the same fault
+//! decision in `on_stream_connect`; stream rejects close the connection/session
+//! and do not deliver HTTP status bodies to clients.
 //!
 //! ## Config
 //!
@@ -327,6 +329,10 @@ impl Plugin for FaultInjectionPlugin {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         NON_UDP_PROTOCOLS
+    }
+
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        true
     }
 
     async fn before_proxy(

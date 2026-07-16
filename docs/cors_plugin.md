@@ -4,7 +4,7 @@ This document explains how to configure the Cross-Origin Resource Sharing (CORS)
 
 ## Overview
 
-The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS) at the gateway level, so backend services do not need to implement CORS themselves. It intercepts preflight `OPTIONS` requests, validates origins and methods, and injects the required `Access-Control-*` response headers on actual cross-origin requests.
+The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS) at the gateway level, so backend services do not need to implement CORS themselves. It intercepts preflight `OPTIONS` requests, validates origins and methods, and injects the required `Access-Control-*` response headers on actual cross-origin HTTP and gRPC-Web requests.
 
 ### What the plugin does
 
