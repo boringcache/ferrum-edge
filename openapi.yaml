@@ -2438,7 +2438,9 @@ paths:
         Returns the merged runtime overlay built from every
         `envoy.service.runtime.v3.Runtime` layer the mesh xDS client has
         received. Each layer's top-level fields are flattened into a single
-        keyed map; later layers override earlier ones on key conflicts.
+        keyed map. Runtime resources are sorted lexicographically by name;
+        later names override earlier ones on key conflicts, and duplicate
+        names are rejected without replacing the last accepted set.
 
         Field values are typed:
         - `number` — `f64`
@@ -2448,11 +2450,10 @@ paths:
           Envoy `FractionalPercent` (`denominator` is one of `hundred`,
           `ten_thousand`, `million`)
 
-        Every proxy-accepted slice fans the overlay out to three live consumers:
+        Every proxy-accepted slice publishes the overlay to live consumers:
         - `ferrum.fault_injection.<scope>.abort_percent` /
-          `.delay_percent` rewires fault injection percentages on
-          `fault_injection` plugins that declared the matching
-          `runtime_overlay_scope`.
+          `.delay_percent` are captured atomically in the request epoch of
+          `fault_injection` plugins that declared the matching scope.
         - `ferrum.request_transformer.<scope>.enabled` /
           `ferrum.response_transformer.<scope>.enabled` short-circuit the
           opted-in header / query / body transformers.
@@ -12581,11 +12582,11 @@ components:
                         type: integer
                         format: uint64
                         minimum: 1
-                        maximum: 3600000
+                        maximum: 60000
                         description: |
                           Sleep duration in milliseconds before dispatch
                           when the percentile roll hits. Bounded to
-                          `[1, 3_600_000]` (1 ms to 1 hour).
+                          `[1, 60_000]` (1 ms to 1 minute).
                       percentage:
                         type: number
                         format: double
@@ -12594,7 +12595,10 @@ components:
                         description: |
                           Percent of matching requests that trigger the
                           delay. `0.0` is rejected at config load time
-                          (omit the action to disable it instead).
+                          (omit the action to disable it instead). Positive
+                          values below one 64-bit sampler bucket round up
+                          to that first bucket so every accepted value can
+                          trigger.
                   abort:
                     type: object
                     additionalProperties: false
@@ -12609,17 +12613,20 @@ components:
                         format: double
                         exclusiveMinimum: 0
                         maximum: 100
+                        description: |
+                          Percent of matching requests that abort. Positive
+                          values below one 64-bit sampler bucket round up to
+                          that first bucket so every accepted value can trigger.
                       grpc_status:
                         type: integer
                         minimum: 0
                         maximum: 16
                         description: |
                           Optional gRPC status code emitted only when the
-                          matching request is detected as gRPC
-                          (`content-type: application/grpc[+...]`,
-                          excluding `application/grpc-web*`). Plain-HTTP
-                          requests on the same rule never receive a
-                          stray `grpc-status` header.
+                          immutable pre-plugin request flavor is native
+                          gRPC. Plain HTTP, WebSocket, and gRPC-Web requests
+                          never receive a stray `grpc-status` header even if
+                          an earlier hook rewrites `content-type`.
                       body:
                         type: [string, "null"]
                         description: Optional response body; empty when omitted.
@@ -13580,7 +13587,7 @@ components:
           format: uint64
           default: 10000
           minimum: 1
-          description: Maximum number of distinct target keys this stable plugin policy will track, bounding limiter memory for high-cardinality wildcard upstreams. State is retained across compatible config reloads; lowering this value or changing the policy's effective subset-filtered backend targets, route-override destinations, or route execution order drains live permits and resets tracked target state before the new key space takes effect. Service-discovery changes outside the policy's selected subset remain compatible. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503) until the policy is removed/recreated, its route key space changes, or the process restarts. Existing keys continue to be admitted subject to their adaptive limit.
+          description: Maximum number of distinct target keys this stable plugin policy will track, bounding limiter memory for high-cardinality wildcard upstreams. State is retained across compatible config reloads. Lowering this value or changing the policy's effective subset-filtered backend targets, route-override destinations, or route execution order publishes an independent tracking space; retired permits finish against detached state, while retired cache and load-balancer views cannot admit, repopulate, or train the replacement. Service-discovery changes outside the policy's selected subset remain compatible. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503) until the policy is removed/recreated, its route key space changes, or the process restarts. Existing keys continue to be admitted subject to their adaptive limit.
         min_limit:
           type: integer
           format: uint64
@@ -13627,11 +13634,11 @@ components:
         shadow_mode:
           type: boolean
           default: false
-          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit.
+          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. Retired cache/load-balancer views and requests crossing a structural generation handoff still fail closed so they cannot repopulate the replacement tracking space.
         expose_headers:
           type: boolean
           default: false
-          description: Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on rejection responses.
+          description: Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Generation-handoff rejections omit them because no truthful per-target limit or in-flight value exists.
 
     IpRestrictionConfig:
       type: object
@@ -14682,10 +14689,10 @@ components:
     FaultInjectionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; stream faults run on stream connect."
+      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; raw TCP faults run on stream connect. UDP and DTLS are not supported."
       properties:
         abort:
-          type: object
+          type: [object, "null"]
           additionalProperties: false
           properties:
             status_code:
@@ -14697,36 +14704,52 @@ components:
               type: number
               exclusiveMinimum: 0
               maximum: 100
-              description: Abort probability as a percentage
+              description: Abort probability as a percentage. Positive values below one 64-bit sampler bucket round up to that first bucket.
             grpc_status:
               type: integer
               minimum: 0
               maximum: 16
-              description: Optional gRPC status trailer emitted for gRPC rejects
+              description: Optional gRPC status emitted only for native application/grpc requests; plain HTTP, WebSocket, and gRPC-Web rejects omit it
             body:
               type: string
               default: ""
               description: HTTP response body returned with the abort
           required: [status_code, percentage]
         delay:
-          type: object
+          type: [object, "null"]
           additionalProperties: false
           properties:
             duration_ms:
               type: integer
               format: uint64
               minimum: 1
-              maximum: 3600000
-              description: Delay duration before continuing or aborting
+              maximum: 60000
+              description: Delay duration before continuing or aborting, capped at one minute
             percentage:
               type: number
               exclusiveMinimum: 0
               maximum: 100
-              description: Delay probability as a percentage
+              description: Delay probability as a percentage. Positive values below one 64-bit sampler bucket round up to that first bucket.
           required: [duration_ms, percentage]
+        runtime_overlay_scope:
+          type: [string, "null"]
+          pattern: '\S'
+          description: |
+            Optional RTDS scope containing at least one non-whitespace
+            character; null is equivalent to omission, and leading and
+            trailing whitespace is trimmed. The accepted request epoch captures
+            `ferrum.fault_injection.<scope>.abort_percent` and `.delay_percent`
+            atomically with this plugin config. Missing or malformed keys fall
+            back independently to the static percentage.
       anyOf:
         - required: [abort]
+          properties:
+            abort:
+              type: object
         - required: [delay]
+          properties:
+            delay:
+              type: object
 
     BodyValidatorConfig:
       type: object

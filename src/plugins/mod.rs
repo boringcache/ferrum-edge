@@ -118,8 +118,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, Proxy, ResolvedPortOverride,
-    RetryConfig, Upstream, UpstreamTarget,
+    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, HttpFlavor, Proxy,
+    ResolvedPortOverride, RetryConfig, Upstream, UpstreamTarget,
 };
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
@@ -730,6 +730,10 @@ pub struct RequestContext {
     /// cheap; the live request uses `Arc::make_mut` after the clone is dropped.
     buffered_initial_response_header_policy_state:
         Option<Arc<BufferedInitialResponseHeaderPolicyState>>,
+    /// Client-visible HTTP flavor classified before any plugin hook can mutate
+    /// request headers. Fault rejection shaping consults this fixed value so a
+    /// transformer cannot add or remove native-gRPC semantics mid-pipeline.
+    request_http_flavor: HttpFlavor,
     /// Whether client-visible rejection responses for this request cross a
     /// WebSocket handshake boundary. Set once after request-flavor detection so
     /// the shared reject finalizer can remove transport-owned handshake fields
@@ -1092,6 +1096,7 @@ impl RequestContext {
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
+            request_http_flavor: HttpFlavor::Plain,
             websocket_response_boundary: false,
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
@@ -1257,6 +1262,7 @@ impl RequestContext {
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             buffered_initial_response_header_policy_state: None,
+            request_http_flavor: self.request_http_flavor,
             websocket_response_boundary: self.websocket_response_boundary,
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
@@ -1334,6 +1340,15 @@ impl RequestContext {
 
     pub(crate) fn set_websocket_response_boundary(&mut self, enabled: bool) {
         self.websocket_response_boundary = enabled;
+    }
+
+    pub(crate) fn set_request_http_flavor(&mut self, flavor: HttpFlavor) {
+        self.request_http_flavor = flavor;
+        self.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
+    }
+
+    pub(crate) fn is_native_grpc_request(&self) -> bool {
+        matches!(self.request_http_flavor, HttpFlavor::Grpc)
     }
 
     pub(crate) fn has_websocket_response_boundary(&self) -> bool {

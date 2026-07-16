@@ -4086,17 +4086,15 @@ pub(crate) fn normalize_mesh_policy_header_map(headers: &mut HashMap<String, Str
 ///
 /// The overlay is carried verbatim on
 /// [`crate::modes::mesh::slice::MeshSlice`]; operators inspect it via
-/// `GET /mesh/runtime-overlay`. Every slice install fans the overlay out to
-/// three live consumers via
+/// `GET /mesh/runtime-overlay`. Fault-injection percentages are captured in
+/// the same plugin cache / request epoch as the config they modify
+/// ([`crate::plugins::fault_injection::runtime_overlay`]). Accepted slices also
+/// fan the remaining process-wide knobs out through
 /// [`crate::modes::mesh::runtime_overlay_consumers::apply_overlay`]:
-/// fault-injection percentages
-/// ([`crate::plugins::fault_injection::runtime_overlay`]), request/response
-/// transformer gates
+/// request/response transformer gates
 /// ([`crate::plugins::request_transformer::runtime_overlay`],
 /// [`crate::plugins::response_transformer::runtime_overlay`]), and the
-/// gateway-wide tracing filter
-/// ([`crate::logging::runtime_overlay`]). Adding a new consumer is a single
-/// `apply_*` call from `runtime_overlay_consumers`.
+/// gateway-wide tracing filter ([`crate::logging::runtime_overlay`]).
 ///
 /// Wire compatibility: the type is an optional field on `MeshSlice` with
 /// `#[serde(default, skip_serializing_if = "MeshRuntimeOverlay::is_empty")]`,
