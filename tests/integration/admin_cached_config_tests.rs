@@ -1896,10 +1896,7 @@ async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
     for (index, (unknown_key, config)) in [
         ("compress_role", json!({"compress_role": ["system"]})),
         ("target_rato", json!({"target_rato": 0.9})),
-        (
-            "min_content_token",
-            json!({"min_content_token": 10}),
-        ),
+        ("min_content_token", json!({"min_content_token": 10})),
         ("max_scan_byte", json!({"max_scan_byte": 4096})),
         ("preserve_tags", json!({"preserve_tags": "keep"})),
     ]

@@ -25,10 +25,7 @@ fn json_headers() -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert(":method".to_string(), "POST".to_string());
-    headers.insert(
-        ":path".to_string(),
-        "/v1/chat/completions".to_string(),
-    );
+    headers.insert(":path".to_string(), "/v1/chat/completions".to_string());
     headers
 }
 
@@ -70,11 +67,7 @@ async fn transform(plugin: &AiPromptCompressor, body: &Value) -> Option<Value> {
     transform_at_path(plugin, body, "/v1/chat/completions").await
 }
 
-async fn transform_at_path(
-    plugin: &AiPromptCompressor,
-    body: &Value,
-    path: &str,
-) -> Option<Value> {
+async fn transform_at_path(plugin: &AiPromptCompressor, body: &Value, path: &str) -> Option<Value> {
     let bytes = serde_json::to_vec(body).unwrap();
     let mut headers = json_headers();
     headers.insert(":path".to_string(), path.to_string());
@@ -618,11 +611,7 @@ async fn successful_rewrite_reserializes_complete_json_body() {
         serde_json::to_string(&long_prompt_text()).unwrap()
     );
     let output = plugin
-        .transform_request_body(
-            raw.as_bytes(),
-            Some("application/json"),
-            &json_headers(),
-        )
+        .transform_request_body(raw.as_bytes(), Some("application/json"), &json_headers())
         .await
         .expect("eligible field should be rewritten");
     let output_text = String::from_utf8(output).unwrap();
@@ -762,8 +751,7 @@ async fn before_proxy_rewrites_metadata_and_records_stats() {
         Some("1")
     );
     assert!(ctx.metadata.keys().any(|key| {
-        key.starts_with("ai_prompt_compressor.instances.")
-            && key.ends_with(".tokens_saved")
+        key.starts_with("ai_prompt_compressor.instances.") && key.ends_with(".tokens_saved")
     }));
 }
 
@@ -812,12 +800,7 @@ async fn multiple_instances_keep_distinct_final_wire_stats() {
     assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
     assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
     let first_wire = first
-        .transform_request_body_with_context(
-            &mut ctx,
-            &raw,
-            Some("application/json"),
-            &headers,
-        )
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
         .await
         .expect("first instance should compress");
     let _final_wire = second
@@ -834,8 +817,7 @@ async fn multiple_instances_keep_distinct_final_wire_stats() {
         .metadata
         .iter()
         .filter(|(key, _)| {
-            key.starts_with("ai_prompt_compressor.instances.")
-                && key.ends_with(".tokens_saved")
+            key.starts_with("ai_prompt_compressor.instances.") && key.ends_with(".tokens_saved")
         })
         .map(|(_, value)| value)
         .collect();
@@ -858,10 +840,8 @@ async fn decompressed_gzip_and_brotli_record_authoritative_wire_stats() {
         let body = chat_body("user", &long_prompt_text());
         let plaintext = serde_json::to_vec(&body).unwrap();
         let encoded = if encoding == "gzip" {
-            let mut encoder = flate2::write::GzEncoder::new(
-                Vec::new(),
-                flate2::Compression::default(),
-            );
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             encoder.write_all(&plaintext).unwrap();
             encoder.finish().unwrap()
         } else {
@@ -899,10 +879,7 @@ async fn decompressed_gzip_and_brotli_record_authoritative_wire_stats() {
             .expect("decoded prompt should compress");
 
         let parsed: Value = serde_json::from_slice(&compressed).unwrap();
-        assert!(
-            first_message_content(&parsed).chars().count()
-                < long_prompt_text().chars().count()
-        );
+        assert!(first_message_content(&parsed).chars().count() < long_prompt_text().chars().count());
         assert!(
             ctx.metadata["ai_prompt_compressor.tokens_saved"]
                 .parse::<usize>()

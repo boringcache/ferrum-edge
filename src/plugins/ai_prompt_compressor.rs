@@ -322,10 +322,7 @@ impl AiPromptCompressor {
         // JSON parsing, token scoring, and serialization are CPU work. Keep
         // them off Tokio request executors and admit a process-wide bounded
         // number of jobs before cloning the already-buffered input.
-        let permit = Arc::clone(&COMPRESSION_BUDGET)
-            .acquire_owned()
-            .await
-            .ok()?;
+        let permit = Arc::clone(&COMPRESSION_BUDGET).acquire_owned().await.ok()?;
         let worker = self.clone();
         let body = body.to_vec();
         let request_path = request_path.map(str::to_owned);
@@ -368,10 +365,7 @@ impl AiPromptCompressor {
         if body.len() > self.max_scan_bytes || body.len() > HARD_MAX_SCAN_BYTES {
             return None;
         }
-        let permit = Arc::clone(&COMPRESSION_BUDGET)
-            .acquire_owned()
-            .await
-            .ok()?;
+        let permit = Arc::clone(&COMPRESSION_BUDGET).acquire_owned().await.ok()?;
         let body = body.to_vec();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -455,11 +449,7 @@ impl AiPromptCompressor {
 
     /// Walk the admitted request family, compressing eligible prompt text in
     /// place and accumulating token stats. `None` aborts the whole rewrite.
-    fn compress_json(
-        &self,
-        json: &mut Value,
-        family: RequestFamily,
-    ) -> Option<CompressionStats> {
+    fn compress_json(&self, json: &mut Value, family: RequestFamily) -> Option<CompressionStats> {
         let mut stats = CompressionStats::default();
 
         match family {
@@ -471,9 +461,7 @@ impl AiPromptCompressor {
                         .get("role")
                         .and_then(Value::as_str)
                         .is_some_and(|role| self.role_is_eligible(role));
-                    if role_eligible
-                        && let Some(content) = message.get_mut("content")
-                    {
+                    if role_eligible && let Some(content) = message.get_mut("content") {
                         self.compress_content(content, true, &mut stats).ok()?;
                     }
                 }
@@ -587,11 +575,7 @@ impl AiPromptCompressor {
     /// internal whitespace is retained, only the markers are stripped. A single
     /// separating space is inserted at a boundary only when needed to avoid
     /// gluing two adjacent non-whitespace characters.
-    fn compress_with_preserve(
-        &self,
-        text: &str,
-        tags: &(String, String),
-    ) -> Result<String, ()> {
+    fn compress_with_preserve(&self, text: &str, tags: &(String, String)) -> Result<String, ()> {
         let (open, close) = tags;
         let mut out = String::with_capacity(text.len());
         let mut depth = 0usize;
@@ -612,11 +596,9 @@ impl AiPromptCompressor {
 
             if opening {
                 if depth == 0 {
-                    let compressed = statistical_compress(
-                        &text[segment_start..marker_start],
-                        self.target_ratio,
-                    )
-                    .ok_or(())?;
+                    let compressed =
+                        statistical_compress(&text[segment_start..marker_start], self.target_ratio)
+                            .ok_or(())?;
                     append_segment(&mut out, &compressed);
                     preserved_started = false;
                 } else {
@@ -650,11 +632,7 @@ impl AiPromptCompressor {
                 statistical_compress(&text[segment_start..], self.target_ratio).ok_or(())?;
             append_segment(&mut out, &compressed);
         } else {
-            append_preserved_piece(
-                &mut out,
-                &text[segment_start..],
-                &mut preserved_started,
-            );
+            append_preserved_piece(&mut out, &text[segment_start..], &mut preserved_started);
         }
 
         Ok(out)
@@ -914,9 +892,7 @@ impl Plugin for AiPromptCompressor {
         }
         let source_len = body.len();
 
-        if let Some(compression) = self
-            .compress_body(body.as_bytes(), Some(&ctx.path))
-            .await
+        if let Some(compression) = self.compress_body(body.as_bytes(), Some(&ctx.path)).await
             && let Ok(serialized) = String::from_utf8(compression.output.clone())
         {
             ctx.metadata.insert("request_body".to_string(), serialized);
@@ -984,9 +960,7 @@ impl Plugin for AiPromptCompressor {
 
         if content_type.is_some_and(is_json_content_type)
             && !has_non_identity_content_encoding(request_headers)
-            && let Some(staged) = ctx
-                .ai_prompt_compressor_staged
-                .remove(&self.instance_id)
+            && let Some(staged) = ctx.ai_prompt_compressor_staged.remove(&self.instance_id)
         {
             if body.len() == staged.source_len
                 && self.body_digest(body).await == Some(staged.source_sha256)
@@ -1094,9 +1068,7 @@ fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
     match config.get(field) {
         None => Ok(None),
-        Some(Value::Null) => Err(format!(
-            "ai_prompt_compressor: '{field}' must not be null"
-        )),
+        Some(Value::Null) => Err(format!("ai_prompt_compressor: '{field}' must not be null")),
         Some(value) => value
             .as_str()
             .map(Some)
@@ -1107,9 +1079,7 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
 fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec<String>>, String> {
     match config.get(field) {
         None => Ok(None),
-        Some(Value::Null) => Err(format!(
-            "ai_prompt_compressor: '{field}' must not be null"
-        )),
+        Some(Value::Null) => Err(format!("ai_prompt_compressor: '{field}' must not be null")),
         Some(value) => {
             let array = value
                 .as_array()
@@ -1129,9 +1099,7 @@ fn optional_string_vec(config: &Value, field: &'static str) -> Result<Option<Vec
 fn optional_usize(config: &Value, field: &'static str) -> Result<Option<usize>, String> {
     match config.get(field) {
         None => Ok(None),
-        Some(Value::Null) => Err(format!(
-            "ai_prompt_compressor: '{field}' must not be null"
-        )),
+        Some(Value::Null) => Err(format!("ai_prompt_compressor: '{field}' must not be null")),
         Some(value) => {
             let number = value.as_u64().ok_or_else(|| {
                 format!("ai_prompt_compressor: '{field}' must be a non-negative integer")
@@ -1207,7 +1175,11 @@ fn statistical_compress(text: &str, ratio: f64) -> Option<String> {
     // clause ("It is not urgent. Delete logs" => "not Delete logs"), so the
     // candidate word immediately after a negation is critical too.
     let mut force_next = false;
-    for (i, token) in tokens.iter().enumerate().filter(|(_, token)| !token.verbatim) {
+    for (i, token) in tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| !token.verbatim)
+    {
         let negation = is_negation(token.core);
         if negation || force_next {
             keep[i] = true;
@@ -1249,11 +1221,7 @@ fn statistical_compress(text: &str, ratio: f64) -> Option<String> {
 
 /// Compute an importance score for a candidate word. Higher = more likely kept.
 fn word_score(token: &Token<'_>, freq: &HashMap<&str, u32>) -> f32 {
-    let mut score = if is_stopword(token.core) {
-        0.0
-    } else {
-        1.0
-    };
+    let mut score = if is_stopword(token.core) { 0.0 } else { 1.0 };
     // Longer words tend to carry more meaning (capped so one long word can't
     // dominate).
     let len = token.core.chars().count().min(12) as f32;
@@ -1471,14 +1439,13 @@ fn reconstruct(tokens: &[Token<'_>], keep: &[bool]) -> String {
 /// Common English stop words — low base importance, dropped first.
 fn is_stopword(word: &str) -> bool {
     const WORDS: &[&str] = &[
-        "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can",
-        "could", "did", "do", "does", "for", "from", "had", "has", "have", "he", "her",
-        "here", "hers", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its",
-        "just", "may", "me", "might", "my", "of", "on", "or", "our", "out", "over", "own",
-        "she", "should", "so", "some", "such", "than", "that", "the", "their", "them", "then",
-        "there", "these", "they", "this", "those", "to", "too", "up", "very", "was", "we",
-        "were", "what", "when", "where", "which", "while", "who", "will", "with", "would",
-        "you", "your",
+        "a", "an", "and", "are", "as", "at", "be", "been", "being", "but", "by", "can", "could",
+        "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "here", "hers",
+        "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "just", "may", "me",
+        "might", "my", "of", "on", "or", "our", "out", "over", "own", "she", "should", "so",
+        "some", "such", "than", "that", "the", "their", "them", "then", "there", "these", "they",
+        "this", "those", "to", "too", "up", "very", "was", "we", "were", "what", "when", "where",
+        "which", "while", "who", "will", "with", "would", "you", "your",
     ];
     WORDS
         .iter()
@@ -1496,8 +1463,8 @@ fn is_negation(word: &str) -> bool {
         return true;
     }
     [
-        "no", "not", "nor", "none", "never", "neither", "without", "cannot", "cant",
-        "dont", "wont", "isnt", "arent",
+        "no", "not", "nor", "none", "never", "neither", "without", "cannot", "cant", "dont",
+        "wont", "isnt", "arent",
     ]
     .iter()
     .any(|candidate| word.eq_ignore_ascii_case(candidate))

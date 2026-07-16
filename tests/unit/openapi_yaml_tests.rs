@@ -1999,7 +1999,10 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
         json!({"preserve_tag": "keep-this_1"}),
         json!({"request_family": "chat_completions"}),
     ] {
-        assert!(validator.validate(&config).is_ok(), "schema rejected {config}");
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema rejected {config}"
+        );
         assert!(
             AiPromptCompressor::new(&config).is_ok(),
             "runtime rejected {config}"

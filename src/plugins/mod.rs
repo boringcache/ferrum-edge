@@ -756,8 +756,7 @@ pub struct RequestContext {
     /// Per-`ai_prompt_compressor`-instance source digest, transformed bytes, and
     /// stats staged by `before_proxy`. Kept out of public metadata so a staged
     /// prompt copy and prompt-derived digest cannot enter transaction logs.
-    pub(crate) ai_prompt_compressor_staged:
-        HashMap<u64, ai_prompt_compressor::StagedCompression>,
+    pub(crate) ai_prompt_compressor_staged: HashMap<u64, ai_prompt_compressor::StagedCompression>,
     /// Whether the authoritative wire transform has reset provisional
     /// `before_proxy` compressor counters for this request.
     pub(crate) ai_prompt_compressor_wire_stats_started: bool,
