@@ -17,10 +17,7 @@ fn test_proxy_and_plugin_writes_run_plugin_graph_candidate_validation() {
         "admin candidates must reject unsupported TCP-throttle attachments"
     );
     assert!(
-        source
-            .matches("validate_plugin_graph_candidates(")
-            .count()
-            >= 3,
+        source.matches("validate_plugin_graph_candidates(").count() >= 3,
         "the helper definition plus Proxy and PluginConfig admission calls must exist"
     );
     assert!(

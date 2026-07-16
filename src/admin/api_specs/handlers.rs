@@ -1750,8 +1750,7 @@ async fn validate_bundle(
             }
             Err(crate::admin::crud::AfterValidateError::Response(_)) => {
                 return Err(ApiSpecError::Internal(
-                    "Plugin-graph candidate validation returned an unexpected response"
-                        .to_string(),
+                    "Plugin-graph candidate validation returned an unexpected response".to_string(),
                 ));
             }
         }

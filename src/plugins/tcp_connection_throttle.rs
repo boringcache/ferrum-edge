@@ -253,8 +253,7 @@ fn parse_config(config: &Value) -> Result<(u64, u64), String> {
     let max_connections_per_key = parse_required_u64(object, "max_connections_per_key")?;
     if max_connections_per_key == 0 {
         return Err(
-            "tcp_connection_throttle: 'max_connections_per_key' must be greater than 0"
-                .to_string(),
+            "tcp_connection_throttle: 'max_connections_per_key' must be greater than 0".to_string(),
         );
     }
     let cleanup_interval_seconds =
@@ -272,7 +271,12 @@ fn reject_unknown_fields(object: &serde_json::Map<String, Value>) -> Result<(), 
     let unknown: Vec<&str> = object
         .keys()
         .map(String::as_str)
-        .filter(|field| !matches!(*field, "max_connections_per_key" | "cleanup_interval_seconds"))
+        .filter(|field| {
+            !matches!(
+                *field,
+                "max_connections_per_key" | "cleanup_interval_seconds"
+            )
+        })
         .collect();
     if unknown.is_empty() {
         Ok(())

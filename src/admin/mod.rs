@@ -4318,8 +4318,7 @@ async fn handle_batch_create(
                 error
             )),
             Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-                "Plugin-graph candidate validation returned an unexpected response"
-                    .to_string(),
+                "Plugin-graph candidate validation returned an unexpected response".to_string(),
             ),
         }
     }
@@ -4946,8 +4945,7 @@ async fn handle_restore(
                 ));
             }
             Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-                "Plugin-graph candidate validation returned an unexpected response"
-                    .to_string(),
+                "Plugin-graph candidate validation returned an unexpected response".to_string(),
             ),
         }
         if !validation_errors.is_empty() {

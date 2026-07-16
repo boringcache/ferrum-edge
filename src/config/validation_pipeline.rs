@@ -129,9 +129,7 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     ) {
         errors.push(found);
     }
-    if let Err(found) =
-        crate::plugin_cache::validate_tcp_connection_throttle_attachments(config)
-    {
+    if let Err(found) = crate::plugin_cache::validate_tcp_connection_throttle_attachments(config) {
         errors.extend(found);
     }
     if let Err(found) = config.validate_unique_mtls_dns_identities() {

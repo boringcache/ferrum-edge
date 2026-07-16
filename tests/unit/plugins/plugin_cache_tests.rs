@@ -3971,10 +3971,7 @@ fn test_tcp_connection_throttle_global_validation_is_namespace_scoped() {
     );
     tenant_a_throttle.namespace = "tenant-a".to_string();
 
-    let config = make_config(
-        vec![tenant_a_http, tenant_b_tcp],
-        vec![tenant_a_throttle],
-    );
+    let config = make_config(vec![tenant_a_http, tenant_b_tcp], vec![tenant_a_throttle]);
     let error = PluginCache::new(&config)
         .err()
         .expect("another namespace's TCP proxy must not satisfy global coverage");
@@ -4076,12 +4073,7 @@ async fn test_tcp_connection_throttle_delta_reload_applies_new_limit_to_shared_s
         json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0});
     replacement.plugin_configs[0].updated_at = Utc::now();
     cache
-        .apply_delta(
-            &replacement,
-            &HashSet::from(["p1".to_string()]),
-            &[],
-            false,
-        )
+        .apply_delta(&replacement, &HashSet::from(["p1".to_string()]), &[], false)
         .unwrap();
     let new_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
     let mut second = make_tcp_stream_context("10.0.0.3");

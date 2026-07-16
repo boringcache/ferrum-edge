@@ -2112,15 +2112,8 @@ impl AdminResource for PluginConfig {
         if existing.plugin_name == "mtls_auth" {
             validate_mtls_auth_candidate(db, namespace, None, None, Some(&existing.id)).await?;
         }
-        validate_plugin_graph_candidates(
-            db,
-            state,
-            namespace,
-            &[],
-            &[],
-            Some(&existing.id),
-        )
-        .await?;
+        validate_plugin_graph_candidates(db, state, namespace, &[], &[], Some(&existing.id))
+            .await?;
         Ok(())
     }
 }

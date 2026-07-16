@@ -2878,8 +2878,14 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
         false,
     );
     for text in [schema_text.as_str(), plugin_docs, cache_docs] {
-        assert!(text.contains("process-local"), "missing process-local scope");
-        assert!(text.contains("residual"), "missing residual sweep semantics");
+        assert!(
+            text.contains("process-local"),
+            "missing process-local scope"
+        );
+        assert!(
+            text.contains("residual"),
+            "missing residual sweep semantics"
+        );
         assert!(text.contains("inline"), "missing inline removal semantics");
     }
     assert!(schema_text.contains("UDP/DTLS"));
@@ -2888,10 +2894,7 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
     assert!(source.contains("entry.remove()"));
     assert!(!source.contains("tcp_connection_throttle.key"));
     assert!(admin_source.contains(r#""enforcement_scope": "process_local""#));
-    assert!(
-        admin_source
-            .contains(r#""replica_limit_behavior": "configured_limit_per_replica""#)
-    );
+    assert!(admin_source.contains(r#""replica_limit_behavior": "configured_limit_per_replica""#));
 
     let status_schema = spec
         .pointer("/components/schemas/AdminMetricsTcpConnectionThrottle")

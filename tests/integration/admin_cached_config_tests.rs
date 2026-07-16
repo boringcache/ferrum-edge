@@ -5005,7 +5005,10 @@ async fn tcp_connection_throttle_admin_rejects_udp_attachment_before_persistence
         &attached,
     )
     .await;
-    assert_eq!(status, 400, "UDP throttle attachment was persisted: {body:?}");
+    assert_eq!(
+        status, 400,
+        "UDP throttle attachment was persisted: {body:?}"
+    );
     assert!(body.to_string().contains("only TCP/TCP+TLS is supported"));
 
     let (status, persisted, _) =

@@ -28,9 +28,7 @@ use crate::adaptive_concurrency::{
     adaptive_concurrency_scope,
 };
 use crate::config::types::PluginConfig;
-use crate::plugins::tcp_connection_throttle::{
-    TcpConnectionThrottle, TcpConnectionThrottleState,
-};
+use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnectionThrottleState};
 use crate::plugins::utils::jwks_cache::retain_active_requirements;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
@@ -660,17 +658,17 @@ fn validate_tcp_connection_throttle_attachment(
     pc: &PluginConfig,
     gateway_config: &GatewayConfig,
 ) -> Result<(), String> {
-    let attached = gateway_config
-        .proxies
-        .iter()
-        .filter(|proxy| {
-            tcp_connection_throttle_effectively_applies_to_proxy(pc, proxy, gateway_config)
-        });
+    let attached = gateway_config.proxies.iter().filter(|proxy| {
+        tcp_connection_throttle_effectively_applies_to_proxy(pc, proxy, gateway_config)
+    });
     let mut attached_count = 0usize;
     let mut unsupported = Vec::new();
     for proxy in attached {
         attached_count += 1;
-        if !matches!(proxy.effective_scheme(), BackendScheme::Tcp | BackendScheme::Tcps) {
+        if !matches!(
+            proxy.effective_scheme(),
+            BackendScheme::Tcp | BackendScheme::Tcps
+        ) {
             unsupported.push(format!("{} ({})", proxy.id, proxy.effective_scheme()));
         }
     }
@@ -725,9 +723,7 @@ fn create_tcp_connection_throttle_plugin(
         .or_else(|| current.get(&identity))
         .map(|instance| Arc::clone(&instance.state));
     let plugin = match existing_state {
-        Some(state) => {
-            TcpConnectionThrottle::with_shared_state(&pc.config, state)?
-        }
+        Some(state) => TcpConnectionThrottle::with_shared_state(&pc.config, state)?,
         None => TcpConnectionThrottle::new_with_pool_shard_amount(
             &pc.config,
             http_client.pool_shard_amount(),
@@ -1003,19 +999,12 @@ fn tcp_connection_throttle_effectively_applies_to_proxy(
     }
 }
 
-fn tcp_connection_throttle_policy_is_active(
-    pc: &PluginConfig,
-    config: &GatewayConfig,
-) -> bool {
+fn tcp_connection_throttle_policy_is_active(pc: &PluginConfig, config: &GatewayConfig) -> bool {
     match pc.scope {
         PluginScope::Global => true,
-        PluginScope::Proxy | PluginScope::ProxyGroup => config
-            .proxies
-            .iter()
-            .any(|proxy| {
-                proxy.namespace == pc.namespace
-                    && scoped_plugin_config_applies_to_proxy(pc, proxy)
-            }),
+        PluginScope::Proxy | PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy.namespace == pc.namespace && scoped_plugin_config_applies_to_proxy(pc, proxy)
+        }),
     }
 }
 
@@ -2826,12 +2815,7 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
     ) -> Result<Arc<PluginCacheInner>, String> {
-        Self::build_inner_with_prior_states(
-            config,
-            http_client,
-            &HashMap::new(),
-            &HashMap::new(),
-        )
+        Self::build_inner_with_prior_states(config, http_client, &HashMap::new(), &HashMap::new())
     }
 
     fn build_inner_with_prior_states(
@@ -2841,8 +2825,7 @@ impl PluginCache {
         current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
-        validate_tcp_connection_throttle_attachments(config)
-            .map_err(|errors| errors.join("; "))?;
+        validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
             globals,
@@ -2965,8 +2948,7 @@ impl PluginCache {
         rebuild_globals: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
-        validate_tcp_connection_throttle_attachments(config)
-            .map_err(|errors| errors.join("; "))?;
+        validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;

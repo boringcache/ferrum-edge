@@ -303,9 +303,8 @@ async fn test_tcp_connection_throttle_release_admission_race_never_detaches_incr
 async fn test_tcp_connection_throttle_concurrent_exact_limit() {
     const LIMIT: usize = 8;
     const ATTEMPTS: usize = 32;
-    let plugin = Arc::new(
-        TcpConnectionThrottle::new(&json!({"max_connections_per_key": LIMIT})).unwrap(),
-    );
+    let plugin =
+        Arc::new(TcpConnectionThrottle::new(&json!({"max_connections_per_key": LIMIT})).unwrap());
     let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS + 1));
     let mut tasks = Vec::new();
     for _ in 0..ATTEMPTS {
