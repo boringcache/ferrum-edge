@@ -29,9 +29,7 @@ def mean_point_estimate(
     estimates_path = (
         criterion_root
         / "ip_restriction_lookup"
-        / decision
-        / f"{rule_count}_rules"
-        / f"{instance_count}_instances"
+        / f"{decision}_{rule_count}_rules_{instance_count}_instances"
         / "new"
         / "estimates.json"
     )
