@@ -28,11 +28,13 @@
 //! number of callers can wait for the single in-flight fetch. This keeps the
 //! anonymous endpoint from accumulating unbounded tasks during an origin
 //! outage. A zero TTL disables the durable positive cache, but concurrent
-//! callers still share a short-lived successful completion.
+//! callers already admitted to the same fetch generation still share its
+//! successful completion.
 //!
 //! TTL is controlled by `cache_ttl_seconds` (default 300s = 5 min).
-//! Set to 0 to disable durable positive caching; a 100 ms completion window
-//! remains so callers in one burst can share the same fetch.
+//! Set to 0 to disable durable positive caching; callers admitted before an
+//! in-flight fetch completes still share that fetch regardless of scheduling
+//! delay.
 //!
 //! # Configuration
 //!
@@ -53,7 +55,7 @@ use http::header::HeaderValue;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 use url::{Host, Url};
@@ -74,9 +76,6 @@ const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 25 * 1024 * 1024;
 /// Maximum number of anonymous cache-miss callers admitted per plugin
 /// instance, including the one performing the upstream fetch.
 const MAX_PENDING_FETCHES: usize = 32;
-/// A zero positive-cache TTL still retains a successful single-flight result
-/// just long enough for callers already in the same burst to reuse it.
-const ZERO_TTL_COALESCE_WINDOW: Duration = Duration::from_millis(100);
 /// Failed fetches back off from one second to a maximum of thirty seconds.
 const FAILURE_BACKOFF_BASE_SECONDS: u64 = 1;
 const FAILURE_BACKOFF_MAX_SECONDS: u64 = 30;
@@ -99,6 +98,7 @@ struct CachedSpec {
     body: Bytes,
     content_type: String,
     inserted_at: Instant,
+    completion_generation: u64,
 }
 
 /// A sanitized failure response retained during the negative-cache window.
@@ -146,6 +146,11 @@ pub struct SpecExpose {
     cache: ArcSwap<Option<CachedSpec>>,
     failure_cache: ArcSwap<Option<CachedFailure>>,
     consecutive_failures: AtomicU32,
+    /// Monotonically identifies published successful fetch completions. With a
+    /// zero TTL, an admitted caller may reuse only a completion published after
+    /// that caller joined, so delayed waiters coalesce without creating a
+    /// durable wall-clock cache.
+    success_generation: AtomicU64,
     /// Single-flight lock around the upstream fetch. Concurrent cache-miss
     /// callers serialize here; whoever acquires first does the upstream fetch
     /// and populates the cache, and the rest observe the fresh entry via
@@ -350,6 +355,7 @@ impl SpecExpose {
             cache: ArcSwap::from_pointee(None),
             failure_cache: ArcSwap::from_pointee(None),
             consecutive_failures: AtomicU32::new(0),
+            success_generation: AtomicU64::new(0),
             fetch_lock: Mutex::new(()),
             fetch_admission: Arc::new(Semaphore::new(MAX_PENDING_FETCHES)),
             http_client,
@@ -376,27 +382,46 @@ impl SpecExpose {
         }
     }
 
-    /// Returns a cached spec when present and not expired. A zero configured
-    /// TTL uses only the short single-flight completion window.
+    /// Returns a durable cached spec when present and not expired. A zero
+    /// configured TTL deliberately has no request-to-request fast path.
     fn cached_spec(&self) -> Option<CachedSpec> {
+        if self.cache_ttl.is_zero() {
+            return None;
+        }
         let snapshot = self.cache.load();
         let entry = snapshot.as_ref().as_ref()?;
-        let effective_ttl = if self.cache_ttl.is_zero() {
-            ZERO_TTL_COALESCE_WINDOW
-        } else {
-            self.cache_ttl
-        };
-        if entry.inserted_at.elapsed() < effective_ttl {
+        if entry.inserted_at.elapsed() < self.cache_ttl {
             Some(entry.clone())
         } else {
             None
         }
     }
 
+    /// Returns the durable cache entry, or for TTL zero only a successful
+    /// completion published after this caller was admitted. Generation-based
+    /// reuse cannot expire under executor starvation, while a request arriving
+    /// after the completion observes the same generation and re-fetches.
+    fn cached_spec_after_admission(&self, admitted_generation: u64) -> Option<CachedSpec> {
+        if !self.cache_ttl.is_zero() {
+            return self.cached_spec();
+        }
+        let snapshot = self.cache.load();
+        let entry = snapshot.as_ref().as_ref()?;
+        (entry.completion_generation != admitted_generation).then(|| entry.clone())
+    }
+
     fn cached_failure(&self) -> Option<FetchFailure> {
         let snapshot = self.failure_cache.load();
         let entry = snapshot.as_ref().as_ref()?;
-        (Instant::now() < entry.retry_at).then(|| entry.failure.clone())
+        let remaining = entry.retry_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let mut failure = entry.failure.clone();
+        failure.retry_after_seconds = remaining.as_secs().saturating_add(u64::from(
+            remaining.subsec_nanos() != 0,
+        ));
+        Some(failure)
     }
 
     fn record_failure(&self, mut failure: FetchFailure) -> FetchFailure {
@@ -418,8 +443,18 @@ impl SpecExpose {
         failure
     }
 
-    fn record_success(&self, entry: &CachedSpec) {
+    fn record_success(&self, entry: &mut CachedSpec) {
+        let next_generation = self
+            .success_generation
+            .load(Ordering::Relaxed)
+            .wrapping_add(1);
+        entry.completion_generation = next_generation;
         self.cache.store(Arc::new(Some(entry.clone())));
+        // Publish the generation only after its cache entry. A caller admitted
+        // during publication observes the preceding generation and safely
+        // shares this completion after it acquires the fetch lock.
+        self.success_generation
+            .store(next_generation, Ordering::Release);
         self.failure_cache.store(Arc::new(None));
         self.consecutive_failures.store(0, Ordering::Relaxed);
     }
@@ -520,6 +555,7 @@ impl SpecExpose {
             body,
             content_type,
             inserted_at: Instant::now(),
+            completion_generation: 0,
         };
 
         Ok(entry)
@@ -693,6 +729,8 @@ impl Plugin for SpecExpose {
             return failure.into_plugin_result();
         }
 
+        let admitted_generation = self.success_generation.load(Ordering::Acquire);
+
         // Admit only a fixed number of cache-miss callers. One performs the
         // fetch; the rest wait for the same completion. Excess callers receive
         // a stable retry signal immediately instead of joining an anonymous,
@@ -711,7 +749,7 @@ impl Plugin for SpecExpose {
 
         // Re-check both outcomes after acquiring the single-flight lock: the
         // preceding caller may have completed successfully or failed.
-        if let Some(entry) = self.cached_spec() {
+        if let Some(entry) = self.cached_spec_after_admission(admitted_generation) {
             return spec_response(entry);
         }
         if let Some(failure) = self.cached_failure() {
@@ -719,8 +757,8 @@ impl Plugin for SpecExpose {
         }
 
         let entry = match self.fetch_spec().await {
-            Ok(entry) => {
-                self.record_success(&entry);
+            Ok(mut entry) => {
+                self.record_success(&mut entry);
                 entry
             }
             Err(failure) => {

@@ -1221,7 +1221,7 @@ async fn test_cache_disabled_when_ttl_zero() {
                 .insert_header("content-type", "application/yaml")
                 .set_body_bytes(b"openapi: 3.0.0\n".to_vec()),
         )
-        .expect(2) // Requests outside the coalescing window re-fetch.
+        .expect(2) // Sequential requests belong to distinct fetch generations.
         .mount(&mock_server)
         .await;
 
@@ -1243,7 +1243,6 @@ async fn test_cache_disabled_when_ttl_zero() {
             ..
         }
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let mut second_ctx = make_ctx("GET", "/api/specz", "/api");
     let second = plugin.on_request_received(&mut second_ctx).await;
     assert!(matches!(
@@ -1477,6 +1476,53 @@ async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
         reject_parts(plugin.on_request_received(&mut cached_failure_ctx).await);
     assert_eq!(status, 502);
     assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
+}
+
+#[tokio::test]
+async fn test_cached_failure_retry_after_reports_remaining_backoff() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "cache_ttl_seconds": 0
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut first_ctx = make_ctx("GET", "/api/specz", "/api");
+    let (_, _, first_headers) = reject_parts(plugin.on_request_received(&mut first_ctx).await);
+    assert_eq!(
+        first_headers.get("retry-after").map(String::as_str),
+        Some("1")
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let mut second_ctx = make_ctx("GET", "/api/specz", "/api");
+    let (_, _, second_headers) = reject_parts(plugin.on_request_received(&mut second_ctx).await);
+    assert_eq!(
+        second_headers.get("retry-after").map(String::as_str),
+        Some("2")
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let mut cached_ctx = make_ctx("GET", "/api/specz", "/api");
+    let (_, _, cached_headers) = reject_parts(plugin.on_request_received(&mut cached_ctx).await);
+    assert_eq!(
+        cached_headers.get("retry-after").map(String::as_str),
+        Some("1"),
+        "cached failures must advertise only the remaining backoff"
+    );
 }
 
 // TTL zero disables durable positive caching, but it must retain admission and
