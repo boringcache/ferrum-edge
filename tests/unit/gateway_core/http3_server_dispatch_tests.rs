@@ -210,6 +210,19 @@ fn h3_deadline_preflight_runs_committed_hooks_exactly_once() {
         .expect("H3 gRPC deadline preflight must remain bounded");
     let preflight = &preflight[..preflight_end];
 
+    let reject_hooks = preflight
+        .find("apply_reject_after_proxy_and_synthetic_body_hooks(")
+        .expect("H3 preflight reject body hooks must remain present");
+    let reject_hooks = &preflight[reject_hooks..];
+    let reject_hooks_end = reject_hooks
+        .find(")\n            .await;")
+        .expect("H3 preflight reject body hooks must remain bounded");
+    assert!(
+        reject_hooks[..reject_hooks_end]
+            .trim_end()
+            .ends_with("false,"),
+        "generic reject finalization must not invoke committed hooks before the bounded helper"
+    );
     assert!(preflight.contains("run_h3_deadline_bounded_reject_committed_hooks("));
     assert!(!preflight.contains("run_h3_reject_response_committed_hooks("));
     assert!(preflight.contains("send_h3_finalized_reject_response("));
