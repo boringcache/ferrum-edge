@@ -60,11 +60,17 @@ fn default_client() -> PluginHttpClient {
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_http_client_ignores_ambient_proxy_environment() {
     let proxy = MockServer::start().await;
-    let _env_lock = crate::unit::env_lock::ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
-    let client = default_client();
+    let client = {
+        let _env_lock = crate::unit::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
+
+        // Reqwest snapshots the system proxy configuration while building the
+        // client. Restore the process environment before any async operation;
+        // the constructed client retains the proxy posture under test.
+        default_client()
+    };
 
     let _ = client
         .get()
