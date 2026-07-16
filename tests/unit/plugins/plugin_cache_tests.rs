@@ -2936,8 +2936,8 @@ fn test_priority_override_applied_correctly() {
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
-#[test]
-fn test_priority_override_delegates_rejection_replacement_capability() {
+#[tokio::test]
+async fn test_priority_override_delegates_rejection_replacement_capability() {
     let mut audit = make_plugin_config_with_json(
         "audit",
         "ai_transcript_audit",

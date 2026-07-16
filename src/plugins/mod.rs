@@ -2049,9 +2049,43 @@ pub enum PluginResult {
     },
 }
 
+/// Preserve whether a request plugin produced its result or exhausted the
+/// client RPC deadline so protocol writers can choose terminal write bias.
+pub(crate) enum RequestPluginDeadlineResult {
+    Completed(PluginResult),
+    DeadlineExceeded,
+}
+
+impl RequestPluginDeadlineResult {
+    pub(crate) fn into_plugin_result(self, ctx: &mut RequestContext) -> PluginResult {
+        match self {
+            Self::Completed(result) => result,
+            Self::DeadlineExceeded => {
+                ctx.mark_gateway_deadline_response_selected();
+                grpc_deadline_exceeded_plugin_result()
+            }
+        }
+    }
+}
+
+/// Await one request-phase plugin hook under the RPC's absolute deadline while
+/// preserving typed deadline provenance for protocol-specific finalizers.
+pub(crate) async fn await_request_plugin_deadline_with_provenance<F>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> RequestPluginDeadlineResult
+where
+    F: std::future::Future<Output = PluginResult>,
+{
+    match await_grpc_deadline(deadline, future).await {
+        Ok(result) => RequestPluginDeadlineResult::Completed(result),
+        Err(()) => RequestPluginDeadlineResult::DeadlineExceeded,
+    }
+}
+
 /// Await one request-phase plugin hook under the RPC's absolute deadline.
-/// Returning a normal plugin rejection keeps every caller's existing
-/// protocol-specific reject finalizer and cleanup path in control.
+/// Returning a normal plugin rejection keeps callers that do not need write
+/// provenance on their existing protocol-specific reject finalizer paths.
 pub async fn await_request_plugin_deadline<F>(
     deadline: Option<tokio::time::Instant>,
     future: F,
@@ -2059,9 +2093,9 @@ pub async fn await_request_plugin_deadline<F>(
 where
     F: std::future::Future<Output = PluginResult>,
 {
-    match await_grpc_deadline(deadline, future).await {
-        Ok(result) => result,
-        Err(_) => grpc_deadline_exceeded_plugin_result(),
+    match await_request_plugin_deadline_with_provenance(deadline, future).await {
+        RequestPluginDeadlineResult::Completed(result) => result,
+        RequestPluginDeadlineResult::DeadlineExceeded => grpc_deadline_exceeded_plugin_result(),
     }
 }
 

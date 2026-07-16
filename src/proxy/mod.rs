@@ -15238,6 +15238,7 @@ pub async fn run_authentication_phase(
                 {
                     Ok(result) => result,
                     Err(()) => {
+                        ctx.mark_gateway_deadline_response_selected();
                         let reject = crate::plugins::grpc_deadline_exceeded_plugin_result();
                         let Some(reject) = plugin_result_into_reject_parts(reject) else {
                             return Some((
@@ -15296,11 +15297,12 @@ pub async fn run_authentication_phase(
                     return None;
                 }
                 let deadline = ctx.grpc_deadline_at();
-                match crate::plugins::await_request_plugin_deadline(
+                match crate::plugins::await_request_plugin_deadline_with_provenance(
                     deadline,
                     auth_plugin.authenticate(ctx, consumer_index),
                 )
                 .await
+                .into_plugin_result(ctx)
                 {
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -28873,8 +28875,9 @@ async fn proxy_to_backend_http3(
                     );
                 }
                 let limited = http_body_util::Limited::new(body, state.max_request_body_size_bytes);
-                match collect_request_body_with_timeout(
+                match collect_request_body_with_deadline(
                     limited.collect(),
+                    grpc_deadline_at,
                     proxy.backend_read_timeout_ms,
                 )
                 .await
@@ -28897,13 +28900,24 @@ async fn proxy_to_backend_http3(
                             None,
                         );
                     }
-                    Err(_) => {
+                    Err(RequestBodyWaitError::TimedOut) => {
                         return (request_body_timeout_backend_response(resolved_ip), None);
+                    }
+                    Err(RequestBodyWaitError::DeadlineExceeded) => {
+                        return (
+                            client_grpc_deadline_exceeded_response_for_optional_request(
+                                ctx.as_deref(),
+                                headers,
+                                resolved_ip,
+                            ),
+                            None,
+                        );
                     }
                 }
             } else {
-                match collect_request_body_with_timeout(
+                match collect_request_body_with_deadline(
                     body.collect(),
+                    grpc_deadline_at,
                     proxy.backend_read_timeout_ms,
                 )
                 .await
@@ -28931,8 +28945,18 @@ async fn proxy_to_backend_http3(
                             None,
                         );
                     }
-                    Err(_) => {
+                    Err(RequestBodyWaitError::TimedOut) => {
                         return (request_body_timeout_backend_response(resolved_ip), None);
+                    }
+                    Err(RequestBodyWaitError::DeadlineExceeded) => {
+                        return (
+                            client_grpc_deadline_exceeded_response_for_optional_request(
+                                ctx.as_deref(),
+                                headers,
+                                resolved_ip,
+                            ),
+                            None,
+                        );
                     }
                 }
             }

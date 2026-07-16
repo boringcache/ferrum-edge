@@ -100,17 +100,30 @@ fn buffered_h3_deadline_replacements_keep_grpc_web_wire_flavor() {
         .find("// transform_response_body hooks — only for buffered responses.")
         .expect("buffered H3 response-hook pipeline must remain present");
     let committed = &server[committed..];
+    let transform = committed
+        .find("transform_buffered_response_body_with_deadline(")
+        .expect("buffered H3 deadline transforms must remain present");
     let replacement = committed
-        .find("replace_buffered_h3_response_with_grpc_deadline(")
-        .expect("buffered H3 deadline replacement must remain flavor-aware");
+        .find("run_deadline_bounded_response_committed_hooks(")
+        .expect("buffered H3 deadline replacement and decoration must remain present");
     let response_write = committed
         .find("apply_response_headers(Response::builder().status(status), &response_headers)")
         .expect("buffered H3 direct response write must remain present");
-    assert!(replacement < response_write);
+    assert!(transform < replacement && replacement < response_write);
     assert!(
         committed[..response_write].contains("grpc_web_response_content_type.as_deref()"),
-        "the direct H3 buffered writer must pass the original gRPC-Web flavor into replacement"
+        "the direct H3 buffered pipeline must retain the original gRPC-Web flavor before writing"
     );
+
+    let shared = include_str!("../../../src/proxy/mod.rs");
+    let committed_hooks = shared
+        .split("pub(crate) async fn run_deadline_bounded_response_committed_hooks(")
+        .nth(1)
+        .expect("shared committed-hook deadline pipeline must remain present")
+        .split("pub(crate) async fn")
+        .next()
+        .expect("shared committed-hook deadline pipeline must remain bounded");
+    assert!(committed_hooks.contains("replace_buffered_grpc_response_with_deadline("));
 
     let cross_protocol = include_str!("../../../src/http3/cross_protocol.rs");
     let replacement = cross_protocol
@@ -357,6 +370,82 @@ fn h3_buffered_terminal_write_bias_uses_typed_gateway_provenance() {
         .expect("bounded native H3 provenance setup");
     assert!(native_writer.contains("ctx.gateway_deadline_response_selected()"));
     assert!(!native_writer.contains("metadata.get(\"grpc_status\")"));
+}
+
+#[test]
+fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
+    let plugins = include_str!("../../../src/plugins/mod.rs");
+    assert!(plugins.contains("enum RequestPluginDeadlineResult"));
+    assert!(plugins.contains("Self::DeadlineExceeded =>"));
+    assert!(plugins.contains("ctx.mark_gateway_deadline_response_selected()"));
+
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let authentication = proxy
+        .split("pub async fn run_authentication_phase(")
+        .nth(1)
+        .expect("shared authentication phase must remain present")
+        .split("pub async fn handle_proxy_request(")
+        .next()
+        .expect("shared authentication phase must remain bounded");
+    assert!(authentication.contains("await_request_plugin_deadline_with_provenance("));
+    assert!(authentication.contains("ctx.mark_gateway_deadline_response_selected()"));
+
+    let server = include_str!("../../../src/http3/server.rs");
+    assert_eq!(
+        server
+            .matches("await_request_plugin_deadline_with_provenance(")
+            .count(),
+        5,
+        "every native H3 request plugin phase must retain deadline provenance"
+    );
+    let writer = server
+        .split("async fn send_h3_plugin_reject_flavor_aware(")
+        .nth(1)
+        .expect("native H3 plugin rejection writer must remain present")
+        .split("/// Send a trailers-only gRPC error response over H3.")
+        .next()
+        .expect("native H3 plugin rejection deadline wrapper must remain bounded");
+    assert!(writer.contains("ctx.gateway_deadline_response_selected()"));
+    assert!(writer.contains("await_terminal_response_write_before_deadline("));
+    assert!(writer.contains("abort_response_stream(stream)"));
+    assert!(writer.contains("halt_request_body(stream)"));
+}
+
+#[test]
+fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let http3 = proxy
+        .split("async fn proxy_to_backend_http3(")
+        .nth(1)
+        .expect("HTTP/3 backend dispatcher must remain present")
+        .split("\nasync fn ")
+        .next()
+        .expect("HTTP/3 backend dispatcher must remain bounded");
+    let buffering = http3
+        .split("let request_body = match client_request_body")
+        .nth(1)
+        .expect("HTTP/3 backend request buffering must remain present")
+        .split("// Prepared buffers have already contributed")
+        .next()
+        .expect("HTTP/3 backend request buffering must remain bounded");
+    assert_eq!(
+        buffering.matches("collect_request_body_with_deadline(").count(),
+        2,
+        "limited and unlimited HTTP/3 upload buffering must share the deadline-aware collector"
+    );
+    assert_eq!(
+        buffering
+            .matches("Err(RequestBodyWaitError::DeadlineExceeded)")
+            .count(),
+        2
+    );
+    assert_eq!(
+        buffering
+            .matches("client_grpc_deadline_exceeded_response_for_optional_request(")
+            .count(),
+        2,
+        "both buffering branches must preserve native gRPC versus gRPC-Web wire flavor"
+    );
 }
 
 #[test]

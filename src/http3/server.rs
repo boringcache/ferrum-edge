@@ -1651,11 +1651,12 @@ async fn handle_h3_request(
     let phase_start = std::time::Instant::now();
     for plugin in plugins.iter() {
         let deadline = ctx.grpc_deadline_at();
-        match crate::plugins::await_request_plugin_deadline(
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
             plugin.on_request_received(&mut ctx),
         )
         .await
+        .into_plugin_result(&mut ctx)
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
@@ -2105,11 +2106,12 @@ async fn handle_h3_request(
         let phase_start = std::time::Instant::now();
         for plugin in authorize_plugins.iter() {
             let deadline = ctx.grpc_deadline_at();
-            match crate::plugins::await_request_plugin_deadline(
+            match crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
                 plugin.authorize(&mut ctx),
             )
             .await
+            .into_plugin_result(&mut ctx)
             {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
@@ -2350,11 +2352,12 @@ async fn handle_h3_request(
                 continue;
             }
             let deadline = ctx.grpc_deadline_at();
-            match crate::plugins::await_request_plugin_deadline(
+            match crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
                 plugin.before_proxy(&mut ctx, &mut cloned),
             )
             .await
+            .into_plugin_result(&mut ctx)
             {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
@@ -2465,11 +2468,12 @@ async fn handle_h3_request(
                 continue;
             }
             let deadline = ctx.grpc_deadline_at();
-            match crate::plugins::await_request_plugin_deadline(
+            match crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
                 plugin.before_proxy(&mut ctx, &mut tmp_headers),
             )
             .await
+            .into_plugin_result(&mut ctx)
             {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
@@ -6097,10 +6101,11 @@ async fn handle_h3_request(
             }};
         }
         let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));
-        if response_headers_sent && !response_body.is_empty() {
-            if await_buffered_h3_write!(stream.send_data(Bytes::from(response_body))) {
-                bytes_received = response_body_bytes;
-            }
+        if response_headers_sent
+            && !response_body.is_empty()
+            && await_buffered_h3_write!(stream.send_data(Bytes::from(response_body)))
+        {
+            bytes_received = response_body_bytes;
         }
 
         // Response-body plugins cannot inspect or transform trailers today.
@@ -6260,11 +6265,12 @@ async fn run_h3_backend_path_plugins_or_send_reject(
     let phase_start = std::time::Instant::now();
     for plugin in backend_path_plugins {
         let deadline = ctx.grpc_deadline_at();
-        match crate::plugins::await_request_plugin_deadline(
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
             plugin.on_backend_path_resolved(ctx, backend_path, phase),
         )
         .await
+        .into_plugin_result(ctx)
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
@@ -10137,20 +10143,42 @@ async fn send_h3_plugin_reject_flavor_aware(
     body: &[u8],
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
-    if let Some(content_type) = grpc_web_response_content_type {
-        return send_h3_grpc_web_reject(
-            stream,
-            plugins,
-            ctx,
-            content_type,
-            http_status,
-            body,
-            headers,
-        )
-        .await;
+    let grpc_deadline_at = ctx.grpc_deadline_at();
+    let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+    let write = async {
+        if let Some(content_type) = grpc_web_response_content_type {
+            return send_h3_grpc_web_reject(
+                stream,
+                plugins,
+                ctx,
+                content_type,
+                http_status,
+                body,
+                headers,
+            )
+            .await;
+        }
+
+        send_h3_reject_flavor_aware(stream, flavor, http_status, body, headers).await
+    };
+    if !terminal_gateway_deadline {
+        return write.await;
     }
 
-    send_h3_reject_flavor_aware(stream, flavor, http_status, body, headers).await
+    match crate::http3::stream_util::await_terminal_response_write_before_deadline(
+        grpc_deadline_at,
+        write,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+            crate::http3::stream_util::abort_response_stream(stream);
+            crate::http3::stream_util::halt_request_body(stream);
+            Ok(())
+        }
+    }
 }
 
 /// Send a trailers-only gRPC error response over H3. The response is

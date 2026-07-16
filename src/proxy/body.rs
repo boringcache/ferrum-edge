@@ -984,11 +984,16 @@ impl http_body::Body for ProxyBody {
                 };
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
-                    logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
-                        class,
-                        bytes,
-                        disconnected,
-                    ));
+                    let grpc_status = client_deadline_fired
+                        .then_some(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED);
+                    logger.fire(
+                        crate::proxy::deferred_log::BodyOutcome::error(
+                            class,
+                            bytes,
+                            disconnected,
+                        )
+                        .with_grpc_status(grpc_status),
+                    );
                 }
                 this.record_deferred_backend_admission(Some(class), disconnected);
                 this.record_deferred_backend_dispatch(Some(class), disconnected);
@@ -2821,7 +2826,12 @@ pub(crate) async fn run_response_inspection(
                         .await;
                     return;
                 }
-                match inspector.on_chunk(&bytes).await {
+                let action = tokio::select! {
+                    biased;
+                    _ = tx.closed() => return,
+                    action = inspector.on_chunk(&bytes) => action,
+                };
+                match action {
                     ResponseStreamAction::Forward(out) => {
                         if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
                             return; // client dropped the receiver
@@ -2844,7 +2854,12 @@ pub(crate) async fn run_response_inspection(
         }
     }
     // Backend stream ended cleanly: flush / inspect the trailing partial window.
-    match inspector.on_end().await {
+    let action = tokio::select! {
+        biased;
+        _ = tx.closed() => return,
+        action = inspector.on_end() => action,
+    };
+    match action {
         ResponseStreamAction::Forward(out) => {
             if !out.is_empty() {
                 let _ = tx.send(Ok(Frame::data(out))).await;
@@ -2893,7 +2908,11 @@ pub(crate) async fn run_proxy_body_response_inspection(
         let Some(frame) = frame else { break };
         match frame {
             Ok(frame) => match frame.into_data() {
-                Ok(bytes) => match inspector.on_chunk(&bytes).await {
+                Ok(bytes) => match tokio::select! {
+                    biased;
+                    _ = tx.closed() => return,
+                    action = inspector.on_chunk(&bytes) => action,
+                } {
                     ResponseStreamAction::Forward(out) => {
                         if !out.is_empty() {
                             if max_response_body_size_bytes > 0
@@ -2948,7 +2967,12 @@ pub(crate) async fn run_proxy_body_response_inspection(
         }
     }
 
-    match inspector.on_end().await {
+    let action = tokio::select! {
+        biased;
+        _ = tx.closed() => return,
+        action = inspector.on_end() => action,
+    };
+    match action {
         ResponseStreamAction::Forward(out) => {
             if !out.is_empty() {
                 if max_response_body_size_bytes > 0

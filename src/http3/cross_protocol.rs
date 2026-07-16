@@ -3212,9 +3212,7 @@ where
     let frontend_aborted = frontend_upload_failed.is_some_and(|flag| flag.load(Ordering::Acquire));
     let outcome_error_class = if request_overflowed_late {
         Some(ErrorClass::RequestBodyTooLarge)
-    } else if client_deadline_expired {
-        Some(ErrorClass::ClientDisconnect)
-    } else if frontend_aborted && body_error_class.is_some() {
+    } else if client_deadline_expired || (frontend_aborted && body_error_class.is_some()) {
         Some(ErrorClass::ClientDisconnect)
     } else {
         body_error_class
