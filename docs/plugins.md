@@ -2123,11 +2123,11 @@ config:
 
 ### `ip_restriction`
 
-Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP — via both `on_request_received` (HTTP-family) and `on_stream_connect` (TCP/UDP).
+Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP/TLS, and UDP/DTLS — via both `on_request_received` (HTTP-family) and `on_stream_connect` (stream-family).
 
 **Priority:** 150
 
-**Supported protocols:** All (HTTP, gRPC, WebSocket, TCP, UDP)
+**Supported protocols:** All (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP/TLS, UDP/DTLS)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -2137,7 +2137,9 @@ Restricts access based on client IP address or CIDR range. Runs on every protoco
 
 At least one of `allow` or `deny` must be configured. Empty config or both lists empty rejects plugin creation.
 
-Rules are validated and pre-parsed at config load time into integer bitmasks; invalid IP/CIDR entries reject plugin creation instead of being silently ignored. The hot path is pure integer comparison — no per-request string parsing. Supports IPv4 (`/0`–`/32`) and IPv6 (`/0`–`/128`); IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching so a malformed `X-Forwarded-For` entry never silently bypasses a deny rule.
+The config must be an object containing only `allow`, `deny`, and `mode`. Unknown or misspelled properties, explicit `null` values, malformed arrays, and non-string/empty rules reject the candidate configuration. File/admin/database/CP-DP admission therefore cannot publish a typo as a broader effective policy, and a rejected reload keeps the last-known-good plugin generation.
+
+Rules are validated and compiled at config load time into sorted, merged numeric intervals; duplicates, overlaps, and adjacent ranges collapse without changing inclusive CIDR boundaries. Invalid IP/CIDR entries reject plugin creation instead of being silently ignored. IPv4 rule octets must use canonical unsigned decimal notation, so ambiguous forms such as `010.1.2.3` and `+10.1.2.3` are rejected. Request-time lookup is allocation-free, lock-free, and O(log n) in the number of non-overlapping intervals rather than a scan of configured rules. The authoritative client IP is parsed and canonicalized once per request, TCP connection, or UDP/DTLS session and the typed value is reused by every attached `ip_restriction` instance. IPv4-mapped IPv6 identities normalize to IPv4 before policy; mapped CIDR rules therefore accept only `/96`–`/128`, which map to IPv4 `/0`–`/32`, while shorter mapped prefixes are rejected as ambiguous. Native IPv6 CIDRs accept `/0`–`/128`; IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching. A malformed authoritative client IP always fails closed. Debug-level construction logs expose only the selected mode and effective IPv4/IPv6 interval counts, never configured addresses.
 
 When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
 
