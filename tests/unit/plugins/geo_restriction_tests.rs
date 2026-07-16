@@ -1050,7 +1050,8 @@ fn geo_lookup_source_has_no_mmap_or_owned_country_decode_regression() {
         MAX_COUNTRY_MMDB_SIZE_BYTES
     );
     assert!(plugin_cache_source.contains("CountryMmdbLoadSession::claim"));
-    assert!(plugin_cache_source.contains("claimed_validation_generation"));
+    assert!(plugin_cache_source.contains("CountryMmdbLoadSession::for_node_local_refresh"));
+    assert!(plugin_cache_source.contains("refresh_country_mmdb_plugins"));
     assert!(plugin_cache_source.contains("build_country_mmdb_reload_inner"));
     assert!(plugin_cache_source.contains("country_mmdb_snapshot_bytes(&new_map, &new_globals)"));
     assert!(validation_source.contains("generation.commit()"));

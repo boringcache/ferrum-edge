@@ -296,6 +296,16 @@ fn test_env_config() -> ferrum_edge::config::EnvConfig {
 }
 
 fn proxy_state_with_config(config: GatewayConfig) -> ProxyState {
+    proxy_state_with_config_and_mode(
+        config,
+        ferrum_edge::config::env_config::OperatingMode::File,
+    )
+}
+
+fn proxy_state_with_config_and_mode(
+    config: GatewayConfig,
+    mode: ferrum_edge::config::env_config::OperatingMode,
+) -> ProxyState {
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: HashMap::new(),
         resolver_addresses: None,
@@ -317,8 +327,10 @@ fn proxy_state_with_config(config: GatewayConfig) -> ProxyState {
         max_concurrent_refreshes: 64,
         shard_amount: 0,
     });
+    let mut env_config = test_env_config();
+    env_config.mode = mode;
     let (state, _health_check_handles) =
-        ProxyState::new(config, dns_cache, test_env_config(), None, None).unwrap();
+        ProxyState::new(config, dns_cache, env_config, None, None).unwrap();
     state
 }
 
@@ -465,6 +477,99 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
     assert!(matches!(
         geo.on_request_received(&mut after).await,
         PluginResult::Continue
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_full_snapshot_refreshes_deployed_mmdb_without_validation_handoff() {
+    let directory = TempDir::new().unwrap();
+    let mmdb_path = directory.path().join("country.mmdb");
+    let config = GatewayConfig {
+        version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
+        proxies: vec![test_proxy("geo-proxy", "/geo")],
+        plugin_configs: vec![
+            PluginConfig {
+                id: "geo-policy".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
+                plugin_name: "geo_restriction".to_string(),
+                config: serde_json::json!({
+                    "db_path": mmdb_path.to_str().unwrap(),
+                    "deny_countries": ["SE"],
+                    "on_lookup_failure": "allow"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            test_plugin_config("unrelated-logging", true),
+        ],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let candidate = config.clone();
+    let state = proxy_state_with_config_and_mode(
+        config,
+        ferrum_edge::config::env_config::OperatingMode::DataPlane,
+    );
+
+    let plugins = state
+        .plugin_cache
+        .request_view("geo-proxy", ProxyProtocol::Http)
+        .plugins();
+    let geo = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "geo_restriction")
+        .unwrap();
+    let unrelated_before = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "stdout_logging")
+        .cloned()
+        .unwrap();
+    let mut before = RequestContext::new(
+        "89.160.20.112".to_string(),
+        "GET".to_string(),
+        "/geo".to_string(),
+    );
+    assert!(matches!(
+        geo.on_request_received(&mut before).await,
+        PluginResult::Continue
+    ));
+
+    std::fs::write(&mmdb_path, country_mmdb_bytes()).unwrap();
+    assert_eq!(
+        state.update_config(candidate),
+        ConfigApplyOutcome::Applied,
+        "an unchanged DP snapshot must refresh node-local plugin files without a CP handoff"
+    );
+
+    let plugins = state
+        .plugin_cache
+        .request_view("geo-proxy", ProxyProtocol::Http)
+        .plugins();
+    let geo = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "geo_restriction")
+        .unwrap();
+    let unrelated_after = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "stdout_logging")
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&unrelated_before, unrelated_after));
+    let mut after = RequestContext::new(
+        "89.160.20.112".to_string(),
+        "GET".to_string(),
+        "/geo".to_string(),
+    );
+    assert!(matches!(
+        geo.on_request_received(&mut after).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
     ));
 }
 

@@ -49,9 +49,9 @@ use tracing::{debug, error, info, warn};
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, NamespaceResourceCounts,
-    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
-    SortOrder, extract_db_hostname, redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, FullConfigLoadPurpose, IncrementalResult,
+    NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+    SnapshotDataIntegrityError, SortOrder, extract_db_hostname, redact_url,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1535,6 +1535,17 @@ impl DatabaseStore {
 
     /// Load the full gateway configuration from the database.
     pub async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
+        self.load_full_config_for_purpose(namespace, FullConfigLoadPurpose::Runtime)
+            .await
+    }
+
+    /// Load the full gateway configuration for a runtime, control-plane, or
+    /// export consumer. Only runtime loads retain node-local plugin snapshots.
+    pub async fn load_full_config_for_purpose(
+        &self,
+        namespace: &str,
+        purpose: FullConfigLoadPurpose,
+    ) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
         // Capture timestamp before queries so the incremental polling safety
         // margin covers the full load duration.
@@ -1635,12 +1646,16 @@ impl DatabaseStore {
             );
         }
 
-        ValidationPipeline::new(&mut config)
+        let validation = ValidationPipeline::new(&mut config)
             .validate_unique_consumer_identities(ValidationAction::Warn)
             .validate_unique_consumer_credentials(ValidationAction::Warn)
-            .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)
-            .validate_plugin_file_dependencies(ValidationAction::Warn)
-            .run()?;
+            .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn);
+        let validation = if purpose.loads_node_local_plugin_files() {
+            validation.validate_plugin_file_dependencies(ValidationAction::Warn)
+        } else {
+            validation
+        };
+        validation.run()?;
 
         // Hot-path isolation: strip api_spec_id from runtime config. The row
         // mappers preserve api_spec_id so admin GET/list paths can serialise
@@ -7402,8 +7417,12 @@ impl DatabaseBackend for DatabaseStore {
         self.backend_allow_ips = policy;
     }
 
-    async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
-        DatabaseStore::load_full_config(self, namespace).await
+    async fn load_full_config_for_purpose(
+        &self,
+        namespace: &str,
+        purpose: FullConfigLoadPurpose,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseStore::load_full_config_for_purpose(self, namespace, purpose).await
     }
 
     async fn load_namespace_snapshot(

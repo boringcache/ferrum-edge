@@ -1,4 +1,5 @@
 use chrono::Utc;
+use ferrum_edge::config::db_backend::FullConfigLoadPurpose;
 use ferrum_edge::config::types::{
     Consumer, anchor_regex_pattern, hosts_overlap, redact_consumer_credentials, validate_host_entry,
 };
@@ -540,29 +541,36 @@ fn cp_full_and_incremental_rejection_share_hmac_composition_validation() {
 }
 
 #[test]
-fn cp_full_snapshot_scopes_and_releases_validated_mmdb_handoff() {
-    let control_plane = include_str!("../../../src/modes/control_plane.rs");
-    let prepare_start = control_plane
-        .find("fn prepare_cp_full_snapshot(")
-        .expect("CP full-snapshot preparation function");
-    let reject_start = control_plane[prepare_start..]
-        .find("fn reject_invalid_cp_full_snapshot(")
-        .map(|offset| prepare_start + offset)
-        .expect("CP full-snapshot rejection function");
-    let preparation = &control_plane[prepare_start..reject_start];
+fn non_runtime_full_loads_skip_node_local_plugin_files() {
+    assert!(FullConfigLoadPurpose::Runtime.loads_node_local_plugin_files());
+    assert!(!FullConfigLoadPurpose::ControlPlane.loads_node_local_plugin_files());
+    assert!(!FullConfigLoadPurpose::BackupExport.loads_node_local_plugin_files());
 
-    let claim = preparation
-        .find("CountryMmdbLoadSession::claim")
-        .expect("CP must claim the accepted MMDB validation handoff");
-    let validation = preparation
-        .find("reject_invalid_cp_full_snapshot(&config)")
-        .expect("CP must validate the prepared snapshot");
-    assert!(
-        claim < validation,
-        "the scoped load session must own the handoff throughout CP validation and drop on return"
+    let control_plane = include_str!("../../../src/modes/control_plane.rs");
+    assert_eq!(
+        control_plane
+            .matches("FullConfigLoadPurpose::ControlPlane")
+            .count(),
+        3,
+        "single- and multi-namespace CP full loads must use the non-serving purpose"
     );
+    assert!(!control_plane.contains("CountryMmdbLoadSession"));
+
+    let admin = include_str!("../../../src/admin/mod.rs");
+    let backup_start = admin.find("async fn handle_backup(").expect("backup handler");
+    let restore_start = admin[backup_start..]
+        .find("async fn handle_restore(")
+        .map(|offset| backup_start + offset)
+        .expect("restore handler after backup");
     assert!(
-        preparation.contains("let _country_mmdb_handoff ="),
-        "CP must retain the scoped handoff owner until snapshot validation returns"
+        admin[backup_start..restore_start].contains("FullConfigLoadPurpose::BackupExport"),
+        "backup export must not create a runtime MMDB validation handoff"
     );
+
+    for source in [
+        include_str!("../../../src/config/db_loader.rs"),
+        include_str!("../../../src/config/mongo_store.rs"),
+    ] {
+        assert!(source.contains("if purpose.loads_node_local_plugin_files() {"));
+    }
 }

@@ -2898,22 +2898,29 @@ impl PluginCache {
         )
     }
 
-    /// Claim and apply an accepted MMDB validation generation even when the
-    /// serialized gateway config has no delta. Returning `None` means there
-    /// was no matching generation to consume, so the caller may keep the live
-    /// plugin snapshot unchanged.
+    /// Refresh country MMDB plugins even when the serialized gateway config has
+    /// no delta. Serving modes normally require an accepted validation handoff;
+    /// DP full snapshots set `force_node_local_refresh` because CP intentionally
+    /// skips node-local file validation and therefore cannot create one.
+    /// Returning `None` means there was no handoff and no forced refresh, so the
+    /// caller may keep the live plugin snapshot unchanged.
     pub(crate) fn build_country_mmdb_reload_inner(
         &self,
         current: &PluginCacheInner,
         config: &GatewayConfig,
+        force_node_local_refresh: bool,
     ) -> Result<Option<Arc<PluginCacheInner>>, String> {
         validate_prometheus_metrics_ownership(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         if paths.is_empty() {
             return Ok(None);
         }
-        let country_mmdb_load_session = CountryMmdbLoadSession::claim(&paths)?;
-        if !country_mmdb_load_session.claimed_validation_generation() {
+        let country_mmdb_load_session = if force_node_local_refresh {
+            CountryMmdbLoadSession::for_node_local_refresh(&paths)?
+        } else {
+            CountryMmdbLoadSession::claim(&paths)?
+        };
+        if !country_mmdb_load_session.refresh_country_mmdb_plugins() {
             return Ok(None);
         }
         self.build_delta_inner_with_country_mmdb_session(
@@ -2948,7 +2955,7 @@ impl PluginCache {
         let mut global_plugins_changed = rebuild_globals || rebuild_adaptive_globals;
         let mut adaptive_concurrency_instances =
             retained_adaptive_concurrency_states(&current.adaptive_concurrency_instances, config);
-        let force_country_mmdb_refresh = country_mmdb_load_session.claimed_validation_generation();
+        let force_country_mmdb_refresh = country_mmdb_load_session.refresh_country_mmdb_plugins();
         let active_country_mmdb_configs: HashMap<CountryMmdbPluginId, &PluginConfig> = config
             .plugin_configs
             .iter()

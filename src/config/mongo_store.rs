@@ -43,7 +43,7 @@
 mod inner {
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
-        IncrementalResult, NamespaceResourceCounts, NamespacedResourceId,
+        FullConfigLoadPurpose, IncrementalResult, NamespaceResourceCounts, NamespacedResourceId,
         PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
     };
     use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
@@ -3257,7 +3257,11 @@ mod inner {
             self.backend_allow_ips = policy;
         }
 
-        async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
+        async fn load_full_config_for_purpose(
+            &self,
+            namespace: &str,
+            purpose: FullConfigLoadPurpose,
+        ) -> Result<GatewayConfig, anyhow::Error> {
             let start = std::time::Instant::now();
             let loaded_at = Utc::now();
             let (proxies, consumers, plugin_configs, upstreams) =
@@ -3402,9 +3406,11 @@ mod inner {
             // plugin-cache build. This must run only after all rejecting
             // validation has passed so an invalid Mongo snapshot cannot leave
             // a claimable MMDB handoff behind.
-            ValidationPipeline::new(&mut config)
-                .validate_plugin_file_dependencies(ValidationAction::Warn)
-                .run()?;
+            if purpose.loads_node_local_plugin_files() {
+                ValidationPipeline::new(&mut config)
+                    .validate_plugin_file_dependencies(ValidationAction::Warn)
+                    .run()?;
+            }
 
             Ok(config)
         }
@@ -10945,10 +10951,8 @@ mod inner {
         fn load_full_config_rejects_after_normalization_and_identity_quarantine() {
             let source = include_str!("mongo_store.rs");
             let load_start = source
-                .find(
-                    "async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error>",
-                )
-                .expect("Mongo load_full_config function");
+                .find("async fn load_full_config_for_purpose(")
+                .expect("Mongo purpose-aware full-config load function");
             let load_path = &source[load_start..];
             let snapshot_start = load_path
                 .find("async fn load_namespace_snapshot(")
@@ -10970,6 +10974,9 @@ mod inner {
             let plugin_file_dependencies = load_body
                 .find("validate_plugin_file_dependencies(ValidationAction::Warn)")
                 .expect("load_full_config database-mode plugin file dependency validation");
+            let runtime_file_guard = load_body
+                .find("if purpose.loads_node_local_plugin_files() {")
+                .expect("node-local plugin files must be gated by full-load purpose");
             let success = load_body
                 .find("Ok(config)")
                 .expect("load_full_config success return");
@@ -11003,10 +11010,11 @@ mod inner {
             );
             assert!(
                 rejecting_validation < non_empty_guard
-                    && non_empty_guard < plugin_file_dependencies
+                    && non_empty_guard < runtime_file_guard
+                    && runtime_file_guard < plugin_file_dependencies
                     && plugin_file_dependencies < success,
                 "the rejecting validation guard must sit between the shared validation call and \
-                 database-mode plugin file dependency generation, which must commit before the \
+                 runtime-only plugin file dependency generation, which must commit before the \
                  Ok(config) success return"
             );
             // The guard must fail closed by RETURNING a typed

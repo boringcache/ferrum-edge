@@ -7275,7 +7275,14 @@ impl ProxyState {
                     // config field and timestamp is unchanged.
                     let country_mmdb_plugin_cache = self
                         .plugin_cache
-                        .build_country_mmdb_reload_inner(&current.plugin_cache, &new_config)?;
+                        .build_country_mmdb_reload_inner(
+                            &current.plugin_cache,
+                            &new_config,
+                            matches!(
+                                self.env_config.mode,
+                                crate::config::env_config::OperatingMode::DataPlane
+                            ),
+                        )?;
                     let mesh_changed = current.config.mesh != new_config.mesh;
                     if !mesh_changed && country_mmdb_plugin_cache.is_none() {
                         return Ok(None);

@@ -30,10 +30,10 @@ use tracing::{debug, error, info, warn};
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
-use crate::config::db_backend::{self, DatabaseBackend, IncrementalResult};
+use crate::config::db_backend::{self, DatabaseBackend, FullConfigLoadPurpose, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
-use crate::config::types::{CountryMmdbLoadSession, GatewayConfig};
+use crate::config::types::GatewayConfig;
 use crate::config::validation_pipeline::{
     ConfigValidationRejection, collect_rejecting_runtime_config_errors,
 };
@@ -394,16 +394,24 @@ async fn load_full_config_multi(
 ) -> Result<GatewayConfig, anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
-        let config = db.load_full_config(ns).await?;
+        let config = db
+            .load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane)
+            .await?;
         return prepare_cp_full_snapshot(config);
     }
 
     // First namespace seeds the loaded_at / version / trust_bundles fields,
     // then we extend with the remaining namespaces' resource vectors.
     let first = namespaces.first().expect("namespaces is non-empty");
-    let mut combined = prepare_cp_full_snapshot(db.load_full_config(first).await?)?;
+    let mut combined = prepare_cp_full_snapshot(
+        db.load_full_config_for_purpose(first, FullConfigLoadPurpose::ControlPlane)
+            .await?,
+    )?;
     for ns in namespaces.iter().skip(1) {
-        let mut next = prepare_cp_full_snapshot(db.load_full_config(ns).await?)?;
+        let mut next = prepare_cp_full_snapshot(
+            db.load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane)
+                .await?,
+        )?;
         combined.proxies.append(&mut next.proxies);
         combined.consumers.append(&mut next.consumers);
         combined.plugin_configs.append(&mut next.plugin_configs);
@@ -436,15 +444,6 @@ async fn load_full_config_multi_with_sequence(
 fn prepare_cp_full_snapshot(mut config: GatewayConfig) -> Result<GatewayConfig, anyhow::Error> {
     config.normalize_fields();
     config.resolve_upstream_tls();
-
-    // Database full loaders retain validated MMDB snapshots for the next
-    // PluginCache generation. CP mode never constructs a PluginCache, so claim
-    // the matching handoff into this scope and let it drop after CP validation
-    // (including rejection). This preserves loader validation while preventing
-    // a long-lived control plane from retaining up to the full MMDB budget.
-    let _country_mmdb_handoff =
-        CountryMmdbLoadSession::claim(&config.country_mmdb_file_dependency_paths())
-            .map_err(anyhow::Error::msg)?;
     reject_invalid_cp_full_snapshot(&config)?;
     Ok(config)
 }

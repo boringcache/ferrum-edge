@@ -5142,7 +5142,7 @@ struct CountryMmdbLoadSessionState {
 #[derive(Default)]
 pub(crate) struct CountryMmdbLoadSession {
     state: Mutex<CountryMmdbLoadSessionState>,
-    claimed_validation_generation: bool,
+    refresh_country_mmdb_plugins: bool,
 }
 
 impl CountryMmdbLoadSession {
@@ -5154,7 +5154,7 @@ impl CountryMmdbLoadSession {
             cache.retain_live();
             cache.claim_validation_handoffs(paths)
         };
-        let claimed_validation_generation = handoff.is_some();
+        let refresh_country_mmdb_plugins = handoff.is_some();
         let state = handoff
             .map(|handoff| CountryMmdbLoadSessionState {
                 snapshots: handoff.snapshots,
@@ -5163,12 +5163,23 @@ impl CountryMmdbLoadSession {
             .unwrap_or_default();
         Ok(Self {
             state: Mutex::new(state),
-            claimed_validation_generation,
+            refresh_country_mmdb_plugins,
         })
     }
 
-    pub(crate) fn claimed_validation_generation(&self) -> bool {
-        self.claimed_validation_generation
+    /// Build a load session for a node-local refresh when the configuration
+    /// source intentionally skipped file validation (DP full snapshots). Any
+    /// matching handoff is still consumed, but its absence must not suppress
+    /// the refresh: each path is loaded directly under the same aggregate
+    /// budget before the replacement cache generation can publish.
+    pub(crate) fn for_node_local_refresh(paths: &HashSet<PathBuf>) -> Result<Self, String> {
+        let mut session = Self::claim(paths)?;
+        session.refresh_country_mmdb_plugins = true;
+        Ok(session)
+    }
+
+    pub(crate) fn refresh_country_mmdb_plugins(&self) -> bool {
+        self.refresh_country_mmdb_plugins
     }
 
     pub(crate) fn load(
