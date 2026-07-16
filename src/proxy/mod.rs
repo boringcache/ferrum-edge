@@ -14666,8 +14666,8 @@ fn set_cookie_storage_key<'a>(
         } else if attribute_name.eq_ignore_ascii_case("samesite") {
             // The last SameSite attribute wins; invalid and bare values map to
             // the default enforcement rather than preserving an earlier None.
-            same_site_none = attribute_value
-                .is_some_and(|value| value.eq_ignore_ascii_case("none"));
+            same_site_none =
+                attribute_value.is_some_and(|value| value.eq_ignore_ascii_case("none"));
         } else if attribute_name.eq_ignore_ascii_case("domain") {
             // A bare Domain is parsed with an empty value. The last Domain
             // attribute wins, including an empty value that makes the cookie
@@ -14767,12 +14767,7 @@ fn collect_later_set_cookies(
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
         if let Some(index) = cookies.iter().position(|existing| {
             existing == candidate
-                || set_cookie_same_storage_key(
-                    existing,
-                    candidate,
-                    default_path,
-                    request_is_secure,
-                )
+                || set_cookie_same_storage_key(existing, candidate, default_path, request_is_secure)
         }) {
             cookies.remove(index);
         }
@@ -14850,12 +14845,7 @@ fn attach_auth_rejection_set_cookie(
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
         // independently scoped requester-owned cookies from earlier rejects.
-        if !set_cookie_conflicts(
-            &merged,
-            &candidate,
-            default_path,
-            ctx.request_is_secure,
-        ) {
+        if !set_cookie_conflicts(&merged, &candidate, default_path, ctx.request_is_secure) {
             merged.push(candidate);
         }
     }
