@@ -1647,7 +1647,7 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `ldap_url` | string | (required) | LDAP server URL. Use `ldaps://` or `ldap://` with `starttls: true`; embedded URL credentials are rejected |
+| `ldap_url` | string | (required) | LDAP server URL. Use `ldaps://` or `ldap://` with `starttls: true`; embedded URL credentials are rejected. Hostnames retain their configured identity for TLS/SNI while each connection dials a freshly resolved, policy-screened IP |
 | `bind_dn_template` | string | (none) | Direct bind DN template with `{username}` placeholder (e.g., `uid={username},ou=users,dc=example,dc=com`) |
 | `search_base_dn` | string | (none) | Base DN for search-then-bind user search |
 | `search_filter` | string | (none) | LDAP search filter with `{username}` placeholder (e.g., `(&(objectClass=user)(sAMAccountName={username}))`) |
@@ -1660,7 +1660,7 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups`; LDAP attribute-name matching is case-insensitive |
 | `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
 | `allow_plaintext` | bool | `false` | Development-only override for non-loopback `ldap://` without STARTTLS. Credentials have no transport confidentiality when enabled |
-| `connect_timeout_seconds` | u64 | `5` | Per-connection and per-operation timeout (1–300s), also sent as the LDAP server-side search time limit |
+| `connect_timeout_seconds` | u64 | `5` | Shared DNS-resolution/TCP/TLS establishment bound per connection plus the per-operation timeout (1–300s), also sent as the LDAP server-side search time limit |
 | `request_timeout_seconds` | u64 | `max(15, connect timeout)` | Strict wall-clock deadline (1–300s) for the complete uncached authentication and group-check flow. Set it explicitly to use a shorter deadline than an individual operation |
 | `max_concurrent_requests` | u64 | `64` | Per-plugin cap (1–1,024) on concurrent uncached LDAP flows; excess requests fail immediately |
 | `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (`0` = disabled, maximum `86400`). Cache keys are process-random HMACs over the presented username/password |
@@ -1719,6 +1719,8 @@ For custom `group_filter` values, a required group returned by the initial searc
 In search-then-bind deployments that use POSIX `memberUid` or `{username}` in a custom group filter, configure `canonical_identity_attribute` to the authoritative directory attribute whose value those groups store. If groups store a different identifier than the desired Ferrum/Consumer identity, use DN-based `member`/`uniqueMember` membership or a `{user_dn}` custom filter. A mismatch fails closed as non-membership; the plugin never falls back to the client-presented login. Direct bind is unchanged because its authenticated canonical identity is the presented login.
 
 **TLS and revocation:** `ldaps://` and STARTTLS connections use rustls with the gateway's CA settings (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`). When a CRL is configured (`FERRUM_TLS_CRL_FILE_PATH`) and verification is not disabled, revoked LDAP server certificates are rejected — the same revocation guarantee as the proxy backend, DTLS, frontend mTLS, and rustls logging-sink surfaces.
+
+**Dial-time DNS and egress policy:** Every LDAP connection is established from a fresh A+AAAA lookup that bypasses positive and negative DNS caches while still honoring configured static overrides and hosts files. The complete candidate set is screened under the active `BackendEgressPolicy` before any socket opens, and each candidate is screened again immediately before its TCP dial. A mixed allowed/denied answer or a reconnect that rebinds to denied space therefore fails closed. Direct bind, the service-account and end-user connections in search-then-bind, and a separate group-search connection all repeat this process. The concrete screened address is passed to `ldap3` without replacing the configured hostname, so LDAPS/STARTTLS certificate and SNI verification continue to use the operator-configured LDAP name. DNS, candidate connection attempts, and TLS/STARTTLS establishment share `connect_timeout_seconds`.
 
 Non-loopback plaintext `ldap://` endpoints are rejected by default because LDAP simple bind sends reusable service-account and user passwords without transport confidentiality. `allow_plaintext: true` is an explicit development-only escape hatch for isolated test environments. Literal loopback addresses and `localhost` remain available for local integration testing without the override.
 

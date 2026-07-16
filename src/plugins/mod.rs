@@ -4198,16 +4198,17 @@ pub fn create_plugin_with_http_client(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
-    // Fail CLOSED before constructing plugins with literal endpoints. Some
-    // (ldap_auth, kafka_logging, ws_logging) dial through their own resolver;
-    // jwks_auth uses the shared client but must still reject denied literals at
-    // config admission rather than installing a permanently keyless provider.
+    // Fail CLOSED before constructing plugins with literal endpoints. LDAP uses
+    // a dedicated fresh, policy-screened dial resolver; kafka_logging and
+    // ws_logging dial through their own clients. JWKS uses the shared client but
+    // must still reject denied literals at config admission rather than
+    // installing a permanently keyless provider.
     // The production `PluginCache` is built with the real-policy client
     // (`proxy/mod.rs` → `PluginHttpClient::new` → `with_http_client`), this also
     // makes a database-mode legacy row pointing at e.g. `169.254.169.254` exclude
-    // the plugin instead of letting its background loop reach the metadata service
-    // (warn-only validation can't stop that — there is no runtime egress backstop
-    // for these clients, unlike proxy/Redis dispatch).
+    // the plugin instead of letting its background loop reach the metadata service.
+    // LDAP repeats this screen at every dial; config admission remains useful for
+    // rejecting an invalid literal before the plugin can enter the runtime cache.
     screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
@@ -4545,9 +4546,9 @@ pub fn validate_plugin_config_with_policy(
     // endpoint must be rejected here at config-load.
     screen_redis_endpoint_egress(config, backend_allow_ips)?;
     // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
-    // screened *inside* `create_plugin_with_http_client` above (before the
-    // dial task spawns), so no explicit `screen_direct_client_endpoint_egress`
-    // call is needed here — that path already failed closed on a denial.
+    // screened *inside* `create_plugin_with_http_client` above (before a dial),
+    // so no explicit `screen_direct_client_endpoint_egress` call is needed
+    // here. LDAP additionally repeats the policy check at dial time.
     Ok(())
 }
 
@@ -4590,17 +4591,16 @@ pub(crate) fn screen_redis_endpoint_egress(
 }
 
 /// Screen literal-IP endpoints that require config-admission enforcement.
-/// `jwks_auth` retains the shared client's runtime DNS/IP backstop, while
-/// `ldap_auth` (`ldap_url`, via `ldap3`), `kafka_logging` (`broker_list`, via
-/// librdkafka), and `ws_logging` dial outside it. A denied literal endpoint
-/// would otherwise pass file/admin validation and either install a permanently
-/// keyless auth provider or reach the metadata service at runtime. Reject it at
-/// config-load.
+/// `jwks_auth` retains the shared client's runtime DNS/IP backstop, and
+/// `ldap_auth` (`ldap_url`) has a dedicated dial-time resolver/backstop.
+/// `kafka_logging` (`broker_list`, via librdkafka) and `ws_logging` dial outside
+/// the shared resolver. A denied literal endpoint must still be rejected at
+/// config-load so file/admin/DB/CP-DP admission is consistent with runtime.
 ///
-/// For the clients outside `DnsCache`, hostname endpoints that later rebind to
-/// a denied address are an accepted limitation, mirroring the
-/// `rediss://`-hostname case documented in `redis_rate_limiter`. JWKS hostname
-/// resolution retains the shared client's runtime policy backstop.
+/// LDAP hostnames are freshly resolved and screened immediately before every
+/// connection/reconnection. Other clients outside `DnsCache` retain their
+/// documented hostname limitations; JWKS hostname resolution keeps the shared
+/// client's runtime policy backstop.
 pub(crate) fn screen_direct_client_endpoint_egress(
     name: &str,
     config: &Value,

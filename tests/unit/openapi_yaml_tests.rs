@@ -975,6 +975,29 @@ fn ldap_auth_schema_matches_runtime_invariants() {
 }
 
 #[test]
+fn ldap_dial_policy_documentation_matches_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/LdapAuthConfig")
+        .expect("LdapAuthConfig exists");
+    let schema_description = schema["description"]
+        .as_str()
+        .expect("LdapAuthConfig description");
+    let url_description = schema["properties"]["ldap_url"]["description"]
+        .as_str()
+        .expect("ldap_url description");
+    assert!(schema_description.contains("uncached A+AAAA lookup"));
+    assert!(schema_description.contains("TLS/SNI verification"));
+    assert!(url_description.contains("policy-screens all A/AAAA candidates"));
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("**Dial-time DNS and egress policy:**"));
+    assert!(guide.contains("screened again immediately before its TCP dial"));
+    assert!(guide.contains("service-account and end-user connections"));
+}
+
+#[test]
 fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
