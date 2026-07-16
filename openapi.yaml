@@ -7208,6 +7208,7 @@ components:
               plugin_name:
                 const: ai_prompt_compressor
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/AiPromptCompressorConfig"
@@ -16603,7 +16604,20 @@ components:
 
     AiPromptCompressorConfig:
       type: object
-      description: "Plugin: ai_prompt_compressor — Shortens LLM prompt text to reduce token usage, cost, and latency using a model-free statistical (extractive) filter. Rewrites messages[].content (per role) and the legacy top-level prompt in OpenAI-shaped chat/completions bodies. Code blocks, inline code, URLs, numbers, and identifiers are preserved verbatim, and negations are always kept. No model files, network calls, or external services are used."
+      additionalProperties: false
+      allOf:
+        - if:
+            required: [request_family]
+            properties:
+              request_family:
+                const: text_completions
+          then:
+            properties:
+              compress_roles:
+                contains:
+                  type: string
+                  pattern: '^\s*[Uu][Ss][Ee][Rr]\s*$'
+      description: "Plugin: ai_prompt_compressor — Shortens LLM prompt text to reduce token usage, cost, and latency using a bounded model-free statistical (extractive) filter. Rewrites messages[].content (per role) and the legacy top-level prompt only for admitted OpenAI Chat Completions or Text Completions representations. Code blocks, inline code, URLs, Unicode numbers, common identifiers, and negations are preserved verbatim. Configured preserve markers use a bounded representation-preserving fallback whenever statistical compression is skipped. Successful compression rewrites reserialize the complete JSON body. No model files, network calls, or external services are used."
       properties:
         compress_roles:
           type: array
@@ -16623,18 +16637,26 @@ components:
         min_content_tokens:
           type: integer
           minimum: 0
+          maximum: 131072
           default: 200
           description: "Estimated-token floor per content string. Content below this is passed through unchanged so short prompts are not mangled. Token counts are estimated (~4 characters per token); no model tokenizer is embedded."
         max_scan_bytes:
           type: integer
           minimum: 1
+          maximum: 1048576
           default: 1048576
-          description: "Skip compression when the request body exceeds this size."
+          description: "Skip statistical compression when the request body exceeds this size. Configured preserve-marker sanitation remains active up to the immutable 1048576-byte hard body/output maximum and fails closed above it. Eligible prompt text is additionally capped at 524288 bytes, 32768 combined whitespace/tokenizer/marker work units, 256 rewritable fields, and 1024 preserve markers per body. A transformed body is staged beside request metadata for wire-path reuse only when it is at most 65536 bytes."
         preserve_tag:
           type: string
           minLength: 1
+          maxLength: 64
           pattern: '^[A-Za-z0-9_-]+$'
-          description: "Optional marker name. Text wrapped in <TAG>...</TAG> is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Name may contain ASCII letters, digits, '-', and '_'."
+          description: "Optional marker name. Text wrapped in <TAG>...</TAG> is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Nested spans are flattened while preserving their text; unmatched and JSON-escaped markers are stripped deterministically from every admitted request family even when statistical compression is skipped. Name may contain at most 64 ASCII letters, digits, '-', and '_'."
+        request_family:
+          type: string
+          enum: [auto, chat_completions, text_completions]
+          default: auto
+          description: "Request-family gate. 'auto' requires a body shape matching the standard endpoint path suffix (/chat/completions or /completions). A fixed family is an explicit opt-in for compatible custom endpoint paths and still rejects malformed, provider-native, or ambiguous body shapes."
 
     AiResponseGuardConfig:
       type: object
