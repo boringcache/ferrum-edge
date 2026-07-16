@@ -2521,12 +2521,6 @@ pub struct MirrorResponseMeta {
     pub mirror_error: Option<String>,
 }
 
-/// Serde skip predicate: true when the value is zero. Used to keep logs tidy
-/// when new u64 counters are unset for a given transaction.
-fn is_zero_u64(v: &u64) -> bool {
-    *v == 0
-}
-
 /// Which direction of a bidirectional stream experienced a failure first.
 ///
 /// Used by TCP/UDP/WebSocket disconnect logging so operators can tell whether
@@ -2689,8 +2683,8 @@ pub struct TransactionSummary {
     ///   an `Arc<AtomicU64>` between the forwarded body and the summary
     ///   builder so the final byte count is visible once hyper has consumed
     ///   the body.
-    /// * **Empty / GET / HEAD / size-zero requests**: zero (skipped during
-    ///   serialization via `skip_serializing_if = "is_zero_u64"`).
+    /// * **Empty / GET / HEAD / size-zero requests**: zero (omitted by the
+    ///   transaction summary serializer).
     pub bytes_sent: u64,
     /// Bytes of the response body relayed from the backend to the client
     /// (gateway-perspective: bytes it received and forwarded back). Unified

@@ -191,17 +191,14 @@ fn parse_optional_bool(config: &Map<String, Value>, key: &str) -> Result<Option<
 
 /// Serialize and enqueue one access-log line after capacity reservation.
 fn write_access_log_line<T: Serialize + ?Sized>(value: &T) -> Result<(), serde_json::Error> {
-    match crate::logging::access_log_writer() {
-        Some(writer) => {
-            // Saturation and oversize outcomes are accounted by the sink and
-            // intentionally do not log into either potentially degraded sink.
-            let _ = writer.try_write_json(value)?;
-        }
-        // The gateway treats process-sink initialization failure as fatal.
-        // `None` therefore only occurs in library/unit contexts; never add a
-        // synchronous stdout fallback here because plugin hooks are hot paths.
-        None => {}
+    if let Some(writer) = crate::logging::access_log_writer() {
+        // Saturation and oversize outcomes are accounted by the sink and
+        // intentionally do not log into either potentially degraded sink.
+        let _ = writer.try_write_json(value)?;
     }
+    // The gateway treats process-sink initialization failure as fatal. A
+    // missing writer therefore only occurs in library/unit contexts; never
+    // add a synchronous stdout fallback here because plugin hooks are hot paths.
     Ok(())
 }
 
