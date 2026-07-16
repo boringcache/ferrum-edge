@@ -15095,10 +15095,8 @@ pub fn apply_trusted_forwarded_request_scheme(
     );
     if forwarded_request_is_https {
         ctx.request_is_secure = true;
-        ctx.metadata.insert(
-            "ferrum.frontend_scheme".to_string(),
-            "https".to_string(),
-        );
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
     }
     forwarded_request_is_https
 }

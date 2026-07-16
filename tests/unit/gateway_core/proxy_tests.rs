@@ -1577,16 +1577,11 @@ async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination()
         "GET".to_string(),
         "/cookie-scope".to_string(),
     );
-    ctx.metadata.insert(
-        "ferrum.frontend_scheme".to_string(),
-        "http".to_string(),
-    );
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
     let mut raw_headers = http::HeaderMap::new();
     raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("http"));
-    raw_headers.append(
-        "x-forwarded-proto",
-        http::HeaderValue::from_static("https"),
-    );
+    raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("https"));
     ctx.set_raw_headers(raw_headers);
 
     assert!(apply_trusted_forwarded_request_scheme(
@@ -1622,15 +1617,10 @@ fn test_trusted_tls_termination_fails_closed_on_invalid_final_proto_field() {
         "GET".to_string(),
         "/cookie-scope".to_string(),
     );
-    ctx.metadata.insert(
-        "ferrum.frontend_scheme".to_string(),
-        "http".to_string(),
-    );
+    ctx.metadata
+        .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
     let mut raw_headers = http::HeaderMap::new();
-    raw_headers.append(
-        "x-forwarded-proto",
-        http::HeaderValue::from_static("https"),
-    );
+    raw_headers.append("x-forwarded-proto", http::HeaderValue::from_static("https"));
     raw_headers.append(
         "x-forwarded-proto",
         http::HeaderValue::from_bytes(&[0x80]).expect("obs-text header value"),
