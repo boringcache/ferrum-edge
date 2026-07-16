@@ -15,7 +15,8 @@ use dashmap::DashMap;
 use futures_util::stream::{self, StreamExt};
 use hickory_resolver::Resolver;
 use hickory_resolver::config::{
-    ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts,
+    ConnectionConfig, LookupIpStrategy, NameServerConfig, ResolveHosts, ResolverConfig,
+    ResolverOpts,
 };
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RData;
@@ -204,6 +205,10 @@ pub struct DnsCache {
     cache: Arc<DashMap<String, DnsCacheEntry>>,
     global_overrides: HashMap<String, String>,
     resolver: Arc<Resolver<TokioRuntimeProvider>>,
+    /// Resolver dedicated to security-sensitive connection establishment.
+    /// Its internal cache is disabled and it always queries A and AAAA so a
+    /// caller cannot reuse a previously permitted answer after a DNS rebind.
+    dial_resolver: Arc<Resolver<TokioRuntimeProvider>>,
     dns_order: Vec<DnsRecordOrder>,
     /// When set, ALL records use this fixed TTL regardless of DNS response.
     /// None = respect each record's native TTL (default).
@@ -258,6 +263,7 @@ impl DnsCache {
         };
 
         let resolver = build_resolver(&config);
+        let dial_resolver = build_dial_resolver(&config);
 
         let dns_order = parse_dns_order(config.dns_order.as_deref());
 
@@ -268,6 +274,7 @@ impl DnsCache {
             cache: Arc::new(DashMap::with_shard_amount(shards)),
             global_overrides,
             resolver: Arc::new(resolver),
+            dial_resolver: Arc::new(dial_resolver),
             dns_order,
             ttl_override: config
                 .ttl_override_seconds
@@ -629,6 +636,55 @@ impl DnsCache {
                 Err(e)
             }
         }
+    }
+
+    /// Resolve every A/AAAA address for security-sensitive connection setup.
+    ///
+    /// Unlike [`Self::resolve`] and [`Self::resolve_all`], this method never
+    /// consults either DNS cache layer. It honors configured static overrides
+    /// and the hosts file, but hostname lookups go to the configured resolver
+    /// on every call. Every returned address is policy-screened as one atomic
+    /// set: if any candidate is denied, the entire lookup fails before callers
+    /// can dial an allowed decoy from a mixed answer.
+    ///
+    /// Callers must still apply their own wall-clock timeout and should recheck
+    /// each candidate immediately before opening its socket. The latter keeps
+    /// the policy decision adjacent to the dial and protects callers whose
+    /// active policy is stricter than the policy carried by this cache.
+    pub(crate) async fn resolve_all_fresh(
+        &self,
+        hostname: &str,
+    ) -> Result<Vec<IpAddr>, anyhow::Error> {
+        let cache_key = dns_hostname_key(hostname);
+        let lookup_hostname = cache_key.as_ref();
+
+        if let Some(ip_str) = self.global_overrides.get(lookup_hostname) {
+            let addr: IpAddr = ip_str.parse()?;
+            return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
+        }
+
+        if let Ok(addr) = lookup_hostname.parse::<IpAddr>() {
+            return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
+        }
+
+        let lookup = match self.dial_resolver.lookup_ip(lookup_hostname).await {
+            Ok(lookup) => lookup,
+            Err(_) if lookup_hostname == "localhost" => {
+                let addr = self.localhost_addr();
+                return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
+            }
+            Err(error) => {
+                anyhow::bail!("DNS dial-time resolution failed for {hostname}: {error}")
+            }
+        };
+
+        let mut seen = HashSet::new();
+        let addresses: Vec<IpAddr> = lookup.iter().filter(|addr| seen.insert(*addr)).collect();
+        if addresses.is_empty() {
+            anyhow::bail!("DNS dial-time resolution returned no addresses for {hostname}");
+        }
+        self.check_backend_addresses_policy(&addresses, hostname)?;
+        Ok(addresses)
     }
 
     /// Refresh a single cache entry in the background.
@@ -1262,6 +1318,22 @@ pub fn is_egress_policy_denial(err: &anyhow::Error) -> bool {
 
 /// Build a hickory-resolver `Resolver` from a `DnsConfig`.
 fn build_resolver(config: &DnsConfig) -> Resolver<TokioRuntimeProvider> {
+    build_resolver_with_cache_mode(config, true)
+}
+
+/// Build the resolver used immediately before security-sensitive dials.
+/// Hickory's own lookup cache is disabled so this resolver cannot hide a DNS
+/// rebind behind a still-valid prior answer. A and AAAA are always queried in
+/// parallel, with the resolver's preferred connection ordering preserved by
+/// the returned iterator.
+fn build_dial_resolver(config: &DnsConfig) -> Resolver<TokioRuntimeProvider> {
+    build_resolver_with_cache_mode(config, false)
+}
+
+fn build_resolver_with_cache_mode(
+    config: &DnsConfig,
+    cache_enabled: bool,
+) -> Resolver<TokioRuntimeProvider> {
     // Start with system configuration as the base
     let (mut resolver_config, mut resolver_opts) =
         match hickory_resolver::system_conf::read_system_conf() {
@@ -1329,6 +1401,15 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioRuntimeProvider> {
 
     // Allow more in-flight queries per connection during bulk warmup
     resolver_opts.max_active_requests = config.max_active_requests;
+
+    if !cache_enabled {
+        resolver_opts.cache_size = 0;
+        resolver_opts.ip_strategy = LookupIpStrategy::Ipv6AndIpv4;
+        // The dial resolver never consumes its cache, so negative TTL bounds
+        // must not turn a resolver error into a cached reconnect decision.
+        resolver_opts.negative_min_ttl = None;
+        resolver_opts.negative_max_ttl = None;
+    }
 
     // Build the resolver
     let mut builder =

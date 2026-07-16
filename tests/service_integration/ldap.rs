@@ -224,8 +224,13 @@ async fn ldap_search_then_bind_validates_credentials() {
         return;
     };
 
+    // Use the hostname form so every service-account and end-user connection
+    // exercises fresh dial-time resolution. On dual-stack hosts this also
+    // verifies that a failed ::1 candidate falls through to the mapped IPv4
+    // OpenLDAP listener without changing the LDAP hostname contract.
+    let hostname_url = ldap.url.replacen("127.0.0.1", "localhost", 1);
     let plugin = ldap_plugin(json!({
-        "ldap_url": ldap.url.clone(),
+        "ldap_url": hostname_url,
         "search_base_dn": "ou=people,dc=example,dc=org",
         "search_filter": "(uid={username})",
         "canonical_identity_attribute": "uid",

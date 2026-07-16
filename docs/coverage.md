@@ -85,9 +85,10 @@ dispatch, and Sundays at 06:00 UTC. It publishes an HTML report, LCOV file, JSON
 summary, and terminal summary as a 30-day GitHub Actions artifact named
 `coverage-report` whenever coverage is collected. It also writes the overall
 coverage percentage and lowest/highest-covered files to the workflow step
-summary. The main `CI` workflow has a `Coverage (CI mirror)` job that waits for
-the matching Coverage workflow run, so the `Tests` aggregate and `main` publish
-jobs do not pass before coverage has completed for the same SHA.
+summary. The Coverage workflow's `Merge Coverage` job is a branch-protection
+required check in its own right; the main `CI` workflow no longer waits on it
+with a mirror job, so a PR merges only once coverage has completed for the
+same SHA via the required check.
 
 The full default-branch gate is based on the latest completed `main` coverage
 artifact available when the gate was introduced on 2026-06-20:
