@@ -1476,9 +1476,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "query-value-slash-only" => "https://redirect.example/next?leak=%2F".to_string(),
             "query-value-slash-only-root-path" => "https://redirect.example/".to_string(),
-            "query-value-slash-only-nonroot-path" => {
-                "https://redirect.example/next".to_string()
-            }
+            "query-value-slash-only-nonroot-path" => "https://redirect.example/next".to_string(),
             "authority-query-value" => "https://signedtoken.attacker.example/next".to_string(),
             "authority-query-key" => "https://signedkey.attacker.example/next".to_string(),
             "authority-query-idna" => "https://xn--bcher-kva.attacker.example/next".to_string(),
@@ -2281,10 +2279,7 @@ async fn test_query_forwarding_omits_only_credentials_marked_for_backend_strippi
         params.get("api_key_suffix").and_then(Value::as_str),
         Some("visible-suffix")
     );
-    assert_eq!(
-        params.get("note").and_then(Value::as_str),
-        Some("api_key")
-    );
+    assert_eq!(params.get("note").and_then(Value::as_str), Some("api_key"));
     assert_eq!(params.get("flag").and_then(Value::as_str), Some(""));
     assert!(!params.contains_key("api_key"));
 
@@ -2307,8 +2302,7 @@ async fn test_query_forwarding_omits_only_credentials_marked_for_backend_strippi
     }
 
     let mut invalid_encoding_ctx = create_test_context();
-    invalid_encoding_ctx
-        .set_raw_query_string("api_key=hidden&visible=%FF".to_string());
+    invalid_encoding_ctx.set_raw_query_string("api_key=hidden&visible=%FF".to_string());
     invalid_encoding_ctx.metadata.insert(
         "auth.strip_query_param.api_key".to_string(),
         "true".to_string(),
