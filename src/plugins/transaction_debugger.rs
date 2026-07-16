@@ -17,9 +17,7 @@ use super::{
     Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
     TransactionSummary, WsDisconnectContext,
 };
-use crate::plugins::utils::metadata_redaction::{
-    REDACTED_PLACEHOLDER, is_sensitive_metadata_key,
-};
+use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use crate::proxy::tcp_proxy::StreamIoSide;
 
 /// Headers that contain sensitive credentials and must be redacted in debug output.

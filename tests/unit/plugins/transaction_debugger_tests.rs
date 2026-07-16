@@ -423,11 +423,9 @@ fn test_shared_validation_matches_transaction_debugger_config_surface() {
     )
     .unwrap();
 
-    let removed = validate_plugin_config(
-        "transaction_debugger",
-        &json!({"log_request_body": false}),
-    )
-    .expect_err("shared validation must reject removed body options");
+    let removed =
+        validate_plugin_config("transaction_debugger", &json!({"log_request_body": false}))
+            .expect_err("shared validation must reject removed body options");
     assert!(removed.contains("payloads are not captured"));
 
     let unknown = validate_plugin_config(
@@ -651,7 +649,10 @@ async fn test_transaction_debugger_stream_output_includes_typed_teardown() {
     ] {
         assert!(logs.contains(expected), "missing {expected}: {logs}");
     }
-    assert!(!logs.contains("stream-secret"), "raw metadata leaked: {logs}");
+    assert!(
+        !logs.contains("stream-secret"),
+        "raw metadata leaked: {logs}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
