@@ -2984,13 +2984,6 @@ impl MtlsDnsAdmissionGuardLifecycle {
         );
     }
 
-    fn mark_settled(&self) {
-        self.mutation_state.store(
-            MtlsDnsAdmissionMutationState::Settled as u8,
-            Ordering::Release,
-        );
-    }
-
     async fn release(&mut self) -> Result<(), anyhow::Error> {
         let result = self
             .db
@@ -5466,19 +5459,8 @@ async fn handle_restore(
                             )
                             .await
                         }
-                        AtomicClearVerification::PriorConfigIntact => {
-                            restore_guard.mark_settled();
-                            finish_atomic_delete_failure(
-                                state,
-                                db.clone(),
-                                actor,
-                                namespace,
-                                e.to_string(),
-                                &mut restore_guard,
-                            )
-                            .await
-                        }
-                        AtomicClearVerification::UnknownOutcome => {
+                        AtomicClearVerification::PriorCountsStillVisible
+                        | AtomicClearVerification::UnknownOutcome => {
                             finish_unknown_atomic_delete_failure(
                                 state,
                                 db.clone(),

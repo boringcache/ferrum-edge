@@ -279,6 +279,11 @@ the clear, all import batches, and any compensating replay. Credential endpoints
 likewise acquire that owner before reading the Consumer and borrow it for the
 write, so an unrelated credential update cannot resurrect a concurrently
 rotated mTLS identity from a stale full-Consumer snapshot.
+If a replica-set clear returns `UnknownTransactionCommitResult`, an immediate
+read that still sees the pre-restore resource counts does not prove abort: the
+delayed commit can become visible later on another pooled connection. Ferrum
+therefore retains the owner-qualified fence and generation pin for manual
+recovery instead of admitting writes that the delayed clear could erase.
 
 Both lock/guard collections hold tiny nonce documents (one per route bucket / referenced upstream) and are created explicitly at migration time because MongoDB < 4.4 cannot implicitly create collections inside transactions.
 

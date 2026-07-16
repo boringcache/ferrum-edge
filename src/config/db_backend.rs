@@ -37,9 +37,7 @@ impl std::fmt::Display for MtlsDnsAdmissionUnavailable {
 impl std::error::Error for MtlsDnsAdmissionUnavailable {}
 
 pub fn is_mtls_dns_admission_unavailable(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<MtlsDnsAdmissionUnavailable>())
+    error.is::<MtlsDnsAdmissionUnavailable>()
 }
 
 pub(crate) fn mark_mtls_dns_admission_unavailable(error: anyhow::Error) -> anyhow::Error {
@@ -311,7 +309,7 @@ pub enum DeleteMode {
     NonAtomic,
 }
 
-/// Authoritative resource counts used to resolve an ambiguous atomic clear.
+/// Authoritative resource counts used to classify an ambiguous atomic clear.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NamespaceResourceCounts {
     pub proxies: u64,
@@ -330,8 +328,18 @@ impl NamespaceResourceCounts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicClearVerification {
     ClearCommitted,
-    PriorConfigIntact,
+    PriorCountsStillVisible,
     UnknownOutcome,
+}
+
+impl AtomicClearVerification {
+    /// Whether an unknown commit result remains unresolved after verification.
+    pub fn is_still_unknown(self) -> bool {
+        matches!(
+            self,
+            Self::PriorCountsStillVisible | Self::UnknownOutcome
+        )
+    }
 }
 
 pub fn classify_atomic_clear_verification<E>(
@@ -339,7 +347,10 @@ pub fn classify_atomic_clear_verification<E>(
     verification: Result<NamespaceResourceCounts, E>,
 ) -> AtomicClearVerification {
     match verification {
-        Ok(post_clear) if post_clear == prior => AtomicClearVerification::PriorConfigIntact,
+        // Matching the prior snapshot only proves the clear was not visible to
+        // this read. An UnknownTransactionCommitResult may still commit later
+        // on another pooled connection, so this is not a definitive abort.
+        Ok(post_clear) if post_clear == prior => AtomicClearVerification::PriorCountsStillVisible,
         Ok(post_clear) if post_clear.is_empty() => AtomicClearVerification::ClearCommitted,
         Ok(_) | Err(_) => AtomicClearVerification::UnknownOutcome,
     }

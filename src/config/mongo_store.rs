@@ -1672,9 +1672,11 @@ mod inner {
 
             let mut candidate =
                 <Self as DatabaseBackend>::load_namespace_snapshot(self, namespace).await?;
-            let prior_conflicts = allow_existing_conflicts
-                .then(|| candidate.mtls_dns_identity_conflicts())
-                .unwrap_or_default();
+            let prior_conflicts = if allow_existing_conflicts {
+                candidate.mtls_dns_identity_conflicts()
+            } else {
+                Vec::new()
+            };
             mutate(&mut candidate);
             candidate.normalize_fields();
             if allow_existing_conflicts
