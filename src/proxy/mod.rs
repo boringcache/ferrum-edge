@@ -14181,15 +14181,61 @@ fn set_cookie_name(set_cookie: &str) -> Option<&str> {
     Some(name)
 }
 
+/// Return the RFC 6265 cookie storage key components that are explicit in a
+/// `Set-Cookie` line. The request host and default-path are unavailable during
+/// auth rejection merging, so omitted Domain/Path attributes are kept distinct
+/// from explicit attributes instead of being collapsed by name alone.
+fn set_cookie_storage_key(set_cookie: &str) -> Option<(&str, Option<&str>, Option<&str>)> {
+    let name = set_cookie_name(set_cookie)?;
+    let mut domain = None;
+    let mut path = None;
+
+    for attribute in set_cookie.split(';').skip(1) {
+        let attribute = attribute.trim();
+        let Some((attribute_name, attribute_value)) = attribute.split_once('=') else {
+            continue;
+        };
+        let attribute_name = attribute_name.trim();
+        let attribute_value = attribute_value.trim();
+        if attribute_name.eq_ignore_ascii_case("domain") {
+            domain = Some(attribute_value);
+        } else if attribute_name.eq_ignore_ascii_case("path") {
+            path = Some(attribute_value);
+        }
+    }
+
+    Some((name, domain, path))
+}
+
+fn set_cookie_same_storage_key(existing: &str, candidate: &str) -> bool {
+    let Some((existing_name, existing_domain, existing_path)) = set_cookie_storage_key(existing)
+    else {
+        return false;
+    };
+    let Some((candidate_name, candidate_domain, candidate_path)) =
+        set_cookie_storage_key(candidate)
+    else {
+        return false;
+    };
+
+    existing_name == candidate_name
+        && existing_path == candidate_path
+        && match (existing_domain, candidate_domain) {
+            (Some(existing_domain), Some(candidate_domain)) => {
+                existing_domain.eq_ignore_ascii_case(candidate_domain)
+            }
+            (None, None) => true,
+            _ => false,
+        }
+}
+
 /// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
-/// earlier line when a later line owns the same exact, case-sensitive cookie
-/// name. Invalid cookie-pairs can only replace byte-identical lines.
+/// earlier line only when a later line owns the same RFC 6265 storage key.
+/// Invalid cookie-pairs can only replace byte-identical lines.
 fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
-        let candidate_name = set_cookie_name(candidate);
         if let Some(index) = cookies.iter().position(|existing| {
-            existing == candidate
-                || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+            existing == candidate || set_cookie_same_storage_key(existing, candidate)
         }) {
             cookies.remove(index);
         }
@@ -14198,11 +14244,9 @@ fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
 }
 
 fn set_cookie_conflicts(cookies: &[String], candidate: &str) -> bool {
-    let candidate_name = set_cookie_name(candidate);
-    cookies.iter().any(|existing| {
-        existing == candidate
-            || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
-    })
+    cookies
+        .iter()
+        .any(|existing| existing == candidate || set_cookie_same_storage_key(existing, candidate))
 }
 
 /// Stage requester-owned cookies from rejecting auth attempts. This remains on

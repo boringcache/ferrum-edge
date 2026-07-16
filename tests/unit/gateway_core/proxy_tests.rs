@@ -405,7 +405,7 @@ impl Plugin for MixedCaseCookieRejectingAuth {
             headers: HashMap::from([
                 (
                     "Set-Cookie".to_string(),
-                    "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nshared=1; Path=/"
+                    "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nshared=1; Path=/\nscoped=clear-root; Path=/\nscoped=clear-app; Path=/app"
                         .to_string(),
                 ),
                 (
@@ -864,7 +864,7 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
     let selected: Arc<dyn Plugin> = Arc::new(MixedCaseCookieRejectingAuth);
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
-    let expected = "upper_only=1; Path=/upper\nshared=1; Path=/\nlower_only=1; Path=/lower\nsession=selected-lower; Path=/lower; Secure; SameSite=Strict\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged";
+    let expected = "session=selected-upper; Path=/upper; HttpOnly\nupper_only=1; Path=/upper\nscoped=clear-root; Path=/\nscoped=clear-app; Path=/app\nshared=1; Path=/\nlower_only=1; Path=/lower\nsession=selected-lower; Path=/lower; Secure; SameSite=Strict\nSession=case-sensitive; Path=/case\nstaged_only=1; Path=/staged";
 
     for _ in 0..32 {
         let mut ctx = RequestContext::new(
