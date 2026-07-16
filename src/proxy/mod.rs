@@ -14076,6 +14076,32 @@ fn build_grpc_web_error_response(
     build_grpc_web_error_response_from_parts(response, status, message)
 }
 
+fn merge_grpc_web_expose_headers(
+    required: Option<&str>,
+    configured: Option<&str>,
+) -> Option<String> {
+    let mut merged = String::new();
+    for value in [required, configured].into_iter().flatten() {
+        for token in value
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            if merged
+                .split(',')
+                .any(|existing| existing.trim().eq_ignore_ascii_case(token))
+            {
+                continue;
+            }
+            if !merged.is_empty() {
+                merged.push_str(", ");
+            }
+            merged.push_str(token);
+        }
+    }
+    (!merged.is_empty()).then_some(merged)
+}
+
 /// Finalize the initial HEADERS for a gateway-generated gRPC-Web error.
 ///
 /// `error_response_for_content_type` temporarily keeps terminal gRPC metadata
@@ -14120,6 +14146,14 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
             &mut response.headers,
         );
     }
+
+    let expose_headers = merge_grpc_web_expose_headers(
+        expose_headers.as_deref(),
+        response
+            .headers
+            .get("access-control-expose-headers")
+            .map(String::as_str),
+    );
 
     response.headers.retain(|name, _| {
         ![

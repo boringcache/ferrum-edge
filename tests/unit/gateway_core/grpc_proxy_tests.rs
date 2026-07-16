@@ -373,6 +373,10 @@ fn grpc_web_reject_finalizer_moves_rich_status_details_into_body_trailer() {
             ("grpc-status".to_string(), "7".to_string()),
             ("grpc-message".to_string(), "denied".to_string()),
             ("grpc-status-details-bin".to_string(), "AQID".to_string()),
+            (
+                "access-control-expose-headers".to_string(),
+                "X-Request-ID, grpc-status".to_string(),
+            ),
         ]);
 
         ferrum_edge::_test_support::finalize_grpc_web_error_response_headers(
@@ -392,6 +396,31 @@ fn grpc_web_reject_finalizer_moves_rich_status_details_into_body_trailer() {
         assert_eq!(
             response.headers.get("content-length").map(String::as_str),
             Some(expected_content_length.as_str())
+        );
+        let exposed_headers = response
+            .headers
+            .get("access-control-expose-headers")
+            .expect("gRPC-Web rejects must expose configured and terminal metadata");
+        for expected in [
+            "grpc-status",
+            "grpc-message",
+            "grpc-status-details-bin",
+            "X-Request-ID",
+        ] {
+            assert!(
+                exposed_headers
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case(expected)),
+                "missing {expected} in {exposed_headers}"
+            );
+        }
+        assert_eq!(
+            exposed_headers
+                .split(',')
+                .filter(|token| token.trim().eq_ignore_ascii_case("grpc-status"))
+                .count(),
+            1,
+            "mandatory exposure must not be duplicated: {exposed_headers}"
         );
         let wire_body = if is_text {
             BASE64.decode(&response.body).expect("decode text response")
