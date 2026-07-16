@@ -5673,6 +5673,8 @@ fn load_validated_country_mmdb_inner(
     verify_country_mmdb_path_still_matches(path, &file_version)?;
 
     let digest: CountryMmdbDigest = hasher.finalize().into();
+    #[cfg(not(unix))]
+    verify_country_mmdb_path_digest(path, &file_version, &digest)?;
     {
         let mut cache = country_mmdb_snapshot_cache().lock().map_err(|_| {
             CountryMmdbLoadError::Invalid(
