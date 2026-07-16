@@ -667,7 +667,7 @@ impl CanonicalClientIpCache {
 }
 
 fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
-    parse_client_ip_literal(client_ip).map(IpAddr::to_canonical)
+    parse_client_ip_literal(client_ip).map(|ip| ip.to_canonical())
 }
 
 /// Parse the legacy client/rule literal forms without allocation.

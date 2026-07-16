@@ -367,7 +367,7 @@ fn parse_rule_ip(ip: &str) -> Option<IpAddr> {
 /// plugin hooks use the context-cached typed client IP and compiled range set.
 #[allow(dead_code)]
 pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
-    let client_ip = parse_rule_ip(client_ip).map(IpAddr::to_canonical);
+    let client_ip = parse_rule_ip(client_ip).map(|ip| ip.to_canonical());
     match (client_ip, parse_rule(rule)) {
         (Some(client_ip), Some(rule)) => rule.matches(client_ip),
         _ => false,
