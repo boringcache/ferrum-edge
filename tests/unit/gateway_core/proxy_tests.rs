@@ -363,23 +363,33 @@ fn test_backend_path_bound_retries_abort_in_every_h1_h2_dispatch_family() {
 #[test]
 fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     let source = include_str!("../../../src/proxy/mod.rs");
-    let path_policy = source
-        .rfind("if let Some(response) = run_backend_path_plugins_or_build_reject(")
+    let handler_start = source
+        .find("async fn handle_proxy_request_inner(")
+        .expect("H1/H2 request handler must remain present");
+    let handler = &source[handler_start..];
+    let path_policy = handler
+        .find("if let Some(response) = run_backend_path_plugins_or_build_reject(")
         .expect("backend-path policy hook must remain present");
-    let deferred = source
+    let deferred = handler
         .find("// Hooks that can dispatch external work or synthesize a terminal response")
         .expect("deferred before_proxy pass must remain present");
     assert!(path_policy < deferred);
     assert!(source.contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"));
-    assert!(source.contains("BackendPathPolicyPhase::Enforce"));
     assert!(
         !source.contains("backend_dispatch::upstream_selection_hash_key("),
-        "an external deferred hook must not reselect an unpreviewed target"
+        "an external deferred hook must not reselect a different target"
     );
     assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
-    let routing_hook = source
-        .rfind("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+    let routing_hook = handler
+        .find("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
         .expect("routing-header hook must remain present");
+    assert_eq!(
+        handler[path_policy..routing_hook]
+            .matches("run_backend_path_plugins_or_build_reject(")
+            .count(),
+        1,
+        "H1/H2 must enforce policy exactly once on the pinned path"
+    );
     assert!(
         path_policy < routing_hook,
         "stateful path policy must reject before deferred external work"
@@ -513,7 +523,7 @@ fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
     );
     assert!(
         !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
-        "deferred headers must not steer the request to an unpreviewed target"
+        "deferred headers must not steer the request to a different target"
     );
 
     let remaining_hook = routing_hook + remaining_hook;

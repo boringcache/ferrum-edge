@@ -107,9 +107,9 @@ use crate::modes::mesh::node_waypoint::{
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
-    BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
-    PluginResult, ProxyProtocol, RequestContext, TransactionSummary, WebSocketFrameDirection,
-    is_builtin_plugin_name, mesh_route_dispatch::MeshRouteDispatchConfig,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
+    RequestContext, TransactionSummary, WebSocketFrameDirection, is_builtin_plugin_name,
+    mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
 use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
@@ -14282,14 +14282,10 @@ async fn run_backend_path_plugins_or_build_reject(
     original_request_path: &str,
     is_grpc_request: bool,
     grpc_web_response_content_type: Option<&str>,
-    phase: BackendPathPolicyPhase,
 ) -> Option<Response<ProxyBody>> {
     let phase_start = Instant::now();
     for plugin in backend_path_plugins {
-        match plugin
-            .on_backend_path_resolved(ctx, backend_path, phase)
-            .await
-        {
+        match plugin.on_backend_path_resolved(ctx, backend_path).await {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -16493,7 +16489,6 @@ async fn handle_proxy_request_inner(
             &original_request_path,
             is_grpc_request,
             grpc_web_response_content_type,
-            BackendPathPolicyPhase::Enforce,
         )
         .await
         {

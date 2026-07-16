@@ -245,21 +245,24 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     );
     assert!(
         !source.contains("backend_dispatch::upstream_selection_hash_key("),
-        "H3 external deferred hooks must not select an unpreviewed target"
+        "H3 external deferred hooks must not reselect a different target"
     );
-    assert!(
-        policy_block.contains("BackendPathPolicyPhase::Enforce"),
-        "H3 must charge policy once on the pinned path before deferred routing"
+    assert_eq!(
+        policy_block
+            .matches("run_h3_backend_path_plugins_or_send_reject(")
+            .count(),
+        1,
+        "H3 must enforce policy exactly once on the pinned path"
     );
     assert!(
         source.contains("BackendPathBeforeProxyPass::RemainingDeferred"),
         "H3 must keep remaining side-effect hooks behind any required reauthorization"
     );
-    let routing_hook = source
-        .rfind("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+    let routing_hook = after_selection
+        .find("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
         .expect("H3 routing-header hook must remain present");
     assert!(
-        path_policy < routing_hook,
+        path_policy < routing_hook && routing_hook < circuit_breaker,
         "H3 stateful path policy must reject before deferred external work"
     );
     let native_retry = source
@@ -630,7 +633,7 @@ fn h3_deferred_hooks_cannot_spoof_backend_consumer_identity() {
     );
     assert!(
         !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
-        "H3 deferred headers must not steer onto an unpreviewed target"
+        "H3 deferred headers must not steer onto a different target"
     );
 
     let remaining_hook = routing_hook + remaining_hook;

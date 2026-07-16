@@ -53,7 +53,7 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 5c. deferred before_proxy │  Remaining external/synthetic work after policy
+│ 5c. deferred hooks      │  Remaining external/synthetic work after policy
 └────────────┬────────────┘
              │
              ▼
@@ -132,9 +132,9 @@ so routing-header mutations cannot steer the request onto a different method.
 The gateway enforces the selected path, including stateful per-method rate
 limits, exactly once before invoking those hooks. Gateway-owned identity
 headers and configured egress baggage filtering are reapplied after every
-deferred mutation pass. Its
-pre-filtered plugin list is built on reload; proxies without an opt-in plugin do
-not scan the chain or allocate an effective-path string. Once policy binds the
+deferred mutation pass. The pre-filtered backend-path plugin list is built on
+reload; proxies without an opt-in plugin do not scan the chain or allocate an
+effective-path string. Once policy binds the
 first target's path, retries may rotate host/port only when the candidate keeps
 the same assembled effective backend path, including the proxy `backend_path`
 fallback when a target has no explicit path. A candidate with a different path
@@ -162,7 +162,8 @@ deferred pass, the gateway removes every case variant of the reserved
 `x-consumer-username` and `x-consumer-custom-id` headers, restores only
 authenticated gateway values, and reapplies configured egress baggage-key
 filtering. Plugin-returned headers therefore cannot spoof backend identity,
-restore forbidden baggage, or steer this request to an unpreviewed target.
+restore forbidden baggage, or steer this request to a different unauthorized
+target.
 
 When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
 

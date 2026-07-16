@@ -28,8 +28,8 @@ use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{
-    BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
-    PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction, TransactionSummary,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
+    RequestContext, ResponseStreamAction, TransactionSummary,
     normalize_response_body_for_inspection,
 };
 use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
@@ -2519,7 +2519,6 @@ async fn handle_h3_request(
             start_time,
             &mut plugin_execution_ns,
             grpc_web_response_content_type.as_deref(),
-            BackendPathPolicyPhase::Enforce,
         )
         .await?
         {
@@ -5772,14 +5771,10 @@ async fn run_h3_backend_path_plugins_or_send_reject(
     start_time: std::time::Instant,
     plugin_execution_ns: &mut u64,
     grpc_web_response_content_type: Option<&str>,
-    phase: BackendPathPolicyPhase,
 ) -> Result<bool, anyhow::Error> {
     let phase_start = std::time::Instant::now();
     for plugin in backend_path_plugins {
-        match plugin
-            .on_backend_path_resolved(ctx, backend_path, phase)
-            .await
-        {
+        match plugin.on_backend_path_resolved(ctx, backend_path).await {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
