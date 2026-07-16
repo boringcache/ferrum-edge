@@ -1064,7 +1064,7 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `batch_size` | integer | `100` | Max entries per batch (1–10,000) |
 | `flush_interval_ms` | integer | `1000` | Flush timer interval (minimum 100) |
 | `buffer_capacity` | integer | `10000` | Channel buffer capacity (1–1,000,000) |
-| `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576); static and reserved labels must collectively leave room for the line |
+| `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576); the configured serializer's minimum HTTP and stream lines plus static, reserved, and unavoidable dynamic labels must fit |
 | `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`) |
 | `max_retries` | integer | `3` | Retries after the initial attempt (0–10) |
 | `retry_delay_ms` | integer | `1000` | Initial exponential-backoff delay (1–60,000 ms) |

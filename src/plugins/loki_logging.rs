@@ -73,6 +73,12 @@ const LOKI_RESPONSE_BODY_LIMIT: usize = 1024 * 1024;
 const LOKI_RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const LOKI_DROP_WARN_EVERY: u64 = 100;
 const LOKI_EMITTER_LABEL: &str = "ferrum_emitter";
+// Random prefix (32 hex bytes), separator, and fixed-width u64 counter (16 hex bytes).
+// A fixed width keeps construction-time and runtime label accounting identical.
+const LOKI_EMITTER_VALUE_BYTES: usize = 16 * 2 + 1 + std::mem::size_of::<u64>() * 2;
+const LOKI_MIN_PROXY_ID: &str = "0";
+const LOKI_MIN_STREAM_PROTOCOL: &str = "tcp";
+const LOKI_MIN_TIMESTAMP: &str = "1970-01-01T00:00:00+00:00";
 
 static LOKI_EMITTER_PREFIX: LazyLock<Result<[u8; 16], ()>> = LazyLock::new(|| {
     let mut bytes = [0_u8; 16];
@@ -170,6 +176,25 @@ struct BoundedJsonWriter {
     limit_exceeded: bool,
 }
 
+#[derive(Default)]
+struct CountingJsonWriter {
+    bytes: usize,
+}
+
+impl Write for CountingJsonWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buf.len())
+            .ok_or_else(|| std::io::Error::other("serialized Loki entry size overflowed"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl BoundedJsonWriter {
     fn new(max_bytes: usize) -> Self {
         Self {
@@ -206,6 +231,36 @@ struct LabelConfig {
     include_proxy_id: bool,
     /// Whether to add status class (2xx/3xx/4xx/5xx) as a label (default true).
     include_status_class: bool,
+}
+
+impl LabelConfig {
+    fn build_http_labels(&self, summary: &TransactionSummary) -> BTreeMap<String, String> {
+        let mut labels = self.static_labels.clone();
+        if self.include_proxy_id
+            && let Some(ref proxy_id) = summary.proxy_id
+        {
+            labels.insert("proxy_id".to_string(), proxy_id.clone());
+        }
+        if self.include_status_class {
+            labels.insert(
+                "status_class".to_string(),
+                status_class(summary.response_status_code),
+            );
+        }
+        labels
+    }
+
+    fn build_stream_labels(
+        &self,
+        summary: &StreamTransactionSummary,
+    ) -> BTreeMap<String, String> {
+        let mut labels = self.static_labels.clone();
+        if self.include_proxy_id {
+            labels.insert("proxy_id".to_string(), summary.proxy_id.clone());
+        }
+        labels.insert("protocol".to_string(), summary.protocol.clone());
+        labels
+    }
 }
 
 pub struct LokiLogging {
@@ -302,10 +357,10 @@ impl LokiLogging {
         validate_batch_config(config, "loki_logging", batch_defaults)?;
         let (max_entry_bytes, buffer_max_bytes, retry) =
             validate_loki_resource_config(config, batch_defaults)?;
-        validate_static_label_budget(&label_config.static_labels, max_entry_bytes)?;
+        let schema = resolve_schema(config, "loki_logging", SchemaCapabilities::BASE)?;
+        validate_minimum_entry_budget(&label_config, schema.as_deref(), max_entry_bytes)?;
         let mut batch_config = build_batch_config(config, "loki_logging", batch_defaults);
         batch_config.retry = retry;
-        let schema = resolve_schema(config, "loki_logging", SchemaCapabilities::BASE)?;
         let flush_config = LokiFlushConfig {
             endpoint_url,
             endpoint_url_for_logs,
@@ -359,12 +414,11 @@ impl LokiLogging {
             return;
         }
         let labels = build_labels();
-        let retained_bytes = writer.bytes.len().saturating_add(
-            labels
-                .iter()
-                .map(|(key, value)| key.len().saturating_add(value.len()))
-                .sum::<usize>(),
-        );
+        let Some(retained_bytes) = retained_entry_bytes(writer.bytes.len(), &labels) else {
+            self.byte_budget
+                .record_drop("entry and labels exceeded byte accounting range");
+            return;
+        };
         if retained_bytes > self.max_entry_bytes {
             self.byte_budget
                 .record_drop("entry and labels exceeded max_entry_bytes");
@@ -389,29 +443,12 @@ impl LokiLogging {
 
     /// Build labels for an HTTP/gRPC/WebSocket transaction.
     fn build_http_labels(&self, summary: &TransactionSummary) -> BTreeMap<String, String> {
-        let mut labels = self.label_config.static_labels.clone();
-        if self.label_config.include_proxy_id
-            && let Some(ref proxy_id) = summary.proxy_id
-        {
-            labels.insert("proxy_id".to_string(), proxy_id.clone());
-        }
-        if self.label_config.include_status_class {
-            labels.insert(
-                "status_class".to_string(),
-                status_class(summary.response_status_code),
-            );
-        }
-        labels
+        self.label_config.build_http_labels(summary)
     }
 
     /// Build labels for a TCP/UDP stream transaction.
     fn build_stream_labels(&self, summary: &StreamTransactionSummary) -> BTreeMap<String, String> {
-        let mut labels = self.label_config.static_labels.clone();
-        if self.label_config.include_proxy_id {
-            labels.insert("proxy_id".to_string(), summary.proxy_id.clone());
-        }
-        labels.insert("protocol".to_string(), summary.protocol.clone());
-        labels
+        self.label_config.build_stream_labels(summary)
     }
 }
 
@@ -563,13 +600,16 @@ fn next_loki_emitter_id() -> Result<String, String> {
         })
         .map_err(|_| "loki_logging: emitter label counter exhausted".to_string())?;
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut value = String::with_capacity(48);
+    let mut value = String::with_capacity(LOKI_EMITTER_VALUE_BYTES);
     for &byte in prefix {
         value.push(HEX[(byte >> 4) as usize] as char);
         value.push(HEX[(byte & 0x0f) as usize] as char);
     }
     value.push('-');
-    value.push_str(&instance_id.to_string());
+    for byte in instance_id.to_be_bytes() {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
     Ok(value)
 }
 
@@ -609,18 +649,104 @@ fn validate_loki_label_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_static_label_budget(
+fn retained_entry_bytes(
+    line_bytes: usize,
     labels: &BTreeMap<String, String>,
+) -> Option<usize> {
+    labels.iter().try_fold(line_bytes, |total, (key, value)| {
+        total.checked_add(key.len())?.checked_add(value.len())
+    })
+}
+
+fn serialized_entry_bytes<T: serde::Serialize>(value: &T, kind: &str) -> Result<usize, String> {
+    let mut writer = CountingJsonWriter::default();
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|error| format!("loki_logging: failed to measure minimum {kind}: {error}"))?;
+    Ok(writer.bytes)
+}
+
+fn minimum_http_summary() -> TransactionSummary {
+    TransactionSummary {
+        namespace: LOKI_MIN_PROXY_ID.to_string(),
+        timestamp_received: LOKI_MIN_TIMESTAMP.to_string(),
+        client_ip: "::".to_string(),
+        http_method: "A".to_string(),
+        request_path: "/".to_string(),
+        proxy_id: Some(LOKI_MIN_PROXY_ID.to_string()),
+        response_status_code: 200,
+        ..TransactionSummary::default()
+    }
+}
+
+fn minimum_stream_summary() -> StreamTransactionSummary {
+    StreamTransactionSummary {
+        namespace: LOKI_MIN_PROXY_ID.to_string(),
+        proxy_id: LOKI_MIN_PROXY_ID.to_string(),
+        proxy_name: None,
+        client_ip: "::".to_string(),
+        consumer_username: None,
+        auth_method: None,
+        backend_target: "a:1".to_string(),
+        backend_resolved_ip: None,
+        protocol: LOKI_MIN_STREAM_PROTOCOL.to_string(),
+        listen_port: 1,
+        duration_ms: 0.0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        connection_error: None,
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: LOKI_MIN_TIMESTAMP.to_string(),
+        timestamp_disconnected: LOKI_MIN_TIMESTAMP.to_string(),
+        sni_hostname: None,
+        metadata: HashMap::new(),
+    }
+}
+
+fn validate_minimum_entry_budget(
+    label_config: &LabelConfig,
+    schema: Option<&SummarySchema>,
     max_entry_bytes: usize,
 ) -> Result<(), String> {
-    let retained_bytes = labels.iter().try_fold(0_usize, |total, (key, value)| {
-        total.checked_add(key.len())?.checked_add(value.len())
-    });
-    if retained_bytes.is_none_or(|bytes| bytes >= max_entry_bytes) {
-        return Err(
-            "loki_logging: configured and reserved labels must collectively use fewer bytes than 'max_entry_bytes'"
-                .to_string(),
-        );
+    let http_summary = minimum_http_summary();
+    let http_line_bytes = match schema.filter(|schema| schema.applies_to_http()) {
+        Some(schema) => serialized_entry_bytes(
+            &SchemaView {
+                summary: &http_summary,
+                schema,
+            },
+            "HTTP entry",
+        )?,
+        None => serialized_entry_bytes(&http_summary, "HTTP entry")?,
+    };
+    let http_labels = label_config.build_http_labels(&http_summary);
+    let http_retained_bytes = retained_entry_bytes(http_line_bytes, &http_labels);
+
+    let stream_summary = minimum_stream_summary();
+    let stream_line_bytes = match schema.filter(|schema| schema.applies_to_stream()) {
+        Some(schema) => serialized_entry_bytes(
+            &SchemaView {
+                summary: &stream_summary,
+                schema,
+            },
+            "stream entry",
+        )?,
+        None => serialized_entry_bytes(&stream_summary, "stream entry")?,
+    };
+    let stream_labels = label_config.build_stream_labels(&stream_summary);
+    let stream_retained_bytes = retained_entry_bytes(stream_line_bytes, &stream_labels);
+
+    let minimum_retained_bytes = http_retained_bytes
+        .zip(stream_retained_bytes)
+        .map(|(http, stream)| http.max(stream))
+        .ok_or_else(|| {
+            "loki_logging: minimum entry retained-byte accounting overflowed".to_string()
+        })?;
+    if minimum_retained_bytes > max_entry_bytes {
+        return Err(format!(
+            "loki_logging: 'max_entry_bytes' must fit a minimum serialized HTTP and stream entry plus configured, reserved, and unavoidable dynamic labels (requires at least {minimum_retained_bytes} bytes, configured {max_entry_bytes})"
+        ));
     }
     Ok(())
 }

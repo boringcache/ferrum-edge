@@ -237,7 +237,104 @@ async fn test_loki_logging_rejects_static_labels_that_exhaust_entry_budget() {
     let error = result
         .err()
         .expect("labels that leave no entry budget must be rejected");
-    assert!(error.contains("collectively use fewer bytes than 'max_entry_bytes'"));
+    assert!(error.contains("minimum serialized HTTP and stream entry"));
+}
+
+fn entry_budget_config(
+    max_entry_bytes: usize,
+    include_proxy_id_label: bool,
+    include_status_class_label: bool,
+) -> serde_json::Value {
+    json!({
+        "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",
+        "labels": {"service": "x".repeat(2048)},
+        "include_proxy_id_label": include_proxy_id_label,
+        "include_status_class_label": include_status_class_label,
+        "max_entry_bytes": max_entry_bytes,
+        "buffer_max_bytes": 8192,
+    })
+}
+
+fn minimum_accepted_entry_budget(
+    include_proxy_id_label: bool,
+    include_status_class_label: bool,
+) -> usize {
+    let mut rejected = 1023_usize;
+    let mut accepted = 4096_usize;
+    assert!(
+        LokiLogging::new(
+            &entry_budget_config(
+                accepted,
+                include_proxy_id_label,
+                include_status_class_label,
+            ),
+            default_client(),
+        )
+        .is_ok(),
+        "upper test boundary must fit the minimum entry"
+    );
+
+    while accepted - rejected > 1 {
+        let candidate = rejected + (accepted - rejected) / 2;
+        if LokiLogging::new(
+            &entry_budget_config(
+                candidate,
+                include_proxy_id_label,
+                include_status_class_label,
+            ),
+            default_client(),
+        )
+        .is_ok()
+        {
+            accepted = candidate;
+        } else {
+            rejected = candidate;
+        }
+    }
+    accepted
+}
+
+#[tokio::test]
+async fn test_loki_logging_entry_budget_exact_boundary_includes_dynamic_labels() {
+    let without_optional_labels = minimum_accepted_entry_budget(false, false);
+    let with_status_class = minimum_accepted_entry_budget(false, true);
+    let with_default_labels = minimum_accepted_entry_budget(true, true);
+
+    // service key/value plus the fixed-width ferrum_emitter key/value. The
+    // accepted boundary must reserve more than the static-label-only check.
+    const STATIC_LABEL_BYTES: usize =
+        "service".len() + 2048 + "ferrum_emitter".len() + (32 + 1 + 16);
+    assert!(without_optional_labels > STATIC_LABEL_BYTES + 1);
+    assert!(
+        with_status_class > without_optional_labels,
+        "enabled status_class must consume minimum entry budget"
+    );
+    assert!(
+        with_default_labels > with_status_class,
+        "enabled proxy_id must consume minimum entry budget"
+    );
+
+    for (minimum, include_proxy_id, include_status_class) in [
+        (without_optional_labels, false, false),
+        (with_status_class, false, true),
+        (with_default_labels, true, true),
+    ] {
+        let error = LokiLogging::new(
+            &entry_budget_config(minimum - 1, include_proxy_id, include_status_class),
+            default_client(),
+        )
+        .err()
+        .expect("one byte below the minimum retained size must be rejected");
+        assert!(error.contains("minimum serialized HTTP and stream entry"));
+        assert!(
+            LokiLogging::new(
+                &entry_budget_config(minimum, include_proxy_id, include_status_class),
+                default_client(),
+            )
+            .is_ok(),
+            "the exact minimum retained size must be accepted"
+        );
+    }
 }
 
 #[tokio::test]
