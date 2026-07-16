@@ -3811,6 +3811,7 @@ fn intervening_clear_recovery_candidate(
 }
 
 #[doc(hidden)]
+#[allow(dead_code)]
 pub(crate) fn intervening_clear_recovery_candidate_for_test(
     snapshot: GatewayConfig,
     current: GatewayConfig,
