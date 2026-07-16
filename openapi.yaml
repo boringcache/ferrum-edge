@@ -15024,6 +15024,7 @@ components:
         cache_ttl_seconds:
           type: [integer, "null"]
           format: uint64
+          minimum: 0
           default: 300
           description: "Time-to-live for the in-process spec body cache (seconds). Omitted or null defaults to 300. The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Set to 0 to disable durable positive caching; callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay, while later requests immediately re-fetch. Failed fetches use bounded negative-cache backoff regardless of this value."
         max_response_body_bytes:
