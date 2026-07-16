@@ -1823,6 +1823,18 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         finalization.contains("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
     );
     assert!(finalization.contains("build_grpc_web_reject_response("));
+    assert_eq!(
+        finalization
+            .matches("finalize_reject_response_with_after_proxy_hooks_and_commit_policy(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        finalization
+            .matches("build_grpc_web_reject_response(")
+            .count(),
+        1
+    );
 
     let helper = source
         .split("async fn finalize_upload_deadline_rejection(")
@@ -1834,11 +1846,30 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
     assert!(helper.contains("build_finalized_upload_deadline_response("));
     assert!(helper.contains("log_rejected_request_with_path("));
     assert!(helper.contains("record_request(state,"));
+    assert_eq!(
+        helper
+            .matches("build_finalized_upload_deadline_response(")
+            .count(),
+        1
+    );
+    assert_eq!(helper.matches("log_rejected_request_with_path(").count(), 1);
+    assert_eq!(helper.matches("record_request(state,").count(), 1);
+    let finalize = helper
+        .find("build_finalized_upload_deadline_response(")
+        .expect("upload deadline finalization");
+    let log = helper
+        .find("log_rejected_request_with_path(")
+        .expect("upload deadline log");
+    let metric = helper
+        .find("record_request(state,")
+        .expect("upload deadline metric");
+    assert!(finalize < log && log < metric);
 
     for phase in [
         "grpc_deadline_upload_before_authenticate",
         "grpc_deadline_upload_before_authorize",
         "grpc_deadline_upload_before_before_proxy",
+        "grpc_deadline_terminal_request_body",
         "grpc_deadline_upload_before_dispatch",
         "grpc_deadline_buffered_grpc_upload",
     ] {
@@ -1851,8 +1882,8 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
         source
             .matches("finalize_upload_deadline_rejection(")
             .count(),
-        7,
-        "the helper definition plus all six H1/H2 buffered upload exits must stay routed through cleanup"
+        8,
+        "the helper definition plus all seven H1/H2 buffered upload exits must stay routed through cleanup"
     );
 
     let grpc_collect_deadline_branches: Vec<&str> = source
