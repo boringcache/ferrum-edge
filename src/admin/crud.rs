@@ -1438,10 +1438,11 @@ fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
 }
 
 fn redact_loki_logging_config_projection(config: &mut Value) {
+    let marker = crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER;
     let Some(config) = config.as_object_mut() else {
+        *config = json!(marker);
         return;
     };
-    let marker = crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER;
 
     if let Some(endpoint) = config.get_mut("endpoint_url")
         && !endpoint.is_null()

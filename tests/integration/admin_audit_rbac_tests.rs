@@ -563,6 +563,69 @@ fn assert_loki_config_projection_redacted(config: &Value) {
 }
 
 #[tokio::test]
+async fn disabled_non_object_loki_configs_are_fully_redacted_across_projections() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    for (shape, raw_config) in [
+        ("scalar", json!("loki-disabled-scalar-secret-canary")),
+        (
+            "array",
+            json!(["loki-disabled-array-secret-canary", {"nested": "credential"}]),
+        ),
+        ("null", Value::Null),
+    ] {
+        let id = format!("loki-disabled-{shape}");
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "loki_logging",
+            "scope": "global",
+            "enabled": false,
+            "config": raw_config
+        });
+
+        let (status, created) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+        assert_eq!(
+            status, 201,
+            "disabled {shape} Loki config create failed: {created:?}"
+        );
+        assert_eq!(created["config"], raw_config);
+
+        let audit_body = wait_for_audit_total(
+            &base,
+            &format!("/audit?resource_type=plugin_config&resource_id={id}"),
+            &admin,
+            1,
+        )
+        .await;
+        let audit_config =
+            &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+        assert_eq!(audit_config, &json!("[REDACTED]"));
+
+        for bearer in [&viewer, &operator] {
+            let (status, projected) =
+                get_json(&base, &format!("/plugins/config/{id}"), bearer).await;
+            assert_eq!(
+                status, 200,
+                "projected disabled {shape} Loki config read failed: {projected:?}"
+            );
+            assert_eq!(projected["config"], "[REDACTED]");
+        }
+
+        let (status, raw) = get_json(&base, &format!("/plugins/config/{id}"), &admin).await;
+        assert_eq!(
+            status, 200,
+            "admin disabled {shape} Loki config read failed: {raw:?}"
+        );
+        assert_eq!(raw["config"], raw_config);
+    }
+}
+
+#[tokio::test]
 async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
