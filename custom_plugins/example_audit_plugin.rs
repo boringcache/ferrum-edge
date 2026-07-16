@@ -8,7 +8,7 @@
 //! ## Features Demonstrated
 //!
 //! - Database migrations via `plugin_migrations()` with multi-DB support
-//! - Async database writes in the `log()` lifecycle hook (fire-and-forget)
+//! - Transaction-log record shaping with timing-aware sink guidance
 //! - Stateful plugin holding a database connection pool
 //! - PostgreSQL-specific and MySQL-specific SQL overrides
 //! - Multi-statement migrations (CREATE TABLE + CREATE INDEX)
@@ -98,36 +98,16 @@ impl Plugin for ExampleAuditPlugin {
         9150
     }
 
-    /// Fire-and-forget logging hook — record each transaction to the audit log.
+    /// Record each transaction to the audit log. Buffered handlers await this
+    /// hook, while hyper-owned streaming bodies invoke it from a spawned
+    /// terminal task and native H3 awaits it after body completion.
     async fn log(&self, summary: &TransactionSummary) {
-        // In a real plugin, you would write to the database here using a
-        // connection pool held in the plugin struct. This example just
-        // demonstrates the pattern — the actual DB write is left as a
-        // placeholder since this is an example plugin.
-        //
-        // Example of what a real implementation would look like:
-        //
-        //   let id = uuid::Uuid::new_v4().to_string();
-        //   let headers_json = if self.log_request_headers {
-        //       serde_json::to_string(&summary.metadata).unwrap_or_default()
-        //   } else {
-        //       String::new()
-        //   };
-        //
-        //   sqlx::query("INSERT INTO audit_log (...) VALUES (...)")
-        //       .bind(&id)
-        //       .bind(&summary.timestamp_received)
-        //       .bind(&summary.client_ip)
-        //       .bind(&summary.http_method)
-        //       .bind(&summary.request_path)
-        //       .bind(summary.response_status_code as i32)
-        //       .bind(summary.latency_total_ms)
-        //       .bind(&summary.consumer_username)
-        //       .bind(&summary.proxy_id)
-        //       .bind(&headers_json)
-        //       .execute(&self.pool)
-        //       .await
-        //       .ok();
+        // A real implementation should shape a bounded record here and offer
+        // it to a bounded, plugin-owned queue. Start the database worker from
+        // `start_background_tasks()` after cache acceptance, define queue-full
+        // behavior, and signal intake closure from `Drop`. Awaiting a database
+        // write inline adds buffered-response latency; spawning one task per
+        // record is unbounded and does not make shutdown durable.
 
         let _ = (summary, self.log_request_headers);
     }
