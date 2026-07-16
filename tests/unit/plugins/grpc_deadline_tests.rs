@@ -289,6 +289,7 @@ struct SlowRejectDecorator {
     delay: std::time::Duration,
     calls: Arc<std::sync::atomic::AtomicUsize>,
     completed: Arc<std::sync::atomic::AtomicUsize>,
+    completion: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
@@ -312,6 +313,7 @@ impl Plugin for SlowRejectDecorator {
         response_headers.insert(format!("x-{}-complete", self.name), "true".to_string());
         self.completed
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.completion.notify_one();
         PluginResult::Continue
     }
 }
@@ -351,18 +353,23 @@ async fn rejection_hook_deadline_selects_terminal_status_and_finishes_cleanup_on
     let completed = (0..2)
         .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
         .collect::<Vec<_>>();
+    let completion = (0..2)
+        .map(|_| Arc::new(tokio::sync::Notify::new()))
+        .collect::<Vec<_>>();
     let plugins: Vec<Arc<dyn Plugin>> = vec![
         Arc::new(SlowRejectDecorator {
             name: "slow-cleanup",
             delay: std::time::Duration::from_millis(20),
             calls: Arc::clone(&calls[0]),
             completed: Arc::clone(&completed[0]),
+            completion: Arc::clone(&completion[0]),
         }),
         Arc::new(SlowRejectDecorator {
             name: "later-decorator",
             delay: std::time::Duration::ZERO,
             calls: Arc::clone(&calls[1]),
             completed: Arc::clone(&completed[1]),
+            completion: Arc::clone(&completion[1]),
         }),
     ];
     let mut ctx = create_grpc_context_with_timeout(None);
@@ -397,17 +404,16 @@ async fn rejection_hook_deadline_selects_terminal_status_and_finishes_cleanup_on
             .map(String::as_str),
         Some("https://browser.example")
     );
-    assert_eq!(
-        headers.get("x-slow-cleanup-complete").map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(
-        headers
-            .get("x-later-decorator-complete")
-            .map(String::as_str),
-        Some("true")
-    );
+    assert!(!headers.contains_key("x-slow-cleanup-complete"));
+    assert!(!headers.contains_key("x-later-decorator-complete"));
     assert!(gateway_deadline_response_selected_for_test(&ctx));
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        completion[1].notified(),
+    )
+    .await
+    .expect("detached rejection cleanup must continue in plugin order");
     for count in calls.iter().chain(completed.iter()) {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -545,7 +551,8 @@ fn deadline_replacement_preserves_safe_decorators_and_strips_conflicting_fields(
 struct CommittedHookProbe {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     observed_grpc_statuses: Arc<std::sync::Mutex<Vec<Option<String>>>>,
-    stall: bool,
+    release: Option<Arc<tokio::sync::Notify>>,
+    completion: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
@@ -570,9 +577,10 @@ impl Plugin for CommittedHookProbe {
             .lock()
             .expect("probe observations lock")
             .push(response_headers.get("grpc-status").cloned());
-        if self.stall {
-            std::future::pending::<()>().await;
+        if let Some(release) = &self.release {
+            release.notified().await;
         }
+        self.completion.notify_one();
     }
 }
 
@@ -588,12 +596,17 @@ async fn committed_deadline_replacement_runs_remaining_hooks_exactly_once() {
     let observed = (0..3)
         .map(|_| Arc::new(std::sync::Mutex::new(Vec::new())))
         .collect::<Vec<_>>();
+    let stalled_release = Arc::new(tokio::sync::Notify::new());
+    let completion = (0..3)
+        .map(|_| Arc::new(tokio::sync::Notify::new()))
+        .collect::<Vec<_>>();
     let plugins: Vec<Arc<dyn Plugin>> = (0..3)
         .map(|index| {
             Arc::new(CommittedHookProbe {
                 calls: Arc::clone(&calls[index]),
                 observed_grpc_statuses: Arc::clone(&observed[index]),
-                stall: index == 1,
+                release: (index == 1).then(|| Arc::clone(&stalled_release)),
+                completion: Arc::clone(&completion[index]),
             }) as Arc<dyn Plugin>
         })
         .collect();
@@ -620,9 +633,9 @@ async fn committed_deadline_replacement_runs_remaining_hooks_exactly_once() {
     assert_eq!(status, 200);
     assert_eq!(headers.get("grpc-status").map(String::as_str), Some("4"));
     assert!(body.is_empty());
-    for call_count in &calls {
-        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
+    assert_eq!(calls[0].load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(calls[1].load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(calls[2].load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(
         observed[0].lock().expect("first probe lock").as_slice(),
         &[None]
@@ -631,6 +644,18 @@ async fn committed_deadline_replacement_runs_remaining_hooks_exactly_once() {
         observed[1].lock().expect("second probe lock").as_slice(),
         &[None]
     );
+    assert!(observed[2].lock().expect("third probe lock").is_empty());
+
+    stalled_release.notify_waiters();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        completion[2].notified(),
+    )
+    .await
+    .expect("detached committed observers must continue in plugin order");
+    for call_count in &calls {
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
     assert_eq!(
         observed[2].lock().expect("third probe lock").as_slice(),
         &[Some("4".to_string())]

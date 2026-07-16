@@ -191,7 +191,7 @@ fn native_h3_client_deadlines_remain_health_neutral() {
         .expect("native H3 body deadline branch must remain present");
     let body_deadline = &source[body_deadline..];
     let body_end = body_deadline
-        .find("if stream_done {")
+        .find("chunk_result = h3_resp.recv_stream.recv_data()")
         .expect("native H3 body deadline branch must remain bounded");
     let body_deadline = &body_deadline[..body_end];
     assert_eq!(
@@ -253,7 +253,7 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
         .expect("bounded relay body");
     assert!(relay.contains("_ = &mut grpc_deadline"));
     assert!(relay.contains("GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER"));
-    assert!(relay.contains("if bytes_streamed == 0"));
+    assert!(relay.contains("grpc_deadline_can_send_terminal_status(bytes_streamed)"));
     assert!(relay.contains("abort_response_stream(stream)"));
     assert!(relay.contains("_ = &mut read_deadline"));
     assert!(relay.contains("await_response_write_before_deadline("));

@@ -386,10 +386,13 @@ struct CommittedCapturePlugin {
     committed_calls: AtomicUsize,
     log_saw_committed_calls: AtomicUsize,
     observation: Mutex<Option<CommittedObservation>>,
+    committed: tokio::sync::Notify,
 }
 
 struct StalledCommittedPlugin {
     calls: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait]
@@ -410,7 +413,8 @@ impl Plugin for StalledCommittedPlugin {
         _body: &[u8],
     ) {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        std::future::pending::<()>().await;
+        self.release.notified().await;
+        self.completed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -437,6 +441,7 @@ impl Plugin for CommittedCapturePlugin {
             headers: response_headers.clone(),
             body: body.to_vec(),
         });
+        self.committed.notify_one();
     }
 
     async fn log(&self, _summary: &TransactionSummary) {
@@ -533,10 +538,14 @@ async fn h3_reject_committed_timeout_selects_status_four_and_runs_remaining_hook
 
     for grpc_web_content_type in [None, Some("application/grpc-web+proto")] {
         let stalled_calls = Arc::new(AtomicUsize::new(0));
+        let stalled_release = Arc::new(tokio::sync::Notify::new());
+        let stalled_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let capture = Arc::new(CommittedCapturePlugin::default());
         let plugins: Vec<Arc<dyn Plugin>> = vec![
             Arc::new(StalledCommittedPlugin {
                 calls: Arc::clone(&stalled_calls),
+                release: Arc::clone(&stalled_release),
+                completed: Arc::clone(&stalled_completed),
             }),
             capture.clone(),
         ];
@@ -573,6 +582,17 @@ async fn h3_reject_committed_timeout_selects_status_four_and_runs_remaining_hook
         assert!(replaced);
         assert!(gateway_deadline_response_selected_for_test(&ctx));
         assert_eq!(stalled_calls.load(Ordering::SeqCst), 1);
+        assert!(!stalled_completed.load(Ordering::SeqCst));
+        assert_eq!(capture.committed_calls.load(Ordering::SeqCst), 0);
+
+        stalled_release.notify_waiters();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            capture.committed.notified(),
+        )
+        .await
+        .expect("detached H3 committed observers must continue in plugin order");
+        assert!(stalled_completed.load(Ordering::SeqCst));
         assert_eq!(capture.committed_calls.load(Ordering::SeqCst), 1);
         let observed = capture
             .observation
