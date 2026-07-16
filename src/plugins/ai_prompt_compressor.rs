@@ -1538,7 +1538,11 @@ fn scan_to_whitespace_or_backtick(bytes: &[u8], start: usize) -> usize {
     end
 }
 
-fn push_verbatim<'a>(tokens: &mut Vec<Token<'a>>, text: &'a str, leading_newline: bool) -> Option<()> {
+fn push_verbatim<'a>(
+    tokens: &mut Vec<Token<'a>>,
+    text: &'a str,
+    leading_newline: bool,
+) -> Option<()> {
     push_token(
         tokens,
         Token {

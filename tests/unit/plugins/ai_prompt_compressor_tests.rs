@@ -1075,7 +1075,9 @@ async fn decompressed_gzip_and_brotli_record_authoritative_wire_stats() {
             .expect("decoded prompt should compress");
 
         let parsed: Value = serde_json::from_slice(&compressed).unwrap();
-        assert!(first_message_content(&parsed).chars().count() < long_prompt_text().chars().count());
+        assert!(
+            first_message_content(&parsed).chars().count() < long_prompt_text().chars().count()
+        );
         assert!(
             ctx.metadata["ai_prompt_compressor.tokens_saved"]
                 .parse::<usize>()
