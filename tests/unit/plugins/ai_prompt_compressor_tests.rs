@@ -1323,6 +1323,18 @@ fn per_request_metadata_paths_do_not_format_instance_keys() {
     assert!(!clear.contains("format!("));
 }
 
+#[test]
+fn marker_sanitation_admission_never_queues_request_bodies() {
+    let source = include_str!("../../../src/plugins/ai_prompt_compressor.rs");
+    let admission = source
+        .split_once("let marker_permit =")
+        .and_then(|(_, rest)| rest.split_once("let compression_permit ="))
+        .map(|(body, _)| body)
+        .expect("marker sanitation admission source region");
+    assert!(admission.contains("try_acquire_owned()"));
+    assert!(!admission.contains("acquire_owned().await"));
+}
+
 #[tokio::test]
 async fn decompressed_gzip_and_brotli_record_authoritative_wire_stats() {
     for encoding in ["gzip", "br"] {

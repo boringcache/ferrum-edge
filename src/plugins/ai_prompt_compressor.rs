@@ -103,9 +103,9 @@ const MAX_STAGED_OUTPUT_BYTES: usize = 65_536;
 /// Maximum simultaneous statistical compression jobs across all plugin instances.
 const MAX_CONCURRENT_COMPRESSIONS: usize = 8;
 /// Maximum simultaneous parse/classify/sanitize jobs for configured preserve
-/// markers. Unlike optional statistical work, this lane waits for admission so
-/// saturation cannot turn marker removal into a passthrough.
-const MAX_CONCURRENT_MARKER_SANITIZATIONS: usize = 16;
+/// markers. Saturation fails closed before cloning the buffered body rather
+/// than retaining an unbounded queue of request contexts.
+const MAX_CONCURRENT_MARKER_SANITIZATIONS: usize = 32;
 
 const STAT_SUFFIXES: [&str; 4] = [
     "original_tokens",
@@ -404,14 +404,13 @@ impl AiPromptCompressor {
         }
 
         // Marker sanitation is a correctness boundary, so configured instances
-        // wait on a separate bounded worker lane instead of converting pressure
-        // into marker-bearing passthrough. Optional statistical work still uses
-        // non-waiting admission and falls back to sanitation-only output.
+        // use a separate bounded worker lane instead of converting pressure
+        // into marker-bearing passthrough. Both lanes use non-waiting admission;
+        // sanitation saturation fails closed before the body clone.
         let marker_permit = if self.preserve_tags.is_some() {
             Some(
                 Arc::clone(&MARKER_SANITIZATION_BUDGET)
-                    .acquire_owned()
-                    .await
+                    .try_acquire_owned()
                     .map_err(|_| MarkerSanitizationError::WorkerUnavailable)?,
             )
         } else {
@@ -1330,16 +1329,23 @@ impl Plugin for AiPromptCompressor {
         {
             return None;
         }
-        self.compress_wire_body(
-            body,
-            content_type,
-            request_headers,
-            request_headers.get(":path").map(String::as_str),
-        )
-        .await
-        .ok()
-        .flatten()
-        .map(|compression| compression.output)
+        match self
+            .compress_wire_body(
+                body,
+                content_type,
+                request_headers,
+                request_headers.get(":path").map(String::as_str),
+            )
+            .await
+        {
+            Ok(Some(compression)) => Some(compression.output),
+            Ok(None) => None,
+            // This compatibility API has no rejection channel. Production HTTP
+            // paths use the context-aware transform and final hook (503); an
+            // empty invalid provider request is the marker-safe fail-closed
+            // result for a context-free caller.
+            Err(_) => Some(Vec::new()),
+        }
     }
 
     async fn transform_request_body_with_context(

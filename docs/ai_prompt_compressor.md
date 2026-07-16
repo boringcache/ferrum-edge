@@ -102,18 +102,21 @@ over-budget statistical work passes through unchanged when no preserve tag is
 configured.
 
 When `preserve_tag` is configured, marker removal is a separate bounded
-correctness path: up to 16 sanitation jobs parse and classify concurrently, and
-additional requests wait before cloning the buffered body. If compression is
-saturated, any work counter is exceeded, or JSON reserialization would exceed
-the hard output bound, the plugin removes markers directly from the admitted
-JSON string literals while preserving all other source bytes (including
-whitespace, duplicate names, member order, escapes, and number spelling).
-Escaped marker spellings such as `\u003ckeep\u003e` are recognized too. The
-gateway applies a 1,048,576-byte plugin-local buffer limit to these candidate
-requests even when its global body limit is unlimited; a larger candidate is
-rejected with `413`. Reusable transformed-body staging is separately capped at
-65,536 bytes; larger direct-dispatch prompts retain only the metadata
-representation.
+correctness path: up to 32 sanitation jobs parse and classify concurrently.
+Saturation fails closed before cloning the buffered body instead of retaining a
+waiter queue. If statistical compression is saturated, any work counter is
+exceeded, or JSON reserialization would exceed the hard output bound, the
+plugin removes markers directly from the admitted JSON string literals while
+preserving all other source bytes (including whitespace, duplicate names,
+member order, escapes, and number spelling). Escaped marker spellings such as
+`\u003ckeep\u003e` are recognized too. The gateway applies a 1,048,576-byte
+plugin-local buffer limit to these candidate requests even when its global body
+limit is unlimited; a larger candidate is rejected with `413`, while sanitation
+worker unavailability is rejected with `503`. The context-free compatibility
+transform has no rejection channel and returns an empty, marker-free invalid
+request representation on that exceptional failure. Reusable transformed-body
+staging is separately capped at 65,536 bytes; larger direct-dispatch prompts
+retain only the metadata representation.
 
 An empty config object (`{}`) is valid and applies the defaults: on standard
 OpenAI Chat/Text Completions paths, compress `user` content longer than ~200
