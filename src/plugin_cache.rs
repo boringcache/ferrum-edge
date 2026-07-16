@@ -1722,8 +1722,7 @@ fn create_adaptive_concurrency_plugin(
         )));
     }
 
-    let (limiter, generation, reset_tracking_space) = if let Some(existing) =
-        current.get(&identity)
+    let (limiter, generation, reset_tracking_space) = if let Some(existing) = current.get(&identity)
     {
         let generation = existing.generation.checked_add(1).ok_or_else(|| {
             format!(
@@ -1743,11 +1742,7 @@ fn create_adaptive_concurrency_plugin(
         // are rejected after a structural cutover. The limiter rotates its
         // target-tracking space at commit, allowing permits from the detached
         // space to finish without blocking or training the replacement.
-        (
-            Arc::clone(&existing.limiter),
-            generation,
-            structural_change,
-        )
+        (Arc::clone(&existing.limiter), generation, structural_change)
     } else {
         (
             Arc::new(AdaptiveConcurrencyLimiter::new(

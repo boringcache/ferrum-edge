@@ -373,9 +373,7 @@ impl AdaptiveConcurrencyLimiter {
         Self {
             // Both maps are on backend admission, so fresh structural spaces
             // preserve the operator-configured shard count.
-            tracking_space: ArcSwap::from_pointee(AdaptiveConcurrencyTrackingSpace::new(
-                shards,
-            )),
+            tracking_space: ArcSwap::from_pointee(AdaptiveConcurrencyTrackingSpace::new(shards)),
             shard_amount: shards,
             backend_scope: Arc::from("backend"),
             policy: Arc::new(AdaptiveConcurrencyPolicyLifecycle::new()),
@@ -463,8 +461,7 @@ impl AdaptiveConcurrencyLimiter {
                 if current >= limit && !config.shadow_mode {
                     let generation_admitted =
                         self.policy_generation_admitted(generation, lb_generation);
-                    let tracking_space_current =
-                        self.tracking_space_is_current(&tracking_space);
+                    let tracking_space_current = self.tracking_space_is_current(&tracking_space);
                     let config_current = self.admission_config_current(config_generation);
                     if !generation_admitted || !tracking_space_current {
                         self.policy.total_in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -568,9 +565,10 @@ impl AdaptiveConcurrencyLimiter {
     }
 
     fn reset_tracking_space(&self) {
-        self.tracking_space.store(Arc::new(
-            AdaptiveConcurrencyTrackingSpace::new(self.shard_amount),
-        ));
+        self.tracking_space
+            .store(Arc::new(AdaptiveConcurrencyTrackingSpace::new(
+                self.shard_amount,
+            )));
     }
 
     fn reserve_policy_slot(

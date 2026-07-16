@@ -1159,11 +1159,7 @@ fn adaptive_concurrency_structural_config_change_does_not_wait_for_old_permits()
     // The replacement has an independent tracking space. A long-lived permit
     // from the retired space must not pin the structural handoff.
     let new_generation = expect_admitted(acquire_from_cache(&cache, &reloaded));
-    assert_rejected(acquire_from_plugin(
-        &old_view,
-        &config.proxies[0],
-        None,
-    ));
+    assert_rejected(acquire_from_plugin(&old_view, &config.proxies[0], None));
     drop(new_generation);
     drop(held);
     drop(old_view);
@@ -1192,11 +1188,7 @@ fn adaptive_concurrency_lower_key_cap_uses_independent_tracking_space() {
 
     let replacement = expect_admitted(acquire_from_cache(&cache, &reloaded));
     assert_rejected(acquire_from_cache(&cache, &reloaded));
-    assert_rejected(acquire_from_plugin(
-        &old_view,
-        &config.proxies[0],
-        None,
-    ));
+    assert_rejected(acquire_from_plugin(&old_view, &config.proxies[0], None));
     drop(replacement);
     drop(retired_permit);
 }
@@ -1279,11 +1271,7 @@ fn adaptive_concurrency_overlapping_structural_reloads_remain_independent() {
         .rebuild(&newest_reload)
         .expect("overlapping structural generation should publish");
     let newest_permit = expect_admitted(acquire_from_cache(&cache, &newest_reload));
-    assert_rejected(acquire_from_plugin(
-        &oldest_view,
-        &config.proxies[0],
-        None,
-    ));
+    assert_rejected(acquire_from_plugin(&oldest_view, &config.proxies[0], None));
     assert_rejected(acquire_from_plugin(
         &middle_view,
         &first_reload.proxies[0],
