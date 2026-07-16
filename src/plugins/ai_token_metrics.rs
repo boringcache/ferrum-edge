@@ -487,9 +487,7 @@ impl Plugin for AiTokenMetrics {
         // the local streaming policy again before inspection so a sibling
         // bufferer cannot enable token accounting implicitly.
         if is_event_stream_content_type(content_type) && !self.buffer_streaming_responses {
-            debug!(
-                "ai_token_metrics: skipping SSE response because stream buffering is disabled"
-            );
+            debug!("ai_token_metrics: skipping SSE response because stream buffering is disabled");
             return PluginResult::Continue;
         }
 
