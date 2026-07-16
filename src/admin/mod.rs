@@ -5100,10 +5100,7 @@ async fn handle_restore(
             if crate::config::db_loader::is_transient_database_error(&error) {
                 response["failure_class"] = json!("connectivity");
             }
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &response,
-            ));
+            return Ok(json_response(StatusCode::SERVICE_UNAVAILABLE, &response));
         }
     };
     let restore_mode = BatchConfigWriteMode::GuardedAdmission {
