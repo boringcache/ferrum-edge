@@ -108,6 +108,28 @@ fn native_grpc_strips_raw_geo_assertion_before_authoritative_merge() {
     );
 }
 
+#[test]
+fn h3_grpc_bridge_preserves_trusted_geo_assertion_on_both_dispatch_paths() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let helper = source
+        .split("fn trusted_plugin_assertion_proxy_headers")
+        .nth(1)
+        .and_then(|tail| tail.split("/// Stream a live gRPC backend response").next())
+        .expect("trusted H3 gRPC assertion helper source section");
+
+    assert!(
+        helper.contains("key.eq_ignore_ascii_case(\"x-geo-country\")"),
+        "the H3 gRPC assertion bridge must retain the authoritative geo result"
+    );
+    assert_eq!(
+        source
+            .matches("trusted_plugin_assertion_proxy_headers(proxy_headers)")
+            .count(),
+        2,
+        "both buffered and streaming H3-to-gRPC dispatches must use the trusted assertion map"
+    );
+}
+
 // --- is_grpc_content_type detection tests ---
 
 #[test]

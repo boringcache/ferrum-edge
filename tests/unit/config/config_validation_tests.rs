@@ -538,3 +538,31 @@ fn cp_full_and_incremental_rejection_share_hmac_composition_validation() {
         "CP incremental snapshots must use the shared rejecting contract"
     );
 }
+
+#[test]
+fn cp_full_snapshot_scopes_and_releases_validated_mmdb_handoff() {
+    let control_plane = include_str!("../../../src/modes/control_plane.rs");
+    let prepare_start = control_plane
+        .find("fn prepare_cp_full_snapshot(")
+        .expect("CP full-snapshot preparation function");
+    let reject_start = control_plane[prepare_start..]
+        .find("fn reject_invalid_cp_full_snapshot(")
+        .map(|offset| prepare_start + offset)
+        .expect("CP full-snapshot rejection function");
+    let preparation = &control_plane[prepare_start..reject_start];
+
+    let claim = preparation
+        .find("CountryMmdbLoadSession::claim")
+        .expect("CP must claim the accepted MMDB validation handoff");
+    let validation = preparation
+        .find("reject_invalid_cp_full_snapshot(&config)")
+        .expect("CP must validate the prepared snapshot");
+    assert!(
+        claim < validation,
+        "the scoped load session must own the handoff throughout CP validation and drop on return"
+    );
+    assert!(
+        preparation.contains("let _country_mmdb_handoff ="),
+        "CP must retain the scoped handoff owner until snapshot validation returns"
+    );
+}
