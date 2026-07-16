@@ -840,8 +840,8 @@ fn virtual_service_status(
 /// projects. `tcp` / `tls` route arrays are not listed here: they are
 /// translated to stream proxies (unsupported matches / weighted splitting
 /// surface via the `Invalid` arm, not as deferred). `corsPolicy` is translated
-/// to a `cors` plugin when its origins are representable; it is deferred only
-/// when they are not.
+/// to a `cors` plugin when the complete source combination is representable;
+/// otherwise it is deferred.
 fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     let mut deferred: Vec<&'static str> = Vec::new();
     // `spec.tcp[]` / `spec.tls[]` are NOT listed as deferred: the translator
@@ -851,11 +851,12 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
     // origins are representable — `allowOrigins[]` `exact`/`prefix`/`regex`
     // `StringMatch` (regex must compile) or the legacy `allowOrigin` exact
-    // list, plus a parseable maxAge. It remains a deferred field only when an
-    // origin matcher is malformed/unknown, a `regex` does not compile, or
-    // `maxAge` is unparseable, in which case the translator leaves it
-    // unprojected. The shared `cors_policy_translatable` predicate keeps the
-    // translator and this report in lockstep.
+    // list, plus a parseable maxAge. It remains a deferred field when an origin
+    // matcher is malformed/unknown, a `regex` does not compile, maxAge is
+    // unparseable, or credentials are combined with exact `*` (the native
+    // wildcard representation cannot preserve that source behavior). The
+    // shared `cors_policy_translatable` predicate keeps the translator and this
+    // report in lockstep.
     let http_routes = spec.get("http").and_then(Value::as_array);
     if http_routes.is_some_and(|routes| {
         routes.iter().any(|route| {
@@ -865,7 +866,7 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
         })
     }) {
         deferred.push(
-            "http[].corsPolicy with an unrepresentable origin matcher \
+            "http[].corsPolicy with an unrepresentable policy combination \
              (not projected; use the cors plugin)",
         );
     }
@@ -2650,6 +2651,44 @@ mod tests {
         assert!(
             deferred.iter().any(|f| f.contains("corsPolicy")),
             "uncompilable-regex http[].corsPolicy should still be flagged as deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_cors_policy_credentialed_wildcard_is_deferred() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "VirtualService",
+            "cors-vs-credentialed-star",
+            json!({
+                "hosts": ["reviews.default.svc.cluster.local"],
+                "http": [
+                    {
+                        "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                        "corsPolicy": {
+                            "allowOrigins": [ { "exact": "*" } ],
+                            "allowCredentials": true
+                        }
+                    }
+                ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.iter().any(|f| f.contains("corsPolicy")),
+            "credentialed wildcard http[].corsPolicy must remain deferred, got {deferred:?}"
         );
     }
 

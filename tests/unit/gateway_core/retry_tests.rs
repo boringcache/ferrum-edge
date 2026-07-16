@@ -290,7 +290,7 @@ fn test_terminal_gateway_errors_are_never_retried_by_status_policy() {
     let config = RetryConfig {
         max_retries: 3,
         retry_on_connect_failure: true,
-        retryable_status_codes: vec![413, 499, 502],
+        retryable_status_codes: vec![413, 499, 502, 503],
         retryable_methods: vec!["GET".to_string(), "POST".to_string()],
         ..default_config()
     };
@@ -299,6 +299,7 @@ fn test_terminal_gateway_errors_are_never_retried_by_status_policy() {
         (413, ErrorClass::RequestBodyTooLarge),
         (499, ErrorClass::ClientDisconnect),
         (502, ErrorClass::DispatchPolicyRejected),
+        (503, ErrorClass::DispatchPolicyRejected),
         (502, ErrorClass::ResponseBodyTooLarge),
     ] {
         assert!(
@@ -356,6 +357,17 @@ fn test_grpc_read_timeout_classified() {
     assert_eq!(
         classify_grpc_proxy_error(&err),
         ErrorClass::ReadWriteTimeout
+    );
+}
+
+#[test]
+fn test_grpc_client_deadline_before_dispatch_is_neutral() {
+    let err = GrpcProxyError::ClientDeadlineExceeded(
+        "gRPC deadline exceeded during backend connection acquisition".into(),
+    );
+    assert_eq!(
+        classify_grpc_proxy_error(&err),
+        ErrorClass::ClientDisconnect
     );
 }
 

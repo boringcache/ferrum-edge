@@ -315,7 +315,7 @@ fn adaptive_concurrency_concurrent_failure_backoff_stops_at_minimum() {
 }
 
 #[test]
-fn adaptive_concurrency_ignores_client_disconnect_samples() {
+fn adaptive_concurrency_ignores_client_deadline_even_with_synthetic_5xx() {
     let proxy = proxy();
     let limiter = AdaptiveConcurrencyLimiter::new(16);
     let config = limiter_config(4);
@@ -324,7 +324,10 @@ fn adaptive_concurrency_ignores_client_disconnect_samples() {
         .expect("request should be admitted");
 
     permit.record_backend_outcome(BackendAdmissionOutcome {
-        response_status: 499,
+        // The gRPC dispatch error path uses a synthetic 502 for permit
+        // accounting, but ClientDisconnect remains authoritative and must be
+        // checked before the generic >= 500 shrink branch.
+        response_status: 502,
         connection_error: true,
         error_class: Some(ErrorClass::ClientDisconnect),
         backend_elapsed: Duration::from_millis(50),

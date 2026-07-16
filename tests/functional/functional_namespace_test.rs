@@ -12,6 +12,8 @@
 //! - `GET /namespaces` returning the full set regardless of the current header
 //! - delete isolation (deleting a namespace's resource by id from another
 //!   namespace returns 404)
+//! - cross-process mTLS DNS-identity admission against a shared persistent
+//!   backend
 //!
 //! Backends:
 //! - `sqlite`: runs unconditionally (tempdir-backed file DB)
@@ -118,6 +120,67 @@ struct NsHarness {
     _gw: TestGateway,
     admin_base_url: String,
     proxy_base_url: String,
+}
+
+/// Two independent gateway processes sharing one persistent backend. The
+/// optional tempdir owns the shared SQLite file for the lifetime of both
+/// processes; external backends use a randomized namespace instead.
+struct SharedAdminHarness {
+    _gateway_a: TestGateway,
+    _gateway_b: TestGateway,
+    _sqlite_dir: Option<tempfile::TempDir>,
+    admin_a: String,
+    admin_b: String,
+}
+
+impl SharedAdminHarness {
+    async fn start(backend: Backend) -> Option<Self> {
+        let (db, sqlite_dir) = match backend {
+            Backend::Sqlite => {
+                let temp_dir = tempfile::TempDir::new().expect("shared SQLite tempdir");
+                let db_path = temp_dir.path().join("shared-admin.db");
+                let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+                (
+                    DbType::Custom {
+                        db_type: "sqlite".to_string(),
+                        db_url,
+                    },
+                    Some(temp_dir),
+                )
+            }
+            _ => (resolve_db(backend).await?, None),
+        };
+
+        let builder = || {
+            let mut builder = TestGateway::builder()
+                .mode_database(db.clone())
+                .jwt_secret(JWT_SECRET)
+                .jwt_issuer(JWT_ISSUER)
+                .db_poll_interval_seconds(1)
+                .max_attempts(3)
+                .log_level("warn");
+            if matches!(backend, Backend::Mongodb) {
+                builder = builder.env("FERRUM_MONGO_DATABASE", "ferrum_test");
+            }
+            builder
+        };
+
+        let gateway_a = builder()
+            .spawn()
+            .await
+            .unwrap_or_else(|error| panic!("first shared admin gateway failed: {error}"));
+        let gateway_b = builder()
+            .spawn()
+            .await
+            .unwrap_or_else(|error| panic!("second shared admin gateway failed: {error}"));
+        Some(Self {
+            admin_a: gateway_a.admin_base_url.clone(),
+            admin_b: gateway_b.admin_base_url.clone(),
+            _gateway_a: gateway_a,
+            _gateway_b: gateway_b,
+            _sqlite_dir: sqlite_dir,
+        })
+    }
 }
 
 impl NsHarness {
@@ -599,6 +662,159 @@ async fn run_namespace_suite(backend: Backend) {
     );
 }
 
+/// Reproduces the original cross-process race: one admin process activates a
+/// proxy-scoped `san_dns` policy while a second rotates another Consumer onto
+/// a case variant of an existing DNS identity. Exactly one transaction may
+/// commit, and the loser must receive a conflict from every persistent backend.
+async fn run_mtls_dns_cross_process_admission_suite(backend: Backend) {
+    let Some(harness) = SharedAdminHarness::start(backend).await else {
+        eprintln!(
+            "Skipping mTLS DNS cross-process suite for {} — backend unavailable",
+            backend.db_type()
+        );
+        return;
+    };
+    let client = reqwest::Client::new();
+    let namespace = format!("mtls-dns-{}", uuid::Uuid::new_v4().simple());
+    let owner_id = mk_id("mtls-owner");
+    let rotating_id = mk_id("mtls-rotating");
+    let proxy_id = mk_id("mtls-proxy");
+    let plugin_id = mk_id("mtls-policy");
+
+    let owner = serde_json::json!({
+        "id": owner_id,
+        "username": mk_id("owner-user"),
+        "credentials": {
+            "mtls_auth": [{"identity": "API.Example.COM"}]
+        }
+    });
+    let rotating = serde_json::json!({
+        "id": rotating_id,
+        "username": mk_id("rotating-user")
+    });
+    for consumer in [&owner, &rotating] {
+        let response = admin_request(
+            &client,
+            reqwest::Method::POST,
+            &format!("{}/consumers", harness.admin_a),
+            Some(&namespace),
+            Some(consumer),
+        )
+        .await;
+        assert!(
+            response.status().is_success(),
+            "{} consumer setup failed with {}",
+            backend.db_type(),
+            response.status()
+        );
+    }
+
+    let proxy = serde_json::json!({
+        "id": proxy_id,
+        "hosts": [format!("{}.test", uuid::Uuid::new_v4().simple())],
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 9
+    });
+    let response = admin_request(
+        &client,
+        reqwest::Method::POST,
+        &format!("{}/proxies", harness.admin_a),
+        Some(&namespace),
+        Some(&proxy),
+    )
+    .await;
+    assert!(response.status().is_success(), "proxy setup failed");
+
+    let policy = serde_json::json!({
+        "id": plugin_id,
+        "plugin_name": "mtls_auth",
+        "scope": "proxy",
+        "proxy_id": proxy_id,
+        "enabled": true,
+        "config": {"cert_field": "san_dns"}
+    });
+    let response = admin_request(
+        &client,
+        reqwest::Method::POST,
+        &format!("{}/plugins/config", harness.admin_a),
+        Some(&namespace),
+        Some(&policy),
+    )
+    .await;
+    assert!(response.status().is_success(), "policy setup failed");
+
+    let mut associated_proxy = proxy.clone();
+    associated_proxy["plugins"] = serde_json::json!([{"plugin_config_id": plugin_id}]);
+    let mut rotated_consumer = rotating.clone();
+    rotated_consumer["credentials"] = serde_json::json!({
+        "mtls_auth": [{"identity": "api.example.com"}]
+    });
+    let association_url = format!("{}/proxies/{}", harness.admin_a, proxy_id);
+    let rotation_url = format!("{}/consumers/{}", harness.admin_b, rotating_id);
+
+    let (association_response, rotation_response) = tokio::join!(
+        admin_request(
+            &client,
+            reqwest::Method::PUT,
+            &association_url,
+            Some(&namespace),
+            Some(&associated_proxy),
+        ),
+        admin_request(
+            &client,
+            reqwest::Method::PUT,
+            &rotation_url,
+            Some(&namespace),
+            Some(&rotated_consumer),
+        )
+    );
+    let statuses = [association_response.status(), rotation_response.status()];
+    assert_eq!(
+        statuses.iter().filter(|status| status.is_success()).count(),
+        1,
+        "{} must admit exactly one concurrent candidate: {statuses:?}",
+        backend.db_type()
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| status.as_u16() == 409)
+            .count(),
+        1,
+        "{} loser must fail closed with 409: {statuses:?}",
+        backend.db_type()
+    );
+
+    let stored_proxy: Value = admin_request(
+        &client,
+        reqwest::Method::GET,
+        &format!("{}/proxies/{}", harness.admin_a, proxy_id),
+        Some(&namespace),
+        None,
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let stored_consumer: Value = admin_request(
+        &client,
+        reqwest::Method::GET,
+        &format!("{}/consumers/{}", harness.admin_b, rotating_id),
+        Some(&namespace),
+        None,
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let policy_active = stored_proxy["plugins"]
+        .as_array()
+        .is_some_and(|plugins| !plugins.is_empty());
+    let rotation_active = stored_consumer["credentials"].get("mtls_auth").is_some();
+    assert_ne!(policy_active, rotation_active);
+}
+
 // ---------------------------------------------------------------------------
 // Entry points per backend
 // ---------------------------------------------------------------------------
@@ -625,6 +841,30 @@ async fn namespace_suite_mysql() {
 #[ignore]
 async fn namespace_suite_mongodb() {
     run_namespace_suite(Backend::Mongodb).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn mtls_dns_cross_process_admission_sqlite() {
+    run_mtls_dns_cross_process_admission_suite(Backend::Sqlite).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn mtls_dns_cross_process_admission_postgres() {
+    run_mtls_dns_cross_process_admission_suite(Backend::Postgres).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn mtls_dns_cross_process_admission_mysql() {
+    run_mtls_dns_cross_process_admission_suite(Backend::Mysql).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn mtls_dns_cross_process_admission_mongodb() {
+    run_mtls_dns_cross_process_admission_suite(Backend::Mongodb).await;
 }
 
 // ---------------------------------------------------------------------------

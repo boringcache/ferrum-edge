@@ -3587,18 +3587,38 @@ fn parse_istio_duration_secs(raw: &str) -> Option<u64> {
     parse_istio_duration_ms(raw).map(|ms| if ms == 0 { 0 } else { ms.div_ceil(1000) })
 }
 
-/// Collect a non-empty list of strings from a `corsPolicy` array field
-/// (`allowMethods` / `allowHeaders` / `exposeHeaders`). Returns `None` when the
-/// field is absent or has no string entries so the caller omits the key and the
-/// `cors` plugin applies its own default.
+/// Collect a present list of strings from a `corsPolicy` array field while
+/// preserving explicit emptiness. Missing and malformed fields return `None`;
+/// [`cors_string_arrays_plugin_valid`] distinguishes those cases before any
+/// projection occurs.
 fn cors_string_array(cors: &Value, key: &str) -> Option<Vec<String>> {
-    let values: Vec<String> = cors
-        .get(key)
+    cors.get(key)
         .and_then(Value::as_array)?
         .iter()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect();
-    (!values.is_empty()).then_some(values)
+        .map(|value| value.as_str().map(str::to_string))
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum IstioUnmatchedPreflights {
+    Forward,
+    Ignore,
+}
+
+fn cors_unmatched_preflights(cors: &Value) -> Result<IstioUnmatchedPreflights, ()> {
+    match cors.get("unmatchedPreflights") {
+        None => Ok(IstioUnmatchedPreflights::Forward),
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("UNSPECIFIED") => {
+            Ok(IstioUnmatchedPreflights::Forward)
+        }
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("FORWARD") => {
+            Ok(IstioUnmatchedPreflights::Forward)
+        }
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("IGNORE") => {
+            Ok(IstioUnmatchedPreflights::Ignore)
+        }
+        _ => Err(()),
+    }
 }
 
 /// Extract CORS allowed origins from an Istio `corsPolicy`, mapped to the
@@ -3648,34 +3668,47 @@ fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
 /// `allowOrigin` list entry) can be faithfully projected as the `cors`
 /// plugin's PLAIN-STRING `allowed_origins` form. Fails (policy stays
 /// deferred) when:
-/// - empty/whitespace-only, or wildcard-shaped after trimming (`*`,
-///   `*.example.com`): the plugin trims plain-string origins before
-///   interpreting `*`/`*.` wildcard syntax, so Istio's literal-exact
-///   semantics would silently WIDEN to allow-all / subdomain matching;
+/// - empty/whitespace-only, or wildcard-shaped after trimming other than exact
+///   `*`: Istio explicitly assigns exact `*` allow-all semantics, but values
+///   such as `*.example.com` remain literal upstream and must not be
+///   reinterpreted as the native plugin's wildcard-subdomain syntax;
 /// - whitespace-padded: the plugin's trim would match the TRIMMED origin
 ///   while Istio's literal exact only matches the padded value (i.e. no real
 ///   Origin header) — the same silent widening;
 /// - not an origin the plugin accepts (`scheme://host[:port]` only — no
 ///   path/query/fragment/credentials, http(s) scheme; the shared
-///   `plugins::cors::validate_exact_origin` admission): projecting it would
+///   `plugins::cors::canonicalize_exact_origin` admission): projecting it would
 ///   fail `CorsPlugin` construction AFTER translation instead of deferring
 ///   here, breaking the always-projectable contract documented on
-///   `cors_allowed_origins`.
+///   `cors_allowed_origins`;
+/// - non-canonical: Istio `StringMatch.exact` is literal, while the native
+///   plugin canonicalizes exact origins. Accepting a default port, case
+///   variant, IDNA spelling, or alternate IP spelling would therefore widen
+///   the source matcher to the browser-serialized origin.
 fn plain_exact_origin_translatable(exact: &str) -> bool {
     let trimmed = exact.trim();
-    !trimmed.is_empty()
-        && !trimmed.starts_with('*')
-        && trimmed.len() == exact.len()
-        && crate::plugins::cors::validate_exact_origin(exact).is_ok()
+    if trimmed.is_empty()
+        || (trimmed != "*" && trimmed.starts_with('*'))
+        || trimmed.len() != exact.len()
+    {
+        return false;
+    }
+    if trimmed == "*" {
+        return true;
+    }
+
+    crate::plugins::cors::canonicalize_exact_origin(exact).is_ok_and(|canonical| canonical == exact)
 }
 
 /// Map one Istio `allowOrigins[]` `StringMatch` entry to the `cors` plugin's
 /// `allowed_origins` entry form. Returns `None` (unrepresentable → policy stays
 /// deferred) when the entry is not an object carrying EXACTLY ONE non-empty
 /// `exact` / `prefix` / `regex` string, when a `regex` fails to compile, or
-/// when an `exact` is wildcard-shaped, whitespace-padded, or not a valid
-/// `scheme://host[:port]` origin (the plugin's own exact-origin admission —
-/// see `plugins::cors::validate_exact_origin`).
+/// when an `exact` is an unsupported wildcard shape, whitespace-padded, or not
+/// a valid canonical `scheme://host[:port]` origin (the plugin's own
+/// exact-origin admission — see
+/// `plugins::cors::canonicalize_exact_origin`). Exact `*` is the documented
+/// Istio allow-all value and projects to native wildcard.
 /// `regex` is compiled here (cold path) purely to gate translatability — the
 /// plugin re-compiles it at config time as the runtime matcher; an invalid
 /// pattern is never reflected into a header.
@@ -3698,10 +3731,10 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 
     match (exact, prefix, regex) {
         (Some(exact), None, None) => {
-            // Wildcard-shaped / padded / non-origin exacts are all silent
-            // policy changes when projected as the plugin's plain-string
-            // form — see `plain_exact_origin_translatable` (shared with the
-            // legacy `allowOrigin` list, which projects identically).
+            // Unsupported wildcard shapes, padded values, and non-origin
+            // exacts are policy changes when projected as the plugin's plain
+            // string form. Exact `*` is intentionally accepted because Istio
+            // assigns it the same allow-all meaning.
             plain_exact_origin_translatable(exact).then(|| Value::String(exact.to_string()))
         }
         (None, Some(prefix), None) => {
@@ -3714,7 +3747,7 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
             // Only translatable if it compiles — otherwise the projected plugin
             // config would fail validation and be silently dropped, defeating
             // the route's CORS policy. Keep it deferred instead.
-            regex::Regex::new(regex).ok()?;
+            regex::Regex::new(&crate::config::types::anchor_regex_pattern(regex)).ok()?;
             Some(serde_json::json!({ "regex": regex }))
         }
         _ => None,
@@ -3729,37 +3762,63 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 /// (`allowOrigins[]` `exact`/`prefix`/`regex` `StringMatch` — `regex` must
 /// compile — or the legacy `allowOrigin` exact list), any `maxAge` parses as a
 /// duration, and every `allowMethods`/`allowHeaders`/`exposeHeaders` entry
-/// passes the plugin's own method/header-name admission. A malformed/unknown
+/// passes the plugin's own method/header-name admission. Credentialed exact `*`
+/// is deferred because the native wildcard representation cannot emit the
+/// concrete request origin required for credentialed CORS. A malformed/unknown
 /// origin matcher, an un-compilable `regex`, or an invalid method/header token
-/// makes the policy non-translatable so it is left unprojected (deferred)
-/// rather than silently approximated or failing `CorsPlugin` construction
-/// after translation.
+/// likewise makes the policy non-translatable so it is left unprojected
+/// (deferred) rather than silently approximated or failing `CorsPlugin`
+/// construction after translation. Exact origins must already equal the
+/// plugin's canonical serialization so its config-path normalization cannot
+/// widen Istio's literal matcher.
 pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
-    let origins_ok = cors_allowed_origins(cors).is_some();
+    let allowed_origins = cors_allowed_origins(cors);
+    let origins_ok = allowed_origins.is_some();
     let max_age_ok = match cors.get("maxAge") {
         None | Some(Value::Null) => true,
         Some(Value::String(s)) => parse_istio_duration_secs(s).is_some(),
         _ => false,
     };
-    origins_ok && max_age_ok && cors_string_arrays_plugin_valid(cors)
+    let allow_credentials_ok = matches!(
+        cors.get("allowCredentials"),
+        None | Some(Value::Null) | Some(Value::Bool(_))
+    );
+    let credentialed_wildcard_ok = !matches!(cors.get("allowCredentials"), Some(Value::Bool(true)))
+        || !allowed_origins.as_ref().is_some_and(|origins| {
+            origins
+                .iter()
+                .any(|origin| origin.as_str().is_some_and(|origin| origin == "*"))
+        });
+    origins_ok
+        && max_age_ok
+        && allow_credentials_ok
+        && credentialed_wildcard_ok
+        && cors_unmatched_preflights(cors).is_ok()
+        && cors_string_arrays_plugin_valid(cors)
 }
 
 /// Whether the projected `allowMethods`/`allowHeaders`/`exposeHeaders` lists
-/// would be accepted by `CorsPlugin` construction: the plugin trims each entry
-/// and rejects empty-after-trim values, invalid HTTP methods, and invalid
+/// would be accepted by `CorsPlugin` construction: the plugin rejects padded
+/// or empty values, invalid HTTP methods, and invalid
 /// header names (shared `plugins::cors::{validate_method,validate_header_name}`
 /// admission — do not fork). `cors_string_array` emits the collected strings
 /// verbatim, so a bad token would otherwise fail plugin construction AFTER
-/// translation instead of deferring the policy here. An absent list is fine
-/// (the plugin applies its defaults).
+/// translation instead of deferring the policy here. An absent list is
+/// projected as explicit empty so Istio omission is preserved.
 fn cors_string_arrays_plugin_valid(cors: &Value) -> bool {
     fn list_ok(cors: &Value, key: &str, validate: fn(&str, &str) -> Result<(), String>) -> bool {
-        cors_string_array(cors, key).is_none_or(|values| {
-            values.iter().all(|value| {
-                let trimmed = value.trim();
-                !trimmed.is_empty() && validate(key, trimmed).is_ok()
-            })
-        })
+        match cors.get(key) {
+            None => true,
+            Some(Value::Array(_)) => cors_string_array(cors, key).is_some_and(|values| {
+                values.iter().all(|value| {
+                    let trimmed = value.trim();
+                    !trimmed.is_empty()
+                        && trimmed.len() == value.len()
+                        && validate(key, value).is_ok()
+                })
+            }),
+            _ => false,
+        }
     }
     list_ok(cors, "allowMethods", crate::plugins::cors::validate_method)
         && list_ok(
@@ -3917,6 +3976,17 @@ fn mesh_cors_policy_from_value(cors: &Value) -> Option<MeshCorsPolicy> {
             .and_then(Value::as_str)
             .and_then(parse_istio_duration_secs),
         allow_credentials: cors.get("allowCredentials").and_then(Value::as_bool),
+        unmatched_preflights: match cors.get("unmatchedPreflights") {
+            None => None,
+            Some(_) => Some(match cors_unmatched_preflights(cors).ok()? {
+                IstioUnmatchedPreflights::Forward => {
+                    crate::modes::mesh::config::MeshCorsUnmatchedPreflights::Forward
+                }
+                IstioUnmatchedPreflights::Ignore => {
+                    crate::modes::mesh::config::MeshCorsUnmatchedPreflights::Ignore
+                }
+            }),
+        },
     })
 }
 
@@ -3931,7 +4001,10 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
             name = %object.metadata.name,
             "VirtualService http[].corsPolicy is not faithfully translatable (allowOrigins[] \
              must be exact/prefix/regex StringMatch with a compilable regex, or the legacy \
-             allowOrigin exact list, plus a parseable maxAge); leaving it unprojected. \
+             allowOrigin exact list, plus well-typed methods, headers, credentials, \
+             unmatched-preflight mode, and maxAge; exact origins must already use their \
+             canonical serialization, and credentialed exact '*' cannot be represented \
+             safely); leaving it unprojected. \
              Configure the `cors` plugin directly."
         );
         return None;
@@ -3941,15 +4014,18 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
 
     let mut config = serde_json::Map::new();
     config.insert("allowed_origins".to_string(), serde_json::json!(origins));
-    if let Some(methods) = cors_string_array(cors, "allowMethods") {
-        config.insert("allowed_methods".to_string(), serde_json::json!(methods));
-    }
-    if let Some(headers) = cors_string_array(cors, "allowHeaders") {
-        config.insert("allowed_headers".to_string(), serde_json::json!(headers));
-    }
-    if let Some(expose) = cors_string_array(cors, "exposeHeaders") {
-        config.insert("exposed_headers".to_string(), serde_json::json!(expose));
-    }
+    config.insert(
+        "allowed_methods".to_string(),
+        serde_json::json!(cors_string_array(cors, "allowMethods").unwrap_or_default()),
+    );
+    config.insert(
+        "allowed_headers".to_string(),
+        serde_json::json!(cors_string_array(cors, "allowHeaders").unwrap_or_default()),
+    );
+    config.insert(
+        "exposed_headers".to_string(),
+        serde_json::json!(cors_string_array(cors, "exposeHeaders").unwrap_or_default()),
+    );
     if let Some(max_age) = cors
         .get("maxAge")
         .and_then(Value::as_str)
@@ -3963,6 +4039,14 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
             serde_json::json!(allow_creds),
         );
     }
+    let unmatched = match cors_unmatched_preflights(cors).ok()? {
+        IstioUnmatchedPreflights::Forward => "forward",
+        IstioUnmatchedPreflights::Ignore => "ignore",
+    };
+    config.insert(
+        "unmatched_preflights".to_string(),
+        serde_json::json!(unmatched),
+    );
 
     let now = chrono::Utc::now();
     Some(PluginConfig {

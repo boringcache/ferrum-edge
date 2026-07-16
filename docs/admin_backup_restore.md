@@ -80,7 +80,8 @@ Build-out compatibility note: legacy backups whose `basicauth` entries contain f
 The recovery snapshot in step 2 is captured with a **non-validating raw load from the primary** (`load_namespace_snapshot`), *not* the validating `load_full_config`. That distinction matters two ways:
 
 - **Invalid-but-present config still snapshots.** An already-invalid namespace (dangling references, conflicting listen_paths, invalid regex) — precisely what an operator runs restore to *repair* — loads its raw rows without the fatal validation pipeline, so the snapshot succeeds and rollback stays available throughout the repair. A restore that imports cleanly succeeds and repairs the namespace; if a later step fails, rollback reapplies the (still invalid) prior config.
-- **An unreadable snapshot aborts the restore.** Connectivity/timeouts return `503`; corrupt or undecodable stored rows/documents return `500` with `failure_class: "data_integrity"` and a safe resource type/id when available. Both abort before deleting anything. Semantic config invalidity alone is still tolerated by this raw snapshot path.
+- **One guard spans the entire restore.** Ferrum acquires a persistent namespace-scoped datastore guard before reading the rollback snapshot and keeps the same owner through the destructive clear, every successful-import batch, and any compensating replay. Other admin processes therefore cannot insert resources absent from the payload between phases or have a concurrent write erased by rollback. Cancellation before the first protected mutation starts bounded owner-qualified cleanup. Once clear/import/replay is dispatched, cancellation retains the fence until the outcome is definitively verified or replay settles; cancellation between a completed clear and import also retains it because the multi-phase restore is incomplete. On MongoDB, the owner pins the exact connection generation for these uncertain phases, so reconnect/failover cannot move a later phase to a different bundle. The guarded rollback replay bypasses normal mTLS DNS admission only for the captured snapshot; the guarded successful import still runs full admission.
+- **An unavailable guard or unreadable snapshot aborts the restore.** A connectivity/timeout failure while acquiring the pre-snapshot guard or reading the snapshot returns `503` with `failure_class: "connectivity"`; the guard-acquisition response redacts backend details. Guard contention returns the stable retryable namespace-admission `503` with `Retry-After: 1` and is not mislabeled as a database outage. Corrupt or undecodable stored rows/documents return `500` with `failure_class: "data_integrity"` and a safe resource type/id when available. All paths abort before deleting anything. Semantic config invalidity alone is still tolerated by this raw snapshot path.
 
 Both the config resources and the `api_specs` count are read from the **primary**, never a lagging read replica, so the recovery report is authoritative.
 
@@ -191,17 +192,20 @@ The `rollback` field reports the outcome:
 
 - `completed` — the prior config was reapplied and retained.
 - `incomplete` — reapplying the prior config failed; the response includes `rollback_errors` and instructs the operator to perform manual recovery. The rollback is best-effort because it uses the same database backend that reported the failure.
-- `not_needed` — the **clear itself failed atomically** (SQL runs it in one transaction; replica-set MongoDB in a multi-document transaction). Nothing was deleted, so the prior config — including its `api_specs` — is fully intact and no compensating re-import runs. Only standalone (non-replica-set) MongoDB, whose clear deletes collections one-by-one, can leave a partial state and take the `completed`/`incomplete` path on a delete failure.
-- `unknown_outcome` — MongoDB reported an unknown transaction commit result and Ferrum could not verify whether the clear committed (the verification query failed or returned a state matching neither the held snapshot nor an empty namespace). Ferrum does not claim the prior config was retained; inspect the namespace and recover manually.
+- `not_needed` — the **clear definitively aborted atomically** (SQL runs it in one transaction; replica-set MongoDB in a multi-document transaction). Nothing was deleted, so the prior config — including its `api_specs` — is fully intact and no compensating re-import runs. An unknown MongoDB transaction commit result is not a definitive abort, even when an immediate read still sees the prior counts. Only standalone (non-replica-set) MongoDB, whose clear deletes collections one-by-one, can leave a known partial state and take the `completed`/`incomplete` path on an ordinary delete failure.
+- `unknown_outcome` — MongoDB reported an unknown transaction commit result. Ferrum retains the namespace admission guard even when an immediate count suggests the prior config is intact, because a timed-out write may still settle later. Inspect the namespace, stop or restart the owning admin process, and remove only the verified owner-qualified guard during manual recovery.
 
 For an unknown MongoDB commit result, Ferrum verifies authoritative namespace
 counts before classifying the failure. An empty namespace is treated as a
-committed clear and rolled back from the held in-memory snapshot; counts matching
-the snapshot retain `not_needed`. A definitive atomic abort continues to take the
-`not_needed` short-circuit without a compensating clear, preserving `api_specs`.
+committed clear and rolled back from the held in-memory snapshot, but the outer
+guard remains fail-closed because the original commit result was uncertain.
+Counts matching the snapshot likewise report `unknown_outcome` and retain the
+guard. Only a definitive atomic abort takes the `not_needed` short-circuit and
+releases the guard, preserving `api_specs`.
 
-When the prior config cannot be snapshotted for rollback, restore **aborts before
-any delete**. Connectivity failures return `503` with
+When the pre-snapshot guard cannot be acquired or the prior config cannot be
+snapshotted for rollback, restore **aborts before any delete**. Connectivity
+failures in either phase return `503` with
 `failure_class: "connectivity"`. Stored row/document integrity failures return
 `500` with `failure_class: "data_integrity"` and identify the offending resource
 type/id when safely available. Both are fail-safe paths: the destructive delete

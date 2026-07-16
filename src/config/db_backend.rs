@@ -14,6 +14,100 @@ use std::collections::HashSet;
 pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
     "A proxy with overlapping hosts and listen_path already exists";
 
+/// Stable admin-facing message for a namespace mutation that could not enter
+/// the datastore-backed admission critical section. Backend/topology details
+/// stay in server logs and the chained error only.
+pub const MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE: &str =
+    "Namespace mutation is temporarily unavailable; retry later";
+
+/// Marker for transient namespace-admission contention.
+///
+/// This is distinct from [`MtlsDnsIdentityConflict`]: contention means the
+/// caller should retry the same request later (HTTP 503), while an identity
+/// conflict means the candidate itself must change (HTTP 409).
+#[derive(Debug)]
+pub struct MtlsDnsAdmissionUnavailable;
+
+impl std::fmt::Display for MtlsDnsAdmissionUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE)
+    }
+}
+
+impl std::error::Error for MtlsDnsAdmissionUnavailable {}
+
+pub fn is_mtls_dns_admission_unavailable(error: &anyhow::Error) -> bool {
+    error.is::<MtlsDnsAdmissionUnavailable>()
+}
+
+// External tests reach this through the lib target's `_test_support` shim;
+// the bin target recompiles this module without that caller.
+#[allow(dead_code)]
+pub(crate) fn mark_mtls_dns_admission_unavailable(error: anyhow::Error) -> anyhow::Error {
+    error.context(MtlsDnsAdmissionUnavailable)
+}
+
+/// Whether a batch owns its namespace admission guard and whether it runs
+/// normal mTLS DNS validation.
+///
+/// `RestoreRollbackReplay` is intentionally narrow: it may only replay the
+/// exact raw snapshot captured immediately before a destructive restore. That
+/// snapshot can contain a pre-existing ambiguity the normal runtime rejects,
+/// so validating it during rollback could destroy the operator's prior state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchConfigWriteMode {
+    Admission,
+    GuardedAdmission { guard_owner: String },
+    RestoreRollbackReplay { guard_owner: String },
+}
+
+impl BatchConfigWriteMode {
+    pub(crate) fn validates_mtls_dns(&self) -> bool {
+        matches!(self, Self::Admission | Self::GuardedAdmission { .. })
+    }
+
+    pub(crate) fn guard_owner(&self) -> Option<&str> {
+        match self {
+            Self::Admission => None,
+            Self::GuardedAdmission { guard_owner }
+            | Self::RestoreRollbackReplay { guard_owner } => Some(guard_owner),
+        }
+    }
+}
+
+/// A datastore-serialized candidate would make an effective `mtls_auth`
+/// `san_dns` policy ambiguous under ASCII case folding.
+///
+/// Persistence implementations carry this typed error through their normal
+/// transaction/lease boundary so the admin API can return a conflict without
+/// exposing unrelated database details. The identities themselves are not
+/// secrets, but callers should still prefer the validation messages already
+/// produced by [`GatewayConfig::validate_unique_mtls_dns_identities`].
+#[derive(Debug)]
+pub struct MtlsDnsIdentityConflict {
+    errors: Vec<String>,
+}
+
+impl MtlsDnsIdentityConflict {
+    pub fn new(errors: Vec<String>) -> Self {
+        Self { errors }
+    }
+}
+
+impl std::fmt::Display for MtlsDnsIdentityConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mTLS DNS identity conflict: {}", self.errors.join("; "))
+    }
+}
+
+impl std::error::Error for MtlsDnsIdentityConflict {}
+
+pub fn is_mtls_dns_identity_conflict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<MtlsDnsIdentityConflict>())
+}
+
 // ---------------------------------------------------------------------------
 // ApiSpec list filter types (Wave 5)
 // ---------------------------------------------------------------------------
@@ -218,7 +312,7 @@ pub enum DeleteMode {
     NonAtomic,
 }
 
-/// Authoritative resource counts used to resolve an ambiguous atomic clear.
+/// Authoritative resource counts used to classify an ambiguous atomic clear.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NamespaceResourceCounts {
     pub proxies: u64,
@@ -237,8 +331,16 @@ impl NamespaceResourceCounts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtomicClearVerification {
     ClearCommitted,
-    PriorConfigIntact,
+    PriorCountsStillVisible,
     UnknownOutcome,
+}
+
+impl AtomicClearVerification {
+    /// Whether the namespace guard must remain retained after verification.
+    /// Fail closed for every result except a definitively committed clear.
+    pub fn requires_guard_retention(self) -> bool {
+        !matches!(self, Self::ClearCommitted)
+    }
 }
 
 pub fn classify_atomic_clear_verification<E>(
@@ -246,7 +348,10 @@ pub fn classify_atomic_clear_verification<E>(
     verification: Result<NamespaceResourceCounts, E>,
 ) -> AtomicClearVerification {
     match verification {
-        Ok(post_clear) if post_clear == prior => AtomicClearVerification::PriorConfigIntact,
+        // Matching the prior snapshot only proves the clear was not visible to
+        // this read. An UnknownTransactionCommitResult may still commit later
+        // on another pooled connection, so this is not a definitive abort.
+        Ok(post_clear) if post_clear == prior => AtomicClearVerification::PriorCountsStillVisible,
         Ok(post_clear) if post_clear.is_empty() => AtomicClearVerification::ClearCommitted,
         Ok(_) | Err(_) => AtomicClearVerification::UnknownOutcome,
     }
@@ -519,7 +624,13 @@ pub trait DatabaseBackend: Send + Sync {
     // -----------------------------------------------------------------------
 
     async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error>;
-    async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error>;
+    /// `mode` lets a multi-step credential or restore operation borrow the
+    /// namespace guard it acquired before its authoritative read.
+    async fn update_consumer(
+        &self,
+        consumer: &Consumer,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<bool, anyhow::Error>;
     async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error>;
     async fn get_consumer(
         &self,
@@ -671,18 +782,36 @@ pub trait DatabaseBackend: Send + Sync {
     // Batch operations
     // -----------------------------------------------------------------------
 
-    async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error>;
+    async fn batch_create_proxies(
+        &self,
+        proxies: &[Proxy],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error>;
     async fn batch_create_proxies_without_plugins(
         &self,
         proxies: &[Proxy],
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error>;
-    async fn batch_attach_proxy_plugins(&self, proxies: &[Proxy]) -> Result<(), anyhow::Error>;
-    async fn batch_create_consumers(&self, consumers: &[Consumer]) -> Result<usize, anyhow::Error>;
+    async fn batch_attach_proxy_plugins(
+        &self,
+        proxies: &[Proxy],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error>;
+    async fn batch_create_consumers(
+        &self,
+        consumers: &[Consumer],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error>;
     async fn batch_create_plugin_configs(
         &self,
         configs: &[PluginConfig],
+        mode: &BatchConfigWriteMode,
     ) -> Result<usize, anyhow::Error>;
-    async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error>;
+    async fn batch_create_upstreams(
+        &self,
+        upstreams: &[Upstream],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error>;
     /// Clear all resources in a namespace and report the mode that actually ran.
     ///
     /// SQL backends run the clear inside a single transaction, so a failure
@@ -697,7 +826,23 @@ pub trait DatabaseBackend: Send + Sync {
     async fn delete_all_resources(
         &self,
         namespace: &str,
+        mode: &BatchConfigWriteMode,
     ) -> Result<DeleteMode, DeleteAllResourcesError>;
+
+    /// Block namespace resource writers across a multi-step operation. The
+    /// opaque owner must be supplied to guarded writes until release.
+    async fn acquire_mtls_dns_admission_guard(
+        &self,
+        namespace: &str,
+    ) -> Result<String, anyhow::Error>;
+
+    /// Release only the guard owned by `guard_owner`. An owner mismatch must
+    /// fail closed rather than unblocking another operation.
+    async fn release_mtls_dns_admission_guard(
+        &self,
+        namespace: &str,
+        guard_owner: &str,
+    ) -> Result<(), anyhow::Error>;
 
     // -----------------------------------------------------------------------
     // Connection lifecycle (called from polling loops)

@@ -36,7 +36,9 @@ fn h1_h2_route_miss_and_method_rejection_precede_request_hooks() {
             "// gRPC spec mandates POST method.",
             "StatusCode::BAD_REQUEST",
             "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);",
-            "match plugin.on_request_received(&mut ctx).await",
+            "// Execute on_request_received hooks",
+            "await_request_plugin_deadline_with_provenance(",
+            "plugin.on_request_received(&mut ctx),",
         ],
     );
 }
@@ -52,8 +54,9 @@ fn h3_route_miss_and_method_rejection_precede_request_hooks() {
             "StatusCode::METHOD_NOT_ALLOWED",
             "// gRPC spec mandates POST.",
             "StatusCode::BAD_REQUEST",
-            "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);",
-            "match plugin.on_request_received(&mut ctx).await",
+            "// Execute on_request_received hooks",
+            "await_request_plugin_deadline_with_provenance(",
+            "plugin.on_request_received(&mut ctx),",
         ],
     );
 }
@@ -68,7 +71,7 @@ fn h1_h2_buffered_terminal_logging_precedes_response_construction() {
             "if body_will_stream {",
             "DeferredTransactionLogger::new_with_start_time(",
             "} else {",
-            "crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;",
+            "crate::plugins::log_with_mirror_before_buffered_response(&plugins, summary, &ctx)",
             "record_request(&state, response_status);",
             "// Build final response",
             "let mut resp_builder = Response::builder()",
@@ -77,17 +80,19 @@ fn h1_h2_buffered_terminal_logging_precedes_response_construction() {
 }
 
 #[test]
-fn h3_buffered_terminal_logging_precedes_response_construction_and_send() {
+fn h3_buffered_response_is_sent_before_terminal_logging() {
     assert_markers_in_order(
         H3_SOURCE,
         "H3 buffered terminal path",
         &[
             "// ===== BUFFERED RESPONSE PATH =====",
-            "let summary = TransactionSummary {",
-            "crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;",
+            "run_deadline_bounded_response_committed_hooks(",
             "// Build and send buffered response",
             "apply_response_headers(Response::builder().status(status), &response_headers);",
-            "stream.send_response(resp).await?;",
+            "let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));",
+            "// Transaction logging follows downstream response completion",
+            "let summary = TransactionSummary {",
+            "crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;",
         ],
     );
 }
@@ -147,4 +152,21 @@ fn trait_example_and_guides_describe_buffered_streaming_and_h3_log_timing() {
     assert!(EXAMPLE_SOURCE.contains("Hyper-owned streamed bodies spawn logging"));
     assert!(H3_SOURCE.contains("# Why H3 does not use `DeferredTransactionLogger`"));
     assert!(H3_SOURCE.contains("drives the\n/// QUIC send stream to completion synchronously"));
+}
+
+#[test]
+fn deadline_bearing_buffered_logging_uses_owned_bounded_cleanup() {
+    let helper = TRAIT_SOURCE
+        .split("pub async fn log_with_mirror_before_buffered_response(")
+        .nth(1)
+        .expect("deadline-aware buffered logging helper")
+        .split("async fn collect_mirror_result(")
+        .next()
+        .expect("bounded deadline-aware buffered logging helper");
+    assert!(helper.contains("if ctx.grpc_deadline_at().is_none()"));
+    assert!(helper.contains("log_with_mirror(plugins, &summary, ctx).await;"));
+    assert!(helper.contains("let plugins = plugins.to_vec();"));
+    assert!(helper.contains("let ctx = ctx.clone();"));
+    assert!(helper.contains("tokio::spawn(async move"));
+    assert!(helper.contains("std::time::Duration::from_secs(5)"));
 }

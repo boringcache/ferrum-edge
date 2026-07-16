@@ -48,7 +48,7 @@ plugin_configs:
     scope: proxy
     proxy_id: public-frontend
     config:
-      origins: ["https://app.example.com"]
+      allowed_origins: ["https://app.example.com"]
 
   # ProxyGroup — shared across a SUBSET of proxies
   # One instance, shared rate limit counters across the group
@@ -1332,7 +1332,7 @@ For UDP+DTLS frontends, the underlying DTLS library exposes only the client leaf
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
 
-For `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, and `san_email`, Ferrum selects only the **first matching value in certificate order**. Later subject attributes or SAN entries are not fallback identities. DNS SAN identities are normalized with ASCII lowercase and compared case-insensitively; every other identity field is compared exactly. Consumer mTLS identities are always exact-unique; while an enabled `san_dns` mTLS policy exists, they must also be unique under ASCII case folding so a DNS certificate cannot resolve ambiguously. Database snapshots that violate the DNS rule are rejected before runtime indexes are published.
+For `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, and `san_email`, Ferrum selects only the **first matching value in certificate order**. Later subject attributes or SAN entries are not fallback identities. DNS SAN identities are normalized with ASCII lowercase and compared case-insensitively; every other identity field is compared exactly. Consumer mTLS identities are always exact-unique; while an enabled `san_dns` mTLS policy exists, they must also be unique under ASCII case folding so a DNS certificate cannot resolve ambiguously. SQL and MongoDB backends serialize Consumer, plugin-policy, and proxy-association admission per namespace, including batch and restore imports, so concurrent admin processes cannot commit conflicting case variants or race a policy activation against a credential update. A restore holds one persistent owner-qualified guard from before its rollback snapshot through the destructive clear, every successful-import batch, and any compensating raw replay; all non-owning namespace resource writers fail closed for that full interval. Cancellation before a protected mutation is dispatched starts bounded owner-qualified cleanup. Cancellation, timeout, shutdown, or process failure after dispatch intentionally retains the fence when the write outcome or a multi-phase restore remains uncertain; definitive settlement releases it. If bounded owner-qualified cleanup itself cannot reach the datastore, the durable fence remains fail-closed, the failure is logged, and the same manual recovery procedure applies. MongoDB admission ownership uses majority-acknowledged, non-expiring writes: a paused writer can never resume after a successor has taken its lock, and an election cannot roll back ownership and reopen a stale writer. After verifying the former process is stopped and the durable outcome, an operator must remove that namespace's orphaned document from `mtls_dns_admission_locks`; an uncertain Mongo operation also pins its connection generation until this recovery. SQL uncertainty leaves `restore_owner` set in the namespace row, including interruption during a dispatched credential mutation, destructive restore phase, or rollback replay. After verifying the former process is stopped and the namespace state, clear that exact owner field before admission resumes. Ordinary identity conflicts return `409 Conflict`; namespace-fence contention returns a redacted `503 Service Unavailable` with `Retry-After: 1`. Batch and restore failures otherwise use those endpoints' documented per-item and rollback responses. File, database, CP/DP, and reload snapshots also reject ambiguity before publishing runtime indexes.
 
 > **`serial` format.** The serial identity is the lowercase hex serial number value — no separators, matching the lowercase of `openssl x509 -serial -noout -in cert.pem` output. DER may include a leading `00` sign-padding byte for positive serials whose high bit is set, but OpenSSL's serial value omits that DER-only pad and Ferrum strips it before lookup (for example, DER bytes `00 C0 01` match stored identity `c001`). Preserve real serial value zeros, but do not add DER sign padding and do not use the colon-separated form from `openssl x509 -text`.
 
@@ -2387,13 +2387,20 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_origins` | (String \| Object)[] | `["*"]` | Permitted origins. Each entry is a string (`"*"`, an exact `scheme://host[:port]` origin, or a `*.suffix.com` wildcard subdomain) or an Istio `StringMatch` object with one of `exact` / `prefix` / `regex` (literal prefix / RE2 full match). |
-| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Allowed methods |
-| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Allowed headers |
+| `allowed_origins` | (String \| Object)[] | required | Permitted origins. Use `["*"]` only for intentional allow-all. Exact origins are canonicalized at config load; `*.suffix.com` is the native wildcard-subdomain form. Istio objects use exactly one of `exact` / `prefix` / `regex`; exact `*` is Istio allow-all. |
+| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
+| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
 | `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` |
 | `max_age` | u64 | `86400` | Preflight cache duration in seconds |
-| `preflight_continue` | bool | `false` | Pass preflight requests to backend |
+| `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
+| `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |
+
+The root config must be an object. Unknown keys, explicit `null`, malformed
+values, and an omitted `allowed_origins` policy fail startup/reload instead of
+falling back to wildcard access. Multiple attached CORS instances compose
+origin/credential/exposure policy on actual requests and additionally
+intersect method/header/max-age policy on preflight.
 
 See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshooting.
 
@@ -3365,15 +3372,19 @@ its ordinary `before_proxy` position and behavior.
 | `max_deadline_ms` | u64 (optional) | *(none)* | Cap incoming deadlines to this value (milliseconds). Must be positive — `0` is rejected at plugin load time (it would reject every request). |
 | `default_deadline_ms` | u64 (optional) | *(none)* | Inject `grpc-timeout` when client omits it. Must be positive — `0` is rejected. If both are set, `default_deadline_ms` cannot exceed `max_deadline_ms`. |
 | `subtract_gateway_processing` | bool | `false` | Subtract elapsed gateway time before forwarding |
-| `reject_no_deadline` | bool | `false` | Reject requests missing `grpc-timeout` (gRPC clients receive normalized `grpc-status`) |
+| `reject_no_deadline` | bool | `false` | Reject requests missing a positive `grpc-timeout` (native H2/H3 clients receive HTTP 200 with a non-OK trailers-only `grpc-status`) |
 
-The plugin requires at least one rule — empty configs are rejected at load time so it cannot be a no-op. Parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), `n` (nanoseconds). Malformed values (non-ASCII, non-digit, or unknown unit) are treated as missing and fall back to `default_deadline_ms` if configured — they never panic the worker.
+The plugin requires at least one effective rule — empty configs and configs containing only `false` boolean rules are rejected at load time so it cannot be a no-op. Configuration is strict: unknown keys, explicit `null`, and incorrect field types are rejected with the property name. This prevents a misspelled enforcement rule from silently weakening policy.
+
+It parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), `n` (nanoseconds). Zero values are not deadlines and are treated as missing, so they cannot satisfy `reject_no_deadline`. Positive sub-millisecond values are rounded up to one millisecond. Other malformed values (non-ASCII, non-digit, oversized, or unknown unit) are treated as missing and fall back to `default_deadline_ms` if configured — they never panic the worker.
 
 Forwarded deadlines are re-encoded to stay within the gRPC wire-format limit of 8 digits, preserving millisecond precision whenever it fits.
 
-When `subtract_gateway_processing` is true and the remaining deadline is zero or negative, returns gRPC status `DEADLINE_EXCEEDED` (status code 4) using the trailers-only response pattern.
+The gateway establishes one monotonic absolute deadline at request receipt, before IP/geo/bot restrictions, authentication, authorization, body buffering, or plugin I/O. This phase-0 ordering is intentional and fail closed: when `reject_no_deadline` is enabled, a missing or malformed deadline is rejected before security plugins, so the deadline-policy response can precede the `401`/`403` that the same request would otherwise receive. It prevents unauthenticated requests from bypassing the configured total RPC resource ceiling. That same instant bounds connection acquisition, all H2/H3 attempts and retry backoff, and response headers/body/trailers. The header sent to a backend remains a relative duration; when `subtract_gateway_processing` is true it is derived from the absolute deadline. Later plugin instances and transports reuse the typed instant and never subtract elapsed time from that rewritten header again.
 
-Populates `ctx.metadata` with `grpc_original_deadline_ms` and `grpc_adjusted_deadline_ms`.
+When the absolute deadline is exhausted, the gateway returns gRPC status `DEADLINE_EXCEEDED` (status code 4). Upload expiry in every buffering phase uses the normal finalized rejection lifecycle, so rejection decorators, committed observers, gRPC-Web response translation/CORS, logging, and admission cleanup are not skipped. If H2 or H3 response headers were already committed but no client-visible DATA bytes were forwarded, it emits a terminal status-4 trailer frame; after partial DATA it aborts the stream because a complete gRPC message boundary cannot be assumed. Response-inspector buffering does not count as client-visible DATA. H3 downstream writes and coalescer flushes are bounded by the same absolute instant, preventing QUIC flow-control stalls from outliving the RPC. Deadline-capable streaming relays remove an upstream `Content-Length` before committing headers because the terminal replacement has a different representation length.
+
+When this plugin is configured, it populates `ctx.metadata` with `grpc_original_deadline_ms` and `grpc_adjusted_deadline_ms`. Merely sending a parseable `grpc-timeout` header without a `grpc_deadline` policy does not create those plugin-policy transaction-log fields.
 
 ```yaml
 plugin_name: grpc_deadline
@@ -3764,7 +3775,7 @@ Use this only when the normal backend has equivalent authentication, model allow
 - `ai_transcript_audit` (2924) stages transcript capture before guardrails; `ai_prompt_shield` (2925) scans/redacts PII before federation
 - `ai_semantic_firewall` (2968) blocks semantic prompt injection, exfiltration, tool-abuse, and topic-policy violations before semantic cache or federation
 - `ai_request_guard` (2975) validates model, tokens, temperature before federation
-- `ai_prompt_compressor` (4055) shortens plaintext prompt metadata for compatible direct dispatchers and compresses the standard backend-dispatch body after request decompression
+- `ai_prompt_compressor` (4055) boundedly shortens admitted OpenAI Chat/Text Completions plaintext, stages compatible direct-dispatch metadata while limiting private wire-result reuse to 65,536 bytes, records authoritative standard wire stats after request decompression, and uses a bounded representation-preserving fallback so configured preserve markers cannot bypass sanitation; successful compression rewrites reserialize the complete JSON body
 - `ai_federation` (4060) routes to provider, writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 
@@ -4373,12 +4384,12 @@ Request buffering is only enabled for matching JSON `POST` requests without a no
 | `compress_roles` | String[] | `["user"]` | Message roles whose `content` is compressed (case-insensitive; non-empty). When it includes `user`, the legacy top-level `prompt` is compressed too. |
 | `target_ratio` | Number | `0.5` | Fraction of word-tokens to keep. `0.5` ≈ 50% reduction; `0.3` is more aggressive. Strictly between 0 and 1. |
 | `min_content_tokens` | Integer | `200` | Estimated-token floor per content string; shorter content is passed through unchanged. |
-| `max_scan_bytes` | Integer | `1048576` | Skip compression when the request body exceeds this size. |
-| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` is kept verbatim and the markers are stripped. ASCII letters, digits, `-`, `_`. |
+| `max_scan_bytes` | Integer | `1048576` | Skip statistical compression when the request body exceeds this size; configured marker sanitation remains active through the hard 1 MiB body/output bound. |
+| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` is kept verbatim and the markers are stripped. At most 64 ASCII letters, digits, `-`, `_`. |
 
 The filter scores each word by stop-word membership, length, in-document rarity, and a proper-noun signal, then drops the lowest-scoring words until `target_ratio` is met. Fenced code blocks, inline code, URLs, numbers, `snake_case`/identifier tokens, uppercase acronyms, and negations (`not`, `never`, `cannot`, …) are always preserved. Token counts are estimated (~4 characters per token); no model tokenizer is embedded.
 
-Runs after `compression` so opt-in request decompression exposes plaintext prompt JSON before this plugin rewrites the standard backend-dispatch body. It rewrites `ctx.metadata["request_body"]` in `before_proxy` for already-plaintext JSON bodies and re-derives the wire body in `transform_request_body` (authoritative for the bytes sent upstream, including the HTTP/3 cross-protocol path). Direct `ai_federation` dispatch can consume the metadata rewrite for plaintext uploads; compressed client uploads must use the standard backend-dispatch path because federation returns before request-body transforms run. Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When a field is rewritten, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
+Runs after `compression` so opt-in request decompression exposes plaintext prompt JSON before this plugin rewrites the standard backend-dispatch body. Its per-request gate buffers candidate JSON `POST` bodies; `before_proxy` rewrites `ctx.metadata["request_body"]` for already-plaintext direct dispatch and stores bounded private stage state; `transform_request_body_with_context` owns the authoritative upstream bytes and counters; and `on_final_request_body_with_context` rejects an unsanitizable decoded marker-bearing surface before dispatch. Direct `ai_federation` dispatch can consume the metadata rewrite for plaintext uploads; compressed client uploads must use the standard backend-dispatch path because federation returns before request-body transforms run. Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When a field is statistically rewritten, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
 
 ```yaml
 plugin_name: ai_prompt_compressor
