@@ -1528,12 +1528,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "authority-query-key" => "https://signedkey.attacker.example/next".to_string(),
             "authority-query-idna" => "https://xn--bcher-kva.attacker.example/next".to_string(),
             "authority-query-port" => "https://attacker.example:18443/next".to_string(),
-            "authority-query-default-https-port" => {
-                "https://attacker.example:443/next".to_string()
-            }
-            "authority-query-default-network-port" => {
-                "//attacker.example:80/next".to_string()
-            }
+            "authority-query-default-https-port" => "https://attacker.example:443/next".to_string(),
+            "authority-query-default-network-port" => "//attacker.example:80/next".to_string(),
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }
@@ -2090,10 +2086,7 @@ async fn test_terminate_revalidates_combined_link_headers() {
                     );
                 } else {
                     let expected = format!("{first}, {second}");
-                    assert_eq!(
-                        headers.get("link").map(String::as_str),
-                        Some(expected.as_str())
-                    );
+                    assert_eq!(headers.get("link").map(String::as_str), Some(expected.as_str()));
                 }
             }
             other => panic!("expected terminal Link response, got {other:?}"),

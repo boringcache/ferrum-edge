@@ -1063,8 +1063,7 @@ impl FunctionDestination {
             .into_iter()
             .chain(explicit_uri_authority_port(&decoded_reference.value))
             .any(|port| {
-                self.sensitive_query_scalars()
-                    .any(|value| value == port)
+                self.sensitive_query_scalars().any(|value| value == port)
             });
         if exposes_explicit_port_scalar {
             return true;
@@ -1476,11 +1475,7 @@ fn nested_path_uri_references(value: &str) -> impl Iterator<Item = &str> {
     value.char_indices().filter_map(move |(index, _)| {
         let reference = &value[index..];
         let starts_at_boundary = index == 0
-            || value
-                .as_bytes()
-                .get(index - 1)
-                .copied()
-                .is_some_and(is_uri_component_boundary);
+            || value.as_bytes().get(index - 1).copied().is_some_and(is_uri_component_boundary);
         (starts_at_boundary
             && (has_ascii_case_insensitive_prefix(reference, "http://")
                 || has_ascii_case_insensitive_prefix(reference, "https://")))
@@ -1496,9 +1491,7 @@ fn explicit_uri_authority_port(value: &str) -> Option<&str> {
         let scheme_end = value.find(':')?;
         let scheme = &value[..scheme_end];
         if !is_valid_uri_scheme(scheme)
-            || !value
-                .get(scheme_end..)
-                .is_some_and(|suffix| suffix.starts_with("://"))
+            || !value.get(scheme_end..).is_some_and(|suffix| suffix.starts_with("://"))
         {
             return None;
         }
@@ -1511,9 +1504,7 @@ fn explicit_uri_authority_port(value: &str) -> Option<&str> {
     let host_and_port = authority.rsplit('@').next()?;
     let port = if let Some(bracketed) = host_and_port.strip_prefix('[') {
         let closing_bracket = bracketed.find(']')? + 1;
-        host_and_port
-            .get(closing_bracket + 1..)?
-            .strip_prefix(':')?
+        host_and_port.get(closing_bracket + 1..)?.strip_prefix(':')?
     } else {
         host_and_port.rsplit_once(':')?.1
     };
@@ -1712,9 +1703,7 @@ fn sanitize_function_response_headers(
                         Some(existing) => {
                             existing.push_str(", ");
                             existing.push_str(value);
-                            function_destination.response_header_exposes_destination(
-                                kind, existing,
-                            )
+                            function_destination.response_header_exposes_destination(kind, existing)
                         }
                         None => true,
                     }
