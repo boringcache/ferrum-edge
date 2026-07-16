@@ -28,8 +28,8 @@ use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{
-    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
-    RequestContext, ResponseStreamAction, TransactionSummary,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
+    PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction, TransactionSummary,
     normalize_response_body_for_inspection,
 };
 use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
@@ -877,7 +877,37 @@ async fn handle_h3_request(
     // falls through the cross-protocol bridge to the H2 gRPC pool. Keeping the
     // flavor around lets every dispatch and rejection stay flavor-aware
     // (trailers-only gRPC status vs JSON).
-    let http_flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    let detected_http_flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    // Extended CONNECT classification takes precedence over Content-Type.
+    // Besides selecting the WebSocket plugin chain below, suppress gRPC-Web
+    // rejection shaping so a spoofed header cannot turn a WS policy reject
+    // into a gRPC-Web response.
+    let grpc_web_response_content_type = if detected_http_flavor == HttpFlavor::WebSocket {
+        None
+    } else {
+        req.headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|content_type| {
+                crate::plugins::grpc_web::is_grpc_web_content_type(content_type).then(|| {
+                    crate::plugins::grpc_web::response_content_type(content_type).to_string()
+                })
+            })
+    };
+    // gRPC-Web remains Plain in the shared wire classifier so the grpc_web
+    // plugin retains ownership of body translation. Once its content type is
+    // recognized here, however, every request-side decision must treat it as
+    // effective gRPC: POST validation, plugin selection, body limits, and
+    // fail-closed method policy all need the same answer. Backend transport is
+    // selected separately after request hooks, once the translator's trusted
+    // marker is known. The separate response content type above preserves
+    // binary/text + proto encoding for client-facing rejection and response
+    // shaping.
+    let http_flavor = if grpc_web_response_content_type.is_some() {
+        HttpFlavor::Grpc
+    } else {
+        detected_http_flavor
+    };
 
     // Global request admission control (HTTP/3). Single atomic load (~1ns).
     if state
@@ -885,10 +915,11 @@ async fn handle_h3_request(
         .reject_new_requests
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        record_request(&state, 503);
+        record_h3_flavor_aware_reject(&state, http_flavor, 503);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             http::StatusCode::SERVICE_UNAVAILABLE,
             r#"{"error":"Service overloaded"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
@@ -909,6 +940,9 @@ async fn handle_h3_request(
     let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
     ctx.metadata
         .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+    if let Some(content_type) = grpc_web_response_content_type.as_deref() {
+        crate::plugins::grpc_web::retain_client_content_type_for_errors(&mut ctx, content_type);
+    }
     // Use the actual UDP listener port so port-scoped plugins such as mesh
     // outbound registry and mesh authz see the same frontend port that accepted
     // the H3 request. Fall back to the configured HTTPS port only if Quinn
@@ -926,7 +960,7 @@ async fn handle_h3_request(
     for (name, value) in req.headers() {
         let header_size = name.as_str().len() + value.len();
         if header_size > state.max_single_header_size_bytes {
-            record_request(&state, 431);
+            record_h3_flavor_aware_reject(&state, http_flavor, 431);
             let body = format!(
                 r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
                 name.as_str(),
@@ -935,6 +969,7 @@ async fn handle_h3_request(
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
+                grpc_web_response_content_type.as_deref(),
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
                 &body,
                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -946,10 +981,11 @@ async fn handle_h3_request(
         total_header_size += header_size;
     }
     if total_header_size > state.max_header_size_bytes {
-        record_request(&state, 431);
+        record_h3_flavor_aware_reject(&state, http_flavor, 431);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             r#"{"error":"Total request headers exceed maximum size"}"#,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -959,7 +995,7 @@ async fn handle_h3_request(
         return Ok(());
     }
     if state.max_header_count > 0 && req.headers().len() > state.max_header_count {
-        record_request(&state, 431);
+        record_h3_flavor_aware_reject(&state, http_flavor, 431);
         let body = format!(
             r#"{{"error":"Request header count ({}) exceeds maximum of {}"}}"#,
             req.headers().len(),
@@ -968,6 +1004,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             &body,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -990,7 +1027,7 @@ async fn handle_h3_request(
                 1 + query_string.len()
             };
         if url_len > state.max_url_length_bytes {
-            record_request(&state, 414);
+            record_h3_flavor_aware_reject(&state, http_flavor, 414);
             let body = format!(
                 r#"{{"error":"Request URL length ({} bytes) exceeds maximum of {} bytes"}}"#,
                 url_len, state.max_url_length_bytes
@@ -998,6 +1035,7 @@ async fn handle_h3_request(
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
+                grpc_web_response_content_type.as_deref(),
                 StatusCode::URI_TOO_LONG,
                 &body,
                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1014,7 +1052,7 @@ async fn handle_h3_request(
     if state.max_query_params > 0 && !query_string.is_empty() {
         let param_count = crate::proxy::count_query_params(&query_string);
         if param_count > state.max_query_params {
-            record_request(&state, 400);
+            record_h3_flavor_aware_reject(&state, http_flavor, 400);
             let body = format!(
                 r#"{{"error":"Query parameter count ({}) exceeds maximum of {}"}}"#,
                 param_count, state.max_query_params
@@ -1022,6 +1060,7 @@ async fn handle_h3_request(
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
+                grpc_web_response_content_type.as_deref(),
                 StatusCode::BAD_REQUEST,
                 &body,
                 crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
@@ -1040,10 +1079,11 @@ async fn handle_h3_request(
         crate::proxy::check_protocol_headers(req.headers(), http::Version::HTTP_3)
     {
         warn!("Rejected HTTP/3 request: {}", error_body);
-        record_request(&state, 400);
+        record_h3_flavor_aware_reject(&state, http_flavor, 400);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             StatusCode::BAD_REQUEST,
             error_body,
             crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
@@ -1058,10 +1098,11 @@ async fn handle_h3_request(
         http::Version::HTTP_3,
     ) {
         warn!("Rejected HTTP/3 request: {}", error_body);
-        record_request(&state, 400);
+        record_h3_flavor_aware_reject(&state, http_flavor, 400);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             StatusCode::BAD_REQUEST,
             error_body,
             crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
@@ -1074,10 +1115,11 @@ async fn handle_h3_request(
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     if method == "TRACE" {
         warn!("Rejected HTTP/3 TRACE request");
-        record_request(&state, 405);
+        record_h3_flavor_aware_reject(&state, http_flavor, 405);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             StatusCode::METHOD_NOT_ALLOWED,
             r#"{"error":"TRACE method is not allowed"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
@@ -1095,10 +1137,11 @@ async fn handle_h3_request(
     // bypasses proxy routing.
     if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket {
         warn!("Rejected non-WebSocket HTTP/3 CONNECT request");
-        record_request(&state, 405);
+        record_h3_flavor_aware_reject(&state, http_flavor, 405);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             StatusCode::METHOD_NOT_ALLOWED,
             r#"{"error":"CONNECT method is not allowed"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
@@ -1116,10 +1159,11 @@ async fn handle_h3_request(
             "Rejected HTTP/3 0-RTT request: method {} not in allowed early data methods",
             method
         );
-        record_request(&state, 425);
+        record_h3_flavor_aware_reject(&state, http_flavor, 425);
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             StatusCode::TOO_EARLY,
             r#"{"error":"Method not allowed in 0-RTT early data"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
@@ -1192,10 +1236,11 @@ async fn handle_h3_request(
                 limit = state.max_concurrent_requests_per_ip,
                 "Per-IP concurrent request limit exceeded (HTTP/3)"
             );
-            record_request(&state, 429);
+            record_h3_flavor_aware_reject(&state, http_flavor, 429);
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
+                grpc_web_response_content_type.as_deref(),
                 http::StatusCode::TOO_MANY_REQUESTS,
                 r#"{"error":"Too many concurrent requests from this IP"}"#,
                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1226,10 +1271,11 @@ async fn handle_h3_request(
             Some(normalized) => Some(normalized),
             None => {
                 warn!("Rejected HTTP/3 request: malformed Host/authority value");
-                record_request(&state, 400);
+                record_h3_flavor_aware_reject(&state, http_flavor, 400);
                 send_h3_error_flavor_aware(
                     &mut stream,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     StatusCode::BAD_REQUEST,
                     r#"{"error":"Request contains malformed Host or authority"}"#,
                     crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
@@ -1326,10 +1372,11 @@ async fn handle_h3_request(
             (rm.proxy, rm.matched_prefix_len)
         }
         None => {
-            record_request(&state, 404);
+            record_h3_flavor_aware_reject(&state, http_flavor, 404);
             send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
+                grpc_web_response_content_type.as_deref(),
                 StatusCode::NOT_FOUND,
                 r#"{"error":"Not Found"}"#,
                 crate::proxy::grpc_proxy::grpc_status::NOT_FOUND,
@@ -1347,7 +1394,7 @@ async fn handle_h3_request(
     // Method-filtered Extended CONNECT requests still require WebSocket-scoped
     // initial response policy and transport-managed header stripping.
     let request_protocol = h3_plugin_protocol_for_flavor(http_flavor);
-    ctx.set_websocket_response_boundary(matches!(http_flavor, HttpFlavor::WebSocket));
+    ctx.set_request_http_flavor(http_flavor);
     let initial_response_header_policy_plugins = epoch
         .plugin_cache
         .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
@@ -1356,7 +1403,7 @@ async fn handle_h3_request(
     if let Some(ref allowed) = proxy.allowed_methods
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
     {
-        record_request(&state, 405);
+        record_h3_flavor_aware_reject(&state, http_flavor, 405);
         let allow_header = allowed.join(", ");
         let mut headers = HashMap::new();
         headers.insert("allow".to_string(), allow_header.clone());
@@ -1368,14 +1415,27 @@ async fn handle_h3_request(
             initial_response_header_policy_plugins.as_ref(),
         );
         crate::proxy::restore_authoritative_allow_header(&mut headers, &allow_header);
-        send_h3_finalized_reject_flavor_aware(
-            &mut stream,
-            http_flavor,
-            StatusCode::METHOD_NOT_ALLOWED,
-            r#"{"error":"Method Not Allowed"}"#.as_bytes(),
-            &headers,
-        )
-        .await?;
+        if let Some(content_type) = grpc_web_response_content_type.as_deref() {
+            send_h3_grpc_web_reject(
+                &mut stream,
+                &[],
+                &mut ctx,
+                content_type,
+                StatusCode::METHOD_NOT_ALLOWED,
+                r#"{"error":"Method Not Allowed"}"#.as_bytes(),
+                &headers,
+            )
+            .await?;
+        } else {
+            send_h3_finalized_reject_flavor_aware(
+                &mut stream,
+                http_flavor,
+                StatusCode::METHOD_NOT_ALLOWED,
+                r#"{"error":"Method Not Allowed"}"#.as_bytes(),
+                &headers,
+            )
+            .await?;
+        }
         return Ok(());
     }
 
@@ -1384,9 +1444,13 @@ async fn handle_h3_request(
     // the H1/H2 dispatch contract.
     if matches!(http_flavor, HttpFlavor::Grpc) && method != "POST" {
         warn!(method = %method, "Rejected HTTP/3 gRPC request: method must be POST");
-        record_request(&state, 400);
-        send_h3_grpc_error(
+        record_h3_flavor_aware_reject(&state, http_flavor, 400);
+        send_h3_error_flavor_aware_with_policy(
             &mut stream,
+            http_flavor,
+            grpc_web_response_content_type.as_deref(),
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"gRPC requires POST method"}"#,
             crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
             "gRPC requires POST method",
             initial_response_header_policy_plugins.as_ref(),
@@ -1413,6 +1477,8 @@ async fn handle_h3_request(
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
     // Pre-computed capability bitset — avoids per-request iter().any() scans.
     let capabilities = plugin_cache_view.capabilities();
+    let backend_path_plugins = plugin_cache_view.backend_path_plugins();
+    let backend_path_is_policy_bound = !backend_path_plugins.is_empty();
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
     let maybe_requires_response_body_buffering =
         plugin_cache_view.requires_response_body_buffering();
@@ -1427,10 +1493,23 @@ async fn handle_h3_request(
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     tracing::error!("Plugin result could not be converted to rejection parts");
-                    record_request(&state, 500);
-                    send_h3_reject_flavor_aware(
-                        &mut stream,
+                    record_h3_flavor_aware_reject(&state, http_flavor, 500);
+                    run_h3_reject_response_committed_hooks(
+                        &plugins,
+                        &mut ctx,
                         http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await;
+                    send_h3_plugin_reject_flavor_aware(
+                        &mut stream,
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
                         StatusCode::INTERNAL_SERVER_ERROR,
                         b"Internal Server Error",
                         &HashMap::new(),
@@ -1455,7 +1534,7 @@ async fn handle_h3_request(
                     &mut headers,
                     &mut reject_body,
                     matches!(http_flavor, HttpFlavor::Grpc),
-                    true,
+                    false,
                 )
                 .await;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -1468,6 +1547,16 @@ async fn handle_h3_request(
                     &reject_body,
                     &headers,
                 );
+                run_h3_reject_response_committed_hooks(
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    http_status,
+                    &reject_body,
+                    &headers,
+                )
+                .await;
                 // Record the normalized wire status: a gRPC reject is sent as
                 // HTTP 200 + grpc-status, so runtime status metrics must match
                 // the logged/served status (not the plugin's HTTP-style code),
@@ -1482,9 +1571,12 @@ async fn handle_h3_request(
                     plugin_execution_ns,
                 )
                 .await;
-                send_h3_reject_flavor_aware(
+                send_h3_plugin_reject_flavor_aware(
                     &mut stream,
+                    &plugins,
+                    &mut ctx,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     http_status,
                     &reject_body,
                     &headers,
@@ -1495,6 +1587,20 @@ async fn handle_h3_request(
         }
     }
     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+
+    // Recognition and policy selection are intentionally unconditional for a
+    // valid gRPC-Web media type, even when no translator is installed. Backend
+    // transport promotion is different: only the grpc_web plugin stamps the
+    // trusted translated marker after rewriting the request to native gRPC.
+    // Without that marker retain the original Plain wire flavor so existing H3
+    // pass-through deployments are not silently moved onto the H2 gRPC pool.
+    let backend_http_flavor = if grpc_web_response_content_type.is_some()
+        && !crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx)
+    {
+        detected_http_flavor
+    } else {
+        http_flavor
+    };
 
     // Materialize query params before authentication. HTTP/3 historically
     // exposed raw, non-percent-decoded values to plugins; keep that default
@@ -1545,10 +1651,11 @@ async fn handle_h3_request(
         match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await {
             Ok(true) => {}
             Ok(false) => {
-                record_request(&state, 413);
+                record_h3_flavor_aware_reject(&state, http_flavor, 413);
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1571,6 +1678,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     StatusCode::REQUEST_TIMEOUT,
                     r#"{"error":"Request body read timed out"}"#,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -1624,7 +1732,7 @@ async fn handle_h3_request(
             &mut headers,
             &mut reject_body,
             matches!(http_flavor, HttpFlavor::Grpc),
-            true,
+            false,
         )
         .await;
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
@@ -1636,6 +1744,16 @@ async fn handle_h3_request(
             &reject_body,
             &headers,
         );
+        run_h3_reject_response_committed_hooks(
+            &plugins,
+            &mut ctx,
+            http_flavor,
+            grpc_web_response_content_type.as_deref(),
+            http_status,
+            &reject_body,
+            &headers,
+        )
+        .await;
         // Record the normalized wire status: gRPC rejects go out as HTTP 200 +
         // grpc-status, so recording the raw `status_code` (e.g. 401/403) here
         // would make /metrics/runtime disagree with the logged and served
@@ -1651,9 +1769,12 @@ async fn handle_h3_request(
             plugin_execution_ns,
         )
         .await;
-        send_h3_reject_flavor_aware(
+        send_h3_plugin_reject_flavor_aware(
             &mut stream,
+            &plugins,
+            &mut ctx,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             http_status,
             &reject_body,
             &headers,
@@ -1699,10 +1820,11 @@ async fn handle_h3_request(
             {
                 Ok(true) => {}
                 Ok(false) => {
-                    record_request(&state, 413);
+                    record_h3_flavor_aware_reject(&state, http_flavor, 413);
                     send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
+                        grpc_web_response_content_type.as_deref(),
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
                         crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1725,6 +1847,7 @@ async fn handle_h3_request(
                     send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
+                        grpc_web_response_content_type.as_deref(),
                         StatusCode::REQUEST_TIMEOUT,
                         r#"{"error":"Request body read timed out"}"#,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -1740,10 +1863,11 @@ async fn handle_h3_request(
 
         if let Some(body_data) = prebuffered_body_data.as_ref() {
             if body_limit > 0 && body_data.len() > body_limit {
-                record_request(&state, 413);
+                record_h3_flavor_aware_reject(&state, http_flavor, 413);
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1775,10 +1899,23 @@ async fn handle_h3_request(
                 | reject @ PluginResult::RejectBinary { .. } => {
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
-                        record_request(&state, 500);
-                        send_h3_reject_flavor_aware(
-                            &mut stream,
+                        record_h3_flavor_aware_reject(&state, http_flavor, 500);
+                        run_h3_reject_response_committed_hooks(
+                            &plugins,
+                            &mut ctx,
                             http_flavor,
+                            grpc_web_response_content_type.as_deref(),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            b"Internal Server Error",
+                            &HashMap::new(),
+                        )
+                        .await;
+                        send_h3_plugin_reject_flavor_aware(
+                            &mut stream,
+                            &plugins,
+                            &mut ctx,
+                            http_flavor,
+                            grpc_web_response_content_type.as_deref(),
                             StatusCode::INTERNAL_SERVER_ERROR,
                             b"Internal Server Error",
                             &HashMap::new(),
@@ -1801,7 +1938,7 @@ async fn handle_h3_request(
                         &mut headers,
                         &mut reject_body,
                         matches!(http_flavor, HttpFlavor::Grpc),
-                        true,
+                        false,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -1814,6 +1951,16 @@ async fn handle_h3_request(
                         &reject_body,
                         &headers,
                     );
+                    run_h3_reject_response_committed_hooks(
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        http_status,
+                        &reject_body,
+                        &headers,
+                    )
+                    .await;
                     // Record the normalized wire status (gRPC rejects go out as
                     // HTTP 200 + grpc-status); keeps runtime metrics consistent
                     // with the logged/served status across every H3 reject phase.
@@ -1827,9 +1974,12 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                     )
                     .await;
-                    send_h3_reject_flavor_aware(
+                    send_h3_plugin_reject_flavor_aware(
                         &mut stream,
+                        &plugins,
+                        &mut ctx,
                         http_flavor,
+                        grpc_web_response_content_type.as_deref(),
                         http_status,
                         &reject_body,
                         &headers,
@@ -1894,10 +2044,11 @@ async fn handle_h3_request(
         match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await {
             Ok(true) => {}
             Ok(false) => {
-                record_request(&state, 413);
+                record_h3_flavor_aware_reject(&state, http_flavor, 413);
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -1920,6 +2071,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     StatusCode::REQUEST_TIMEOUT,
                     r#"{"error":"Request body read timed out"}"#,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -1953,16 +2105,34 @@ async fn handle_h3_request(
         let phase_start = std::time::Instant::now();
         let mut cloned = ctx.headers.clone();
         for plugin in plugins.iter() {
+            if backend_path_is_policy_bound
+                && plugin.defer_before_proxy_until_backend_path_resolved()
+            {
+                continue;
+            }
             match plugin.before_proxy(&mut ctx, &mut cloned).await {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
-                        record_request(&state, 500);
-                        send_h3_reject_flavor_aware(
-                            &mut stream,
+                        record_h3_flavor_aware_reject(&state, http_flavor, 500);
+                        run_h3_reject_response_committed_hooks(
+                            &plugins,
+                            &mut ctx,
                             http_flavor,
+                            grpc_web_response_content_type.as_deref(),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            b"Internal Server Error",
+                            &HashMap::new(),
+                        )
+                        .await;
+                        send_h3_plugin_reject_flavor_aware(
+                            &mut stream,
+                            &plugins,
+                            &mut ctx,
+                            http_flavor,
+                            grpc_web_response_content_type.as_deref(),
                             StatusCode::INTERNAL_SERVER_ERROR,
                             b"Internal Server Error",
                             &HashMap::new(),
@@ -1985,7 +2155,7 @@ async fn handle_h3_request(
                         &mut headers,
                         &mut reject_body,
                         matches!(http_flavor, HttpFlavor::Grpc),
-                        true,
+                        false,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -1998,6 +2168,16 @@ async fn handle_h3_request(
                         &reject_body,
                         &headers,
                     );
+                    run_h3_reject_response_committed_hooks(
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        http_status,
+                        &reject_body,
+                        &headers,
+                    )
+                    .await;
                     // Record the normalized wire status (gRPC rejects go out as
                     // HTTP 200 + grpc-status); keeps runtime metrics consistent
                     // with the logged/served status across every H3 reject phase.
@@ -2011,9 +2191,12 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                     )
                     .await;
-                    send_h3_reject_flavor_aware(
+                    send_h3_plugin_reject_flavor_aware(
                         &mut stream,
+                        &plugins,
+                        &mut ctx,
                         http_flavor,
+                        grpc_web_response_content_type.as_deref(),
                         http_status,
                         &reject_body,
                         &headers,
@@ -2031,6 +2214,11 @@ async fn handle_h3_request(
         let phase_start = std::time::Instant::now();
         let mut tmp_headers = std::mem::take(&mut ctx.headers);
         for plugin in plugins.iter() {
+            if backend_path_is_policy_bound
+                && plugin.defer_before_proxy_until_backend_path_resolved()
+            {
+                continue;
+            }
             match plugin.before_proxy(&mut ctx, &mut tmp_headers).await {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
@@ -2038,10 +2226,23 @@ async fn handle_h3_request(
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         tracing::error!("Plugin result could not be converted to rejection parts");
                         ctx.headers = tmp_headers;
-                        record_request(&state, 500);
-                        send_h3_reject_flavor_aware(
-                            &mut stream,
+                        record_h3_flavor_aware_reject(&state, http_flavor, 500);
+                        run_h3_reject_response_committed_hooks(
+                            &plugins,
+                            &mut ctx,
                             http_flavor,
+                            grpc_web_response_content_type.as_deref(),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            b"Internal Server Error",
+                            &HashMap::new(),
+                        )
+                        .await;
+                        send_h3_plugin_reject_flavor_aware(
+                            &mut stream,
+                            &plugins,
+                            &mut ctx,
+                            http_flavor,
+                            grpc_web_response_content_type.as_deref(),
                             StatusCode::INTERNAL_SERVER_ERROR,
                             b"Internal Server Error",
                             &HashMap::new(),
@@ -2065,7 +2266,7 @@ async fn handle_h3_request(
                         &mut headers,
                         &mut reject_body,
                         matches!(http_flavor, HttpFlavor::Grpc),
-                        true,
+                        false,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -2078,6 +2279,16 @@ async fn handle_h3_request(
                         &reject_body,
                         &headers,
                     );
+                    run_h3_reject_response_committed_hooks(
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        http_status,
+                        &reject_body,
+                        &headers,
+                    )
+                    .await;
                     // Record the normalized wire status (gRPC rejects go out as
                     // HTTP 200 + grpc-status); keeps runtime metrics consistent
                     // with the logged/served status across every H3 reject phase.
@@ -2091,9 +2302,12 @@ async fn handle_h3_request(
                         plugin_execution_ns,
                     )
                     .await;
-                    send_h3_reject_flavor_aware(
+                    send_h3_plugin_reject_flavor_aware(
                         &mut stream,
+                        &plugins,
+                        &mut ctx,
                         http_flavor,
+                        grpc_web_response_content_type.as_deref(),
                         http_status,
                         &reject_body,
                         &headers,
@@ -2116,10 +2330,6 @@ async fn handle_h3_request(
     // plugins use lowercase). To preserve the zero-alloc hot path, only
     // materialize/scrub when a principal must be injected OR a reserved header is
     // actually present in the effective source.
-    let principal_username = ctx.backend_consumer_username().map(str::to_string);
-    let principal_custom_id = principal_username
-        .as_ref()
-        .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
     let source_has_reserved_identity = owned_proxy_headers
         .as_ref()
         .unwrap_or(&ctx.headers)
@@ -2128,18 +2338,9 @@ async fn handle_h3_request(
             k.eq_ignore_ascii_case("x-consumer-username")
                 || k.eq_ignore_ascii_case("x-consumer-custom-id")
         });
-    if principal_username.is_some() || source_has_reserved_identity {
+    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        headers.retain(|k, _| {
-            !k.eq_ignore_ascii_case("x-consumer-username")
-                && !k.eq_ignore_ascii_case("x-consumer-custom-id")
-        });
-        if let Some(username) = principal_username {
-            headers.insert("X-Consumer-Username".to_string(), username);
-            if let Some(custom_id) = principal_custom_id {
-                headers.insert("X-Consumer-Custom-Id".to_string(), custom_id);
-            }
-        }
+        crate::proxy::refresh_backend_consumer_identity_headers(&ctx, headers);
     }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing
     // ctx.headers while ctx is passed as &mut to proxy functions downstream.
@@ -2211,10 +2412,11 @@ async fn handle_h3_request(
         && let Ok(len) = content_length.parse::<usize>()
         && len > content_length_limit
     {
-        record_request(&state, 413);
+        record_h3_flavor_aware_reject(&state, http_flavor, 413);
         send_h3_error_flavor_aware_with_policy(
             &mut stream,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             StatusCode::PAYLOAD_TOO_LARGE,
             r#"{"error":"Request body exceeds maximum size"}"#,
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -2229,9 +2431,10 @@ async fn handle_h3_request(
     // buffer/stream classification. This path exists only when request-body
     // buffering is already required and PluginCache says a response buffer or
     // stream hook is configured; ordinary H3 requests do no additional work.
-    let reevaluate_response_policy_after_request_body = matches!(http_flavor, HttpFlavor::Plain)
-        && plugin_needs_request_buffering
-        && (maybe_requires_response_body_buffering || stream_hooks_enabled);
+    let reevaluate_response_policy_after_request_body =
+        matches!(backend_http_flavor, HttpFlavor::Plain)
+            && plugin_needs_request_buffering
+            && (maybe_requires_response_body_buffering || stream_hooks_enabled);
     let mut request_body_prepared = false;
     let mut prepared_raw_request_body_bytes: Option<u64> = None;
 
@@ -2245,6 +2448,7 @@ async fn handle_h3_request(
     // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
     // frontend never carries a captured original destination. A Passthrough
     // upstream therefore round-robins here (with the existing warn).
+    let routing_proxy = Arc::clone(&proxy);
     let selection = crate::proxy::backend_dispatch::select_upstream_target(
         &proxy,
         &state,
@@ -2269,8 +2473,10 @@ async fn handle_h3_request(
     // WebSocket dial loop — re-resolves the effective proxy per attempt from
     // the capped but UNRESOLVED base proxy, so a later target does not inherit
     // the first target's port-level TLS/SNI/H1 policy.
-    let selected_base_proxy =
-        crate::proxy::cap_proxy_retry_for_target(proxy, upstream_target.as_deref());
+    let selected_base_proxy = crate::proxy::cap_proxy_retry_for_target(
+        Arc::clone(&routing_proxy),
+        upstream_target.as_deref(),
+    );
     let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
         &selected_base_proxy,
         upstream_target.as_deref(),
@@ -2285,6 +2491,194 @@ async fn handle_h3_request(
     // dispatch-time concern and must not appear baked into the plugin-visible
     // proxy on H3 only.
     ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
+
+    let has_deferred_routing_header_hooks = backend_path_is_policy_bound
+        && capabilities
+            .has(crate::plugin_cache::PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
+    let mut deferred_result = PluginResult::Continue;
+    let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
+
+    loop {
+        if backend_path_is_policy_bound {
+            let backend_path = crate::proxy::build_backend_effective_path(
+                &proxy,
+                &path,
+                strip_len,
+                upstream_target
+                    .as_ref()
+                    .and_then(|target| target.path.as_deref()),
+            );
+            let phase = if run_deferred_routing_headers {
+                BackendPathPolicyPhase::Preview
+            } else {
+                BackendPathPolicyPhase::Enforce
+            };
+            if !run_h3_backend_path_plugins_or_send_reject(
+                backend_path_plugins,
+                &plugins,
+                &mut ctx,
+                &backend_path,
+                &original_request_path,
+                http_flavor,
+                &mut stream,
+                &state,
+                start_time,
+                &mut plugin_execution_ns,
+                grpc_web_response_content_type.as_deref(),
+                phase,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            if phase == BackendPathPolicyPhase::Enforce {
+                ctx.bind_authorized_backend_path(backend_path);
+            }
+        }
+
+        if !run_deferred_routing_headers {
+            break;
+        }
+        run_deferred_routing_headers = false;
+
+        // Deferral changes authorization order, not the client-path view that
+        // before_proxy hooks received before a mesh backend rewrite.
+        let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
+        let phase_start = std::time::Instant::now();
+        deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+            &plugins,
+            &mut ctx,
+            &mut proxy_headers,
+            true,
+            crate::proxy::BackendPathBeforeProxyPass::RoutingHeaderDeferred,
+        )
+        .await;
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        ctx.path = backend_ctx_path;
+        if matches!(deferred_result, PluginResult::Continue) {
+            // Re-establish gateway-authenticated identity and egress baggage
+            // policy before a deferred function's headers reach a backend.
+            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+                &mut proxy_headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
+        }
+        // Always make one more pass after the routing-header hook, including
+        // when it rejects, so final enforcement charges the pinned method
+        // exactly once before any external-hook rejection is returned.
+    }
+
+    if backend_path_is_policy_bound {
+        if matches!(deferred_result, PluginResult::Continue) {
+            // Deferred hooks retain the original client path; request_mirror
+            // separately consumes the private path that passed final policy.
+            let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
+            let phase_start = std::time::Instant::now();
+            deferred_result = crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+                &plugins,
+                &mut ctx,
+                &mut proxy_headers,
+                true,
+                crate::proxy::BackendPathBeforeProxyPass::RemainingDeferred,
+            )
+            .await;
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+            ctx.path = backend_ctx_path;
+        }
+        if matches!(deferred_result, PluginResult::Continue) {
+            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+                &mut proxy_headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
+        }
+        match deferred_result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                    record_h3_flavor_aware_reject(&state, http_flavor, 500);
+                    run_h3_reject_response_committed_hooks(
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await;
+                    send_h3_plugin_reject_flavor_aware(
+                        &mut stream,
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let mut headers = reject.headers;
+                let mut reject_status = reject.status_code;
+                let mut reject_body = reject.body;
+                apply_reject_after_proxy_and_synthetic_body_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut reject_status,
+                    &mut headers,
+                    &mut reject_body,
+                    matches!(http_flavor, HttpFlavor::Grpc),
+                    false,
+                )
+                .await;
+                let http_status = StatusCode::from_u16(reject_status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    http_status,
+                    &reject_body,
+                    &headers,
+                );
+                run_h3_reject_response_committed_hooks(
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    http_status,
+                    &reject_body,
+                    &headers,
+                )
+                .await;
+                record_request(&state, log_status_code);
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    "before_proxy",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                send_h3_plugin_reject_flavor_aware(
+                    &mut stream,
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    http_status,
+                    &reject_body,
+                    &headers,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
 
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
@@ -2325,26 +2719,16 @@ async fn handle_h3_request(
                     &reject_body,
                     &rej_headers,
                 );
-                if capabilities
-                    .has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
-                {
-                    let normalized = crate::proxy::normalize_reject_response(
-                        reject_status,
-                        &reject_body,
-                        &rej_headers,
-                        matches!(http_flavor, HttpFlavor::Grpc),
-                    );
-                    for plugin in plugins.iter() {
-                        plugin
-                            .on_response_committed(
-                                &mut ctx,
-                                normalized.http_status.as_u16(),
-                                &normalized.headers,
-                                &normalized.body,
-                            )
-                            .await;
-                    }
-                }
+                run_h3_reject_response_committed_hooks(
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    reject_status,
+                    &reject_body,
+                    &rej_headers,
+                )
+                .await;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 record_request(&state, log_status_code);
                 log_rejected_request(
@@ -2356,9 +2740,12 @@ async fn handle_h3_request(
                     plugin_execution_ns,
                 )
                 .await;
-                send_h3_reject_flavor_aware(
+                send_h3_plugin_reject_flavor_aware(
                     &mut stream,
+                    &plugins,
+                    &mut ctx,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     reject_status,
                     &reject_body,
                     &rej_headers,
@@ -2403,6 +2790,7 @@ async fn handle_h3_request(
                 &proxy,
                 upstream_target.as_deref(),
                 http_flavor,
+                grpc_web_response_content_type.as_deref(),
                 &mut stream,
                 &state,
                 start_time,
@@ -2455,6 +2843,7 @@ async fn handle_h3_request(
                     send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
+                        grpc_web_response_content_type.as_deref(),
                         StatusCode::PAYLOAD_TOO_LARGE,
                         r#"{"error":"Request body exceeds maximum size"}"#,
                         crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -2494,6 +2883,7 @@ async fn handle_h3_request(
                     send_h3_error_flavor_aware_with_policy(
                         &mut stream,
                         http_flavor,
+                        grpc_web_response_content_type.as_deref(),
                         StatusCode::REQUEST_TIMEOUT,
                         r#"{"error":"Request body read timed out"}"#,
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -2541,10 +2931,23 @@ async fn handle_h3_request(
                     cb_is_half_open_probe,
                 );
                 let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
-                    record_request(&state, 500);
-                    send_h3_reject_flavor_aware(
-                        &mut stream,
+                    record_h3_flavor_aware_reject(&state, http_flavor, 500);
+                    run_h3_reject_response_committed_hooks(
+                        &plugins,
+                        &mut ctx,
                         http_flavor,
+                        grpc_web_response_content_type.as_deref(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await;
+                    send_h3_plugin_reject_flavor_aware(
+                        &mut stream,
+                        &plugins,
+                        &mut ctx,
+                        http_flavor,
+                        grpc_web_response_content_type.as_deref(),
                         StatusCode::INTERNAL_SERVER_ERROR,
                         b"Internal Server Error",
                         &HashMap::new(),
@@ -2570,6 +2973,16 @@ async fn handle_h3_request(
                     &reject.body,
                     &headers,
                 );
+                run_h3_reject_response_committed_hooks(
+                    &plugins,
+                    &mut ctx,
+                    http_flavor,
+                    grpc_web_response_content_type.as_deref(),
+                    http_status,
+                    &reject.body,
+                    &headers,
+                )
+                .await;
                 record_request(&state, log_status_code);
                 log_rejected_request_with_path(
                     &plugins,
@@ -2581,9 +2994,12 @@ async fn handle_h3_request(
                     Some(&original_request_path),
                 )
                 .await;
-                send_h3_reject_flavor_aware(
+                send_h3_plugin_reject_flavor_aware(
                     &mut stream,
+                    &plugins,
+                    &mut ctx,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     http_status,
                     &reject.body,
                     &headers,
@@ -2597,7 +3013,7 @@ async fn handle_h3_request(
     // Determine streaming vs buffered mode from the finalized request context.
     // This remains after selected-target retry capping and now also after the
     // fail-fast breaker admission above.
-    let has_retry = match http_flavor {
+    let has_retry = match backend_http_flavor {
         HttpFlavor::Plain => {
             crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
         }
@@ -2620,12 +3036,13 @@ async fn handle_h3_request(
         crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let retry_response_needs_header_refinement =
         has_retry && crate::proxy::plugins_may_release_response_body_under_retries(&plugins, &ctx);
-    let use_native_h3_pool =
-        http_flavor == HttpFlavor::Plain && !forces_reqwest_dispatch && backend_supports_native_h3;
+    let use_native_h3_pool = backend_http_flavor == HttpFlavor::Plain
+        && !forces_reqwest_dispatch
+        && backend_supports_native_h3;
 
     let backend_url = build_h3_backend_url_for_flavor(
         &proxy,
-        http_flavor,
+        backend_http_flavor,
         &path,
         effective_query_string.as_ref(),
         strip_len,
@@ -2679,6 +3096,7 @@ async fn handle_h3_request(
         send_h3_error_flavor_aware_with_policy(
             &mut stream,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             StatusCode::BAD_GATEWAY,
             r#"{"error":"backend address blocked by egress policy"}"#,
             crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
@@ -2716,7 +3134,7 @@ async fn handle_h3_request(
     // ONLY path that can reach an H3-only gRPC backend (the H2 gRPC pool speaks
     // h2/h2c, never QUIC); every other gRPC case still falls through the
     // cross-protocol bridge to the H2 gRPC pool — see `dispatch_grpc_native_h3`.
-    let use_native_h3_grpc = http_flavor == HttpFlavor::Grpc
+    let use_native_h3_grpc = backend_http_flavor == HttpFlavor::Grpc
         && can_stream_request_body
         && !forces_reqwest_dispatch
         && backend_supports_native_h3;
@@ -2770,9 +3188,22 @@ async fn handle_h3_request(
             &mut reason_headers,
             initial_response_header_policy_plugins.as_ref(),
         );
-        send_h3_finalized_reject_flavor_aware(
-            &mut stream,
+        run_h3_reject_response_committed_hooks(
+            &plugins,
+            &mut ctx,
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
+            StatusCode::BAD_GATEWAY,
+            br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+            &reason_headers,
+        )
+        .await;
+        send_h3_plugin_reject_flavor_aware(
+            &mut stream,
+            &plugins,
+            &mut ctx,
+            http_flavor,
+            grpc_web_response_content_type.as_deref(),
             StatusCode::BAD_GATEWAY,
             br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
             &reason_headers,
@@ -2884,6 +3315,7 @@ async fn handle_h3_request(
             requires_ws_frame_hooks,
             is_early_data,
             strip_len,
+            backend_path_is_policy_bound,
             original_request_path.clone(),
         )
         .await;
@@ -2934,7 +3366,9 @@ async fn handle_h3_request(
         // `cross_protocol::run` still handles every other gRPC case. Hands the
         // OWNED QUIC stream to the bridge so it can `.split()` into independent
         // send/recv halves for concurrent request-upload + response-stream.
-        let outcome = if matches!(http_flavor, HttpFlavor::Grpc) && can_stream_request_body {
+        let stream_grpc_request =
+            matches!(backend_http_flavor, HttpFlavor::Grpc) && can_stream_request_body;
+        let outcome = if stream_grpc_request {
             let client_ip_owned = ctx.client_ip.clone();
             crate::http3::cross_protocol::dispatch_grpc_streaming(
                 &state,
@@ -3008,6 +3442,7 @@ async fn handle_h3_request(
                             send_h3_error_flavor_aware_with_policy(
                                 &mut stream,
                                 http_flavor,
+                                grpc_web_response_content_type.as_deref(),
                                 StatusCode::PAYLOAD_TOO_LARGE,
                                 r#"{"error":"Request body exceeds maximum size"}"#,
                                 crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -3062,6 +3497,7 @@ async fn handle_h3_request(
                             send_h3_error_flavor_aware_with_policy(
                                 &mut stream,
                                 http_flavor,
+                                grpc_web_response_content_type.as_deref(),
                                 StatusCode::REQUEST_TIMEOUT,
                                 r#"{"error":"Request body read timed out"}"#,
                                 crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -3103,12 +3539,14 @@ async fn handle_h3_request(
                 path: &path,
                 query_string: effective_query_string.as_ref(),
                 backend_url: &backend_url,
+                strip_len,
+                backend_path_is_policy_bound,
                 lb_hash_key: lb_hash_key.as_deref(),
                 upstream_target: upstream_target.as_deref(),
                 upstream_balancer: upstream_balancer.as_ref(),
                 cb_target_key: cb_target_key.as_deref(),
                 cb_is_half_open_probe,
-                flavor: http_flavor,
+                flavor: backend_http_flavor,
                 prebuffered_body: prebuffered,
                 request_body_prepared,
                 raw_prebuffered_body_bytes: prepared_raw_request_body_bytes,
@@ -3216,6 +3654,7 @@ async fn handle_h3_request(
             &proxy,
             upstream_target.as_deref(),
             http_flavor,
+            grpc_web_response_content_type.as_deref(),
             &mut stream,
             &state,
             start_time,
@@ -4168,6 +4607,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
                     crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -4204,6 +4644,7 @@ async fn handle_h3_request(
                 send_h3_error_flavor_aware_with_policy(
                     &mut stream,
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     StatusCode::REQUEST_TIMEOUT,
                     r#"{"error":"Request body read timed out"}"#,
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -4332,6 +4773,16 @@ async fn handle_h3_request(
                 &reject.body,
                 &headers,
             );
+            run_h3_reject_response_committed_hooks(
+                &plugins,
+                &mut ctx,
+                http_flavor,
+                grpc_web_response_content_type.as_deref(),
+                http_status,
+                &reject.body,
+                &headers,
+            )
+            .await;
             record_request(&state, log_status_code);
             log_rejected_request(
                 &plugins,
@@ -4342,9 +4793,12 @@ async fn handle_h3_request(
                 plugin_execution_ns,
             )
             .await;
-            send_h3_reject_flavor_aware(
+            send_h3_plugin_reject_flavor_aware(
                 &mut stream,
+                &plugins,
+                &mut ctx,
                 http_flavor,
+                grpc_web_response_content_type.as_deref(),
                 http_status,
                 &reject.body,
                 &headers,
@@ -4366,6 +4820,7 @@ async fn handle_h3_request(
                 &proxy,
                 upstream_target.as_deref(),
                 http_flavor,
+                grpc_web_response_content_type.as_deref(),
                 &mut stream,
                 &state,
                 start_time,
@@ -4750,6 +5205,41 @@ async fn handle_h3_request(
                 },
                 attempt,
             ) {
+                // Resolve and validate the retry target before charging this
+                // failure as an intermediate attempt or entering backoff. An
+                // incompatible path terminates here, leaving the ordinary
+                // final-outcome path to record the failed attempt exactly once.
+                let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
+                    (&proxy.upstream_id, &current_target)
+                    && let Some(ref hash_key) = lb_hash_key
+                    && let Some(next) = crate::proxy::backend_dispatch::select_next_retry_target(
+                        &state,
+                        &epoch,
+                        &proxy,
+                        prev_target,
+                        hash_key,
+                        &ctx.client_ip,
+                        &proxy_headers,
+                    ) {
+                    if !crate::proxy::retry_target_preserves_backend_path(
+                        backend_path_is_policy_bound,
+                        &proxy,
+                        &path,
+                        strip_len,
+                        prev_target,
+                        &next,
+                    ) {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            "Aborting H3 retry because the candidate would change the authorized backend method path"
+                        );
+                        break;
+                    }
+                    Some(next)
+                } else {
+                    None
+                };
+
                 record_h3_backend_admission_outcome(
                     &mut backend_admission_permits,
                     result.status,
@@ -4779,20 +5269,7 @@ async fn handle_h3_request(
                 tokio::time::sleep(delay).await;
                 attempt += 1;
 
-                // Try a different target on retry if load balancing is configured
-                if let (Some(_upstream_id), Some(prev_target)) =
-                    (&proxy.upstream_id, &current_target)
-                    && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = crate::proxy::backend_dispatch::select_next_retry_target(
-                        &state,
-                        &epoch,
-                        &proxy,
-                        prev_target,
-                        hash_key,
-                        &ctx.client_ip,
-                        &proxy_headers,
-                    )
-                {
+                if let Some(next) = next_retry_target {
                     current_url = crate::proxy::build_backend_url_with_target(
                         &proxy,
                         &path,
@@ -4849,6 +5326,7 @@ async fn handle_h3_request(
                     &proxy,
                     current_target.as_deref(),
                     http_flavor,
+                    grpc_web_response_content_type.as_deref(),
                     &mut stream,
                     &state,
                     start_time,
@@ -5297,6 +5775,121 @@ fn h3_plugin_protocol_for_flavor(flavor: HttpFlavor) -> ProxyProtocol {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn run_h3_backend_path_plugins_or_send_reject(
+    backend_path_plugins: &[Arc<dyn Plugin>],
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    backend_path: &str,
+    original_request_path: &str,
+    flavor: HttpFlavor,
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    state: &ProxyState,
+    start_time: std::time::Instant,
+    plugin_execution_ns: &mut u64,
+    grpc_web_response_content_type: Option<&str>,
+    phase: BackendPathPolicyPhase,
+) -> Result<bool, anyhow::Error> {
+    let phase_start = std::time::Instant::now();
+    for plugin in backend_path_plugins {
+        match plugin
+            .on_backend_path_resolved(ctx, backend_path, phase)
+            .await
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                    error!(
+                        plugin = plugin.name(),
+                        "H3 backend-path plugin rejection could not be normalized"
+                    );
+                    record_request(state, 500);
+                    run_h3_reject_response_committed_hooks(
+                        plugins,
+                        ctx,
+                        flavor,
+                        grpc_web_response_content_type,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await;
+                    send_h3_plugin_reject_flavor_aware(
+                        stream,
+                        plugins,
+                        ctx,
+                        flavor,
+                        grpc_web_response_content_type,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await?;
+                    return Ok(false);
+                };
+                let mut headers = reject.headers;
+                let mut reject_status = reject.status_code;
+                let mut reject_body = reject.body;
+                apply_reject_after_proxy_and_synthetic_body_hooks(
+                    plugins,
+                    ctx,
+                    &mut reject_status,
+                    &mut headers,
+                    &mut reject_body,
+                    matches!(flavor, HttpFlavor::Grpc),
+                    false,
+                )
+                .await;
+                *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                let http_status = StatusCode::from_u16(reject_status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    ctx,
+                    flavor,
+                    http_status,
+                    &reject_body,
+                    &headers,
+                );
+                run_h3_reject_response_committed_hooks(
+                    plugins,
+                    ctx,
+                    flavor,
+                    grpc_web_response_content_type,
+                    http_status,
+                    &reject_body,
+                    &headers,
+                )
+                .await;
+                record_request(state, log_status_code);
+                log_rejected_request_with_path(
+                    plugins,
+                    ctx,
+                    log_status_code,
+                    start_time,
+                    "on_backend_path_resolved",
+                    *plugin_execution_ns,
+                    Some(original_request_path),
+                )
+                .await;
+                send_h3_plugin_reject_flavor_aware(
+                    stream,
+                    plugins,
+                    ctx,
+                    flavor,
+                    grpc_web_response_content_type,
+                    http_status,
+                    &reject_body,
+                    &headers,
+                )
+                .await?;
+                return Ok(false);
+            }
+        }
+    }
+    *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_h3_backend_admission_or_send_reject(
     backend_admission_plugins: &[Arc<dyn Plugin>],
     plugins: &[Arc<dyn Plugin>],
@@ -5304,6 +5897,7 @@ async fn run_h3_backend_admission_or_send_reject(
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: &ProxyState,
     start_time: std::time::Instant,
@@ -5350,27 +5944,16 @@ async fn run_h3_backend_admission_or_send_reject(
                 &rejection.body,
                 &headers,
             );
-            if plugins
-                .iter()
-                .any(|plugin| plugin.requires_response_committed_hook())
-            {
-                let normalized = crate::proxy::normalize_reject_response(
-                    http_status,
-                    &rejection.body,
-                    &headers,
-                    matches!(flavor, HttpFlavor::Grpc),
-                );
-                for plugin in plugins {
-                    plugin
-                        .on_response_committed(
-                            ctx,
-                            normalized.http_status.as_u16(),
-                            &normalized.headers,
-                            &normalized.body,
-                        )
-                        .await;
-                }
-            }
+            run_h3_reject_response_committed_hooks(
+                plugins,
+                ctx,
+                flavor,
+                grpc_web_response_content_type,
+                http_status,
+                &rejection.body,
+                &headers,
+            )
+            .await;
             record_request(state, log_status_code);
             log_rejected_request(
                 plugins,
@@ -5381,8 +5964,17 @@ async fn run_h3_backend_admission_or_send_reject(
                 plugin_execution_ns,
             )
             .await;
-            send_h3_reject_flavor_aware(stream, flavor, http_status, &rejection.body, &headers)
-                .await?;
+            send_h3_plugin_reject_flavor_aware(
+                stream,
+                plugins,
+                ctx,
+                flavor,
+                grpc_web_response_content_type,
+                http_status,
+                &rejection.body,
+                &headers,
+            )
+            .await?;
             Ok(Err(()))
         }
     }
@@ -6657,6 +7249,7 @@ async fn dispatch_grpc_native_h3(
         proxy,
         upstream_target,
         HttpFlavor::Grpc,
+        None,
         stream,
         state,
         start_time,
@@ -8716,6 +9309,110 @@ async fn send_h3_finalized_reject_response(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn send_h3_grpc_web_reject(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    _plugins: &[Arc<dyn Plugin>],
+    _ctx: &mut RequestContext,
+    response_content_type: &str,
+    http_status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Result<(), anyhow::Error> {
+    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
+    let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+        response_content_type,
+        grpc_status,
+        grpc_message.as_ref(),
+    );
+    crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, &[], Some(headers));
+    send_h3_finalized_reject_response(
+        stream,
+        StatusCode::OK,
+        &translated.body,
+        &translated.headers,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_h3_reject_response_committed_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
+    http_status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) {
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.requires_response_committed_hook())
+    {
+        return;
+    }
+
+    if let Some(content_type) = grpc_web_response_content_type {
+        let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
+        let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_status,
+            grpc_message.as_ref(),
+        );
+        crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, &[], Some(headers));
+        for plugin in plugins {
+            plugin
+                .on_response_committed(ctx, 200, &translated.headers, &translated.body)
+                .await;
+        }
+        return;
+    }
+
+    let normalized = crate::proxy::normalize_reject_response(
+        http_status,
+        body,
+        headers,
+        matches!(flavor, HttpFlavor::Grpc),
+    );
+    for plugin in plugins {
+        plugin
+            .on_response_committed(
+                ctx,
+                normalized.http_status.as_u16(),
+                &normalized.headers,
+                &normalized.body,
+            )
+            .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_h3_plugin_reject_flavor_aware(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
+    http_status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Result<(), anyhow::Error> {
+    if let Some(content_type) = grpc_web_response_content_type {
+        return send_h3_grpc_web_reject(
+            stream,
+            plugins,
+            ctx,
+            content_type,
+            http_status,
+            body,
+            headers,
+        )
+        .await;
+    }
+
+    send_h3_reject_flavor_aware(stream, flavor, http_status, body, headers).await
+}
+
 /// Send a trailers-only gRPC error response over H3. The response is
 /// HTTP 200 with `grpc-status` and `grpc-message` in the header block and
 /// an empty body. Used when a gRPC request is rejected before dispatch so
@@ -8811,6 +9508,7 @@ async fn finish_h3_grpc_stream_trailers_only(
 async fn send_h3_error_flavor_aware(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
     http_status: StatusCode,
     http_body: &str,
     grpc_status: u32,
@@ -8819,6 +9517,7 @@ async fn send_h3_error_flavor_aware(
     send_h3_error_flavor_aware_with_policy(
         stream,
         flavor,
+        grpc_web_response_content_type,
         http_status,
         http_body,
         grpc_status,
@@ -8828,16 +9527,36 @@ async fn send_h3_error_flavor_aware(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_h3_error_flavor_aware_with_policy(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
     http_status: StatusCode,
     http_body: &str,
     grpc_status: u32,
     grpc_message: &str,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Result<(), anyhow::Error> {
-    if matches!(flavor, HttpFlavor::Grpc) {
+    if let Some(content_type) = grpc_web_response_content_type {
+        let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_status,
+            grpc_message,
+        );
+        crate::proxy::finalize_grpc_web_error_response_headers(
+            &mut translated,
+            initial_response_header_policy_plugins,
+            None,
+        );
+        send_h3_finalized_reject_response(
+            stream,
+            StatusCode::OK,
+            &translated.body,
+            &translated.headers,
+        )
+        .await
+    } else if matches!(flavor, HttpFlavor::Grpc) {
         send_h3_grpc_error(
             stream,
             grpc_status,
@@ -9124,6 +9843,21 @@ fn record_request(state: &ProxyState, status: u16) {
     crate::runtime_metrics::global_ref().record_http_status(status);
 }
 
+/// Record the HTTP status actually emitted by a flavor-aware H3 rejection.
+/// Native gRPC and gRPC-Web errors carry their status in trailers (or a
+/// gRPC-Web trailer frame) and therefore use HTTP 200 on the wire.
+#[inline]
+fn record_h3_flavor_aware_reject(state: &ProxyState, flavor: HttpFlavor, http_status: u16) {
+    record_request(
+        state,
+        if matches!(flavor, HttpFlavor::Grpc) {
+            StatusCode::OK.as_u16()
+        } else {
+            http_status
+        },
+    );
+}
+
 #[cfg(test)]
 mod h3_request_body_timeout_tests {
     #[tokio::test]
@@ -9195,9 +9929,9 @@ mod native_h3_retry_refinement_tests {
             .expect("end of handle_h3_request not found");
         let handler = &handler_tail[..handler_end];
         assert!(handler.contains("(!has_retry || retry_response_needs_header_refinement)"));
-        assert!(handler.contains(
-            "http_flavor == HttpFlavor::Plain && !forces_reqwest_dispatch && backend_supports_native_h3"
-        ));
+        assert!(handler.contains("backend_http_flavor == HttpFlavor::Plain"));
+        assert!(handler.contains("&& !forces_reqwest_dispatch"));
+        assert!(handler.contains("&& backend_supports_native_h3;"));
         assert!(handler.contains("let refined_body_data = if has_retry"));
         assert!(handler.contains("body_data.clone()"));
 

@@ -690,6 +690,103 @@ fn access_control_schema_matches_runtime_validation() {
 }
 
 #[test]
+fn grpc_method_router_schema_matches_runtime_validation() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/GrpcMethodRouterConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("GrpcMethodRouterConfig schema compiles");
+
+    for config in [
+        json!({"allow_methods": []}),
+        json!({"deny_methods": ["pkg.Service/Denied"]}),
+        json!({"deny_methods": [" /pkg.Service/Denied "]}),
+        json!({
+            "method_rate_limits": {
+                "/pkg.Service/Call": {"max_requests": 1, "window_seconds": 60}
+            }
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379/0",
+            "redis_key_prefix": "ferrum:grpc",
+            "redis_pool_size": 1,
+            "redis_connect_timeout_seconds": 1,
+            "redis_health_check_interval_seconds": 1
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "config should be valid: {config}"
+        );
+    }
+
+    for config in [
+        json!({}),
+        json!({"deny_methods": []}),
+        json!({"method_rate_limits": {}}),
+        json!({"deny_methods": ["not-a-grpc-method"]}),
+        json!({"deny_methods": ["pkg.Service/Method", "pkg.Service/Method"]}),
+        json!({
+            "method_rate_limits": {
+                "pkg.Service/Call/Extra": {"max_requests": 1, "window_seconds": 60}
+            }
+        }),
+        json!({
+            "method_rate_limits": {
+                "pkg.Service/Call": {"max_requests": 0, "window_seconds": 60}
+            }
+        }),
+        json!({"deny_methods": ["pkg.Service/Denied"], "sync_mode": "redis"}),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": ""
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "http://localhost:6379"
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_key_prefix": ""
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_pool_size": 0
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_connect_timeout_seconds": 0
+        }),
+        json!({
+            "deny_methods": ["pkg.Service/Denied"],
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379",
+            "redis_health_check_interval_seconds": 0
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "config should be invalid: {config}"
+        );
+    }
+}
+
+#[test]
 fn key_auth_location_schema_matches_runtime_whitespace_contract() {
     use ferrum_edge::plugins::key_auth::KeyAuth;
 
@@ -875,6 +972,29 @@ fn ldap_auth_schema_matches_runtime_invariants() {
     ] {
         assert_component_validity(&spec, "LdapAuthConfig", &config, false);
     }
+}
+
+#[test]
+fn ldap_dial_policy_documentation_matches_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/LdapAuthConfig")
+        .expect("LdapAuthConfig exists");
+    let schema_description = schema["description"]
+        .as_str()
+        .expect("LdapAuthConfig description");
+    let url_description = schema["properties"]["ldap_url"]["description"]
+        .as_str()
+        .expect("ldap_url description");
+    assert!(schema_description.contains("uncached A+AAAA lookup"));
+    assert!(schema_description.contains("TLS/SNI verification"));
+    assert!(url_description.contains("policy-screens all A/AAAA candidates"));
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("**Dial-time DNS and egress policy:**"));
+    assert!(guide.contains("screened again immediately before its TCP dial"));
+    assert!(guide.contains("service-account and end-user connections"));
 }
 
 #[test]
@@ -1165,6 +1285,7 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     );
 
     for (plugin_name, config) in [
+        ("bot_detection", json!({})),
         ("udp_rate_limiting", json!({"datagrams_per_second": 100})),
         (
             "fault_injection",
@@ -1192,6 +1313,9 @@ fn plugin_config_schema_applies_plugin_specific_config() {
     }
 
     for (plugin_name, config) in [
+        ("bot_detection", None),
+        ("bot_detection", Some(serde_json::Value::Null)),
+        ("bot_detection", Some(json!([]))),
         ("udp_rate_limiting", None),
         ("udp_rate_limiting", Some(json!({}))),
         ("fault_injection", None),
@@ -1311,6 +1435,13 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
             }),
         ),
         (
+            "fault_injection",
+            json!({
+                "abort": {"status_code": 503, "percentage": 1.0},
+                "runtime_overlay_scope": "checkout"
+            }),
+        ),
+        (
             "serverless_function",
             json!({
                 "provider": "aws_lambda",
@@ -1427,6 +1558,62 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
             false,
         );
     }
+
+    for invalid_scope in [json!(""), json!(" \t "), json!(42), json!(true)] {
+        assert_component_validity(
+            &spec,
+            "FaultInjectionConfig",
+            &json!({
+                "abort": {"status_code": 503, "percentage": 1.0},
+                "runtime_overlay_scope": invalid_scope
+            }),
+            false,
+        );
+    }
+    assert_component_validity(
+        &spec,
+        "FaultInjectionConfig",
+        &json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "runtime_overlay_scope": null
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "FaultInjectionConfig",
+        &json!({"delay": {"duration_ms": 60_000, "percentage": f64::from_bits(1)}}),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "FaultInjectionConfig",
+        &json!({"delay": {"duration_ms": 60_001, "percentage": 1.0}}),
+        false,
+    );
+    for valid in [
+        json!({
+            "abort": null,
+            "delay": {"duration_ms": 1, "percentage": 1.0}
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "delay": null
+        }),
+        json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "delay": {"duration_ms": 1, "percentage": 1.0}
+        }),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &valid, true);
+    }
+    for invalid in [
+        json!({"abort": null}),
+        json!({"delay": null}),
+        json!({"abort": null, "delay": null}),
+    ] {
+        assert_component_validity(&spec, "FaultInjectionConfig", &invalid, false);
+    }
 }
 
 fn assert_component_validity(
@@ -1448,6 +1635,193 @@ fn assert_component_validity(
         actual_valid, expected_valid,
         "unexpected {component} validation result for {instance}"
     );
+}
+
+#[tokio::test]
+async fn loki_logging_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::loki_logging::{
+        LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES, LOKI_LOGGING_CONFIG_KEYS,
+        LOKI_MAX_BUFFER_MAX_BYTES, LOKI_MAX_CUSTOM_HEADER_NAME_BYTES, LOKI_MAX_MAX_ENTRY_BYTES,
+        LOKI_MAX_RETRIES, LOKI_MAX_RETRY_DELAY_MS, LokiLogging,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/LokiLoggingConfig")
+        .expect("LokiLoggingConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["labels"]["additionalProperties"]["type"],
+        "string"
+    );
+    assert!(schema["properties"]["custom_headers"]["additionalProperties"].is_object());
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("Loki properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = LOKI_LOGGING_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "Loki runtime/OpenAPI key drift");
+    assert_eq!(
+        schema["properties"]["max_entry_bytes"]["default"],
+        json!(LOKI_DEFAULT_MAX_ENTRY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["max_entry_bytes"]["maximum"],
+        json!(LOKI_MAX_MAX_ENTRY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["buffer_max_bytes"]["default"],
+        json!(LOKI_DEFAULT_BUFFER_MAX_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["buffer_max_bytes"]["maximum"],
+        json!(LOKI_MAX_BUFFER_MAX_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["max_retries"]["maximum"],
+        json!(LOKI_MAX_RETRIES)
+    );
+    assert_eq!(
+        schema["properties"]["retry_delay_ms"]["maximum"],
+        json!(LOKI_MAX_RETRY_DELAY_MS)
+    );
+    assert_eq!(
+        schema["properties"]["custom_headers"]["propertyNames"]["maxLength"],
+        json!(LOKI_MAX_CUSTOM_HEADER_NAME_BYTES)
+    );
+
+    let valid = json!({
+        "endpoint_url": "HTTPS://logs.example.com/loki/api/v1/push?tenant=dynamic",
+        "authorization_header": "Bearer test",
+        "custom_headers": {"X-Scope-OrgID": "tenant-a", "X-Dynamic": "value"},
+        "labels": {"service": "edge", "tenant_name": "tenant-a"},
+        "include_proxy_id_label": false,
+        "include_status_class_label": true,
+        "gzip": false,
+        "batch_size": 10000,
+        "flush_interval_ms": 100,
+        "buffer_capacity": 1000000,
+        "max_entry_bytes": LOKI_MAX_MAX_ENTRY_BYTES,
+        "buffer_max_bytes": LOKI_MAX_BUFFER_MAX_BYTES,
+        "max_retries": LOKI_MAX_RETRIES,
+        "retry_delay_ms": LOKI_MAX_RETRY_DELAY_MS,
+        "schema": {}
+    });
+    assert_component_validity(&spec, "LokiLoggingConfig", &valid, true);
+    assert!(LokiLogging::new(&valid, PluginHttpClient::default()).is_ok());
+    let valid_minima = json!({
+        "endpoint_url": "http://127.0.0.1:3100/loki/api/v1/push",
+        "labels": {"_a": ""},
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "buffer_capacity": 1,
+        "max_entry_bytes": 2048,
+        "buffer_max_bytes": 2048,
+        "max_retries": 0,
+        "retry_delay_ms": 1
+    });
+    assert_component_validity(&spec, "LokiLoggingConfig", &valid_minima, true);
+    assert!(LokiLogging::new(&valid_minima, PluginHttpClient::default()).is_ok());
+
+    let mut invalid = vec![
+        json!({"endpoint_url": "https://logs.example.com/push", "endpont_url": "typo"}),
+        json!({"endpoint_url": "https://user:secret@logs.example.com/push"}),
+        json!({"endpoint_url": "https://logs.example.com/push", "labels": {"__tenant": "x"}}),
+        json!({"endpoint_url": "https://logs.example.com/push", "labels": {"ferrum_emitter": "x"}}),
+        json!({"endpoint_url": "https://logs.example.com/push", "labels": {"tenant": "x".repeat(2049)}}),
+        json!({"endpoint_url": "https://logs.example.com/push", "authorization_header": "   "}),
+        json!({"endpoint_url": "https://logs.example.com/push", "authorization_header": " Bearer test"}),
+        json!({"endpoint_url": "https://logs.example.com/push", "authorization_header": "Bearer test\t"}),
+        json!({"endpoint_url": "https://logs.example.com/push", "custom_headers": {"Bad Header": "x"}}),
+        json!({"endpoint_url": "https://logs.example.com/push", "custom_headers": {"X-Bad": "bad\nvalue"}}),
+        json!({"endpoint_url": "https://logs.example.com/push", "batch_size": 10001}),
+        json!({"endpoint_url": "https://logs.example.com/push", "flush_interval_ms": 99}),
+        json!({"endpoint_url": "https://logs.example.com/push", "buffer_capacity": 1000001}),
+        json!({"endpoint_url": "https://logs.example.com/push", "max_retries": 11}),
+        json!({"endpoint_url": "https://logs.example.com/push", "retry_delay_ms": 0}),
+        json!({"endpoint_url": "https://logs.example.com/push", "max_entry_bytes": 1023}),
+        json!({"endpoint_url": "https://logs.example.com/push", "buffer_max_bytes": 268435457}),
+    ];
+    let oversized_header_name = "x".repeat(LOKI_MAX_CUSTOM_HEADER_NAME_BYTES + 1);
+    let mut oversized_headers = serde_json::Map::new();
+    oversized_headers.insert(oversized_header_name, json!("value"));
+    invalid.push(json!({
+        "endpoint_url": "https://logs.example.com/push",
+        "custom_headers": oversized_headers
+    }));
+    for key in LOKI_LOGGING_CONFIG_KEYS {
+        let mut config = json!({"endpoint_url": "https://logs.example.com/push"});
+        config
+            .as_object_mut()
+            .expect("config object")
+            .insert((*key).to_string(), serde_json::Value::Null);
+        invalid.push(config);
+    }
+    for config in invalid {
+        assert_component_validity(&spec, "LokiLoggingConfig", &config, false);
+        assert!(
+            LokiLogging::new(&config, PluginHttpClient::default()).is_err(),
+            "runtime accepted OpenAPI-invalid Loki config: {config}"
+        );
+    }
+}
+
+#[test]
+fn ip_restriction_schema_matches_the_strict_runtime_shape() {
+    use ferrum_edge::plugins::ip_restriction::IpRestriction;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let component = &spec["components"]["schemas"]["IpRestrictionConfig"];
+    assert_eq!(component["additionalProperties"], false);
+    assert_eq!(component["anyOf"][0]["properties"]["allow"]["minItems"], 1);
+    assert_eq!(component["anyOf"][1]["properties"]["deny"]["minItems"], 1);
+    let description = component["description"]
+        .as_str()
+        .expect("IpRestrictionConfig has a description");
+    assert!(description.contains("canonical unsigned decimal"));
+    assert!(description.contains("mapped CIDRs accept only `/96`-`/128`"));
+
+    for config in [
+        json!({"allow": ["10.0.0.0/8"]}),
+        json!({"allow": [], "deny": ["192.0.2.0/24"]}),
+        json!({"allow": ["2001:db8::/32"], "deny": [], "mode": "deny_first"}),
+    ] {
+        assert_component_validity(&spec, "IpRestrictionConfig", &config, true);
+        assert!(
+            IpRestriction::new(&config).is_ok(),
+            "runtime rejected schema-valid strict config: {config}"
+        );
+    }
+
+    for config in [
+        json!(null),
+        json!([]),
+        json!({}),
+        json!({"allow": [], "deny": []}),
+        json!({"allow": null, "deny": ["192.0.2.0/24"]}),
+        json!({"allow": ["10.0.0.0/8"], "deny": null}),
+        json!({"allow": ["10.0.0.0/8"], "mode": null}),
+        json!({"allow": ["10.0.0.0/8"], "mod": "deny_first"}),
+        json!({"alow": ["10.0.0.0/8"], "deny": ["192.0.2.0/24"]}),
+        json!({"allow": "10.0.0.0/8"}),
+        json!({"allow": [""]}),
+        json!({"allow": ["   "]}),
+    ] {
+        assert_component_validity(&spec, "IpRestrictionConfig", &config, false);
+        assert!(
+            IpRestriction::new(&config).is_err(),
+            "runtime accepted schema-invalid strict config: {config}"
+        );
+    }
 }
 
 #[test]
@@ -1980,6 +2354,35 @@ fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
 }
 
 #[test]
+fn adaptive_concurrency_schema_documents_generation_handoff_exceptions() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AdaptiveConcurrencyConfig")
+        .expect("missing AdaptiveConcurrencyConfig schema");
+
+    let shadow_description = schema
+        .pointer("/properties/shadow_mode/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("shadow_mode description should be present");
+    assert!(
+        shadow_description.contains("structural generation handoff")
+            && shadow_description.contains("still fail closed"),
+        "shadow_mode must document the structural handoff exception"
+    );
+
+    let header_description = schema
+        .pointer("/properties/expose_headers/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("expose_headers description should be present");
+    assert!(
+        header_description.contains("genuine per-target limit rejections")
+            && header_description.contains("Generation-handoff rejections omit"),
+        "expose_headers must document generation-handoff omission"
+    );
+}
+
+#[test]
 fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
     use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 
@@ -2048,6 +2451,29 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
 
     assert_component_validity(&spec, "MeshRouteDispatchConfig", &representative, true);
     MeshRouteDispatch::new(&representative).expect("representative config is runtime-valid");
+
+    let tiny_fault = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "fault": {"abort": {
+                "status_code": 503,
+                "percentage": f64::from_bits(1)
+            }}
+        }]
+    });
+    assert_component_validity(&spec, "MeshRouteDispatchConfig", &tiny_fault, true);
+    MeshRouteDispatch::new(&tiny_fault).expect("tiny positive percentage is runtime-valid");
+
+    let overlong_fault = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "fault": {"delay": {"duration_ms": 60_001, "percentage": 1.0}}
+        }]
+    });
+    assert_component_validity(&spec, "MeshRouteDispatchConfig", &overlong_fault, false);
+    assert!(MeshRouteDispatch::new(&overlong_fault).is_err());
 
     let documented_old_transform = json!({
         "rules": [{
@@ -2262,6 +2688,24 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
 }
 
 #[test]
+fn transaction_debugger_schema_matches_closed_runtime_surface() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/TransactionDebuggerConfig")
+        .expect("missing TransactionDebuggerConfig schema");
+
+    assert_eq!(schema["additionalProperties"], false);
+    let properties: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("transaction debugger properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(properties, BTreeSet::from(["redacted_headers"]));
+}
+
+#[test]
 fn ai_response_guard_schema_matches_strict_runtime_constraints() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -2454,4 +2898,170 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
         status_schema["properties"]["replica_limit_behavior"]["enum"][0],
         "configured_limit_per_replica"
     );
+}
+
+#[test]
+fn spec_expose_schema_matches_strict_runtime_null_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/SpecExposeConfig")
+        .expect("SpecExposeConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["required"], json!(["spec_url"]));
+    for (field, scalar_type) in [
+        ("content_type", "string"),
+        ("tls_no_verify", "boolean"),
+        ("cache_ttl_seconds", "integer"),
+        ("max_response_body_bytes", "integer"),
+    ] {
+        assert_eq!(
+            schema["properties"][field]["type"],
+            json!([scalar_type, "null"]),
+            "{field} must document the runtime's explicit-null default"
+        );
+    }
+
+    assert_component_validity(
+        &spec,
+        "SpecExposeConfig",
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "content_type": null,
+            "tls_no_verify": null,
+            "cache_ttl_seconds": null,
+            "max_response_body_bytes": null
+        }),
+        true,
+    );
+    for invalid in [
+        json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verfy": true}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "content_type": 7}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "tls_no_verify": "false"}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "cache_ttl_seconds": -1}),
+        json!({"spec_url": "https://example.com/openapi.yaml", "max_response_body_bytes": 0}),
+    ] {
+        assert_component_validity(&spec, "SpecExposeConfig", &invalid, false);
+    }
+}
+
+#[test]
+fn bot_detection_schema_matches_strict_runtime_and_documented_contract() {
+    use ferrum_edge::plugins::bot_detection::{BOT_DETECTION_CONFIG_KEYS, BotDetection};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/BotDetectionConfig")
+        .expect("BotDetectionConfig component exists");
+
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("BotDetectionConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = BOT_DETECTION_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(schema_fields, runtime_fields);
+
+    assert_eq!(
+        schema["properties"]["blocked_patterns"]["type"],
+        json!(["array", "null"])
+    );
+    assert_eq!(
+        schema["properties"]["allow_list"]["type"],
+        json!(["array", "null"])
+    );
+    assert_eq!(
+        schema["properties"]["allow_missing_user_agent"]["type"],
+        json!(["boolean", "null"])
+    );
+    assert_eq!(
+        schema["properties"]["custom_response_code"]["type"],
+        json!(["integer", "null"])
+    );
+    assert_eq!(schema["properties"]["custom_response_code"]["minimum"], 400);
+    assert_eq!(schema["properties"]["custom_response_code"]["maximum"], 599);
+
+    for valid in [
+        json!({}),
+        json!({
+            "blocked_patterns": [" FerrumAuditCrawler "],
+            "allow_list": ["TrustedBot"],
+            "allow_missing_user_agent": false,
+            "custom_response_code": 451
+        }),
+        json!({
+            "blocked_patterns": null,
+            "allow_list": null,
+            "allow_missing_user_agent": null,
+            "custom_response_code": null
+        }),
+        json!({"blocked_patterns": [], "allow_missing_user_agent": false}),
+        json!({"custom_response_code": 400}),
+        json!({"custom_response_code": 403.0}),
+        json!({"custom_response_code": 599}),
+        // U+FEFF ZWNBSP is not in Rust's Unicode White_Space set.
+        json!({"blocked_patterns": ["\u{feff}"]}),
+        json!({"allow_list": ["\u{feff}"]}),
+    ] {
+        assert_component_validity(&spec, "BotDetectionConfig", &valid, true);
+        BotDetection::new(&valid)
+            .unwrap_or_else(|error| panic!("schema-valid config {valid} failed runtime: {error}"));
+    }
+
+    for invalid in [
+        serde_json::Value::Null,
+        json!([]),
+        json!("config"),
+        json!({"blocked_paterns": ["FerrumAuditCrawler"]}),
+        json!({
+            "blocked_patterns": ["FerrumAuditCrawler"],
+            "allow_missing_useragent": false
+        }),
+        json!({"allowlist": ["TrustedBot"]}),
+        json!({"custom_reponse_code": 451}),
+        json!({"allow_missing_useragent": false}),
+        json!({"blocked_patterns": "FerrumAuditCrawler"}),
+        json!({"blocked_patterns": [42]}),
+        json!({"blocked_patterns": [""]}),
+        json!({"blocked_patterns": [" \t "]}),
+        // U+0085 NEL is in Rust's Unicode White_Space set.
+        json!({"blocked_patterns": ["\u{0085}"]}),
+        json!({"allow_list": "TrustedBot"}),
+        json!({"allow_list": [false]}),
+        json!({"allow_list": ["\n"]}),
+        json!({"allow_list": ["\u{0085}"]}),
+        json!({"allow_missing_user_agent": "false"}),
+        json!({"custom_response_code": "451"}),
+        json!({"custom_response_code": 451.5}),
+        json!({"blocked_patterns": []}),
+        json!({"blocked_patterns": [], "allow_missing_user_agent": true}),
+        json!({"blocked_patterns": [], "allow_missing_user_agent": null}),
+        json!({"custom_response_code": -1}),
+        json!({"custom_response_code": 100}),
+        json!({"custom_response_code": 199}),
+        json!({"custom_response_code": 204}),
+        json!({"custom_response_code": 205}),
+        json!({"custom_response_code": 304}),
+        json!({"custom_response_code": 399}),
+        json!({"custom_response_code": 600}),
+        json!({"custom_response_code": 1e100}),
+    ] {
+        assert_component_validity(&spec, "BotDetectionConfig", &invalid, false);
+        assert!(
+            BotDetection::new(&invalid).is_err(),
+            "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let guide = include_str!("../../docs/plugins.md");
+    assert!(guide.contains("Configuration must be a top-level object."));
+    assert!(guide.contains("unknown keys are rejected instead of falling back to defaults"));
+    assert!(guide.contains("Only 400–599 is accepted"));
+    assert!(guide.contains("never reflect the client-controlled User-Agent"));
+    assert!(guide.contains("Native gRPC rejections instead use an empty-body HTTP 200"));
 }

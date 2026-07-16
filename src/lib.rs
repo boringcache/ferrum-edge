@@ -88,6 +88,13 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    pub fn bind_authorized_backend_path_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        path: &str,
+    ) {
+        ctx.bind_authorized_backend_path(path.to_string());
+    }
+
     // ── adaptive_concurrency lifecycle ──────────────────────────────────────
     pub struct AdaptiveConcurrencyDecreaseHarness {
         limit: AtomicU64,
@@ -144,10 +151,6 @@ pub mod _test_support {
             }
         }
 
-        pub fn observe(&self) -> u64 {
-            self.transition.load()
-        }
-
         pub fn begin_structural_reset(&self) -> AdaptiveConcurrencyResetToken {
             AdaptiveConcurrencyResetToken {
                 reset: self.transition.begin_structural_reset(),
@@ -160,17 +163,8 @@ pub mod _test_support {
                 .map(|reset| AdaptiveConcurrencyResetToken { reset })
         }
 
-        pub fn try_begin_observed_drain_reset(
-            &self,
-            observed: u64,
-        ) -> Option<AdaptiveConcurrencyResetToken> {
-            self.transition
-                .try_begin_drain_reset(observed)
-                .map(|reset| AdaptiveConcurrencyResetToken { reset })
-        }
-
-        pub fn finish_reset(&self, reset: AdaptiveConcurrencyResetToken, drain: bool) -> bool {
-            self.transition.finish_reset(reset.reset, drain)
+        pub fn finish_reset(&self, reset: AdaptiveConcurrencyResetToken) -> bool {
+            self.transition.finish_reset(reset.reset)
         }
 
         pub fn is_active(&self) -> bool {
@@ -801,6 +795,39 @@ pub mod _test_support {
         crate::plugins::grpc_web::response_content_type(original_ct)
     }
 
+    pub fn finalize_grpc_web_error_response_headers(
+        response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
+        initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+        finalized_reject_headers: Option<&HashMap<String, String>>,
+    ) {
+        crate::proxy::finalize_grpc_web_error_response_headers(
+            response,
+            initial_response_header_policy_plugins,
+            finalized_reject_headers,
+        );
+    }
+
+    pub async fn run_h3_reject_response_committed_hooks(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        flavor: crate::config::types::HttpFlavor,
+        grpc_web_response_content_type: Option<&str>,
+        http_status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) {
+        crate::http3::server::run_h3_reject_response_committed_hooks(
+            plugins,
+            ctx,
+            flavor,
+            grpc_web_response_content_type,
+            http_status,
+            body,
+            headers,
+        )
+        .await;
+    }
+
     // ── proxy/mod ────────────────────────────────────────────────────────────
     pub struct NormalizedRejectResponse {
         pub http_status: StatusCode,
@@ -873,6 +900,36 @@ pub mod _test_support {
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message,
         }
+    }
+
+    pub fn set_websocket_response_boundary_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        enabled: bool,
+    ) {
+        ctx.set_websocket_response_boundary(enabled);
+    }
+
+    pub fn set_request_http_flavor_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        flavor: crate::config::types::HttpFlavor,
+    ) {
+        ctx.set_request_http_flavor(flavor);
+    }
+
+    pub async fn wait_for_tcp_peer_reset_for_test(stream: &tokio::net::TcpStream) {
+        crate::proxy::tcp_proxy::wait_for_tcp_peer_reset(stream).await;
+    }
+
+    pub fn tcp_fault_admission_retry_delays_for_test(polls: usize) -> Vec<Duration> {
+        let mut backoff = crate::proxy::tcp_proxy::TcpFaultAdmissionRetryBackoff::new();
+        (0..polls).map(|_| backoff.next_delay()).collect()
+    }
+
+    pub fn tcp_fault_admission_should_cancel_for_test(
+        readiness: std::io::Result<tokio::io::Ready>,
+        socket_error: std::io::Result<Option<std::io::Error>>,
+    ) -> bool {
+        crate::proxy::tcp_proxy::tcp_fault_admission_should_cancel(&readiness, &socket_error)
     }
 
     pub fn insert_grpc_error_metadata(

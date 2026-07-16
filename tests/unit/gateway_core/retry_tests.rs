@@ -966,6 +966,16 @@ fn test_classify_boxed_error_typed_no_healthy_targets() {
 }
 
 #[test]
+fn test_classify_boxed_error_typed_client_admission_disconnect() {
+    use ferrum_edge::proxy::stream_error::{StreamSetupError, StreamSetupKind};
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamSetupError::new(
+        StreamSetupKind::ClientDisconnectedDuringAdmission,
+        "TCP",
+    ));
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::RequestError);
+}
+
+#[test]
 fn test_classify_boxed_error_typed_kind_survives_anyhow_context() {
     // Construction sites convert StreamSetupError to anyhow::Error via
     // .into() and may further .context(...) it before reaching the cause

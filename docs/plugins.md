@@ -10,15 +10,16 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 2. **`authenticate`** — Identifies the consumer (mTLS, JWKS, JWT, API Key, LDAP, Basic Auth, HMAC)
 3. **`authorize`** — Checks consumer permissions and policy decisions (Access Control, OPA, consumer-mode rate limiting)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
-5. **`backend_admission`** — Decides whether the selected backend target can accept one more in-flight request after load balancing
-6. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
-7. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
-8. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
-9. **`on_final_response_body`** — Validates or stores the transformed buffered body and may still replace it (Body Validator, Response Size Limiting, Response Caching)
-10. **`on_response_committed`** — Observe-only exporter hook for the final client-visible buffered status, headers, and body after validators and rejection replacement
-11. **`on_response_stream_terminated`** — Releases state and writes aggregate metadata for streamed, non-buffered responses after terminal success, error, or client disconnect
-12. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
-13. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
+5. **`on_backend_path_resolved`** — Applies opt-in policy to the finalized backend path after routing and initial target selection
+6. **`backend_admission`** — Decides whether the selected backend target can accept one more in-flight request after load balancing
+7. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
+8. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
+9. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
+10. **`on_final_response_body`** — Validates or stores the transformed buffered body and may still replace it (Body Validator, Response Size Limiting, Response Caching)
+11. **`on_response_committed`** — Observe-only exporter hook for the final client-visible buffered status, headers, and body after validators and rejection replacement
+12. **`on_response_stream_terminated`** — Releases state and writes aggregate metadata for streamed, non-buffered responses after terminal success, error, or client disconnect
+13. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
+14. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
 
 ## Custom Plugins
 
@@ -1050,38 +1051,52 @@ UDP sessions are logged when the session is cleaned up after idle timeout.
 **Phases**: `log`, `on_stream_disconnect`
 **Protocols**: All (HTTP, gRPC, WebSocket, TCP, UDP)
 
-Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header.
+Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header. Config admission is strict: unknown top-level fields and explicit `null` values are rejected. Nested `labels` and `custom_headers` remain dynamic maps.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `endpoint_url` | string | (required) | Loki push API URL |
-| `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic) |
-| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`) |
-| `labels` | object | `{"service":"ferrum-edge"}` | Static labels applied to every log stream |
+| `endpoint_url` | string | (required) | HTTP(S) Loki push API URL; URL user information is rejected |
+| `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic); leading/trailing whitespace is rejected |
+| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`); names use HTTP token syntax and are at most 65,535 bytes |
+| `labels` | object | `{"service":"ferrum-edge"}` | Static labels; names beginning `__` and reserved `ferrum_emitter` are rejected; names are at most 1,024 characters and values at most 2,048 characters |
 | `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label |
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
 | `gzip` | bool | `true` | Gzip-compress request bodies |
-| `batch_size` | integer | `100` | Max entries per batch |
+| `batch_size` | integer | `100` | Max entries per batch (1–10,000) |
 | `flush_interval_ms` | integer | `1000` | Flush timer interval (minimum 100) |
-| `buffer_capacity` | integer | `10000` | Channel buffer capacity |
-| `max_retries` | integer | `3` | Retry attempts on failure |
-| `retry_delay_ms` | integer | `1000` | Delay between retries |
+| `buffer_capacity` | integer | `10000` | Channel buffer capacity (1–1,000,000) |
+| `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576); the configured serializer's minimum HTTP and stream lines plus static, reserved, and worst-case dynamic label values must fit |
+| `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`) |
+| `max_retries` | integer | `3` | Retries after the initial attempt (0–10) |
+| `retry_delay_ms` | integer | `1000` | Initial exponential-backoff delay (1–60,000 ms) |
+| `schema` | object | (none) | Inline transaction-log schema |
+| `schema_ref` | string | (none) | Named `transaction_log_schema` reference; mutually exclusive with `schema` |
 
-Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, `authorization_header`, or tenant header rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests, which Loki uses for ingestion throttling) are transient signals and are retried within the configured budget.
+HTTP **204 No Content** is Loki's canonical delivery success. A received 204 is treated as committed even if the best-effort response drain is incomplete, because retrying after the sink accepted the batch can duplicate entries. Other 2xx responses from Loki-compatible receivers or intermediaries are accepted only when their response drains completely and is empty. Loki's blocked-ingestion status **260**, non-empty or anomalously drained compatible-success responses, 3xx, and non-retryable 4xx responses are terminal; transport failures, 408, 429, and 5xx retry with capped exponential backoff and full jitter. Response bodies are never logged or retained: they are discarded with a 1 MiB cap and a one-second timeout, and diagnostics contain only status and bounded size/drain classifications.
+
+The outer Loki timestamp is assigned in the plugin's single flush order and is strictly increasing across batches. The original request/session timestamps remain in the structured JSON line, so completion-order batching does not invent event chronology. Ferrum Edge adds a unique `ferrum_emitter` label to each plugin instance; independently ordered replicas and reload generations therefore do not share a Loki stream. Reusing an emitter across generations would be unsafe because old and new cache generations can flush concurrently. Consequently, every replica and every rebuilt Loki plugin generation creates one active Loki stream per remaining label combination until the prior stream ages out. Operators with frequent file/DP/mesh/global reloads should monitor tenant stream utilization, avoid unnecessary rebuilds, and size Loki `max_streams_per_user` (or equivalent compatible-receiver limits) for replica count × generation overlap × label combinations; 429 responses are retried but sustained limit pressure still drops batches after the configured attempts.
+
+Compatibility note: earlier Ferrum Edge releases treated every 2xx status, including Loki's blocked-ingestion 260, as success. This release makes 260 and non-empty/anomalous non-204 2xx responses terminal and accepts empty non-204 2xx responses for compatible receivers. Receivers should prefer the Loki-standard 204 contract.
+
+The channel slot is reserved before serialization. Serialization is capped by `max_entry_bytes`, and retained entry content remains charged to `buffer_max_bytes` until delivery, terminal loss, or shutdown drain completes. Construction reserves the configured serializer's smallest HTTP/stream shape plus maximum admitted proxy-ID and other dynamic label values; request-shaped fields can still make an individual JSON line exceed the configured per-entry limit, in which case that entry is dropped. Pressure drops are non-blocking and diagnostics never contain entry content. Operational logs show only the endpoint scheme/host/port; path, query, authorization, and all custom-header values are redacted from audit records and non-admin config reads. Shared plugin HTTP clients ignore ambient proxy environment variables, while preserving configured DNS, TLS, redirect, and backend-egress policy.
 
 ### `transaction_debugger`
 
-Emits verbose request/response diagnostics via `tracing::debug!` on the `transaction_debug` target. All output flows through the non-blocking writer, avoiding synchronous stdout mutex contention. Sensitive headers are automatically redacted. Enable per-proxy only for debugging — not recommended for production due to information disclosure risk. Requires `FERRUM_LOG_LEVEL=debug` (or `RUST_LOG=transaction_debug=debug`) to see output.
+Emits verbose request/response and terminal diagnostics via `tracing::debug!` on the `transaction_debug` target. All output flows through the non-blocking writer, avoiding synchronous stdout mutex contention. Sensitive headers are automatically redacted. Enable per-proxy only for debugging — not recommended for production due to information disclosure risk. Requires `FERRUM_LOG_LEVEL=debug` (or `RUST_LOG=transaction_debug=debug`) to see output.
+
+The plugin does not capture request or response payloads. The former `log_request_body` and `log_response_body` options are rejected instead of silently accepting no-op body settings. Terminal HTTP/gRPC diagnostics use the final transaction outcome, including dispatch/body errors, client disconnects, completion and byte counts, rejection phase, and non-zero gRPC status. TCP/UDP/DTLS diagnostics include typed disconnect direction, cause, and error classification.
+
+WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic and exactly one additional terminal session diagnostic when the upgraded session ends. When `correlation_id` or `otel_tracing` supplied `request_id` or `trace_id` metadata, the terminal records include the same selected value; all selected metadata passes through the central sensitivity classifier. The plugin never dumps the complete metadata map.
 
 **Priority:** 9200
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `log_request_body` | bool | `false` | Log incoming request body |
-| `log_response_body` | bool | `false` | Log backend response body |
 | `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list |
 
-**Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
+**Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
+
+The configuration object is closed: any key other than `redacted_headers` is rejected. `schema` and `schema_ref` retain their specialized unsupported-schema error.
 
 ### `correlation_id`
 
@@ -1646,7 +1661,7 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `ldap_url` | string | (required) | LDAP server URL. Use `ldaps://` or `ldap://` with `starttls: true`; embedded URL credentials are rejected |
+| `ldap_url` | string | (required) | LDAP server URL. Use `ldaps://` or `ldap://` with `starttls: true`; embedded URL credentials are rejected. Hostnames retain their configured identity for TLS/SNI while each connection dials a freshly resolved, policy-screened IP |
 | `bind_dn_template` | string | (none) | Direct bind DN template with `{username}` placeholder (e.g., `uid={username},ou=users,dc=example,dc=com`) |
 | `search_base_dn` | string | (none) | Base DN for search-then-bind user search |
 | `search_filter` | string | (none) | LDAP search filter with `{username}` placeholder (e.g., `(&(objectClass=user)(sAMAccountName={username}))`) |
@@ -1659,7 +1674,7 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups`; LDAP attribute-name matching is case-insensitive |
 | `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
 | `allow_plaintext` | bool | `false` | Development-only override for non-loopback `ldap://` without STARTTLS. Credentials have no transport confidentiality when enabled |
-| `connect_timeout_seconds` | u64 | `5` | Per-connection and per-operation timeout (1–300s), also sent as the LDAP server-side search time limit |
+| `connect_timeout_seconds` | u64 | `5` | Shared DNS-resolution/TCP/TLS establishment bound per connection plus the per-operation timeout (1–300s), also sent as the LDAP server-side search time limit |
 | `request_timeout_seconds` | u64 | `max(15, connect timeout)` | Strict wall-clock deadline (1–300s) for the complete uncached authentication and group-check flow. Set it explicitly to use a shorter deadline than an individual operation |
 | `max_concurrent_requests` | u64 | `64` | Per-plugin cap (1–1,024) on concurrent uncached LDAP flows; excess requests fail immediately |
 | `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (`0` = disabled, maximum `86400`). Cache keys are process-random HMACs over the presented username/password |
@@ -1718,6 +1733,8 @@ For custom `group_filter` values, a required group returned by the initial searc
 In search-then-bind deployments that use POSIX `memberUid` or `{username}` in a custom group filter, configure `canonical_identity_attribute` to the authoritative directory attribute whose value those groups store. If groups store a different identifier than the desired Ferrum/Consumer identity, use DN-based `member`/`uniqueMember` membership or a `{user_dn}` custom filter. A mismatch fails closed as non-membership; the plugin never falls back to the client-presented login. Direct bind is unchanged because its authenticated canonical identity is the presented login.
 
 **TLS and revocation:** `ldaps://` and STARTTLS connections use rustls with the gateway's CA settings (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`). When a CRL is configured (`FERRUM_TLS_CRL_FILE_PATH`) and verification is not disabled, revoked LDAP server certificates are rejected — the same revocation guarantee as the proxy backend, DTLS, frontend mTLS, and rustls logging-sink surfaces.
+
+**Dial-time DNS and egress policy:** Every LDAP connection is established from a fresh A+AAAA lookup that bypasses positive and negative DNS caches while still honoring configured static overrides and hosts files. The complete candidate set is screened under the active `BackendEgressPolicy` before any socket opens, and each candidate is screened again immediately before its TCP dial. A mixed allowed/denied answer or a reconnect that rebinds to denied space therefore fails closed. Direct bind, the service-account and end-user connections in search-then-bind, and a separate group-search connection all repeat this process. The concrete screened address is passed to `ldap3` without replacing the configured hostname, so LDAPS/STARTTLS certificate and SNI verification continue to use the operator-configured LDAP name. DNS, candidate connection attempts, and TLS/STARTTLS establishment share `connect_timeout_seconds`.
 
 Non-loopback plaintext `ldap://` endpoints are rejected by default because LDAP simple bind sends reusable service-account and user passwords without transport confidentiality. `allow_plaintext: true` is an explicit development-only escape hatch for isolated test environments. Literal loopback addresses and `localhost` remain available for local integration testing without the override.
 
@@ -2085,7 +2102,7 @@ For HTTP and gRPC, admission runs after load balancing selects the backend targe
 
 **Behavior notes:**
 
-- **Reload continuity** is keyed by the plugin configuration's namespace and ID. Compatible cache rebuilds preserve learned limits and count permits held by streaming bodies or WebSocket sessions against the replacement plugin; requests that pinned an older compatible cache view may still admit against the shared counters, but use the replacement admission bounds and cannot train them with retired feedback. Limit-bound changes clamp the shared learned limit at publication. Strict scale-out that only adds concrete effective targets or protected proxy-group associations while preserving every old target key, scope, and route meaning is compatible when `max_tracked_keys` is not lowered, so a long-lived old-target permit does not block admission to the new target. A `key_by`, plugin-scope, effective route-override destination or execution order, effective target retirement/replacement, policy-coverage contraction/remap, lowering `max_tracked_keys`, or a transition involving an ambiguous zero-target route establishes a new tracking space, so the replacement returns `503` until older permits drain, then resets retired target state before admitting; this brief fail-closed transition also applies in `shadow_mode`. Service-discovery churn outside a policy's selected subset and route-plugin edits that cannot change its destination remain compatible. Removing and later recreating a policy starts new state, as does removing the last proxy/proxy-group association and later reattaching it.
+- **Reload continuity** is keyed by the plugin configuration's namespace and ID. Compatible cache rebuilds preserve learned limits and count permits held by streaming bodies or WebSocket sessions against the replacement plugin; requests that pinned an older compatible cache view may still admit against the shared counters, but use the replacement admission bounds and cannot train them with retired feedback. Limit-bound changes clamp the shared learned limit at publication. Strict scale-out that only adds concrete effective targets or protected proxy-group associations while preserving every old target key, scope, and route meaning is compatible when `max_tracked_keys` is not lowered, so a long-lived old-target permit does not block admission to the new target. A `key_by`, plugin-scope, effective route-override destination or execution order, effective target retirement/replacement (including service-discovery replacement), policy-coverage contraction/remap, lowering `max_tracked_keys`, or a transition involving an ambiguous zero-target route establishes an independent tracking space. Retired permits finish against their detached state; retired cache and load-balancer views cannot admit, repopulate, or train the replacement policy. That retired-view generation check fails closed even in `shadow_mode`: shadow mode bypasses only a current target's adaptive limit, never structural generation ownership. Service-discovery churn outside a policy's selected subset and route-plugin edits that cannot change its destination remain compatible. Removing and later recreating a policy starts new state, as does removing the last proxy/proxy-group association and later reattaching it.
 - **Failure recovery** is cohort-aware. Every concurrent backend failure or high-latency sample applies its own multiplicative decrease, bounded by `min_limit`, and invalidates additive-growth credit for requests admitted before that decrease. The lower limit must admit a later healthy cohort before it can grow again, so completion ordering and a large `increase_step` cannot immediately erase the backoff.
 - **Unknown configuration keys are rejected.** Misspelled limit, scope, tracking, sampling, shadow, or header fields fail startup/write/reload validation instead of falling back to defaults.
 - **Streaming responses** record their latency sample at TTFB (response-header arrival) while the in-flight slot is held for the full body. Unlike a WebSocket session this slot is still transient (it frees when the body completes), so streaming keeps the normal growth behavior rather than the handshake-style suppression above. For very long-lived streaming/SSE backends this means the limit can grow on fast TTFB while slots stay tied up for the stream duration.
@@ -2102,8 +2119,8 @@ For HTTP and gRPC, admission runs after load balancing selects the backend targe
 | `target_latency_multiplier` | f64 | `1.5` | Target latency threshold as a multiple of the learned minimum observed backend latency. Must be finite and greater than `1.0`. |
 | `decrease_ratio` | f64 | `0.8` | Multiplicative decrease applied after a failure signal or high latency. Must be greater than `0` and less than `1`. |
 | `increase_step` | u64 | `1` | Additive increase applied when the target is saturated and latency remains within the target. |
-| `shadow_mode` | bool | `false` | Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. |
-| `expose_headers` | bool | `false` | Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Policy-generation and key-space-drain rejections omit them because those transitions have no truthful per-target limit or in-flight value. |
+| `shadow_mode` | bool | `false` | Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. Retired cache/load-balancer views and requests crossing a structural generation handoff still fail closed so they cannot repopulate the replacement tracking space. |
+| `expose_headers` | bool | `false` | Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Generation-handoff rejections omit them because those transitions have no truthful per-target limit or in-flight value. |
 
 ```yaml
 plugin_name: adaptive_concurrency
@@ -2122,11 +2139,11 @@ config:
 
 ### `ip_restriction`
 
-Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP — via both `on_request_received` (HTTP-family) and `on_stream_connect` (TCP/UDP).
+Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP/TLS, and UDP/DTLS — via both `on_request_received` (HTTP-family) and `on_stream_connect` (stream-family).
 
 **Priority:** 150
 
-**Supported protocols:** All (HTTP, gRPC, WebSocket, TCP, UDP)
+**Supported protocols:** All (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP/TLS, UDP/DTLS)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -2136,7 +2153,9 @@ Restricts access based on client IP address or CIDR range. Runs on every protoco
 
 At least one of `allow` or `deny` must be configured. Empty config or both lists empty rejects plugin creation.
 
-Rules are validated and pre-parsed at config load time into integer bitmasks; invalid IP/CIDR entries reject plugin creation instead of being silently ignored. The hot path is pure integer comparison — no per-request string parsing. Supports IPv4 (`/0`–`/32`) and IPv6 (`/0`–`/128`); IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching so a malformed `X-Forwarded-For` entry never silently bypasses a deny rule.
+The config must be an object containing only `allow`, `deny`, and `mode`. Unknown or misspelled properties, explicit `null` values, malformed arrays, and non-string/empty rules reject the candidate configuration. File/admin/database/CP-DP admission therefore cannot publish a typo as a broader effective policy, and a rejected reload keeps the last-known-good plugin generation.
+
+Rules are validated and compiled at config load time into sorted, merged numeric intervals; duplicates, overlaps, and adjacent ranges collapse without changing inclusive CIDR boundaries. Invalid IP/CIDR entries reject plugin creation instead of being silently ignored. IPv4 rule octets must use canonical unsigned decimal notation, so ambiguous forms such as `010.1.2.3` and `+10.1.2.3` are rejected. Request-time lookup is allocation-free, lock-free, and O(log n) in the number of non-overlapping intervals rather than a scan of configured rules. The authoritative client IP is parsed and canonicalized once per request, TCP connection, or UDP/DTLS session and the typed value is reused by every attached `ip_restriction` instance. IPv4-mapped IPv6 identities normalize to IPv4 before policy; mapped CIDR rules therefore accept only `/96`–`/128`, which map to IPv4 `/0`–`/32`, while shorter mapped prefixes are rejected as ambiguous. Native IPv6 CIDRs accept `/0`–`/128`; IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching. A malformed authoritative client IP always fails closed. Debug-level construction logs expose only the selected mode and effective IPv4/IPv6 interval counts, never configured addresses.
 
 When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
 
@@ -2320,20 +2339,27 @@ config:
 
 ### `fault_injection`
 
-Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; TCP/UDP stream proxies run the same decision in `on_stream_connect`. Stream rejects close the frontend connection/session, so HTTP status/body/grpc-status fields only have downstream meaning for HTTP-family protocols.
+Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; raw TCP proxies run the same decision in `on_stream_connect`. UDP and DTLS are not supported: their listener/session loops cannot safely wait inside a plugin delay without head-of-line blocking unrelated datagrams. TCP admission races fault delays against client resets and transport errors while preserving valid read-half closes, and all fault delays are capped at one minute. Stream rejects close the frontend connection, so HTTP status/body fields only have downstream meaning for HTTP-family protocols.
+
+When route-sensitive backend-path policy such as `grpc_method_router` is active, the HTTP-family fault decision runs only after the backend-effective method is authorized. A denied rewritten method therefore returns the policy rejection without first sleeping or receiving a synthetic fault response. Proxies without backend-path policy retain the ordinary `before_proxy` ordering.
 
 **Priority:** 2940
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `abort.status_code` | u16 | required when `abort` is set | Final HTTP status to return, 200-599 |
-| `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0 |
-| `abort.grpc_status` | u32 (optional) | — | gRPC status trailer to emit on gRPC rejects, 0-16 |
+| `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
+| `abort.grpc_status` | u32 (optional) | — | gRPC status to emit only for actual native gRPC requests (excluding gRPC-Web and WebSocket even if an earlier plugin rewrites or preserves `application/grpc`), 0-16 |
 | `abort.body` | String | `""` | HTTP response body for aborts |
-| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-3,600,000 ms |
-| `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0 |
+| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-60,000 ms |
+| `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
+| `runtime_overlay_scope` | String or null (optional) | — | RTDS scope with at least one non-whitespace character (outer whitespace is trimmed) for `ferrum.fault_injection.<scope>.{abort,delay}_percent`; null is equivalent to omission |
 
-Each plugin instance owns its own sampling counter, so proxy-scoped and proxy-group-scoped instances make independent decisions. The plugin rejects no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
+Each plugin instance owns a process-random sampling stream and makes independent delay/abort rolls. Multiple scoped instances therefore all decide in configured priority order: a delaying instance does not suppress a later sibling, while the first abort naturally short-circuits the remaining plugin chain. Route-local VirtualService faults still deduplicate against proxy-scoped faults through a private source marker, so route translation does not accidentally stack the same policy surface. The plugin rejects static no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
+
+`abort` and `delay` may be omitted or set to `null` to represent an unused side, but at least one must be an object. `runtime_overlay_scope: null` is likewise equivalent to omitting the optional scope. RTDS zero materialization treats a null sibling exactly like an omitted sibling, so removing the only configured side disables that plugin instance for the accepted generation.
+
+When `runtime_overlay_scope` is set, a mesh request epoch captures the matching RTDS values atomically with the plugin config. Missing or malformed keys fall back independently to the static percentage. RTDS layers are ordered lexicographically by Runtime resource name, with later names winning; duplicate Runtime names are rejected. A numeric RTDS value may be `0` to temporarily disable one configured fault kind.
 
 ```yaml
 plugin_name: fault_injection
@@ -2346,6 +2372,7 @@ config:
   delay:
     duration_ms: 250
     percentage: 10.0
+  runtime_overlay_scope: checkout
 ```
 
 ---
@@ -2357,6 +2384,7 @@ config:
 Handles Cross-Origin Resource Sharing at the gateway level.
 
 **Priority:** 100
+**Supported protocols:** HTTP, gRPC (including gRPC-Web)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -2379,10 +2407,12 @@ Detects and blocks bot traffic based on the User-Agent header. `blocked_patterns
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `blocked_patterns` | String[] | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Setting this field replaces the defaults. Setting it to `[]` is valid only when `allow_missing_user_agent: false` creates a missing-header reject path; an allow-list alone is not enforcement. |
-| `allow_list` | String[] | `[]` | User-Agent tokens that always pass, evaluated before `blocked_patterns` (allow wins). Case-insensitive and word-boundary anchored, so an entry only matches when it appears as a standalone token. |
-| `allow_missing_user_agent` | bool | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. |
-| `custom_response_code` | u16 | `403` | HTTP status code for blocked requests. Values outside 100–599 (or non-numeric) are coerced to 403. |
+| `blocked_patterns` | String[] \| null | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Array entries are trimmed and must be nonblank. An array replaces the defaults; `null` or omission installs the defaults. Setting this field to `[]` is valid only when `allow_missing_user_agent: false` creates a missing-header reject path; an allow-list alone is not enforcement. |
+| `allow_list` | String[] \| null | `[]` | User-Agent tokens that always pass, evaluated before `blocked_patterns` (allow wins). Entries are trimmed, must be nonblank, and are matched case-insensitively with word-boundary anchors. `null` or omission installs an empty list. |
+| `allow_missing_user_agent` | bool \| null | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. `null` or omission selects `true`. |
+| `custom_response_code` | u16 \| null | `403` | For non-gRPC requests, the final 4xx or 5xx HTTP status for blocked requests. Native gRPC maps it to `grpc-status` under HTTP 200. Only 400–599 is accepted; informational, no-body, out-of-range, and non-integer values are rejected. `null` or omission selects 403. |
+
+Configuration must be a top-level object. The only accepted keys are `blocked_patterns`, `allow_list`, `allow_missing_user_agent`, and `custom_response_code`; unknown keys are rejected instead of falling back to defaults. Pattern entry whitespace follows Rust `str::trim` Unicode `White_Space` semantics. Non-gRPC rejections use the fixed JSON body `{"error":"Forbidden"}` with `Content-Type: application/json`, and never reflect the client-controlled User-Agent. Native gRPC rejections instead use an empty-body HTTP 200 trailers-only response: the configured HTTP code is mapped through the gateway's standard HTTP-to-gRPC mapping into `grpc-status`, and the fixed error text becomes `grpc-message: Forbidden`.
 
 ```yaml
 plugin_name: bot_detection
@@ -2593,21 +2623,21 @@ Rules are evaluated in order — first match wins. Regex paths use the same `~` 
 
 ### `spec_expose`
 
-Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a `/specz` sub-path of each proxy's listen path. When a `GET` request arrives at `{listen_path}/specz`, the plugin fetches the specification from the configured upstream URL and returns it to the caller. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
+Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a canonical `/specz` sub-path of each proxy's listen path. `GET` returns the configured specification and `HEAD` carries that GET representation through response-body transforms and guards before returning the same final status and representation headers (including `Content-Type`, `Content-Length`, and `X-Content-Type-Options`) with no wire body. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
 
 Useful for providing a common, discoverable pattern for API specifications across enterprise-wide APIs.
 
 **Priority:** 210 | **Phase:** `on_request_received` | **Protocols:** HTTP only
 
-**Only works with prefix-based `listen_path` proxies.** Regex listen paths (`~` prefix) are skipped — the plugin continues without intercepting. Host-only or port-only routing is not supported.
+**Only works with prefix-based `listen_path` proxies.** Regex (`~`) and exact (`=`) listen paths are skipped — the plugin continues without intercepting. Host-only or port-only routing is not supported. A trailing separator is normalized when composing the resource: both `/api` and `/api/` expose `/api/specz`. The double-slash alias `/api//specz`, encoded separators, and extra path segments are deliberately not intercepted. Query strings do not change the canonical match.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https` scheme; other schemes (e.g., `file://`) are rejected at plugin load time. |
-| `content_type` | String | _(upstream)_ | Override the response `Content-Type`. When omitted, the upstream response's `Content-Type` is passed through (so YAML specs return as YAML, JSON as JSON, etc.). |
-| `tls_no_verify` | bool | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Defaults to the gateway's global `FERRUM_TLS_NO_VERIFY` setting. Useful for internal endpoints with self-signed certificates. |
-| `cache_ttl_seconds` | u64 | `300` | TTL for the in-process spec body cache. The first `/specz` request fetches the spec from `spec_url` and caches it in memory; subsequent requests within the TTL window are served directly from the cache without re-fetching. Failed fetches are never cached — every failure is retried on the next request. Set to `0` to disable caching entirely (every request re-fetches). |
-| `max_response_body_bytes` | u64 | `26214400` | Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
+| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https`; URL userinfo is rejected. Paths and queries may route or authorize the origin request, but diagnostics include only the credential-free origin. |
+| `content_type` | String or null | _(upstream)_ | Trusted response `Content-Type` override, not restricted by the upstream allow-list. When omitted or null, only the supported spec media types listed below are preserved; other or missing upstream values fall back to `application/octet-stream`. |
+| `tls_no_verify` | bool or null | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Omitted or null uses the gateway's global setting. When verification is enabled and a custom gateway CA bundle is configured, failure to load or parse it rejects the plugin generation rather than widening trust to public roots. |
+| `cache_ttl_seconds` | u64 or null | `300` | TTL for the in-process positive spec cache. Omitted or null uses 300 seconds. `0` disables durable positive caching, but callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay. Failed fetches are negatively cached with bounded exponential backoff for every TTL setting. |
+| `max_response_body_bytes` | u64 or null | `26214400` | Maximum upstream spec response body size to buffer and cache. Omitted or null uses 25 MiB. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
 
 ```yaml
 # Example: Expose an OpenAPI spec for an API behind /my/api/v1
@@ -2631,9 +2661,11 @@ config:
   cache_ttl_seconds: 0
 ```
 
-**Error handling:** If the upstream spec URL is unreachable or returns a non-2xx status, the plugin returns a `502` JSON error response. The `spec_url` hostname is pre-warmed via DNS at startup alongside other backend hostnames. Failed fetches are NOT cached, so a transient upstream error is retried on the very next request.
+**Content-Type handling:** Without an explicit override, the media type (case-insensitive, before any `;` parameters) must be one of `application/json`, `application/openapi+json`, `application/openapi+yaml`, `application/vnd.oai.openapi`, `application/vnd.oai.openapi+json`, `application/yaml`, `application/x-yaml`, `application/wsdl+xml`, `application/vnd.sun.wadl+xml`, `application/xml`, `text/yaml`, `text/xml`, or `text/plain`. Matching values are preserved verbatim, including parameters; all other or missing values become `application/octet-stream`. An explicit `content_type` is operator-trusted and bypasses this upstream allow-list. Every successful response includes `X-Content-Type-Options: nosniff`.
 
-**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting the gateway clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway.
+**Error handling and admission:** If the upstream spec URL is unreachable, oversized, unreadable, or returns a non-2xx status, the plugin returns a `502` JSON error with `Retry-After`. One outbound fetch is active per plugin instance, failed completions are negatively cached with exponential backoff from 1 to 30 seconds, and cached failures report the whole seconds remaining in that window. At most 32 cache-miss callers (including the fetcher) are admitted. Excess callers receive `503` with `Retry-After` immediately rather than accumulating behind the fetch. The `spec_url` hostname is pre-warmed via DNS; logs include only its credential-free origin, never the configured path, query, fragment, or URL userinfo.
+
+**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting or reloading the plugin clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway. With a zero TTL, there is no durable positive cache: callers admitted before a fetch completes share that completion by generation, while a later request immediately starts a new fetch.
 
 **Interaction with other plugins:** The plugin runs at priority 210 — after CORS (100), IP restriction (150), and bot detection (200), but before all authentication plugins (950+). This means blocked IPs and bots cannot access `/specz`, CORS preflight responses work correctly for browser-based spec consumers, and all authentication and authorization plugins are skipped for `/specz` requests.
 
@@ -3248,7 +3280,7 @@ Supports both encoding modes:
 - **Binary** (`application/grpc-web`, `application/grpc-web+proto`): same length-prefixed framing as native gRPC — request body passes through unchanged.
 - **Text** (`application/grpc-web-text`, `application/grpc-web-text+proto`): base64-encoded binary frames — decoded on request and re-encoded on response.
 
-On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. On the response path, it embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` back to the original gRPC-Web variant.
+On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. On the response path, `grpc_web` embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` back to the original gRPC-Web variant.
 
 **Priority:** 260 (runs before `grpc_method_router` at 275)
 **Protocols:** HTTP, gRPC
@@ -3267,7 +3299,7 @@ config:
 
 ### `grpc_method_router`
 
-Parses the gRPC path (`/package.Service/Method`) and enables per-method access control and rate limiting. Populates `grpc_service`, `grpc_method`, and `grpc_full_method` metadata for downstream plugins.
+Enables per-method access control and rate limiting for canonical gRPC paths (`/package.Service/Method`). The security decision uses the backend-effective path after URI rewrites, listen-path stripping, proxy/target backend-path composition, and initial load-balancer target selection. It then refreshes `grpc_service`, `grpc_method`, and `grpc_full_method` metadata with the method actually authorized for backend dispatch. When a deferred pre-proxy function can mutate routing headers, its already-previewed target remains pinned across the external invocation; those mutations are forwarded only after gateway identity and egress baggage policy are restored, and cannot steer the current request onto an unpreviewed method. Retry rotation may change the backend host or port only while preserving the assembled authorized path, including proxy-path fallback; a path-changing candidate aborts the retry. Late policy rejections retain native gRPC or gRPC-Web wire framing as appropriate for the client, including gRPC-Web over HTTP/3.
 
 **Priority:** 275
 **Protocol:** gRPC only
@@ -3288,11 +3320,15 @@ Parses the gRPC path (`/package.Service/Method`) and enables per-method access c
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit.
+Each configured method accepts one optional leading slash and must use protobuf identifier grammar: `package.Service/Method`, with dot-separated service segments. Leading/trailing whitespace is normalized. Byte-identical duplicates are rejected by OpenAPI `uniqueItems`; duplicates that become equal only after trimming or slash normalization are rejected at runtime because JSON Schema cannot express canonical equality for array entries or object keys.
 
-The plugin requires at least one rule (`allow_methods`, `deny_methods`, or `method_rate_limits`) — an empty config is rejected. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+Each rate limit entry is `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit. In Redis mode, `redis_url` and `redis_key_prefix` must be non-empty, the URL must use `redis://` or `rediss://` with an authority, and pool/connect/health numeric settings must be positive.
 
-Populates `ctx.metadata` with `grpc_service`, `grpc_method`, and `grpc_full_method` in the `on_request_received` phase.
+The plugin requires at least one effective rule (`allow_methods`, a non-empty `deny_methods`, or a non-empty `method_rate_limits`) — an empty config is rejected. An explicitly empty `allow_methods` is valid block-all policy. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+
+`on_request_received` may populate provisional client-path metadata for early consumers. After the first backend target is selected, `on_backend_path_resolved` clears those three fields and replaces them from the backend-effective method before enforcing allow/deny/rate policy. A deferred external routing-header hook runs only after a non-state-consuming access preview and cannot change that selected target. An invalid backend-effective gRPC path fails closed for every policy shape, including deny-only and rate-only configurations. Retries may rotate hosts or ports but do not rotate to a target-specific path that would change the already authorized method.
+
+The backend-path boundary is shared by the HTTP/1.1 + HTTP/2 handler (including gRPC-Web requests classified as gRPC) and the HTTP/3 frontend, including its H3-to-H2 gRPC bridge.
 
 **Counter storage** (`sync_mode`): gRPC method rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter and falls back to local counters while Redis is unavailable.
 
@@ -3319,6 +3355,11 @@ Manages the `grpc-timeout` metadata header at the gateway. Can enforce maximum d
 
 **Priority:** 3050
 **Protocol:** gRPC only
+
+When backend-effective method policy such as `grpc_method_router` is active,
+deadline injection and terminal deadline rejection run after that finalized
+method-policy boundary. Without a backend-path policy, `grpc_deadline` retains
+its ordinary `before_proxy` position and behavior.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -3357,12 +3398,19 @@ Mirror response metadata (status code, response size, latency) is logged as a se
 | `mirror_host` | String | **(required)** | Hostname or IP of the mirror target |
 | `mirror_port` | Integer | 80/443 | Port of the mirror target (default based on protocol) |
 | `mirror_protocol` | String | `"http"` | `"http"` or `"https"` |
-| `mirror_path` | String | _(none)_ | Override the request path for the mirror. When unset, uses the original request path |
+| `mirror_path` | String | _(none)_ | Override the request path for the mirror. When unset, uses the backend-effective authorized path if backend-path policy is active; otherwise uses the original request path |
 | `percentage` | Float | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 | `mirror_request_body` | Boolean | `true` | Whether to include the request body in the mirror request |
 | `max_response_body_bytes` | Integer | `1048576` | Cap on bytes read from a mirror response when sizing it. Only consulted when the response has no `content-length` header — streaming aborts as soon as the limit is crossed and the truncated count is recorded. The mirror task discards the bytes after sizing, so this only bounds memory pressure from a misbehaving mirror endpoint streaming an unbounded body to a fire-and-forget task. Default is 1 MiB |
 
 When `mirror_request_body` is enabled, the plugin preserves binary payloads (including gRPC protobuf) using a binary-safe body store. Non-UTF-8 request bodies are mirrored correctly.
+
+When route-sensitive backend-path policy such as `grpc_method_router` is
+active, an unset `mirror_path` follows the finalized path that passed policy
+enforcement. This prevents a rewritten, unauthorized client method from being
+replayed to the shadow destination. An explicit `mirror_path` remains an
+operator override, and proxies without backend-path policy retain the original
+request path default.
 
 ```yaml
 plugin_name: request_mirror

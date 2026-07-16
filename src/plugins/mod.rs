@@ -2,9 +2,12 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → `transform_request_body` → `on_final_request_body` →
-//! `backend_admission` → `after_proxy` → `normalize_response_body` →
-//! `on_response_body` → `transform_response_body` → `on_final_response_body` →
+//! `before_proxy` → backend-path policy preview → deferred routing-header hooks →
+//! final backend-path enforcement → remaining deferred `before_proxy` hooks →
+//! `transform_request_body` →
+//! `on_final_request_body` → `backend_admission` → `after_proxy` →
+//! `normalize_response_body` → `on_response_body` →
+//! `transform_response_body` → `on_final_response_body` →
 //! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
@@ -111,12 +114,14 @@ use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, Proxy, ResolvedPortOverride,
-    RetryConfig, Upstream, UpstreamTarget,
+    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, HttpFlavor, Proxy,
+    ResolvedPortOverride, RetryConfig, Upstream, UpstreamTarget,
 };
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
@@ -143,6 +148,19 @@ pub enum ProxyProtocol {
     Tcp,
     /// Raw UDP datagram proxy (includes DTLS termination/origination)
     Udp,
+}
+
+/// Whether a backend-effective path policy hook is validating a provisional
+/// selection or enforcing the final selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendPathPolicyPhase {
+    /// Validate access rules before a deferred routing hook performs external
+    /// work. Stateful policy such as rate limiting must not be charged here.
+    Preview,
+    /// Enforce the settled backend-effective path immediately before the
+    /// remaining deferred hooks, a deferred-hook rejection, or backend
+    /// dispatch. Stateful policy is committed exactly once in this phase.
+    Enforce,
 }
 
 /// All protocol variants, for plugins that support every protocol.
@@ -618,6 +636,74 @@ pub struct WsDisconnectContext {
     pub metadata: HashMap<String, String>,
 }
 
+/// One-request/session cache for the authoritative, canonical client IP.
+///
+/// Client-IP resolution is complete before policy hooks run. The first policy
+/// that needs a typed address parses that final string, canonicalizes
+/// IPv4-mapped IPv6, and publishes the result here. Every later plugin instance
+/// performs only the lock-free `OnceLock::get_or_init` fast path. `None` is
+/// cached as well, preserving fail-closed behavior for malformed identities.
+#[derive(Debug, Clone, Default)]
+pub struct CanonicalClientIpCache {
+    value: OnceLock<Option<IpAddr>>,
+}
+
+impl CanonicalClientIpCache {
+    fn get_or_parse(&self, client_ip: &str) -> Option<IpAddr> {
+        *self
+            .value
+            .get_or_init(|| parse_canonical_client_ip(client_ip))
+    }
+
+    /// Whether a policy has already resolved the typed address.
+    ///
+    /// This is exposed for external regression tests that verify multiple
+    /// plugin instances share one parse. Runtime policy should call the context
+    /// accessors instead.
+    #[doc(hidden)]
+    pub fn is_initialized(&self) -> bool {
+        self.value.get().is_some()
+    }
+}
+
+fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
+    parse_client_ip_literal(client_ip).map(|ip| ip.to_canonical())
+}
+
+/// Parse the legacy client/rule literal forms without allocation.
+///
+/// IPv4 accepts the same four decimal-octet grammar used by the original
+/// `ip_restriction` matcher. Brackets and zone identifiers remain IPv6-only;
+/// accepting them on IPv4 would broaden the established policy grammar.
+fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
+    if let Some(ipv4) = parse_ipv4_client_ip_literal(client_ip) {
+        return Some(IpAddr::V4(ipv4));
+    }
+
+    let unbracketed = client_ip
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(client_ip);
+    let without_zone = unbracketed
+        .find('%')
+        .map_or(unbracketed, |index| &unbracketed[..index]);
+    without_zone.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
+}
+
+fn parse_ipv4_client_ip_literal(client_ip: &str) -> Option<Ipv4Addr> {
+    let mut octets = client_ip.split('.');
+    let ipv4 = [
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+    ];
+    if octets.next().is_some() {
+        return None;
+    }
+    Some(Ipv4Addr::from(ipv4))
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -637,6 +723,7 @@ pub struct RequestContext {
     /// resolution. Mesh authz uses this for Istio `source.ip` so forwarded
     /// `remote.ip` cannot masquerade as the direct peer.
     pub direct_client_ip: String,
+    canonical_client_ip: CanonicalClientIpCache,
     pub method: String,
     pub path: String,
     /// Canonical client-request authority for authentication mechanisms that
@@ -710,6 +797,10 @@ pub struct RequestContext {
     /// cheap; the live request uses `Arc::make_mut` after the clone is dropped.
     buffered_initial_response_header_policy_state:
         Option<Arc<BufferedInitialResponseHeaderPolicyState>>,
+    /// Client-visible HTTP flavor classified before any plugin hook can mutate
+    /// request headers. Fault rejection shaping consults this fixed value so a
+    /// transformer cannot add or remove native-gRPC semantics mid-pipeline.
+    request_http_flavor: HttpFlavor,
     /// Whether client-visible rejection responses for this request cross a
     /// WebSocket handshake boundary. Set once after request-flavor detection so
     /// the shared reject finalizer can remove transport-owned handshake fields
@@ -955,6 +1046,11 @@ pub struct RequestContext {
     /// path; VS-derived proxies never set `strip_listen_path`, so the override
     /// is the literal forwarded path.
     pub route_override_path: Option<String>,
+    /// Backend-effective path that successfully passed the final route policy
+    /// boundary. Not exposed through the public plugin API, so custom plugins
+    /// cannot forge the path consumed by security-sensitive deferred work such
+    /// as request mirroring.
+    authorized_backend_path: Option<String>,
     /// Treat `route_override_path` as an absolute backend path by disabling
     /// `strip_listen_path` on the effective proxy. Used by direct upstream
     /// routers when the override is already the final upstream URL path rather
@@ -1045,6 +1141,7 @@ impl RequestContext {
         Self {
             direct_client_ip: client_ip.clone(),
             client_ip,
+            canonical_client_ip: CanonicalClientIpCache::default(),
             method,
             path,
             request_authority: None,
@@ -1066,6 +1163,7 @@ impl RequestContext {
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
+            request_http_flavor: HttpFlavor::Plain,
             websocket_response_boundary: false,
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
@@ -1114,6 +1212,7 @@ impl RequestContext {
             route_override_request_transform: None,
             route_override_response_transform: None,
             route_override_path: None,
+            authorized_backend_path: None,
             route_override_path_is_absolute: false,
             route_override_authority: None,
             node_waypoint_pod_uid: None,
@@ -1133,12 +1232,34 @@ impl RequestContext {
         self.response_stream_id
     }
 
+    /// Return the authoritative client IP as a canonical typed address.
+    ///
+    /// The value is parsed at most once after trusted-forwarding resolution and
+    /// reused by every policy instance attached to this request.
+    pub fn canonical_client_ip(&self) -> Option<IpAddr> {
+        self.canonical_client_ip.get_or_parse(&self.client_ip)
+    }
+
+    /// Whether [`Self::canonical_client_ip`] has initialized the shared cache.
+    #[doc(hidden)]
+    pub fn canonical_client_ip_is_initialized(&self) -> bool {
+        self.canonical_client_ip.is_initialized()
+    }
+
     pub(crate) fn mark_gateway_response_compression(&mut self, algorithm: &'static str) {
         self.gateway_response_compression_algorithm = Some(algorithm);
     }
 
     pub(crate) fn gateway_response_compression_algorithm(&self) -> Option<&'static str> {
         self.gateway_response_compression_algorithm
+    }
+
+    pub(crate) fn bind_authorized_backend_path(&mut self, path: String) {
+        self.authorized_backend_path = Some(path);
+    }
+
+    pub(crate) fn authorized_backend_path(&self) -> Option<&str> {
+        self.authorized_backend_path.as_deref()
     }
 
     /// Begin tracking initial-response policy against genuine initial headers
@@ -1183,6 +1304,7 @@ impl RequestContext {
         Self {
             client_ip: self.client_ip.clone(),
             direct_client_ip: self.direct_client_ip.clone(),
+            canonical_client_ip: self.canonical_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
             request_authority: self.request_authority.clone(),
@@ -1218,6 +1340,7 @@ impl RequestContext {
             pending_claim_headers: HashMap::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             buffered_initial_response_header_policy_state: None,
+            request_http_flavor: self.request_http_flavor,
             websocket_response_boundary: self.websocket_response_boundary,
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
@@ -1266,6 +1389,7 @@ impl RequestContext {
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
             route_override_path: self.route_override_path.clone(),
+            authorized_backend_path: self.authorized_backend_path.clone(),
             route_override_path_is_absolute: self.route_override_path_is_absolute,
             route_override_authority: self.route_override_authority.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
@@ -1294,6 +1418,15 @@ impl RequestContext {
 
     pub(crate) fn set_websocket_response_boundary(&mut self, enabled: bool) {
         self.websocket_response_boundary = enabled;
+    }
+
+    pub(crate) fn set_request_http_flavor(&mut self, flavor: HttpFlavor) {
+        self.request_http_flavor = flavor;
+        self.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
+    }
+
+    pub(crate) fn is_native_grpc_request(&self) -> bool {
+        matches!(self.request_http_flavor, HttpFlavor::Grpc)
     }
 
     pub(crate) fn has_websocket_response_boundary(&self) -> bool {
@@ -2755,6 +2888,9 @@ pub struct StreamConnectionContext {
     /// `mesh_authz` to populate Istio's `source.ip` principal (socket peer)
     /// separately from `remote.ip` (forwarded/resolved address).
     pub direct_client_ip: String,
+    /// Shared typed-client-IP cache for stream policy instances.
+    #[doc(hidden)]
+    pub canonical_client_ip: CanonicalClientIpCache,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub listen_port: u16,
@@ -2818,6 +2954,20 @@ pub struct StreamConnectionContext {
 }
 
 impl StreamConnectionContext {
+    /// Return the authoritative stream client IP as a canonical typed address.
+    ///
+    /// The value is parsed at most once per TCP connection or UDP/DTLS session
+    /// and reused by every attached policy instance.
+    pub fn canonical_client_ip(&self) -> Option<IpAddr> {
+        self.canonical_client_ip.get_or_parse(&self.client_ip)
+    }
+
+    /// Whether [`Self::canonical_client_ip`] has initialized the shared cache.
+    #[doc(hidden)]
+    pub fn canonical_client_ip_is_initialized(&self) -> bool {
+        self.canonical_client_ip.is_initialized()
+    }
+
     /// Return the stable authenticated identity for stream policies. A mapped
     /// Consumer username takes precedence over any external authenticated identity.
     pub fn effective_identity(&self) -> Option<&str> {
@@ -2922,7 +3072,7 @@ pub struct StreamTransactionSummary {
 ///
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
-/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
+/// | Early     | 0–949       | Matched-request tracing and preflight     | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
@@ -3156,7 +3306,17 @@ pub trait Plugin: Send + Sync {
         priority::DEFAULT
     }
 
-    /// Called when a request is first received (before routing).
+    /// Called after routing and per-proxy allowed-method admission succeed.
+    /// Native gRPC requests must also use `POST` before this hook runs.
+    ///
+    /// The hook receives a context whose `matched_proxy` is populated and runs
+    /// over the resolved plugin view for that proxy (applicable global plugins
+    /// plus proxy/proxy-group-scoped plugins). An unmatched route returns 404,
+    /// and a matched route with a disallowed method returns 405, before any
+    /// `on_request_received` hook runs. Consequently neither global nor scoped
+    /// implementations observe those two early terminal paths on H1, H2, or H3.
+    /// Terminal transaction logging is a separate lifecycle concern and must
+    /// not be inferred from whether this ordinary request hook ran.
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
     }
@@ -3310,6 +3470,51 @@ pub trait Plugin: Send + Sync {
         &self,
         _ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when `before_proxy` can dispatch external work or
+    /// synthesize a terminal response and therefore must wait until an active
+    /// backend-path policy has authorized the resolved route and target path.
+    ///
+    /// The ordinary plugin pipeline is unchanged when no backend-path plugin
+    /// is active. Opt-in hooks retain their relative order in a deferred pass.
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when a deferred `before_proxy` hook can mutate headers
+    /// that normally participate in upstream target selection. The gateway
+    /// runs these hooks in a separate deferred subphase after an access preview
+    /// and pins that previewed target across the external call; the returned
+    /// headers cannot steer this request onto an unpreviewed path.
+    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin must inspect the backend-effective path
+    /// after route overrides and load balancing have selected the first target.
+    ///
+    /// The plugin cache precomputes this opt-in list, so requests without a
+    /// participating plugin do not scan the full chain at this boundary.
+    fn requires_backend_path_resolution(&self) -> bool {
+        false
+    }
+
+    /// Called after the backend-effective path has been assembled from the
+    /// route override, listen-path stripping, proxy/backend path, and selected
+    /// upstream target path, but before any backend is dialed.
+    ///
+    /// When a deferred hook can mutate routing headers, `Preview` runs before
+    /// that hook and `Enforce` runs afterward against the same pinned target.
+    /// Otherwise only `Enforce` runs. Implementations must keep `Preview` free
+    /// of state-consuming effects such as rate-limit charges.
+    async fn on_backend_path_resolved(
+        &self,
+        _ctx: &mut RequestContext,
+        _backend_path: &str,
+        _phase: BackendPathPolicyPhase,
     ) -> PluginResult {
         PluginResult::Continue
     }
@@ -3501,6 +3706,17 @@ pub trait Plugin: Send + Sync {
     /// the shared finalizer, before any response bytes are sent.
     fn may_replace_rejection_response(&self) -> bool {
         false
+    }
+
+    /// Returns `true` when a successful reject-path response replacement
+    /// should emit a warning.
+    ///
+    /// Fail-closed enforcement plugins should retain the default. A plugin
+    /// performing an expected protocol normalization (for example suppressing
+    /// a `HEAD` response body without changing its representation) may return
+    /// `false`; the replacement is then logged at debug level instead.
+    fn warn_on_rejection_response_replacement(&self) -> bool {
+        true
     }
 
     /// Returns `true` if this plugin needs the entire response body buffered
@@ -3862,6 +4078,15 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Called for transaction logging.
+    ///
+    /// Buffered HTTP-family handlers await each plugin's hook sequentially
+    /// before returning the response. Native H3 also awaits the hooks after it
+    /// has synchronously driven the response body to completion. Hyper-owned
+    /// streamed H1/H2/gRPC bodies instead spawn terminal hooks and logging when
+    /// the body completes; that spawned work can be lost if no runtime remains
+    /// during shutdown. Plugins should hand slow I/O to a bounded,
+    /// lifecycle-owned worker rather than awaiting it inline or spawning one
+    /// unbounded task per transaction.
     async fn log(&self, _summary: &TransactionSummary) {}
 
     /// Called for transaction logging with a precomputed mesh RED key when
@@ -4168,16 +4393,17 @@ pub fn create_plugin_with_http_client(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
-    // Fail CLOSED before constructing plugins with literal endpoints. Some
-    // (ldap_auth, kafka_logging, ws_logging) dial through their own resolver;
-    // jwks_auth uses the shared client but must still reject denied literals at
-    // config admission rather than installing a permanently keyless provider.
+    // Fail CLOSED before constructing plugins with literal endpoints. LDAP uses
+    // a dedicated fresh, policy-screened dial resolver; kafka_logging and
+    // ws_logging dial through their own clients. JWKS uses the shared client but
+    // must still reject denied literals at config admission rather than
+    // installing a permanently keyless provider.
     // The production `PluginCache` is built with the real-policy client
     // (`proxy/mod.rs` → `PluginHttpClient::new` → `with_http_client`), this also
     // makes a database-mode legacy row pointing at e.g. `169.254.169.254` exclude
-    // the plugin instead of letting its background loop reach the metadata service
-    // (warn-only validation can't stop that — there is no runtime egress backstop
-    // for these clients, unlike proxy/Redis dispatch).
+    // the plugin instead of letting its background loop reach the metadata service.
+    // LDAP repeats this screen at every dial; config admission remains useful for
+    // rejecting an invalid literal before the plugin can enter the runtime cache.
     screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
@@ -4518,9 +4744,9 @@ pub fn validate_plugin_config_with_policy(
     // endpoint must be rejected here at config-load.
     screen_redis_endpoint_egress(config, backend_allow_ips)?;
     // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
-    // screened *inside* `create_plugin_with_http_client` above (before the
-    // dial task spawns), so no explicit `screen_direct_client_endpoint_egress`
-    // call is needed here — that path already failed closed on a denial.
+    // screened *inside* `create_plugin_with_http_client` above (before a dial),
+    // so no explicit `screen_direct_client_endpoint_egress` call is needed
+    // here. LDAP additionally repeats the policy check at dial time.
     Ok(())
 }
 
@@ -4563,17 +4789,16 @@ pub(crate) fn screen_redis_endpoint_egress(
 }
 
 /// Screen literal-IP endpoints that require config-admission enforcement.
-/// `jwks_auth` retains the shared client's runtime DNS/IP backstop, while
-/// `ldap_auth` (`ldap_url`, via `ldap3`), `kafka_logging` (`broker_list`, via
-/// librdkafka), and `ws_logging` dial outside it. A denied literal endpoint
-/// would otherwise pass file/admin validation and either install a permanently
-/// keyless auth provider or reach the metadata service at runtime. Reject it at
-/// config-load.
+/// `jwks_auth` retains the shared client's runtime DNS/IP backstop, and
+/// `ldap_auth` (`ldap_url`) has a dedicated dial-time resolver/backstop.
+/// `kafka_logging` (`broker_list`, via librdkafka) and `ws_logging` dial outside
+/// the shared resolver. A denied literal endpoint must still be rejected at
+/// config-load so file/admin/DB/CP-DP admission is consistent with runtime.
 ///
-/// For the clients outside `DnsCache`, hostname endpoints that later rebind to
-/// a denied address are an accepted limitation, mirroring the
-/// `rediss://`-hostname case documented in `redis_rate_limiter`. JWKS hostname
-/// resolution retains the shared client's runtime policy backstop.
+/// LDAP hostnames are freshly resolved and screened immediately before every
+/// connection/reconnection. Other clients outside `DnsCache` retain their
+/// documented hostname limitations; JWKS hostname resolution keeps the shared
+/// client's runtime policy backstop.
 pub(crate) fn screen_direct_client_endpoint_egress(
     name: &str,
     config: &Value,

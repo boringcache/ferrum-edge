@@ -41,9 +41,9 @@ use crate::plugins::{
 // ---------------------------------------------------------------------------
 
 use crate::plugins::{
-    PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
-    StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
-    WebSocketFrameDirection,
+    BackendPathPolicyPhase, PluginResult, RequestContext, ResponseStreamInspector,
+    StreamConnectionContext, StreamTransactionSummary, TransactionSummary, UdpDatagramContext,
+    UdpDatagramVerdict, WebSocketFrameDirection,
 };
 use async_trait::async_trait;
 
@@ -242,6 +242,26 @@ impl Plugin for PriorityOverridePlugin {
     ) -> PluginResult {
         self.inner.before_proxy(ctx, headers).await
     }
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        self.inner.defer_before_proxy_until_backend_path_resolved()
+    }
+    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
+        self.inner
+            .deferred_before_proxy_may_change_routing_headers()
+    }
+    fn requires_backend_path_resolution(&self) -> bool {
+        self.inner.requires_backend_path_resolution()
+    }
+    async fn on_backend_path_resolved(
+        &self,
+        ctx: &mut RequestContext,
+        backend_path: &str,
+        phase: BackendPathPolicyPhase,
+    ) -> PluginResult {
+        self.inner
+            .on_backend_path_resolved(ctx, backend_path, phase)
+            .await
+    }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();
     }
@@ -321,6 +341,12 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn applies_after_proxy_on_reject(&self) -> bool {
         self.inner.applies_after_proxy_on_reject()
+    }
+    fn may_replace_rejection_response(&self) -> bool {
+        self.inner.may_replace_rejection_response()
+    }
+    fn warn_on_rejection_response_replacement(&self) -> bool {
+        self.inner.warn_on_rejection_response_replacement()
     }
     fn requires_response_body_buffering(&self) -> bool {
         self.inner.requires_response_body_buffering()
@@ -848,7 +874,7 @@ struct AdaptiveConcurrencyInstance {
     proxy_id: Option<String>,
     route_definition: AdaptiveConcurrencyRouteDefinition,
     generation: u64,
-    drain_older_generation: bool,
+    reset_tracking_space: bool,
 }
 
 type AdaptiveConcurrencyInstanceMap =
@@ -1663,10 +1689,11 @@ fn adaptive_concurrency_has_zero_target_sentinel(keys: &[AdaptiveConcurrencyRout
 }
 
 /// Existing target keys keep their counters during strict scale-out. Any
-/// retirement/replacement still drains, as do expansions involving the
-/// zero-target sentinel because it identifies a route source rather than a
-/// concrete limiter key and can collide across sources sharing one scope.
-fn adaptive_concurrency_key_space_requires_drain(
+/// retirement/replacement requires an independent tracking space, as do
+/// expansions involving the zero-target sentinel because it identifies a route
+/// source rather than a concrete limiter key and can collide across sources
+/// sharing one scope.
+fn adaptive_concurrency_key_space_requires_reset(
     current: &[AdaptiveConcurrencyRouteKey],
     replacement: &[AdaptiveConcurrencyRouteKey],
 ) -> bool {
@@ -1683,7 +1710,7 @@ fn adaptive_concurrency_key_space_requires_drain(
         .all(|key| replacement.binary_search(key).is_ok())
 }
 
-fn adaptive_concurrency_route_definition_requires_drain(
+fn adaptive_concurrency_route_definition_requires_reset(
     current: &AdaptiveConcurrencyRouteDefinition,
     replacement: &AdaptiveConcurrencyRouteDefinition,
 ) -> bool {
@@ -1718,7 +1745,7 @@ fn adaptive_concurrency_route_definition_requires_drain(
     {
         return true;
     }
-    adaptive_concurrency_key_space_requires_drain(&current.keys, &replacement.keys)
+    adaptive_concurrency_key_space_requires_reset(&current.keys, &replacement.keys)
 }
 
 fn adaptive_concurrency_lb_key_space_changed(
@@ -1729,7 +1756,7 @@ fn adaptive_concurrency_lb_key_space_changed(
     let current_keys = adaptive_concurrency_effective_lb_keys(&instance.route_definition, current);
     let replacement_keys =
         adaptive_concurrency_effective_lb_keys(&instance.route_definition, replacement);
-    adaptive_concurrency_key_space_requires_drain(&current_keys, &replacement_keys)
+    adaptive_concurrency_key_space_requires_reset(&current_keys, &replacement_keys)
 }
 
 fn retained_adaptive_concurrency_states(
@@ -1854,8 +1881,7 @@ fn create_adaptive_concurrency_plugin(
         )));
     }
 
-    let (limiter, generation, drain_older_generation) = if let Some(existing) =
-        current.get(&identity)
+    let (limiter, generation, reset_tracking_space) = if let Some(existing) = current.get(&identity)
     {
         let generation = existing.generation.checked_add(1).ok_or_else(|| {
             format!(
@@ -1863,18 +1889,19 @@ fn create_adaptive_concurrency_plugin(
                 pc.namespace, pc.id
             )
         })?;
-        (
-            Arc::clone(&existing.limiter),
-            generation,
-            existing.config.key_by != parsed.key_by
-                || parsed.max_tracked_keys < existing.config.max_tracked_keys
-                || existing.scope != pc.scope
-                || existing.proxy_id != pc.proxy_id
-                || adaptive_concurrency_route_definition_requires_drain(
-                    &existing.route_definition,
-                    &route_definition,
-                ),
-        )
+        let structural_change = existing.config.key_by != parsed.key_by
+            || parsed.max_tracked_keys < existing.config.max_tracked_keys
+            || existing.scope != pc.scope
+            || existing.proxy_id != pc.proxy_id
+            || adaptive_concurrency_route_definition_requires_reset(
+                &existing.route_definition,
+                &route_definition,
+            );
+        // Keep the generation lifecycle shared so pinned retired cache views
+        // are rejected after a structural cutover. The limiter rotates its
+        // target-tracking space at commit, allowing permits from the detached
+        // space to finish without blocking or training the replacement.
+        (Arc::clone(&existing.limiter), generation, structural_change)
     } else {
         (
             Arc::new(AdaptiveConcurrencyLimiter::new(
@@ -1900,7 +1927,7 @@ fn create_adaptive_concurrency_plugin(
             proxy_id: pc.proxy_id.clone(),
             route_definition,
             generation,
-            drain_older_generation,
+            reset_tracking_space,
         },
     );
     Ok(Some(Arc::new(plugin)))
@@ -2069,6 +2096,8 @@ impl PluginCapabilities {
     pub const HAS_RESPONSE_COMMITTED_HOOK: u16 = 1 << 8;
     pub const HAS_RESPONSE_STREAM_HOOKS: u16 = 1 << 9;
     pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
+    pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
+    pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -2086,6 +2115,8 @@ pub struct PluginPhaseData {
     pub authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Backend-admission plugins only (pre-filtered from the protocol plugin list).
     pub backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Plugins that inspect the backend-effective path after route resolution.
+    pub backend_path_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Credential-bearing request header names used by safe downstream views.
     pub request_headers_to_redact: Arc<Vec<String>>,
     /// Deterministic initial-response header policy plugins, already filtered
@@ -2103,6 +2134,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut auth = Vec::new();
     let mut authorize = Vec::new();
     let mut backend_admission = Vec::new();
+    let mut backend_path = Vec::new();
     let mut request_headers_to_redact = Vec::new();
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
@@ -2116,6 +2148,13 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.is_backend_admission_plugin() {
             backend_admission.push(Arc::clone(p));
+        }
+        if p.requires_backend_path_resolution() {
+            caps |= PluginCapabilities::HAS_BACKEND_PATH_PLUGINS;
+            backend_path.push(Arc::clone(p));
+        }
+        if p.deferred_before_proxy_may_change_routing_headers() {
+            caps |= PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS;
         }
         if p.is_initial_response_header_policy() {
             initial_response_header_policy_plugins.push(Arc::clone(p));
@@ -2168,6 +2207,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         auth_plugins: Arc::new(auth),
         authorize_plugins: Arc::new(authorize),
         backend_admission_plugins: Arc::new(backend_admission),
+        backend_path_plugins: Arc::new(backend_path),
         request_headers_to_redact: Arc::new(request_headers_to_redact),
         initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
@@ -2374,7 +2414,7 @@ impl PluginCacheInner {
         for instance in self.adaptive_concurrency_instances.values() {
             instance
                 .limiter
-                .prepare_policy_generation(instance.generation, instance.drain_older_generation);
+                .prepare_policy_generation(instance.generation, instance.reset_tracking_space);
         }
     }
 
@@ -2383,7 +2423,7 @@ impl PluginCacheInner {
             instance.limiter.commit_policy_generation(
                 instance.generation,
                 Arc::clone(&instance.config),
-                instance.drain_older_generation,
+                instance.reset_tracking_space,
             );
         }
     }
@@ -2395,11 +2435,11 @@ impl PluginCacheInner {
         replacement: &crate::load_balancer::LoadBalancerCacheInner,
     ) {
         for instance in self.adaptive_concurrency_instances.values() {
-            let drain_older_generation =
+            let reset_tracking_space =
                 adaptive_concurrency_lb_key_space_changed(instance, current, replacement);
             instance
                 .limiter
-                .prepare_lb_generation(generation, drain_older_generation);
+                .prepare_lb_generation(generation, reset_tracking_space);
         }
     }
 
@@ -2410,11 +2450,11 @@ impl PluginCacheInner {
         replacement: &crate::load_balancer::LoadBalancerCacheInner,
     ) {
         for instance in self.adaptive_concurrency_instances.values() {
-            let drain_older_generation =
+            let reset_tracking_space =
                 adaptive_concurrency_lb_key_space_changed(instance, current, replacement);
             instance
                 .limiter
-                .commit_lb_generation(generation, drain_older_generation);
+                .commit_lb_generation(generation, reset_tracking_space);
         }
     }
 
@@ -2471,6 +2511,16 @@ impl PluginCacheInner {
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
         self.protocol_entry(proxy_id, protocol)
             .map(|entry| Arc::clone(&entry.phase.backend_admission_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn get_backend_path_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.backend_path_plugins))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
@@ -2540,17 +2590,22 @@ impl PluginCacheInner {
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> PluginCacheRequestView {
+        let capabilities = self.get_capabilities(proxy_id, protocol);
+        let backend_path_plugins = capabilities
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+            .then(|| self.get_backend_path_plugins(proxy_id, protocol));
         PluginCacheRequestView {
             plugins: self.get_plugins_for_protocol(proxy_id, protocol),
             auth_plugins: self.get_auth_plugins(proxy_id, protocol),
             authorize_plugins: self.get_authorize_plugins(proxy_id, protocol),
             backend_admission_plugins: self.get_backend_admission_plugins(proxy_id, protocol),
+            backend_path_plugins,
             request_headers_to_redact: self.get_request_headers_to_redact(proxy_id, protocol),
             initial_response_header_policy_plugins: self
                 .get_initial_response_header_policy_plugins(proxy_id, protocol),
             initial_response_header_policy_names: self
                 .get_initial_response_header_policy_names(proxy_id, protocol),
-            capabilities: self.get_capabilities(proxy_id, protocol),
+            capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
             requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_id),
@@ -2569,6 +2624,7 @@ pub struct PluginCacheRequestView {
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    backend_path_plugins: Option<Arc<Vec<Arc<dyn Plugin>>>>,
     request_headers_to_redact: Arc<Vec<String>>,
     initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     initial_response_header_policy_names: Arc<Vec<String>>,
@@ -2597,6 +2653,14 @@ impl PluginCacheRequestView {
     /// Get pre-computed backend admission plugins from this request view.
     pub fn backend_admission_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.backend_admission_plugins)
+    }
+
+    /// Get plugins that inspect the finalized backend path.
+    pub fn backend_path_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.backend_path_plugins
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Get credential-bearing request headers precomputed for safe downstream views.

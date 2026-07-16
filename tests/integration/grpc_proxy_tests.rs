@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,13 +19,13 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http2::Builder as Http2ServerBuilder;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
+use hyper::{Method, Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginConfig, PluginScope, Proxy,
-    ResponseBodyMode,
+    AuthMode, BackendScheme, BackoffStrategy, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
+    PluginConfig, PluginScope, Proxy, ResponseBodyMode, RetryConfig, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::proxy::ProxyState;
@@ -216,6 +218,14 @@ fn create_test_proxy_state_with_plugins(
     proxies: Vec<Proxy>,
     plugin_configs: Vec<PluginConfig>,
 ) -> ProxyState {
+    create_test_proxy_state_with_plugins_and_upstreams(proxies, plugin_configs, Vec::new())
+}
+
+fn create_test_proxy_state_with_plugins_and_upstreams(
+    proxies: Vec<Proxy>,
+    plugin_configs: Vec<PluginConfig>,
+    upstreams: Vec<Upstream>,
+) -> ProxyState {
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: HashMap::new(),
         resolver_addresses: None,
@@ -242,7 +252,7 @@ fn create_test_proxy_state_with_plugins(
         proxies,
         consumers: vec![],
         plugin_configs,
-        upstreams: vec![],
+        upstreams,
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
         ..Default::default()
@@ -250,6 +260,36 @@ fn create_test_proxy_state_with_plugins(
     let (state, _health_check_handles) =
         ProxyState::new(config, dns_cache, create_test_env_config(), None, None).unwrap();
     state
+}
+
+fn create_test_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        name: Some(format!("gRPC Test Upstream {id}")),
+        targets,
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
 }
 
 fn security_headers_plugin(id: &str) -> PluginConfig {
@@ -391,6 +431,21 @@ async fn start_mock_grpc_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) 
     (addr, handle)
 }
 
+async fn start_connection_counting_backend()
+-> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let task_count = Arc::clone(&connection_count);
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            task_count.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    (addr, connection_count, handle)
+}
+
 /// Start the gateway proxy listener and return the address.
 ///
 /// Uses an internal listener approach to avoid port race conditions:
@@ -489,7 +544,396 @@ async fn send_grpc_request(
     Ok((status, headers, body_bytes))
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TestHttpVersion {
+    H1,
+    H2,
+}
+
+async fn send_http_request(
+    gateway_addr: SocketAddr,
+    version: TestHttpVersion,
+    method: Method,
+    path: &str,
+    content_type: &str,
+) -> Result<(u16, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await?;
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "localhost")
+        .header("content-type", content_type)
+        .body(Full::new(Bytes::from_static(&[0u8, 0, 0, 0, 0])))?;
+
+    let response = match version {
+        TestHttpVersion::H1 => {
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+            tokio::spawn(async move {
+                if let Err(error) = conn.await {
+                    eprintln!("HTTP/1 test client connection error: {error}");
+                }
+            });
+            sender.send_request(request).await?
+        }
+        TestHttpVersion::H2 => {
+            let (mut sender, conn) =
+                hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await?;
+            tokio::spawn(async move {
+                if let Err(error) = conn.await {
+                    eprintln!("HTTP/2 test client connection error: {error}");
+                }
+            });
+            sender.send_request(request).await?
+        }
+    };
+
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes().to_vec())
+        .unwrap_or_default();
+    Ok((status, headers, body))
+}
+
+fn test_plugin_config(
+    id: &str,
+    plugin_name: &str,
+    proxy_id: &str,
+    config: serde_json::Value,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: plugin_name.to_string(),
+        enabled: true,
+        config,
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn attach_test_plugin(proxy: &mut Proxy, plugin_config_id: &str) {
+    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: plugin_config_id.to_string(),
+    }];
+}
+
 // --- Integration Tests ---
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_early_rejects_are_browser_safe_on_h1_and_h2() {
+    let backend_port = 9;
+
+    let mut allowed = create_grpc_proxy("grpc-web-allowed", "/allowed", backend_port);
+    allowed.allowed_methods = Some(vec!["POST".to_string()]);
+
+    let non_post = create_grpc_proxy("grpc-web-non-post", "/non-post", backend_port);
+
+    let mut terminated = create_grpc_proxy("grpc-web-terminated", "/terminated", backend_port);
+    attach_test_plugin(&mut terminated, "grpc-web-termination");
+
+    let mut authenticate =
+        create_grpc_proxy("grpc-web-authenticate", "/authenticate", backend_port);
+    attach_test_plugin(&mut authenticate, "grpc-web-key-auth");
+
+    let mut authorize = create_grpc_proxy("grpc-web-authorize", "/authorize", backend_port);
+    attach_test_plugin(&mut authorize, "grpc-web-access-control");
+
+    let mut before_proxy =
+        create_grpc_proxy("grpc-web-before-proxy", "/before-proxy", backend_port);
+    attach_test_plugin(&mut before_proxy, "grpc-web-deadline");
+
+    let plugins = vec![
+        test_plugin_config(
+            "grpc-web-termination",
+            "request_termination",
+            "grpc-web-terminated",
+            serde_json::json!({"status_code": 503}),
+        ),
+        test_plugin_config(
+            "grpc-web-key-auth",
+            "key_auth",
+            "grpc-web-authenticate",
+            serde_json::json!({}),
+        ),
+        test_plugin_config(
+            "grpc-web-access-control",
+            "access_control",
+            "grpc-web-authorize",
+            serde_json::json!({"allowed_consumers": ["allowed"]}),
+        ),
+        test_plugin_config(
+            "grpc-web-deadline",
+            "grpc_deadline",
+            "grpc-web-before-proxy",
+            serde_json::json!({"reject_no_deadline": true}),
+        ),
+    ];
+    let state = create_test_proxy_state_with_plugins(
+        vec![
+            allowed,
+            non_post,
+            terminated,
+            authenticate,
+            authorize,
+            before_proxy,
+        ],
+        plugins,
+    );
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let cases = [
+        (
+            Method::POST,
+            "/missing/pkg.Service/Call",
+            "route miss",
+            5u32,
+        ),
+        (
+            Method::PUT,
+            "/allowed/pkg.Service/Call",
+            "allowed methods",
+            12,
+        ),
+        (Method::GET, "/non-post/pkg.Service/Call", "non-POST", 3),
+        (
+            Method::POST,
+            "/terminated/pkg.Service/Call",
+            "on_request_received",
+            14,
+        ),
+        (
+            Method::POST,
+            "/authenticate/pkg.Service/Call",
+            "authenticate",
+            16,
+        ),
+        (Method::POST, "/authorize/pkg.Service/Call", "authorize", 16),
+        (
+            Method::POST,
+            "/before-proxy/pkg.Service/Call",
+            "initial before_proxy",
+            3,
+        ),
+    ];
+
+    for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
+        for (method, path, phase, grpc_status) in &cases {
+            let (status, headers, body) = send_http_request(
+                gateway_addr,
+                version,
+                method.clone(),
+                path,
+                "application/grpc-web+proto",
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{version:?} {phase} request failed: {error}"));
+            assert_eq!(status, 200, "{version:?} {phase} HTTP status");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/grpc-web+proto"),
+                "{version:?} {phase} content type"
+            );
+            assert!(
+                !headers.contains_key("grpc-status") && !headers.contains_key("grpc-message"),
+                "{version:?} {phase} terminal gRPC metadata must remain body-only"
+            );
+            assert_eq!(
+                body.first(),
+                Some(&0x80),
+                "{version:?} {phase} trailer flag"
+            );
+            let expected = format!("grpc-status: {grpc_status}\r\n");
+            assert!(
+                body.windows(expected.len())
+                    .any(|window| window == expected.as_bytes()),
+                "{version:?} {phase} trailer body must contain {expected:?}"
+            );
+        }
+    }
+
+    let (status, headers, _) = send_http_request(
+        gateway_addr,
+        TestHttpVersion::H2,
+        Method::POST,
+        "/missing/pkg.Service/Call",
+        "application/grpc-website",
+    )
+    .await
+    .expect("deceptive content-type request");
+    assert_eq!(status, 404);
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+
+    let (status, headers, body) = send_http_request(
+        gateway_addr,
+        TestHttpVersion::H2,
+        Method::POST,
+        "/missing/pkg.Service/Call",
+        "application/grpc",
+    )
+    .await
+    .expect("native gRPC route-miss request");
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("5"));
+    assert!(
+        body.is_empty(),
+        "native gRPC reject must remain trailers-only"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_method_policy_precedes_missing_deadline_on_h1_and_h2() {
+    let backend_port = 9;
+
+    let mut method_policy = create_grpc_proxy(
+        "grpc-method-before-deadline",
+        "/method-policy",
+        backend_port,
+    );
+    method_policy.plugins = ["method-policy-router", "method-policy-deadline"]
+        .into_iter()
+        .map(
+            |plugin_config_id| ferrum_edge::config::types::PluginAssociation {
+                plugin_config_id: plugin_config_id.to_string(),
+            },
+        )
+        .collect();
+
+    let mut deadline_only = create_grpc_proxy("grpc-deadline-only", "/deadline-only", backend_port);
+    attach_test_plugin(&mut deadline_only, "deadline-only");
+
+    let plugins = vec![
+        test_plugin_config(
+            "method-policy-router",
+            "grpc_method_router",
+            "grpc-method-before-deadline",
+            serde_json::json!({
+                "allow_methods": ["pkg.Service/Allowed", "pkg.Service/RateLimited"],
+                "deny_methods": ["pkg.Service/Denied"],
+                "method_rate_limits": {
+                    "pkg.Service/RateLimited": {
+                        "max_requests": 1,
+                        "window_seconds": 60
+                    }
+                }
+            }),
+        ),
+        test_plugin_config(
+            "method-policy-deadline",
+            "grpc_deadline",
+            "grpc-method-before-deadline",
+            serde_json::json!({"reject_no_deadline": true}),
+        ),
+        test_plugin_config(
+            "deadline-only",
+            "grpc_deadline",
+            "grpc-deadline-only",
+            serde_json::json!({"reject_no_deadline": true}),
+        ),
+    ];
+    let state = create_test_proxy_state_with_plugins(vec![method_policy, deadline_only], plugins);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
+        for (path, expected_grpc_status, case) in [
+            (
+                "/method-policy/pkg.Service/Denied",
+                "7",
+                "backend-effective method denial",
+            ),
+            (
+                "/deadline-only/pkg.Service/Allowed",
+                "3",
+                "deadline-only control",
+            ),
+        ] {
+            let (status, headers, body) = send_http_request(
+                gateway_addr,
+                version,
+                Method::POST,
+                path,
+                "application/grpc-web+proto",
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{version:?} {case} request failed: {error}"));
+            assert_eq!(status, 200, "{version:?} {case} HTTP status");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/grpc-web+proto"),
+                "{version:?} {case} content type"
+            );
+            let expected = format!("grpc-status: {expected_grpc_status}\r\n");
+            assert!(
+                body.windows(expected.len())
+                    .any(|window| window == expected.as_bytes()),
+                "{version:?} {case} must contain {expected:?}"
+            );
+        }
+    }
+
+    // The first request consumes the finalized method bucket before the
+    // missing-deadline rejection. The second must therefore be rejected by
+    // method policy instead of bypassing that stateful boundary again.
+    for expected_grpc_status in ["3", "8"] {
+        let (status, _headers, body) = send_http_request(
+            gateway_addr,
+            TestHttpVersion::H2,
+            Method::POST,
+            "/method-policy/pkg.Service/RateLimited",
+            "application/grpc-web+proto",
+        )
+        .await
+        .expect("H2 rate/deadline ordering request");
+        assert_eq!(status, 200);
+        let expected = format!("grpc-status: {expected_grpc_status}\r\n");
+        assert!(
+            body.windows(expected.len())
+                .any(|window| window == expected.as_bytes()),
+            "rate/deadline ordering response must contain {expected:?}"
+        );
+    }
+
+    let (status, headers, body) = send_http_request(
+        gateway_addr,
+        TestHttpVersion::H2,
+        Method::POST,
+        "/method-policy/pkg.Service/Denied",
+        "application/grpc",
+    )
+    .await
+    .expect("native H2 method/deadline ordering request");
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
+    assert!(
+        body.is_empty(),
+        "native gRPC rejection must remain bodyless"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_grpc_unary_proxy_through_gateway() {
@@ -1947,6 +2391,191 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
             .windows(b"grpc-status: 14".len())
             .any(|w| w == b"grpc-status: 14"),
         "gRPC-Web error body must embed the gateway's grpc-status: 14 (UNAVAILABLE)"
+    );
+}
+
+/// A backend-effective method rejection happens after prefix stripping and
+/// target selection, but gRPC-Web clients must still receive the browser-safe
+/// trailer-frame representation instead of a native gRPC Trailers-Only reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_backend_path_policy_reject_is_grpc_web_shaped() {
+    let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
+
+    let mut proxy = create_grpc_proxy("grpc-web-method-policy", "/grpc", backend_addr.port());
+    proxy.plugins = vec![
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-method-policy-bridge".to_string(),
+        },
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-method-policy-router".to_string(),
+        },
+    ];
+    let grpc_web = PluginConfig {
+        id: "grpc-web-method-policy-bridge".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_web".to_string(),
+        enabled: true,
+        config: serde_json::json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-web-method-policy".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let method_router = PluginConfig {
+        id: "grpc-web-method-policy-router".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_method_router".to_string(),
+        enabled: true,
+        config: serde_json::json!({
+            "deny_methods": ["my.Service/Unary"]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-web-method-policy".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![grpc_web, method_router]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/grpc/my.Service/Unary")
+        .header("content-type", "application/grpc-web+proto")
+        .body(Full::new(Bytes::from_static(&[0u8, 0, 0, 0, 0])))
+        .unwrap();
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("method-policy request send failed");
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/grpc-web+proto")
+    );
+    assert!(!response.headers().contains_key("grpc-status"));
+    assert!(!response.headers().contains_key("grpc-message"));
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes().to_vec())
+        .unwrap_or_default();
+    assert!(
+        body.contains(&0x80),
+        "gRPC-Web reject must contain a trailer frame"
+    );
+    assert!(
+        body.windows(b"grpc-status: 7".len())
+            .any(|window| window == b"grpc-status: 7"),
+        "method policy reject must embed PERMISSION_DENIED in the gRPC-Web body"
+    );
+}
+
+/// A connect retry must not dial an alternate target whose effective path
+/// would change the method authorized for the first target.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_retry_does_not_dial_path_changing_target() {
+    let (unavailable_addr, unavailable_connections, _unavailable_handle) =
+        start_connection_counting_backend().await;
+    let (path_changing_addr, path_changing_connections, _path_changing_handle) =
+        start_connection_counting_backend().await;
+
+    let mut proxy = create_grpc_proxy("grpc-retry-method-policy", "/grpc", unavailable_addr.port());
+    proxy.upstream_id = Some("grpc-retry-method-policy-upstream".to_string());
+    proxy.retry = Some(RetryConfig {
+        max_retries: 1,
+        retryable_status_codes: Vec::new(),
+        retryable_methods: vec!["POST".to_string()],
+        backoff: BackoffStrategy::Fixed { delay_ms: 1 },
+        retry_on_connect_failure: true,
+    });
+    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: "grpc-retry-method-policy-router".to_string(),
+    }];
+
+    let method_router = PluginConfig {
+        id: "grpc-retry-method-policy-router".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_method_router".to_string(),
+        enabled: true,
+        config: serde_json::json!({
+            "allow_methods": ["/pkg.Service/Allowed"]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-retry-method-policy".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let upstream = create_test_upstream(
+        "grpc-retry-method-policy-upstream",
+        vec![
+            UpstreamTarget {
+                host: "127.0.0.1".to_string(),
+                port: unavailable_addr.port(),
+                service_port_policy_key: None,
+                weight: 100,
+                tags: HashMap::new(),
+                locality: None,
+                path: Some("/pkg.Service".to_string()),
+            },
+            UpstreamTarget {
+                host: "127.0.0.1".to_string(),
+                port: path_changing_addr.port(),
+                service_port_policy_key: None,
+                weight: 100,
+                tags: HashMap::new(),
+                locality: None,
+                path: Some("/admin.Service".to_string()),
+            },
+        ],
+    );
+    let state = create_test_proxy_state_with_plugins_and_upstreams(
+        vec![proxy],
+        vec![method_router],
+        vec![upstream],
+    );
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+    let unavailable_before = unavailable_connections.load(Ordering::SeqCst);
+    let path_changing_before = path_changing_connections.load(Ordering::SeqCst);
+
+    let (status, headers, _body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_grpc_request(gateway_addr, "/grpc/Allowed", b"", &[]),
+    )
+    .await
+    .expect("gRPC retry request timed out")
+    .expect("gRPC retry request failed");
+
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("14"));
+    assert!(
+        unavailable_connections.load(Ordering::SeqCst) > unavailable_before,
+        "initial target must fail during the h2c connect handshake"
+    );
+    assert_eq!(
+        path_changing_connections.load(Ordering::SeqCst),
+        path_changing_before,
+        "path-changing retry target must not be dialed"
     );
 }
 

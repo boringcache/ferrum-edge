@@ -8,22 +8,25 @@
 //!    early termination, IP restriction, bot detection
 //! 3. **Plugin: authenticate** — mtls_auth, jwks_auth, jwt_auth, key_auth, basic_auth, hmac_auth
 //! 4. **Plugin: authorize** — access_control, rate_limiting (consumer mode)
-//! 5. **Plugin: before_proxy** — request/response policy before backend dispatch:
-//!    request size limiting, GraphQL guardrails, AI plugins, request transformation,
-//!    response caching preparation, gRPC deadline injection
-//! 6. **Plugin: transform_request_body / on_final_request_body** — buffered request-body
+//! 5. **Plugin: before_proxy** — route/header preparation and request policy;
+//!    external/synthetic hooks are deferred when backend-path policy is active
+//! 6. **Plugin: on_backend_path_resolved** — opt-in policy over the path assembled
+//!    after routing and initial target selection
+//! 7. **Plugin: deferred before_proxy** — external/synthetic work after path authorization
+//! 8. **Plugin: transform_request_body / on_final_request_body** — buffered request-body
 //!    rewrites and final validation before backend dispatch
-//! 7. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
-//!    Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
-//! 8. **Plugin: after_proxy** — CORS headers, response caching metadata, response transforms,
-//!    response size limiting, AI rate limiter
-//! 9. **Plugin: on_response_body** — raw backend body inspection before transforms:
-//!    AI token metrics, AI rate limiter
-//! 10. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
-//! 11. **Plugin: on_final_response_body** — buffered body validation/storage:
+//! 9. **Plugin: backend_admission** — selected-target concurrency admission
+//! 10. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
+//!     Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
+//! 11. **Plugin: after_proxy** — CORS headers, response caching metadata, response transforms,
+//!     response size limiting, AI rate limiter
+//! 12. **Plugin: on_response_body** — raw backend body inspection before transforms:
+//!     AI token metrics, AI rate limiter
+//! 13. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
+//! 14. **Plugin: on_final_response_body** — buffered body validation/storage:
 //!     body validation, response size limiting, response caching
-//! 12. **Plugin: on_response_committed** — observe-only final buffered status/body export
-//! 13. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
+//! 15. **Plugin: on_response_committed** — observe-only final buffered status/body export
+//! 16. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
 //!
 //! Key design principles:
 //! - **Lock-free reads**: All config access uses `ArcSwap::load()` — no mutexes on the hot path
@@ -104,9 +107,9 @@ use crate::modes::mesh::node_waypoint::{
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
-    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
-    RequestContext, TransactionSummary, WebSocketFrameDirection, is_builtin_plugin_name,
-    mesh_route_dispatch::MeshRouteDispatchConfig,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
+    PluginResult, ProxyProtocol, RequestContext, TransactionSummary, WebSocketFrameDirection,
+    is_builtin_plugin_name, mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
 use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
@@ -188,6 +191,14 @@ pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_
 /// Only ever set on the synthetic short-circuit path, so its presence is a
 /// precise signal; the normal buffered backend-response path never sets it.
 pub(crate) const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
+/// One-shot request-method override used only while synthetic response-body
+/// hooks inspect a plugin-generated representation. `spec_expose` sets `GET`
+/// for canonical HEAD responses so response guards evaluate the representation
+/// exactly as they do for GET; the real method is restored before rejection
+/// `after_proxy` hooks normalize the final wire response.
+pub(crate) const SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY: &str =
+    "ferrum:synthetic_response_method_override";
 
 /// Internal marker carried only on a response-decision context clone while an
 /// effective retry policy is active. It never reaches transaction metadata.
@@ -8256,6 +8267,7 @@ async fn handle_websocket_request_authenticated(
     requires_ws_frame_hooks: bool,
     query_string: String,
     strip_len: usize,
+    backend_path_is_policy_bound: bool,
     // The client-requested path before any VirtualService `rewrite.uri`
     // was applied. Used for `request_path` in transaction logs so that
     // access logs record what the client sent, not the backend-rewritten
@@ -8703,13 +8715,10 @@ async fn handle_websocket_request_authenticated(
                         cb_failure_already_recorded = true;
                     }
 
-                    let delay = retry::retry_delay(retry_config, ws_attempt);
-                    tokio::time::sleep(delay).await;
-                    ws_attempt += 1;
-
                     let mut retry_backend_url = current_backend_url.clone();
                     let mut retry_target = current_target.clone();
                     let mut retry_cb_target_key = current_cb_target_key.clone();
+                    let mut retry_path_mismatch = false;
 
                     // Try a different target on retry if load balancing is configured
                     if let (Some(_upstream_id), Some(prev_target)) =
@@ -8725,18 +8734,39 @@ async fn handle_websocket_request_authenticated(
                             &ctx.headers,
                         )
                     {
-                        retry_backend_url = build_websocket_backend_url_with_target(
+                        if !retry_target_preserves_backend_path(
+                            backend_path_is_policy_bound,
                             &proxy,
                             &ctx.path,
-                            &query_string,
-                            &next.host,
-                            next.port,
                             strip_len,
-                            next.path.as_deref(),
-                        );
-                        retry_cb_target_key =
-                            Some(crate::circuit_breaker::target_key(&next.host, next.port));
-                        retry_target = Some(next);
+                            prev_target,
+                            &next,
+                        ) {
+                            retry_path_mismatch = true;
+                            warn!(
+                                proxy_id = %proxy.id,
+                                "Aborting WebSocket retry because the candidate would change the authorized backend method path"
+                            );
+                        } else {
+                            retry_backend_url = build_websocket_backend_url_with_target(
+                                &proxy,
+                                &ctx.path,
+                                &query_string,
+                                &next.host,
+                                next.port,
+                                strip_len,
+                                next.path.as_deref(),
+                            );
+                            retry_cb_target_key =
+                                Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                            retry_target = Some(next);
+                        }
+                    }
+
+                    if !retry_path_mismatch {
+                        let delay = retry::retry_delay(retry_config, ws_attempt);
+                        tokio::time::sleep(delay).await;
+                        ws_attempt += 1;
                     }
 
                     // A retry may rotate to a different app-port lane, and a
@@ -8744,15 +8774,17 @@ async fn handle_websocket_request_authenticated(
                     // current lane during the retry backoff. Re-check before
                     // acquiring any admission or circuit-breaker state for the
                     // next target and before attempting its backend handshake.
-                    if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
-                        &state,
-                        ctx.mesh_direction,
-                        mesh_inbound_pre_handshake_app_port,
-                        &proxy,
-                        retry_target.as_deref(),
-                        is_tls,
-                        ctx.tls_client_cert_der.is_some(),
-                    ) {
+                    if !retry_path_mismatch
+                        && let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+                            &state,
+                            ctx.mesh_direction,
+                            mesh_inbound_pre_handshake_app_port,
+                            &proxy,
+                            retry_target.as_deref(),
+                            is_tls,
+                            ctx.tls_client_cert_der.is_some(),
+                        )
+                    {
                         return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
                             &state,
                             plugins.as_ref(),
@@ -8770,7 +8802,7 @@ async fn handle_websocket_request_authenticated(
                     }
 
                     let mut retry_admitted_by_cb = true;
-                    if let Some(cb_config) = &proxy.circuit_breaker {
+                    if !retry_path_mismatch && let Some(cb_config) = &proxy.circuit_breaker {
                         match state.circuit_breaker_cache.can_execute(
                             &proxy.id,
                             retry_cb_target_key.as_deref(),
@@ -8790,7 +8822,7 @@ async fn handle_websocket_request_authenticated(
                         }
                     }
 
-                    if retry_admitted_by_cb {
+                    if retry_admitted_by_cb && !retry_path_mismatch {
                         current_backend_url = retry_backend_url;
                         current_target = retry_target;
                         current_cb_target_key = retry_cb_target_key;
@@ -9510,8 +9542,51 @@ fn push_forwardable_header_override(
 }
 
 fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, String>) {
-    headers.remove("x-consumer-username");
-    headers.remove("x-consumer-custom-id");
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("x-consumer-username")
+            && !name.eq_ignore_ascii_case("x-consumer-custom-id")
+    });
+}
+
+/// Remove plugin-controlled consumer identity headers and restore only the
+/// gateway-authenticated values for backend dispatch.
+pub(crate) fn refresh_backend_consumer_identity_headers(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    let principal_username = ctx.backend_consumer_username().map(str::to_string);
+    let principal_custom_id = principal_username
+        .as_ref()
+        .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
+    let source_has_reserved_identity = principal_username.is_none()
+        && headers.keys().any(|name| {
+            name.eq_ignore_ascii_case("x-consumer-username")
+                || name.eq_ignore_ascii_case("x-consumer-custom-id")
+        });
+    if principal_username.is_none() && !source_has_reserved_identity {
+        return;
+    }
+
+    sanitize_reserved_consumer_identity_headers(headers);
+    if let Some(username) = principal_username {
+        headers.insert("x-consumer-username".to_string(), username);
+        if let Some(custom_id) = principal_custom_id {
+            headers.insert("x-consumer-custom-id".to_string(), custom_id);
+        }
+    }
+}
+
+fn refresh_effective_backend_consumer_identity_headers(
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    if let Some(headers) = owned_proxy_headers.as_mut() {
+        refresh_backend_consumer_identity_headers(ctx, headers);
+    } else {
+        let mut headers = std::mem::take(&mut ctx.headers);
+        refresh_backend_consumer_identity_headers(ctx, &mut headers);
+        ctx.headers = headers;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -9565,6 +9640,79 @@ fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str)
         url.push('/');
     }
     url.push_str(remaining_path);
+}
+
+fn with_backend_path_parts<R>(
+    proxy: &Proxy,
+    incoming_path: &str,
+    strip_len: usize,
+    target_path: Option<&str>,
+    use_parts: impl FnOnce(&str, &str) -> R,
+) -> R {
+    // `strip_len` is measured by the router after encoded-slash
+    // normalization, so stripping must use the same coordinate system.
+    let normalized_path = if proxy.strip_listen_path {
+        Some(crate::router_cache::normalize_encoded_slashes(
+            incoming_path,
+        ))
+    } else {
+        None
+    };
+    let remaining_path = match &normalized_path {
+        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
+        None => incoming_path,
+    };
+    let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
+    use_parts(backend_path, remaining_path)
+}
+
+/// Assemble the exact path that URL construction will forward to the selected
+/// backend target. This intentionally shares path segmentation with
+/// [`build_backend_url_with_target`] so post-routing policy cannot authorize a
+/// path that differs from the one placed on the wire.
+pub fn build_backend_effective_path(
+    proxy: &Proxy,
+    incoming_path: &str,
+    strip_len: usize,
+    target_path: Option<&str>,
+) -> String {
+    with_backend_path_parts(
+        proxy,
+        incoming_path,
+        strip_len,
+        target_path,
+        |backend_path, remaining_path| {
+            let layout = backend_path_layout(backend_path, remaining_path);
+            let mut path = String::with_capacity(layout.len);
+            push_backend_path(&mut path, backend_path, remaining_path);
+            path
+        },
+    )
+}
+
+/// Once a route-sensitive plugin has authorized the first target's assembled
+/// path, retries may rotate hosts and ports but must not select a different
+/// assembled effective path without rerunning policy and charging another
+/// method. Comparing the URL-builder output includes the proxy backend-path
+/// fallback used when a target omits its own path. Keeping the authorized path
+/// immutable avoids turning transport retry into a second routing decision.
+#[doc(hidden)]
+pub fn retry_target_preserves_backend_path(
+    backend_path_is_policy_bound: bool,
+    proxy: &Proxy,
+    incoming_path: &str,
+    strip_len: usize,
+    previous: &UpstreamTarget,
+    next: &UpstreamTarget,
+) -> bool {
+    if !backend_path_is_policy_bound {
+        return true;
+    }
+    let previous_path = previous.path.as_deref().or(proxy.backend_path.as_deref());
+    let next_path = next.path.as_deref().or(proxy.backend_path.as_deref());
+    previous_path == next_path
+        || build_backend_effective_path(proxy, incoming_path, strip_len, previous.path.as_deref())
+            == build_backend_effective_path(proxy, incoming_path, strip_len, next.path.as_deref())
 }
 
 fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
@@ -13144,12 +13292,21 @@ async fn run_after_proxy_hooks_on_rejection(
                             })
                             .or_insert_with(|| "Origin".to_string());
                     }
-                    warn!(
-                        rejecting_plugin = plugin.name(),
-                        replacement_status = *status_code,
-                        replaced_status,
-                        "after_proxy plugin replaced an uncommitted rejection response"
-                    );
+                    if plugin.warn_on_rejection_response_replacement() {
+                        warn!(
+                            rejecting_plugin = plugin.name(),
+                            replacement_status = *status_code,
+                            replaced_status,
+                            "after_proxy plugin replaced an uncommitted rejection response"
+                        );
+                    } else {
+                        debug!(
+                            replacing_plugin = plugin.name(),
+                            replacement_status = *status_code,
+                            replaced_status,
+                            "after_proxy plugin normalized an uncommitted rejection response"
+                        );
+                    }
                     continue;
                 }
                 // The gateway is already committed to emitting this rejection
@@ -13447,6 +13604,10 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) {
+    let original_method = ctx
+        .metadata
+        .remove(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY)
+        .map(|method_override| std::mem::replace(&mut ctx.method, method_override));
     let applied_synthetic_body_hooks = !plugins.is_empty()
         && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx);
     if applied_synthetic_body_hooks {
@@ -13479,6 +13640,9 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         // The two requirements directly conflict; we keep the one-shot guarantee
         // and accept the minor body-transform divergence on the synthetic path.
         apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
+    }
+    if let Some(original_method) = original_method {
+        ctx.method = original_method;
     }
     // Apply the after_proxy reject hooks exactly once, over the final response
     // (the synthetic 2xx or the body-rejection response produced above), so
@@ -13936,6 +14100,36 @@ fn build_grpc_web_error_response(
     build_grpc_web_error_response_from_parts(response, status, message)
 }
 
+fn merge_grpc_web_expose_headers(
+    required: Option<&str>,
+    headers: &HashMap<String, String>,
+) -> Option<String> {
+    let mut merged = String::new();
+    let configured = headers.iter().filter_map(|(name, value)| {
+        name.eq_ignore_ascii_case("access-control-expose-headers")
+            .then_some(value.as_str())
+    });
+    for value in required.into_iter().chain(configured) {
+        for token in value
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            if merged
+                .split(',')
+                .any(|existing| existing.trim().eq_ignore_ascii_case(token))
+            {
+                continue;
+            }
+            if !merged.is_empty() {
+                merged.push_str(", ");
+            }
+            merged.push_str(token);
+        }
+    }
+    (!merged.is_empty()).then_some(merged)
+}
+
 /// Finalize the initial HEADERS for a gateway-generated gRPC-Web error.
 ///
 /// `error_response_for_content_type` temporarily keeps terminal gRPC metadata
@@ -13944,7 +14138,7 @@ fn build_grpc_web_error_response(
 /// fields are also authoritative: neither a security policy nor headers from
 /// an already-finalized reject-hook chain may replace them or supply a stale
 /// content length.
-fn finalize_grpc_web_error_response_headers(
+pub(crate) fn finalize_grpc_web_error_response_headers(
     response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     finalized_reject_headers: Option<&HashMap<String, String>>,
@@ -13962,12 +14156,27 @@ fn finalize_grpc_web_error_response_headers(
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone())),
         );
+        if let Some(content_type) = content_type.as_ref() {
+            // Rejection normalization uses native application/grpc. Restore
+            // the client representation before choosing binary versus text
+            // trailer framing.
+            response
+                .headers
+                .insert("content-type".to_string(), content_type.clone());
+        }
+        // Rejection hooks may supply rich terminal metadata such as
+        // grpc-status-details-bin. Fold it into the body trailer frame before
+        // terminal gRPC fields are removed from the initial header block.
+        crate::plugins::grpc_web::rebuild_error_body_from_headers(response);
     } else {
         crate::plugins::apply_initial_response_header_policies(
             initial_response_header_policy_plugins,
             &mut response.headers,
         );
     }
+
+    let expose_headers =
+        merge_grpc_web_expose_headers(expose_headers.as_deref(), &response.headers);
 
     response.headers.retain(|name, _| {
         ![
@@ -14021,6 +14230,144 @@ fn build_grpc_web_error_response_from_parts(
     builder
         .body(ProxyBody::full(Bytes::from(response.body)))
         .unwrap_or_else(|_| grpc_proxy::build_grpc_error_response(status, message))
+}
+
+fn build_pre_plugin_reject_response(
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    request_uses_grpc_content_type: bool,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    let reject = normalize_reject_response(
+        status,
+        body,
+        headers,
+        request_uses_grpc_content_type || grpc_web_response_content_type.is_some(),
+    );
+    if let (Some(content_type), Some(grpc_status)) =
+        (grpc_web_response_content_type, reject.grpc_status)
+    {
+        let message = reject
+            .grpc_message
+            .as_deref()
+            .unwrap_or_else(|| grpc_status_reason(grpc_status));
+        return build_grpc_web_error_response(content_type, grpc_status, message, &[]);
+    }
+    build_response_from_normalized_reject(reject)
+}
+
+async fn build_grpc_web_reject_response(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_content_type: Option<&str>,
+    reject: &NormalizedRejectResponse,
+) -> Option<Response<ProxyBody>> {
+    let (Some(content_type), Some(grpc_status)) = (response_content_type, reject.grpc_status)
+    else {
+        return None;
+    };
+    let message = reject
+        .grpc_message
+        .as_deref()
+        .unwrap_or_else(|| grpc_status_reason(grpc_status));
+    let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+        content_type,
+        grpc_status,
+        message,
+    );
+    finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));
+    if plugins
+        .iter()
+        .any(|plugin| plugin.requires_response_committed_hook())
+    {
+        for plugin in plugins {
+            plugin
+                .on_response_committed(ctx, 200, &translated.headers, &translated.body)
+                .await;
+        }
+    }
+    Some(build_grpc_web_error_response_from_parts(
+        translated,
+        grpc_status,
+        message,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_backend_path_plugins_or_build_reject(
+    backend_path_plugins: &[Arc<dyn Plugin>],
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    backend_path: &str,
+    state: &ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: &mut u64,
+    original_request_path: &str,
+    is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&str>,
+    phase: BackendPathPolicyPhase,
+) -> Option<Response<ProxyBody>> {
+    let phase_start = Instant::now();
+    for plugin in backend_path_plugins {
+        match plugin
+            .on_backend_path_resolved(ctx, backend_path, phase)
+            .await
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    error!(
+                        plugin = plugin.name(),
+                        "Backend-path plugin rejection could not be normalized"
+                    );
+                    record_request(state, 500);
+                    return Some(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status = StatusCode::from_u16(plugin_reject.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    plugins,
+                    ctx,
+                    status,
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    plugins,
+                    ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request_with_path(
+                    plugins,
+                    ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "on_backend_path_resolved",
+                    *plugin_execution_ns,
+                    Some(original_request_path),
+                )
+                .await;
+                record_request(state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Some(response);
+                }
+                return Some(build_response_from_normalized_reject(reject));
+            }
+        }
+    }
+    *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    None
 }
 
 async fn finalize_reject_response_with_after_proxy_hooks(
@@ -14104,37 +14451,8 @@ async fn handle_backend_admission_rejection(
     )
     .await;
     apply_grpc_reject_metadata(ctx, &reject);
-    let grpc_web_response = if let (Some(content_type), Some(grpc_status)) =
-        (grpc_web_error_content_type, reject.grpc_status)
-    {
-        let message = reject
-            .grpc_message
-            .as_deref()
-            .unwrap_or_else(|| grpc_status_reason(grpc_status));
-        let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
-            content_type,
-            grpc_status,
-            message,
-        );
-        finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));
-        if plugins
-            .iter()
-            .any(|plugin| plugin.requires_response_committed_hook())
-        {
-            for plugin in plugins {
-                plugin
-                    .on_response_committed(ctx, 200, &translated.headers, &translated.body)
-                    .await;
-            }
-        }
-        Some(build_grpc_web_error_response_from_parts(
-            translated,
-            grpc_status,
-            message,
-        ))
-    } else {
-        None
-    };
+    let grpc_web_response =
+        build_grpc_web_reject_response(plugins, ctx, grpc_web_error_content_type, &reject).await;
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -14188,6 +14506,45 @@ fn missing_authentication_reject(
         .unwrap_or("ferrum-edge");
     headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
     (401, MISSING_AUTHENTICATION_BODY.to_vec(), headers)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BackendPathBeforeProxyPass {
+    Initial,
+    RoutingHeaderDeferred,
+    RemainingDeferred,
+}
+
+pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    backend_path_is_policy_bound: bool,
+    pass: BackendPathBeforeProxyPass,
+) -> PluginResult {
+    for plugin in plugins {
+        let deferred =
+            backend_path_is_policy_bound && plugin.defer_before_proxy_until_backend_path_resolved();
+        let should_run = match pass {
+            BackendPathBeforeProxyPass::Initial => !deferred,
+            BackendPathBeforeProxyPass::RoutingHeaderDeferred => {
+                deferred && plugin.deferred_before_proxy_may_change_routing_headers()
+            }
+            BackendPathBeforeProxyPass::RemainingDeferred => {
+                deferred && !plugin.deferred_before_proxy_may_change_routing_headers()
+            }
+        };
+        if !should_run {
+            continue;
+        }
+        match plugin.before_proxy(ctx, headers).await {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return reject;
+            }
+        }
+    }
+    PluginResult::Continue
 }
 
 /// Return the RFC 6265 cookie-name from the leading cookie-pair only.
@@ -14906,7 +15263,24 @@ async fn handle_proxy_request_inner(
         )
     });
     ctx.request_authority = request_authority;
-    let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
+
+    // Classify before routing so route/method rejects can use the client's wire
+    // representation. WebSocket Upgrade / Extended CONNECT wins over any
+    // hostile Content-Type, matching backend dispatch and the H3 frontend.
+    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
+    let grpc_web_response_content_type = if flavor == HttpFlavor::WebSocket {
+        None
+    } else {
+        req.headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|content_type| {
+                crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+                    .then(|| crate::plugins::grpc_web::response_content_type(content_type))
+            })
+    };
+    let grpc_web_request = grpc_web_response_content_type.is_some();
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
 
@@ -14947,14 +15321,15 @@ async fn handle_proxy_request_inner(
                 "Direct Pod-IP HTTP mesh egress destination is declared but not routable; rejecting captured request"
             );
             state.request_count.fetch_add(1, Ordering::Relaxed);
-            let reject = normalize_reject_response(
+            let response = build_pre_plugin_reject_response(
                 StatusCode::BAD_GATEWAY,
                 br#"{"error":"Original destination is not a mesh-routable direct workload HTTP destination"}"#,
                 &EMPTY_HEADERS,
                 request_uses_grpc_content_type,
+                grpc_web_response_content_type,
             );
-            record_status(&state, reject.http_status.as_u16());
-            return Ok(build_response_from_normalized_reject(reject));
+            record_status(&state, response.status().as_u16());
+            return Ok(response);
         }
         None => state.router_cache.find_proxy_in_snapshot(
             &epoch.route_table,
@@ -15030,14 +15405,15 @@ async fn handle_proxy_request_inner(
                             br#"{"error":"Original destination port is not a mesh-routable port of this service"}"#
                         }
                     };
-                    let reject = normalize_reject_response(
+                    let response = build_pre_plugin_reject_response(
                         StatusCode::BAD_GATEWAY,
                         body,
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
+                        grpc_web_response_content_type,
                     );
-                    record_status(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_status(&state, response.status().as_u16());
+                    return Ok(response);
                 }
             }
         }
@@ -15093,14 +15469,15 @@ async fn handle_proxy_request_inner(
                             br#"{"error":"Request port is not a mesh-routable port of the local service"}"#
                         }
                     };
-                    let reject = normalize_reject_response(
+                    let response = build_pre_plugin_reject_response(
                         StatusCode::BAD_GATEWAY,
                         body,
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
+                        grpc_web_response_content_type,
                     );
-                    record_status(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_status(&state, response.status().as_u16());
+                    return Ok(response);
                 }
             }
         }
@@ -15207,14 +15584,15 @@ async fn handle_proxy_request_inner(
                 None => {
                     debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
                     state.request_count.fetch_add(1, Ordering::Relaxed);
-                    let reject = normalize_reject_response(
+                    let response = build_pre_plugin_reject_response(
                         StatusCode::NOT_FOUND,
                         br#"{"error":"Not Found"}"#,
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
+                        grpc_web_response_content_type,
                     );
-                    record_status(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_status(&state, response.status().as_u16());
+                    return Ok(response);
                 }
             }
         }
@@ -15223,29 +15601,17 @@ async fn handle_proxy_request_inner(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     debug!(proxy_id = %proxy.id, method = %method, path = %path, client_ip = %ctx.client_ip, "Request routed to proxy");
 
-    // Detect request flavor purely from the incoming traffic. WebSocket and
-    // gRPC are no longer pinned by the proxy's scheme — a single `Https`
-    // backend serves all three flavors depending on the request. Classify the
-    // client-visible boundary before route-level rejects so a failed WebSocket
-    // handshake still receives WebSocket-scoped policy without exposing
-    // policy-controlled upgrade fields.
+    // Reuse the client-visible flavor and strict gRPC-Web classification made
+    // before routing. In particular, WebSocket precedence must continue to
+    // suppress gRPC-Web shaping for route-level rejects carrying a hostile
+    // Content-Type.
     let is_h2_ws = is_h2_websocket_connect(&req);
-    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
-    ctx.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
+    ctx.set_request_http_flavor(flavor);
 
     // Resolve the client-visible protocol before route-level rejects so every
     // post-routing synthesized initial HEADERS block uses the same precomputed
     // policy slice as normal responses. gRPC-Web dispatch remains plain HTTP
     // while selecting the gRPC policy set.
-    let grpc_web_response_content_type = req
-        .headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|ct| {
-            crate::plugins::grpc_web::is_grpc_web_content_type(ct)
-                .then(|| crate::plugins::grpc_web::response_content_type(ct))
-        });
-    let grpc_web_request = grpc_web_response_content_type.is_some();
     let request_protocol = match flavor {
         HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
@@ -15255,6 +15621,7 @@ async fn handle_proxy_request_inner(
     let initial_response_header_policy_plugins = epoch
         .plugin_cache
         .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
+    let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
     // Per-proxy HTTP method filtering (checked before plugins to save work)
     if let Some(ref allowed) = proxy.allowed_methods
@@ -15268,7 +15635,7 @@ async fn handle_proxy_request_inner(
             StatusCode::METHOD_NOT_ALLOWED,
             br#"{"error":"Method Not Allowed"}"#,
             &reject_headers,
-            request_uses_grpc_content_type,
+            is_grpc_request,
         );
         finalize_synthesized_reject_headers(
             &mut reject,
@@ -15276,12 +15643,17 @@ async fn handle_proxy_request_inner(
             initial_response_header_policy_plugins.as_ref(),
         );
         restore_authoritative_allow_header(&mut reject.headers, &allow_header);
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
         record_status(&state, reject.http_status.as_u16());
+        if let Some(response) = grpc_web_response {
+            return Ok(response);
+        }
         return Ok(build_response_from_normalized_reject(reject));
     }
 
     let allows_request_body_buffering = http_flavor_allows_request_body_buffering(flavor);
-    let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
     if is_grpc_request {
         ctx.metadata
             .entry("request_protocol".to_string())
@@ -15304,7 +15676,13 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
         record_status(&state, reject.http_status.as_u16());
+        if let Some(response) = grpc_web_response {
+            return Ok(response);
+        }
         return Ok(build_response_from_normalized_reject(reject));
     }
 
@@ -15356,6 +15734,8 @@ async fn handle_proxy_request_inner(
     // Pre-computed capability bitset and phase-specific plugin lists — avoids
     // per-request `iter().filter().collect()` and `iter().any()` scans.
     let capabilities = plugin_cache_view.capabilities();
+    let backend_path_plugins = plugin_cache_view.backend_path_plugins();
+    let backend_path_is_policy_bound = !backend_path_plugins.is_empty();
     let mut client_request_body = ClientRequestBody::Streaming(Box::new(req));
 
     // Accumulator for total wall-clock time spent inside plugin phase callbacks.
@@ -15375,7 +15755,7 @@ async fn handle_proxy_request_inner(
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code)
@@ -15383,9 +15763,17 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
+                        grpc_web_response_content_type.is_none(),
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
+                    let grpc_web_response = build_grpc_web_reject_response(
+                        &plugins,
+                        &mut ctx,
+                        grpc_web_response_content_type,
+                        &reject,
+                    )
+                    .await;
                     log_rejected_request(
                         &plugins,
                         &ctx,
@@ -15396,6 +15784,9 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     record_request(&state, reject.http_status.as_u16());
+                    if let Some(response) = grpc_web_response {
+                        return Ok(response);
+                    }
                     return Ok(build_response_from_normalized_reject(reject));
                 }
             }
@@ -15525,16 +15916,24 @@ async fn handle_proxy_request_inner(
         .await
         {
             plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
-            let reject = finalize_reject_response_with_after_proxy_hooks(
+            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
                 &body,
                 headers,
                 is_grpc_request,
+                grpc_web_response_content_type.is_none(),
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
+            let grpc_web_response = build_grpc_web_reject_response(
+                &plugins,
+                &mut ctx,
+                grpc_web_response_content_type,
+                &reject,
+            )
+            .await;
             log_rejected_request(
                 &plugins,
                 &ctx,
@@ -15545,6 +15944,9 @@ async fn handle_proxy_request_inner(
             )
             .await;
             record_request(&state, reject.http_status.as_u16());
+            if let Some(response) = grpc_web_response {
+                return Ok(response);
+            }
             return Ok(build_response_from_normalized_reject(reject));
         }
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
@@ -15659,16 +16061,24 @@ async fn handle_proxy_request_inner(
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
+                        grpc_web_response_content_type.is_none(),
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
+                    let grpc_web_response = build_grpc_web_reject_response(
+                        &plugins,
+                        &mut ctx,
+                        grpc_web_response_content_type,
+                        &reject,
+                    )
+                    .await;
                     log_rejected_request(
                         &plugins,
                         &ctx,
@@ -15679,6 +16089,9 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     record_request(&state, reject.http_status.as_u16());
+                    if let Some(response) = grpc_web_response {
+                        return Ok(response);
+                    }
                     return Ok(build_response_from_normalized_reject(reject));
                 }
             }
@@ -15807,38 +16220,59 @@ async fn handle_proxy_request_inner(
     if needs_header_clone {
         let phase_start = Instant::now();
         let mut cloned = ctx.headers.clone();
-        for plugin in plugins.iter() {
-            match plugin.before_proxy(&mut ctx, &mut cloned).await {
-                PluginResult::Continue => {}
-                reject @ PluginResult::Reject { .. }
-                | reject @ PluginResult::RejectBinary { .. } => {
-                    let plugin_reject = plugin_result_into_reject_parts(reject)
-                        .expect("reject result should convert to rejection parts");
-                    let status_code = plugin_reject.status_code;
-                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks(
-                        &plugins,
-                        &mut ctx,
-                        StatusCode::from_u16(status_code)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &plugin_reject.body,
-                        plugin_reject.headers,
-                        is_grpc_request,
-                    )
-                    .await;
-                    apply_grpc_reject_metadata(&mut ctx, &reject);
-                    log_rejected_request(
-                        &plugins,
-                        &ctx,
-                        reject.http_status.as_u16(),
-                        start_time,
-                        "before_proxy",
-                        plugin_execution_ns,
-                    )
-                    .await;
-                    record_request(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+        match run_before_proxy_hooks_for_backend_path_policy(
+            &plugins,
+            &mut ctx,
+            &mut cloned,
+            backend_path_is_policy_bound,
+            BackendPathBeforeProxyPass::Initial,
+        )
+        .await
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    error!("before_proxy rejection could not be normalized");
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status_code = plugin_reject.status_code;
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "before_proxy",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
                 }
+                return Ok(build_response_from_normalized_reject(reject));
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -15849,39 +16283,61 @@ async fn handle_proxy_request_inner(
         // satisfy the borrow checker without cloning — zero allocation hot path.
         let phase_start = Instant::now();
         let mut tmp_headers = std::mem::take(&mut ctx.headers);
-        for plugin in plugins.iter() {
-            match plugin.before_proxy(&mut ctx, &mut tmp_headers).await {
-                PluginResult::Continue => {}
-                reject @ PluginResult::Reject { .. }
-                | reject @ PluginResult::RejectBinary { .. } => {
-                    let plugin_reject = plugin_result_into_reject_parts(reject)
-                        .expect("reject result should convert to rejection parts");
-                    let status_code = plugin_reject.status_code;
-                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        match run_before_proxy_hooks_for_backend_path_policy(
+            &plugins,
+            &mut ctx,
+            &mut tmp_headers,
+            backend_path_is_policy_bound,
+            BackendPathBeforeProxyPass::Initial,
+        )
+        .await
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    error!("before_proxy rejection could not be normalized");
                     ctx.headers = tmp_headers;
-                    let reject = finalize_reject_response_with_after_proxy_hooks(
-                        &plugins,
-                        &mut ctx,
-                        StatusCode::from_u16(status_code)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &plugin_reject.body,
-                        plugin_reject.headers,
-                        is_grpc_request,
-                    )
-                    .await;
-                    apply_grpc_reject_metadata(&mut ctx, &reject);
-                    log_rejected_request(
-                        &plugins,
-                        &ctx,
-                        reject.http_status.as_u16(),
-                        start_time,
-                        "before_proxy",
-                        plugin_execution_ns,
-                    )
-                    .await;
-                    record_request(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status_code = plugin_reject.status_code;
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                ctx.headers = tmp_headers;
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "before_proxy",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
                 }
+                return Ok(build_response_from_normalized_reject(reject));
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -15933,17 +16389,18 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // Inject identity headers when authentication resolved a principal.
-    if let Some(username) = ctx.backend_consumer_username() {
+    // Strip plugin-controlled identity headers and inject only the gateway's
+    // authenticated values. The common no-header/no-principal path avoids
+    // materializing an owned header map.
+    let source_has_reserved_identity = owned_proxy_headers.as_ref().is_some_and(|headers| {
+        headers.keys().any(|name| {
+            name.eq_ignore_ascii_case("x-consumer-username")
+                || name.eq_ignore_ascii_case("x-consumer-custom-id")
+        })
+    });
+    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        sanitize_reserved_consumer_identity_headers(headers);
-        headers.insert("x-consumer-username".to_string(), username.to_string());
-        if let Some(custom_id) = ctx.backend_consumer_custom_id() {
-            headers.insert("x-consumer-custom-id".to_string(), custom_id.to_string());
-        }
-    } else if ctx.suppresses_backend_consumer_identity_headers() {
-        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        sanitize_reserved_consumer_identity_headers(headers);
+        refresh_backend_consumer_identity_headers(&ctx, headers);
     }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.
@@ -16032,6 +16489,201 @@ async fn handle_proxy_request_inner(
         selection.target,
         request_host.as_deref(),
     );
+
+    let has_deferred_routing_header_hooks = backend_path_is_policy_bound
+        && capabilities.has(PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
+    let mut deferred_result = PluginResult::Continue;
+    let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
+
+    loop {
+        // Preview access rules for the already-selected target before a
+        // deferred routing function performs external work, then enforce
+        // stateful policy exactly once after its header mutations settle. The
+        // target is deliberately pinned across this hook: otherwise a cloud
+        // function could cause side effects before its hash header selected a
+        // different, denied backend-effective method.
+        if backend_path_is_policy_bound {
+            let backend_path = build_backend_effective_path(
+                &proxy,
+                &path,
+                strip_len,
+                upstream_target
+                    .as_ref()
+                    .and_then(|target| target.path.as_deref()),
+            );
+            let phase = if run_deferred_routing_headers {
+                BackendPathPolicyPhase::Preview
+            } else {
+                BackendPathPolicyPhase::Enforce
+            };
+            if let Some(response) = run_backend_path_plugins_or_build_reject(
+                backend_path_plugins,
+                &plugins,
+                &mut ctx,
+                &backend_path,
+                &state,
+                start_time,
+                &mut plugin_execution_ns,
+                &original_request_path,
+                is_grpc_request,
+                grpc_web_response_content_type,
+                phase,
+            )
+            .await
+            {
+                return Ok(response);
+            }
+            if phase == BackendPathPolicyPhase::Enforce {
+                ctx.bind_authorized_backend_path(backend_path);
+            }
+        }
+
+        if !run_deferred_routing_headers {
+            break;
+        }
+        run_deferred_routing_headers = false;
+
+        // These hooks moved later for authorization ordering, but their
+        // documented request view remains the original client path.
+        let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
+        let phase_start = Instant::now();
+        deferred_result = match owned_proxy_headers.as_mut() {
+            Some(headers) => {
+                run_before_proxy_hooks_for_backend_path_policy(
+                    &plugins,
+                    &mut ctx,
+                    headers,
+                    true,
+                    BackendPathBeforeProxyPass::RoutingHeaderDeferred,
+                )
+                .await
+            }
+            None => {
+                let mut headers = std::mem::take(&mut ctx.headers);
+                let result = run_before_proxy_hooks_for_backend_path_policy(
+                    &plugins,
+                    &mut ctx,
+                    &mut headers,
+                    true,
+                    BackendPathBeforeProxyPass::RoutingHeaderDeferred,
+                )
+                .await;
+                ctx.headers = headers;
+                result
+            }
+        };
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        ctx.path = backend_ctx_path;
+        if matches!(deferred_result, PluginResult::Continue) {
+            // A deferred routing function can return arbitrary headers.
+            // Restore gateway-owned identity and reapply the egress baggage
+            // policy before those headers can reach any backend transport.
+            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            hbone_proxy::strip_egress_baggage_in_proxy_headers(
+                &mut owned_proxy_headers,
+                &ctx.headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
+        }
+        // Always make one more pass after the routing-header hook, including
+        // when it rejects, so final enforcement charges the pinned method
+        // exactly once before any external-hook rejection is returned.
+    }
+
+    // Hooks that can dispatch external work or synthesize a terminal response
+    // must not run until route-sensitive policy has authorized the exact first
+    // backend path. The ordinary pipeline never enters this second pass.
+    if backend_path_is_policy_bound {
+        if matches!(deferred_result, PluginResult::Continue) {
+            // Preserve the pre-existing client-path view for deferred hooks.
+            // request_mirror separately consumes the private path that passed
+            // final backend-effective authorization.
+            let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
+            let phase_start = Instant::now();
+            deferred_result = match owned_proxy_headers.as_mut() {
+                Some(headers) => {
+                    run_before_proxy_hooks_for_backend_path_policy(
+                        &plugins,
+                        &mut ctx,
+                        headers,
+                        true,
+                        BackendPathBeforeProxyPass::RemainingDeferred,
+                    )
+                    .await
+                }
+                None => {
+                    let mut headers = std::mem::take(&mut ctx.headers);
+                    let result = run_before_proxy_hooks_for_backend_path_policy(
+                        &plugins,
+                        &mut ctx,
+                        &mut headers,
+                        true,
+                        BackendPathBeforeProxyPass::RemainingDeferred,
+                    )
+                    .await;
+                    ctx.headers = headers;
+                    result
+                }
+            };
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+            ctx.path = backend_ctx_path;
+        }
+        if matches!(deferred_result, PluginResult::Continue) {
+            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            hbone_proxy::strip_egress_baggage_in_proxy_headers(
+                &mut owned_proxy_headers,
+                &ctx.headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
+        }
+        match deferred_result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status = StatusCode::from_u16(plugin_reject.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    status,
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "before_proxy",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
+                return Ok(build_response_from_normalized_reject(reject));
+            }
+        }
+    }
 
     // The effective PeerAuthentication app port is not authoritative until
     // routing plugins have applied their overrides and load balancing has
@@ -16408,6 +17060,7 @@ async fn handle_proxy_request_inner(
             requires_ws_frame_hooks,
             effective_query_string.to_string(),
             strip_len,
+            backend_path_is_policy_bound,
             original_request_path.clone(),
         )
         .await;
@@ -17190,6 +17843,42 @@ async fn handle_proxy_request_inner(
                     break;
                 }
 
+                // Resolve and validate the next gRPC retry target before
+                // charging this failure as an intermediate attempt or
+                // entering backoff. A path-changing candidate will never be
+                // dispatched, so the ordinary final-outcome path must record
+                // the failed attempt exactly once without adding retry delay.
+                let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
+                    (&proxy.upstream_id, &grpc_current_target)
+                    && let Some(ref hash_key) = lb_hash_key
+                    && let Some(next) = backend_dispatch::select_next_retry_target(
+                        &state,
+                        &epoch,
+                        &proxy,
+                        prev_target,
+                        hash_key,
+                        &ctx.client_ip,
+                        proxy_headers,
+                    ) {
+                    if !retry_target_preserves_backend_path(
+                        backend_path_is_policy_bound,
+                        &proxy,
+                        &path,
+                        strip_len,
+                        prev_target,
+                        &next,
+                    ) {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            "Aborting gRPC retry because the candidate would change the authorized backend method path"
+                        );
+                        break;
+                    }
+                    Some(next)
+                } else {
+                    None
+                };
+
                 if let Some(permits) = backend_admission_permits.take() {
                     let error_class = match &grpc_result {
                         Err(error) => Some(retry::classify_grpc_proxy_error(error)),
@@ -17252,19 +17941,7 @@ async fn handle_proxy_request_inner(
                 let grpc_pre_rotation_target = grpc_current_target.clone();
 
                 // Try a different target on retry if load balancing is configured
-                if let (Some(_upstream_id), Some(prev_target)) =
-                    (&proxy.upstream_id, &grpc_current_target)
-                    && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = backend_dispatch::select_next_retry_target(
-                        &state,
-                        &epoch,
-                        &proxy,
-                        prev_target,
-                        hash_key,
-                        &ctx.client_ip,
-                        proxy_headers,
-                    )
-                {
+                if let Some(next) = next_retry_target {
                     grpc_backend_url = build_backend_url_with_target(
                         &proxy,
                         &path,
@@ -19262,6 +19939,42 @@ async fn handle_proxy_request_inner(
         };
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
+            // Resolve and validate the next retry target before charging this
+            // failure as an intermediate attempt or entering backoff. A
+            // path-changing candidate will not be dispatched, so leave final
+            // accounting to the ordinary post-loop path without delaying the
+            // client first.
+            let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
+                (&proxy.upstream_id, &current_target)
+                && let Some(ref hash_key) = lb_hash_key
+                && let Some(next) = backend_dispatch::select_next_retry_target(
+                    &state,
+                    &epoch,
+                    &proxy,
+                    prev_target,
+                    hash_key,
+                    &ctx.client_ip,
+                    proxy_headers,
+                ) {
+                if !retry_target_preserves_backend_path(
+                    backend_path_is_policy_bound,
+                    &proxy,
+                    &path,
+                    strip_len,
+                    prev_target,
+                    &next,
+                ) {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        "Aborting retry because the candidate would change the authorized backend method path"
+                    );
+                    break;
+                }
+                Some(next)
+            } else {
+                None
+            };
+
             if let Some(permits) = backend_admission_permits.take() {
                 permits.record_backend_outcome(BackendAdmissionOutcome {
                     response_status: result.status_code,
@@ -19303,19 +20016,10 @@ async fn handle_proxy_request_inner(
             // result correctly if we break before dispatching to the new
             // target (e.g. its circuit breaker is open).
             let pre_rotation_cb_key = current_cb_target_key.clone();
-            if let (Some(_upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
-                && let Some(ref hash_key) = lb_hash_key
-                && let Some(next) = backend_dispatch::select_next_retry_target(
-                    &state,
-                    &epoch,
-                    &proxy,
-                    prev_target,
-                    hash_key,
-                    &ctx.client_ip,
-                    proxy_headers,
-                )
-            {
-                let target_changed = next.host != prev_target.host || next.port != prev_target.port;
+            if let Some(next) = next_retry_target {
+                let target_changed = current_target.as_ref().is_some_and(|prev_target| {
+                    next.host != prev_target.host || next.port != prev_target.port
+                });
                 current_url = build_backend_url_with_target(
                     &proxy,
                     &path,
@@ -20817,58 +21521,38 @@ pub fn build_backend_url_with_target(
         DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
     };
 
-    // `strip_len` (RouteMatch::matched_prefix_len) is a byte offset into the
-    // path AFTER encoded-slash normalization: the router matches against
-    // `normalize_encoded_slashes(path)`, which collapses %2f/%252f to '/'.
-    // Slicing that offset out of the RAW `incoming_path` is a coordinate
-    // mismatch — the offset is too small whenever the request contained
-    // encoded slashes (each %2f shrinks 2 bytes, %252f 4), which both forwards
-    // a corrupted tail to the backend (routing-vs-forwarding desync) and can
-    // index into the middle of a multi-byte UTF-8 codepoint, panicking the
-    // request task. Strip from the SAME normalized path the offset was
-    // computed against so the slice is coordinate-correct and on a char
-    // boundary. Normalization is an allocation-free borrow when the path has
-    // no encoded slashes (the common case) and only runs when stripping.
-    let normalized_path = if proxy.strip_listen_path {
-        Some(crate::router_cache::normalize_encoded_slashes(
-            incoming_path,
-        ))
-    } else {
-        None
-    };
-    let remaining_path = match &normalized_path {
-        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
-        None => incoming_path,
-    };
+    with_backend_path_parts(
+        proxy,
+        incoming_path,
+        strip_len,
+        target_path,
+        |backend_path, remaining_path| {
+            let path_layout = backend_path_layout(backend_path, remaining_path);
+            let rendered_host = url_render_host(host);
 
-    let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
+            // Build URL in a single buffer, writing the path segments directly
+            // to avoid an intermediate `full_path` allocation.
+            let capacity = scheme.len()
+                + 3
+                + rendered_host.len()
+                + 6
+                + path_layout.len
+                + if query_string.is_empty() {
+                    0
+                } else {
+                    1 + query_string.len()
+                };
+            let mut url = String::with_capacity(capacity);
+            let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
+            push_backend_path(&mut url, backend_path, remaining_path);
 
-    let path_layout = backend_path_layout(backend_path, remaining_path);
-    let rendered_host = url_render_host(host);
-
-    // Build URL in a single buffer, writing the path segments directly to avoid
-    // an intermediate `full_path` String allocation from format!().
-    let capacity = scheme.len()
-        + 3
-        + rendered_host.len()
-        + 6
-        + path_layout.len
-        + if query_string.is_empty() {
-            0
-        } else {
-            1 + query_string.len()
-        };
-    let mut url = String::with_capacity(capacity);
-    let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
-
-    push_backend_path(&mut url, backend_path, remaining_path);
-
-    if !query_string.is_empty() {
-        url.push('?');
-        url.push_str(query_string);
-    }
-
-    url
+            if !query_string.is_empty() {
+                url.push('?');
+                url.push_str(query_string);
+            }
+            url
+        },
+    )
 }
 
 /// Resolve the effective `Proxy` for one backend dispatch, honoring an
@@ -29024,6 +29708,8 @@ mod tests {
 
     struct SyntheticNormalizationProbePlugin;
 
+    struct HeadSkippingSyntheticGuardPlugin;
+
     struct RejectHeaderPlugin;
 
     struct ReplaceRejectPlugin;
@@ -29072,6 +29758,51 @@ mod tests {
             _response_headers: &HashMap<String, String>,
         ) -> Option<Vec<u8>> {
             Some(b"incorrectly-normalized".to_vec())
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for HeadSkippingSyntheticGuardPlugin {
+        fn name(&self) -> &str {
+            "head_skipping_synthetic_guard"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+            !ctx.method.eq_ignore_ascii_case("HEAD")
+        }
+
+        async fn on_response_body(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            _response_headers: &HashMap<String, String>,
+            _body: &[u8],
+        ) -> PluginResult {
+            ctx.metadata
+                .insert("test:synthetic_body_method".to_string(), ctx.method.clone());
+            PluginResult::Reject {
+                status_code: 451,
+                body: "blocked synthetic representation".to_string(),
+                headers: HashMap::new(),
+            }
+        }
+
+        fn applies_after_proxy_on_reject(&self) -> bool {
+            true
+        }
+
+        async fn after_proxy(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            response_headers.insert("x-after-proxy-method".to_string(), ctx.method.clone());
+            PluginResult::Continue
         }
     }
 
@@ -29703,6 +30434,53 @@ mod tests {
 
         assert_eq!(response.http_status, StatusCode::OK);
         assert_eq!(response.body, body);
+    }
+
+    #[tokio::test]
+    async fn synthetic_head_representation_uses_get_guardrails_then_restores_head() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(HeadSkippingSyntheticGuardPlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "HEAD".to_string(),
+            "/api/specz".to_string(),
+        );
+        ctx.metadata.insert(
+            SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY.to_string(),
+            "GET".to_string(),
+        );
+        let mut status = 200;
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let mut body = br#"{"secret":"must be inspected"}"#.to_vec();
+
+        apply_reject_after_proxy_and_synthetic_body_hooks(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, 451);
+        assert_eq!(body, b"blocked synthetic representation");
+        assert_eq!(
+            ctx.metadata
+                .get("test:synthetic_body_method")
+                .map(String::as_str),
+            Some("GET")
+        );
+        assert_eq!(ctx.method, "HEAD");
+        assert_eq!(
+            headers.get("x-after-proxy-method").map(String::as_str),
+            Some("HEAD")
+        );
+        assert!(
+            !ctx.metadata
+                .contains_key(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY)
+        );
     }
 
     #[tokio::test]

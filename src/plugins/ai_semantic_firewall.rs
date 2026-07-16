@@ -983,8 +983,10 @@ impl AiSemanticFirewall {
         let segments = if event_stream {
             let (segments, fully_parsed) =
                 reassemble_sse_response_segments(body, &self.engine.extraction);
-            if (buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx))
-                && (!fully_parsed || segments.is_empty())
+            let streaming_inspection_requested =
+                buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx);
+            if (!fully_parsed && (was_governed || streaming_inspection_requested))
+                || (segments.is_empty() && streaming_inspection_requested)
             {
                 self.set_response_hash(ctx, sha256_hex_bytes(body));
                 return self.engine.handle_uninspectable_buffered_stream(ctx);
@@ -1912,11 +1914,12 @@ impl FirewallEngine {
         }
     }
 
-    /// Disposition for a `buffer`-mode streamed response that yielded no
-    /// inspectable content (uninspectable `data:` events, or no extractable
-    /// content). Buffer mode exists to inspect the stream, so an uninspectable
-    /// body is treated as an inspection failure governed by `on_error`: `reject`
-    /// fails closed (502), `warn`/`allow` (and dry-run) record and deliver.
+    /// Disposition for an event stream whose buffered representation promised
+    /// inspection but yielded uninspectable `data:` events or no extractable
+    /// content. This covers explicit `buffer` mode and an already-governed
+    /// encoded stream after bounded decoding. The inspection failure follows
+    /// `on_error`: `reject` fails closed (502), while `warn`/`allow` (and
+    /// dry-run) record and deliver.
     fn handle_uninspectable_buffered_stream(&self, ctx: &mut RequestContext) -> PluginResult {
         ctx.metadata.insert(
             RESPONSE_INSPECTION_KEY.to_string(),
@@ -2137,18 +2140,6 @@ impl Plugin for AiSemanticFirewall {
             return false;
         }
 
-        // An encoded range body is only a fragment of the selected
-        // representation, so its bytes are not a complete gzip/Brotli stream
-        // and cannot be decoded safely. Do not pin encoded partial responses
-        // onto the buffered inspection path, including when an earlier hook
-        // stripped Content-Range after the proxy stamped the original-response
-        // marker. Unencoded JSON partials retain the pre-existing inspection.
-        if is_partial_response(ctx, response_status, response_headers)
-            && response_content_encoding_value(ctx, response_headers).is_some()
-        {
-            return false;
-        }
-
         // The final buffered hook is the only phase that can safely classify
         // an origin-encoded response by its decoded shape. Keep every eligible
         // non-identity encoding on the bounded decode path even when the origin
@@ -2298,12 +2289,6 @@ impl Plugin for AiSemanticFirewall {
         if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
             return PluginResult::Continue;
         }
-        if is_partial_response(ctx, response_status, response_headers)
-            && response_content_encoding_value(ctx, response_headers).is_some()
-        {
-            return PluginResult::Continue;
-        }
-
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let encoded_body = response_content_encoding_value(ctx, response_headers).is_some()
             && !gateway_response_compression_planned(ctx, response_headers);
@@ -2349,12 +2334,6 @@ impl Plugin for AiSemanticFirewall {
         if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
             return PluginResult::Continue;
         }
-        if is_partial_response(ctx, response_status, response_headers)
-            && response_content_encoding_value(ctx, response_headers).is_some()
-        {
-            return PluginResult::Continue;
-        }
-
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let was_governed = self.response_hash(ctx).is_some();
         let type_candidate = response_content_type_is_inspection_candidate(content_type);
@@ -2405,11 +2384,16 @@ impl Plugin for AiSemanticFirewall {
             if self.response_hash(ctx) == Some(decoded_hash.as_str()) {
                 return PluginResult::Continue;
             }
-            // Once decoded bytes have a JSON shape, parse them with JSON
-            // candidate semantics even if the origin mislabeled the media
-            // type as another candidate such as text/event-stream. Shape must
-            // win here so bare JSON cannot be routed through the SSE parser.
-            let decoded_content_type = if decoded_looks_like_json {
+            // A bare JSON document mislabeled as an event stream still needs
+            // JSON extraction. Do not rely on its first byte alone, though:
+            // valid SSE may begin with an ignored JSON-looking field before
+            // later `data:` frames. Preserve the SSE parser unless the entire
+            // decoded representation is one JSON document.
+            let decoded_is_json_document = decoded_looks_like_json
+                && (!is_event_stream_content_type(content_type)
+                    || serde_json::from_slice::<serde::de::IgnoredAny>(strip_json_bom(&decoded))
+                        .is_ok());
+            let decoded_content_type = if decoded_is_json_document {
                 "application/json"
             } else {
                 content_type
@@ -3066,8 +3050,9 @@ fn extract_response_segments_from_json(
 ///
 /// Returns the segments plus whether the body was **fully inspectable** (valid
 /// UTF-8 and every `data:` payload parsed as JSON). A caller that forced this
-/// stream onto the buffered path (`buffer` mode) uses that flag to fail closed
-/// when part of the body could not be parsed and might hide content.
+/// stream onto the buffered path (`buffer` mode), or that decoded an already
+/// governed encoded stream, uses that flag to fail closed when part of the body
+/// could not be parsed and might hide content.
 fn reassemble_sse_response_segments(
     body: &[u8],
     extraction: &ExtractionConfig,
@@ -5017,18 +5002,6 @@ fn response_content_encoding_value<'a>(
         .get(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
         .and_then(|encoding| non_identity_content_encoding_value(encoding))
         .or_else(|| content_encoding_value(headers))
-}
-
-fn is_partial_response(
-    ctx: &RequestContext,
-    response_status: u16,
-    response_headers: &HashMap<String, String>,
-) -> bool {
-    response_status == 206
-        || header_value(response_headers, "content-range").is_some()
-        || ctx
-            .metadata
-            .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)
 }
 
 fn response_content_type_is_inspection_candidate(content_type: &str) -> bool {
