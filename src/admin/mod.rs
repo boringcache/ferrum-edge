@@ -5445,10 +5445,8 @@ async fn handle_restore(
                         "Restore: failed to verify ambiguous atomic clear outcome"
                     );
                 }
-                let clear_verification = classify_atomic_clear_verification(
-                    snapshot.resource_counts(),
-                    verification,
-                );
+                let clear_verification =
+                    classify_atomic_clear_verification(snapshot.resource_counts(), verification);
                 return Ok(if clear_verification.requires_guard_retention() {
                     finish_unknown_atomic_delete_failure(
                         state,
