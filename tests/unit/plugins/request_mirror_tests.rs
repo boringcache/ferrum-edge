@@ -153,7 +153,10 @@ fn test_mirror_summary_uses_its_own_terminal_outcome() {
     assert!(failed_mirror.grpc_status().is_none());
     assert!(failed_mirror.is_terminal_failure());
     assert_eq!(
-        failed_mirror.metadata.get("mirror_error").map(String::as_str),
+        failed_mirror
+            .metadata
+            .get("mirror_error")
+            .map(String::as_str),
         Some("connection refused")
     );
 }
