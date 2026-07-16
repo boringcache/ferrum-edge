@@ -1586,6 +1586,54 @@ async fn transaction_log_schema_crud_validates_the_prospective_database_graph() 
 }
 
 #[tokio::test]
+async fn disabled_schema_graph_plugins_defer_policy_validation_for_crud_and_batch() {
+    let tc = TestConfig::default();
+    let (mut state, _dir) = create_db_admin_state(&tc).await;
+    state.backend_allow_ips = ferrum_edge::config::BackendEgressPolicy::from_env(
+        ferrum_edge::config::BackendAllowIps::Both,
+        "",
+        "",
+        true,
+    )
+    .expect("default deny policy is valid");
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let disabled = json!({
+        "id": "disabled-schema-ref-crud",
+        "plugin_name": "rate_limiting",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "window_seconds": 60,
+            "max_requests": 10,
+            "sync_mode": "redis",
+            "redis_url": "redis://169.254.169.254:6379/0",
+            "schema_ref": "missing"
+        }
+    });
+
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &disabled).await;
+    assert_eq!(
+        status, 201,
+        "disabled direct CRUD must defer policy and graph validation: {body:?}"
+    );
+
+    let mut batch_plugin = disabled;
+    batch_plugin["id"] = json!("disabled-schema-ref-batch");
+    let (status, body) = admin_post(
+        &base_url,
+        "/batch",
+        &token,
+        &json!({"plugin_configs": [batch_plugin]}),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "disabled batch config must defer policy and graph validation: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn transaction_log_schema_batch_and_restore_are_definition_order_independent() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

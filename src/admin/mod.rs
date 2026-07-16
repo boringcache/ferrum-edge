@@ -4178,7 +4178,9 @@ async fn handle_batch_create(
                 plugin_config.id, plugin_config.plugin_name
             ));
         }
-        if crate::plugins::transaction_log_schema::participates_in_config_graph(plugin_config) {
+        if crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(
+            plugin_config,
+        ) {
             if let Err(err) = crate::plugins::validate_plugin_config_policy_only(
                 &plugin_config.plugin_name,
                 &plugin_config.config,
@@ -4202,7 +4204,7 @@ async fn handle_batch_create(
     if batch
         .plugin_configs
         .iter()
-        .any(crate::plugins::transaction_log_schema::participates_in_config_graph)
+        .any(crate::plugins::transaction_log_schema::is_enabled_config_graph_participant)
     {
         match crud::validate_transaction_log_schema_candidates(
             db.as_ref(),

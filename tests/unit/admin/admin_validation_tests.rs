@@ -48,6 +48,8 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("validate_transaction_log_schema_candidates("));
     assert!(crud_source.contains("std::slice::from_ref(resource)"));
     assert!(crud_source.contains("Some(&existing.id)"));
+    assert!(crud_source.contains(".chain(replaced_plugins.iter())"));
+    assert!(crud_source.contains("is_enabled_config_graph_participant(resource)"));
 
     let graph_validation = crud_source
         .rfind("validate_transaction_log_schema_candidates(")
@@ -63,6 +65,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     let batch_source = include_str!("../../../src/admin/mod.rs");
     assert!(batch_source.contains("crud::validate_transaction_log_schema_candidates("));
     assert!(batch_source.contains("&batch.plugin_configs,"));
+    assert!(batch_source.contains("is_enabled_config_graph_participant"));
 
     let pipeline_source = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(pipeline_source.contains("transaction_log_schema::validate_config_graph("));

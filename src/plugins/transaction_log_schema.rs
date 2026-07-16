@@ -136,6 +136,16 @@ pub(crate) fn participates_in_config_graph(
         || plugin_config.config.get("schema_ref").is_some()
 }
 
+/// Whether an enabled plugin config participates in the named-schema graph.
+///
+/// Disabled plugin configs are intentionally stageable without constructor,
+/// policy, or graph validation until they are enabled.
+pub(crate) fn is_enabled_config_graph_participant(
+    plugin_config: &crate::config::types::PluginConfig,
+) -> bool {
+    plugin_config.enabled && participates_in_config_graph(plugin_config)
+}
+
 /// Validate enabled named schemas and all of their enabled referrers against
 /// the supplied prospective configuration, without publishing anything to the
 /// live registry.

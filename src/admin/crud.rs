@@ -377,12 +377,20 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_replacement_candida
     existing_spec: &crate::config::types::ApiSpec,
     plugins: &[PluginConfig],
 ) -> Result<(), AfterValidateError> {
-    let mut candidate = db
-        .load_namespace_snapshot(namespace)
-        .await
-        .map_err(AfterValidateError::Db)?;
     let replaced_plugins = db
         .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    if !plugins
+        .iter()
+        .chain(replaced_plugins.iter())
+        .any(crate::plugins::transaction_log_schema::is_enabled_config_graph_participant)
+    {
+        return Ok(());
+    }
+
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
         .await
         .map_err(AfterValidateError::Db)?;
     let replaced_plugin_ids: HashSet<String> = replaced_plugins
@@ -2090,7 +2098,7 @@ impl AdminResource for PluginConfig {
             }
         }
 
-        if crate::plugins::transaction_log_schema::participates_in_config_graph(resource) {
+        if crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(resource) {
             if let Err(error) = crate::plugins::validate_plugin_config_policy_only(
                 &resource.plugin_name,
                 &resource.config,
@@ -2149,9 +2157,10 @@ impl AdminResource for PluginConfig {
             None,
         )
         .await?;
-        if crate::plugins::transaction_log_schema::participates_in_config_graph(resource)
-            || existing
-                .is_some_and(crate::plugins::transaction_log_schema::participates_in_config_graph)
+        if crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(resource)
+            || existing.is_some_and(
+                crate::plugins::transaction_log_schema::is_enabled_config_graph_participant,
+            )
         {
             validate_transaction_log_schema_candidates(
                 db,
@@ -2185,7 +2194,7 @@ impl AdminResource for PluginConfig {
             Some(&existing.id),
         )
         .await?;
-        if crate::plugins::transaction_log_schema::participates_in_config_graph(existing) {
+        if crate::plugins::transaction_log_schema::is_enabled_config_graph_participant(existing) {
             validate_transaction_log_schema_candidates(
                 db,
                 state,

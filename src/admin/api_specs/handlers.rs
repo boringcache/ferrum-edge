@@ -1780,7 +1780,9 @@ async fn validate_bundle(
                 &bundle.plugins,
             )
             .await
-        } else {
+        } else if bundle.plugins.iter().any(
+            crate::plugins::transaction_log_schema::is_enabled_config_graph_participant,
+        ) {
             crate::admin::crud::validate_transaction_log_schema_candidates(
                 db,
                 state,
@@ -1789,6 +1791,8 @@ async fn validate_bundle(
                 None,
             )
             .await
+        } else {
+            Ok(())
         };
         match validation_result {
             Ok(()) => {}

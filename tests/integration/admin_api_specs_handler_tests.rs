@@ -1521,6 +1521,129 @@ async fn api_spec_post_and_exact_put_validate_against_prospective_schema_graph()
 }
 
 #[tokio::test]
+async fn api_spec_writes_ignore_an_unchanged_invalid_persisted_schema_graph() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("unrelated-schema-graph-proxy");
+    let mut spec = minimal_json_spec(&proxy_id);
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id");
+
+    store
+        .create_plugin_config(&PluginConfig {
+            id: uid("preexisting-dangling-logger"),
+            namespace: "ferrum".to_string(),
+            plugin_name: "stdout_logging".to_string(),
+            config: json!({"schema_ref": "missing"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist pre-existing invalid graph participant");
+
+    let unrelated_proxy_id = uid("second-unrelated-schema-graph-proxy");
+    let (unrelated_status, unrelated_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&unrelated_proxy_id))
+        .await;
+    assert_eq!(
+        unrelated_status,
+        reqwest::StatusCode::CREATED,
+        "unrelated POST must not repair the persisted graph: {unrelated_body}"
+    );
+
+    spec["info"]["version"] = json!("2.0.0");
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::OK,
+        "unrelated PUT must not repair the persisted graph: {put_body}"
+    );
+}
+
+#[tokio::test]
+async fn api_spec_exact_put_validates_removed_spec_owned_schema_definitions() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("removed-schema-definition-proxy");
+    let mut spec = minimal_json_spec(&proxy_id);
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("created API spec returns id")
+        .to_string();
+    let schema_name = uid("spec-owned-schema");
+    let schema_id = uid("spec-owned-schema-plugin");
+    store
+        .create_plugin_config(&PluginConfig {
+            id: schema_id.clone(),
+            namespace: "ferrum".to_string(),
+            plugin_name: "transaction_log_schema".to_string(),
+            config: json!({"schemas": {(schema_name.clone()): {}}}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: Some(spec_id.clone()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist spec-owned schema definition");
+    store
+        .create_plugin_config(&PluginConfig {
+            id: uid("manual-schema-referrer"),
+            namespace: "ferrum".to_string(),
+            plugin_name: "stdout_logging".to_string(),
+            config: json!({"schema_ref": schema_name}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("persist manual schema referrer");
+
+    spec["info"]["version"] = json!("2.0.0");
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "removing the spec-owned definition must validate retained referrers: {put_body}"
+    );
+    assert!(put_body.to_string().contains("unknown schema"), "{put_body}");
+    let owned_plugins = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list spec-owned plugins after rejected PUT");
+    assert!(
+        owned_plugins.iter().any(|plugin| plugin.id == schema_id),
+        "rejected PUT must preserve the spec-owned schema definition"
+    );
+}
+
+#[tokio::test]
 async fn post_rejects_hmac_request_body_transformer_composition() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
