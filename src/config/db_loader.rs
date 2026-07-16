@@ -49,9 +49,10 @@ use tracing::{debug, error, info, warn};
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, NamespaceResourceCounts,
-    NamespaceConfigAdmissionLeaseBackend, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR,
-    PaginatedResult, SnapshotDataIntegrityError, SortOrder, extract_db_hostname, redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult,
+    NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts, NamespacedResourceId,
+    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
+    extract_db_hostname, redact_url,
 };
 
 const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
@@ -5063,9 +5064,10 @@ impl DatabaseStore {
         if configs.is_empty() {
             return Ok(0);
         }
-        let total = if configs.iter().any(
-            crate::plugins::transaction_log_schema::is_enabled_config_graph_participant,
-        ) {
+        let total = if configs
+            .iter()
+            .any(crate::plugins::transaction_log_schema::is_enabled_config_graph_participant)
+        {
             self.batch_create_plugin_configs_chunk(configs).await?
         } else {
             let mut total = 0usize;
@@ -7382,10 +7384,8 @@ impl NamespaceConfigAdmissionLeaseBackend for DatabaseStore {
     ) -> Result<bool, anyhow::Error> {
         let now = Utc::now().timestamp_millis();
         let expires_at = now + CONFIG_ADMISSION_LEASE_DURATION_MILLIS;
-        let sql = self.q(
-            "UPDATE config_admission_locks SET expires_at = ? \
-             WHERE namespace = ? AND owner = ? AND expires_at > ?",
-        );
+        let sql = self.q("UPDATE config_admission_locks SET expires_at = ? \
+             WHERE namespace = ? AND owner = ? AND expires_at > ?");
         let result = sqlx::query(&sql)
             .bind(expires_at)
             .bind(namespace)
