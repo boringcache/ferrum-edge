@@ -1042,6 +1042,10 @@ async fn test_plugin_correlation_id() {
     .await
     .unwrap();
 
+    // The second database-backed route is admitted asynchronously. Prove the
+    // poller has published it before exercising the multi-instance lifecycle.
+    harness.wait_for_route("/corrid-multi").await;
+
     let attacker_id = "attacker-preserved-id";
     let response = client
         .get(format!("{}/corrid-multi/test", harness.proxy_base_url))
