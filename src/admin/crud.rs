@@ -3171,9 +3171,11 @@ impl AdminResource for PluginConfig {
         candidate
             .plugin_configs
             .retain(|plugin| plugin.namespace != namespace || plugin.id != written.id);
-        Ok(validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client)
-            .await
-            .is_ok())
+        Ok(
+            validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client)
+                .await
+                .is_ok(),
+        )
     }
 
     async fn check_uniqueness(
