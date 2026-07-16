@@ -1468,9 +1468,7 @@ fn materialize_fault_runtime_overlay(
         .iter_mut()
         .filter(|plugin| plugin.enabled && plugin.plugin_name == "fault_injection")
     {
-        if materialize_config(&mut plugin.config, overlay)
-            == FaultOverlayMaterialization::Disabled
-        {
+        if materialize_config(&mut plugin.config, overlay) == FaultOverlayMaterialization::Disabled {
             plugin.enabled = false;
         }
     }
@@ -1497,10 +1495,7 @@ fn reconcile_fault_plugin_generations(candidate: &mut GatewayConfig, previous: &
         .iter_mut()
         .filter(|plugin| plugin.plugin_name == "fault_injection")
     {
-        let Some(previous) = previous_plugins.get(&(
-            plugin.namespace.as_str(),
-            plugin.id.as_str(),
-        ))
+        let Some(previous) = previous_plugins.get(&(plugin.namespace.as_str(), plugin.id.as_str()))
         else {
             continue;
         };
@@ -22522,8 +22517,7 @@ mod tests {
         );
         reconcile_fault_plugin_generations(&mut repeated, &candidate);
         assert_eq!(
-            repeated.plugin_configs[0].updated_at,
-            candidate.plugin_configs[0].updated_at,
+            repeated.plugin_configs[0].updated_at, candidate.plugin_configs[0].updated_at,
             "an unchanged effective RTDS generation must retain the accepted stamp"
         );
         let repeated_delta = crate::config_delta::ConfigDelta::compute(&candidate, &repeated);

@@ -1409,7 +1409,10 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         ),
         (
             "fault_injection",
-            json!({"runtime_overlay_scope": "checkout"}),
+            json!({
+                "abort": {"status_code": 503, "percentage": 1.0},
+                "runtime_overlay_scope": "checkout"
+            }),
         ),
         (
             "serverless_function",
@@ -2226,12 +2229,7 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             "fault": {"delay": {"duration_ms": 60_001, "percentage": 1.0}}
         }]
     });
-    assert_component_validity(
-        &spec,
-        "MeshRouteDispatchConfig",
-        &overlong_fault,
-        false,
-    );
+    assert_component_validity(&spec, "MeshRouteDispatchConfig", &overlong_fault, false);
     assert!(MeshRouteDispatch::new(&overlong_fault).is_err());
 
     let documented_old_transform = json!({

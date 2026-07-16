@@ -1,8 +1,6 @@
 //! Tests for fault_injection plugin
 
-use ferrum_edge::_test_support::{
-    normalize_reject_response, set_request_http_flavor_for_test,
-};
+use ferrum_edge::_test_support::{normalize_reject_response, set_request_http_flavor_for_test};
 use ferrum_edge::HttpFlavor;
 use ferrum_edge::plugins::fault_injection::FaultInjectionPlugin;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -665,7 +663,10 @@ async fn test_fault_rejection_shaping_matches_request_protocols() {
             assert_eq!(normalized.http_status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(normalized.body, b"fault", "{protocol}");
             assert_eq!(normalized.grpc_status, None, "{protocol}");
-            assert!(!normalized.headers.contains_key("grpc-status"), "{protocol}");
+            assert!(
+                !normalized.headers.contains_key("grpc-status"),
+                "{protocol}"
+            );
         }
     }
 
@@ -843,7 +844,11 @@ fn test_zero_overlay_treats_null_fault_sides_as_absent() {
         FaultOverlayMaterialization::Changed,
         "an object sibling keeps the generation enabled"
     );
-    assert!(both_objects.get("abort").is_some_and(serde_json::Value::is_object));
+    assert!(
+        both_objects
+            .get("abort")
+            .is_some_and(serde_json::Value::is_object)
+    );
 }
 
 // === GAP-3E: RTDS overlay-driven percentages ===

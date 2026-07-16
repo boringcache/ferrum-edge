@@ -68,12 +68,10 @@ use crate::config::types::{
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
 };
+use crate::plugins::fault_injection::{ROUTE_FAULT_INJECTED_METADATA_KEY, is_native_grpc_request};
 use crate::plugins::mesh::authz::{
     NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
     NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
-};
-use crate::plugins::fault_injection::{
-    ROUTE_FAULT_INJECTED_METADATA_KEY, is_native_grpc_request,
 };
 use crate::plugins::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
 use crate::plugins::utils::route_header_transform::{

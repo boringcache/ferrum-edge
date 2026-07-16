@@ -2094,10 +2094,7 @@ mod tests {
         }
     }
 
-    fn runtime_resource(
-        name: &str,
-        fields: &[(&str, runtime_proto::value::Kind)],
-    ) -> proto::Any {
+    fn runtime_resource(name: &str, fields: &[(&str, runtime_proto::value::Kind)]) -> proto::Any {
         let fields = fields
             .iter()
             .map(|(key, kind)| {
@@ -2179,15 +2176,17 @@ mod tests {
                 .expect("reverse translation")
                 .expect("required types are coherent");
             assert_eq!(
-                slice.runtime_overlay.fields.get(
-                    "ferrum.fault_injection.checkout.abort_percent"
-                ),
+                slice
+                    .runtime_overlay
+                    .fields
+                    .get("ferrum.fault_injection.checkout.abort_percent"),
                 Some(&RuntimeValue::Number(75.0))
             );
             assert_eq!(
-                slice.runtime_overlay.fields.get(
-                    "ferrum.request_transformer.checkout.enabled"
-                ),
+                slice
+                    .runtime_overlay
+                    .fields
+                    .get("ferrum.request_transformer.checkout.enabled"),
                 Some(&RuntimeValue::Bool(true))
             );
         }
@@ -2224,10 +2223,7 @@ mod tests {
                 ),
             ],
         );
-        let mut accumulator = coherent_accumulator_with_rtds(&[
-            override_layer,
-            base.clone(),
-        ]);
+        let mut accumulator = coherent_accumulator_with_rtds(&[override_layer, base.clone()]);
         accumulator
             .apply_sotw_response(RTDS_TYPE_URL, &[base], "rtds-v2")
             .expect("replacement applies");
@@ -2270,18 +2266,17 @@ mod tests {
             &[("ferrum.log.level", Kind::StringValue("warn".to_string()))],
         );
         let error = accumulator
-            .apply_sotw_response(
-                RTDS_TYPE_URL,
-                &[duplicate_a, duplicate_b],
-                "rtds-v2",
-            )
+            .apply_sotw_response(RTDS_TYPE_URL, &[duplicate_a, duplicate_b], "rtds-v2")
             .expect_err("duplicate Runtime names must NACK");
 
         assert!(error.contains("duplicate Runtime resource name 'duplicate'"));
         assert_eq!(accumulator.resources(RTDS_TYPE_URL).len(), 1);
         assert_eq!(accumulator.resources(RTDS_TYPE_URL)[0].name, "stable");
         assert_eq!(
-            accumulator.versions_by_type.get(RTDS_TYPE_URL).map(String::as_str),
+            accumulator
+                .versions_by_type
+                .get(RTDS_TYPE_URL)
+                .map(String::as_str),
             Some("rtds-v1")
         );
     }
