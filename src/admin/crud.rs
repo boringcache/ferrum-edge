@@ -333,6 +333,69 @@ impl Drop for NamespaceConfigAdmissionGuard {
     }
 }
 
+async fn release_namespace_config_admission_claim(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    owner: &str,
+    context: &'static str,
+) {
+    match tokio::time::timeout(
+        CONFIG_ADMISSION_LEASE_RETRY_INTERVAL,
+        db.release_namespace_config_admission_lease(namespace, owner),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(
+            %namespace,
+            %error,
+            "Failed to release {context}; expiry will recover it"
+        ),
+        Err(_) => tracing::warn!(
+            %namespace,
+            "Timed out releasing {context}; expiry will recover it"
+        ),
+    }
+}
+
+struct PendingNamespaceConfigAdmissionClaim {
+    db: Arc<dyn DatabaseBackend>,
+    namespace: String,
+    owner: String,
+    lease_started_at: Instant,
+    generation: u64,
+    armed: bool,
+}
+
+impl PendingNamespaceConfigAdmissionClaim {
+    fn into_acquired(mut self) -> (Instant, u64) {
+        self.armed = false;
+        (self.lease_started_at, self.generation)
+    }
+}
+
+impl Drop for PendingNamespaceConfigAdmissionClaim {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let db = self.db.clone();
+        let namespace = self.namespace.clone();
+        let owner = self.owner.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _cleanup_task = runtime.spawn(async move {
+                release_namespace_config_admission_claim(
+                    db.as_ref(),
+                    &namespace,
+                    &owner,
+                    "a cancelled namespace config admission acquisition",
+                )
+                .await;
+            });
+        }
+    }
+}
+
 pub(crate) async fn lock_namespace_config_admission(
     db: Arc<dyn DatabaseBackend>,
     namespace: &str,
@@ -340,12 +403,52 @@ pub(crate) async fn lock_namespace_config_admission(
     let local = lock_local_namespace_config_admission(namespace).await;
     let owner = Uuid::new_v4().to_string();
     let (lease_started_at, generation) = loop {
-        let attempt_started_at = Instant::now();
-        if let Some(generation) = db
-            .try_acquire_namespace_config_admission_lease(namespace, &owner)
-            .await?
-        {
-            break (attempt_started_at, generation);
+        let acquire_db = db.clone();
+        let acquire_namespace = namespace.to_string();
+        let acquire_owner = owner.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let _acquire_task = tokio::spawn(async move {
+            let attempt_started_at = Instant::now();
+            let result = acquire_db
+                .try_acquire_namespace_config_admission_lease(
+                    &acquire_namespace,
+                    &acquire_owner,
+                )
+                .await;
+
+            // An error can be an ambiguous datastore outcome. Make one
+            // owner-qualified release attempt before reporting it. If the
+            // request disappeared while acquisition was in flight, an
+            // acquired claim is likewise released instead of waiting for its
+            // full lease expiry.
+            if result.is_err() {
+                release_namespace_config_admission_claim(
+                    acquire_db.as_ref(),
+                    &acquire_namespace,
+                    &acquire_owner,
+                    "an ambiguous namespace config admission acquisition",
+                )
+                .await;
+            }
+
+            let result = result.map(|generation| {
+                generation.map(|generation| PendingNamespaceConfigAdmissionClaim {
+                    db: acquire_db,
+                    namespace: acquire_namespace,
+                    owner: acquire_owner,
+                    lease_started_at: attempt_started_at,
+                    generation,
+                    armed: true,
+                })
+            });
+            // If the receiver disappeared before or after this send, the
+            // undelivered/queued claim is dropped and starts cleanup.
+            let _ = result_tx.send(result);
+        });
+        if let Some(claim) = result_rx.await.map_err(|_| {
+            anyhow::anyhow!("namespace config admission acquisition task stopped unexpectedly")
+        })?? {
+            break claim.into_acquired();
         }
         tokio::time::sleep(CONFIG_ADMISSION_LEASE_RETRY_INTERVAL).await;
     };
@@ -784,6 +887,23 @@ async fn validate_transaction_log_schema_graph_on_blocking_pool(
         ))
     })?
     .map_err(AfterValidateError::BadRequest)
+}
+
+pub(crate) async fn current_transaction_log_schema_graph_is_valid(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+) -> DbResult<bool> {
+    let candidate = db.load_namespace_snapshot(namespace).await?;
+    let http_client = super::plugin_validation_http_client(state);
+    match validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await {
+        Ok(()) => Ok(true),
+        Err(AfterValidateError::BadRequest(_) | AfterValidateError::Conflict(_)) => Ok(false),
+        Err(AfterValidateError::Db(error)) => Err(error),
+        Err(AfterValidateError::Response(_)) => {
+            anyhow::bail!("transaction-log schema graph validation returned an HTTP response")
+        }
+    }
 }
 
 async fn validate_mtls_auth_candidate(

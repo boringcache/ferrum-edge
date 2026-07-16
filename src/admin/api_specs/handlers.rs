@@ -255,11 +255,98 @@ async fn compensate_late_api_spec_create(
     db: Arc<dyn DatabaseBackend>,
     bundle: ExtractedBundle,
     spec: ApiSpec,
+    state: &AdminState,
 ) -> Result<(), anyhow::Error> {
-    if stored_api_spec_bundle_matches(db.as_ref(), &bundle, &spec).await? {
-        db.delete_api_spec(&spec.namespace, &spec.id).await?;
+    if crate::admin::crud::current_transaction_log_schema_graph_is_valid(
+        db.as_ref(),
+        state,
+        &spec.namespace,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    match crate::admin::crud::validate_transaction_log_schema_api_spec_deletion_candidate(
+        db.as_ref(),
+        state,
+        &spec.namespace,
+        &spec,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crate::admin::crud::AfterValidateError::BadRequest(errors))
+        | Err(crate::admin::crud::AfterValidateError::Conflict(errors)) => anyhow::bail!(
+            "late API-spec create compensation would leave an invalid transaction-log schema graph: {}",
+            errors.join("; ")
+        ),
+        Err(crate::admin::crud::AfterValidateError::Db(error)) => return Err(error),
+        Err(crate::admin::crud::AfterValidateError::Response(_)) => anyhow::bail!(
+            "late API-spec create compensation validation returned an HTTP response"
+        ),
+    }
+    if !late_api_spec_create_compensation_safe(db.as_ref(), &bundle, &spec).await? {
+        anyhow::bail!(
+            "late API-spec create compensation found intervening resources attached to its proxy"
+        );
+    }
+    if !db.delete_api_spec(&spec.namespace, &spec.id).await? {
+        anyhow::bail!("late API-spec create compensation found no matching API spec");
     }
     Ok(())
+}
+
+async fn late_api_spec_create_compensation_safe(
+    db: &dyn DatabaseBackend,
+    bundle: &ExtractedBundle,
+    spec: &ApiSpec,
+) -> Result<bool, anyhow::Error> {
+    if !stored_api_spec_bundle_matches(db, bundle, spec).await? {
+        return Ok(false);
+    }
+    let Some(current_proxy) = db
+        .get_proxy_for_write(&spec.namespace, &bundle.proxy.id)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let expected_associations = bundle
+        .proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect::<HashSet<_>>();
+    if current_proxy.plugins.len() != expected_associations.len()
+        || current_proxy.plugins.iter().any(|association| {
+            !expected_associations.contains(association.plugin_config_id.as_str())
+        })
+    {
+        return Ok(false);
+    }
+
+    let expected_plugin_ids = bundle
+        .plugins
+        .iter()
+        .map(|plugin| plugin.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_plugin_configs_paginated(&spec.namespace, PAGE_SIZE, offset)
+            .await?;
+        let items_len = page.items.len() as i64;
+        if page.items.iter().any(|plugin| {
+            plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str())
+                && !expected_plugin_ids.contains(plugin.id.as_str())
+        }) {
+            return Ok(false);
+        }
+        if items_len == 0 || offset + items_len >= page.total {
+            return Ok(true);
+        }
+        offset += items_len;
+    }
 }
 
 async fn compensate_late_api_spec_replace(
@@ -268,11 +355,42 @@ async fn compensate_late_api_spec_replace(
     written_spec: ApiSpec,
     previous_bundle: ExtractedBundle,
     previous_spec: ApiSpec,
+    state: &AdminState,
 ) -> Result<(), anyhow::Error> {
-    if stored_api_spec_bundle_matches(db.as_ref(), &written_bundle, &written_spec).await? {
-        db.replace_api_spec_bundle(&previous_bundle, &previous_spec)
-            .await?;
+    if crate::admin::crud::current_transaction_log_schema_graph_is_valid(
+        db.as_ref(),
+        state,
+        &written_spec.namespace,
+    )
+    .await?
+    {
+        return Ok(());
     }
+    match crate::admin::crud::validate_transaction_log_schema_api_spec_replacement_candidate(
+        db.as_ref(),
+        state,
+        &written_spec.namespace,
+        &written_spec,
+        &previous_bundle.plugins,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crate::admin::crud::AfterValidateError::BadRequest(errors))
+        | Err(crate::admin::crud::AfterValidateError::Conflict(errors)) => anyhow::bail!(
+            "late API-spec replacement compensation could not produce a valid transaction-log schema graph: {}",
+            errors.join("; ")
+        ),
+        Err(crate::admin::crud::AfterValidateError::Db(error)) => return Err(error),
+        Err(crate::admin::crud::AfterValidateError::Response(_)) => anyhow::bail!(
+            "late API-spec replacement compensation validation returned an HTTP response"
+        ),
+    }
+    if !stored_api_spec_bundle_matches(db.as_ref(), &written_bundle, &written_spec).await? {
+        anyhow::bail!("late API-spec replacement no longer matches the written bundle");
+    }
+    db.replace_api_spec_bundle(&previous_bundle, &previous_spec)
+        .await?;
     Ok(())
 }
 
@@ -2650,7 +2768,7 @@ pub async fn handle_post_api_spec(
         namespace,
         _namespace_config_admission_guard,
         db.submit_api_spec_bundle(&bundle, &spec),
-        compensate_late_api_spec_create(db.clone(), bundle.clone(), spec.clone()),
+        compensate_late_api_spec_create(db.clone(), bundle.clone(), spec.clone(), state),
         true,
     )
     .await
@@ -2867,8 +2985,9 @@ pub async fn handle_put_api_spec(
             spec.clone(),
             previous_bundle,
             existing_spec.clone(),
+            state,
         ),
-        false,
+        true,
     )
     .await
     {

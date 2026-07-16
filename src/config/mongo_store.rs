@@ -2212,7 +2212,14 @@ mod inner {
         }
 
         fn config_admission_locks(&self) -> MongoCollectionHandle {
-            self.collection("config_admission_locks")
+            let connection = self.connection();
+            MongoCollectionHandle {
+                collection: connection
+                    .lease_client
+                    .database(connection.db.name())
+                    .collection("config_admission_locks"),
+                _connection: connection,
+            }
         }
 
         /// Merged consumer identity keyspace (id ∪ username ∪ custom_id per

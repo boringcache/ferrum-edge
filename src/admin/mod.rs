@@ -3738,6 +3738,81 @@ async fn rollback_failed_restore(
     }
 }
 
+fn snapshot_resources_missing_after_intervening_write(
+    snapshot: &RestorePayload,
+    current: &GatewayConfig,
+) -> RestorePayload {
+    let proxy_ids = current
+        .proxies
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let consumer_ids = current
+        .consumers
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let plugin_config_ids = current
+        .plugin_configs
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    let upstream_ids = current
+        .upstreams
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<HashSet<_>>();
+    RestorePayload {
+        version: snapshot.version.clone(),
+        proxies: snapshot
+            .proxies
+            .iter()
+            .filter(|resource| !proxy_ids.contains(resource.id.as_str()))
+            .cloned()
+            .collect(),
+        consumers: snapshot
+            .consumers
+            .iter()
+            .filter(|resource| !consumer_ids.contains(resource.id.as_str()))
+            .cloned()
+            .collect(),
+        plugin_configs: snapshot
+            .plugin_configs
+            .iter()
+            .filter(|resource| !plugin_config_ids.contains(resource.id.as_str()))
+            .cloned()
+            .collect(),
+        upstreams: snapshot
+            .upstreams
+            .iter()
+            .filter(|resource| !upstream_ids.contains(resource.id.as_str()))
+            .cloned()
+            .collect(),
+    }
+}
+
+async fn restore_snapshot_after_intervening_clear(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    snapshot: &RestorePayload,
+    guard_owner: &str,
+) -> Result<(), Vec<String>> {
+    let current = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(|error| vec![format!("failed to load intervening resources: {error}")])?;
+    let missing = snapshot_resources_missing_after_intervening_write(snapshot, &current);
+    let mode = BatchConfigWriteMode::RestoreRollbackReplay {
+        guard_owner: guard_owner.to_string(),
+    };
+    let (_, errors, _) = persist_payload_resources(db, &missing, false, &mode).await;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 /// Finalize a failed restore. Attempts a best-effort rollback to the pre-restore
 /// snapshot, records the audit event, and builds the operator-facing `500`
 /// response. Shared by the delete-failure and import-failure paths so both roll
@@ -3836,6 +3911,88 @@ async fn finish_failed_restore(
         response["api_specs_note"] = json!(note);
     }
 
+    json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
+}
+
+/// Recover a clear that completed after namespace admission expired without
+/// deleting resources committed by the intervening lease owner. Current IDs
+/// win and only snapshot resources that are still absent are replayed.
+async fn finish_failed_restore_after_intervening_clear(
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    restore_errors: Vec<String>,
+    snapshot: &RestoreSnapshot,
+    guard: &mut MtlsDnsAdmissionGuardLifecycle,
+) -> Response<Full<Bytes>> {
+    let guard_owner = guard.guard_owner().to_string();
+    let operation = guard.operation();
+    let (mut rollback_status, mut rollback_errors) = match operation
+        .run_mutation(restore_snapshot_after_intervening_clear(
+            db.as_ref(),
+            namespace,
+            &snapshot.payload,
+            &guard_owner,
+        ))
+        .await
+    {
+        Ok(()) => ("completed", None),
+        Err(errors) => {
+            error!(
+                namespace = %namespace,
+                errors = %errors.join("; "),
+                "Restore: additive rollback after an intervening clear failed"
+            );
+            ("incomplete", Some(errors))
+        }
+    };
+    if let Err(error) = guard.release().await {
+        error!(
+            namespace = %namespace,
+            %error,
+            "Restore: additive rollback guard could not be released"
+        );
+        rollback_status = "incomplete";
+        rollback_errors
+            .get_or_insert_with(Vec::new)
+            .push("failed to release restore admission guard".to_string());
+    }
+
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            json!({"rollback": rollback_status}),
+        ),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    let mut response = json!({
+        "error": if rollback_status == "completed" {
+            "Restore lost namespace admission during clear; prior and intervening config resources were preserved"
+        } else {
+            "Restore lost namespace admission during clear and additive rollback was incomplete; manual recovery required"
+        },
+        "restore_errors": restore_errors,
+        "rollback": rollback_status,
+    });
+    if let Some(errors) = rollback_errors {
+        response["rollback_errors"] = json!(errors);
+    }
+    if snapshot.api_specs_total > 0 {
+        response["api_specs_not_restored"] = json!(snapshot.api_specs_total);
+        response["api_specs_note"] = json!(format!(
+            "{} pre-restore API spec(s) were removed by the clear and are not part of config rollback. API specs committed by the intervening writer were not deleted.",
+            snapshot.api_specs_total
+        ));
+    }
     json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
 }
 
@@ -6030,16 +6187,8 @@ async fn handle_restore(
                 ));
             }
         };
-        if !namespace_config_admission_guard.immediately_succeeds_generation(lost_generation) {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": "Config admission was lost during restore clear; recovery was skipped because another writer acquired the namespace lease",
-                    "restore_errors": [error.to_string()],
-                    "rollback": "skipped_after_intervening_write",
-                }),
-            ));
-        }
+        let intervening_write =
+            !namespace_config_admission_guard.immediately_succeeds_generation(lost_generation);
         restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(recovery_error) => {
@@ -6055,17 +6204,34 @@ async fn handle_restore(
             }
         };
         if delete_result.is_ok() {
-            let rollback = finish_failed_restore(
-                state,
-                db.clone(),
-                actor,
-                namespace,
-                vec![format!(
-                    "namespace admission was lost during restore clear: {error}"
-                )],
-                &snapshot,
-                &mut restore_guard,
-            );
+            let restore_errors = vec![format!(
+                "namespace admission was lost during restore clear: {error}"
+            )];
+            let rollback = async {
+                if intervening_write {
+                    finish_failed_restore_after_intervening_clear(
+                        state,
+                        db.clone(),
+                        actor,
+                        namespace,
+                        restore_errors,
+                        &snapshot,
+                        &mut restore_guard,
+                    )
+                    .await
+                } else {
+                    finish_failed_restore(
+                        state,
+                        db.clone(),
+                        actor,
+                        namespace,
+                        restore_errors,
+                        &snapshot,
+                        &mut restore_guard,
+                    )
+                    .await
+                }
+            };
             return Ok(
                 match namespace_config_admission_guard
                     .run_to_completion_while_held(rollback)
@@ -6091,6 +6257,16 @@ async fn handle_restore(
                     ),
                 },
             );
+        }
+        if intervening_write {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Config admission was lost during a failed restore clear after another writer acquired the namespace lease",
+                    "restore_errors": [error.to_string()],
+                    "rollback": "not_needed_after_intervening_write",
+                }),
+            ));
         }
     }
     if let Err(e) = delete_result {
