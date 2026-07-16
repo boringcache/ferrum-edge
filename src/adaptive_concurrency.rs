@@ -105,10 +105,8 @@ impl AdaptiveConcurrencyPolicyTransition {
         if !reset.can_reactivate {
             return false;
         }
-        let next = policy_transition_word(
-            policy_transition_epoch(reset.resetting_word),
-            POLICY_ACTIVE,
-        );
+        let next =
+            policy_transition_word(policy_transition_epoch(reset.resetting_word), POLICY_ACTIVE);
         self.word
             .compare_exchange(
                 reset.resetting_word,
@@ -386,8 +384,7 @@ impl AdaptiveConcurrencyLimiter {
                 Entry::Occupied(entry) => Arc::clone(entry.get()),
                 Entry::Vacant(entry) => {
                     if self.reserve_key_slot(&tracking_space, config.max_tracked_keys) {
-                        let state =
-                            Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
+                        let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
                         entry.insert(Arc::clone(&state));
                         state
                     } else {
