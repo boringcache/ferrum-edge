@@ -105,7 +105,6 @@ use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::plugins::{

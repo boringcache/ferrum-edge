@@ -5,7 +5,6 @@ use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::str::FromStr;
 
 const GUIDE: &str = include_str!("../../../CUSTOM_PLUGINS.md");
 const MAX_CUSTOM_HEADER_NAME_BYTES: usize = 256;
