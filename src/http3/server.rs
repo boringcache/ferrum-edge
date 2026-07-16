@@ -2458,11 +2458,10 @@ async fn handle_h3_request(
         None,
     );
     let lb_hash_key = selection.lb_hash_key;
-    let upstream_target =
-        crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
-            selection.target,
-            request_host.as_deref(),
-        );
+    let upstream_target = crate::proxy::backend_dispatch::concretize_wildcard_target_for_request(
+        selection.target,
+        request_host.as_deref(),
+    );
     let upstream_balancer = selection.balancer;
     // Mirror H1/H2 selected-target policy: cap per-request retries, then build
     // an effective proxy carrying per-target DestinationRule-derived
