@@ -14680,11 +14680,7 @@ fn set_cookie_storage_key<'a>(
     })
 }
 
-fn set_cookie_same_storage_key(
-    existing: &str,
-    candidate: &str,
-    default_path: &str,
-) -> bool {
+fn set_cookie_same_storage_key(existing: &str, candidate: &str, default_path: &str) -> bool {
     let Some(existing_key) = set_cookie_storage_key(existing, default_path) else {
         return false;
     };
@@ -14708,15 +14704,10 @@ fn set_cookie_same_storage_key(
 /// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
 /// earlier line only when a later line owns the same RFC 6265 storage key.
 /// Invalid cookie-pairs can only replace byte-identical lines.
-fn collect_later_set_cookies(
-    cookies: &mut Vec<String>,
-    joined: &str,
-    default_path: &str,
-) {
+fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str, default_path: &str) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
         if let Some(index) = cookies.iter().position(|existing| {
-            existing == candidate
-                || set_cookie_same_storage_key(existing, candidate, default_path)
+            existing == candidate || set_cookie_same_storage_key(existing, candidate, default_path)
         }) {
             cookies.remove(index);
         }
@@ -14724,14 +14715,9 @@ fn collect_later_set_cookies(
     }
 }
 
-fn set_cookie_conflicts(
-    cookies: &[String],
-    candidate: &str,
-    default_path: &str,
-) -> bool {
+fn set_cookie_conflicts(cookies: &[String], candidate: &str, default_path: &str) -> bool {
     cookies.iter().any(|existing| {
-        existing == candidate
-            || set_cookie_same_storage_key(existing, candidate, default_path)
+        existing == candidate || set_cookie_same_storage_key(existing, candidate, default_path)
     })
 }
 
