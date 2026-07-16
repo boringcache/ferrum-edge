@@ -646,7 +646,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 
 | Plugin | Http | Grpc | WebSocket | Tcp | Udp | Rationale |
 |--------|:----:|:----:|:---------:|:---:|:---:|-----------|
-| `cors` | ✓ | | | | | HTTP-only concept (Origin/ACAO headers) |
+| `cors` | ✓ | ✓ | | | | Origin/ACAO enforcement includes browser gRPC-Web requests |
 | `ip_restriction` | ✓ | ✓ | ✓ | ✓ | ✓ | IP filtering is protocol-agnostic |
 | `bot_detection` | ✓ | ✓ | ✓ | | | Needs User-Agent header |
 | `sse` | ✓ | | | | | SSE is HTTP-only (text/event-stream over chunked transfer) |

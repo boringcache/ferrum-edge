@@ -378,6 +378,12 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
         "an external deferred hook must not reselect an unpreviewed target"
     );
     assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
+    assert!(
+        !source.contains(
+            "if !matches!(deferred_result, PluginResult::Continue) {\n            break;"
+        ),
+        "a deferred routing-hook rejection must still reach final method enforcement"
+    );
 
     let mirror = include_str!("../../../src/plugins/request_mirror.rs");
     assert!(mirror.contains("ctx.authorized_backend_path().unwrap_or(&ctx.path)"));
@@ -426,8 +432,10 @@ fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
         !handler[routed..protocol].contains("let grpc_web_response_content_type"),
         "route-level rejects must reuse the WebSocket-safe strict classification"
     );
-    assert!(handler.contains("finalize_grpc_web_error_response_headers("));
-    assert!(handler.contains("Some(&reject.headers)"));
+    assert!(handler.contains("build_grpc_web_reject_response("));
+    assert!(source.contains(
+        "finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));"
+    ));
     let finalizer = source
         .find("pub(crate) fn finalize_grpc_web_error_response_headers(")
         .map(|start| &source[start..])

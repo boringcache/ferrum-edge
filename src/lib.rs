@@ -808,6 +808,18 @@ pub mod _test_support {
         crate::plugins::grpc_web::response_content_type(original_ct)
     }
 
+    pub fn finalize_grpc_web_error_response_headers(
+        response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
+        initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+        finalized_reject_headers: Option<&HashMap<String, String>>,
+    ) {
+        crate::proxy::finalize_grpc_web_error_response_headers(
+            response,
+            initial_response_header_policy_plugins,
+            finalized_reject_headers,
+        );
+    }
+
     pub async fn run_h3_reject_response_committed_hooks(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,

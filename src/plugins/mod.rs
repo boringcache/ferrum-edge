@@ -156,8 +156,8 @@ pub enum BackendPathPolicyPhase {
     /// work. Stateful policy such as rate limiting must not be charged here.
     Preview,
     /// Enforce the settled backend-effective path immediately before the
-    /// remaining deferred hooks and backend dispatch. Stateful policy is
-    /// committed exactly once in this phase.
+    /// remaining deferred hooks, a deferred-hook rejection, or backend
+    /// dispatch. Stateful policy is committed exactly once in this phase.
     Enforce,
 }
 

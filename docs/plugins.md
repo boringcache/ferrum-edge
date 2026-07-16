@@ -2358,6 +2358,7 @@ config:
 Handles Cross-Origin Resource Sharing at the gateway level.
 
 **Priority:** 100
+**Supported protocols:** HTTP, gRPC (including gRPC-Web)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

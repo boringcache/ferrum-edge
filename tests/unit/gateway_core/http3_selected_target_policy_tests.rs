@@ -13,7 +13,7 @@ use http::StatusCode;
 fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
     let source = include_str!("../../../src/http3/server.rs");
     let selection = source
-        .find("let mut selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
         .expect("H3 selected-target lookup must remain present");
     let after_selection = &source[selection..];
 
@@ -204,7 +204,7 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         .find("let backend_path_plugins = plugin_cache_view.backend_path_plugins();")
         .expect("H3 must load the prefiltered backend-path policy list");
     let selection = source
-        .find("let mut selection = crate::proxy::backend_dispatch::select_upstream_target(")
+        .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
         .expect("H3 selected-target lookup must remain present");
     assert!(
         backend_path_plugins < selection,
@@ -255,6 +255,12 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     assert!(
         source.contains("BackendPathBeforeProxyPass::RemainingDeferred"),
         "H3 must keep remaining side-effect hooks behind any required reauthorization"
+    );
+    assert!(
+        !source.contains(
+            "if !matches!(deferred_result, PluginResult::Continue) {\n            break;"
+        ),
+        "an H3 deferred routing-hook rejection must still reach final method enforcement"
     );
     let native_retry = source
         .find("// Resolve and validate the retry target before charging this")

@@ -185,7 +185,7 @@ fn reject_config(backend_port: u16) -> Value {
             proxy(
                 "h3-grpc-web-received",
                 "/received",
-                &["grpc-web-received", "received-reject"],
+                &["grpc-web-received", "grpc-web-cors", "received-reject"],
             ),
             proxy(
                 "h3-grpc-web-authenticate",
@@ -208,6 +208,14 @@ fn reject_config(backend_port: u16) -> Value {
                 "proxy_id": "h3-grpc-web-received",
                 "enabled": true,
                 "config": {},
+            },
+            {
+                "id": "grpc-web-cors",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-received",
+                "enabled": true,
+                "config": {"allowed_origins": ["https://app.example"]},
             },
             {
                 "id": "received-reject",
@@ -295,10 +303,30 @@ async fn h3_grpc_web_rejects_and_negative_controls_use_client_wire_flavor() {
     let received = request_with_retry(
         &client,
         &format!("https://127.0.0.1:{https_port}/received/echo.Echo/Unary"),
-        grpc_web(Method::POST),
+        grpc_web(Method::POST).header("origin", "https://app.example"),
     )
     .await;
     assert_grpc_web_error(&received, "13", "application/grpc-web+proto");
+    assert_eq!(
+        received
+            .headers
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("https://app.example")
+    );
+
+    let disallowed_origin = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/received/echo.Echo/Unary"),
+        grpc_web(Method::POST).header("origin", "https://blocked.example"),
+    )
+    .await;
+    assert_grpc_web_error(&disallowed_origin, "7", "application/grpc-web+proto");
+    assert!(
+        !disallowed_origin
+            .headers
+            .contains_key("access-control-allow-origin")
+    );
 
     let authenticate = request_with_retry(
         &client,

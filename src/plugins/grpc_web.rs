@@ -360,6 +360,21 @@ pub struct GrpcWebErrorResponse {
     pub body: Vec<u8>,
 }
 
+/// Rebuild a synthesized error's body trailer frame after finalized rejection
+/// metadata has been merged into its temporary header map.
+pub(crate) fn rebuild_error_body_from_headers(response: &mut GrpcWebErrorResponse) {
+    let response_ct = response
+        .headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or(APPLICATION_GRPC_WEB);
+    let mut body = build_trailer_frame(&response.headers);
+    if is_grpc_web_text(response_ct) {
+        body = BASE64.encode(&body).into_bytes();
+    }
+    response.body = body;
+}
+
 /// Build the client-visible gRPC-Web error shape for an early gateway refusal
 /// that happens before normal response hooks can run.
 pub fn error_response_for_content_type(

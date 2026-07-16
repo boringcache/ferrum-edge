@@ -2555,22 +2555,18 @@ async fn handle_h3_request(
         .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.path = backend_ctx_path;
-        if !matches!(deferred_result, PluginResult::Continue) {
-            break;
+        if matches!(deferred_result, PluginResult::Continue) {
+            // Re-establish gateway-authenticated identity and egress baggage
+            // policy before a deferred function's headers reach a backend.
+            crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
+            crate::modes::mesh::hbone::strip_egress_baggage_in_map(
+                &mut proxy_headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
         }
-
-        // Re-establish gateway-authenticated identity and egress baggage
-        // policy before a deferred function's headers can reach a backend.
-        // Keep the already-previewed target pinned across this external hook:
-        // header-based reselection could otherwise invoke the function before
-        // authorizing the backend-effective method it selected.
-        crate::proxy::refresh_backend_consumer_identity_headers(&ctx, &mut proxy_headers);
-        crate::modes::mesh::hbone::strip_egress_baggage_in_map(
-            &mut proxy_headers,
-            &state.mesh_egress_strip_baggage_keys,
-        );
-        // Always make one more pass after the routing-header hook so final
-        // enforcement charges only the pinned backend-effective method.
+        // Always make one more pass after the routing-header hook, including
+        // when it rejects, so final enforcement charges the pinned method
+        // exactly once before any external-hook rejection is returned.
     }
 
     if backend_path_is_policy_bound {

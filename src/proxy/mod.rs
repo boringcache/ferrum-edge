@@ -14102,6 +14102,18 @@ pub(crate) fn finalize_grpc_web_error_response_headers(
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone())),
         );
+        if let Some(content_type) = content_type.as_ref() {
+            // Rejection normalization uses native application/grpc. Restore
+            // the client representation before choosing binary versus text
+            // trailer framing.
+            response
+                .headers
+                .insert("content-type".to_string(), content_type.clone());
+        }
+        // Rejection hooks may supply rich terminal metadata such as
+        // grpc-status-details-bin. Fold it into the body trailer frame before
+        // terminal gRPC fields are removed from the initial header block.
+        crate::plugins::grpc_web::rebuild_error_body_from_headers(response);
     } else {
         crate::plugins::apply_initial_response_header_policies(
             initial_response_header_policy_plugins,
@@ -16505,24 +16517,23 @@ async fn handle_proxy_request_inner(
         };
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.path = backend_ctx_path;
-        if !matches!(deferred_result, PluginResult::Continue) {
-            break;
+        if matches!(deferred_result, PluginResult::Continue) {
+            // A deferred routing function can return arbitrary headers.
+            // Restore gateway-owned identity and reapply the egress baggage
+            // policy before those headers can reach any backend transport.
+            refresh_effective_backend_consumer_identity_headers(
+                &mut ctx,
+                &mut owned_proxy_headers,
+            );
+            hbone_proxy::strip_egress_baggage_in_proxy_headers(
+                &mut owned_proxy_headers,
+                &ctx.headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
         }
-
-        // A deferred routing function can return arbitrary headers. Restore
-        // gateway-owned identity and reapply the egress baggage policy before
-        // those headers can reach any backend transport. Backend-path policy
-        // pins the already-previewed target, so the returned headers cannot
-        // steer this request onto a path that was not authorized before the
-        // external call.
-        refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
-        hbone_proxy::strip_egress_baggage_in_proxy_headers(
-            &mut owned_proxy_headers,
-            &ctx.headers,
-            &state.mesh_egress_strip_baggage_keys,
-        );
-        // Always make one more pass after the routing-header hook so final
-        // enforcement charges the pinned backend-effective method.
+        // Always make one more pass after the routing-header hook, including
+        // when it rejects, so final enforcement charges the pinned method
+        // exactly once before any external-hook rejection is returned.
     }
 
     // Hooks that can dispatch external work or synthesize a terminal response
