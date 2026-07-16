@@ -2159,7 +2159,7 @@ async fn apply_fault_action(
         // proper `application/grpc` trailers-only response. Plain HTTP
         // requests on the same rule never receive a stray header.
         if let Some(grpc_status) = abort.grpc_status
-            && is_native_grpc_request(headers)
+            && is_native_grpc_request(ctx, headers)
         {
             reject_headers.insert("grpc-status".to_string(), grpc_status.to_string());
         }
@@ -5045,7 +5045,7 @@ mod tests {
     async fn full_abort_emits_grpc_status_only_for_grpc_requests() {
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
-                "match": {"methods": ["POST"]},
+                "match": {"methods": ["POST", "GET"]},
                 "destination": {"upstream_id": "canary"},
                 "fault": {"abort": {
                     "status_code": 200,
@@ -5090,10 +5090,29 @@ mod tests {
             }
             other => panic!("expected reject, got {other:?}"),
         }
+
+        // WebSocket takes precedence over a hostile native-gRPC media type.
+        let mut ctx = ctx_with("GET", "/socket");
+        ctx.set_websocket_response_boundary(true);
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject {
+                headers: resp_headers,
+                ..
+            } => {
+                assert!(
+                    !resp_headers.contains_key("grpc-status"),
+                    "WebSocket requests must not receive grpc-status"
+                );
+            }
+            other => panic!("expected reject, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn grpc_web_request_is_not_treated_as_grpc() {
+    async fn translated_grpc_web_request_is_not_treated_as_native_grpc() {
         let plugin = MeshRouteDispatch::new(&json!({
             "rules": [{
                 "match": {"methods": ["POST"]},
@@ -5107,10 +5126,20 @@ mod tests {
         }))
         .unwrap();
         let mut ctx = ctx_with("POST", "/svc/Method");
-        let mut headers = HashMap::from([(
+        ctx.headers = HashMap::from([(
             "content-type".to_string(),
             "application/grpc-web+proto".to_string(),
         )]);
+        let grpc_web = crate::plugins::grpc_web::GrpcWebPlugin::new(&json!({})).unwrap();
+        assert!(matches!(
+            grpc_web.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut headers = ctx.headers.clone();
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc")
+        );
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         match result {
             PluginResult::Reject {

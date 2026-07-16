@@ -915,6 +915,13 @@ pub mod _test_support {
         }
     }
 
+    pub fn set_websocket_response_boundary_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        enabled: bool,
+    ) {
+        ctx.set_websocket_response_boundary(enabled);
+    }
+
     pub fn insert_grpc_error_metadata(
         metadata: &mut HashMap<String, String>,
         grpc_status: u32,

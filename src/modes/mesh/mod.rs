@@ -1505,6 +1505,12 @@ fn reconcile_fault_plugin_generations(candidate: &mut GatewayConfig, previous: &
             continue;
         };
         if plugin.config == previous.config && plugin.enabled == previous.enabled {
+            // The candidate may have been reconstructed from the static mesh
+            // source timestamp while `previous` carries the synthetic stamp
+            // assigned to an earlier RTDS materialization. Preserve that
+            // accepted stamp when the effective config is identical so
+            // ConfigDelta does not rebuild the plugin or reset its sampler.
+            plugin.updated_at = previous.updated_at;
             continue;
         }
 
@@ -22503,6 +22509,26 @@ mod tests {
         let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
         assert_eq!(delta.modified_plugin_configs.len(), 1);
         assert!(delta.global_plugin_configs_changed);
+
+        let mut repeated = accepted.clone();
+        materialize_fault_runtime_overlay(
+            &mut repeated,
+            &crate::modes::mesh::config::MeshRuntimeOverlay {
+                fields: HashMap::from([(
+                    "ferrum.fault_injection.checkout.abort_percent".to_string(),
+                    RuntimeValue::Number(90.0),
+                )]),
+            },
+        );
+        reconcile_fault_plugin_generations(&mut repeated, &candidate);
+        assert_eq!(
+            repeated.plugin_configs[0].updated_at,
+            candidate.plugin_configs[0].updated_at,
+            "an unchanged effective RTDS generation must retain the accepted stamp"
+        );
+        let repeated_delta = crate::config_delta::ConfigDelta::compute(&candidate, &repeated);
+        assert!(repeated_delta.modified_plugin_configs.is_empty());
+        assert!(!repeated_delta.global_plugin_configs_changed);
 
         let mut unrelated_only = accepted.clone();
         materialize_fault_runtime_overlay(

@@ -1897,7 +1897,7 @@ async fn run_tcp_stream_connect_plugins(
         let result = if plugin.name() == "fault_injection" {
             tokio::select! {
                 result = plugin.on_stream_connect(stream_ctx) => result,
-                () = wait_for_tcp_peer_disconnect(client_stream) => {
+                () = wait_for_tcp_peer_reset(client_stream) => {
                     return Err(StreamSetupError::new(
                         StreamSetupKind::ClientDisconnectedDuringAdmission,
                         connection_label,
@@ -1922,23 +1922,13 @@ async fn run_tcp_stream_connect_plugins(
     Ok(())
 }
 
-/// Wait until the accepted TCP peer closes or resets without consuming any
-/// application bytes. `Ready::is_read_closed` observes FIN/RDHUP even when
-/// unread data remains queued; error readiness covers resets. If ordinary data
-/// makes the socket continuously readable, the small poll interval prevents a
-/// busy loop while preserving the bytes for the eventual relay.
-async fn wait_for_tcp_peer_disconnect(client_stream: &TcpStream) {
-    const POLL_INTERVAL: Duration = Duration::from_millis(25);
-    loop {
-        match client_stream
-            .ready(tokio::io::Interest::READABLE | tokio::io::Interest::ERROR)
-            .await
-        {
-            Ok(ready) if ready.is_read_closed() || ready.is_error() => return,
-            Err(_) => return,
-            Ok(_) => tokio::time::sleep(POLL_INTERVAL).await,
-        }
-    }
+/// Wait until the accepted TCP peer resets or the socket reports a transport
+/// error without consuming any application bytes. A read-half FIN is
+/// deliberately not treated as cancellation: request/response protocols may
+/// validly send their complete request and then half-close while continuing to
+/// wait for the response.
+async fn wait_for_tcp_peer_reset(client_stream: &TcpStream) {
+    let _ = client_stream.ready(tokio::io::Interest::ERROR).await;
 }
 
 /// Maximum number of opening client bytes captured for stream first-bytes
@@ -8180,7 +8170,7 @@ mod first_bytes_peek_tests {
 
     use tokio::io::AsyncWriteExt;
 
-    use super::{peek_tcp_first_bytes, wait_for_tcp_peer_disconnect};
+    use super::{peek_tcp_first_bytes, wait_for_tcp_peer_reset};
 
     /// Bind a loopback listener and return it with its address.
     async fn listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
@@ -8192,26 +8182,48 @@ mod first_bytes_peek_tests {
     }
 
     #[tokio::test]
-    async fn disconnect_wait_observes_close_with_unread_bytes_queued() {
+    async fn reset_wait_observes_abortive_close() {
         let (listener, addr) = listener().await;
         let peer = tokio::spawn(async move {
-            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
-            client.write_all(b"queued-before-close").await.expect("write");
-            client.shutdown().await.expect("shutdown");
+            let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            client.set_zero_linger().expect("set abortive close");
         });
         let (server, _) = listener.accept().await.expect("accept");
 
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            wait_for_tcp_peer_disconnect(&server),
-        )
-        .await
-        .expect("read-closed readiness must cancel admission promptly");
         peer.await.expect("peer task");
+        tokio::time::timeout(Duration::from_secs(1), wait_for_tcp_peer_reset(&server))
+            .await
+            .expect("reset/error readiness must cancel admission promptly");
+    }
+
+    #[tokio::test]
+    async fn reset_wait_preserves_valid_half_close_with_unread_bytes() {
+        let (listener, addr) = listener().await;
+        let (half_closed_tx, half_closed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            client.write_all(b"complete-request").await.expect("write");
+            client.shutdown().await.expect("half close");
+            let _ = half_closed_tx.send(());
+            let _ = release_rx.await;
+        });
+        let (server, _) = listener.accept().await.expect("accept");
+        half_closed_rx.await.expect("half-close signal");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), wait_for_tcp_peer_reset(&server))
+                .await
+                .is_err(),
+            "a valid read-half FIN must not cancel admission"
+        );
 
         let mut queued = [0_u8; 32];
         let queued_len = server.peek(&mut queued).await.expect("peek queued bytes");
-        assert!(queued_len > 0, "disconnect wait must not consume application bytes");
+        assert!(queued_len > 0, "reset wait must not consume application bytes");
+
+        let _ = release_tx.send(());
+        peer.await.expect("peer task");
     }
 
     #[tokio::test]
@@ -8229,7 +8241,7 @@ mod first_bytes_peek_tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(75),
-                wait_for_tcp_peer_disconnect(&server),
+                wait_for_tcp_peer_reset(&server),
             )
             .await
             .is_err(),

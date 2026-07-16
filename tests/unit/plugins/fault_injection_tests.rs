@@ -498,6 +498,42 @@ async fn test_abort_omits_grpc_status_for_plain_http_and_grpc_web() {
 }
 
 #[tokio::test]
+async fn test_abort_omits_grpc_status_after_grpc_web_translation() {
+    let grpc_web = ferrum_edge::plugins::create_plugin("grpc_web", &json!({}))
+        .unwrap()
+        .unwrap();
+    let fault = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 100.0, "grpc_status": 14 }
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
+
+    assert!(matches!(
+        grpc_web.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    let mut headers = ctx.headers.clone();
+
+    match fault.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { headers, .. } => {
+            assert!(
+                !headers.contains_key("grpc-status"),
+                "translated gRPC-Web remains a plain-HTTP client response"
+            );
+        }
+        _ => panic!("expected Reject"),
+    }
+}
+
+#[tokio::test]
 async fn test_abort_omits_grpc_status_for_websocket_upgrade() {
     let plugin = FaultInjectionPlugin::new(&json!({
         "abort": { "status_code": 503, "percentage": 100.0, "grpc_status": 14 }
@@ -507,7 +543,9 @@ async fn test_abort_omits_grpc_status_for_websocket_upgrade() {
     let mut headers = HashMap::from([
         ("connection".to_string(), "upgrade".to_string()),
         ("upgrade".to_string(), "websocket".to_string()),
+        ("content-type".to_string(), "application/grpc".to_string()),
     ]);
+    ferrum_edge::_test_support::set_websocket_response_boundary_for_test(&mut ctx, true);
 
     match plugin.before_proxy(&mut ctx, &mut headers).await {
         PluginResult::Reject { headers, .. } => {

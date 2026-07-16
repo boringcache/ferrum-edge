@@ -64,9 +64,10 @@ pub enum StreamSetupKind {
     /// (`on_stream_connect`/`before_proxy`). Covers ACL/policy/throttle
     /// rejections — they all share the same client-side classification.
     RejectedByPlugin,
-    /// The client closed or reset the connection while the fault-injection
-    /// plugin was still delaying admission. Client-side; used to cancel the
-    /// delay without retaining the connection task.
+    /// The client reset the connection or the socket reported a transport
+    /// error while the fault-injection plugin was still delaying admission.
+    /// Client-side; used to cancel the delay without retaining the connection
+    /// task. A graceful read-half close is not classified as a disconnect.
     ClientDisconnectedDuringAdmission,
     /// Load balancer returned no healthy targets for the configured upstream.
     /// Backend-side — the configured pool is empty or all targets are

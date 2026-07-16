@@ -290,7 +290,20 @@ impl FaultInjectionPlugin {
 /// priority-overridden proxy-scoped instance to no-op.
 pub(crate) const ROUTE_FAULT_INJECTED_METADATA_KEY: &str = "fault_injection.route_applied";
 
-pub(crate) fn is_native_grpc_request(headers: &HashMap<String, String>) -> bool {
+/// Classify only client-visible native gRPC requests. Earlier plugins may
+/// rewrite gRPC-Web to `application/grpc`, and WebSocket requests can carry a
+/// hostile gRPC media type, so request-context flavor takes precedence over
+/// the post-plugin header map.
+pub(crate) fn is_native_grpc_request(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> bool {
+    if ctx.has_websocket_response_boundary()
+        || crate::plugins::grpc_web::client_uses_grpc_web(ctx)
+    {
+        return false;
+    }
+
     headers
         .get("content-type")
         .map(|content_type| {
@@ -352,7 +365,7 @@ impl Plugin for FaultInjectionPlugin {
             ctx.metadata
                 .insert("fault_abort_status".to_string(), a.status_code.to_string());
 
-            return self.reject_for_abort(a, is_native_grpc_request(headers));
+            return self.reject_for_abort(a, is_native_grpc_request(ctx, headers));
         }
 
         ctx.metadata

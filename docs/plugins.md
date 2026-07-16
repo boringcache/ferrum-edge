@@ -2319,7 +2319,7 @@ config:
 
 ### `fault_injection`
 
-Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; raw TCP proxies run the same decision in `on_stream_connect`. UDP and DTLS are not supported: their listener/session loops cannot safely wait inside a plugin delay without head-of-line blocking unrelated datagrams. TCP admission races fault delays against client disconnect, and all fault delays are capped at one minute. Stream rejects close the frontend connection, so HTTP status/body fields only have downstream meaning for HTTP-family protocols.
+Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; raw TCP proxies run the same decision in `on_stream_connect`. UDP and DTLS are not supported: their listener/session loops cannot safely wait inside a plugin delay without head-of-line blocking unrelated datagrams. TCP admission races fault delays against client resets and transport errors while preserving valid read-half closes, and all fault delays are capped at one minute. Stream rejects close the frontend connection, so HTTP status/body fields only have downstream meaning for HTTP-family protocols.
 
 When route-sensitive backend-path policy such as `grpc_method_router` is active, the HTTP-family fault decision runs only after the backend-effective method is authorized. A denied rewritten method therefore returns the policy rejection without first sleeping or receiving a synthetic fault response. Proxies without backend-path policy retain the ordinary `before_proxy` ordering.
 
@@ -2329,7 +2329,7 @@ When route-sensitive backend-path policy such as `grpc_method_router` is active,
 |---|---|---|---|
 | `abort.status_code` | u16 | required when `abort` is set | Final HTTP status to return, 200-599 |
 | `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
-| `abort.grpc_status` | u32 (optional) | — | gRPC status to emit only on rejects with a valid native `application/grpc` media type (excluding gRPC-Web), 0-16 |
+| `abort.grpc_status` | u32 (optional) | — | gRPC status to emit only for actual native gRPC requests (excluding gRPC-Web and WebSocket even if an earlier plugin rewrites or preserves `application/grpc`), 0-16 |
 | `abort.body` | String | `""` | HTTP response body for aborts |
 | `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-60,000 ms |
 | `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
