@@ -2447,9 +2447,9 @@ fn deadline_bound_grpc_web_pass_through_never_selects_native_backend_h3() {
         .expect("initial backend H3 selection block");
     assert!(dispatch.contains("&& !grpc_request_is_web_translated"));
     assert!(dispatch.contains("&& ctx.grpc_deadline_at().is_some();"));
-    assert!(dispatch.contains(
-        "let mut current_dispatch_h3 = !deadline_bound_grpc_web_pass_through"
-    ));
+    assert!(
+        dispatch.contains("let mut current_dispatch_h3 = !deadline_bound_grpc_web_pass_through")
+    );
 
     let retry_rotation = source
         .split("if target_changed {")
@@ -2458,7 +2458,5 @@ fn deadline_bound_grpc_web_pass_through_never_selects_native_backend_h3() {
         .split("// Re-evaluate the live PeerAuthentication snapshot")
         .next()
         .expect("bounded retry target capability refresh");
-    assert!(retry_rotation.contains(
-        "current_dispatch_h3 = !deadline_bound_grpc_web_pass_through"
-    ));
+    assert!(retry_rotation.contains("current_dispatch_h3 = !deadline_bound_grpc_web_pass_through"));
 }

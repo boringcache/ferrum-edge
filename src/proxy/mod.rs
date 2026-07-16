@@ -21090,9 +21090,8 @@ async fn handle_proxy_request_inner(
     // Keep deadline-bound untranslated gRPC-Web on the reqwest path, whose
     // entire exchange is guarded and can still synthesize the browser-visible
     // status-4 trailer frame before any response bytes are committed.
-    let deadline_bound_grpc_web_pass_through = grpc_web_request
-        && !grpc_request_is_web_translated
-        && ctx.grpc_deadline_at().is_some();
+    let deadline_bound_grpc_web_pass_through =
+        grpc_web_request && !grpc_request_is_web_translated && ctx.grpc_deadline_at().is_some();
     let mut current_dispatch_h3 = !deadline_bound_grpc_web_pass_through
         && !requires_response_stream_inspection
         && supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
@@ -22227,10 +22226,8 @@ async fn handle_proxy_request_inner(
                     ),
                 )
             } else {
-                crate::plugins::log_with_mirror_before_buffered_response(
-                    &plugins, summary, &ctx,
-                )
-                .await;
+                crate::plugins::log_with_mirror_before_buffered_response(&plugins, summary, &ctx)
+                    .await;
                 None
             }
         } else {

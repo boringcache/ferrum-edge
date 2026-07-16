@@ -1661,7 +1661,8 @@ where
                             Some(&mut pending_slot),
                         ),
                     )
-                    .await {
+                    .await
+                    {
                         Ok(result) => result?,
                         Err(()) => {
                             drop(pending_slot);
@@ -2110,7 +2111,8 @@ where
                         Some(&mut pending_slot),
                     ),
                 )
-                .await {
+                .await
+                {
                     Ok(result) => result?,
                     Err(()) => {
                         drop(pending_slot);
