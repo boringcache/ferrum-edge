@@ -1491,7 +1491,7 @@ async fn test_cancelled_fetch_creator_does_not_restart_origin_request() {
     ));
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
