@@ -88,6 +88,13 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    pub fn bind_authorized_backend_path_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        path: &str,
+    ) {
+        ctx.bind_authorized_backend_path(path.to_string());
+    }
+
     // ── adaptive_concurrency lifecycle ──────────────────────────────────────
     pub struct AdaptiveConcurrencyDecreaseHarness {
         limit: AtomicU64,
@@ -850,6 +857,39 @@ pub mod _test_support {
 
     pub fn response_content_type(original_ct: &str) -> &'static str {
         crate::plugins::grpc_web::response_content_type(original_ct)
+    }
+
+    pub fn finalize_grpc_web_error_response_headers(
+        response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
+        initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+        finalized_reject_headers: Option<&HashMap<String, String>>,
+    ) {
+        crate::proxy::finalize_grpc_web_error_response_headers(
+            response,
+            initial_response_header_policy_plugins,
+            finalized_reject_headers,
+        );
+    }
+
+    pub async fn run_h3_reject_response_committed_hooks(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        flavor: crate::config::types::HttpFlavor,
+        grpc_web_response_content_type: Option<&str>,
+        http_status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) {
+        crate::http3::server::run_h3_reject_response_committed_hooks(
+            plugins,
+            ctx,
+            flavor,
+            grpc_web_response_content_type,
+            http_status,
+            body,
+            headers,
+        )
+        .await;
     }
 
     // ── proxy/mod ────────────────────────────────────────────────────────────

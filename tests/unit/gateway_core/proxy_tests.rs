@@ -1,7 +1,13 @@
 use chrono::Utc;
-use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
-use ferrum_edge::proxy::{build_backend_url, build_backend_url_with_target};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, UpstreamTarget,
+};
+use ferrum_edge::proxy::{
+    build_backend_effective_path, build_backend_url, build_backend_url_with_target,
+    retry_target_preserves_backend_path,
+};
 use ferrum_edge::router_cache::RouterCache;
+use std::collections::HashMap;
 
 fn test_proxy() -> Proxy {
     Proxy {
@@ -210,6 +216,323 @@ fn test_build_backend_url_target_path_with_query() {
 }
 
 #[test]
+fn test_backend_effective_grpc_path_uses_prefix_strip() {
+    let mut proxy = test_proxy();
+    proxy.listen_path = Some("/prefix".into());
+    let path =
+        build_backend_effective_path(&proxy, "/prefix/pkg.Service/Denied", "/prefix".len(), None);
+    assert_eq!(path, "/pkg.Service/Denied");
+}
+
+#[test]
+fn test_backend_effective_grpc_path_uses_exact_route_backend_path() {
+    let mut proxy = test_proxy();
+    proxy.listen_path = Some("=/public.Service/Allowed".into());
+    proxy.backend_path = Some("/admin.Service/Delete".into());
+    let incoming = "/public.Service/Allowed";
+    let path = build_backend_effective_path(&proxy, incoming, incoming.len(), None);
+    assert_eq!(path, "/admin.Service/Delete");
+}
+
+#[test]
+fn test_backend_effective_grpc_path_uses_regex_match_length() {
+    let mut proxy = test_proxy();
+    proxy.listen_path = Some("~^/public\\.Service/Allowed$".into());
+    proxy.backend_path = Some("/admin.Service/Delete".into());
+    let incoming = "/public.Service/Allowed";
+    let path = build_backend_effective_path(&proxy, incoming, incoming.len(), None);
+    assert_eq!(path, "/admin.Service/Delete");
+}
+
+#[test]
+fn test_backend_effective_grpc_path_uses_selected_target_path() {
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("/ignored.Service/Method".into());
+    let incoming = "/api/v1";
+    let path = build_backend_effective_path(
+        &proxy,
+        incoming,
+        incoming.len(),
+        Some("/selected.Service/Method"),
+    );
+    assert_eq!(path, "/selected.Service/Method");
+}
+
+#[test]
+fn test_backend_effective_path_matches_backend_url_path_assembly() {
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("/backend.Service".into());
+    let incoming = "/api/v1/Method";
+    let strip_len = "/api/v1".len();
+    let path = build_backend_effective_path(&proxy, incoming, strip_len, None);
+    let url = build_backend_url_with_target(
+        &proxy,
+        incoming,
+        "",
+        "target.example.com",
+        9090,
+        strip_len,
+        None,
+    );
+    assert_eq!(path, "/backend.Service/Method");
+    assert_eq!(url, format!("http://target.example.com:9090{path}"));
+}
+
+fn retry_target(host: &str, path: Option<&str>) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.to_string(),
+        port: 9090,
+        service_port_policy_key: None,
+        weight: 100,
+        tags: HashMap::new(),
+        locality: None,
+        path: path.map(str::to_string),
+    }
+}
+
+#[test]
+fn test_backend_path_policy_pins_target_path_across_retries() {
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("/pkg.Service".to_string());
+    let incoming = "/api/v1/Allowed";
+    let strip_len = "/api/v1".len();
+    let initial = retry_target("first.example.com", Some("/pkg.Service"));
+    let same_method = retry_target("second.example.com", Some("/pkg.Service"));
+    let different_method = retry_target("third.example.com", Some("/admin.Service"));
+    let explicit_prefix = retry_target("fourth.example.com", Some("/pkg.Service"));
+    let proxy_fallback = retry_target("fifth.example.com", None);
+    let relative_prefix = retry_target("sixth.example.com", Some("pkg.Service"));
+
+    assert!(retry_target_preserves_backend_path(
+        true,
+        &proxy,
+        incoming,
+        strip_len,
+        &initial,
+        &same_method
+    ));
+    assert!(!retry_target_preserves_backend_path(
+        true,
+        &proxy,
+        incoming,
+        strip_len,
+        &initial,
+        &different_method
+    ));
+    assert!(retry_target_preserves_backend_path(
+        false,
+        &proxy,
+        incoming,
+        strip_len,
+        &initial,
+        &different_method
+    ));
+    assert!(retry_target_preserves_backend_path(
+        true,
+        &proxy,
+        incoming,
+        strip_len,
+        &explicit_prefix,
+        &proxy_fallback
+    ));
+    assert!(retry_target_preserves_backend_path(
+        true,
+        &proxy,
+        incoming,
+        strip_len,
+        &relative_prefix,
+        &proxy_fallback
+    ));
+}
+
+#[test]
+fn test_backend_path_bound_retries_abort_in_every_h1_h2_dispatch_family() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    assert!(source.contains(
+        "Aborting gRPC retry because the candidate would change the authorized backend method path"
+    ));
+    assert!(source.contains(
+        "Aborting retry because the candidate would change the authorized backend method path"
+    ));
+    assert!(source.contains(
+        "Aborting WebSocket retry because the candidate would change the authorized backend method path"
+    ));
+    assert!(source.contains("if retry_admitted_by_cb && !retry_path_mismatch"));
+}
+
+#[test]
+fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let path_policy = source
+        .rfind("if let Some(response) = run_backend_path_plugins_or_build_reject(")
+        .expect("backend-path policy hook must remain present");
+    let deferred = source
+        .find("// Hooks that can dispatch external work or synthesize a terminal response")
+        .expect("deferred before_proxy pass must remain present");
+    assert!(path_policy < deferred);
+    assert!(source.contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"));
+    assert!(source.contains("BackendPathPolicyPhase::Preview"));
+    assert!(source.contains("BackendPathPolicyPhase::Enforce"));
+    assert!(
+        !source.contains("backend_dispatch::upstream_selection_hash_key("),
+        "an external deferred hook must not reselect an unpreviewed target"
+    );
+    assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
+    assert!(
+        !source.contains(
+            "if !matches!(deferred_result, PluginResult::Continue) {\n            break;"
+        ),
+        "a deferred routing-hook rejection must still reach final method enforcement"
+    );
+
+    let mirror = include_str!("../../../src/plugins/request_mirror.rs");
+    assert!(mirror.contains("ctx.authorized_backend_path().unwrap_or(&ctx.path)"));
+
+    for plugin_source in [
+        include_str!("../../../src/plugins/fault_injection.rs"),
+        include_str!("../../../src/plugins/grpc_deadline.rs"),
+        include_str!("../../../src/plugins/request_mirror.rs"),
+        include_str!("../../../src/plugins/response_mock.rs"),
+        include_str!("../../../src/plugins/serverless_function.rs"),
+        include_str!("../../../src/plugins/load_testing.rs"),
+    ] {
+        assert!(
+            plugin_source
+                .contains("fn defer_before_proxy_until_backend_path_resolved(&self) -> bool")
+        );
+    }
+
+    let serverless = include_str!("../../../src/plugins/serverless_function.rs");
+    assert!(
+        serverless.contains("fn deferred_before_proxy_may_change_routing_headers(&self) -> bool")
+    );
+}
+
+#[test]
+fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let handler = source
+        .find("async fn handle_proxy_request_inner(")
+        .map(|start| &source[start..])
+        .expect("H1/H2 request handler must remain present");
+    let flavor = handler
+        .find("let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);")
+        .expect("wire flavor classification must remain present");
+    let websocket_precedence = handler
+        .find("let grpc_web_response_content_type = if flavor == HttpFlavor::WebSocket")
+        .expect("WebSocket must suppress hostile gRPC-Web Content-Type promotion");
+    let routed = handler
+        .find("ctx.matched_proxy = Some(Arc::clone(&proxy));")
+        .expect("route selection must remain present");
+    let protocol = handler
+        .find("let request_protocol = match flavor")
+        .expect("route-level protocol selection must remain present");
+
+    assert!(flavor < websocket_precedence && websocket_precedence < routed && routed < protocol);
+    assert!(
+        !handler[routed..protocol].contains("let grpc_web_response_content_type"),
+        "route-level rejects must reuse the WebSocket-safe strict classification"
+    );
+    assert!(handler.contains("build_grpc_web_reject_response("));
+    assert!(source.contains(
+        "finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));"
+    ));
+    let finalizer = source
+        .find("pub(crate) fn finalize_grpc_web_error_response_headers(")
+        .map(|start| &source[start..])
+        .expect("gRPC-Web error finalizer must remain present");
+    assert!(finalizer.contains("\"grpc-status\","));
+    assert!(finalizer.contains("\"grpc-message\","));
+}
+
+#[test]
+fn test_backend_path_bound_retries_preflight_before_backoff() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    let grpc_retry = source
+        .find("// Resolve and validate the next gRPC retry target before")
+        .expect("direct gRPC retries must preflight the next target");
+    let grpc_after_preflight = &source[grpc_retry..];
+    let grpc_mismatch = grpc_after_preflight
+        .find("Aborting gRPC retry because the candidate would change")
+        .expect("direct gRPC retries must reject a path-changing target");
+    let grpc_intermediate_record = grpc_after_preflight
+        .find("record_grpc_backend_dispatch_outcome(")
+        .expect("direct gRPC retry accounting must remain present");
+    let grpc_backoff = grpc_after_preflight
+        .find("let delay = retry::retry_delay(retry_config, grpc_attempt);")
+        .expect("direct gRPC retry backoff must remain present");
+    assert!(
+        grpc_mismatch < grpc_intermediate_record
+            && grpc_mismatch < grpc_backoff
+            && grpc_after_preflight[grpc_mismatch..grpc_intermediate_record].contains("break;"),
+        "direct gRPC path mismatch must abort before intermediate accounting and retry backoff"
+    );
+
+    let generic_retry = source
+        .find("// Resolve and validate the next retry target before charging this")
+        .expect("generic H1/H2 retries must preflight the next target");
+    let generic_after_preflight = &source[generic_retry..];
+    let generic_mismatch = generic_after_preflight
+        .find("Aborting retry because the candidate would change")
+        .expect("generic H1/H2 retries must reject a path-changing target");
+    let generic_intermediate_record = generic_after_preflight
+        .find("permits.record_backend_outcome(BackendAdmissionOutcome {")
+        .expect("generic H1/H2 retry accounting must remain present");
+    let generic_backoff = generic_after_preflight
+        .find("let delay = retry::retry_delay(retry_config, attempt);")
+        .expect("generic H1/H2 retry backoff must remain present");
+    assert!(
+        generic_mismatch < generic_intermediate_record
+            && generic_mismatch < generic_backoff
+            && generic_after_preflight[generic_mismatch..generic_intermediate_record]
+                .contains("break;"),
+        "generic H1/H2 path mismatch must abort before intermediate accounting and retry backoff"
+    );
+}
+
+#[test]
+fn test_deferred_hooks_cannot_spoof_backend_consumer_identity() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let routing_hook = source
+        .rfind("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .expect("deferred routing-header hook must remain present");
+    let after_routing_hook = &source[routing_hook..];
+    let refresh = after_routing_hook
+        .find("refresh_effective_backend_consumer_identity_headers(")
+        .expect("identity headers must be refreshed after deferred routing hooks");
+    let baggage_strip = after_routing_hook
+        .find("hbone_proxy::strip_egress_baggage_in_proxy_headers(")
+        .expect("egress baggage policy must run after deferred routing hooks");
+    let remaining_hook = after_routing_hook
+        .find("BackendPathBeforeProxyPass::RemainingDeferred")
+        .expect("remaining deferred hook pass must remain present");
+    assert!(
+        refresh < baggage_strip && baggage_strip < remaining_hook,
+        "gateway identity and baggage policy must be restored before final enforcement"
+    );
+    assert!(
+        !after_routing_hook[..remaining_hook].contains("select_upstream_target("),
+        "deferred headers must not steer the request to an unpreviewed target"
+    );
+
+    let remaining_hook = routing_hook + remaining_hook;
+    assert!(
+        source[remaining_hook..].contains("refresh_effective_backend_consumer_identity_headers("),
+        "gateway identity must be restored after every deferred hook pass"
+    );
+    assert!(
+        source[remaining_hook..].contains("hbone_proxy::strip_egress_baggage_in_proxy_headers("),
+        "egress baggage policy must be restored after every deferred hook pass"
+    );
+    assert!(
+        source.contains("name.eq_ignore_ascii_case(\"x-consumer-username\")")
+            && source.contains("name.eq_ignore_ascii_case(\"x-consumer-custom-id\")"),
+        "the shared scrub must reject case variants of reserved identity headers"
+    );
+}
+
+#[test]
 fn test_longest_prefix_match() {
     let config = GatewayConfig {
         version: "1".to_string(),
@@ -278,7 +601,6 @@ use ferrum_edge::proxy::grpc_proxy::grpc_status;
 use ferrum_edge::proxy::run_authentication_phase;
 use hyper::StatusCode;
 use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 struct ExternalIdentityAuth;

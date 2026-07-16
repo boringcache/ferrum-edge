@@ -1,6 +1,6 @@
 # DNS Resolver Configuration
 
-Ferrum Edge includes a full-featured DNS resolver built on [hickory-resolver](https://github.com/hickory-dns/hickory-dns), providing configurable nameservers, hosts file support, record type ordering, native TTL respect, stale-while-revalidate caching, error caching, and automatic failed lookup retries — all designed to keep DNS resolution off the hot request path.
+Ferrum Edge includes a full-featured DNS resolver built on [hickory-resolver](https://github.com/hickory-dns/hickory-dns), providing configurable nameservers, hosts file support, record type ordering, native TTL respect, stale-while-revalidate caching, error caching, and automatic failed lookup retries — all designed to keep DNS resolution off the hot request path. Security-sensitive LDAP connection establishment is an intentional exception: it uses a dedicated uncached A+AAAA lookup immediately before every connection/reconnection so a cached permitted answer cannot conceal a later DNS rebind.
 
 ## Native TTL Respect
 
@@ -139,6 +139,8 @@ All outbound HTTP clients (proxy traffic, health check probes, plugin outbound c
 - **Unified caching**: Proxy backends, upstream targets, health check probes, and plugin outbound calls (http_logging, tcp_logging, jwks_auth, etc.) all share the same DNS cache, benefiting from warmup and background refresh.
 
 Plugins declare their endpoint hostnames by implementing the `warmup_hostnames()` method on the `Plugin` trait. This allows the warmup phase to pre-resolve plugin endpoints alongside backend hostnames.
+
+LDAP warmup remains useful for early diagnostics, but it never authorizes a later dial. Each direct-bind, search-bind, and group-search connection performs a fresh uncached A+AAAA lookup, screens the complete answer set under `BackendEgressPolicy`, and rechecks the selected candidate immediately before connecting. The dial still presents the configured hostname for LDAPS/STARTTLS certificate and SNI verification.
 
 ## Resolution Priority
 

@@ -31,12 +31,18 @@
 //!   rejected via `build_server_verifier_with_crls()`, giving `ldaps://` /
 //!   STARTTLS the same revocation guarantees as the proxy backend, DTLS,
 //!   frontend mTLS, and rustls logging-sink surfaces.
+//!
+//! Every connection performs an uncached A+AAAA lookup, screens the complete
+//! answer set and each imminent dial under the gateway backend egress policy,
+//! and gives `ldap3` the screened socket together with the original URL. This
+//! closes DNS-rebinding windows without replacing the hostname used for TLS
+//! certificate and SNI verification.
 
 use async_trait::async_trait;
 use base64::Engine;
 use dashmap::DashMap;
 use hmac::{Hmac, KeyInit, Mac};
-use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions};
+use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions, StdStream};
 use ring::rand::SecureRandom;
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
@@ -44,15 +50,18 @@ use serde_json::Map;
 use serde_json::Value;
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 use url::{Host, Url};
 use zeroize::Zeroizing;
 
 use crate::consumer_index::ConsumerIndex;
+use crate::dns::{DnsCache, DnsConfig};
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 use super::utils::PluginHttpClient;
@@ -180,8 +189,18 @@ pub struct LdapAuth {
     tls_config: Option<Arc<ClientConfig>>,
     /// Whether to skip TLS verification (passed to ldap3 for IP-address handling).
     tls_no_verify: bool,
-    /// Extracted hostname from ldap_url for DNS pre-warming.
-    ldap_hostname: Option<String>,
+    /// Configured hostname retained for DNS and TLS hostname/SNI verification.
+    ldap_hostname: String,
+    ldap_port: u16,
+    /// Resolver with a cache-bypassing dial path. In production this is the
+    /// gateway's shared resolver; cache-less test/validation clients receive a
+    /// private resolver carrying the same backend policy.
+    dns_cache: DnsCache,
+    /// Active backend policy rechecked immediately before each socket opens.
+    backend_egress_policy: crate::config::BackendEgressPolicy,
+    /// Plaintext loopback endpoints are admitted without the development-only
+    /// override, but their actual dial-time answers must remain loopback.
+    plaintext_requires_loopback: bool,
 }
 
 impl LdapAuth {
@@ -214,7 +233,10 @@ impl LdapAuth {
         if !has_non_empty_authority(&ldap_url) {
             return Err("ldap_auth: 'ldap_url' must include a hostname".to_string());
         }
-        let ldap_hostname = Some(ldap_url_hostname(&parsed_ldap_url)?);
+        let ldap_hostname = ldap_url_hostname(&parsed_ldap_url)?;
+        let ldap_port = parsed_ldap_url
+            .port()
+            .unwrap_or(if is_ldaps { 636 } else { 389 });
 
         let bind_dn_template = parse_optional_string(config_obj, "bind_dn_template")?;
 
@@ -410,6 +432,7 @@ impl LdapAuth {
         let consumer_mapping = parse_bool(config_obj, "consumer_mapping", true)?;
 
         let allow_plaintext = parse_bool(config_obj, "allow_plaintext", false)?;
+        let plaintext_requires_loopback = !is_ldaps && !starttls && !allow_plaintext;
         if !is_ldaps && !starttls && !is_loopback_ldap_endpoint(&parsed_ldap_url) {
             if !allow_plaintext {
                 return Err(
@@ -432,6 +455,13 @@ impl LdapAuth {
             Some(key)
         };
         let cache_shard_amount = http_client.pool_shard_amount();
+        let backend_egress_policy = http_client.backend_allow_ips().clone();
+        let dns_cache = http_client.dns_cache().cloned().unwrap_or_else(|| {
+            DnsCache::new(DnsConfig {
+                backend_allow_ips: backend_egress_policy.clone(),
+                ..DnsConfig::default()
+            })
+        });
 
         // Build rustls TLS config respecting gateway settings, including the
         // gateway's parsed CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so revoked LDAP
@@ -476,6 +506,10 @@ impl LdapAuth {
             tls_config,
             tls_no_verify,
             ldap_hostname,
+            ldap_port,
+            dns_cache,
+            backend_egress_policy,
+            plaintext_requires_loopback,
         })
     }
 
@@ -605,15 +639,94 @@ impl LdapAuth {
     /// unreachable, TLS handshake failure), not a credential problem, so it is
     /// surfaced as [`AuthError::Backend`].
     async fn connect(&self) -> Result<ldap3::Ldap, AuthError> {
+        tokio::time::timeout(self.connect_timeout, self.connect_with_policy())
+            .await
+            .map_err(|_| {
+                AuthError::Backend(
+                    "ldap_auth: DNS resolution or connection establishment timed out".to_string(),
+                )
+            })?
+    }
+
+    async fn connect_with_policy(&self) -> Result<ldap3::Ldap, AuthError> {
+        let candidates = self
+            .dns_cache
+            .resolve_all_fresh(&self.ldap_hostname)
+            .await
+            .map_err(|error| {
+                AuthError::Backend(format!(
+                    "ldap_auth: dial-time DNS resolution failed: {error}"
+                ))
+            })?;
+
+        // Validate the complete answer set before opening any socket. A mixed
+        // allowed/denied response fails closed instead of letting an allowed
+        // decoy make the answer look safe while a client later selects a denied
+        // candidate.
+        for &candidate in &candidates {
+            self.screen_dial_candidate(candidate)?;
+        }
+
+        let mut last_connect_error = None;
+        for candidate in candidates {
+            // Keep the active-policy check immediately adjacent to the actual
+            // dial. This is intentionally repeated after the whole-set screen.
+            self.screen_dial_candidate(candidate)?;
+            let socket_addr = SocketAddr::new(candidate, self.ldap_port);
+            match TcpStream::connect(socket_addr).await {
+                Ok(stream) => {
+                    let std_stream = stream.into_std().map_err(|error| {
+                        AuthError::Backend(format!(
+                            "ldap_auth: failed to prepare screened connection: {error}"
+                        ))
+                    })?;
+                    return self.connect_ldap_over_stream(std_stream).await;
+                }
+                Err(error) => last_connect_error = Some((socket_addr, error)),
+            }
+        }
+
+        match last_connect_error {
+            Some((socket_addr, error)) => Err(AuthError::Backend(format!(
+                "ldap_auth: all screened connection candidates failed; last dial to {socket_addr} failed: {error}"
+            ))),
+            None => Err(AuthError::Backend(
+                "ldap_auth: dial-time DNS resolution returned no connection candidates".to_string(),
+            )),
+        }
+    }
+
+    fn screen_dial_candidate(&self, candidate: IpAddr) -> Result<(), AuthError> {
+        if let Some(reason) = self.backend_egress_policy.deny_reason(&candidate) {
+            return Err(AuthError::Backend(format!(
+                "ldap_auth: dial candidate {candidate} denied by backend egress policy: {reason}"
+            )));
+        }
+        if self.plaintext_requires_loopback && !candidate.is_loopback() {
+            return Err(AuthError::Backend(format!(
+                "ldap_auth: plaintext loopback endpoint resolved to non-loopback address {candidate}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn connect_ldap_over_stream(
+        &self,
+        stream: std::net::TcpStream,
+    ) -> Result<ldap3::Ldap, AuthError> {
         let mut settings = LdapConnSettings::new()
             .set_conn_timeout(self.connect_timeout)
             .set_starttls(self.starttls)
-            .set_no_tls_verify(self.tls_no_verify);
+            .set_no_tls_verify(self.tls_no_verify)
+            .set_std_stream(StdStream::Tcp(stream));
 
         if let Some(ref config) = self.tls_config {
             settings = settings.set_config(config.clone());
         }
 
+        // Supplying the original URL together with the preconnected concrete
+        // socket makes ldap3 use `ldap_hostname` for rustls ServerName/SNI. The
+        // screened IP is never substituted into the TLS identity.
         let (conn, ldap) = LdapConnAsync::with_settings(settings, &self.ldap_url)
             .await
             .map_err(|e| AuthError::Backend(format!("ldap_auth: connection failed: {e}")))?;
@@ -1522,10 +1635,7 @@ auth_flow::impl_auth_plugin!(
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
     auth_flow::run_auth_external_identity;
     fn warmup_hostnames(&self) -> Vec<String> {
-        self.ldap_hostname
-            .as_ref()
-            .map(|h| vec![h.clone()])
-            .unwrap_or_default()
+        vec![self.ldap_hostname.clone()]
     }
 );
 
