@@ -10686,6 +10686,8 @@ fn record_h3_flavor_aware_reject(state: &ProxyState, flavor: HttpFlavor, http_st
 
 #[cfg(test)]
 mod h3_request_body_timeout_tests {
+    use crate::proxy::grpc_proxy::GATEWAY_DEADLINE_EXCEEDED_MESSAGE;
+
     #[tokio::test]
     async fn completed_pre_policy_upload_returns_without_timeout() {
         let upload = std::future::ready::<Result<usize, &'static str>>(Ok(7));
@@ -10742,8 +10744,13 @@ mod h3_request_body_timeout_tests {
         ]);
         let mut body = b"backend response".to_vec();
 
-        let status =
-            super::replace_h3_response_with_grpc_deadline(&mut ctx, &mut headers, &mut body, &[]);
+        let status = super::replace_buffered_h3_response_with_grpc_deadline(
+            &mut ctx,
+            None,
+            &mut headers,
+            &mut body,
+            &[],
+        );
 
         assert_eq!(status, http::StatusCode::OK);
         assert_eq!(headers.len(), 3);

@@ -6689,6 +6689,7 @@ mod tests {
     use crate::config::types::{CircuitBreakerConfig, GatewayConfig, Proxy, UpstreamTarget};
     use crate::dns::{DnsCache, DnsConfig};
     use crate::plugins::{Plugin, PluginResult, RequestContext, security_headers::SecurityHeaders};
+    use crate::proxy::grpc_proxy::GATEWAY_DEADLINE_EXCEEDED_MESSAGE;
     use crate::proxy::ProxyState;
     use crate::retry::ErrorClass;
     use hyper::{HeaderMap, StatusCode};
