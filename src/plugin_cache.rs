@@ -799,7 +799,7 @@ struct AdaptiveConcurrencyInstance {
     proxy_id: Option<String>,
     route_definition: AdaptiveConcurrencyRouteDefinition,
     generation: u64,
-    drain_older_generation: bool,
+    reset_tracking_space: bool,
 }
 
 type AdaptiveConcurrencyInstanceMap =
@@ -1559,10 +1559,11 @@ fn adaptive_concurrency_has_zero_target_sentinel(keys: &[AdaptiveConcurrencyRout
 }
 
 /// Existing target keys keep their counters during strict scale-out. Any
-/// retirement/replacement still drains, as do expansions involving the
-/// zero-target sentinel because it identifies a route source rather than a
-/// concrete limiter key and can collide across sources sharing one scope.
-fn adaptive_concurrency_key_space_requires_drain(
+/// retirement/replacement requires an independent tracking space, as do
+/// expansions involving the zero-target sentinel because it identifies a route
+/// source rather than a concrete limiter key and can collide across sources
+/// sharing one scope.
+fn adaptive_concurrency_key_space_requires_reset(
     current: &[AdaptiveConcurrencyRouteKey],
     replacement: &[AdaptiveConcurrencyRouteKey],
 ) -> bool {
@@ -1579,7 +1580,7 @@ fn adaptive_concurrency_key_space_requires_drain(
         .all(|key| replacement.binary_search(key).is_ok())
 }
 
-fn adaptive_concurrency_route_definition_requires_drain(
+fn adaptive_concurrency_route_definition_requires_reset(
     current: &AdaptiveConcurrencyRouteDefinition,
     replacement: &AdaptiveConcurrencyRouteDefinition,
 ) -> bool {
@@ -1614,7 +1615,7 @@ fn adaptive_concurrency_route_definition_requires_drain(
     {
         return true;
     }
-    adaptive_concurrency_key_space_requires_drain(&current.keys, &replacement.keys)
+    adaptive_concurrency_key_space_requires_reset(&current.keys, &replacement.keys)
 }
 
 fn adaptive_concurrency_lb_key_space_changed(
@@ -1625,7 +1626,7 @@ fn adaptive_concurrency_lb_key_space_changed(
     let current_keys = adaptive_concurrency_effective_lb_keys(&instance.route_definition, current);
     let replacement_keys =
         adaptive_concurrency_effective_lb_keys(&instance.route_definition, replacement);
-    adaptive_concurrency_key_space_requires_drain(&current_keys, &replacement_keys)
+    adaptive_concurrency_key_space_requires_reset(&current_keys, &replacement_keys)
 }
 
 fn retained_adaptive_concurrency_states(
@@ -1750,8 +1751,7 @@ fn create_adaptive_concurrency_plugin(
         )));
     }
 
-    let (limiter, generation, drain_older_generation) = if let Some(existing) =
-        current.get(&identity)
+    let (limiter, generation, reset_tracking_space) = if let Some(existing) = current.get(&identity)
     {
         let generation = existing.generation.checked_add(1).ok_or_else(|| {
             format!(
@@ -1759,18 +1759,19 @@ fn create_adaptive_concurrency_plugin(
                 pc.namespace, pc.id
             )
         })?;
-        (
-            Arc::clone(&existing.limiter),
-            generation,
-            existing.config.key_by != parsed.key_by
-                || parsed.max_tracked_keys < existing.config.max_tracked_keys
-                || existing.scope != pc.scope
-                || existing.proxy_id != pc.proxy_id
-                || adaptive_concurrency_route_definition_requires_drain(
-                    &existing.route_definition,
-                    &route_definition,
-                ),
-        )
+        let structural_change = existing.config.key_by != parsed.key_by
+            || parsed.max_tracked_keys < existing.config.max_tracked_keys
+            || existing.scope != pc.scope
+            || existing.proxy_id != pc.proxy_id
+            || adaptive_concurrency_route_definition_requires_reset(
+                &existing.route_definition,
+                &route_definition,
+            );
+        // Keep the generation lifecycle shared so pinned retired cache views
+        // are rejected after a structural cutover. The limiter rotates its
+        // target-tracking space at commit, allowing permits from the detached
+        // space to finish without blocking or training the replacement.
+        (Arc::clone(&existing.limiter), generation, structural_change)
     } else {
         (
             Arc::new(AdaptiveConcurrencyLimiter::new(
@@ -1796,7 +1797,7 @@ fn create_adaptive_concurrency_plugin(
             proxy_id: pc.proxy_id.clone(),
             route_definition,
             generation,
-            drain_older_generation,
+            reset_tracking_space,
         },
     );
     Ok(Some(Arc::new(plugin)))
@@ -2277,7 +2278,7 @@ impl PluginCacheInner {
         for instance in self.adaptive_concurrency_instances.values() {
             instance
                 .limiter
-                .prepare_policy_generation(instance.generation, instance.drain_older_generation);
+                .prepare_policy_generation(instance.generation, instance.reset_tracking_space);
         }
     }
 
@@ -2286,7 +2287,7 @@ impl PluginCacheInner {
             instance.limiter.commit_policy_generation(
                 instance.generation,
                 Arc::clone(&instance.config),
-                instance.drain_older_generation,
+                instance.reset_tracking_space,
             );
         }
     }
@@ -2298,11 +2299,11 @@ impl PluginCacheInner {
         replacement: &crate::load_balancer::LoadBalancerCacheInner,
     ) {
         for instance in self.adaptive_concurrency_instances.values() {
-            let drain_older_generation =
+            let reset_tracking_space =
                 adaptive_concurrency_lb_key_space_changed(instance, current, replacement);
             instance
                 .limiter
-                .prepare_lb_generation(generation, drain_older_generation);
+                .prepare_lb_generation(generation, reset_tracking_space);
         }
     }
 
@@ -2313,11 +2314,11 @@ impl PluginCacheInner {
         replacement: &crate::load_balancer::LoadBalancerCacheInner,
     ) {
         for instance in self.adaptive_concurrency_instances.values() {
-            let drain_older_generation =
+            let reset_tracking_space =
                 adaptive_concurrency_lb_key_space_changed(instance, current, replacement);
             instance
                 .limiter
-                .commit_lb_generation(generation, drain_older_generation);
+                .commit_lb_generation(generation, reset_tracking_space);
         }
     }
 

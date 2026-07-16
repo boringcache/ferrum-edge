@@ -61,8 +61,8 @@ mod tests {
         PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget, default_namespace,
     };
     use crate::plugins::{
-        BackendAdmissionContext, BackendAdmissionDecision, PluginHttpClient, ProxyProtocol,
-        RequestContext,
+        BackendAdmissionContext, BackendAdmissionDecision, PluginHttpClient, PluginResult,
+        ProxyProtocol, RequestContext,
     };
     use chrono::Utc;
     use serde_json::{Map, Value, json};
@@ -282,6 +282,153 @@ mod tests {
         assert_eq!(after.route_generation, before.route_generation);
         assert_eq!(after.config.proxies.len(), 1);
         assert_eq!(after.config.proxies[0].id, "old");
+    }
+
+    #[tokio::test]
+    async fn fault_overlay_publication_keeps_in_flight_request_epoch_coherent() {
+        use crate::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+        use crate::plugins::Plugin;
+        use crate::plugins::fault_injection::runtime_overlay::{
+            FaultOverlayMaterialization, materialize_config,
+        };
+
+        async fn execute_before_proxy_chain(plugins: Arc<Vec<Arc<dyn Plugin>>>) -> PluginResult {
+            let mut ctx = RequestContext::new(
+                "192.0.2.10".to_string(),
+                "GET".to_string(),
+                "/checkout".to_string(),
+            );
+            let mut headers = HashMap::new();
+            for plugin in plugins.iter() {
+                match plugin.before_proxy(&mut ctx, &mut headers).await {
+                    PluginResult::Continue => {}
+                    terminal => return terminal,
+                }
+            }
+            PluginResult::Continue
+        }
+
+        let static_fault = || {
+            plugin_config(
+                "fault",
+                "fault_injection",
+                json!({
+                    "abort": {"status_code": 503, "percentage": 50.0},
+                    "runtime_overlay_scope": "checkout"
+                }),
+            )
+        };
+        let overlay = |percentage| MeshRuntimeOverlay {
+            fields: HashMap::from([(
+                "ferrum.fault_injection.checkout.abort_percent".to_string(),
+                RuntimeValue::Number(percentage),
+            )]),
+        };
+
+        let mut fault_a = static_fault();
+        assert_eq!(
+            materialize_config(&mut fault_a.config, &overlay(100.0)),
+            FaultOverlayMaterialization::Changed
+        );
+        let config_a = config(
+            vec![proxy("checkout", "/checkout", vec!["fault"])],
+            vec![fault_a],
+            vec![],
+        );
+        let store = epoch_store(config_a);
+        let epoch_a = store.load();
+        let plugins_a = epoch_a
+            .plugin_cache
+            .request_view("checkout", ProxyProtocol::Http)
+            .plugins();
+
+        let mut fault_b = static_fault();
+        assert_eq!(
+            materialize_config(&mut fault_b.config, &overlay(0.0)),
+            FaultOverlayMaterialization::Disabled
+        );
+        fault_b.enabled = false;
+        let config_b = config(
+            vec![proxy("checkout", "/checkout", vec!["fault"])],
+            vec![fault_b],
+            vec![],
+        );
+        store
+            .update_config(
+                |current| {
+                    let plugin_cache =
+                        PluginCache::build_inner(&config_b, &PluginHttpClient::default())?;
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::new(config_b.clone()),
+                        route_table: RouterCache::build_route_table_snapshot(&config_b),
+                        plugin_cache,
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: false,
+                        lb_changed: false,
+                    }))
+                },
+                |_| {},
+            )
+            .unwrap_or_else(|error| panic!("generation B should publish: {error}"))
+            .expect("generation B should publish");
+
+        let epoch_b = store.load();
+        let plugins_b = epoch_b
+            .plugin_cache
+            .request_view("checkout", ProxyProtocol::Http)
+            .plugins();
+        assert!(!Arc::ptr_eq(&epoch_a, &epoch_b));
+        assert!(matches!(
+            execute_before_proxy_chain(Arc::clone(&plugins_a)).await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ));
+        assert!(matches!(
+            execute_before_proxy_chain(Arc::clone(&plugins_b)).await,
+            PluginResult::Continue
+        ));
+
+        let invalid_config = config(
+            vec![proxy("checkout", "/checkout", vec!["fault"])],
+            vec![plugin_config(
+                "fault",
+                "fault_injection",
+                json!({"runtime_overlay_scope": "checkout"}),
+            )],
+            vec![],
+        );
+        let rejection = store.update_config(
+            |current| {
+                let plugin_cache =
+                    PluginCache::build_inner(&invalid_config, &PluginHttpClient::default())?;
+                Ok(Some(StagedRequestEpoch {
+                    config: Arc::new(invalid_config.clone()),
+                    route_table: RouterCache::build_route_table_snapshot(&invalid_config),
+                    plugin_cache,
+                    consumer_index: Arc::clone(&current.consumer_index),
+                    load_balancer: Arc::clone(&current.load_balancer),
+                    route_changed: false,
+                    lb_changed: false,
+                }))
+            },
+            |_| {},
+        );
+        assert!(rejection.is_err());
+        assert!(Arc::ptr_eq(&epoch_b, &store.load()));
+        assert!(matches!(
+            execute_before_proxy_chain(plugins_a).await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ));
+        assert!(matches!(
+            execute_before_proxy_chain(plugins_b).await,
+            PluginResult::Continue
+        ));
     }
 
     #[test]
@@ -991,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn lb_only_target_update_resets_adaptive_concurrency_key_space() {
+    fn lb_only_overlapping_target_replacements_do_not_wait_for_retired_permits() {
         let mut protected_proxy = proxy("p1", "/one", vec!["adaptive"]);
         protected_proxy.upstream_id = Some("u1".to_string());
         let adaptive = plugin_config(
@@ -1001,7 +1148,8 @@ mod tests {
                 "max_tracked_keys": 1,
                 "min_limit": 1,
                 "initial_limit": 1,
-                "max_limit": 1
+                "max_limit": 1,
+                "expose_headers": true
             }),
         );
         let initial = config(
@@ -1056,16 +1204,21 @@ mod tests {
         let replacement_epoch = store.load();
         let replacement_target =
             replacement_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
-        match acquire(&replacement_epoch, &replacement_target) {
-            BackendAdmissionDecision::Reject { status_code, .. } => {
-                assert_eq!(status_code, 503)
-            }
-            _ => panic!("replacement target must wait for the retired permit to drain"),
-        }
-        drop(old_target_permit);
         match acquire(&initial_epoch, &first_target) {
-            BackendAdmissionDecision::Reject { status_code, .. } => {
-                assert_eq!(status_code, 503)
+            BackendAdmissionDecision::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 503);
+                assert!(
+                    !headers.contains_key("x-adaptive-concurrency-limit"),
+                    "a retired LB view has no truthful per-target limit"
+                );
+                assert!(
+                    !headers.contains_key("x-adaptive-concurrency-inflight"),
+                    "a retired LB view has no truthful per-target in-flight count"
+                );
             }
             _ => panic!("a retired load-balancer view must not recreate the old target"),
         }
@@ -1074,12 +1227,93 @@ mod tests {
             _ => panic!("replacement target should be admitted"),
         };
         match acquire(&replacement_epoch, &replacement_target) {
-            BackendAdmissionDecision::Reject { status_code, .. } => {
-                assert_eq!(status_code, 503)
+            BackendAdmissionDecision::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 503);
+                assert_eq!(
+                    headers
+                        .get("x-adaptive-concurrency-limit")
+                        .map(String::as_str),
+                    Some("1")
+                );
+                assert_eq!(
+                    headers
+                        .get("x-adaptive-concurrency-inflight")
+                        .map(String::as_str),
+                    Some("1")
+                );
             }
             _ => panic!("replacement target should remain adaptively limited"),
         }
+
+        store
+            .update_load_balancer(
+                |current| {
+                    Some(LoadBalancerCache::build_update_targets_inner(
+                        &current.load_balancer,
+                        "u1",
+                        vec![target("c.local", 82)],
+                        LoadBalancerAlgorithm::RoundRobin,
+                        None,
+                    ))
+                },
+                |_| {},
+            )
+            .unwrap_or_else(|error| panic!("second LB update should succeed: {error}"))
+            .expect("second LB update should publish");
+
+        let newest_epoch = store.load();
+        let newest_target = newest_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+        match acquire(&replacement_epoch, &replacement_target) {
+            BackendAdmissionDecision::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 503);
+                assert!(
+                    !headers.contains_key("x-adaptive-concurrency-limit"),
+                    "the middle retired LB view must omit a per-target limit"
+                );
+                assert!(
+                    !headers.contains_key("x-adaptive-concurrency-inflight"),
+                    "the middle retired LB view must omit a per-target in-flight count"
+                );
+            }
+            _ => panic!("the middle load-balancer view must stay retired"),
+        }
+        let newest = match acquire(&newest_epoch, &newest_target) {
+            BackendAdmissionDecision::Admit(permit) => permit,
+            _ => panic!("newest target should admit independently"),
+        };
+        match acquire(&newest_epoch, &newest_target) {
+            BackendAdmissionDecision::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 503);
+                assert_eq!(
+                    headers
+                        .get("x-adaptive-concurrency-limit")
+                        .map(String::as_str),
+                    Some("1")
+                );
+                assert_eq!(
+                    headers
+                        .get("x-adaptive-concurrency-inflight")
+                        .map(String::as_str),
+                    Some("1")
+                );
+            }
+            _ => panic!("newest target should enforce its independent limit"),
+        }
+        drop(newest);
         drop(held);
+        drop(old_target_permit);
     }
 
     #[test]
@@ -1230,7 +1464,8 @@ impl RequestEpochStore {
         // generations. Stage the validated replacements, publish the one
         // request epoch, then retire stale feedback/bounds. Compatible old and
         // new plugin objects can both admit during this handoff because their
-        // target counters are shared; structural replacements remain draining.
+        // target counters are shared; structural replacements publish an
+        // independent accounting space at commit.
         next.plugin_cache.prepare_adaptive_concurrency_generations();
         next.plugin_cache
             .prepare_adaptive_concurrency_lb_generation(

@@ -1448,7 +1448,10 @@ async fn handle_h3_request(
         detected_http_flavor,
         grpc_web_response_content_type.is_some(),
     );
-    ctx.set_websocket_response_boundary(matches!(http_flavor, HttpFlavor::WebSocket));
+    // Fault shaping must retain the immutable wire flavor: recognized
+    // gRPC-Web is promoted only for gRPC policy selection above and must not
+    // become native gRPC merely because its policy chain is gRPC-scoped.
+    ctx.set_request_http_flavor(detected_http_flavor);
     let initial_response_header_policy_plugins = epoch
         .plugin_cache
         .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);

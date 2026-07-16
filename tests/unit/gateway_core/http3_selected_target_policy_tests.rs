@@ -328,6 +328,9 @@ fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
     let plugin_protocol = source
         .find("let request_protocol = h3_plugin_protocol_for_request(")
         .expect("H3 plugin selection must account for recognized gRPC-Web requests");
+    let wire_flavor_stamp = source
+        .find("ctx.set_request_http_flavor(detected_http_flavor)")
+        .expect("H3 fault shaping must retain the immutable client wire flavor");
     let backend_flavor = source
         .find("let backend_http_flavor = if grpc_web_response_content_type.is_some()")
         .expect("H3 must derive backend transport flavor after request plugins");
@@ -344,12 +347,14 @@ fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
         detected < websocket_precedence
             && websocket_precedence < effective
             && effective < plugin_protocol
-            && plugin_protocol < post_guard
+            && plugin_protocol < wire_flavor_stamp
+            && wire_flavor_stamp < post_guard
             && plugin_protocol < backend_flavor
             && backend_flavor <= translated_marker
             && plugin_protocol < bridge,
         "wire classification, WebSocket precedence, policy promotion, route policy selection, \
-         POST policy, translation-aware backend flavor, and dispatch must stay in that order"
+         immutable wire-flavor stamping, POST policy, translation-aware backend flavor, and \
+         dispatch must stay in that order"
     );
     assert!(
         source[bridge..].contains("flavor: backend_http_flavor,"),

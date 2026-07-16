@@ -189,10 +189,6 @@ pub mod _test_support {
             }
         }
 
-        pub fn observe(&self) -> u64 {
-            self.transition.load()
-        }
-
         pub fn begin_structural_reset(&self) -> AdaptiveConcurrencyResetToken {
             AdaptiveConcurrencyResetToken {
                 reset: self.transition.begin_structural_reset(),
@@ -205,17 +201,8 @@ pub mod _test_support {
                 .map(|reset| AdaptiveConcurrencyResetToken { reset })
         }
 
-        pub fn try_begin_observed_drain_reset(
-            &self,
-            observed: u64,
-        ) -> Option<AdaptiveConcurrencyResetToken> {
-            self.transition
-                .try_begin_drain_reset(observed)
-                .map(|reset| AdaptiveConcurrencyResetToken { reset })
-        }
-
-        pub fn finish_reset(&self, reset: AdaptiveConcurrencyResetToken, drain: bool) -> bool {
-            self.transition.finish_reset(reset.reset, drain)
+        pub fn finish_reset(&self, reset: AdaptiveConcurrencyResetToken) -> bool {
+            self.transition.finish_reset(reset.reset)
         }
 
         pub fn is_active(&self) -> bool {
@@ -1140,6 +1127,36 @@ pub mod _test_support {
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message,
         }
+    }
+
+    pub fn set_websocket_response_boundary_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        enabled: bool,
+    ) {
+        ctx.set_websocket_response_boundary(enabled);
+    }
+
+    pub fn set_request_http_flavor_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        flavor: crate::config::types::HttpFlavor,
+    ) {
+        ctx.set_request_http_flavor(flavor);
+    }
+
+    pub async fn wait_for_tcp_peer_reset_for_test(stream: &tokio::net::TcpStream) {
+        crate::proxy::tcp_proxy::wait_for_tcp_peer_reset(stream).await;
+    }
+
+    pub fn tcp_fault_admission_retry_delays_for_test(polls: usize) -> Vec<Duration> {
+        let mut backoff = crate::proxy::tcp_proxy::TcpFaultAdmissionRetryBackoff::new();
+        (0..polls).map(|_| backoff.next_delay()).collect()
+    }
+
+    pub fn tcp_fault_admission_should_cancel_for_test(
+        readiness: std::io::Result<tokio::io::Ready>,
+        socket_error: std::io::Result<Option<std::io::Error>>,
+    ) -> bool {
+        crate::proxy::tcp_proxy::tcp_fault_admission_should_cancel(&readiness, &socket_error)
     }
 
     pub fn insert_grpc_error_metadata(

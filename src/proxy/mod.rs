@@ -16178,7 +16178,7 @@ async fn handle_proxy_request_inner(
     // suppress gRPC-Web shaping for route-level rejects carrying a hostile
     // Content-Type.
     let is_h2_ws = is_h2_websocket_connect(&req);
-    ctx.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
+    ctx.set_request_http_flavor(flavor);
 
     // Resolve the client-visible protocol before route-level rejects so every
     // post-routing synthesized initial HEADERS block uses the same precomputed
