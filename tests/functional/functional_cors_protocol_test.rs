@@ -36,10 +36,7 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
         assert_eq!(header(response, "access-control-allow-methods"), "PUT");
         assert_eq!(header(response, "access-control-allow-headers"), "X-Custom");
         assert_eq!(header(response, "access-control-max-age"), "600");
-        assert_eq!(
-            header(response, "access-control-allow-credentials"),
-            "true"
-        );
+        assert_eq!(header(response, "access-control-allow-credentials"), "true");
         assert_eq!(
             header(response, "access-control-expose-headers"),
             "X-Response"
@@ -233,8 +230,16 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.is_empty());
         assert_eq!(header(&response, "access-control-allow-origin"), ORIGIN);
-        assert!(!response.headers.contains_key("access-control-allow-methods"));
-        assert!(!response.headers.contains_key("access-control-allow-headers"));
+        assert!(
+            !response
+                .headers
+                .contains_key("access-control-allow-methods")
+        );
+        assert!(
+            !response
+                .headers
+                .contains_key("access-control-allow-headers")
+        );
         assert!(!response.headers.contains_key("access-control-max-age"));
     }
 
@@ -319,7 +324,7 @@ struct CorsProtocolHarness {
 
 impl CorsProtocolHarness {
     async fn spawn() -> Self {
-        let echo = spawn_http_echo().await.expect("spawn CORS backend");
+        let mut echo = spawn_http_echo().await.expect("spawn CORS backend");
         let config = cors_config(echo.port);
         let mut last_error = String::new();
         for _ in 0..5 {
@@ -394,18 +399,8 @@ fn cors_config(backend_port: u16) -> String {
             backend_port,
             &["istio-ignore"],
         ),
-        cors_proxy(
-            "istio-star",
-            "/istio-star",
-            backend_port,
-            &["istio-star"],
-        ),
-        cors_proxy(
-            "canonical",
-            "/canonical",
-            backend_port,
-            &["canonical"],
-        ),
+        cors_proxy("istio-star", "/istio-star", backend_port, &["istio-star"]),
+        cors_proxy("canonical", "/canonical", backend_port, &["canonical"]),
     ];
     let config = serde_json::json!({
         "version": "1",
@@ -510,9 +505,11 @@ fn cors_proxy(
 ) -> serde_json::Value {
     let plugins = plugin_ids
         .iter()
-        .map(|plugin_config_id| serde_json::json!({
-            "plugin_config_id": plugin_config_id
-        }))
+        .map(|plugin_config_id| {
+            serde_json::json!({
+                "plugin_config_id": plugin_config_id
+            })
+        })
         .collect::<Vec<_>>();
     serde_json::json!({
         "id": id,

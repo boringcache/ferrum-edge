@@ -1032,7 +1032,10 @@ virtual_service_cors_policies:
     assert_eq!(plugin.config["max_age"], serde_json::json!(600));
     assert_eq!(plugin.config["allowed_headers"], serde_json::json!([]));
     assert_eq!(plugin.config["exposed_headers"], serde_json::json!([]));
-    assert_eq!(plugin.config["unmatched_preflights"], serde_json::json!("forward"));
+    assert_eq!(
+        plugin.config["unmatched_preflights"],
+        serde_json::json!("forward")
+    );
     assert!(
         plugin.config.get("preflight_continue").is_none(),
         "the plugin must answer preflights itself (Istio semantics)"
@@ -1222,11 +1225,8 @@ async fn virtual_service_cors_exact_origin_is_canonicalized_after_both_projectio
 
     for config in [&gateway.config, &mesh_config] {
         let plugin = CorsPlugin::new(config).expect("projected CORS config");
-        let mut ctx = RequestContext::new(
-            "127.0.0.1".to_string(),
-            "GET".to_string(),
-            "/".to_string(),
-        );
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
         ctx.headers.insert(
             "origin".to_string(),
             "https://xn--bcher-kva.example".to_string(),
@@ -1712,7 +1712,10 @@ fn virtual_service_cors_policy_exact_star_projects_but_other_wildcards_defer() {
         .iter()
         .find(|plugin| plugin.plugin_name == "cors")
         .expect("exact star projects a gateway CORS plugin");
-    assert_eq!(star_plugin.config["allowed_origins"], serde_json::json!(["*"]));
+    assert_eq!(
+        star_plugin.config["allowed_origins"],
+        serde_json::json!(["*"])
+    );
     assert_eq!(
         star_plugin.config["unmatched_preflights"],
         serde_json::json!("forward")

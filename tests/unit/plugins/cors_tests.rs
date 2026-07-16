@@ -501,7 +501,10 @@ async fn test_preflight_continue_replaces_backend_policy_with_complete_gateway_p
     assert_eq!(response_headers["access-control-allow-headers"], "X-Custom");
     assert_eq!(response_headers["access-control-max-age"], "600");
     assert_eq!(response_headers["access-control-allow-credentials"], "true");
-    assert_eq!(response_headers["access-control-expose-headers"], "X-Response");
+    assert_eq!(
+        response_headers["access-control-expose-headers"],
+        "X-Response"
+    );
     for token in [
         "Accept-Encoding",
         "Origin",
@@ -537,7 +540,10 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
             ..
         } => {
             assert_eq!(status_code, 200);
-            assert_eq!(headers["access-control-allow-origin"], "https://app.example");
+            assert_eq!(
+                headers["access-control-allow-origin"],
+                "https://app.example"
+            );
             assert!(!headers.contains_key("access-control-allow-methods"));
             assert!(!headers.contains_key("access-control-allow-headers"));
             assert!(!headers.contains_key("access-control-max-age"));
@@ -547,9 +553,7 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
 
     let mut unmatched_preflight = make_preflight_ctx("https://other.example", "DELETE");
     assert!(matches!(
-        forward
-            .on_request_received(&mut unmatched_preflight)
-            .await,
+        forward.on_request_received(&mut unmatched_preflight).await,
         PluginResult::Continue
     ));
     let mut upstream_headers = HashMap::from([("x-backend".to_string(), "ok".to_string())]);

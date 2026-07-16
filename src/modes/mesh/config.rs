@@ -2744,9 +2744,9 @@ fn validate_virtual_service_cors_policies(
                         errors.push(format!(
                             "{context}: cors.allowed_origins[{index}] must not be empty"
                         ));
-                    } else if let Err(err) = regex::Regex::new(
-                        &crate::config::types::anchor_regex_pattern(pattern),
-                    ) {
+                    } else if let Err(err) =
+                        regex::Regex::new(&crate::config::types::anchor_regex_pattern(pattern))
+                    {
                         errors.push(format!(
                             "{context}: cors.allowed_origins[{index}] regex does not compile: {err}"
                         ));

@@ -2070,8 +2070,9 @@ mod virtual_service_cors {
             "*.example.com".into(),
         )])]);
         assert!(
-            errors.iter().any(|error| error
-                .contains("wildcard syntax other than Istio's exact `*`")),
+            errors
+                .iter()
+                .any(|error| error.contains("wildcard syntax other than Istio's exact `*`")),
             "non-Istio wildcard exact must be rejected: {errors:?}"
         );
         // Wildcard-looking PREFIX matchers are fine — prefix is a literal

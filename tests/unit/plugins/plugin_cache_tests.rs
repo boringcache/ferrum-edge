@@ -245,7 +245,10 @@ async fn multiple_cors_instances_intersect_preflight_and_actual_policy() {
     let cache = PluginCache::new(&config).expect("composed CORS cache");
     let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
     assert_eq!(
-        plugins.iter().map(|plugin| plugin.name()).collect::<Vec<_>>(),
+        plugins
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
         vec!["cors", "cors", "__cors_finalizer"]
     );
     let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
@@ -376,7 +379,9 @@ async fn multiple_cors_instances_intersect_preflight_and_actual_policy() {
             ),
         ],
     );
-    cache.rebuild(&reversed).expect("rebuild reversed CORS cache");
+    cache
+        .rebuild(&reversed)
+        .expect("rebuild reversed CORS cache");
     let reversed_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
     let mut reversed_delete = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -399,11 +404,7 @@ async fn multiple_cors_instances_intersect_preflight_and_actual_policy() {
     ));
 
     let three = make_config(
-        vec![make_proxy(
-            "p1",
-            "/api",
-            vec!["wide", "middle", "narrow"],
-        )],
+        vec![make_proxy("p1", "/api", vec!["wide", "middle", "narrow"])],
         vec![
             cors_config("wide", &["GET", "POST"], &["X-A", "X-B"], None),
             cors_config("middle", &["GET", "POST"], &["X-B"], None),
@@ -469,7 +470,10 @@ fn multiple_cors_instances_must_remain_contiguous() {
     let err = PluginCache::new(&config)
         .err()
         .expect("interleaved CORS instances must fail cache construction");
-    assert!(err.contains("cors instances must remain contiguous"), "got: {err}");
+    assert!(
+        err.contains("cors instances must remain contiguous"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -516,18 +520,9 @@ fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
     );
 
     let composed = make_config(
-        vec![make_proxy(
-            "p1",
-            "/api",
-            vec!["cors-wide", "cors-narrow"],
-        )],
+        vec![make_proxy("p1", "/api", vec!["cors-wide", "cors-narrow"])],
         vec![
-            cors_config(
-                "cors-wide",
-                &["GET", "DELETE"],
-                &["X-Test"],
-                None,
-            ),
+            cors_config("cors-wide", &["GET", "DELETE"], &["X-Test"], None),
             cors_config("cors-narrow", &["GET"], &["X-Test"], None),
         ],
     );

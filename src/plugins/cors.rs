@@ -237,12 +237,8 @@ impl CorsPlugin {
 
         let unmatched_preflights = match object.get("unmatched_preflights") {
             None => UnmatchedPreflights::Reject,
-            Some(Value::String(value)) if value == "forward" => {
-                UnmatchedPreflights::Forward
-            }
-            Some(Value::String(value)) if value == "ignore" => {
-                UnmatchedPreflights::Ignore
-            }
+            Some(Value::String(value)) if value == "forward" => UnmatchedPreflights::Forward,
+            Some(Value::String(value)) if value == "ignore" => UnmatchedPreflights::Ignore,
             Some(Value::String(value)) => {
                 return Err(format!(
                     "cors: 'unmatched_preflights' must be 'forward' or 'ignore', got: {value}"
@@ -351,7 +347,7 @@ impl CorsPlugin {
                             if origin.is_empty() {
                                 return Err(
                                     "cors: 'allowed_origins' entries must be non-empty strings"
-                                    .to_string(),
+                                        .to_string(),
                                 );
                             }
                             if origin.len() != raw_origin.len() {
@@ -369,17 +365,14 @@ impl CorsPlugin {
                                     validate_wildcard_origin(origin)?,
                                 ));
                             } else {
-                                patterns.push(OriginPattern::Exact(canonicalize_exact_origin(
-                                    origin,
-                                )?));
+                                patterns
+                                    .push(OriginPattern::Exact(canonicalize_exact_origin(origin)?));
                             }
                         }
-                        Value::Object(_) => {
-                            match Self::parse_origin_matcher(value)? {
-                                Some(pattern) => patterns.push(pattern),
-                                None => wildcard = true,
-                            }
-                        }
+                        Value::Object(_) => match Self::parse_origin_matcher(value)? {
+                            Some(pattern) => patterns.push(pattern),
+                            None => wildcard = true,
+                        },
                         other => {
                             return Err(format!(
                                 "cors: 'allowed_origins' entries must be strings or \
@@ -972,20 +965,32 @@ fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String
             "true".to_string(),
         );
     }
-    if let Some(exposed) = state.exposed_headers.as_ref().filter(|values| !values.is_empty()) {
+    if let Some(exposed) = state
+        .exposed_headers
+        .as_ref()
+        .filter(|values| !values.is_empty())
+    {
         headers.insert(
             "access-control-expose-headers".to_string(),
             exposed.join(", "),
         );
     }
     if preflight {
-        if let Some(methods) = state.allowed_methods.as_ref().filter(|values| !values.is_empty()) {
+        if let Some(methods) = state
+            .allowed_methods
+            .as_ref()
+            .filter(|values| !values.is_empty())
+        {
             headers.insert(
                 "access-control-allow-methods".to_string(),
                 methods.join(", "),
             );
         }
-        if let Some(allowed) = state.allowed_headers.as_ref().filter(|values| !values.is_empty()) {
+        if let Some(allowed) = state
+            .allowed_headers
+            .as_ref()
+            .filter(|values| !values.is_empty())
+        {
             headers.insert(
                 "access-control-allow-headers".to_string(),
                 allowed.join(", "),
