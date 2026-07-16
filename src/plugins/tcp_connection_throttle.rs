@@ -36,9 +36,6 @@ struct CleanupTask {
 /// Stable accounting state shared by compatible plugin-cache generations.
 pub(crate) struct TcpConnectionThrottleState {
     active_counts: DashMap<String, Arc<ConnectionCounter>>,
-    // Retained for the public construction-path normalization assertion.
-    #[allow(dead_code)]
-    shard_amount: usize,
     cleanup_task: Mutex<CleanupTask>,
 }
 
@@ -47,7 +44,6 @@ impl TcpConnectionThrottleState {
         let shard_amount = crate::util::sharding::pool_shard_amount(pool_shard_amount).max(2);
         Arc::new(Self {
             active_counts: DashMap::with_shard_amount(shard_amount),
-            shard_amount,
             cleanup_task: Mutex::new(CleanupTask {
                 interval_seconds: 0,
                 handle: None,
@@ -167,14 +163,7 @@ pub struct TcpConnectionThrottle {
 }
 
 impl TcpConnectionThrottle {
-    // Kept as the standalone plugin constructor; production cache builds use
-    // `new_with_pool_shard_amount` to carry the normalized runtime setting.
-    #[allow(dead_code)]
-    pub fn new(config: &Value) -> Result<Self, String> {
-        Self::new_with_pool_shard_amount(config, 0)
-    }
-
-    pub fn new_with_pool_shard_amount(
+    pub(crate) fn new_with_pool_shard_amount(
         config: &Value,
         pool_shard_amount: usize,
     ) -> Result<Self, String> {
@@ -206,13 +195,6 @@ impl TcpConnectionThrottle {
 
     pub(crate) fn cleanup_interval_seconds(&self) -> u64 {
         self.cleanup_interval_seconds
-    }
-
-    // Exposes the construction result for focused external validation without
-    // enabling DashMap's raw shard API in production.
-    #[allow(dead_code)]
-    pub fn shard_amount(&self) -> usize {
-        self.state.shard_amount
     }
 
     fn throttle_key(&self, ctx: &StreamConnectionContext) -> String {
@@ -351,5 +333,22 @@ impl Plugin for TcpConnectionThrottle {
             state.release(key, counter);
         }));
         PluginResult::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TcpConnectionThrottleState;
+    use dashmap::Map;
+
+    #[test]
+    fn state_normalizes_pool_shard_amount_for_the_actual_counter_map() {
+        for override_value in [0, 1, 3] {
+            let state = TcpConnectionThrottleState::new(override_value);
+            assert_eq!(
+                state.active_counts._shard_count(),
+                crate::util::sharding::pool_shard_amount(override_value).max(2)
+            );
+        }
     }
 }

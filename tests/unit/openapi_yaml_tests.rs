@@ -2755,6 +2755,51 @@ fn mtls_dns_admission_mutations_document_conflict_responses() {
 }
 
 #[test]
+fn plugin_graph_delete_rejections_have_openapi_parity() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for pointer in [
+        "/paths/~1proxies~1{id}/delete/responses/400",
+        "/paths/~1plugins~1config~1{id}/delete/responses/400",
+    ] {
+        let response = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("plugin-graph DELETE is missing 400 response: {pointer}"));
+        assert_eq!(
+            response["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/Error"
+        );
+        assert!(
+            response["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("plugin-composition"))
+        );
+    }
+
+    let api_spec_response = spec
+        .pointer("/paths/~1api-specs~1{id}/delete/responses/422")
+        .expect("API-spec DELETE is missing 422 response");
+    assert_eq!(
+        api_spec_response["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ApiSpecValidationError"
+    );
+    assert!(
+        api_spec_response["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("plugin-composition"))
+    );
+
+    let resource_types = spec
+        .pointer(
+            "/components/schemas/ApiSpecValidationError/properties/failures/items/properties/resource_type/enum",
+        )
+        .and_then(serde_json::Value::as_array)
+        .expect("API-spec validation resource types");
+    assert!(resource_types.contains(&json!("plugin_composition")));
+}
+
+#[test]
 fn namespace_admission_contention_is_documented_as_retryable() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

@@ -1,9 +1,15 @@
 use ferrum_edge::config::types::{BackendScheme, Consumer};
-use ferrum_edge::plugins::tcp_connection_throttle::TcpConnectionThrottle;
-use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, StreamConnectionContext};
-use serde_json::json;
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, create_plugin,
+};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+fn make_plugin(config: &Value) -> Result<Arc<dyn Plugin>, String> {
+    create_plugin("tcp_connection_throttle", config)?
+        .ok_or_else(|| "tcp_connection_throttle is not registered".to_string())
+}
 
 fn make_consumer(username: &str) -> Consumer {
     Consumer {
@@ -45,34 +51,34 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
 
 #[test]
 fn test_tcp_connection_throttle_requires_positive_limit() {
-    assert!(TcpConnectionThrottle::new(&json!(null)).is_err());
-    assert!(TcpConnectionThrottle::new(&json!([])).is_err());
-    assert!(TcpConnectionThrottle::new(&json!({})).is_err());
-    assert!(TcpConnectionThrottle::new(&json!({"max_connections_per_key": "1"})).is_err());
-    assert!(TcpConnectionThrottle::new(&json!({"max_connections_per_key": 0})).is_err());
+    assert!(make_plugin(&json!(null)).is_err());
+    assert!(make_plugin(&json!([])).is_err());
+    assert!(make_plugin(&json!({})).is_err());
+    assert!(make_plugin(&json!({"max_connections_per_key": "1"})).is_err());
+    assert!(make_plugin(&json!({"max_connections_per_key": 0})).is_err());
     assert!(
-        TcpConnectionThrottle::new(&json!({
+        make_plugin(&json!({
             "max_connections_per_key": 1,
             "cleanup_interval_seconds": "60"
         }))
         .is_err()
     );
     assert!(
-        TcpConnectionThrottle::new(&json!({
+        make_plugin(&json!({
             "max_connections_per_key": 1,
             "cleanup_interval_seconds": 0
         }))
         .is_ok()
     );
     assert!(
-        TcpConnectionThrottle::new(&json!({
+        make_plugin(&json!({
             "max_connections_per_key": 1,
             "cleanup_intervl_seconds": 60
         }))
         .is_err()
     );
     assert!(
-        TcpConnectionThrottle::new(&json!({
+        make_plugin(&json!({
             "max_connections_per_key": 1,
             "cleanup_interval_seconds": 86401
         }))
@@ -82,7 +88,7 @@ fn test_tcp_connection_throttle_requires_positive_limit() {
 
 #[test]
 fn test_tcp_connection_throttle_protocol_and_priority() {
-    let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 2})).unwrap();
+    let plugin = make_plugin(&json!({"max_connections_per_key": 2})).unwrap();
     assert_eq!(plugin.name(), "tcp_connection_throttle");
     assert_eq!(
         plugin.priority(),
@@ -104,7 +110,7 @@ fn test_tcp_connection_throttle_protocol_and_priority() {
 
 #[tokio::test]
 async fn test_tcp_connection_throttle_rejects_second_connection_for_same_ip() {
-    let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
 
     let mut ctx1 = make_ctx("tcp-proxy", "10.0.0.1", None);
     assert!(matches!(
@@ -126,7 +132,7 @@ async fn test_tcp_connection_throttle_rejects_second_connection_for_same_ip() {
 
 #[tokio::test]
 async fn test_tcp_connection_throttle_releases_slot_on_disconnect() {
-    let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
 
     let mut ctx1 = make_ctx("tcp-proxy", "10.0.0.1", None);
     assert!(matches!(
@@ -145,38 +151,9 @@ async fn test_tcp_connection_throttle_releases_slot_on_disconnect() {
     ));
 }
 
-#[test]
-fn test_tcp_connection_throttle_normalizes_pool_shard_amount() {
-    let automatic = TcpConnectionThrottle::new_with_pool_shard_amount(
-        &json!({"max_connections_per_key": 1}),
-        0,
-    )
-    .unwrap();
-    let non_power_of_two = TcpConnectionThrottle::new_with_pool_shard_amount(
-        &json!({"max_connections_per_key": 1}),
-        3,
-    )
-    .unwrap();
-    let dashmap_minimum = TcpConnectionThrottle::new_with_pool_shard_amount(
-        &json!({"max_connections_per_key": 1}),
-        1,
-    )
-    .unwrap();
-
-    assert_eq!(
-        automatic.shard_amount(),
-        ferrum_edge::util::sharding::pool_shard_amount(0)
-    );
-    assert_eq!(
-        non_power_of_two.shard_amount(),
-        ferrum_edge::util::sharding::pool_shard_amount(3)
-    );
-    assert_eq!(dashmap_minimum.shard_amount(), 2);
-}
-
 #[tokio::test]
 async fn test_tcp_connection_throttle_canonicalizes_ipv4_mapped_identity() {
-    let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
     let mut ipv4 = make_ctx("tcp-proxy", "192.0.2.10", None);
     let mut mapped = make_ctx("tcp-proxy", "::ffff:192.0.2.10", None);
 
@@ -192,8 +169,8 @@ async fn test_tcp_connection_throttle_canonicalizes_ipv4_mapped_identity() {
 
 #[tokio::test]
 async fn test_tcp_connection_throttle_multiple_instances_use_independent_permits() {
-    let first = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
-    let second = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let first = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+    let second = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
     let mut connection = make_ctx("tcp-proxy", "10.0.0.1", None);
 
     assert!(matches!(
@@ -215,8 +192,8 @@ async fn test_tcp_connection_throttle_multiple_instances_use_independent_permits
 
 #[tokio::test]
 async fn test_tcp_connection_throttle_auth_boundary_permits_do_not_overwrite() {
-    let before_auth = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
-    let after_auth = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let before_auth = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+    let after_auth = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
     let mut connection = make_ctx("tcp-proxy", "10.0.0.1", None);
 
     assert!(matches!(
@@ -247,13 +224,11 @@ async fn test_tcp_connection_throttle_auth_boundary_permits_do_not_overwrite() {
 
 #[tokio::test]
 async fn test_tcp_connection_throttle_release_admission_race_never_detaches_increment() {
-    let plugin = Arc::new(
-        TcpConnectionThrottle::new(&json!({
-            "max_connections_per_key": 1,
-            "cleanup_interval_seconds": 0
-        }))
-        .unwrap(),
-    );
+    let plugin = make_plugin(&json!({
+        "max_connections_per_key": 1,
+        "cleanup_interval_seconds": 0
+    }))
+    .unwrap();
 
     for _ in 0..256 {
         let mut current = make_ctx("tcp-proxy", "10.0.0.9", None);
@@ -303,8 +278,7 @@ async fn test_tcp_connection_throttle_release_admission_race_never_detaches_incr
 async fn test_tcp_connection_throttle_concurrent_exact_limit() {
     const LIMIT: usize = 8;
     const ATTEMPTS: usize = 32;
-    let plugin =
-        Arc::new(TcpConnectionThrottle::new(&json!({"max_connections_per_key": LIMIT})).unwrap());
+    let plugin = make_plugin(&json!({"max_connections_per_key": LIMIT})).unwrap();
     let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS + 1));
     let mut tasks = Vec::new();
     for _ in 0..ATTEMPTS {
@@ -339,7 +313,7 @@ async fn test_tcp_connection_throttle_concurrent_exact_limit() {
 
 #[tokio::test]
 async fn test_tcp_connection_throttle_uses_consumer_identity_when_present() {
-    let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
 
     let mut ctx1 = make_ctx("tcp-proxy", "10.0.0.1", Some("alice"));
     assert!(matches!(
@@ -365,7 +339,7 @@ async fn test_tcp_connection_throttle_uses_consumer_identity_when_present() {
 
 #[tokio::test]
 async fn test_tcp_connection_throttle_allows_same_identity_on_different_proxies() {
-    let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
 
     let mut ctx1 = make_ctx("tcp-proxy-a", "10.0.0.1", Some("alice"));
     assert!(matches!(

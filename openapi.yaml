@@ -3530,6 +3530,12 @@ paths:
       responses:
         "204":
           description: Proxy deleted
+        "400":
+          description: Deletion would leave an invalid plugin-composition graph, such as a global TCP connection throttle with no supported TCP/TCP+TLS target
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -4107,6 +4113,12 @@ paths:
       responses:
         "204":
           description: Plugin configuration deleted
+        "400":
+          description: Deletion would expose an invalid plugin-composition graph, including unsupported TCP connection-throttle attachments
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -4823,7 +4835,8 @@ paths:
         the database `ON DELETE CASCADE` constraint removes the spec row in that
         case too.
 
-        Returns 204 on success, 404 if the spec does not exist.
+        Returns 204 on success, 404 if the spec does not exist, or 422 when
+        the cascade would leave an invalid plugin-composition graph.
 
         This mutation requires the `admin` role.
       tags: [API Specs]
@@ -4845,6 +4858,12 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "422":
+          description: The spec cascade would leave an invalid plugin-composition graph, such as a global TCP connection throttle with no supported TCP/TCP+TLS target
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiSpecValidationError"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -18851,11 +18870,14 @@ components:
     ApiSpecValidationError:
       type: object
       description: |
-        Response body for 422 Unprocessable Entity from `POST /api-specs` or
-        `PUT /api-specs/{id}`. The spec document was parsed successfully and the
-        Ferrum extensions were found, but one or more extracted resources failed
-        structural validation or database cross-checks (e.g., duplicate
-        `listen_path`, invalid plugin config).
+        Response body for 422 Unprocessable Entity from `POST /api-specs`,
+        `PUT /api-specs/{id}`, or `DELETE /api-specs/{id}`. For POST/PUT, the
+        spec document was parsed successfully and the Ferrum extensions were
+        found, but one or more extracted resources failed structural validation
+        or database cross-checks (e.g., duplicate `listen_path`, invalid plugin
+        config). For DELETE, the cascade would leave an invalid
+        `plugin_composition`; an authoritative in-transaction rejection may omit
+        `spec_version` and the failure `id`.
       properties:
         error:
           type: string
@@ -18871,8 +18893,8 @@ components:
             properties:
               resource_type:
                 type: string
-                enum: [proxy, upstream, plugin]
-                description: Kind of resource that failed
+                enum: [proxy, upstream, plugin, plugin_composition]
+                description: Kind of resource or aggregate plugin composition that failed
               id:
                 type: string
                 description: ID of the resource (from the extension object)
