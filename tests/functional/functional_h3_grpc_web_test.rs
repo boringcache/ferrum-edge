@@ -147,7 +147,9 @@ async fn spawn_h3_gateway(config: Value) -> (GatewayHarness, u16, tempfile::Temp
 }
 
 async fn request_with_retry(client: &Http3Client, url: &str, options: GetOptions) -> Http3Response {
-    request_with_retry_and_attempts(client, url, options).await.0
+    request_with_retry_and_attempts(client, url, options)
+        .await
+        .0
 }
 
 async fn request_with_retry_and_attempts(
