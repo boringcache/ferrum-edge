@@ -4415,12 +4415,12 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
                 Some("p1"),
                 true,
             ),
-            make_plugin_config(
+            make_plugin_config_with_json(
                 "deadline",
                 "grpc_deadline",
+                json!({"default_deadline_ms": 1000}),
                 PluginScope::Proxy,
                 Some("p1"),
-                true,
             ),
         ],
     );
@@ -4489,12 +4489,12 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
                 Some("p1"),
                 true,
             ),
-            make_plugin_config(
+            make_plugin_config_with_json(
                 "deadline",
                 "grpc_deadline",
+                json!({"default_deadline_ms": 1000}),
                 PluginScope::Proxy,
                 Some("p1"),
-                true,
             ),
         ],
     );

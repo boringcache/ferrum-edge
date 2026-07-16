@@ -716,6 +716,10 @@ pub struct RequestContext {
     /// inbound `grpc-timeout` value. Initialization happens once, immediately
     /// after routing and before any request-plugin or body-buffering await.
     pub(crate) grpc_deadline_initialized: bool,
+    /// Whether the inbound request supplied a valid positive `grpc-timeout`.
+    /// Keep this source fact separate from the effective budget so an earlier
+    /// default policy cannot satisfy a later `reject_no_deadline` policy.
+    pub(crate) grpc_deadline_had_valid_client_timeout: bool,
     /// Monotonic receipt instant captured with the request context. Effective
     /// budgets are added to this exact anchor, independent of wall-clock jumps.
     pub(crate) grpc_deadline_received_at: tokio::time::Instant,
@@ -1118,6 +1122,7 @@ impl RequestContext {
             auth_method: None,
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
+            grpc_deadline_had_valid_client_timeout: false,
             grpc_deadline_received_at: tokio::time::Instant::now(),
             grpc_deadline_preflight_complete: false,
             grpc_deadline_budget_ms: None,
@@ -1221,6 +1226,7 @@ impl RequestContext {
             return;
         }
         self.grpc_deadline_initialized = true;
+        self.grpc_deadline_had_valid_client_timeout = budget_ms.is_some();
         self.set_grpc_deadline_budget(budget_ms);
     }
 
@@ -1316,6 +1322,8 @@ impl RequestContext {
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
+            grpc_deadline_had_valid_client_timeout: self
+                .grpc_deadline_had_valid_client_timeout,
             grpc_deadline_received_at: self.grpc_deadline_received_at,
             grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,

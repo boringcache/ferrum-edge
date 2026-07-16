@@ -3397,7 +3397,7 @@ pub(crate) async fn run_final_request_body_hooks(
     {
         crate::plugins::RequestPluginDeadlineResult::Completed(result) => result,
         crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded => {
-            if let Some(ctx) = ctx.as_deref_mut() {
+            if let Some(ctx) = ctx {
                 ctx.mark_gateway_deadline_response_selected();
             }
             crate::plugins::grpc_deadline_exceeded_plugin_result()
@@ -13586,7 +13586,7 @@ async fn run_after_proxy_hooks_on_rejection(
     if terminal_gateway_deadline {
         replace_rejection_with_gateway_deadline(
             status_code,
-            response_body.as_deref_mut(),
+            response_body,
             response_headers,
         );
     }

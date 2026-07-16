@@ -299,7 +299,7 @@ impl Plugin for GrpcDeadline {
 
     fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
         let mut deadline_ms = ctx.grpc_deadline_budget_ms;
-        if deadline_ms.is_none() && self.reject_no_deadline {
+        if !ctx.grpc_deadline_had_valid_client_timeout && self.reject_no_deadline {
             debug!(
                 plugin = "grpc_deadline",
                 "Request missing valid grpc-timeout"

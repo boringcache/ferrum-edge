@@ -1197,6 +1197,33 @@ async fn test_multiple_instances_share_one_absolute_deadline() {
     );
 }
 
+#[test]
+fn test_composed_reject_no_deadline_checks_original_header_before_default() {
+    let default = create_plugin(
+        "grpc_deadline",
+        &json!({"default_deadline_ms": 5000}),
+    )
+    .unwrap()
+    .unwrap();
+    let required = create_plugin("grpc_deadline", &json!({"reject_no_deadline": true}))
+        .unwrap()
+        .unwrap();
+    let plugins = vec![default, required];
+
+    for timeout in [None, Some("0m"), Some("invalid")] {
+        let mut ctx = create_grpc_context_with_timeout(timeout);
+        assert_reject(
+            ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
+            Some(400),
+        );
+    }
+
+    let mut ctx = create_grpc_context_with_timeout(Some("2S"));
+    assert_continue(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
+    );
+}
+
 #[tokio::test]
 async fn test_preflight_deadline_cancels_request_plugin_work_with_status_four() {
     let plugin = create_plugin("grpc_deadline", &json!({"default_deadline_ms": 1}))
