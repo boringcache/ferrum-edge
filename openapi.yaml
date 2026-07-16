@@ -10593,16 +10593,13 @@ components:
 
     TransactionDebuggerConfig:
       type: object
-      description: "Plugin: transaction_debugger — Emits verbose request/response diagnostics via tracing::debug on the transaction_debug target. Requires FERRUM_LOG_LEVEL=debug to see output."
+      additionalProperties: false
+      description: >-
+        Plugin: transaction_debugger — Emits verbose request/response and
+        terminal diagnostics via tracing::debug on the transaction_debug
+        target. Request and response payloads are never captured. Requires
+        FERRUM_LOG_LEVEL=debug to see output. Unsupported keys are rejected.
       properties:
-        log_request_body:
-          type: boolean
-          default: false
-          description: Log incoming request body
-        log_response_body:
-          type: boolean
-          default: false
-          description: Log backend response body
         redacted_headers:
           type: array
           items:
