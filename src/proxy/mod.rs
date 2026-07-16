@@ -14717,8 +14717,7 @@ fn set_cookie_same_storage_key(
     default_domain: Option<SetCookieDomain<'_>>,
     default_path: &str,
 ) -> bool {
-    let Some(existing_key) = set_cookie_storage_key(existing, default_domain, default_path)
-    else {
+    let Some(existing_key) = set_cookie_storage_key(existing, default_domain, default_path) else {
         return false;
     };
     let Some(candidate_key) = set_cookie_storage_key(candidate, default_domain, default_path)
