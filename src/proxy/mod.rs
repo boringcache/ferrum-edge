@@ -14600,11 +14600,24 @@ fn valid_set_cookie_path(path: &str) -> bool {
     path.starts_with('/') && !path.bytes().any(|byte| byte <= 0x1f || byte == 0x7f)
 }
 
-/// Return the RFC 6265 cookie storage key components that are explicit in a
-/// `Set-Cookie` line. The request host and default-path are unavailable during
-/// auth rejection merging, so omitted Domain/Path attributes are kept distinct
-/// from explicit attributes instead of being collapsed by name alone.
-fn set_cookie_storage_key(set_cookie: &str) -> Option<(&str, Option<&str>, Option<&str>)> {
+fn default_set_cookie_path(request_path: &str) -> &str {
+    if !request_path.starts_with('/') {
+        return "/";
+    }
+    match request_path.rfind('/') {
+        Some(0) | None => "/",
+        Some(last_slash) => &request_path[..last_slash],
+    }
+}
+
+/// Return the effective RFC 6265 cookie storage key. Omitted Domain attributes
+/// use the request host, while omitted, empty, or non-absolute Path attributes
+/// use the request path's default directory.
+fn set_cookie_storage_key<'a>(
+    set_cookie: &'a str,
+    default_domain: Option<&'a str>,
+    default_path: &'a str,
+) -> Option<(&'a str, Option<&'a str>, &'a str)> {
     let name = set_cookie_name(set_cookie)?;
     let mut domain_attribute = None;
     let mut path_attribute = None;
@@ -14617,35 +14630,42 @@ fn set_cookie_storage_key(set_cookie: &str) -> Option<(&str, Option<&str>, Optio
         let attribute_name = attribute_name.trim();
         let attribute_value = attribute_value.trim();
         if attribute_name.eq_ignore_ascii_case("domain") {
-            domain_attribute = Some(attribute_value);
+            if !attribute_value.is_empty() {
+                domain_attribute = Some(attribute_value);
+            }
         } else if attribute_name.eq_ignore_ascii_case("path") {
             path_attribute = Some(attribute_value);
         }
     }
 
-    // RFC 6265 uses the last Domain/Path attribute. Invalid or quoted scope
-    // values remain non-comparable so only byte-identical malformed lines can
-    // replace one another.
+    // RFC 6265 uses the last Domain/Path attribute. An empty Domain attribute
+    // is ignored, and an invalid Path attribute falls back to the request's
+    // default path. Other malformed domain forms remain non-comparable.
     let domain = match domain_attribute {
         Some(domain) => Some(canonical_set_cookie_domain(domain)?),
-        None => None,
+        None => default_domain,
     };
     let path = match path_attribute {
-        Some(path) if valid_set_cookie_path(path) => Some(path),
-        Some(_) => return None,
-        None => None,
+        Some(path) if valid_set_cookie_path(path) => path,
+        Some(_) | None => default_path,
     };
 
     Some((name, domain, path))
 }
 
-fn set_cookie_same_storage_key(existing: &str, candidate: &str) -> bool {
-    let Some((existing_name, existing_domain, existing_path)) = set_cookie_storage_key(existing)
+fn set_cookie_same_storage_key(
+    existing: &str,
+    candidate: &str,
+    default_domain: Option<&str>,
+    default_path: &str,
+) -> bool {
+    let Some((existing_name, existing_domain, existing_path)) =
+        set_cookie_storage_key(existing, default_domain, default_path)
     else {
         return false;
     };
     let Some((candidate_name, candidate_domain, candidate_path)) =
-        set_cookie_storage_key(candidate)
+        set_cookie_storage_key(candidate, default_domain, default_path)
     else {
         return false;
     };
@@ -14664,10 +14684,21 @@ fn set_cookie_same_storage_key(existing: &str, candidate: &str) -> bool {
 /// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
 /// earlier line only when a later line owns the same RFC 6265 storage key.
 /// Invalid cookie-pairs can only replace byte-identical lines.
-fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
+fn collect_later_set_cookies(
+    cookies: &mut Vec<String>,
+    joined: &str,
+    default_domain: Option<&str>,
+    default_path: &str,
+) {
     for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
         if let Some(index) = cookies.iter().position(|existing| {
-            existing == candidate || set_cookie_same_storage_key(existing, candidate)
+            existing == candidate
+                || set_cookie_same_storage_key(
+                    existing,
+                    candidate,
+                    default_domain,
+                    default_path,
+                )
         }) {
             cookies.remove(index);
         }
@@ -14675,20 +14706,32 @@ fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
     }
 }
 
-fn set_cookie_conflicts(cookies: &[String], candidate: &str) -> bool {
-    cookies
-        .iter()
-        .any(|existing| existing == candidate || set_cookie_same_storage_key(existing, candidate))
+fn set_cookie_conflicts(
+    cookies: &[String],
+    candidate: &str,
+    default_domain: Option<&str>,
+    default_path: &str,
+) -> bool {
+    cookies.iter().any(|existing| {
+        existing == candidate
+            || set_cookie_same_storage_key(existing, candidate, default_domain, default_path)
+    })
 }
 
 /// Stage requester-owned cookies from rejecting auth attempts. This remains on
 /// the rejection path: successful authentication only removes the metadata.
 pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
+    let default_domain = ctx
+        .request_authority
+        .as_deref()
+        .and_then(split_request_authority)
+        .map(|(host, _)| host);
+    let default_path = default_set_cookie_path(&ctx.path);
     let mut staged = Vec::new();
     if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
-        collect_later_set_cookies(&mut staged, existing);
+        collect_later_set_cookies(&mut staged, existing, default_domain, default_path);
     }
-    collect_later_set_cookies(&mut staged, &cookie);
+    collect_later_set_cookies(&mut staged, &cookie, default_domain, default_path);
 
     if staged.is_empty() {
         ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
@@ -14707,6 +14750,12 @@ fn attach_auth_rejection_set_cookie(
     let Some(staged) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
         return;
     };
+    let default_domain = ctx
+        .request_authority
+        .as_deref()
+        .and_then(split_request_authority)
+        .map(|(host, _)| host);
+    let default_path = default_set_cookie_path(&ctx.path);
 
     // A custom plugin can return multiple case variants because rejection
     // headers use a String-keyed HashMap. Sort the variants by their exact key
@@ -14723,16 +14772,21 @@ fn attach_auth_rejection_set_cookie(
 
     let mut merged = Vec::new();
     for (_, value) in selected_variants {
-        collect_later_set_cookies(&mut merged, &value);
+        collect_later_set_cookies(&mut merged, &value, default_domain, default_path);
     }
 
     let mut staged_cookies = Vec::new();
-    collect_later_set_cookies(&mut staged_cookies, &staged);
+    collect_later_set_cookies(
+        &mut staged_cookies,
+        &staged,
+        default_domain,
+        default_path,
+    );
     for candidate in staged_cookies {
         // The selected final rejection owns conflicts. Preserve each selected
         // line's full attributes and deterministic order, appending only
         // independently scoped requester-owned cookies from earlier rejects.
-        if !set_cookie_conflicts(&merged, &candidate) {
+        if !set_cookie_conflicts(&merged, &candidate, default_domain, default_path) {
             merged.push(candidate);
         }
     }
