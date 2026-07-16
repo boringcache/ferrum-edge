@@ -79,8 +79,8 @@ workflow runs it right after the fixture). No contract row remains
 with issue #2002 (the in-fixture Ferrum CP above).
 
 This contract is **PR- and release-blocking**: the dedicated workflow's
-result is mirrored into the required CI aggregate by the
-`Mesh E2E Sidecar Live (CI mirror)` job in `ci.yml`, the suite force-runs on
+`Mesh E2E Sidecar Live` gate job is a branch-protection required check
+directly (there is no mirror job in `ci.yml`), the suite force-runs on
 every main push, and `release.yml`'s `validate-release-sha` requires a green
 push run for the tag target before anything ships.
 
