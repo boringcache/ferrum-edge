@@ -3386,8 +3386,8 @@ pub(crate) async fn run_final_request_body_hooks(
     headers: &HashMap<String, String>,
     body: &[u8],
 ) -> PluginResult {
-    let deadline_expired =
-        grpc_deadline_at.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    let deadline_expired = grpc_deadline_at
+        .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
         || ctx.as_deref().is_some_and(|ctx| {
             ctx.metadata
                 .get("grpc_deadline.request_body_transform_timed_out")

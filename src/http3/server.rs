@@ -6145,7 +6145,9 @@ async fn handle_h3_request(
                                     "H3 send_trailers failed on buffered response; dropping trailers and finishing cleanly"
                                 );
                             }
-                            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                            Err(
+                                crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded,
+                            ) => {
                                 crate::proxy::insert_grpc_error_metadata(
                                     &mut ctx.metadata,
                                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -8390,9 +8392,7 @@ async fn dispatch_grpc_native_h3(
     if let Err(write_error) = response_header_write {
         let (response_header_deadline_expired, response_header_client_disconnected) =
             match write_error {
-                crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded => {
-                    (true, false)
-                }
+                crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded => (true, false),
                 crate::http3::stream_util::H3ResponseWriteError::Write(_) => (false, true),
             };
         if response_header_deadline_expired {
