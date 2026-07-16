@@ -601,6 +601,12 @@ impl Plugin for CorsPlugin {
         super::priority::CORS
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        // gRPC-Web is selected through the gRPC request-policy chain even
+        // though browsers still require ordinary Origin/ACAO enforcement.
+        super::HTTP_GRPC_PROTOCOLS
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         if self.unmatched_preflights == UnmatchedPreflights::Reject {
             ctx.cors_state.native_policy_seen = true;

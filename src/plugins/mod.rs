@@ -2,9 +2,12 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → `transform_request_body` → `on_final_request_body` →
-//! `backend_admission` → `after_proxy` → `normalize_response_body` →
-//! `on_response_body` → `transform_response_body` → `on_final_response_body` →
+//! `before_proxy` → backend-path policy preview → deferred routing-header hooks →
+//! final backend-path enforcement → remaining deferred `before_proxy` hooks →
+//! `transform_request_body` →
+//! `on_final_request_body` → `backend_admission` → `after_proxy` →
+//! `normalize_response_body` → `on_response_body` →
+//! `transform_response_body` → `on_final_response_body` →
 //! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
@@ -143,6 +146,19 @@ pub enum ProxyProtocol {
     Tcp,
     /// Raw UDP datagram proxy (includes DTLS termination/origination)
     Udp,
+}
+
+/// Whether a backend-effective path policy hook is validating a provisional
+/// selection or enforcing the final selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendPathPolicyPhase {
+    /// Validate access rules before a deferred routing hook performs external
+    /// work. Stateful policy such as rate limiting must not be charged here.
+    Preview,
+    /// Enforce the settled backend-effective path immediately before the
+    /// remaining deferred hooks, a deferred-hook rejection, or backend
+    /// dispatch. Stateful policy is committed exactly once in this phase.
+    Enforce,
 }
 
 /// All protocol variants, for plugins that support every protocol.
@@ -959,6 +975,11 @@ pub struct RequestContext {
     /// path; VS-derived proxies never set `strip_listen_path`, so the override
     /// is the literal forwarded path.
     pub route_override_path: Option<String>,
+    /// Backend-effective path that successfully passed the final route policy
+    /// boundary. Not exposed through the public plugin API, so custom plugins
+    /// cannot forge the path consumed by security-sensitive deferred work such
+    /// as request mirroring.
+    authorized_backend_path: Option<String>,
     /// Treat `route_override_path` as an absolute backend path by disabling
     /// `strip_listen_path` on the effective proxy. Used by direct upstream
     /// routers when the override is already the final upstream URL path rather
@@ -1119,6 +1140,7 @@ impl RequestContext {
             route_override_request_transform: None,
             route_override_response_transform: None,
             route_override_path: None,
+            authorized_backend_path: None,
             route_override_path_is_absolute: false,
             route_override_authority: None,
             node_waypoint_pod_uid: None,
@@ -1144,6 +1166,14 @@ impl RequestContext {
 
     pub(crate) fn gateway_response_compression_algorithm(&self) -> Option<&'static str> {
         self.gateway_response_compression_algorithm
+    }
+
+    pub(crate) fn bind_authorized_backend_path(&mut self, path: String) {
+        self.authorized_backend_path = Some(path);
+    }
+
+    pub(crate) fn authorized_backend_path(&self) -> Option<&str> {
+        self.authorized_backend_path.as_deref()
     }
 
     /// Begin tracking initial-response policy against genuine initial headers
@@ -1271,6 +1301,7 @@ impl RequestContext {
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
             route_override_path: self.route_override_path.clone(),
+            authorized_backend_path: self.authorized_backend_path.clone(),
             route_override_path_is_absolute: self.route_override_path_is_absolute,
             route_override_authority: self.route_override_authority.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
@@ -3275,6 +3306,51 @@ pub trait Plugin: Send + Sync {
         &self,
         _ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when `before_proxy` can dispatch external work or
+    /// synthesize a terminal response and therefore must wait until an active
+    /// backend-path policy has authorized the resolved route and target path.
+    ///
+    /// The ordinary plugin pipeline is unchanged when no backend-path plugin
+    /// is active. Opt-in hooks retain their relative order in a deferred pass.
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when a deferred `before_proxy` hook can mutate headers
+    /// that normally participate in upstream target selection. The gateway
+    /// runs these hooks in a separate deferred subphase after an access preview
+    /// and pins that previewed target across the external call; the returned
+    /// headers cannot steer this request onto an unpreviewed path.
+    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin must inspect the backend-effective path
+    /// after route overrides and load balancing have selected the first target.
+    ///
+    /// The plugin cache precomputes this opt-in list, so requests without a
+    /// participating plugin do not scan the full chain at this boundary.
+    fn requires_backend_path_resolution(&self) -> bool {
+        false
+    }
+
+    /// Called after the backend-effective path has been assembled from the
+    /// route override, listen-path stripping, proxy/backend path, and selected
+    /// upstream target path, but before any backend is dialed.
+    ///
+    /// When a deferred hook can mutate routing headers, `Preview` runs before
+    /// that hook and `Enforce` runs afterward against the same pinned target.
+    /// Otherwise only `Enforce` runs. Implementations must keep `Preview` free
+    /// of state-consuming effects such as rate-limit charges.
+    async fn on_backend_path_resolved(
+        &self,
+        _ctx: &mut RequestContext,
+        _backend_path: &str,
+        _phase: BackendPathPolicyPhase,
     ) -> PluginResult {
         PluginResult::Continue
     }
