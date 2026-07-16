@@ -53,7 +53,7 @@ pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, IncrementalResult,
     MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceResourceCounts,
     NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
-    SortOrder, extract_db_hostname, redact_url,
+    SortOrder, TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
 };
 
 pub(crate) const MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL: &str = "INSERT INTO mtls_dns_admission_locks \
@@ -1042,6 +1042,34 @@ impl DatabaseStore {
         candidate
             .validate_unique_mtls_dns_identities()
             .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
+    }
+
+    /// Re-read and validate the effective TCP-throttle attachment graph while
+    /// the caller holds the namespace admission row through commit. This is
+    /// the authoritative cross-process check; admin-layer candidate validation
+    /// remains an early, friendlier rejection only.
+    async fn validate_tcp_connection_throttle_admission_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<(), anyhow::Error> {
+        let proxies = self
+            .load_proxies_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .await?;
+        let plugin_configs = self
+            .load_plugin_configs_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .await?;
+        let mut candidate = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            plugin_configs,
+            loaded_at: Utc::now(),
+            ..Default::default()
+        };
+        candidate.normalize_fields();
+        crate::plugin_cache::validate_tcp_connection_throttle_attachments(&candidate).map_err(
+            |errors| anyhow::Error::new(TcpConnectionThrottleAttachmentConflict::new(errors)),
+        )
     }
 
     async fn mtls_dns_identity_conflicts_tx(
@@ -2439,6 +2467,8 @@ impl DatabaseStore {
             .await?;
         }
 
+        self.validate_tcp_connection_throttle_admission_tx(&mut tx, &proxy.namespace)
+            .await?;
         self.validate_mtls_dns_admission_tx(&mut tx, &proxy.namespace)
             .await?;
         self.record_config_change_tx(&mut tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
@@ -2580,6 +2610,8 @@ impl DatabaseStore {
                 .await?;
         }
 
+        self.validate_tcp_connection_throttle_admission_tx(&mut tx, &proxy.namespace)
+            .await?;
         self.validate_mtls_dns_admission_tx(&mut tx, &proxy.namespace)
             .await?;
         self.record_config_change_tx(&mut tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
@@ -2705,6 +2737,8 @@ impl DatabaseStore {
                 .await?;
         }
 
+        self.validate_tcp_connection_throttle_admission_tx(&mut tx, namespace)
+            .await?;
         self.validate_mtls_dns_repair_delete_tx(&mut tx, namespace, &prior_mtls_dns_conflicts)
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "proxy", id, "delete")
@@ -3120,6 +3154,8 @@ impl DatabaseStore {
             self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
                 .await?;
         }
+        self.validate_tcp_connection_throttle_admission_tx(&mut tx, &pc.namespace)
+            .await?;
         self.validate_mtls_dns_admission_tx(&mut tx, &pc.namespace)
             .await?;
         self.compact_config_changes_tx(&mut tx, &pc.namespace)
@@ -3183,6 +3219,8 @@ impl DatabaseStore {
             self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
                 .await?;
         }
+        self.validate_tcp_connection_throttle_admission_tx(&mut tx, &pc.namespace)
+            .await?;
         self.validate_mtls_dns_admission_tx(&mut tx, &pc.namespace)
             .await?;
         self.compact_config_changes_tx(&mut tx, &pc.namespace)
@@ -3253,6 +3291,8 @@ impl DatabaseStore {
                 .bind(namespace)
                 .execute(&mut *tx)
                 .await?;
+        self.validate_tcp_connection_throttle_admission_tx(&mut tx, namespace)
+            .await?;
         self.validate_mtls_dns_repair_delete_tx(&mut tx, namespace, &prior_mtls_dns_conflicts)
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "plugin_config", id, "delete")
@@ -5218,6 +5258,8 @@ impl DatabaseStore {
 
         if mode.validates_mtls_dns() {
             for namespace in &admission_namespaces {
+                self.validate_tcp_connection_throttle_admission_tx(&mut tx, namespace)
+                    .await?;
                 self.validate_mtls_dns_admission_tx(&mut tx, namespace)
                     .await?;
             }
@@ -5297,6 +5339,8 @@ impl DatabaseStore {
             }
             if mode.validates_mtls_dns() {
                 for namespace in &admission_namespaces {
+                    self.validate_tcp_connection_throttle_admission_tx(&mut tx, namespace)
+                        .await?;
                     self.validate_mtls_dns_admission_tx(&mut tx, namespace)
                         .await?;
                 }
@@ -5473,6 +5517,8 @@ impl DatabaseStore {
 
         if mode.validates_mtls_dns() {
             for namespace in &admission_namespaces {
+                self.validate_tcp_connection_throttle_admission_tx(&mut tx, namespace)
+                    .await?;
                 self.validate_mtls_dns_admission_tx(&mut tx, namespace)
                     .await?;
             }
@@ -6460,6 +6506,8 @@ impl DatabaseStore {
 
         // 4. INSERT api_specs row.
         self.insert_api_spec_tx(&mut tx, spec).await?;
+        self.validate_tcp_connection_throttle_admission_tx(&mut tx, &spec.namespace)
+            .await?;
         self.validate_mtls_dns_admission_tx(&mut tx, &spec.namespace)
             .await?;
         if let Some(u) = &bundle.upstream {
@@ -6932,6 +6980,8 @@ impl DatabaseStore {
         .bind(&spec.id)
         .execute(&mut *tx)
         .await?;
+        self.validate_tcp_connection_throttle_admission_tx(&mut tx, &spec.namespace)
+            .await?;
         self.validate_mtls_dns_admission_tx(&mut tx, &spec.namespace)
             .await?;
         self.record_config_change_tx(
@@ -7517,6 +7567,8 @@ impl DatabaseStore {
             .bind(id)
             .bind(namespace)
             .execute(&mut *tx)
+            .await?;
+        self.validate_tcp_connection_throttle_admission_tx(&mut tx, namespace)
             .await?;
         self.validate_mtls_dns_repair_delete_tx(&mut tx, namespace, &prior_mtls_dns_conflicts)
             .await?;

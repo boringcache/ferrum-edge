@@ -16,7 +16,7 @@ use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
     PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
-    is_mtls_dns_identity_conflict,
+    is_mtls_dns_identity_conflict, tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
@@ -229,6 +229,40 @@ pub(crate) async fn validate_plugin_graph_candidates(
             candidate.plugin_configs.push(plugin.clone());
         }
     }
+
+    let http_client = super::plugin_validation_http_client(state);
+    validate_candidate_plugin_graph(&candidate, &http_client)
+}
+
+/// Validate the exact graph produced by deleting a Proxy, including the
+/// proxy-scoped plugin FK cascade and orphaned proxy-group cleanup performed by
+/// both direct Proxy deletion and API-spec cascade deletion.
+pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(
+    db: &dyn DatabaseBackend,
+    state: &AdminState,
+    namespace: &str,
+    removed_proxy_id: &str,
+) -> Result<(), AfterValidateError> {
+    let mut candidate = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    candidate
+        .proxies
+        .retain(|proxy| proxy.id != removed_proxy_id);
+    candidate.plugin_configs.retain(|plugin| {
+        plugin.proxy_id.as_deref() != Some(removed_proxy_id)
+    });
+
+    let remaining_associations: HashSet<String> = candidate
+        .proxies
+        .iter()
+        .flat_map(|proxy| proxy.plugins.iter())
+        .map(|association| association.plugin_config_id.clone())
+        .collect();
+    candidate.plugin_configs.retain(|plugin| {
+        plugin.scope != PluginScope::ProxyGroup || remaining_associations.contains(&plugin.id)
+    });
 
     let http_client = super::plugin_validation_http_client(state);
     validate_candidate_plugin_graph(&candidate, &http_client)
@@ -479,6 +513,9 @@ pub(crate) trait AdminResource:
         if is_mtls_dns_admission_unavailable(error) {
             return super::mtls_dns_admission_unavailable_response();
         }
+        if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
+            return Self::map_after_validate_errors(conflict.errors());
+        }
         // Unique-constraint violations at persist time are conflicts, not
         // server faults: the admission prechecks are namespace-scoped and
         // raceable, so the DB constraint is the authoritative backstop (e.g.
@@ -500,6 +537,8 @@ pub(crate) trait AdminResource:
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
         if is_mtls_dns_admission_unavailable(error) {
             super::mtls_dns_admission_unavailable_response()
+        } else if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
+            Self::map_after_validate_errors(conflict.errors())
         } else if is_mtls_dns_identity_conflict(error) {
             super::json_response(StatusCode::CONFLICT, &json!({"error": error.to_string()}))
         } else {
@@ -2417,6 +2456,9 @@ impl AdminResource for Proxy {
         if is_mtls_dns_admission_unavailable(error) {
             return super::mtls_dns_admission_unavailable_response();
         }
+        if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
+            return Self::map_after_validate_errors(conflict.errors());
+        }
         let message = error.to_string();
         if message.contains(PROXY_ROUTE_CONFLICT_ERROR) {
             return super::json_response(
@@ -2621,6 +2663,16 @@ impl AdminResource for Proxy {
         }
 
         Ok(())
+    }
+
+    async fn before_delete(
+        db: &dyn DatabaseBackend,
+        state: &AdminState,
+        namespace: &str,
+        existing: &Self,
+        _ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        validate_plugin_graph_proxy_deletion_candidate(db, state, namespace, &existing.id).await
     }
 
     async fn after_write(

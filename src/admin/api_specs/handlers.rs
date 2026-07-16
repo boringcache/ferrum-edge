@@ -27,6 +27,7 @@ use crate::admin::{AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, SortOrder,
     is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
+    tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
 use crate::util::body_limit::is_length_limit_error;
@@ -62,6 +63,8 @@ enum ApiSpecError {
     MongoDocTooLarge,
     /// FK or business-logic violation (422)
     Unprocessable(String),
+    /// Authoritative plugin-composition validation failure (422)
+    PluginComposition(Vec<String>),
     /// No DB configured (503)
     NoDatabase,
     /// Namespace admission is currently fenced (503)
@@ -87,6 +90,9 @@ fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
     }
     if is_mtls_dns_identity_conflict(&e) {
         return ApiSpecError::Conflict(e.to_string());
+    }
+    if let Some(conflict) = tcp_connection_throttle_attachment_conflict(&e) {
+        return ApiSpecError::PluginComposition(conflict.errors().to_vec());
     }
     if e.chain().any(|cause| {
         cause
@@ -199,6 +205,16 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
                 }),
             )
         }
+        ApiSpecError::PluginComposition(errors) => json_resp(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &json!({
+                "error": "Spec validation failed",
+                "failures": [{
+                    "resource_type": "plugin_composition",
+                    "errors": errors,
+                }]
+            }),
+        ),
         ApiSpecError::NoDatabase => json_resp(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "No database configured"}),
@@ -2716,6 +2732,36 @@ pub async fn handle_delete_api_spec(
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
+
+    match crate::admin::crud::validate_plugin_graph_proxy_deletion_candidate(
+        db.as_ref(),
+        state,
+        namespace,
+        &existing.proxy_id,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crate::admin::crud::AfterValidateError::BadRequest(errors)) => {
+            return Ok(error_response(ApiSpecError::ValidationFailures {
+                spec_version: existing.spec_version.clone(),
+                failures: vec![ValidationFailure {
+                    resource_type: "plugin_composition",
+                    id: existing.proxy_id.clone(),
+                    errors,
+                }],
+            }));
+        }
+        Err(crate::admin::crud::AfterValidateError::Conflict(errors)) => {
+            return Ok(error_response(ApiSpecError::Conflict(errors.join("; "))));
+        }
+        Err(crate::admin::crud::AfterValidateError::Db(error)) => {
+            return Ok(error_response(classify_db_error(error)));
+        }
+        Err(crate::admin::crud::AfterValidateError::Response(response)) => {
+            return Ok(*response);
+        }
+    }
 
     match db.delete_api_spec(namespace, id).await {
         Ok(true) => {

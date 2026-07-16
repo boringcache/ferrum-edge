@@ -37,6 +37,38 @@ fn test_proxy_and_plugin_writes_run_plugin_graph_candidate_validation() {
 }
 
 #[test]
+fn proxy_and_api_spec_deletes_validate_the_post_cascade_plugin_graph() {
+    let crud = include_str!("../../../src/admin/crud.rs");
+    assert!(
+        crud.contains("validate_plugin_graph_proxy_deletion_candidate("),
+        "direct Proxy deletion must build the post-cascade graph"
+    );
+    assert!(
+        crud.contains(
+            "validate_plugin_graph_proxy_deletion_candidate(db, state, namespace, &existing.id)"
+        ),
+        "Proxy::before_delete must reject the candidate before persistence"
+    );
+    assert!(
+        crud.contains("plugin.proxy_id.as_deref() != Some(removed_proxy_id)"),
+        "the candidate must mirror proxy-scoped plugin cascade deletion"
+    );
+    assert!(
+        crud.contains("plugin.scope != PluginScope::ProxyGroup"),
+        "the candidate must mirror orphaned proxy-group cleanup"
+    );
+
+    let api_specs = include_str!("../../../src/admin/api_specs/handlers.rs");
+    let validation = api_specs
+        .rfind("validate_plugin_graph_proxy_deletion_candidate(")
+        .expect("API-spec DELETE must validate its proxy cascade");
+    let persistence = api_specs
+        .rfind("db.delete_api_spec(namespace, id)")
+        .expect("API-spec DELETE persistence call");
+    assert!(validation < persistence);
+}
+
+#[test]
 fn test_batch_writes_run_plugin_graph_candidate_validation() {
     let source = include_str!("../../../src/admin/mod.rs");
     assert!(
