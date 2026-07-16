@@ -125,6 +125,15 @@ JOB_GATE_NAMES = (
     "run_ebpf_build",
 )
 
+# Scripts whose logic controls the gate decisions themselves. Changing either
+# force-runs every gated suite (see select_job_gates).
+GATE_CONTROLLER_PATHS = frozenset(
+    {
+        ".github/scripts/pr_ci_plan.py",
+        ".github/scripts/live_suite_path_filter.py",
+    }
+)
+
 
 def is_lightweight_path(path: str) -> bool:
     if path.startswith(FULL_CI_PREFIXES) or path in FULL_CI_DOCUMENTATION_PATHS:
@@ -154,6 +163,14 @@ def any_path_matches(patterns: list[re.Pattern[str]], changed_files: list[str]) 
 
 def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, bool]:
     if event_name != "pull_request" or not changed_files:
+        return {name: True for name in JOB_GATE_NAMES}
+
+    # These scripts decide which gated suites run. A PR that edits them is
+    # evaluated by the TRUSTED base-branch copy (which cannot see its own
+    # replacement's behavior), so force every gated suite on: a broken gate
+    # change must prove the suites it controls still run before it can start
+    # suppressing them on subsequent PRs.
+    if any(path in GATE_CONTROLLER_PATHS for path in changed_files):
         return {name: True for name in JOB_GATE_NAMES}
 
     return {
@@ -240,6 +257,16 @@ def self_test() -> int:
             "pull_request",
             ["docs/admin_api.md"],
             {name: False for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
+            [".github/scripts/pr_ci_plan.py"],
+            {name: True for name in JOB_GATE_NAMES},
+        ),
+        (
+            "pull_request",
+            [".github/scripts/live_suite_path_filter.py"],
+            {name: True for name in JOB_GATE_NAMES},
         ),
         (
             "pull_request",
