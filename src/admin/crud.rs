@@ -109,9 +109,7 @@ static NAMESPACE_CONFIG_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::ne
 /// plugin-graph mutation (including API-spec bundles) uses the same lock so a
 /// prospective transaction-log schema snapshot remains authoritative until
 /// the corresponding write commits.
-pub(crate) async fn lock_namespace_config_admission(
-    namespace: &str,
-) -> MutexGuard<'static, ()> {
+pub(crate) async fn lock_namespace_config_admission(namespace: &str) -> MutexGuard<'static, ()> {
     let locks = NAMESPACE_CONFIG_ADMISSION_LOCKS.get_or_init(|| {
         (0..NAMESPACE_CONFIG_ADMISSION_LOCK_SHARDS)
             .map(|_| Mutex::new(()))
@@ -480,9 +478,9 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_deletion_candidate(
         .await
         .map_err(AfterValidateError::Db)?;
 
-    candidate.proxies.retain(|proxy| {
-        proxy.namespace != namespace || proxy.id != existing_spec.proxy_id
-    });
+    candidate
+        .proxies
+        .retain(|proxy| proxy.namespace != namespace || proxy.id != existing_spec.proxy_id);
     removed_plugin_ids.extend(
         candidate
             .plugin_configs

@@ -1651,7 +1651,8 @@ async fn disabled_schema_graph_plugins_defer_graph_validation_but_not_egress_scr
         "disabled direct CRUD must retain literal egress screening: {body:?}"
     );
     assert!(
-        body.to_string().contains("redis_url IP 169.254.169.254 denied"),
+        body.to_string()
+            .contains("redis_url IP 169.254.169.254 denied"),
         "unexpected direct CRUD denial: {body:?}"
     );
 
@@ -1669,7 +1670,8 @@ async fn disabled_schema_graph_plugins_defer_graph_validation_but_not_egress_scr
         "disabled batch config must retain literal egress screening: {body:?}"
     );
     assert!(
-        body.to_string().contains("redis_url IP 169.254.169.254 denied"),
+        body.to_string()
+            .contains("redis_url IP 169.254.169.254 denied"),
         "unexpected batch denial: {body:?}"
     );
 }

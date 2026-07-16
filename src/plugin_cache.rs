@@ -3046,12 +3046,11 @@ impl PluginCache {
         // bracket above — abort it so the process-global named-schema
         // registry doesn't get mutated by a config that's being rejected.
         if !plugin_errors.is_empty() {
-            if rebuild_globals {
-                if let Err(error) =
+            if rebuild_globals
+                && let Err(error) =
                     crate::plugins::utils::log_schema::registry::abort_reload()
-                {
-                    plugin_errors.push(error);
-                }
+            {
+                plugin_errors.push(error);
             }
             return Err(format!(
                 "Config reload rejected: {} plugin config(s) failed validation: {}",

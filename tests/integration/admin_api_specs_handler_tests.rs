@@ -1606,15 +1606,13 @@ async fn api_spec_put_and_delete_validate_removed_spec_owned_schema_definitions(
         })
         .await
         .expect("persist spec-owned schema definition");
-    sqlx::query(
-        "UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?",
-    )
-    .bind(&spec_id)
-    .bind("ferrum")
-    .bind(&schema_id)
-    .execute(&store.pool())
-    .await
-    .expect("tag schema definition with API-spec ownership");
+    sqlx::query("UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?")
+        .bind(&spec_id)
+        .bind("ferrum")
+        .bind(&schema_id)
+        .execute(&store.pool())
+        .await
+        .expect("tag schema definition with API-spec ownership");
     let owned_plugins = store
         .list_spec_owned_plugin_configs("ferrum", &spec_id)
         .await
@@ -1711,15 +1709,13 @@ async fn api_spec_delete_models_proxy_and_orphaned_group_plugin_cascades() {
         })
         .await
         .expect("persist schema definition");
-    sqlx::query(
-        "UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?",
-    )
-    .bind(&spec_id)
-    .bind("ferrum")
-    .bind(&schema_id)
-    .execute(&store.pool())
-    .await
-    .expect("tag schema definition with API-spec ownership");
+    sqlx::query("UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?")
+        .bind(&spec_id)
+        .bind("ferrum")
+        .bind(&schema_id)
+        .execute(&store.pool())
+        .await
+        .expect("tag schema definition with API-spec ownership");
 
     let proxy_logger_id = uid("cascade-proxy-logger");
     let proxy_logger = manual_proxy_plugin(

@@ -110,10 +110,7 @@ fn nested_reload_is_rejected_without_clobbering_outer_staging() {
     let _g = registry_lock();
     registry::reset_for_tests();
     registry::begin_reload().expect("outer reload bracket opens");
-    create_ok(
-        "transaction_log_schema",
-        json!({"schemas": {"outer": {}}}),
-    );
+    create_ok("transaction_log_schema", json!({"schemas": {"outer": {}}}));
 
     let error = registry::begin_reload().expect_err("nested reload must be rejected");
     assert!(error.contains("nested begin_reload"), "got: {error}");
@@ -142,7 +139,9 @@ async fn namespace_config_admission_serializes_same_namespace_mutations() {
         .await;
     });
 
-    attempting_rx.await.expect("waiter reaches lock acquisition");
+    attempting_rx
+        .await
+        .expect("waiter reaches lock acquisition");
     assert!(
         tokio::time::timeout(Duration::from_millis(50), &mut waiter)
             .await
