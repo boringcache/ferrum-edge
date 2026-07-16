@@ -987,13 +987,8 @@ impl FunctionDestination {
         } else {
             None
         };
-        let mut sensitive_query_pairs = Vec::new();
-        for (key, value) in url.query_pairs() {
-            let key = decode_percent_layers(key.as_ref());
-            let value = decode_percent_layers(value.as_ref());
-            has_unresolved_encoding |= !key.fully_decoded || !value.fully_decoded;
-            sensitive_query_pairs.push((key.value, value.value));
-        }
+        let (sensitive_query_pairs, query_has_unresolved_encoding) = decoded_url_query_pairs(&url);
+        has_unresolved_encoding |= query_has_unresolved_encoding;
         Ok(Self {
             url,
             sensitive_path,
@@ -1038,14 +1033,9 @@ impl FunctionDestination {
             return true;
         }
 
-        let mut candidate_pairs = Vec::new();
-        for (key, value) in candidate.query_pairs() {
-            let key = decode_percent_layers(key.as_ref());
-            let value = decode_percent_layers(value.as_ref());
-            if !key.fully_decoded || !value.fully_decoded {
-                return true;
-            }
-            candidate_pairs.push((key.value, value.value));
+        let (candidate_pairs, query_has_unresolved_encoding) = decoded_url_query_pairs(&candidate);
+        if query_has_unresolved_encoding {
+            return true;
         }
 
         let candidate_path = decode_percent_layers(candidate.path());
@@ -1241,6 +1231,27 @@ fn nested_uri_reference(value: &str) -> Option<&str> {
         || trimmed.starts_with('?')
         || trimmed.starts_with('#'))
     .then_some(trimmed)
+}
+
+fn decoded_url_query_pairs(url: &Url) -> (Vec<(String, String)>, bool) {
+    let mut pairs = Vec::new();
+    let mut has_unresolved_encoding = false;
+    for pair in url
+        .query()
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter(|pair| !pair.is_empty())
+    {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        // A URL query is not necessarily form data. Decode percent escapes
+        // without translating a literal '+' to a space so signed tokens that
+        // contain '+' compare consistently with their `%2B` representation.
+        let key = decode_percent_layers(key);
+        let value = decode_percent_layers(value);
+        has_unresolved_encoding |= !key.fully_decoded || !value.fully_decoded;
+        pairs.push((key.value, value.value));
+    }
+    (pairs, has_unresolved_encoding)
 }
 
 fn path_contains_segment_sequence(candidate: &str, sensitive: &str) -> bool {

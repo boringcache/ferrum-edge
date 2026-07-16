@@ -15168,7 +15168,9 @@ components:
         configured signed function path/query. Complete signed paths match at
         slash-delimited segment boundaries even with added prefix or descendant
         segments, not inside arbitrary substrings. Non-empty signed query values
-        remain protected if copied under another parameter name. Inspection is
+        remain protected if copied under another parameter name. Query comparison
+        percent-decodes generic URI components but preserves literal `+` characters
+        instead of applying form-data space conversion. Inspection is
         bounded to 16 KiB per field, 32 Link targets, eight percent-decoding
         transforms, and two nested URI-reference hops. URI userinfo, residual
         encoding, malformed target syntax, budget overflow, or another

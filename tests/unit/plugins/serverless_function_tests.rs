@@ -1273,6 +1273,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "nested-path-encoded",
         "copied-query-other-host",
         "renamed-query-other-host",
+        "literal-plus-encoded-candidate",
+        "encoded-plus-literal-candidate",
         "malformed",
         "userinfo",
         "benign-relative",
@@ -1281,19 +1283,30 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-external-label",
         "benign-path-lookalike",
         "benign-query-value-lookalike",
+        "benign-plus-space-distinct",
     ] {
         let server = MockServer::start().await;
-        let function_url = if case == "destination-over-decode-budget" {
-            let mut path = "signed/trigger".to_string();
-            for _ in 0..12 {
-                path = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
+        let function_url = match case {
+            "destination-over-decode-budget" => {
+                let mut path = "signed/trigger".to_string();
+                for _ in 0..12 {
+                    path = url::form_urlencoded::byte_serialize(path.as_bytes()).collect();
+                }
+                format!("{}/{path}?code=secret%2Fvalue", server.uri())
             }
-            format!("{}/{path}?code=secret%2Fvalue", server.uri())
-        } else {
-            format!(
+            "literal-plus-encoded-candidate" => {
+                format!("{}/signed%2Ftrigger?code=token+part", server.uri())
+            }
+            "encoded-plus-literal-candidate" => {
+                format!("{}/signed%2Ftrigger?code=token%2Bpart", server.uri())
+            }
+            "benign-plus-space-distinct" => {
+                format!("{}/signed%2Ftrigger?code=token%20part", server.uri())
+            }
+            _ => format!(
                 "{}/signed%2Ftrigger?code=secret%2Fvalue",
                 server.uri()
-            )
+            ),
         };
         let location = match case {
             "relative-query" => "?code=secret%2Fvalue".to_string(),
@@ -1345,6 +1358,12 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "renamed-query-other-host" => {
                 "https://redirect.example/next?leak=secret%2Fvalue".to_string()
             }
+            "literal-plus-encoded-candidate" => {
+                "https://redirect.example/next?leak=token%2Bpart".to_string()
+            }
+            "encoded-plus-literal-candidate" => {
+                "https://redirect.example/next?leak=token+part".to_string()
+            }
             "malformed" => "http://[signed%2Ftrigger?code=secret%2Fvalue".to_string(),
             "userinfo" => "https://user:password@redirect.example/next".to_string(),
             "benign-relative" => "/next".to_string(),
@@ -1358,6 +1377,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-query-value-lookalike" => {
                 "https://redirect.example/next?leak=secret%2Fvalue-extra".to_string()
+            }
+            "benign-plus-space-distinct" => {
+                "https://redirect.example/next?leak=token+part".to_string()
             }
             _ => unreachable!(),
         };
