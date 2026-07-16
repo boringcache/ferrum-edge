@@ -1397,6 +1397,7 @@ async fn run_tcp_accept_loop(
                         authenticated_identity: None,
                         auth_method: None,
                         metadata: None,
+                        admission_permits: Vec::new(),
                         tls_client_cert_der: None,
                         tls_client_cert_chain_der: None,
                         sni_hostname: None,
@@ -1892,6 +1893,7 @@ async fn run_tcp_stream_connect_plugins(
 ) -> Result<(), anyhow::Error> {
     for plugin in plugins {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
+            stream_ctx.release_admission_permits();
             debug!(
                 proxy_id = %proxy_id,
                 client = %client_ip,
@@ -2227,6 +2229,7 @@ async fn handle_tcp_connection_inner(
         if !plugins.is_empty() {
             for plugin in plugins.iter() {
                 if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
+                    stream_ctx.release_admission_permits();
                     debug!(
                         proxy_id = %proxy_id,
                         client = %remote_addr.ip(),

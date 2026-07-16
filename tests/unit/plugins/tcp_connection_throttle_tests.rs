@@ -1,8 +1,6 @@
 use ferrum_edge::config::types::{BackendScheme, Consumer};
 use ferrum_edge::plugins::tcp_connection_throttle::TcpConnectionThrottle;
-use ferrum_edge::plugins::{
-    Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
-};
+use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, StreamConnectionContext};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +31,7 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
         authenticated_identity: None,
         auth_method: None,
         metadata: None,
+        admission_permits: Vec::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -40,32 +39,6 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
         node_waypoint_policy_scope: None,
         first_bytes: None,
         first_bytes_kind: None,
-    }
-}
-
-fn make_summary(metadata: HashMap<String, String>) -> StreamTransactionSummary {
-    StreamTransactionSummary {
-        namespace: "ferrum".to_string(),
-        proxy_id: "tcp-proxy".to_string(),
-        proxy_name: Some("TCP Proxy".to_string()),
-        client_ip: "127.0.0.1".to_string(),
-        consumer_username: None,
-        auth_method: None,
-        backend_target: "127.0.0.1:5432".to_string(),
-        backend_resolved_ip: Some("127.0.0.1".to_string()),
-        protocol: "tcp".to_string(),
-        listen_port: 5432,
-        duration_ms: 1.0,
-        bytes_sent: 0,
-        bytes_received: 0,
-        connection_error: None,
-        error_class: None,
-        disconnect_direction: None,
-        disconnect_cause: None,
-        timestamp_connected: "2026-04-02T00:00:00Z".to_string(),
-        timestamp_disconnected: "2026-04-02T00:00:01Z".to_string(),
-        sni_hostname: None,
-        metadata,
     }
 }
 
@@ -89,6 +62,20 @@ fn test_tcp_connection_throttle_requires_positive_limit() {
             "cleanup_interval_seconds": 0
         }))
         .is_ok()
+    );
+    assert!(
+        TcpConnectionThrottle::new(&json!({
+            "max_connections_per_key": 1,
+            "cleanup_intervl_seconds": 60
+        }))
+        .is_err()
+    );
+    assert!(
+        TcpConnectionThrottle::new(&json!({
+            "max_connections_per_key": 1,
+            "cleanup_interval_seconds": 86401
+        }))
+        .is_err()
     );
 }
 
@@ -146,9 +133,8 @@ async fn test_tcp_connection_throttle_releases_slot_on_disconnect() {
         PluginResult::Continue
     ));
 
-    plugin
-        .on_stream_disconnect(&make_summary(ctx1.take_metadata()))
-        .await;
+    assert!(ctx1.metadata.is_none());
+    ctx1.release_admission_permits();
     assert_eq!(plugin.tracked_keys_count(), Some(0));
 
     let mut ctx2 = make_ctx("tcp-proxy", "10.0.0.1", None);
@@ -156,6 +142,199 @@ async fn test_tcp_connection_throttle_releases_slot_on_disconnect() {
         plugin.on_stream_connect(&mut ctx2).await,
         PluginResult::Continue
     ));
+}
+
+#[test]
+fn test_tcp_connection_throttle_normalizes_pool_shard_amount() {
+    let automatic = TcpConnectionThrottle::new_with_pool_shard_amount(
+        &json!({"max_connections_per_key": 1}),
+        0,
+    )
+    .unwrap();
+    let non_power_of_two = TcpConnectionThrottle::new_with_pool_shard_amount(
+        &json!({"max_connections_per_key": 1}),
+        3,
+    )
+    .unwrap();
+    let dashmap_minimum = TcpConnectionThrottle::new_with_pool_shard_amount(
+        &json!({"max_connections_per_key": 1}),
+        1,
+    )
+    .unwrap();
+
+    assert_eq!(
+        automatic.shard_amount(),
+        ferrum_edge::util::sharding::pool_shard_amount(0)
+    );
+    assert_eq!(
+        non_power_of_two.shard_amount(),
+        ferrum_edge::util::sharding::pool_shard_amount(3)
+    );
+    assert_eq!(dashmap_minimum.shard_amount(), 2);
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_canonicalizes_ipv4_mapped_identity() {
+    let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let mut ipv4 = make_ctx("tcp-proxy", "192.0.2.10", None);
+    let mut mapped = make_ctx("tcp-proxy", "::ffff:192.0.2.10", None);
+
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ipv4).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut mapped).await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_multiple_instances_use_independent_permits() {
+    let first = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let second = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let mut connection = make_ctx("tcp-proxy", "10.0.0.1", None);
+
+    assert!(matches!(
+        first.on_stream_connect(&mut connection).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.on_stream_connect(&mut connection).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(connection.admission_permits.len(), 2);
+    assert!(connection.metadata.is_none());
+
+    connection.release_admission_permits();
+    connection.release_admission_permits();
+    assert_eq!(first.tracked_keys_count(), Some(0));
+    assert_eq!(second.tracked_keys_count(), Some(0));
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_auth_boundary_permits_do_not_overwrite() {
+    let before_auth = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let after_auth = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+    let mut connection = make_ctx("tcp-proxy", "10.0.0.1", None);
+
+    assert!(matches!(
+        before_auth.on_stream_connect(&mut connection).await,
+        PluginResult::Continue
+    ));
+    connection.identified_consumer = Some(Arc::new(make_consumer("alice")));
+    assert!(matches!(
+        after_auth.on_stream_connect(&mut connection).await,
+        PluginResult::Continue
+    ));
+
+    let mut same_consumer = make_ctx("tcp-proxy", "10.0.0.2", None);
+    assert!(matches!(
+        before_auth.on_stream_connect(&mut same_consumer).await,
+        PluginResult::Continue
+    ));
+    same_consumer.identified_consumer = Some(Arc::new(make_consumer("alice")));
+    assert!(matches!(
+        after_auth.on_stream_connect(&mut same_consumer).await,
+        PluginResult::Reject { .. }
+    ));
+    same_consumer.release_admission_permits();
+    connection.release_admission_permits();
+    assert_eq!(before_auth.tracked_keys_count(), Some(0));
+    assert_eq!(after_auth.tracked_keys_count(), Some(0));
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_release_admission_race_never_detaches_increment() {
+    let plugin = Arc::new(
+        TcpConnectionThrottle::new(&json!({
+            "max_connections_per_key": 1,
+            "cleanup_interval_seconds": 0
+        }))
+        .unwrap(),
+    );
+
+    for _ in 0..256 {
+        let mut current = make_ctx("tcp-proxy", "10.0.0.9", None);
+        assert!(matches!(
+            plugin.on_stream_connect(&mut current).await,
+            PluginResult::Continue
+        ));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let release_barrier = Arc::clone(&barrier);
+        let release = tokio::spawn(async move {
+            release_barrier.wait().await;
+            current.release_admission_permits();
+        });
+        let admit_barrier = Arc::clone(&barrier);
+        let admit_plugin = Arc::clone(&plugin);
+        let admit = tokio::spawn(async move {
+            let mut candidate = make_ctx("tcp-proxy", "10.0.0.9", None);
+            admit_barrier.wait().await;
+            let admitted = matches!(
+                admit_plugin.on_stream_connect(&mut candidate).await,
+                PluginResult::Continue
+            );
+            (admitted, candidate)
+        });
+        barrier.wait().await;
+        release.await.unwrap();
+        let (admitted, mut candidate) = admit.await.unwrap();
+        if !admitted {
+            assert!(matches!(
+                plugin.on_stream_connect(&mut candidate).await,
+                PluginResult::Continue
+            ));
+        }
+        assert_eq!(plugin.tracked_keys_count(), Some(1));
+
+        let mut over_limit = make_ctx("tcp-proxy", "10.0.0.9", None);
+        assert!(matches!(
+            plugin.on_stream_connect(&mut over_limit).await,
+            PluginResult::Reject { .. }
+        ));
+        candidate.release_admission_permits();
+        assert_eq!(plugin.tracked_keys_count(), Some(0));
+    }
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_concurrent_exact_limit() {
+    const LIMIT: usize = 8;
+    const ATTEMPTS: usize = 32;
+    let plugin = Arc::new(
+        TcpConnectionThrottle::new(&json!({"max_connections_per_key": LIMIT})).unwrap(),
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(ATTEMPTS + 1));
+    let mut tasks = Vec::new();
+    for _ in 0..ATTEMPTS {
+        let plugin = Arc::clone(&plugin);
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            let mut ctx = make_ctx("tcp-proxy", "10.0.0.10", None);
+            barrier.wait().await;
+            let admitted = matches!(
+                plugin.on_stream_connect(&mut ctx).await,
+                PluginResult::Continue
+            );
+            (admitted, ctx)
+        }));
+    }
+    barrier.wait().await;
+
+    let mut admitted = Vec::new();
+    for task in tasks {
+        let (was_admitted, ctx) = task.await.unwrap();
+        if was_admitted {
+            admitted.push(ctx);
+        }
+    }
+    assert_eq!(admitted.len(), LIMIT);
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    for mut ctx in admitted {
+        ctx.release_admission_permits();
+    }
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
 }
 
 #[tokio::test]

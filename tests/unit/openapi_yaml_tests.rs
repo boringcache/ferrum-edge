@@ -2400,3 +2400,58 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
         assert_component_validity(&spec, "SecurityHeadersConfig", &non_ascii_value, false);
     }
 }
+
+#[test]
+fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/TcpConnectionThrottleConfig")
+        .expect("TcpConnectionThrottleConfig component exists");
+    let schema_text = serde_json::to_string(schema).unwrap();
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let cache_docs = include_str!("../../docs/cache_management.md");
+    let source = include_str!("../../src/plugins/tcp_connection_throttle.rs");
+    let admin_source = include_str!("../../src/admin/mod.rs");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_interval_seconds": 0}),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "TcpConnectionThrottleConfig",
+        &json!({"max_connections_per_key": 1, "cleanup_intervl_seconds": 60}),
+        false,
+    );
+    for text in [schema_text.as_str(), plugin_docs, cache_docs] {
+        assert!(text.contains("process-local"), "missing process-local scope");
+        assert!(text.contains("residual"), "missing residual sweep semantics");
+        assert!(text.contains("inline"), "missing inline removal semantics");
+    }
+    assert!(schema_text.contains("UDP/DTLS"));
+    assert!(plugin_docs.contains("attachment to any other protocol is rejected"));
+    assert!(source.contains("DashMap::with_shard_amount"));
+    assert!(source.contains("entry.remove()"));
+    assert!(!source.contains("tcp_connection_throttle.key"));
+    assert!(admin_source.contains(r#""enforcement_scope": "process_local""#));
+    assert!(
+        admin_source
+            .contains(r#""replica_limit_behavior": "configured_limit_per_replica""#)
+    );
+
+    let status_schema = spec
+        .pointer("/components/schemas/AdminMetricsTcpConnectionThrottle")
+        .expect("AdminMetricsTcpConnectionThrottle component exists");
+    assert_eq!(
+        status_schema["properties"]["enforcement_scope"]["enum"][0],
+        "process_local"
+    );
+    assert_eq!(
+        status_schema["properties"]["replica_limit_behavior"]["enum"][0],
+        "configured_limit_per_replica"
+    );
+}

@@ -4045,6 +4045,10 @@ fn build_metrics(state: &AdminState) -> Value {
             "rate_limiting": {
                 "tracked_key_count": rate_limiter_keys,
             },
+            "tcp_connection_throttle": {
+                "enforcement_scope": "process_local",
+                "replica_limit_behavior": "configured_limit_per_replica",
+            },
         });
         if state.mode == "database"
             && let Some(snapshot) = crate::plugins::prometheus_metrics::global_registry()
@@ -4080,6 +4084,10 @@ fn build_metrics(state: &AdminState) -> Value {
             "caches": {},
             "consumer_index": {"total_consumers": 0, "key_auth_credentials": 0, "basic_auth_credentials": 0, "mtls_credentials": 0, "jwt_credentials": 0, "hmac_credentials": 0, "identity_credentials": 0},
             "rate_limiting": {"tracked_key_count": 0},
+            "tcp_connection_throttle": {
+                "enforcement_scope": "process_local",
+                "replica_limit_behavior": "configured_limit_per_replica",
+            },
         })
     }
 }

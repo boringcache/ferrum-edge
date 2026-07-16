@@ -1488,7 +1488,9 @@ paths:
         request throughput, connection pool sizes, circuit breaker states, health
         check results, load balancer active connections, cache statistics, consumer
         index breakdowns, rate limiter tracked keys, and database rejected-delta
-        polling state in database mode.
+        polling state in database mode. The `tcp_connection_throttle` status
+        object states that its configured concurrent-connection limit is
+        process-local and independently enforced per replica.
 
         The response is cached for 5 seconds to avoid performance impact from
         frequent polling. The `X-Cache` response header indicates `hit` or `miss`.
@@ -9530,6 +9532,7 @@ components:
         - caches
         - consumer_index
         - rate_limiting
+        - tcp_connection_throttle
       properties:
         gateway:
           $ref: "#/components/schemas/AdminMetricsGateway"
@@ -9552,6 +9555,8 @@ components:
           $ref: "#/components/schemas/AdminMetricsConsumerIndex"
         rate_limiting:
           $ref: "#/components/schemas/AdminMetricsRateLimiting"
+        tcp_connection_throttle:
+          $ref: "#/components/schemas/AdminMetricsTcpConnectionThrottle"
         database_polling:
           $ref: "#/components/schemas/DatabaseDeltaPollingMetrics"
 
@@ -9839,6 +9844,24 @@ components:
           description: |
             Total number of rate-limit keys currently tracked across all
             rate_limiting plugin instances (deduplicated by plugin identity)
+
+    AdminMetricsTcpConnectionThrottle:
+      type: object
+      description: Runtime scope contract for TCP concurrent-connection throttling.
+      required: [enforcement_scope, replica_limit_behavior]
+      properties:
+        enforcement_scope:
+          type: string
+          enum: [process_local]
+          description: Counters are held only by this ferrum-edge process.
+        replica_limit_behavior:
+          type: string
+          enum: [configured_limit_per_replica]
+          description: >-
+            Each replica enforces the configured limit independently, so the
+            aggregate deployment allowance can reach the configured limit
+            multiplied by the number of replicas receiving that identity's TCP
+            connections.
 
     # ── Pagination envelope ────────────────────────────────────────────
     Pagination:
@@ -13459,20 +13482,39 @@ components:
 
     TcpConnectionThrottleConfig:
       type: object
-      description: "Plugin: tcp_connection_throttle — Caps active TCP connections per Consumer when a stream auth plugin identified one, else per client IP."
+      additionalProperties: false
+      description: >-
+        Plugin: tcp_connection_throttle — Caps active TCP/TCP+TLS connections
+        per Consumer when a stream auth plugin identified one, else per
+        canonical client IP. Explicit proxy/proxy-group attachment to any other
+        protocol is rejected during plugin-cache validation. UDP/DTLS is not
+        protected; use udp_rate_limiting for datagram/session admission.
+        Enforcement is process-local, so each replica independently permits up
+        to the configured limit and the deployment-wide allowance can be the
+        limit multiplied by the number of replicas receiving the same identity.
       required: [max_connections_per_key]
       properties:
         max_connections_per_key:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum active TCP connections allowed for one Consumer/IP key
+          description: >-
+            Maximum active TCP connections allowed for one Consumer/IP key in
+            this ferrum-edge process. Each replica enforces this limit
+            independently.
         cleanup_interval_seconds:
           type: integer
           format: uint64
           default: 60
           minimum: 0
-          description: Interval in seconds between background sweeps that remove zero-count entries from the per-key connection counter map. `0` disables the sweep (entries remain in memory until process restart).
+          maximum: 86400
+          description: >-
+            Interval in seconds between defensive background sweeps that remove
+            residual zero-count entries. Normal connection completion and
+            plugin-chain rejection release the exact admission permit and remove
+            its zero-count entry inline. The sweep never repairs a missed
+            positive decrement. `0` disables only the residual sweep; inline
+            permit release and removal remain enabled.
 
     AdaptiveConcurrencyConfig:
       type: object

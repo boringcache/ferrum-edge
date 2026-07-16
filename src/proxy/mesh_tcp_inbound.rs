@@ -176,6 +176,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
         authenticated_identity: None,
         auth_method: None,
         metadata: None,
+        admission_permits: Vec::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         // Populated above for opaque-TLS captures; `None` for raw-TCP streams.
@@ -197,6 +198,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
 
     for plugin in plugins.iter() {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
+            stream_ctx.release_admission_permits();
             debug!(
                 service = %entry.service_fqdn,
                 orig_dst = %orig_dst,
