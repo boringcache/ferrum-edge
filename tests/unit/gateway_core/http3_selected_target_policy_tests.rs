@@ -248,19 +248,19 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         "H3 external deferred hooks must not select an unpreviewed target"
     );
     assert!(
-        policy_block.contains("BackendPathPolicyPhase::Preview")
-            && policy_block.contains("BackendPathPolicyPhase::Enforce"),
-        "H3 must preview access before deferred routing and charge final policy on the pinned path"
+        policy_block.contains("BackendPathPolicyPhase::Enforce"),
+        "H3 must charge policy once on the pinned path before deferred routing"
     );
     assert!(
         source.contains("BackendPathBeforeProxyPass::RemainingDeferred"),
         "H3 must keep remaining side-effect hooks behind any required reauthorization"
     );
+    let routing_hook = source
+        .rfind("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .expect("H3 routing-header hook must remain present");
     assert!(
-        !source.contains(
-            "if !matches!(deferred_result, PluginResult::Continue) {\n            break;"
-        ),
-        "an H3 deferred routing-hook rejection must still reach final method enforcement"
+        path_policy < routing_hook,
+        "H3 stateful path policy must reject before deferred external work"
     );
     let native_retry = source
         .find("// Resolve and validate the retry target before charging this")

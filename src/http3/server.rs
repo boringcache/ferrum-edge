@@ -2496,51 +2496,39 @@ async fn handle_h3_request(
         && capabilities
             .has(crate::plugin_cache::PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
     let mut deferred_result = PluginResult::Continue;
-    let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
-
-    loop {
-        if backend_path_is_policy_bound {
-            let backend_path = crate::proxy::build_backend_effective_path(
-                &proxy,
-                &path,
-                strip_len,
-                upstream_target
-                    .as_ref()
-                    .and_then(|target| target.path.as_deref()),
-            );
-            let phase = if run_deferred_routing_headers {
-                BackendPathPolicyPhase::Preview
-            } else {
-                BackendPathPolicyPhase::Enforce
-            };
-            if !run_h3_backend_path_plugins_or_send_reject(
-                backend_path_plugins,
-                &plugins,
-                &mut ctx,
-                &backend_path,
-                &original_request_path,
-                http_flavor,
-                &mut stream,
-                &state,
-                start_time,
-                &mut plugin_execution_ns,
-                grpc_web_response_content_type.as_deref(),
-                phase,
-            )
-            .await?
-            {
-                return Ok(());
-            }
-            if phase == BackendPathPolicyPhase::Enforce {
-                ctx.bind_authorized_backend_path(backend_path);
-            }
+    // The target is already pinned, so enforce backend-path policy before a
+    // deferred routing-header hook can invoke an external service.
+    if backend_path_is_policy_bound {
+        let backend_path = crate::proxy::build_backend_effective_path(
+            &proxy,
+            &path,
+            strip_len,
+            upstream_target
+                .as_ref()
+                .and_then(|target| target.path.as_deref()),
+        );
+        if !run_h3_backend_path_plugins_or_send_reject(
+            backend_path_plugins,
+            &plugins,
+            &mut ctx,
+            &backend_path,
+            &original_request_path,
+            http_flavor,
+            &mut stream,
+            &state,
+            start_time,
+            &mut plugin_execution_ns,
+            grpc_web_response_content_type.as_deref(),
+            BackendPathPolicyPhase::Enforce,
+        )
+        .await?
+        {
+            return Ok(());
         }
+        ctx.bind_authorized_backend_path(backend_path);
+    }
 
-        if !run_deferred_routing_headers {
-            break;
-        }
-        run_deferred_routing_headers = false;
-
+    if has_deferred_routing_header_hooks {
         // Deferral changes authorization order, not the client-path view that
         // before_proxy hooks received before a mesh backend rewrite.
         let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
@@ -2564,9 +2552,6 @@ async fn handle_h3_request(
                 &state.mesh_egress_strip_baggage_keys,
             );
         }
-        // Always make one more pass after the routing-header hook, including
-        // when it rejects, so final enforcement charges the pinned method
-        // exactly once before any external-hook rejection is returned.
     }
 
     if backend_path_is_policy_bound {

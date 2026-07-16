@@ -371,18 +371,18 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
         .expect("deferred before_proxy pass must remain present");
     assert!(path_policy < deferred);
     assert!(source.contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"));
-    assert!(source.contains("BackendPathPolicyPhase::Preview"));
     assert!(source.contains("BackendPathPolicyPhase::Enforce"));
     assert!(
         !source.contains("backend_dispatch::upstream_selection_hash_key("),
         "an external deferred hook must not reselect an unpreviewed target"
     );
     assert!(source.contains("std::mem::replace(&mut ctx.path, original_request_path.clone())"));
+    let routing_hook = source
+        .rfind("BackendPathBeforeProxyPass::RoutingHeaderDeferred")
+        .expect("routing-header hook must remain present");
     assert!(
-        !source.contains(
-            "if !matches!(deferred_result, PluginResult::Continue) {\n            break;"
-        ),
-        "a deferred routing-hook rejection must still reach final method enforcement"
+        path_policy < routing_hook,
+        "stateful path policy must reject before deferred external work"
     );
 
     let mirror = include_str!("../../../src/plugins/request_mirror.rs");

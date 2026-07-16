@@ -31,22 +31,17 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 5a. path policy preview │  Stateless access check for initial selected path
+│ 5a. final path policy   │  Enforce selected method; charge state once
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 5b. routing-header hook │  Deferred enrichment with previewed target pinned
+│ 5b. routing-header hook │  Deferred enrichment with target pinned
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 5c. final path policy   │  Enforce settled method; charge state once
-└────────────┬────────────┘
-             │
-             ▼
-┌─────────────────────────┐
-│ 5d. deferred before_proxy │  Remaining external/synthetic work after policy
+│ 5c. deferred before_proxy │  Remaining external/synthetic work after policy
 └────────────┬────────────┘
              │
              ▼
@@ -107,15 +102,12 @@ segments used by the backend URL builder, including regex/exact/prefix match
 length, encoded-slash normalization, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
-backend wire. When a deferred external hook can inject headers used by load
-balancing, the policy hook first receives a non-state-consuming preview phase
-for the already selected path. That target remains pinned across the external
-call so the hook cannot cause side effects and then steer the request onto a
-method that was not authorized first. The same path is enforced once afterward;
-per-method rate limits are charged only in this final phase, so one request
-cannot consume two method buckets. Gateway-owned identity headers and
-configured egress baggage filtering are reapplied after every deferred mutation
-pass. Its
+backend wire. The selected target remains pinned across deferred external hooks,
+so routing-header mutations cannot steer the request onto a different method.
+The gateway enforces the selected path, including stateful per-method rate
+limits, exactly once before invoking those hooks. Gateway-owned identity
+headers and configured egress baggage filtering are reapplied after every
+deferred mutation pass. Its
 pre-filtered plugin list is built on reload; proxies without an opt-in plugin do
 not scan the chain or allocate an effective-path string. Once policy binds the
 first target's path, retries may rotate host/port only when the candidate keeps
@@ -139,9 +131,8 @@ normal request semantics even when mesh routing rewrote the backend path.
 is active and `mirror_path` is unset, it mirrors the exact effective path that
 passed final authorization. An explicit operator-configured `mirror_path`
 still wins. A deferred hook that can inject routing headers runs after the
-selected target's access preview, and that target is pinned across the external
-call. Ferrum performs the single state-consuming enforcement against the same
-effective path before any remaining external or synthetic hook. After each
+selected target's single state-consuming enforcement, and that target is pinned
+across the external call. After each
 deferred pass, the gateway removes every case variant of the reserved
 `x-consumer-username` and `x-consumer-custom-id` headers, restores only
 authenticated gateway values, and reapplies configured egress baggage-key
