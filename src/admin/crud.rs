@@ -525,13 +525,7 @@ async fn recover_late_resource_write<R: AdminResource>(
         &action,
         LateResourceWrite::Update { .. } | LateResourceWrite::Delete { .. }
     ) && matches!(
-        R::intervening_write_recovery(
-            db.as_ref(),
-            namespace,
-            previous,
-            http_client,
-        )
-        .await?,
+        R::intervening_write_recovery(db.as_ref(), namespace, previous, http_client,).await?,
         InterveningWriteRecovery::KeepCurrent
     ) {
         return Ok(false);
@@ -710,11 +704,7 @@ async fn persist_delete_to_settlement<R: AdminResource>(
     previous_api_spec: Option<ApiSpecDeleteSnapshot>,
     http_client: crate::plugins::PluginHttpClient,
 ) -> DbResult<bool> {
-    match run_db_write_while_held(
-        guard.as_ref(),
-        R::db_delete(db.as_ref(), &namespace, &id),
-    )
-    .await
+    match run_db_write_while_held(guard.as_ref(), R::db_delete(db.as_ref(), &namespace, &id)).await
     {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
         Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
