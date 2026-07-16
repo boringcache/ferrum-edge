@@ -1023,7 +1023,12 @@ async fn correlation_id_composition_populates_generated_and_preserved_approval_r
             .await;
     }
 
-    let governor = make(approval_config(&format!("{}/approve", server.uri())));
+    // Exercise both request IDs at the webhook boundary. Approval caching is
+    // covered separately and would intentionally collapse these otherwise
+    // identical tool calls before the second request reaches the mock server.
+    let mut governor_config = approval_config(&format!("{}/approve", server.uri()));
+    governor_config["approval"]["cache_ttl_seconds"] = json!(0);
+    let governor = make(governor_config);
     let body = response_with_tool_call("deploy", r#"{"env":"prod"}"#);
     assert_continue(
         governor
