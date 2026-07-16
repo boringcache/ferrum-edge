@@ -29782,10 +29782,8 @@ mod tests {
             _response_headers: &HashMap<String, String>,
             _body: &[u8],
         ) -> PluginResult {
-            ctx.metadata.insert(
-                "test:synthetic_body_method".to_string(),
-                ctx.method.clone(),
-            );
+            ctx.metadata
+                .insert("test:synthetic_body_method".to_string(), ctx.method.clone());
             PluginResult::Reject {
                 status_code: 451,
                 body: "blocked synthetic representation".to_string(),
