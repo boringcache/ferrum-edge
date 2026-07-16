@@ -340,10 +340,11 @@ impl Default for TestGatewayBuilder {
     fn default() -> Self {
         Self {
             mode: GatewayMode::Database(DbType::Sqlite),
-            // Secrets are ≥32 chars per CLAUDE.md's admin-JWT rule.
+            // Secrets are ≥32 chars per the admin-JWT rule and the
+            // basic_auth HMAC-secret minimum.
             jwt_secret: "ferrum-edge-shared-harness-secret-00000".to_string(),
             jwt_issuer: "ferrum-edge-shared-harness".to_string(),
-            basic_auth_hmac_secret: "ferrum-edge-shared-harness-hmac".to_string(),
+            basic_auth_hmac_secret: "ferrum-edge-shared-harness-hmac-secret".to_string(),
             log_level: "info".to_string(),
             health_timeout: Duration::from_secs(30),
             max_attempts: 3,

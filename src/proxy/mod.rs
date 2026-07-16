@@ -8,22 +8,25 @@
 //!    early termination, IP restriction, bot detection
 //! 3. **Plugin: authenticate** — mtls_auth, jwks_auth, jwt_auth, key_auth, basic_auth, hmac_auth
 //! 4. **Plugin: authorize** — access_control, rate_limiting (consumer mode)
-//! 5. **Plugin: before_proxy** — request/response policy before backend dispatch:
-//!    request size limiting, GraphQL guardrails, AI plugins, request transformation,
-//!    response caching preparation, gRPC deadline injection
-//! 6. **Plugin: transform_request_body / on_final_request_body** — buffered request-body
+//! 5. **Plugin: before_proxy** — route/header preparation and request policy;
+//!    external/synthetic hooks are deferred when backend-path policy is active
+//! 6. **Plugin: on_backend_path_resolved** — opt-in policy over the path assembled
+//!    after routing and initial target selection
+//! 7. **Plugin: deferred before_proxy** — external/synthetic work after path authorization
+//! 8. **Plugin: transform_request_body / on_final_request_body** — buffered request-body
 //!    rewrites and final validation before backend dispatch
-//! 7. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
-//!    Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
-//! 8. **Plugin: after_proxy** — CORS headers, response caching metadata, response transforms,
-//!    response size limiting, AI rate limiter
-//! 9. **Plugin: on_response_body** — raw backend body inspection before transforms:
-//!    AI token metrics, AI rate limiter
-//! 10. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
-//! 11. **Plugin: on_final_response_body** — buffered body validation/storage:
+//! 9. **Plugin: backend_admission** — selected-target concurrency admission
+//! 10. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
+//!     Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
+//! 11. **Plugin: after_proxy** — CORS headers, response caching metadata, response transforms,
+//!     response size limiting, AI rate limiter
+//! 12. **Plugin: on_response_body** — raw backend body inspection before transforms:
+//!     AI token metrics, AI rate limiter
+//! 13. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
+//! 14. **Plugin: on_final_response_body** — buffered body validation/storage:
 //!     body validation, response size limiting, response caching
-//! 12. **Plugin: on_response_committed** — observe-only final buffered status/body export
-//! 13. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
+//! 15. **Plugin: on_response_committed** — observe-only final buffered status/body export
+//! 16. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
 //!
 //! Key design principles:
 //! - **Lock-free reads**: All config access uses `ArcSwap::load()` — no mutexes on the hot path
@@ -41,6 +44,7 @@ pub mod hbone_pool;
 mod hbone_proxy;
 pub mod headers;
 pub mod http2_pool;
+mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
 mod mesh_tcp_inbound;
@@ -103,9 +107,9 @@ use crate::modes::mesh::node_waypoint::{
 };
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
-    BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
-    RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, TransactionSummary,
-    WebSocketFrameDirection, is_builtin_plugin_name,
+    BackendAdmissionOutcome, BackendAdmissionPermitSet, BackendPathPolicyPhase, Plugin,
+    PluginResult, ProxyProtocol, RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext,
+    TransactionSummary, WebSocketFrameDirection, is_builtin_plugin_name,
     mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
@@ -127,6 +131,9 @@ use self::backend_capabilities::{
     ProtocolSupport, RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
 };
 pub use self::body::ProxyBody;
+use self::grpc_proxy::{
+    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+};
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::hbone_pool::{HboneConnectionPool, HbonePoolError};
 use self::http2_pool::Http2ConnectionPool;
@@ -163,6 +170,15 @@ pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_respo
 pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
     "ferrum:replaceable_rejection_response";
 
+/// One-shot handoff for requester-owned auth session state that changed before
+/// authentication attempts rejected. Distinct cookie names are newline-joined;
+/// a later attempt replaces an earlier candidate with the same exact name. The
+/// authentication phase removes this key on every exit: it attaches the cookies
+/// only to the final rejection and discards them when a later credential
+/// succeeds. The key contains "cookie" so metadata serialization still redacts
+/// the sealed values defensively.
+pub(crate) const AUTH_REJECTION_SET_COOKIE_METADATA_KEY: &str = "auth.rejection_set_cookie";
+
 /// Marker recorded in `ctx.metadata` for the duration of
 /// [`apply_synthetic_response_body_hooks`] — i.e. while the response-body hook
 /// pipeline (`on_response_body`, `transform_response_body_with_context`,
@@ -179,6 +195,14 @@ pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
 /// Only ever set on the synthetic short-circuit path, so its presence is a
 /// precise signal; the normal buffered backend-response path never sets it.
 pub(crate) const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
+/// One-shot request-method override used only while synthetic response-body
+/// hooks inspect a plugin-generated representation. `spec_expose` sets `GET`
+/// for canonical HEAD responses so response guards evaluate the representation
+/// exactly as they do for GET; the real method is restored before rejection
+/// `after_proxy` hooks normalize the final wire response.
+pub(crate) const SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY: &str =
+    "ferrum:synthetic_response_method_override";
 
 /// Internal marker carried only on a response-decision context clone while an
 /// effective retry policy is active. It never reaches transaction metadata.
@@ -220,9 +244,10 @@ pub(crate) const ORIGINAL_RESPONSE_METADATA_STAMPED_KEY: &str =
 pub(crate) const ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY: &str =
     "ferrum:original_response_content_length";
 
-/// Marker that the original backend response carried a non-identity
-/// `Content-Encoding`. This distinguishes origin encoding from an encoding
-/// selected later by the gateway compression plugin.
+/// Exact non-identity `Content-Encoding` from the original backend response.
+/// This distinguishes origin encoding from an encoding selected later by the
+/// gateway compression plugin and preserves the decoder input if a response
+/// header transform subsequently removes or renames the live header.
 pub(crate) const ORIGIN_ENCODED_RESPONSE_METADATA_KEY: &str = "ferrum:origin_encoded_response";
 
 /// The ORIGINAL backend HTTP status, captured at the start of
@@ -307,13 +332,15 @@ pub(crate) fn stamp_original_response_metadata(
         );
     }
     ctx.metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
-    if response_headers
-        .get("content-encoding")
-        .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
-    {
+    if let Some(encoding) = response_headers.get("content-encoding").filter(|encoding| {
+        encoding
+            .split(',')
+            .map(str::trim)
+            .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
+    }) {
         ctx.metadata.insert(
             ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
-            "true".to_string(),
+            encoding.clone(),
         );
     }
     if response_status == 206 || response_headers.contains_key("content-range") {
@@ -1158,12 +1185,13 @@ fn simulate_later_after_proxy_headers(
 }
 
 /// Refine the pre-flight `stream_response` decision once the backend response
-/// headers — and therefore the response `Content-Type` — are known.
+/// headers — including representation metadata such as `Content-Type` and
+/// `Content-Encoding` — are known.
 ///
 /// [`should_stream_response_body`] runs before the backend request is sent, so
-/// it cannot consult the response content-type and conservatively buffers
-/// whenever any plugin *might* need the body. This downgrades buffer -> stream
-/// when no plugin actually needs to inspect the body for THIS content-type
+/// it cannot consult the response headers and conservatively buffers whenever
+/// any plugin *might* need the body. This downgrades buffer -> stream when no
+/// plugin actually needs to inspect the body for THIS representation
 /// (e.g. `waf` with `response_body_inspection` skips non-allowlisted/binary
 /// bodies), avoiding a full-body collection that would be discarded unscanned.
 ///
@@ -1282,9 +1310,10 @@ pub(crate) fn refine_stream_response_for_content_type(
         return false;
     }
     // Keep buffering only while at least one plugin still needs the body for
-    // this content-type; otherwise stream it straight through. Plugins also see
-    // the response status/headers so a plugin can release a response it will not
-    // transform (e.g. `compression` skips `206`/`Content-Range` range responses).
+    // this response representation; otherwise stream it straight through.
+    // Plugins see the response status and full header map so they can account
+    // for Content-Encoding or release a response they will not transform (e.g.
+    // `compression` skips `206`/`Content-Range` range responses).
     !plugins.iter().any(|plugin| {
         plugin.should_buffer_response_body_for_content_type(
             ctx,
@@ -2215,12 +2244,28 @@ enum RequestBodyBufferError {
     TooLarge,
     ClientDisconnected(String),
     TimedOut,
+    DeadlineExceeded,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RequestBodyWaitError {
+    TimedOut,
+    DeadlineExceeded,
+}
+
+impl From<RequestBodyWaitError> for RequestBodyBufferError {
+    fn from(error: RequestBodyWaitError) -> Self {
+        match error {
+            RequestBodyWaitError::TimedOut => Self::TimedOut,
+            RequestBodyWaitError::DeadlineExceeded => Self::DeadlineExceeded,
+        }
+    }
 }
 
 async fn collect_request_body_with_timeout<F, T, E>(
     collect: F,
     request_body_read_timeout_ms: u64,
-) -> Result<Result<T, E>, RequestBodyBufferError>
+) -> Result<Result<T, E>, RequestBodyWaitError>
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
@@ -2230,7 +2275,39 @@ where
 
     tokio::time::timeout(Duration::from_millis(request_body_read_timeout_ms), collect)
         .await
-        .map_err(|_| RequestBodyBufferError::TimedOut)
+        .map_err(|_| RequestBodyWaitError::TimedOut)
+}
+
+async fn collect_request_body_with_deadline<F, T, E>(
+    collect: F,
+    deadline: Option<tokio::time::Instant>,
+    request_body_read_timeout_ms: u64,
+) -> Result<Result<T, E>, RequestBodyWaitError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    if let Some(deadline) = deadline {
+        // The RPC deadline is an end-to-end ceiling, while the configured
+        // read timeout remains the operator's client-upload stall guard. Keep
+        // both by waiting only until the earlier instant; a very large
+        // grpc-timeout must not disable the operator bound.
+        let (effective_deadline, timeout_error) = if request_body_read_timeout_ms > 0 {
+            match tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(request_body_read_timeout_ms))
+            {
+                Some(read_deadline) if read_deadline < deadline => {
+                    (read_deadline, RequestBodyWaitError::TimedOut)
+                }
+                _ => (deadline, RequestBodyWaitError::DeadlineExceeded),
+            }
+        } else {
+            (deadline, RequestBodyWaitError::DeadlineExceeded)
+        };
+        return tokio::time::timeout_at(effective_deadline, collect)
+            .await
+            .map_err(|_| timeout_error);
+    }
+    collect_request_body_with_timeout(collect, request_body_read_timeout_ms).await
 }
 
 pub(crate) fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
@@ -2249,8 +2326,14 @@ async fn buffer_request_body_for_before_proxy(
     headers: &HashMap<String, String>,
     max_request_body_size_bytes: usize,
     request_body_read_timeout_ms: u64,
+    grpc_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<ClientRequestBody, RequestBodyBufferError> {
-    if !request_may_have_body(method, headers) {
+    // Keep the existing no-collection fast path only when the method/header
+    // classification and the protocol body state agree that the request is
+    // empty. In particular, an H2 GET/HEAD/OPTIONS request can omit
+    // Content-Length while keeping the stream open for DATA, so method/header
+    // heuristics alone must not infer an empty body.
+    if !request_may_have_body(method, headers) && hyper::body::Body::is_end_stream(request.body()) {
         return Ok(ClientRequestBody::Streaming(Box::new(request)));
     }
 
@@ -2265,9 +2348,12 @@ async fn buffer_request_body_for_before_proxy(
     let (_parts, body) = request.into_parts();
     let body_bytes = if max_request_body_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_request_body_size_bytes);
-        let collected =
-            collect_request_body_with_timeout(limited.collect(), request_body_read_timeout_ms)
-                .await?;
+        let collected = collect_request_body_with_deadline(
+            limited.collect(),
+            grpc_deadline_at,
+            request_body_read_timeout_ms,
+        )
+        .await?;
         collected
             .map_err(|e| {
                 // Limited::collect() returns either a LengthLimitError (the body
@@ -2287,8 +2373,12 @@ async fn buffer_request_body_for_before_proxy(
             .to_bytes()
             .to_vec()
     } else {
-        let collected =
-            collect_request_body_with_timeout(body.collect(), request_body_read_timeout_ms).await?;
+        let collected = collect_request_body_with_deadline(
+            body.collect(),
+            grpc_deadline_at,
+            request_body_read_timeout_ms,
+        )
+        .await?;
         collected
             .map_err(|e| RequestBodyBufferError::ClientDisconnected(e.to_string()))?
             .to_bytes()
@@ -2303,6 +2393,7 @@ pub(crate) fn store_request_body_metadata(
     body: &[u8],
     needs_body_text: bool,
     needs_body_bytes: bool,
+    needs_body_digests: bool,
 ) {
     ctx.metadata.insert(
         "request_body_size_bytes".to_string(),
@@ -2322,6 +2413,13 @@ pub(crate) fn store_request_body_metadata(
     if needs_body_bytes && ctx.request_body_bytes.is_none() {
         ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
     }
+    if needs_body_digests
+        && (ctx.request_body_sha256.is_none() || ctx.request_body_sha512.is_none())
+    {
+        use sha2::{Digest, Sha256, Sha512};
+        ctx.request_body_sha256 = Some(Sha256::digest(body).into());
+        ctx.request_body_sha512 = Some(Sha512::digest(body).into());
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2329,6 +2427,7 @@ pub(crate) struct RequestBodyPhaseRequirements {
     pub required: bool,
     pub needs_text: bool,
     pub needs_bytes: bool,
+    pub needs_digests: bool,
     pub plugin_limit: Option<usize>,
 }
 
@@ -2346,6 +2445,33 @@ pub(crate) fn request_body_requirements_before_authorize(
         requirements.required = true;
         requirements.needs_text |= plugin.needs_request_body_text();
         requirements.needs_bytes |= plugin.needs_request_body_bytes();
+        requirements.needs_digests |= plugin.needs_request_body_digests();
+        if let Some(limit) = plugin.request_body_buffer_limit() {
+            requirements.plugin_limit = Some(
+                requirements
+                    .plugin_limit
+                    .map_or(limit, |current| current.min(limit)),
+            );
+        }
+    }
+    requirements
+}
+
+pub(crate) fn request_body_requirements_before_before_proxy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> RequestBodyPhaseRequirements {
+    let mut requirements = RequestBodyPhaseRequirements::default();
+    for plugin in plugins {
+        if !plugin.requires_request_body_before_before_proxy()
+            || !plugin.should_buffer_request_body(ctx)
+        {
+            continue;
+        }
+        requirements.required = true;
+        requirements.needs_text |= plugin.needs_request_body_text();
+        requirements.needs_bytes |= plugin.needs_request_body_bytes();
+        requirements.needs_digests |= plugin.needs_request_body_digests();
         if let Some(limit) = plugin.request_body_buffer_limit() {
             requirements.plugin_limit = Some(
                 requirements
@@ -2360,17 +2486,26 @@ pub(crate) fn request_body_requirements_before_authorize(
 pub(crate) fn request_body_requirements_before_authenticate(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
+    consumer_index: &ConsumerIndex,
 ) -> RequestBodyPhaseRequirements {
     let mut requirements = RequestBodyPhaseRequirements::default();
     for plugin in plugins {
         if !plugin.requires_request_body_before_authenticate()
-            || !plugin.should_buffer_request_body(ctx)
+            || !plugin.should_buffer_request_body_before_authenticate(ctx, consumer_index)
         {
             continue;
         }
         requirements.required = true;
         requirements.needs_text |= plugin.needs_request_body_text();
         requirements.needs_bytes |= plugin.needs_request_body_bytes();
+        requirements.needs_digests |= plugin.needs_request_body_digests();
+        if let Some(limit) = plugin.request_body_buffer_limit() {
+            requirements.plugin_limit = Some(
+                requirements
+                    .plugin_limit
+                    .map_or(limit, |current| current.min(limit)),
+            );
+        }
     }
     requirements
 }
@@ -3210,17 +3345,10 @@ fn is_forwarded_token(value: &str) -> bool {
         })
 }
 
-pub(crate) async fn apply_request_body_plugins(
-    plugins: &[Arc<dyn Plugin>],
-    headers: &HashMap<String, String>,
-    body_bytes: Vec<u8>,
-) -> Vec<u8> {
-    apply_request_body_plugins_with_context(plugins, None, headers, body_bytes).await
-}
-
 pub(crate) async fn apply_request_body_plugins_with_context(
     plugins: &[Arc<dyn Plugin>],
     mut ctx: Option<&mut RequestContext>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
     headers: &HashMap<String, String>,
     body_bytes: Vec<u8>,
 ) -> Vec<u8> {
@@ -3231,18 +3359,56 @@ pub(crate) async fn apply_request_body_plugins_with_context(
     let content_type = headers.get("content-type").map(|value| value.as_str());
     let mut current = body_bytes;
     for plugin in plugins {
-        if plugin.modifies_request_body()
-            && let Some(transformed) = if let Some(ctx) = ctx.as_deref_mut() {
-                plugin
-                    .transform_request_body_with_context(ctx, &current, content_type, headers)
+        if plugin.modifies_request_body() {
+            let deadline = ctx
+                .as_deref()
+                .and_then(RequestContext::grpc_deadline_at)
+                .or(grpc_deadline_at);
+            let transformed = if let Some(ctx) = ctx.as_deref_mut() {
+                if let Some(deadline) = deadline {
+                    match tokio::time::timeout_at(
+                        deadline,
+                        plugin.transform_request_body_with_context(
+                            ctx,
+                            &current,
+                            content_type,
+                            headers,
+                        ),
+                    )
                     .await
+                    {
+                        Ok(transformed) => transformed,
+                        Err(_) => {
+                            ctx.metadata.insert(
+                                "grpc_deadline.request_body_transform_timed_out".to_string(),
+                                "true".to_string(),
+                            );
+                            break;
+                        }
+                    }
+                } else {
+                    plugin
+                        .transform_request_body_with_context(ctx, &current, content_type, headers)
+                        .await
+                }
+            } else if let Some(deadline) = deadline {
+                match tokio::time::timeout_at(
+                    deadline,
+                    plugin.transform_request_body(&current, content_type, headers),
+                )
+                .await
+                {
+                    Ok(transformed) => transformed,
+                    Err(_) => break,
+                }
             } else {
                 plugin
                     .transform_request_body(&current, content_type, headers)
                     .await
+            };
+            if let Some(transformed) = transformed {
+                current = transformed;
             }
-        {
-            current = transformed;
         }
     }
     current
@@ -3251,25 +3417,87 @@ pub(crate) async fn apply_request_body_plugins_with_context(
 pub(crate) async fn run_final_request_body_hooks(
     plugins: &[Arc<dyn Plugin>],
     mut ctx: Option<&mut RequestContext>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
     headers: &HashMap<String, String>,
     body: &[u8],
 ) -> PluginResult {
+    match run_final_request_body_hooks_with_provenance(
+        plugins,
+        ctx.as_deref_mut(),
+        grpc_deadline_at,
+        headers,
+        body,
+    )
+    .await
+    {
+        crate::plugins::RequestPluginDeadlineResult::Completed(result) => result,
+        crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded => {
+            if let Some(ctx) = ctx {
+                ctx.mark_gateway_deadline_response_selected();
+            }
+            crate::plugins::grpc_deadline_exceeded_plugin_result()
+        }
+    }
+}
+
+pub(crate) async fn run_final_request_body_hooks_with_provenance(
+    plugins: &[Arc<dyn Plugin>],
+    mut ctx: Option<&mut RequestContext>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> crate::plugins::RequestPluginDeadlineResult {
+    let deadline_expired = grpc_deadline_at
+        .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+        || ctx.as_deref().is_some_and(|ctx| {
+            ctx.metadata
+                .get("grpc_deadline.request_body_transform_timed_out")
+                .is_some_and(|value| value == "true")
+                || ctx
+                    .grpc_deadline_at()
+                    .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+        });
+    if deadline_expired {
+        return crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded;
+    }
     for plugin in plugins {
+        let deadline = ctx
+            .as_deref()
+            .and_then(RequestContext::grpc_deadline_at)
+            .or(grpc_deadline_at);
         let result = if let Some(ctx) = ctx.as_deref_mut() {
-            plugin
-                .on_final_request_body_with_context(ctx, headers, body)
-                .await
+            match crate::plugins::await_grpc_deadline(
+                deadline,
+                plugin.on_final_request_body_with_context(ctx, headers, body),
+            )
+            .await
+            {
+                Ok(result) => crate::plugins::RequestPluginDeadlineResult::Completed(result),
+                Err(()) => crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded,
+            }
         } else {
-            plugin.on_final_request_body(headers, body).await
+            crate::plugins::await_request_plugin_deadline_with_provenance(
+                deadline,
+                plugin.on_final_request_body(headers, body),
+            )
+            .await
         };
         match result {
-            PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                return reject;
+            crate::plugins::RequestPluginDeadlineResult::Completed(PluginResult::Continue) => {}
+            crate::plugins::RequestPluginDeadlineResult::Completed(
+                reject @ PluginResult::Reject { .. },
+            )
+            | crate::plugins::RequestPluginDeadlineResult::Completed(
+                reject @ PluginResult::RejectBinary { .. },
+            ) => {
+                return crate::plugins::RequestPluginDeadlineResult::Completed(reject);
+            }
+            crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded => {
+                return crate::plugins::RequestPluginDeadlineResult::DeadlineExceeded;
             }
         }
     }
-    PluginResult::Continue
+    crate::plugins::RequestPluginDeadlineResult::Completed(PluginResult::Continue)
 }
 
 pub(crate) struct RejectedResponseParts {
@@ -3316,7 +3544,13 @@ fn reject_result_to_backend_response(
         headers: reject.headers,
         connection_error: false,
         backend_resolved_ip,
-        error_class: (reject.status_code == 413).then_some(retry::ErrorClass::RequestBodyTooLarge),
+        // Final request-body hooks run before backend dispatch. Keep their
+        // synthetic responses terminal and neutral to backend health.
+        error_class: Some(if reject.status_code == 413 {
+            retry::ErrorClass::RequestBodyTooLarge
+        } else {
+            retry::ErrorClass::DispatchPolicyRejected
+        }),
     }
 }
 
@@ -6523,6 +6757,9 @@ impl ProxyState {
     ///     500 every request through that proxy.
     ///   - `validate_plugin_references` — dangling plugin IDs / wrong
     ///     scope.
+    ///   - `validate_unique_mtls_dns_identities` — case-variant identities
+    ///     would collapse into one `ConsumerIndex` DNS key when an effective
+    ///     `mtls_auth` `san_dns` policy is enabled.
     ///   - `validate_mesh_route_dispatch_upstream_references` — dangling
     ///     `mesh_route_dispatch.destination.upstream_id` references are
     ///     observationally identical to a dangling `Proxy.upstream_id`:
@@ -6586,6 +6823,9 @@ impl ProxyState {
             errors.extend(errs);
         }
         if let Err(errs) = config.validate_plugin_references() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_unique_mtls_dns_identities() {
             errors.extend(errs);
         }
         if let Err(errs) = validate_mesh_route_dispatch_upstream_references(config) {
@@ -7058,6 +7298,13 @@ impl ProxyState {
         new_config.normalize_fields();
         // Resolve upstream TLS into each proxy's resolved_tls before applying.
         new_config.resolve_upstream_tls();
+        // Full snapshots can arrive from sources that bypass the SQL/Mongo
+        // loaders, notably CP-to-DP config sync. Quarantine malformed, weak,
+        // or cross-Consumer duplicate HMAC credentials at the common swap
+        // boundary so none can reach the runtime ConsumerIndex.
+        for message in new_config.quarantine_invalid_hmac_credentials() {
+            error!("Config reload: {}", message);
+        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -7659,6 +7906,15 @@ impl ProxyState {
         // canonicalized fields.
         new_config.normalize_fields();
         new_config.resolve_upstream_tls();
+        // Fail-closed hmac_auth secret policy for point-loaded consumer rows:
+        // full snapshots quarantine weak/duplicate HMAC secrets in
+        // `update_config`, but deltas from non-database or older control-plane
+        // sources can still merge raw consumer rows through this separate
+        // path. Storage constraints backstop normal admin races; this boundary
+        // retains defense in depth for out-of-band data.
+        for message in new_config.quarantine_invalid_hmac_credentials() {
+            error!("Incremental config: {}", message);
+        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -8097,6 +8353,80 @@ pub fn try_acquire_websocket_connection_permit(
     }
 }
 
+const WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS: [&str; 14] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "sec-websocket-accept",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-protocol",
+    "sec-websocket-extensions",
+];
+
+fn is_websocket_transport_managed_response_header(name: &str) -> bool {
+    // The ordinary backend response strip predicate is lowercase-only because
+    // backend maps are canonical. Plugin rejection maps can retain caller case,
+    // so keep the boundary comparison case-insensitive without allocating a
+    // lowercased copy on every WebSocket handshake.
+    WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+pub(crate) fn strip_websocket_transport_managed_response_header_map(
+    response_headers: &mut HashMap<String, String>,
+) {
+    response_headers.retain(|name, _| !is_websocket_transport_managed_response_header(name));
+}
+
+/// Apply deterministic initial-response policy at the WebSocket boundary, then
+/// remove transport-managed fields. Successful handshake builders add their
+/// protocol-required Upgrade / Extended CONNECT metadata after this returns, so
+/// a configured remove or hostile replacement cannot corrupt H1, H2, or H3
+/// handshake semantics. Negotiated subprotocol metadata is likewise added only
+/// from the verified backend handshake.
+pub(crate) fn finalize_websocket_response_headers(
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    response_headers: &mut HashMap<String, String>,
+) {
+    crate::plugins::apply_initial_response_header_policies(
+        initial_response_header_policy_plugins,
+        response_headers,
+    );
+    strip_websocket_transport_managed_response_header_map(response_headers);
+}
+
+fn build_websocket_error_response(
+    status: StatusCode,
+    body: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Response<ProxyBody> {
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    finalize_websocket_response_headers(
+        initial_response_header_policy_plugins,
+        &mut response_headers,
+    );
+    headers_mod::apply_response_headers(Response::builder().status(status), &response_headers)
+        .body(ProxyBody::from_string(body))
+        .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
+}
+
+fn build_websocket_error_fallback_response(status: StatusCode) -> Response<ProxyBody> {
+    let mut response = Response::new(ProxyBody::from_string(
+        r#"{"error":"Internal server error"}"#,
+    ));
+    *response.status_mut() = status;
+    response
+}
+
 /// Handle WebSocket requests AFTER authentication and authorization plugins have run.
 ///
 /// Supports both HTTP/1.1 Upgrade (101 Switching Protocols) and HTTP/2 Extended CONNECT
@@ -8111,6 +8441,7 @@ async fn handle_websocket_request_authenticated(
     ctx: RequestContext,
     proxy_headers: HashMap<String, String>,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
     epoch: Arc<RequestEpoch>,
@@ -8127,6 +8458,7 @@ async fn handle_websocket_request_authenticated(
     requires_ws_frame_hooks: bool,
     query_string: String,
     strip_len: usize,
+    backend_path_is_policy_bound: bool,
     // The client-requested path before any VirtualService `rewrite.uri`
     // was applied. Used for `request_path` in transaction logs so that
     // access logs record what the client sent, not the backend-rewritten
@@ -8139,6 +8471,11 @@ async fn handle_websocket_request_authenticated(
         remote_addr.ip()
     );
     let mut ctx = ctx;
+    // This dedicated handler is itself the authoritative flavor boundary.
+    // Stamp it again here so every rejection it owns is stripped before the
+    // generic finalizer invokes committed-response observers, independent of
+    // how the caller classified or constructed the request context.
+    ctx.set_websocket_response_boundary(true);
     let mut current_cb_target_key = cb_target_key;
 
     // Build backend URL using upstream target if available
@@ -8175,9 +8512,10 @@ async fn handle_websocket_request_authenticated(
                 current_cb_target_key.as_deref(),
                 cb_is_half_open_probe,
             );
-            return Ok(build_response(
+            return Ok(build_websocket_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 r#"{"error":"Internal server error during WebSocket upgrade"}"#,
+                &initial_response_header_policy_plugins,
             ));
         }
     };
@@ -8216,9 +8554,10 @@ async fn handle_websocket_request_authenticated(
                     current_cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
-                return Ok(build_response(
+                return Ok(build_websocket_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"WebSocket connection limit exceeded"}"#,
+                    &initial_response_header_policy_plugins,
                 ));
             }
         };
@@ -8334,9 +8673,10 @@ async fn handle_websocket_request_authenticated(
                     current_cb_target_key.as_deref(),
                     ws_cb_probe_slot_available,
                 );
-                return Ok(build_response(
+                return Ok(build_websocket_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"Backend connection limit exceeded"}"#,
+                    &initial_response_header_policy_plugins,
                 ));
             }
         };
@@ -8358,7 +8698,7 @@ async fn handle_websocket_request_authenticated(
                     current_cb_target_key.as_deref(),
                     ws_cb_probe_slot_available,
                 );
-                return Ok(handle_backend_admission_rejection(
+                let response = handle_backend_admission_rejection(
                     rejection,
                     &plugins,
                     &mut ctx,
@@ -8369,7 +8709,8 @@ async fn handle_websocket_request_authenticated(
                     false,
                     None,
                 )
-                .await);
+                .await;
+                return Ok(response);
             }
         };
 
@@ -8536,7 +8877,11 @@ async fn handle_websocket_request_authenticated(
                         Some(rc) => rc,
                         None => {
                             let ws_body = r#"{"error":"Backend WebSocket connection failed"}"#;
-                            return Ok(build_response(StatusCode::BAD_GATEWAY, ws_body));
+                            return Ok(build_websocket_error_response(
+                                StatusCode::BAD_GATEWAY,
+                                ws_body,
+                                &initial_response_header_policy_plugins,
+                            ));
                         }
                     };
 
@@ -8561,13 +8906,10 @@ async fn handle_websocket_request_authenticated(
                         cb_failure_already_recorded = true;
                     }
 
-                    let delay = retry::retry_delay(retry_config, ws_attempt);
-                    tokio::time::sleep(delay).await;
-                    ws_attempt += 1;
-
                     let mut retry_backend_url = current_backend_url.clone();
                     let mut retry_target = current_target.clone();
                     let mut retry_cb_target_key = current_cb_target_key.clone();
+                    let mut retry_path_mismatch = false;
 
                     // Try a different target on retry if load balancing is configured
                     if let (Some(_upstream_id), Some(prev_target)) =
@@ -8583,18 +8925,39 @@ async fn handle_websocket_request_authenticated(
                             &ctx.headers,
                         )
                     {
-                        retry_backend_url = build_websocket_backend_url_with_target(
+                        if !retry_target_preserves_backend_path(
+                            backend_path_is_policy_bound,
                             &proxy,
                             &ctx.path,
-                            &query_string,
-                            &next.host,
-                            next.port,
                             strip_len,
-                            next.path.as_deref(),
-                        );
-                        retry_cb_target_key =
-                            Some(crate::circuit_breaker::target_key(&next.host, next.port));
-                        retry_target = Some(next);
+                            prev_target,
+                            &next,
+                        ) {
+                            retry_path_mismatch = true;
+                            warn!(
+                                proxy_id = %proxy.id,
+                                "Aborting WebSocket retry because the candidate would change the authorized backend method path"
+                            );
+                        } else {
+                            retry_backend_url = build_websocket_backend_url_with_target(
+                                &proxy,
+                                &ctx.path,
+                                &query_string,
+                                &next.host,
+                                next.port,
+                                strip_len,
+                                next.path.as_deref(),
+                            );
+                            retry_cb_target_key =
+                                Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                            retry_target = Some(next);
+                        }
+                    }
+
+                    if !retry_path_mismatch {
+                        let delay = retry::retry_delay(retry_config, ws_attempt);
+                        tokio::time::sleep(delay).await;
+                        ws_attempt += 1;
                     }
 
                     // A retry may rotate to a different app-port lane, and a
@@ -8602,15 +8965,17 @@ async fn handle_websocket_request_authenticated(
                     // current lane during the retry backoff. Re-check before
                     // acquiring any admission or circuit-breaker state for the
                     // next target and before attempting its backend handshake.
-                    if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
-                        &state,
-                        ctx.mesh_direction,
-                        mesh_inbound_pre_handshake_app_port,
-                        &proxy,
-                        retry_target.as_deref(),
-                        is_tls,
-                        ctx.tls_client_cert_der.is_some(),
-                    ) {
+                    if !retry_path_mismatch
+                        && let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+                            &state,
+                            ctx.mesh_direction,
+                            mesh_inbound_pre_handshake_app_port,
+                            &proxy,
+                            retry_target.as_deref(),
+                            is_tls,
+                            ctx.tls_client_cert_der.is_some(),
+                        )
+                    {
                         return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
                             &state,
                             plugins.as_ref(),
@@ -8628,7 +8993,7 @@ async fn handle_websocket_request_authenticated(
                     }
 
                     let mut retry_admitted_by_cb = true;
-                    if let Some(cb_config) = &proxy.circuit_breaker {
+                    if !retry_path_mismatch && let Some(cb_config) = &proxy.circuit_breaker {
                         match state.circuit_breaker_cache.can_execute(
                             &proxy.id,
                             retry_cb_target_key.as_deref(),
@@ -8648,7 +9013,7 @@ async fn handle_websocket_request_authenticated(
                         }
                     }
 
-                    if retry_admitted_by_cb {
+                    if retry_admitted_by_cb && !retry_path_mismatch {
                         current_backend_url = retry_backend_url;
                         current_target = retry_target;
                         current_cb_target_key = retry_cb_target_key;
@@ -8763,7 +9128,10 @@ async fn handle_websocket_request_authenticated(
                             metadata,
                             ..TransactionSummary::default()
                         };
-                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                        crate::plugins::log_with_mirror_before_buffered_response(
+                            &plugins, summary, &ctx,
+                        )
+                        .await;
                     }
                 } else {
                     crate::runtime_metrics::global_ref()
@@ -8771,7 +9139,11 @@ async fn handle_websocket_request_authenticated(
                 }
 
                 let ws_body = r#"{"error":"Backend WebSocket connection failed"}"#;
-                return Ok(build_response(StatusCode::BAD_GATEWAY, ws_body));
+                return Ok(build_websocket_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    ws_body,
+                    &initial_response_header_policy_plugins,
+                ));
             }
         }
     };
@@ -8918,40 +9290,17 @@ async fn handle_websocket_request_authenticated(
         ..TransactionSummary::default()
     };
 
-    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+    crate::plugins::log_with_mirror_before_buffered_response(&plugins, summary, &ctx).await;
 
-    // Build the upgrade response.
-    // HTTP/2 Extended CONNECT (RFC 8441): 200 OK — the H2 stream becomes the WebSocket
-    // transport. No Upgrade/Connection/Sec-WebSocket-Accept headers (those are HTTP/1.1).
-    // HTTP/1.1: 101 Switching Protocols with standard WebSocket handshake headers.
-    let mut ws_resp_builder = if is_h2_websocket {
-        Response::builder().status(StatusCode::OK)
-    } else {
-        Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
-            .header("upgrade", "websocket")
-            .header("connection", "upgrade")
-            .header(
-                "sec-websocket-accept",
-                ws_accept_from_key(
-                    parts
-                        .headers
-                        .get("sec-websocket-key")
-                        .and_then(|k| k.to_str().ok())
-                        .unwrap_or(""),
-                ),
-            )
-    };
-
-    // Forward the backend's negotiated subprotocol (RFC 6455 §11.3.4, RFC
-    // 8441 §5.2). Clients that send `Sec-WebSocket-Protocol` expect the
-    // server to confirm the selected value; dropping it breaks
-    // subprotocol-based dispatch in application code.
-    if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
-        ws_resp_builder = ws_resp_builder.header("sec-websocket-protocol", proto);
-    }
-
-    // Inject sticky session cookie on WebSocket upgrade responses
+    // Apply response policy before gateway-owned affinity and transport fields.
+    // This matches ordinary HTTP/gRPC ordering: operator policy governs backend
+    // metadata, while the gateway's selected-target cookie and mandatory
+    // handshake fields are committed at the client boundary afterward.
+    let mut response_headers = HashMap::new();
+    finalize_websocket_response_headers(
+        &initial_response_header_policy_plugins,
+        &mut response_headers,
+    );
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
@@ -8969,13 +9318,53 @@ async fn handle_websocket_request_authenticated(
                 .and_then(|u| u.hash_on_cookie_config.as_ref())
                 .unwrap_or(&default_cc);
             let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
-            ws_resp_builder = ws_resp_builder.header("set-cookie", cookie_val);
+            headers_mod::append_set_cookie_header(&mut response_headers, cookie_val);
         }
+    }
+
+    // Build the upgrade response.
+    // HTTP/2 Extended CONNECT (RFC 8441): 200 OK — the H2 stream becomes the WebSocket
+    // transport. No Upgrade/Connection/Sec-WebSocket-Accept headers (those are HTTP/1.1).
+    // HTTP/1.1: 101 Switching Protocols with standard WebSocket handshake headers.
+    let response_status = if is_h2_websocket {
+        StatusCode::OK
+    } else {
+        StatusCode::SWITCHING_PROTOCOLS
+    };
+    let mut ws_resp_builder = headers_mod::apply_response_headers(
+        Response::builder().status(response_status),
+        &response_headers,
+    );
+    if !is_h2_websocket {
+        ws_resp_builder = ws_resp_builder
+            .header("upgrade", "websocket")
+            .header("connection", "upgrade")
+            .header(
+                "sec-websocket-accept",
+                ws_accept_from_key(
+                    parts
+                        .headers
+                        .get("sec-websocket-key")
+                        .and_then(|k| k.to_str().ok())
+                        .unwrap_or(""),
+                ),
+            );
+    }
+
+    // Forward the backend's negotiated subprotocol (RFC 6455 §11.3.4, RFC
+    // 8441 §5.2). It is appended after response policy so configuration cannot
+    // remove it or fabricate a value the backend did not negotiate.
+    if let Some(proto) = backend_handshake.negotiated_subprotocol().cloned() {
+        ws_resp_builder = ws_resp_builder.header("sec-websocket-protocol", proto);
     }
 
     let upgrade_response = ws_resp_builder
         .body(ProxyBody::empty())
-        .unwrap_or_else(|_| Response::new(ProxyBody::empty()));
+        .unwrap_or_else(|_| {
+            let mut response = Response::new(ProxyBody::empty());
+            *response.status_mut() = response_status;
+            response
+        });
 
     // Collect plugins that opted into per-frame WebSocket hooks. `plugins`
     // was resolved from the request's plugin-cache snapshot, so the upgrade
@@ -9347,8 +9736,51 @@ fn push_forwardable_header_override(
 }
 
 fn sanitize_reserved_consumer_identity_headers(headers: &mut HashMap<String, String>) {
-    headers.remove("x-consumer-username");
-    headers.remove("x-consumer-custom-id");
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("x-consumer-username")
+            && !name.eq_ignore_ascii_case("x-consumer-custom-id")
+    });
+}
+
+/// Remove plugin-controlled consumer identity headers and restore only the
+/// gateway-authenticated values for backend dispatch.
+pub(crate) fn refresh_backend_consumer_identity_headers(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    let principal_username = ctx.backend_consumer_username().map(str::to_string);
+    let principal_custom_id = principal_username
+        .as_ref()
+        .and_then(|_| ctx.backend_consumer_custom_id().map(str::to_string));
+    let source_has_reserved_identity = principal_username.is_none()
+        && headers.keys().any(|name| {
+            name.eq_ignore_ascii_case("x-consumer-username")
+                || name.eq_ignore_ascii_case("x-consumer-custom-id")
+        });
+    if principal_username.is_none() && !source_has_reserved_identity {
+        return;
+    }
+
+    sanitize_reserved_consumer_identity_headers(headers);
+    if let Some(username) = principal_username {
+        headers.insert("x-consumer-username".to_string(), username);
+        if let Some(custom_id) = principal_custom_id {
+            headers.insert("x-consumer-custom-id".to_string(), custom_id);
+        }
+    }
+}
+
+fn refresh_effective_backend_consumer_identity_headers(
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    if let Some(headers) = owned_proxy_headers.as_mut() {
+        refresh_backend_consumer_identity_headers(ctx, headers);
+    } else {
+        let mut headers = std::mem::take(&mut ctx.headers);
+        refresh_backend_consumer_identity_headers(ctx, &mut headers);
+        ctx.headers = headers;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -9402,6 +9834,79 @@ fn push_backend_path(url: &mut String, backend_path: &str, remaining_path: &str)
         url.push('/');
     }
     url.push_str(remaining_path);
+}
+
+fn with_backend_path_parts<R>(
+    proxy: &Proxy,
+    incoming_path: &str,
+    strip_len: usize,
+    target_path: Option<&str>,
+    use_parts: impl FnOnce(&str, &str) -> R,
+) -> R {
+    // `strip_len` is measured by the router after encoded-slash
+    // normalization, so stripping must use the same coordinate system.
+    let normalized_path = if proxy.strip_listen_path {
+        Some(crate::router_cache::normalize_encoded_slashes(
+            incoming_path,
+        ))
+    } else {
+        None
+    };
+    let remaining_path = match &normalized_path {
+        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
+        None => incoming_path,
+    };
+    let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
+    use_parts(backend_path, remaining_path)
+}
+
+/// Assemble the exact path that URL construction will forward to the selected
+/// backend target. This intentionally shares path segmentation with
+/// [`build_backend_url_with_target`] so post-routing policy cannot authorize a
+/// path that differs from the one placed on the wire.
+pub fn build_backend_effective_path(
+    proxy: &Proxy,
+    incoming_path: &str,
+    strip_len: usize,
+    target_path: Option<&str>,
+) -> String {
+    with_backend_path_parts(
+        proxy,
+        incoming_path,
+        strip_len,
+        target_path,
+        |backend_path, remaining_path| {
+            let layout = backend_path_layout(backend_path, remaining_path);
+            let mut path = String::with_capacity(layout.len);
+            push_backend_path(&mut path, backend_path, remaining_path);
+            path
+        },
+    )
+}
+
+/// Once a route-sensitive plugin has authorized the first target's assembled
+/// path, retries may rotate hosts and ports but must not select a different
+/// assembled effective path without rerunning policy and charging another
+/// method. Comparing the URL-builder output includes the proxy backend-path
+/// fallback used when a target omits its own path. Keeping the authorized path
+/// immutable avoids turning transport retry into a second routing decision.
+#[doc(hidden)]
+pub fn retry_target_preserves_backend_path(
+    backend_path_is_policy_bound: bool,
+    proxy: &Proxy,
+    incoming_path: &str,
+    strip_len: usize,
+    previous: &UpstreamTarget,
+    next: &UpstreamTarget,
+) -> bool {
+    if !backend_path_is_policy_bound {
+        return true;
+    }
+    let previous_path = previous.path.as_deref().or(proxy.backend_path.as_deref());
+    let next_path = next.path.as_deref().or(proxy.backend_path.as_deref());
+    previous_path == next_path
+        || build_backend_effective_path(proxy, incoming_path, strip_len, previous.path.as_deref())
+            == build_backend_effective_path(proxy, incoming_path, strip_len, next.path.as_deref())
 }
 
 fn url_render_host(host: &str) -> std::borrow::Cow<'_, str> {
@@ -12892,7 +13397,222 @@ pub(crate) async fn log_rejected_request_with_path(
         ..TransactionSummary::default()
     };
 
-    crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
+    crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
+}
+
+/// Keep already-applied response decorators while removing fields that describe
+/// the response representation, transport framing, cache state, or terminal
+/// gRPC outcome being replaced. `Vary: Origin` is retained explicitly because
+/// it is part of the CORS decorator contract rather than backend content
+/// negotiation for the discarded representation.
+fn retain_deadline_response_decorators(response_headers: &mut HashMap<String, String>) {
+    let preserve_origin_vary = response_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("vary"))
+        .is_some_and(|(_, value)| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("origin"))
+        });
+    response_headers.retain(|name, _| {
+        ![
+            "accept-ranges",
+            "age",
+            "cache-control",
+            "cdn-cache-control",
+            "connection",
+            "content-encoding",
+            "content-digest",
+            "content-language",
+            "content-length",
+            "content-location",
+            "content-md5",
+            "content-range",
+            "content-type",
+            "digest",
+            "etag",
+            "expires",
+            "grpc-accept-encoding",
+            "grpc-encoding",
+            "grpc-message",
+            "grpc-previous-rpc-attempts",
+            "grpc-retry-pushback-ms",
+            "grpc-status",
+            "grpc-status-details-bin",
+            "keep-alive",
+            "last-modified",
+            "pragma",
+            "proxy-authenticate",
+            "proxy-connection",
+            "proxy-status",
+            "repr-digest",
+            "retry-after",
+            "surrogate-control",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "vary",
+            "warning",
+        ]
+        .iter()
+        .any(|managed| name.eq_ignore_ascii_case(managed))
+    });
+    if preserve_origin_vary {
+        response_headers.insert("vary".to_string(), "Origin".to_string());
+    }
+}
+
+fn replace_rejection_with_gateway_deadline(
+    status_code: &mut u16,
+    response_body: Option<&mut Vec<u8>>,
+    response_headers: &mut HashMap<String, String>,
+) {
+    *status_code = StatusCode::OK.as_u16();
+    if let Some(body) = response_body {
+        body.clear();
+    }
+    retain_deadline_response_decorators(response_headers);
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    response_headers.insert(
+        "grpc-status".to_string(),
+        GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+    );
+    response_headers.insert(
+        "grpc-message".to_string(),
+        GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
+    );
+}
+
+const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct OwnedRejectionHookResult {
+    ctx: RequestContext,
+    status_code: u16,
+    response_body: Option<Vec<u8>>,
+    response_headers: HashMap<String, String>,
+    result: PluginResult,
+}
+
+type OwnedRejectionHookFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = OwnedRejectionHookResult> + Send + 'static>>;
+
+fn owned_rejection_hook_future(
+    plugin: Arc<dyn Plugin>,
+    mut ctx: RequestContext,
+    status_code: u16,
+    response_body: Option<Vec<u8>>,
+    mut response_headers: HashMap<String, String>,
+) -> OwnedRejectionHookFuture {
+    Box::pin(async move {
+        let result = plugin
+            .after_proxy(&mut ctx, status_code, &mut response_headers)
+            .await;
+        OwnedRejectionHookResult {
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+            result,
+        }
+    })
+}
+
+async fn poll_owned_rejection_hook_once(
+    future: &mut OwnedRejectionHookFuture,
+) -> Option<OwnedRejectionHookResult> {
+    futures_util::future::poll_fn(|cx| {
+        Poll::Ready(match std::future::Future::poll(future.as_mut(), cx) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        })
+    })
+    .await
+}
+
+fn adopt_owned_rejection_hook_result(
+    outcome: OwnedRejectionHookResult,
+    ctx: &mut RequestContext,
+    status_code: &mut u16,
+    response_body: &mut Option<&mut Vec<u8>>,
+    response_headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    *ctx = outcome.ctx;
+    *status_code = outcome.status_code;
+    if let (Some(body), Some(owned_body)) = (response_body.as_deref_mut(), outcome.response_body) {
+        *body = owned_body;
+    }
+    *response_headers = outcome.response_headers;
+    outcome.result
+}
+
+fn restore_rejection_response_markers(
+    ctx: &mut RequestContext,
+    previous_marker: Option<String>,
+    previous_replaceable_marker: Option<String>,
+) {
+    if let Some(previous_marker) = previous_marker {
+        ctx.metadata
+            .insert(REJECTION_RESPONSE_METADATA_KEY.to_string(), previous_marker);
+    } else {
+        ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
+    }
+    if let Some(previous_marker) = previous_replaceable_marker {
+        ctx.metadata.insert(
+            REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY.to_string(),
+            previous_marker,
+        );
+    } else {
+        ctx.metadata
+            .remove(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY);
+    }
+}
+
+fn spawn_detached_rejection_cleanup(
+    pending_hook: OwnedRejectionHookFuture,
+    remaining_plugins: Vec<Arc<dyn Plugin>>,
+    previous_marker: Option<String>,
+    previous_replaceable_marker: Option<String>,
+) {
+    std::mem::drop(tokio::spawn(async move {
+        let cleanup = async move {
+            let OwnedRejectionHookResult {
+                mut ctx,
+                mut status_code,
+                mut response_body,
+                mut response_headers,
+                result: _,
+            } = pending_hook.await;
+            ctx.mark_gateway_deadline_response_selected();
+            replace_rejection_with_gateway_deadline(
+                &mut status_code,
+                response_body.as_mut(),
+                &mut response_headers,
+            );
+            for plugin in remaining_plugins {
+                if plugin.may_replace_rejection_response() {
+                    continue;
+                }
+                let _ = plugin
+                    .after_proxy(&mut ctx, status_code, &mut response_headers)
+                    .await;
+            }
+            restore_rejection_response_markers(
+                &mut ctx,
+                previous_marker,
+                previous_replaceable_marker,
+            );
+        };
+        if tokio::time::timeout(DETACHED_REJECTION_CLEANUP_TIMEOUT, cleanup)
+            .await
+            .is_err()
+        {
+            warn!(
+                timeout_seconds = DETACHED_REJECTION_CLEANUP_TIMEOUT.as_secs(),
+                "detached rejection cleanup exceeded its post-response bound"
+            );
+        }
+    }));
 }
 
 async fn run_after_proxy_hooks_on_rejection(
@@ -12915,12 +13635,134 @@ async fn run_after_proxy_hooks_on_rejection(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
         "true".to_string(),
     );
-
-    for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
-        match plugin
-            .after_proxy(ctx, *status_code, response_headers)
-            .await
-        {
+    let deadline_already_elapsed = ctx
+        .grpc_deadline_at()
+        .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+    let initial_terminal_gateway_deadline =
+        ctx.gateway_deadline_response_selected() || deadline_already_elapsed;
+    if initial_terminal_gateway_deadline {
+        ctx.mark_gateway_deadline_response_selected();
+        replace_rejection_with_gateway_deadline(
+            status_code,
+            response_body.as_deref_mut(),
+            response_headers,
+        );
+    }
+    for (index, plugin) in plugins.iter().enumerate() {
+        if !plugin.applies_after_proxy_on_reject() {
+            continue;
+        }
+        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected()
+            || ctx
+                .grpc_deadline_at()
+                .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+        if terminal_gateway_deadline {
+            ctx.mark_gateway_deadline_response_selected();
+            replace_rejection_with_gateway_deadline(
+                status_code,
+                response_body.as_deref_mut(),
+                response_headers,
+            );
+        }
+        // Once an earlier phase has selected the canonical client-deadline
+        // response, give non-replacing decorators and cleanup hooks one
+        // immediate poll. Pending work continues in order on owned state under
+        // the detached cleanup bound and cannot retain the response writer.
+        // Response-replacing hooks are skipped after the terminal deadline is
+        // selected: an already-ready replacer must never overwrite
+        // DEADLINE_EXCEEDED at the boundary.
+        if terminal_gateway_deadline && plugin.may_replace_rejection_response() {
+            continue;
+        }
+        let result = if terminal_gateway_deadline {
+            let mut future = owned_rejection_hook_future(
+                Arc::clone(plugin),
+                ctx.clone(),
+                *status_code,
+                response_body.as_deref().cloned(),
+                response_headers.clone(),
+            );
+            match poll_owned_rejection_hook_once(&mut future).await {
+                Some(outcome) => adopt_owned_rejection_hook_result(
+                    outcome,
+                    ctx,
+                    status_code,
+                    &mut response_body,
+                    response_headers,
+                ),
+                None => {
+                    spawn_detached_rejection_cleanup(
+                        future,
+                        plugins[index + 1..]
+                            .iter()
+                            .filter(|plugin| plugin.applies_after_proxy_on_reject())
+                            .cloned()
+                            .collect(),
+                        previous_marker.clone(),
+                        previous_replaceable_marker.clone(),
+                    );
+                    restore_rejection_response_markers(
+                        ctx,
+                        previous_marker,
+                        previous_replaceable_marker,
+                    );
+                    return;
+                }
+            }
+        } else if let Some(deadline) = ctx.grpc_deadline_at() {
+            let mut future = owned_rejection_hook_future(
+                Arc::clone(plugin),
+                ctx.clone(),
+                *status_code,
+                response_body.as_deref().cloned(),
+                response_headers.clone(),
+            );
+            let deadline_sleep = tokio::time::sleep_until(deadline);
+            tokio::pin!(deadline_sleep);
+            tokio::select! {
+                biased;
+                () = &mut deadline_sleep => {
+                    ctx.mark_gateway_deadline_response_selected();
+                    replace_rejection_with_gateway_deadline(
+                        status_code,
+                        response_body.as_deref_mut(),
+                        response_headers,
+                    );
+                    spawn_detached_rejection_cleanup(
+                        future,
+                        plugins[index + 1..]
+                            .iter()
+                            .filter(|plugin| plugin.applies_after_proxy_on_reject())
+                            .cloned()
+                            .collect(),
+                        previous_marker.clone(),
+                        previous_replaceable_marker.clone(),
+                    );
+                    restore_rejection_response_markers(
+                        ctx,
+                        previous_marker,
+                        previous_replaceable_marker,
+                    );
+                    return;
+                }
+                outcome = &mut future => adopt_owned_rejection_hook_result(
+                    outcome,
+                    ctx,
+                    status_code,
+                    &mut response_body,
+                    response_headers,
+                ),
+            }
+        } else {
+            plugin
+                .after_proxy(ctx, *status_code, response_headers)
+                .await
+        };
+        if terminal_gateway_deadline {
+            ctx.mark_gateway_deadline_response_selected();
+        }
+        match result {
+            PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     warn!(
@@ -12981,12 +13823,21 @@ async fn run_after_proxy_hooks_on_rejection(
                             })
                             .or_insert_with(|| "Origin".to_string());
                     }
-                    warn!(
-                        rejecting_plugin = plugin.name(),
-                        replacement_status = *status_code,
-                        replaced_status,
-                        "after_proxy plugin replaced an uncommitted rejection response"
-                    );
+                    if plugin.warn_on_rejection_response_replacement() {
+                        warn!(
+                            rejecting_plugin = plugin.name(),
+                            replacement_status = *status_code,
+                            replaced_status,
+                            "after_proxy plugin replaced an uncommitted rejection response"
+                        );
+                    } else {
+                        debug!(
+                            replacing_plugin = plugin.name(),
+                            replacement_status = *status_code,
+                            replaced_status,
+                            "after_proxy plugin normalized an uncommitted rejection response"
+                        );
+                    }
                     continue;
                 }
                 // The gateway is already committed to emitting this rejection
@@ -13006,25 +13857,19 @@ async fn run_after_proxy_hooks_on_rejection(
                      ignoring (response already committed)"
                 );
             }
-            PluginResult::Continue => {}
         }
     }
 
-    if let Some(previous_marker) = previous_marker {
-        ctx.metadata
-            .insert(REJECTION_RESPONSE_METADATA_KEY.to_string(), previous_marker);
-    } else {
-        ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
+    if ctx.gateway_deadline_response_selected()
+        || ctx
+            .grpc_deadline_at()
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+    {
+        ctx.mark_gateway_deadline_response_selected();
+        replace_rejection_with_gateway_deadline(status_code, response_body, response_headers);
     }
-    if let Some(previous_marker) = previous_replaceable_marker {
-        ctx.metadata.insert(
-            REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY.to_string(),
-            previous_marker,
-        );
-    } else {
-        ctx.metadata
-            .remove(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY);
-    }
+
+    restore_rejection_response_markers(ctx, previous_marker, previous_replaceable_marker);
 }
 
 pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
@@ -13169,9 +14014,13 @@ async fn apply_synthetic_response_body_hooks(
 
     let mut response_body_reject = None;
     for plugin in plugins.iter() {
-        let result = plugin
-            .on_response_body(ctx, *response_status, response_headers, response_body)
-            .await;
+        let deadline = ctx.grpc_deadline_at();
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.on_response_body(ctx, *response_status, response_headers, response_body),
+        )
+        .await
+        .into_plugin_result(ctx);
         match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
@@ -13197,10 +14046,22 @@ async fn apply_synthetic_response_body_hooks(
     let content_type = response_headers.get("content-type").cloned();
     let ct_ref = content_type.as_deref();
     for plugin in plugins.iter() {
-        if let Some(transformed) = plugin
-            .transform_response_body_with_context(ctx, response_body, ct_ref, response_headers)
-            .await
+        let deadline = ctx.grpc_deadline_at();
+        let transformed = match crate::plugins::await_grpc_deadline(
+            deadline,
+            plugin.transform_response_body_with_context(
+                ctx,
+                response_body,
+                ct_ref,
+                response_headers,
+            ),
+        )
+        .await
         {
+            Ok(transformed) => transformed,
+            Err(()) => break,
+        };
+        if let Some(transformed) = transformed {
             response_headers.insert("content-length".to_string(), transformed.len().to_string());
             *response_body = transformed;
             plugin.on_response_body_transformed(ctx, response_headers);
@@ -13209,9 +14070,13 @@ async fn apply_synthetic_response_body_hooks(
 
     let mut response_body_reject = None;
     for plugin in plugins.iter() {
-        let result = plugin
-            .on_final_response_body(ctx, *response_status, response_headers, response_body)
-            .await;
+        let deadline = ctx.grpc_deadline_at();
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.on_final_response_body(ctx, *response_status, response_headers, response_body),
+        )
+        .await
+        .into_plugin_result(ctx);
         match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
@@ -13285,6 +14150,10 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) {
+    let original_method = ctx
+        .metadata
+        .remove(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY)
+        .map(|method_override| std::mem::replace(&mut ctx.method, method_override));
     let applied_synthetic_body_hooks = !plugins.is_empty()
         && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx);
     if applied_synthetic_body_hooks {
@@ -13318,12 +14187,26 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         // and accept the minor body-transform divergence on the synthetic path.
         apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
     }
+    if let Some(original_method) = original_method {
+        ctx.method = original_method;
+    }
     // Apply the after_proxy reject hooks exactly once, over the final response
     // (the synthetic 2xx or the body-rejection response produced above), so
     // one-shot response state (rotated session cookie, route overrides) is
     // emitted onto whatever the client actually receives. Runs LAST by design —
     // see the divergence note above.
     apply_replaceable_after_proxy_hooks_to_rejection(plugins, ctx, status, body, headers).await;
+
+    // A failed WebSocket handshake is still an ordinary HTTP response, but its
+    // transport-owned fields must come only from a successful H1 Upgrade or
+    // Extended CONNECT builder. Run this boundary after every ordered reject
+    // hook (including security_headers) so an early auth/authz/before_proxy
+    // rejection cannot expose configured Upgrade/Connection/Sec-WebSocket-*
+    // values. The request-flavor bit is stamped once by both frontends, avoiding
+    // a second hot-path classification or plugin scan here.
+    if ctx.has_websocket_response_boundary() {
+        strip_websocket_transport_managed_response_header_map(headers);
+    }
 
     // Observe every client-visible rejection that flows through this finalizer —
     // synthetic short-circuits, gRPC rejects, non-2xx rejects, empty-body rejects
@@ -13339,15 +14222,35 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     {
         let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
         let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
-        for plugin in plugins.iter() {
-            plugin
-                .on_response_committed(
-                    ctx,
-                    normalized.http_status.as_u16(),
-                    &normalized.headers,
-                    &normalized.body,
-                )
-                .await;
+        for (index, plugin) in plugins.iter().enumerate() {
+            if !plugin.requires_response_committed_hook() {
+                continue;
+            }
+            let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+            let Some(pending_hook) = run_response_committed_hook_until_deadline(
+                Arc::clone(plugin),
+                ctx,
+                normalized.http_status.as_u16(),
+                &normalized.headers,
+                &normalized.body,
+                terminal_gateway_deadline,
+            )
+            .await
+            else {
+                continue;
+            };
+            if !terminal_gateway_deadline {
+                ctx.mark_gateway_deadline_response_selected();
+                replace_rejection_with_gateway_deadline(status, Some(body), headers);
+            }
+            spawn_detached_response_committed_hooks(
+                pending_hook,
+                plugins[index + 1..].to_vec(),
+                *status,
+                Arc::new(headers.clone()),
+                Arc::new(body.clone()),
+            );
+            break;
         }
     }
 }
@@ -13417,11 +14320,26 @@ pub(crate) async fn run_after_proxy_hooks(
             ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
         }
 
-        match plugin
-            .after_proxy(ctx, response_status, response_headers)
-            .await
+        let deadline = ctx.grpc_deadline_at();
+        let result = match crate::plugins::await_grpc_deadline(
+            deadline,
+            plugin.after_proxy(ctx, response_status, response_headers),
+        )
+        .await
         {
-            PluginResult::Continue => {}
+            Ok(result) => result,
+            Err(()) => {
+                ctx.mark_gateway_deadline_response_selected();
+                crate::plugins::grpc_deadline_exceeded_plugin_result()
+            }
+        };
+        match result {
+            PluginResult::Continue => {
+                ctx.record_buffered_initial_response_header_plugin(
+                    plugin.as_ref(),
+                    response_headers,
+                );
+            }
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let RejectedResponseParts {
                     mut status_code,
@@ -13466,6 +14384,70 @@ pub(crate) struct NormalizedRejectResponse {
     pub(crate) body: Vec<u8>,
     pub(crate) grpc_status: Option<u32>,
     pub(crate) grpc_message: Option<String>,
+}
+
+/// Apply route policy to a gateway-generated plain HTTP response and then
+/// discard fields whose framing is owned by the frontend transport.
+pub(crate) fn finalize_plain_gateway_error_response_headers(
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    response_headers: &mut HashMap<String, String>,
+) {
+    crate::plugins::apply_initial_response_header_policies(
+        initial_response_header_policy_plugins,
+        response_headers,
+    );
+    response_headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("content-length")
+            && ![
+                "connection",
+                "keep-alive",
+                "proxy-authenticate",
+                "proxy-connection",
+                "te",
+                "trailer",
+                "transfer-encoding",
+                "upgrade",
+            ]
+            .iter()
+            .any(|managed| name.eq_ignore_ascii_case(managed))
+    });
+}
+
+/// Restore the gateway-owned method retry contract after generic response
+/// policy has run. Policy may decorate a 405 response, but it must not remove,
+/// replace, or duplicate the authoritative `Allow` value derived from the
+/// matched route.
+pub(crate) fn restore_authoritative_allow_header(
+    response_headers: &mut HashMap<String, String>,
+    allow_value: &str,
+) {
+    response_headers.retain(|name, _| !name.eq_ignore_ascii_case("allow"));
+    response_headers.insert("allow".to_string(), allow_value.to_string());
+}
+
+fn finalize_synthesized_reject_headers(
+    reject: &mut NormalizedRejectResponse,
+    request_protocol: ProxyProtocol,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) {
+    if let Some(grpc_status) = reject.grpc_status {
+        grpc_proxy::finalize_grpc_error_response_headers(
+            &mut reject.headers,
+            grpc_status,
+            reject.grpc_message.as_deref().unwrap_or(""),
+            initial_response_header_policy_plugins,
+        );
+    } else if request_protocol == ProxyProtocol::WebSocket {
+        finalize_websocket_response_headers(
+            initial_response_header_policy_plugins,
+            &mut reject.headers,
+        );
+    } else {
+        finalize_plain_gateway_error_response_headers(
+            initial_response_header_policy_plugins,
+            &mut reject.headers,
+        );
+    }
 }
 
 fn grpc_status_reason(status: u32) -> &'static str {
@@ -13576,6 +14558,25 @@ pub(crate) fn normalize_reject_response(
     }
 }
 
+fn normalized_grpc_deadline_exceeded() -> NormalizedRejectResponse {
+    normalize_reject_response(
+        StatusCode::OK,
+        &[],
+        &HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            (
+                "grpc-status".to_string(),
+                GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+            ),
+            (
+                "grpc-message".to_string(),
+                GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
+            ),
+        ]),
+        true,
+    )
+}
+
 pub(crate) fn insert_grpc_error_metadata(
     metadata: &mut HashMap<String, String>,
     grpc_status: u32,
@@ -13649,33 +14650,451 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
     })
 }
 
+/// Build a gateway-generated error for a request the grpc_web plugin already
+/// translated, enforcing the precomputed initial-header policy chain because
+/// no backend response exists and the ordinary after_proxy lifecycle cannot
+/// run. Policy is applied after the gRPC-Web representation headers are built
+/// so content framing remains authoritative.
 fn build_translated_grpc_web_error_response(
     ctx: &RequestContext,
     status: u32,
     message: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Option<Response<ProxyBody>> {
-    let translated = crate::plugins::grpc_web::translated_error_response(ctx, status, message)?;
-    let builder =
-        headers_mod::apply_response_headers(Response::builder().status(200), &translated.headers);
-
-    Some(
-        builder
-            .body(ProxyBody::full(Bytes::from(translated.body)))
-            .unwrap_or_else(|_| grpc_proxy::build_grpc_error_response(status, message)),
-    )
+    let mut translated = crate::plugins::grpc_web::translated_error_response(ctx, status, message)?;
+    finalize_grpc_web_error_response_headers(
+        &mut translated,
+        initial_response_header_policy_plugins,
+        None,
+    );
+    Some(build_grpc_web_error_response_from_parts(
+        translated, status, message,
+    ))
 }
 
+/// Build a gateway-generated gRPC-Web error at the client-visible boundary.
+/// These early/backend-exchange failure paths bypass normal response hooks, so
+/// enforce the precomputed initial-header policy chain directly without a
+/// plugin scan or moving terminal gRPC metadata out of the body trailer frame.
 fn build_grpc_web_error_response(
     response_content_type: &str,
     status: u32,
     message: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Response<ProxyBody> {
-    let response = crate::plugins::grpc_web::error_response_for_content_type(
+    let mut response = crate::plugins::grpc_web::error_response_for_content_type(
         response_content_type,
         status,
         message,
     );
+    finalize_grpc_web_error_response_headers(
+        &mut response,
+        initial_response_header_policy_plugins,
+        None,
+    );
     build_grpc_web_error_response_from_parts(response, status, message)
+}
+
+fn merge_grpc_web_expose_headers(
+    required: Option<&str>,
+    headers: &HashMap<String, String>,
+) -> Option<String> {
+    let mut merged = String::new();
+    let configured = headers.iter().filter_map(|(name, value)| {
+        name.eq_ignore_ascii_case("access-control-expose-headers")
+            .then_some(value.as_str())
+    });
+    for value in required.into_iter().chain(configured) {
+        for token in value
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            if merged
+                .split(',')
+                .any(|existing| existing.trim().eq_ignore_ascii_case(token))
+            {
+                continue;
+            }
+            if !merged.is_empty() {
+                merged.push_str(", ");
+            }
+            merged.push_str(token);
+        }
+    }
+    (!merged.is_empty()).then_some(merged)
+}
+
+/// Finalize the initial HEADERS for a gateway-generated gRPC-Web error.
+///
+/// Terminal gRPC metadata remains body-only at the wire boundary. A finalized
+/// reject-hook chain may temporarily contribute terminal fields so the body
+/// trailer frame can be rebuilt, but those fields are removed from the initial
+/// headers before sending. The generated representation fields are also
+/// authoritative: neither a security policy nor reject headers may replace
+/// them or supply a stale content length.
+pub(crate) fn finalize_grpc_web_error_response_headers(
+    response: &mut crate::plugins::grpc_web::GrpcWebErrorResponse,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    finalized_reject_headers: Option<&HashMap<String, String>>,
+) {
+    let content_type = response.headers.get("content-type").cloned();
+    let grpc_web = response.headers.get("x-grpc-web").cloned();
+    let expose_headers = response
+        .headers
+        .get("access-control-expose-headers")
+        .cloned();
+
+    if let Some(finalized_headers) = finalized_reject_headers {
+        response.headers.extend(
+            finalized_headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        if let Some(content_type) = content_type.as_ref() {
+            // Rejection normalization uses native application/grpc. Restore
+            // the client representation before choosing binary versus text
+            // trailer framing.
+            response
+                .headers
+                .insert("content-type".to_string(), content_type.clone());
+        }
+        // Rejection hooks may supply rich terminal metadata such as
+        // grpc-status-details-bin. Fold it into the body trailer frame before
+        // terminal gRPC fields are removed from the initial header block.
+        crate::plugins::grpc_web::rebuild_error_body_from_headers(response);
+    } else {
+        crate::plugins::apply_initial_response_header_policies(
+            initial_response_header_policy_plugins,
+            &mut response.headers,
+        );
+    }
+
+    let expose_headers =
+        merge_grpc_web_expose_headers(expose_headers.as_deref(), &response.headers);
+
+    response.headers.retain(|name, _| {
+        ![
+            "content-type",
+            "content-length",
+            "content-encoding",
+            "x-grpc-web",
+            "access-control-expose-headers",
+            "grpc-status",
+            "grpc-message",
+            "grpc-status-details-bin",
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ]
+        .iter()
+        .any(|managed| name.eq_ignore_ascii_case(managed))
+    });
+    if let Some(content_type) = content_type {
+        response
+            .headers
+            .insert("content-type".to_string(), content_type);
+    }
+    if let Some(grpc_web) = grpc_web {
+        response.headers.insert("x-grpc-web".to_string(), grpc_web);
+    }
+    if let Some(expose_headers) = expose_headers {
+        response
+            .headers
+            .insert("access-control-expose-headers".to_string(), expose_headers);
+    }
+    response.headers.insert(
+        "content-length".to_string(),
+        response.body.len().to_string(),
+    );
+}
+
+/// Replace an uncommitted buffered native gRPC or gRPC-Web response with the
+/// canonical gateway deadline result. All buffered frontends use this helper
+/// so the terminal status, browser framing, CORS exposure, and initial-header
+/// policies cannot drift by protocol or lifecycle phase.
+pub(crate) fn replace_buffered_grpc_response_with_deadline(
+    ctx: &mut RequestContext,
+    grpc_web_response_content_type: Option<&str>,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> StatusCode {
+    ctx.mark_gateway_deadline_response_selected();
+    retain_deadline_response_decorators(response_headers);
+    if let Some(content_type) = grpc_web_response_content_type {
+        let mut response = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+        );
+        response.headers.extend(response_headers.drain());
+        finalize_grpc_web_error_response_headers(
+            &mut response,
+            initial_response_header_policy_plugins,
+            None,
+        );
+        *response_headers = response.headers;
+        *response_body = response.body;
+    } else {
+        grpc_proxy::finalize_grpc_error_response_headers(
+            response_headers,
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+            initial_response_header_policy_plugins,
+        );
+        response_body.clear();
+    }
+    insert_grpc_error_metadata(
+        &mut ctx.metadata,
+        grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+        GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+    );
+    StatusCode::OK
+}
+
+/// Run buffered response transforms under the request's absolute gRPC
+/// deadline. A transform that exhausts the deadline selects the same
+/// flavor-aware terminal response as every other buffered response phase.
+pub(crate) async fn transform_buffered_response_body_with_deadline(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+    grpc_web_response_content_type: Option<&str>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> (bool, bool) {
+    let content_type = response_headers.get("content-type").cloned();
+    let content_type = content_type.as_deref();
+    let mut body_transformed = false;
+    for plugin in plugins {
+        let transformed = match crate::plugins::await_grpc_deadline(
+            ctx.grpc_deadline_at(),
+            plugin.transform_response_body_with_context(
+                ctx,
+                response_body,
+                content_type,
+                response_headers,
+            ),
+        )
+        .await
+        {
+            Ok(transformed) => transformed,
+            Err(()) => {
+                *response_status = replace_buffered_grpc_response_with_deadline(
+                    ctx,
+                    grpc_web_response_content_type,
+                    response_headers,
+                    response_body,
+                    initial_response_header_policy_plugins,
+                )
+                .as_u16();
+                return (true, body_transformed);
+            }
+        };
+        if let Some(transformed) = transformed {
+            response_headers.insert("content-length".to_string(), transformed.len().to_string());
+            *response_body = transformed;
+            plugin.on_response_body_transformed(ctx, response_headers);
+            body_transformed = true;
+        }
+    }
+    (false, body_transformed)
+}
+
+/// A streaming deadline may replace the backend body with native trailers or
+/// a gRPC-Web trailer DATA frame before any backend DATA is forwarded. The
+/// backend's declared length therefore cannot remain authoritative.
+pub(crate) fn strip_content_length_for_streaming_grpc_deadline(
+    response_headers: &mut HashMap<String, String>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
+) {
+    if grpc_deadline_at.is_some() {
+        response_headers.remove("content-length");
+    }
+}
+
+pub(crate) type OwnedResponseCommittedHookFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = RequestContext> + Send + 'static>>;
+
+fn owned_response_committed_hook_future(
+    plugin: Arc<dyn Plugin>,
+    mut ctx: RequestContext,
+    response_status: u16,
+    response_headers: Arc<HashMap<String, String>>,
+    response_body: Arc<Vec<u8>>,
+) -> OwnedResponseCommittedHookFuture {
+    Box::pin(async move {
+        plugin
+            .on_response_committed(
+                &mut ctx,
+                response_status,
+                response_headers.as_ref(),
+                response_body.as_ref(),
+            )
+            .await;
+        ctx
+    })
+}
+
+/// Await a committed observer only while it can still affect the synchronous
+/// terminal lifecycle. Once the client deadline is selected, give an
+/// immediately-ready observer one poll; a pending observer is returned with
+/// owned state so cleanup can continue without borrowing the response writer.
+pub(crate) async fn run_response_committed_hook_until_deadline(
+    plugin: Arc<dyn Plugin>,
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+    response_body: &[u8],
+    terminal_gateway_deadline: bool,
+) -> Option<OwnedResponseCommittedHookFuture> {
+    let deadline = ctx.grpc_deadline_at();
+    if !terminal_gateway_deadline && deadline.is_none() {
+        plugin
+            .on_response_committed(ctx, response_status, response_headers, response_body)
+            .await;
+        return None;
+    }
+    let mut hook = owned_response_committed_hook_future(
+        plugin,
+        ctx.clone(),
+        response_status,
+        Arc::new(response_headers.clone()),
+        Arc::new(response_body.to_vec()),
+    );
+    if terminal_gateway_deadline {
+        let completed = futures_util::future::poll_fn(|cx| {
+            Poll::Ready(match std::future::Future::poll(hook.as_mut(), cx) {
+                Poll::Ready(ctx) => Some(ctx),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+        if let Some(completed) = completed {
+            *ctx = completed;
+            return None;
+        }
+        return Some(hook);
+    }
+    let Some(deadline) = deadline else {
+        return Some(hook);
+    };
+    let deadline_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
+    tokio::select! {
+        biased;
+        () = &mut deadline_sleep => Some(hook),
+        completed = &mut hook => {
+            *ctx = completed;
+            None
+        },
+    }
+}
+
+pub(crate) fn spawn_detached_response_committed_hooks(
+    pending_hook: OwnedResponseCommittedHookFuture,
+    remaining_plugins: Vec<Arc<dyn Plugin>>,
+    response_status: u16,
+    response_headers: Arc<HashMap<String, String>>,
+    response_body: Arc<Vec<u8>>,
+) {
+    std::mem::drop(tokio::spawn(async move {
+        let cleanup = async move {
+            let mut ctx = pending_hook.await;
+            for plugin in remaining_plugins {
+                if !plugin.requires_response_committed_hook() {
+                    continue;
+                }
+                plugin
+                    .on_response_committed(
+                        &mut ctx,
+                        response_status,
+                        response_headers.as_ref(),
+                        response_body.as_ref(),
+                    )
+                    .await;
+            }
+        };
+        if tokio::time::timeout(DETACHED_REJECTION_CLEANUP_TIMEOUT, cleanup)
+            .await
+            .is_err()
+        {
+            warn!(
+                timeout_seconds = DETACHED_REJECTION_CLEANUP_TIMEOUT.as_secs(),
+                "detached committed-response cleanup exceeded its post-response bound"
+            );
+        }
+    }));
+}
+
+/// Invoke each opted-in committed-response observer at most once. If the RPC
+/// deadline expires inside one observer, select the canonical deadline
+/// response and transfer that exact pending invocation plus the remaining
+/// observers to bounded, owned post-response cleanup. Earlier observers are
+/// never replayed and no observer can retain the client response writer.
+pub(crate) async fn run_deadline_bounded_response_committed_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> bool {
+    let terminal_at_entry = ctx.gateway_deadline_response_selected();
+    for (index, plugin) in plugins.iter().enumerate() {
+        if !plugin.requires_response_committed_hook() {
+            continue;
+        }
+        let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+        let Some(pending_hook) = run_response_committed_hook_until_deadline(
+            Arc::clone(plugin),
+            ctx,
+            *response_status,
+            response_headers,
+            response_body,
+            terminal_gateway_deadline,
+        )
+        .await
+        else {
+            continue;
+        };
+
+        let grpc_web_response_content_type =
+            crate::plugins::grpc_web::retained_response_content_type(ctx).or_else(|| {
+                response_headers
+                    .get("content-type")
+                    .filter(|content_type| {
+                        crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+                    })
+                    .map(|content_type| {
+                        crate::plugins::grpc_web::response_content_type(content_type)
+                    })
+            });
+        *response_status = replace_buffered_grpc_response_with_deadline(
+            ctx,
+            grpc_web_response_content_type,
+            response_headers,
+            response_body,
+            initial_response_header_policy_plugins,
+        )
+        .as_u16();
+        spawn_detached_response_committed_hooks(
+            pending_hook,
+            plugins[index + 1..].to_vec(),
+            *response_status,
+            Arc::new(response_headers.clone()),
+            Arc::new(response_body.clone()),
+        );
+        return true;
+    }
+    terminal_at_entry
 }
 
 fn build_grpc_web_error_response_from_parts(
@@ -13689,6 +15108,192 @@ fn build_grpc_web_error_response_from_parts(
     builder
         .body(ProxyBody::full(Bytes::from(response.body)))
         .unwrap_or_else(|_| grpc_proxy::build_grpc_error_response(status, message))
+}
+
+fn build_pre_plugin_reject_response(
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    request_uses_grpc_content_type: bool,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    let reject = normalize_reject_response(
+        status,
+        body,
+        headers,
+        request_uses_grpc_content_type || grpc_web_response_content_type.is_some(),
+    );
+    if let (Some(content_type), Some(grpc_status)) =
+        (grpc_web_response_content_type, reject.grpc_status)
+    {
+        let message = reject
+            .grpc_message
+            .as_deref()
+            .unwrap_or_else(|| grpc_status_reason(grpc_status));
+        return build_grpc_web_error_response(content_type, grpc_status, message, &[]);
+    }
+    build_response_from_normalized_reject(reject)
+}
+
+async fn build_grpc_web_reject_response(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_content_type: Option<&str>,
+    reject: &NormalizedRejectResponse,
+) -> Option<Response<ProxyBody>> {
+    let (Some(content_type), Some(mut grpc_status)) = (response_content_type, reject.grpc_status)
+    else {
+        return None;
+    };
+    let mut message = reject
+        .grpc_message
+        .as_deref()
+        .unwrap_or_else(|| grpc_status_reason(grpc_status))
+        .to_string();
+    let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+        content_type,
+        grpc_status,
+        &message,
+    );
+    finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));
+    if plugins
+        .iter()
+        .any(|plugin| plugin.requires_response_committed_hook())
+    {
+        for (index, plugin) in plugins.iter().enumerate() {
+            if !plugin.requires_response_committed_hook() {
+                continue;
+            }
+            let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+            let Some(pending_hook) = run_response_committed_hook_until_deadline(
+                Arc::clone(plugin),
+                ctx,
+                StatusCode::OK.as_u16(),
+                &translated.headers,
+                &translated.body,
+                terminal_gateway_deadline,
+            )
+            .await
+            else {
+                continue;
+            };
+            if !terminal_gateway_deadline {
+                ctx.mark_gateway_deadline_response_selected();
+                grpc_status = grpc_proxy::grpc_status::DEADLINE_EXCEEDED;
+                message = GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string();
+                translated = crate::plugins::grpc_web::error_response_for_content_type(
+                    content_type,
+                    grpc_status,
+                    &message,
+                );
+                let mut deadline_headers = reject.headers.clone();
+                deadline_headers.retain(|name, _| {
+                    !["grpc-status", "grpc-message", "grpc-status-details-bin"]
+                        .iter()
+                        .any(|terminal| name.eq_ignore_ascii_case(terminal))
+                });
+                finalize_grpc_web_error_response_headers(
+                    &mut translated,
+                    &[],
+                    Some(&deadline_headers),
+                );
+                insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, &message);
+            }
+            spawn_detached_response_committed_hooks(
+                pending_hook,
+                plugins[index + 1..].to_vec(),
+                StatusCode::OK.as_u16(),
+                Arc::new(translated.headers.clone()),
+                Arc::new(translated.body.clone()),
+            );
+            break;
+        }
+    }
+    Some(build_grpc_web_error_response_from_parts(
+        translated,
+        grpc_status,
+        &message,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_backend_path_plugins_or_build_reject(
+    backend_path_plugins: &[Arc<dyn Plugin>],
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    backend_path: &str,
+    state: &ProxyState,
+    start_time: Instant,
+    plugin_execution_ns: &mut u64,
+    original_request_path: &str,
+    is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&str>,
+    phase: BackendPathPolicyPhase,
+) -> Option<Response<ProxyBody>> {
+    let phase_start = Instant::now();
+    for plugin in backend_path_plugins {
+        let deadline = ctx.grpc_deadline_at();
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.on_backend_path_resolved(ctx, backend_path, phase),
+        )
+        .await
+        .into_plugin_result(ctx)
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    error!(
+                        plugin = plugin.name(),
+                        "Backend-path plugin rejection could not be normalized"
+                    );
+                    record_request(state, 500);
+                    return Some(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status = StatusCode::from_u16(plugin_reject.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    plugins,
+                    ctx,
+                    status,
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    plugins,
+                    ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request_with_path(
+                    plugins,
+                    ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "on_backend_path_resolved",
+                    *plugin_execution_ns,
+                    Some(original_request_path),
+                )
+                .await;
+                record_request(state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Some(response);
+                }
+                return Some(build_response_from_normalized_reject(reject));
+            }
+        }
+    }
+    *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    None
 }
 
 async fn finalize_reject_response_with_after_proxy_hooks(
@@ -13816,36 +15421,8 @@ async fn handle_backend_admission_rejection(
     )
     .await;
     apply_grpc_reject_metadata(ctx, &reject);
-    let grpc_web_response = if let (Some(content_type), Some(grpc_status)) =
-        (grpc_web_error_content_type, reject.grpc_status)
-    {
-        let message = reject
-            .grpc_message
-            .as_deref()
-            .unwrap_or_else(|| grpc_status_reason(grpc_status));
-        let translated = crate::plugins::grpc_web::error_response_for_content_type(
-            content_type,
-            grpc_status,
-            message,
-        );
-        if plugins
-            .iter()
-            .any(|plugin| plugin.requires_response_committed_hook())
-        {
-            for plugin in plugins {
-                plugin
-                    .on_response_committed(ctx, 200, &translated.headers, &translated.body)
-                    .await;
-            }
-        }
-        Some(build_grpc_web_error_response_from_parts(
-            translated,
-            grpc_status,
-            message,
-        ))
-    } else {
-        None
-    };
+    let grpc_web_response =
+        build_grpc_web_reject_response(plugins, ctx, grpc_web_error_content_type, &reject).await;
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -13861,6 +15438,66 @@ async fn handle_backend_admission_rejection(
         return response;
     }
     build_response_from_normalized_reject(reject)
+}
+
+/// Finalize a client RPC deadline discovered while buffering the upload.
+///
+/// These exits occur before a backend response exists, but they are still
+/// ordinary client-visible rejections: reject-path `after_proxy` decorators,
+/// committed observers, and rejection logging must all see the canonical
+/// status-4 result. In particular, gRPC-Web needs the finalized header map so
+/// CORS decorators survive translation into its body-trailer representation.
+pub(crate) async fn build_finalized_upload_deadline_response(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    grpc_web_response_content_type: Option<&str>,
+) -> (Response<ProxyBody>, u16) {
+    let deadline = normalized_grpc_deadline_exceeded();
+    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+        plugins,
+        ctx,
+        deadline.http_status,
+        &deadline.body,
+        deadline.headers,
+        true,
+        grpc_web_response_content_type.is_none(),
+    )
+    .await;
+    apply_grpc_reject_metadata(ctx, &reject);
+    let grpc_web_response =
+        build_grpc_web_reject_response(plugins, ctx, grpc_web_response_content_type, &reject).await;
+    let log_status = reject.http_status.as_u16();
+    let response =
+        grpc_web_response.unwrap_or_else(|| build_response_from_normalized_reject(reject));
+    (response, log_status)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_upload_deadline_rejection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+    original_request_path: Option<&str>,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    let (response, log_status) =
+        build_finalized_upload_deadline_response(plugins, ctx, grpc_web_response_content_type)
+            .await;
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        log_status,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        original_request_path,
+    )
+    .await;
+    record_request(state, log_status);
+    response
 }
 
 fn release_circuit_breaker_probe_on_admission_reject(
@@ -13890,12 +15527,181 @@ fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
 ) -> (u16, Vec<u8>, HashMap<String, String>) {
     let mut headers = HashMap::new();
+    // Challenge selection follows configured priority order: mechanisms that
+    // do not advertise a challenge are skipped, and the first available
+    // challenge wins.
     let challenge = auth_plugins
         .iter()
         .find_map(|plugin| plugin.authentication_challenge())
         .unwrap_or("ferrum-edge");
     headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
     (401, MISSING_AUTHENTICATION_BODY.to_vec(), headers)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BackendPathBeforeProxyPass {
+    Initial,
+    RoutingHeaderDeferred,
+    RemainingDeferred,
+}
+
+pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    backend_path_is_policy_bound: bool,
+    pass: BackendPathBeforeProxyPass,
+) -> PluginResult {
+    for plugin in plugins {
+        let deferred =
+            backend_path_is_policy_bound && plugin.defer_before_proxy_until_backend_path_resolved();
+        let should_run = match pass {
+            BackendPathBeforeProxyPass::Initial => !deferred,
+            BackendPathBeforeProxyPass::RoutingHeaderDeferred => {
+                deferred && plugin.deferred_before_proxy_may_change_routing_headers()
+            }
+            BackendPathBeforeProxyPass::RemainingDeferred => {
+                deferred && !plugin.deferred_before_proxy_may_change_routing_headers()
+            }
+        };
+        if !should_run {
+            continue;
+        }
+        let deadline = ctx.grpc_deadline_at();
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
+            deadline,
+            plugin.before_proxy(ctx, headers),
+        )
+        .await
+        .into_plugin_result(ctx)
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return reject;
+            }
+        }
+    }
+    PluginResult::Continue
+}
+
+/// Return the RFC 6265 cookie-name from the leading cookie-pair only.
+/// Attributes, padded names, and lines without a valid token are not names.
+fn set_cookie_name(set_cookie: &str) -> Option<&str> {
+    let cookie_pair = set_cookie
+        .split_once(';')
+        .map_or(set_cookie, |(pair, _)| pair);
+    let (name, _) = cookie_pair.split_once('=')?;
+    if name.is_empty()
+        || !name.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'a'..=b'z'
+                    | b'|'
+                    | b'~'
+            )
+        })
+    {
+        return None;
+    }
+    Some(name)
+}
+
+/// Add newline-joined `Set-Cookie` lines in encounter order, replacing an
+/// earlier line when a later line owns the same exact, case-sensitive cookie
+/// name. Invalid cookie-pairs can only replace byte-identical lines.
+fn collect_later_set_cookies(cookies: &mut Vec<String>, joined: &str) {
+    for candidate in joined.split('\n').filter(|candidate| !candidate.is_empty()) {
+        let candidate_name = set_cookie_name(candidate);
+        if let Some(index) = cookies.iter().position(|existing| {
+            existing == candidate
+                || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+        }) {
+            cookies.remove(index);
+        }
+        cookies.push(candidate.to_string());
+    }
+}
+
+fn set_cookie_conflicts(cookies: &[String], candidate: &str) -> bool {
+    let candidate_name = set_cookie_name(candidate);
+    cookies.iter().any(|existing| {
+        existing == candidate
+            || candidate_name.is_some_and(|name| set_cookie_name(existing) == Some(name))
+    })
+}
+
+/// Stage requester-owned cookies from rejecting auth attempts. This remains on
+/// the rejection path: successful authentication only removes the metadata.
+pub(crate) fn stage_auth_rejection_set_cookie(ctx: &mut RequestContext, cookie: String) {
+    let mut staged = Vec::new();
+    if let Some(existing) = ctx.metadata.get(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) {
+        collect_later_set_cookies(&mut staged, existing);
+    }
+    collect_later_set_cookies(&mut staged, &cookie);
+
+    if staged.is_empty() {
+        ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
+    } else {
+        ctx.metadata.insert(
+            AUTH_REJECTION_SET_COOKIE_METADATA_KEY.to_string(),
+            staged.join("\n"),
+        );
+    }
+}
+
+fn attach_auth_rejection_set_cookie(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    let Some(staged) = ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY) else {
+        return;
+    };
+
+    // A custom plugin can return multiple case variants because rejection
+    // headers use a String-keyed HashMap. Sort the variants by their exact key
+    // before merging so randomized HashMap iteration cannot select ownership.
+    // The canonical lowercase key sorts after uppercase variants and therefore
+    // wins same-name conflicts deterministically.
+    let mut selected_variants = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    selected_variants.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("set-cookie"));
+
+    let mut merged = Vec::new();
+    for (_, value) in selected_variants {
+        collect_later_set_cookies(&mut merged, &value);
+    }
+
+    let mut staged_cookies = Vec::new();
+    collect_later_set_cookies(&mut staged_cookies, &staged);
+    for candidate in staged_cookies {
+        // The selected final rejection owns conflicts. Preserve each selected
+        // line's full attributes and deterministic order, appending only
+        // independently named requester-owned cookies from earlier rejects.
+        if !set_cookie_conflicts(&merged, &candidate) {
+            merged.push(candidate);
+        }
+    }
+    if !merged.is_empty() {
+        headers.insert("set-cookie".to_string(), merged.join("\n"));
+    }
 }
 
 pub async fn run_authentication_phase(
@@ -13920,7 +15726,28 @@ pub async fn run_authentication_phase(
             let mut last_reject: Option<(u16, Vec<u8>, HashMap<String, String>)> = None;
             let mut server_reject: Option<(u16, Vec<u8>, HashMap<String, String>)> = None;
             for auth_plugin in auth_plugins {
-                match auth_plugin.authenticate(ctx, consumer_index).await {
+                let deadline = ctx.grpc_deadline_at();
+                let auth_result = match crate::plugins::await_grpc_deadline(
+                    deadline,
+                    auth_plugin.authenticate(ctx, consumer_index),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(()) => {
+                        ctx.mark_gateway_deadline_response_selected();
+                        let reject = crate::plugins::grpc_deadline_exceeded_plugin_result();
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            return Some((
+                                500,
+                                br#"{"error":"Internal error"}"#.to_vec(),
+                                HashMap::new(),
+                            ));
+                        };
+                        return Some((reject.status_code, reject.body, reject.headers));
+                    }
+                };
+                match auth_result {
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
@@ -13951,25 +15778,42 @@ pub async fn run_authentication_phase(
                 || auth_plugins.is_empty()
                 || (last_reject.is_none() && mesh_permissive_only_auth_plugin)
             {
+                ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
                 None
             } else {
-                Some(
-                    server_reject
-                        .or(last_reject)
-                        .unwrap_or_else(|| missing_authentication_reject(auth_plugins)),
-                )
+                let mut reject = server_reject
+                    .or(last_reject)
+                    .unwrap_or_else(|| missing_authentication_reject(auth_plugins));
+                attach_auth_rejection_set_cookie(ctx, &mut reject.2);
+                Some(reject)
             }
         }
         AuthMode::Single => {
             for auth_plugin in auth_plugins {
-                match auth_plugin.authenticate(ctx, consumer_index).await {
+                if request_is_authenticated(ctx) {
+                    return None;
+                }
+                let deadline = ctx.grpc_deadline_at();
+                match crate::plugins::await_request_plugin_deadline_with_provenance(
+                    deadline,
+                    auth_plugin.authenticate(ctx, consumer_index),
+                )
+                .await
+                .into_plugin_result(ctx)
+                {
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
-                            return Some((reject.status_code, reject.body, reject.headers));
+                            let mut reject = (reject.status_code, reject.body, reject.headers);
+                            attach_auth_rejection_set_cookie(ctx, &mut reject.2);
+                            return Some(reject);
                         }
                     }
-                    PluginResult::Continue => {}
+                    PluginResult::Continue => {
+                        if request_is_authenticated(ctx) {
+                            return None;
+                        }
+                    }
                 }
             }
             let mesh_permissive_only_auth_plugin = auth_plugins.len() == 1
@@ -13977,6 +15821,7 @@ pub async fn run_authentication_phase(
                     .metadata
                     .get("mesh_request_auth.permissive_missing_token")
                     .is_some_and(|v| v == "true");
+            ctx.metadata.remove(AUTH_REJECTION_SET_COOKIE_METADATA_KEY);
             if request_is_authenticated(ctx)
                 || auth_plugins.is_empty()
                 || mesh_permissive_only_auth_plugin
@@ -14476,8 +16321,33 @@ async fn handle_proxy_request_inner(
         },
         None => None,
     };
-    let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
+    let request_authority = raw_host.and_then(|authority| {
+        normalize_request_authority_for_signing(
+            authority,
+            Some(if is_tls { "https" } else { "http" }),
+        )
+    });
+    ctx.request_authority = request_authority;
+
+    // Classify before routing so route/method rejects can use the client's wire
+    // representation. WebSocket Upgrade / Extended CONNECT wins over any
+    // hostile Content-Type, matching backend dispatch and the H3 frontend.
+    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
+    let grpc_web_response_content_type = if flavor == HttpFlavor::WebSocket {
+        None
+    } else {
+        req.headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|content_type| {
+                crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+                    .then(|| crate::plugins::grpc_web::response_content_type(content_type))
+            })
+    };
+    let grpc_web_request = grpc_web_response_content_type.is_some();
     let epoch = state.request_epoch.load();
+    ctx.lb_generation = epoch.lb_generation;
 
     // Direct Pod-IP HTTP mesh egress is selected by captured original
     // destination before Host routing. The client-controlled Host header cannot
@@ -14516,14 +16386,15 @@ async fn handle_proxy_request_inner(
                 "Direct Pod-IP HTTP mesh egress destination is declared but not routable; rejecting captured request"
             );
             state.request_count.fetch_add(1, Ordering::Relaxed);
-            let reject = normalize_reject_response(
+            let response = build_pre_plugin_reject_response(
                 StatusCode::BAD_GATEWAY,
                 br#"{"error":"Original destination is not a mesh-routable direct workload HTTP destination"}"#,
                 &EMPTY_HEADERS,
                 request_uses_grpc_content_type,
+                grpc_web_response_content_type,
             );
-            record_status(&state, reject.http_status.as_u16());
-            return Ok(build_response_from_normalized_reject(reject));
+            record_status(&state, response.status().as_u16());
+            return Ok(response);
         }
         None => state.router_cache.find_proxy_in_snapshot(
             &epoch.route_table,
@@ -14599,14 +16470,15 @@ async fn handle_proxy_request_inner(
                             br#"{"error":"Original destination port is not a mesh-routable port of this service"}"#
                         }
                     };
-                    let reject = normalize_reject_response(
+                    let response = build_pre_plugin_reject_response(
                         StatusCode::BAD_GATEWAY,
                         body,
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
+                        grpc_web_response_content_type,
                     );
-                    record_status(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_status(&state, response.status().as_u16());
+                    return Ok(response);
                 }
             }
         }
@@ -14662,14 +16534,15 @@ async fn handle_proxy_request_inner(
                             br#"{"error":"Request port is not a mesh-routable port of the local service"}"#
                         }
                     };
-                    let reject = normalize_reject_response(
+                    let response = build_pre_plugin_reject_response(
                         StatusCode::BAD_GATEWAY,
                         body,
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
+                        grpc_web_response_content_type,
                     );
-                    record_status(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_status(&state, response.status().as_u16());
+                    return Ok(response);
                 }
             }
         }
@@ -14776,14 +16649,15 @@ async fn handle_proxy_request_inner(
                 None => {
                     debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
                     state.request_count.fetch_add(1, Ordering::Relaxed);
-                    let reject = normalize_reject_response(
+                    let response = build_pre_plugin_reject_response(
                         StatusCode::NOT_FOUND,
                         br#"{"error":"Not Found"}"#,
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
+                        grpc_web_response_content_type,
                     );
-                    record_status(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_status(&state, response.status().as_u16());
+                    return Ok(response);
                 }
             }
         }
@@ -14792,6 +16666,34 @@ async fn handle_proxy_request_inner(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     debug!(proxy_id = %proxy.id, method = %method, path = %path, client_ip = %ctx.client_ip, "Request routed to proxy");
 
+    // Preserve the path the client actually requested before any plugin can
+    // select a rewritten backend path. Upload-deadline rejection logging runs
+    // before route overrides are applied, while normal transaction logging
+    // below shares this same authoritative client-path snapshot.
+    let original_request_path = path.clone();
+
+    // Reuse the client-visible flavor and strict gRPC-Web classification made
+    // before routing. In particular, WebSocket precedence must continue to
+    // suppress gRPC-Web shaping for route-level rejects carrying a hostile
+    // Content-Type.
+    let is_h2_ws = is_h2_websocket_connect(&req);
+    ctx.set_request_http_flavor(flavor);
+
+    // Resolve the client-visible protocol before route-level rejects so every
+    // post-routing synthesized initial HEADERS block uses the same precomputed
+    // policy slice as normal responses. gRPC-Web dispatch remains plain HTTP
+    // while selecting the gRPC policy set.
+    let request_protocol = match flavor {
+        HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
+        HttpFlavor::Grpc => ProxyProtocol::Grpc,
+        HttpFlavor::Plain if grpc_web_request => ProxyProtocol::Grpc,
+        HttpFlavor::Plain => ProxyProtocol::Http,
+    };
+    let initial_response_header_policy_plugins = epoch
+        .plugin_cache
+        .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
+    let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
+
     // Per-proxy HTTP method filtering (checked before plugins to save work)
     if let Some(ref allowed) = proxy.allowed_methods
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
@@ -14799,45 +16701,30 @@ async fn handle_proxy_request_inner(
         state.request_count.fetch_add(1, Ordering::Relaxed);
         let allow_header = allowed.join(", ");
         let mut reject_headers = HashMap::new();
-        reject_headers.insert("allow".to_string(), allow_header);
-        let reject = normalize_reject_response(
+        reject_headers.insert("allow".to_string(), allow_header.clone());
+        let mut reject = normalize_reject_response(
             StatusCode::METHOD_NOT_ALLOWED,
             br#"{"error":"Method Not Allowed"}"#,
             &reject_headers,
-            request_uses_grpc_content_type,
+            is_grpc_request,
         );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        restore_authoritative_allow_header(&mut reject.headers, &allow_header);
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
         record_status(&state, reject.http_status.as_u16());
+        if let Some(response) = grpc_web_response {
+            return Ok(response);
+        }
         return Ok(build_response_from_normalized_reject(reject));
     }
 
-    // Detect request flavor purely from the incoming traffic. WebSocket and
-    // gRPC are no longer pinned by the proxy's scheme — a single `Https`
-    // backend serves all three flavors depending on the request. This is
-    // the decoupling that lets an H3 client hit an H1/H2 backend through
-    // the same proxy config. The `detect_http_flavor` helper is shared with
-    // the H3 frontend so both paths classify requests identically.
-    let is_h2_ws = is_h2_websocket_connect(&req);
-    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
-    let grpc_web_response_content_type = req
-        .headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|ct| {
-            crate::plugins::grpc_web::is_grpc_web_content_type(ct)
-                .then(|| crate::plugins::grpc_web::response_content_type(ct))
-        });
-    let grpc_web_request = grpc_web_response_content_type.is_some();
-    let request_protocol = match flavor {
-        HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
-        HttpFlavor::Grpc => ProxyProtocol::Grpc,
-        // gRPC-Web requests are intentionally dispatched as plain HTTP on the
-        // backend path, but they still need gRPC-only policy plugins (e.g.
-        // grpc_method_router) in the request plugin chain.
-        HttpFlavor::Plain if grpc_web_request => ProxyProtocol::Grpc,
-        HttpFlavor::Plain => ProxyProtocol::Http,
-    };
     let allows_request_body_buffering = http_flavor_allows_request_body_buffering(flavor);
-    let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
     if is_grpc_request {
         ctx.metadata
             .entry("request_protocol".to_string())
@@ -14849,13 +16736,24 @@ async fn handle_proxy_request_inner(
     if is_grpc_request && method != "POST" {
         state.request_count.fetch_add(1, Ordering::Relaxed);
         warn!(method = %method, path = %path, "Rejected gRPC request: method must be POST");
-        let reject = normalize_reject_response(
+        let mut reject = normalize_reject_response(
             StatusCode::BAD_REQUEST,
             br#"{"error":"gRPC requires POST method"}"#,
             &EMPTY_HEADERS,
             true,
         );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
         record_status(&state, reject.http_status.as_u16());
+        if let Some(response) = grpc_web_response {
+            return Ok(response);
+        }
         return Ok(build_response_from_normalized_reject(reject));
     }
 
@@ -14903,9 +16801,63 @@ async fn handle_proxy_request_inner(
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
+    ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
+    // Establish the effective RPC budget before any request-plugin or body
+    // await. The absolute instant is anchored to `timestamp_received` and is
+    // carried independently of the relative header forwarded upstream.
+    if is_grpc_request {
+        let prepared = crate::plugins::grpc_deadline::prepare_request_deadline(
+            plugin_cache_view.grpc_deadline_plugins(),
+            &mut ctx,
+        );
+        if let reject @ (PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }) = prepared
+        {
+            let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                record_request(&state, 500);
+                return Ok(build_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"Internal error"}"#,
+                ));
+            };
+            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                &plugins,
+                &mut ctx,
+                StatusCode::from_u16(plugin_reject.status_code).unwrap_or(StatusCode::BAD_REQUEST),
+                &plugin_reject.body,
+                plugin_reject.headers,
+                true,
+                grpc_web_response_content_type.is_none(),
+            )
+            .await;
+            apply_grpc_reject_metadata(&mut ctx, &reject);
+            let grpc_web_response = build_grpc_web_reject_response(
+                &plugins,
+                &mut ctx,
+                grpc_web_response_content_type,
+                &reject,
+            )
+            .await;
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                "grpc_deadline_preflight",
+                0,
+            )
+            .await;
+            record_request(&state, reject.http_status.as_u16());
+            if let Some(response) = grpc_web_response {
+                return Ok(response);
+            }
+            return Ok(build_response_from_normalized_reject(reject));
+        }
+    }
     // Pre-computed capability bitset and phase-specific plugin lists — avoids
     // per-request `iter().filter().collect()` and `iter().any()` scans.
     let capabilities = plugin_cache_view.capabilities();
+    let backend_path_plugins = plugin_cache_view.backend_path_plugins();
+    let backend_path_is_policy_bound = !backend_path_plugins.is_empty();
     let mut client_request_body = ClientRequestBody::Streaming(Box::new(req));
 
     // Accumulator for total wall-clock time spent inside plugin phase callbacks.
@@ -14917,7 +16869,14 @@ async fn handle_proxy_request_inner(
     if !plugins.is_empty() {
         let phase_start = Instant::now();
         for plugin in plugins.iter() {
-            match plugin.on_request_received(&mut ctx).await {
+            let deadline = ctx.grpc_deadline_at();
+            match crate::plugins::await_request_plugin_deadline_with_provenance(
+                deadline,
+                plugin.on_request_received(&mut ctx),
+            )
+            .await
+            .into_plugin_result(&mut ctx)
+            {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
@@ -14925,7 +16884,7 @@ async fn handle_proxy_request_inner(
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code)
@@ -14933,9 +16892,17 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
+                        grpc_web_response_content_type.is_none(),
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
+                    let grpc_web_response = build_grpc_web_reject_response(
+                        &plugins,
+                        &mut ctx,
+                        grpc_web_response_content_type,
+                        &reject,
+                    )
+                    .await;
                     log_rejected_request(
                         &plugins,
                         &ctx,
@@ -14946,6 +16913,9 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     record_request(&state, reject.http_status.as_u16());
+                    if let Some(response) = grpc_web_response {
+                        return Ok(response);
+                    }
                     return Ok(build_response_from_normalized_reject(reject));
                 }
             }
@@ -14966,11 +16936,12 @@ async fn handle_proxy_request_inner(
     // WebSocket Extended CONNECT is also excluded: DATA frames after the 200
     // response are WebSocket bytes, not an HTTP request body to drain before
     // authentication.
+    let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
     let authenticate_body_requirements = if !is_hbone_connect_any
         && allows_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
     {
-        request_body_requirements_before_authenticate(&plugins, &ctx)
+        request_body_requirements_before_authenticate(&plugins, &ctx, &consumer_index)
     } else {
         RequestBodyPhaseRequirements::default()
     };
@@ -14982,21 +16953,44 @@ async fn handle_proxy_request_inner(
                     *request,
                     &method,
                     &ctx.headers,
-                    state.max_request_body_size_bytes,
+                    effective_request_body_limit(
+                        state.max_request_body_size_bytes,
+                        authenticate_body_requirements.plugin_limit,
+                    ),
                     proxy.backend_read_timeout_ms,
+                    ctx.grpc_deadline_at(),
                 )
                 .await
                 {
                     Ok(buffered) => {
-                        if let ClientRequestBody::Buffered(body) = &buffered {
-                            store_request_body_metadata(
-                                &mut ctx,
-                                body,
-                                authenticate_body_requirements.needs_text,
-                                authenticate_body_requirements.needs_bytes,
-                            );
-                            ctx.bytes_sent_observed
-                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                        match &buffered {
+                            ClientRequestBody::Buffered(body) => {
+                                store_request_body_metadata(
+                                    &mut ctx,
+                                    body,
+                                    authenticate_body_requirements.needs_text,
+                                    authenticate_body_requirements.needs_bytes,
+                                    authenticate_body_requirements.needs_digests,
+                                );
+                                ctx.bytes_sent_observed.fetch_max(
+                                    body.len() as u64,
+                                    std::sync::atomic::Ordering::Release,
+                                );
+                            }
+                            ClientRequestBody::Streaming(_) => {
+                                // The buffering helper returns Streaming only
+                                // when Incoming already reports END_STREAM, so
+                                // seeding empty-body digests cannot race later
+                                // H2 DATA. Retain the original empty stream for
+                                // zero-copy backend forwarding.
+                                store_request_body_metadata(
+                                    &mut ctx,
+                                    &[],
+                                    false,
+                                    false,
+                                    authenticate_body_requirements.needs_digests,
+                                );
+                            }
                         }
                         buffered
                     }
@@ -15025,8 +17019,25 @@ async fn handle_proxy_request_inner(
                         let response = build_request_body_timeout_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         );
                         record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        let response = finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_upload_before_authenticate",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                        )
+                        .await;
                         return Ok(response);
                     }
                 }
@@ -15040,7 +17051,6 @@ async fn handle_proxy_request_inner(
 
     {
         let auth_phase_start = Instant::now();
-        let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
         if let Some((status_code, body, headers)) = run_authentication_phase(
             proxy.auth_mode.clone(),
             &auth_plugins,
@@ -15050,16 +17060,24 @@ async fn handle_proxy_request_inner(
         .await
         {
             plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
-            let reject = finalize_reject_response_with_after_proxy_hooks(
+            let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
                 &body,
                 headers,
                 is_grpc_request,
+                grpc_web_response_content_type.is_none(),
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
+            let grpc_web_response = build_grpc_web_reject_response(
+                &plugins,
+                &mut ctx,
+                grpc_web_response_content_type,
+                &reject,
+            )
+            .await;
             log_rejected_request(
                 &plugins,
                 &ctx,
@@ -15070,6 +17088,9 @@ async fn handle_proxy_request_inner(
             )
             .await;
             record_request(&state, reject.http_status.as_u16());
+            if let Some(response) = grpc_web_response {
+                return Ok(response);
+            }
             return Ok(build_response_from_normalized_reject(reject));
         }
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
@@ -15101,6 +17122,7 @@ async fn handle_proxy_request_inner(
                     &ctx.headers,
                     body_limit,
                     proxy.backend_read_timeout_ms,
+                    ctx.grpc_deadline_at(),
                 )
                 .await
                 {
@@ -15111,6 +17133,7 @@ async fn handle_proxy_request_inner(
                                 body,
                                 authorize_body_requirements.needs_text,
                                 authorize_body_requirements.needs_bytes,
+                                authorize_body_requirements.needs_digests,
                             );
                             ctx.bytes_sent_observed
                                 .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
@@ -15142,8 +17165,25 @@ async fn handle_proxy_request_inner(
                         let response = build_request_body_timeout_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         );
                         record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        let response = finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_upload_before_authorize",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                        )
+                        .await;
                         return Ok(response);
                     }
                 }
@@ -15161,6 +17201,7 @@ async fn handle_proxy_request_inner(
                     &body,
                     authorize_body_requirements.needs_text,
                     authorize_body_requirements.needs_bytes,
+                    authorize_body_requirements.needs_digests,
                 );
                 ClientRequestBody::Buffered(body)
             }
@@ -15171,7 +17212,14 @@ async fn handle_proxy_request_inner(
     if !authorize_plugins.is_empty() {
         let phase_start = Instant::now();
         for plugin in authorize_plugins.iter() {
-            match plugin.authorize(&mut ctx).await {
+            let deadline = ctx.grpc_deadline_at();
+            match crate::plugins::await_request_plugin_deadline_with_provenance(
+                deadline,
+                plugin.authorize(&mut ctx),
+            )
+            .await
+            .into_plugin_result(&mut ctx)
+            {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
                 | reject @ PluginResult::RejectBinary { .. } => {
@@ -15179,16 +17227,24 @@ async fn handle_proxy_request_inner(
                         .expect("reject result should convert to rejection parts");
                     let status_code = plugin_reject.status_code;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
+                        grpc_web_response_content_type.is_none(),
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
+                    let grpc_web_response = build_grpc_web_reject_response(
+                        &plugins,
+                        &mut ctx,
+                        grpc_web_response_content_type,
+                        &reject,
+                    )
+                    .await;
                     log_rejected_request(
                         &plugins,
                         &ctx,
@@ -15199,6 +17255,9 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     record_request(&state, reject.http_status.as_u16());
+                    if let Some(response) = grpc_web_response {
+                        return Ok(response);
+                    }
                     return Ok(build_response_from_normalized_reject(reject));
                 }
             }
@@ -15248,37 +17307,28 @@ async fn handle_proxy_request_inner(
     } else {
         (false, false, false)
     };
-    let requires_request_body_before_before_proxy = requires_request_body_buffering
+    let before_proxy_body_requirements = if requires_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
-        && plugins.iter().any(|plugin| {
-            plugin.requires_request_body_before_before_proxy()
-                && plugin.should_buffer_request_body(&ctx)
-        });
-    let (needs_body_text, needs_body_bytes) = if requires_request_body_before_before_proxy {
-        let mut needs_text = false;
-        let mut needs_bytes = false;
-        for plugin in plugins.iter() {
-            if plugin.requires_request_body_before_before_proxy()
-                && plugin.should_buffer_request_body(&ctx)
-            {
-                needs_text |= plugin.needs_request_body_text();
-                needs_bytes |= plugin.needs_request_body_bytes();
-            }
-        }
-        (needs_text, needs_bytes)
+    {
+        request_body_requirements_before_before_proxy(&plugins, &ctx)
     } else {
-        (false, false)
+        RequestBodyPhaseRequirements::default()
     };
 
-    if requires_request_body_before_before_proxy {
+    if before_proxy_body_requirements.required {
+        let body_limit = effective_request_body_limit(
+            state.max_request_body_size_bytes,
+            before_proxy_body_requirements.plugin_limit,
+        );
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
                 match buffer_request_body_for_before_proxy(
                     *request,
                     &method,
                     &ctx.headers,
-                    state.max_request_body_size_bytes,
+                    body_limit,
                     proxy.backend_read_timeout_ms,
+                    ctx.grpc_deadline_at(),
                 )
                 .await
                 {
@@ -15287,8 +17337,9 @@ async fn handle_proxy_request_inner(
                             store_request_body_metadata(
                                 &mut ctx,
                                 body,
-                                needs_body_text,
-                                needs_body_bytes,
+                                before_proxy_body_requirements.needs_text,
+                                before_proxy_body_requirements.needs_bytes,
+                                before_proxy_body_requirements.needs_digests,
                             );
                             // Seed bytes_sent_observed from the prebuffered
                             // body so before_proxy rejects (logged via
@@ -15326,14 +17377,44 @@ async fn handle_proxy_request_inner(
                         let response = build_request_body_timeout_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         );
                         record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        let response = finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_upload_before_before_proxy",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                        )
+                        .await;
                         return Ok(response);
                     }
                 }
             }
             ClientRequestBody::Buffered(body) => {
-                store_request_body_metadata(&mut ctx, &body, needs_body_text, needs_body_bytes);
+                if body_limit > 0 && body.len() > body_limit {
+                    record_request(&state, 413);
+                    return Ok(build_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                    ));
+                }
+                store_request_body_metadata(
+                    &mut ctx,
+                    &body,
+                    before_proxy_body_requirements.needs_text,
+                    before_proxy_body_requirements.needs_bytes,
+                    before_proxy_body_requirements.needs_digests,
+                );
                 ClientRequestBody::Buffered(body)
             }
         };
@@ -15347,38 +17428,59 @@ async fn handle_proxy_request_inner(
     if needs_header_clone {
         let phase_start = Instant::now();
         let mut cloned = ctx.headers.clone();
-        for plugin in plugins.iter() {
-            match plugin.before_proxy(&mut ctx, &mut cloned).await {
-                PluginResult::Continue => {}
-                reject @ PluginResult::Reject { .. }
-                | reject @ PluginResult::RejectBinary { .. } => {
-                    let plugin_reject = plugin_result_into_reject_parts(reject)
-                        .expect("reject result should convert to rejection parts");
-                    let status_code = plugin_reject.status_code;
-                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    let reject = finalize_reject_response_with_after_proxy_hooks(
-                        &plugins,
-                        &mut ctx,
-                        StatusCode::from_u16(status_code)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &plugin_reject.body,
-                        plugin_reject.headers,
-                        is_grpc_request,
-                    )
-                    .await;
-                    apply_grpc_reject_metadata(&mut ctx, &reject);
-                    log_rejected_request(
-                        &plugins,
-                        &ctx,
-                        reject.http_status.as_u16(),
-                        start_time,
-                        "before_proxy",
-                        plugin_execution_ns,
-                    )
-                    .await;
-                    record_request(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+        match run_before_proxy_hooks_for_backend_path_policy(
+            &plugins,
+            &mut ctx,
+            &mut cloned,
+            backend_path_is_policy_bound,
+            BackendPathBeforeProxyPass::Initial,
+        )
+        .await
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    error!("before_proxy rejection could not be normalized");
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status_code = plugin_reject.status_code;
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "before_proxy",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
                 }
+                return Ok(build_response_from_normalized_reject(reject));
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -15389,39 +17491,61 @@ async fn handle_proxy_request_inner(
         // satisfy the borrow checker without cloning — zero allocation hot path.
         let phase_start = Instant::now();
         let mut tmp_headers = std::mem::take(&mut ctx.headers);
-        for plugin in plugins.iter() {
-            match plugin.before_proxy(&mut ctx, &mut tmp_headers).await {
-                PluginResult::Continue => {}
-                reject @ PluginResult::Reject { .. }
-                | reject @ PluginResult::RejectBinary { .. } => {
-                    let plugin_reject = plugin_result_into_reject_parts(reject)
-                        .expect("reject result should convert to rejection parts");
-                    let status_code = plugin_reject.status_code;
-                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        match run_before_proxy_hooks_for_backend_path_policy(
+            &plugins,
+            &mut ctx,
+            &mut tmp_headers,
+            backend_path_is_policy_bound,
+            BackendPathBeforeProxyPass::Initial,
+        )
+        .await
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    error!("before_proxy rejection could not be normalized");
                     ctx.headers = tmp_headers;
-                    let reject = finalize_reject_response_with_after_proxy_hooks(
-                        &plugins,
-                        &mut ctx,
-                        StatusCode::from_u16(status_code)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &plugin_reject.body,
-                        plugin_reject.headers,
-                        is_grpc_request,
-                    )
-                    .await;
-                    apply_grpc_reject_metadata(&mut ctx, &reject);
-                    log_rejected_request(
-                        &plugins,
-                        &ctx,
-                        reject.http_status.as_u16(),
-                        start_time,
-                        "before_proxy",
-                        plugin_execution_ns,
-                    )
-                    .await;
-                    record_request(&state, reject.http_status.as_u16());
-                    return Ok(build_response_from_normalized_reject(reject));
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status_code = plugin_reject.status_code;
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                ctx.headers = tmp_headers;
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "before_proxy",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
                 }
+                return Ok(build_response_from_normalized_reject(reject));
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -15473,17 +17597,18 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // Inject identity headers when authentication resolved a principal.
-    if let Some(username) = ctx.backend_consumer_username() {
+    // Strip plugin-controlled identity headers and inject only the gateway's
+    // authenticated values. The common no-header/no-principal path avoids
+    // materializing an owned header map.
+    let source_has_reserved_identity = owned_proxy_headers.as_ref().is_some_and(|headers| {
+        headers.keys().any(|name| {
+            name.eq_ignore_ascii_case("x-consumer-username")
+                || name.eq_ignore_ascii_case("x-consumer-custom-id")
+        })
+    });
+    if ctx.backend_consumer_username().is_some() || source_has_reserved_identity {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        sanitize_reserved_consumer_identity_headers(headers);
-        headers.insert("x-consumer-username".to_string(), username.to_string());
-        if let Some(custom_id) = ctx.backend_consumer_custom_id() {
-            headers.insert("x-consumer-custom-id".to_string(), custom_id.to_string());
-        }
-    } else if ctx.suppresses_backend_consumer_identity_headers() {
-        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        sanitize_reserved_consumer_identity_headers(headers);
+        refresh_backend_consumer_identity_headers(&ctx, headers);
     }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.
@@ -15533,15 +17658,6 @@ async fn handle_proxy_request_inner(
     let proxy = ctx.apply_route_overrides_with_upstreams(proxy, epoch.load_balancer.upstreams());
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
-    // Preserve the path the client actually requested for access logging. The
-    // documented contract (the `route_override_path` field doc and
-    // `docs/mesh.md`) is that transaction logs record the original request
-    // path, not the VirtualService-rewritten backend path; the rewrite below
-    // only affects backend URL building and `ctx.path` for dispatch. The
-    // transaction summaries built later in this function source `request_path`
-    // from this value, not the rebased `path`/`ctx.path`.
-    let original_request_path = path.clone();
-
     // Istio `VirtualService.http[].rewrite.uri`: `mesh_route_dispatch` set
     // `ctx.route_override_path` for the matched route. Rebase the request path
     // used for backend URL building (reqwest / direct-H2 / gRPC paths read the
@@ -15575,6 +17691,201 @@ async fn handle_proxy_request_inner(
         selection.target,
         request_host.as_deref(),
     );
+
+    let has_deferred_routing_header_hooks = backend_path_is_policy_bound
+        && capabilities.has(PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS);
+    let mut deferred_result = PluginResult::Continue;
+    let mut run_deferred_routing_headers = has_deferred_routing_header_hooks;
+
+    loop {
+        // Preview access rules for the already-selected target before a
+        // deferred routing function performs external work, then enforce
+        // stateful policy exactly once after its header mutations settle. The
+        // target is deliberately pinned across this hook: otherwise a cloud
+        // function could cause side effects before its hash header selected a
+        // different, denied backend-effective method.
+        if backend_path_is_policy_bound {
+            let backend_path = build_backend_effective_path(
+                &proxy,
+                &path,
+                strip_len,
+                upstream_target
+                    .as_ref()
+                    .and_then(|target| target.path.as_deref()),
+            );
+            let phase = if run_deferred_routing_headers {
+                BackendPathPolicyPhase::Preview
+            } else {
+                BackendPathPolicyPhase::Enforce
+            };
+            if let Some(response) = run_backend_path_plugins_or_build_reject(
+                backend_path_plugins,
+                &plugins,
+                &mut ctx,
+                &backend_path,
+                &state,
+                start_time,
+                &mut plugin_execution_ns,
+                &original_request_path,
+                is_grpc_request,
+                grpc_web_response_content_type,
+                phase,
+            )
+            .await
+            {
+                return Ok(response);
+            }
+            if phase == BackendPathPolicyPhase::Enforce {
+                ctx.bind_authorized_backend_path(backend_path);
+            }
+        }
+
+        if !run_deferred_routing_headers {
+            break;
+        }
+        run_deferred_routing_headers = false;
+
+        // These hooks moved later for authorization ordering, but their
+        // documented request view remains the original client path.
+        let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
+        let phase_start = Instant::now();
+        deferred_result = match owned_proxy_headers.as_mut() {
+            Some(headers) => {
+                run_before_proxy_hooks_for_backend_path_policy(
+                    &plugins,
+                    &mut ctx,
+                    headers,
+                    true,
+                    BackendPathBeforeProxyPass::RoutingHeaderDeferred,
+                )
+                .await
+            }
+            None => {
+                let mut headers = std::mem::take(&mut ctx.headers);
+                let result = run_before_proxy_hooks_for_backend_path_policy(
+                    &plugins,
+                    &mut ctx,
+                    &mut headers,
+                    true,
+                    BackendPathBeforeProxyPass::RoutingHeaderDeferred,
+                )
+                .await;
+                ctx.headers = headers;
+                result
+            }
+        };
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        ctx.path = backend_ctx_path;
+        if matches!(deferred_result, PluginResult::Continue) {
+            // A deferred routing function can return arbitrary headers.
+            // Restore gateway-owned identity and reapply the egress baggage
+            // policy before those headers can reach any backend transport.
+            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            hbone_proxy::strip_egress_baggage_in_proxy_headers(
+                &mut owned_proxy_headers,
+                &ctx.headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
+        }
+        // Always make one more pass after the routing-header hook, including
+        // when it rejects, so final enforcement charges the pinned method
+        // exactly once before any external-hook rejection is returned.
+    }
+
+    // Hooks that can dispatch external work or synthesize a terminal response
+    // must not run until route-sensitive policy has authorized the exact first
+    // backend path. The ordinary pipeline never enters this second pass.
+    if backend_path_is_policy_bound {
+        if matches!(deferred_result, PluginResult::Continue) {
+            // Preserve the pre-existing client-path view for deferred hooks.
+            // request_mirror separately consumes the private path that passed
+            // final backend-effective authorization.
+            let backend_ctx_path = std::mem::replace(&mut ctx.path, original_request_path.clone());
+            let phase_start = Instant::now();
+            deferred_result = match owned_proxy_headers.as_mut() {
+                Some(headers) => {
+                    run_before_proxy_hooks_for_backend_path_policy(
+                        &plugins,
+                        &mut ctx,
+                        headers,
+                        true,
+                        BackendPathBeforeProxyPass::RemainingDeferred,
+                    )
+                    .await
+                }
+                None => {
+                    let mut headers = std::mem::take(&mut ctx.headers);
+                    let result = run_before_proxy_hooks_for_backend_path_policy(
+                        &plugins,
+                        &mut ctx,
+                        &mut headers,
+                        true,
+                        BackendPathBeforeProxyPass::RemainingDeferred,
+                    )
+                    .await;
+                    ctx.headers = headers;
+                    result
+                }
+            };
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+            ctx.path = backend_ctx_path;
+        }
+        if matches!(deferred_result, PluginResult::Continue) {
+            refresh_effective_backend_consumer_identity_headers(&mut ctx, &mut owned_proxy_headers);
+            hbone_proxy::strip_egress_baggage_in_proxy_headers(
+                &mut owned_proxy_headers,
+                &ctx.headers,
+                &state.mesh_egress_strip_baggage_keys,
+            );
+        }
+        match deferred_result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                };
+                let status = StatusCode::from_u16(plugin_reject.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+                    &plugins,
+                    &mut ctx,
+                    status,
+                    &plugin_reject.body,
+                    plugin_reject.headers,
+                    is_grpc_request,
+                    grpc_web_response_content_type.is_none(),
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &reject);
+                let grpc_web_response = build_grpc_web_reject_response(
+                    &plugins,
+                    &mut ctx,
+                    grpc_web_response_content_type,
+                    &reject,
+                )
+                .await;
+                log_rejected_request_with_path(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "before_proxy",
+                    plugin_execution_ns,
+                    Some(&original_request_path),
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                if let Some(response) = grpc_web_response {
+                    return Ok(response);
+                }
+                return Ok(build_response_from_normalized_reject(reject));
+            }
+        }
+    }
 
     // The effective PeerAuthentication app port is not authoritative until
     // routing plugins have applied their overrides and load balancing has
@@ -15623,6 +17934,7 @@ async fn handle_proxy_request_inner(
                     &hook_headers,
                     state.max_request_body_size_bytes,
                     proxy.backend_read_timeout_ms,
+                    ctx.grpc_deadline_at(),
                 )
                 .await
                 {
@@ -15676,6 +17988,23 @@ async fn handle_proxy_request_inner(
                         )
                         .await);
                     }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        ctx.metadata.insert(
+                            RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
+                            "true".to_string(),
+                        );
+                        return Ok(finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_terminal_request_body",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                        )
+                        .await);
+                    }
                 }
             }
             buffered => buffered,
@@ -15688,9 +18017,11 @@ async fn handle_proxy_request_inner(
                 let mut body_hook_ctx = needs_final_request_body_context
                     .then(|| ctx.clone_for_final_request_body_hooks());
                 let terminal_hook_start = Instant::now();
+                let grpc_deadline_at = ctx.grpc_deadline_at();
                 let transformed = apply_request_body_plugins_with_context(
                     &plugins,
                     body_hook_ctx.as_mut(),
+                    grpc_deadline_at,
                     &hook_headers,
                     body,
                 )
@@ -15698,6 +18029,7 @@ async fn handle_proxy_request_inner(
                 let final_body_result = run_final_request_body_hooks(
                     &plugins,
                     body_hook_ctx.as_mut(),
+                    grpc_deadline_at,
                     &hook_headers,
                     &transformed,
                 )
@@ -15885,6 +18217,7 @@ async fn handle_proxy_request_inner(
                     &hook_headers,
                     state.max_request_body_size_bytes,
                     proxy.backend_read_timeout_ms,
+                    ctx.grpc_deadline_at(),
                 )
                 .await
                 {
@@ -15933,8 +18266,32 @@ async fn handle_proxy_request_inner(
                         let response = build_request_body_timeout_response(
                             is_grpc_request,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         );
                         record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
+                    Err(RequestBodyBufferError::DeadlineExceeded) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        let response = finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_upload_before_dispatch",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                        )
+                        .await;
                         return Ok(response);
                     }
                 }
@@ -15946,11 +18303,13 @@ async fn handle_proxy_request_inner(
             ClientRequestBody::Buffered(body) => {
                 ctx.bytes_sent_observed
                     .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                let grpc_deadline_at = ctx.grpc_deadline_at();
                 let mut body_hook_ctx = needs_final_request_body_context
                     .then(|| ctx.clone_for_final_request_body_hooks());
                 let transformed = apply_request_body_plugins_with_context(
                     &plugins,
                     body_hook_ctx.as_mut(),
+                    grpc_deadline_at,
                     &hook_headers,
                     body,
                 )
@@ -15958,11 +18317,15 @@ async fn handle_proxy_request_inner(
                 let final_body_result = run_final_request_body_hooks(
                     &plugins,
                     body_hook_ctx.as_mut(),
+                    grpc_deadline_at,
                     &hook_headers,
                     &transformed,
                 )
                 .await;
                 if let Some(body_hook_ctx) = body_hook_ctx {
+                    if body_hook_ctx.gateway_deadline_response_selected() {
+                        ctx.mark_gateway_deadline_response_selected();
+                    }
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
                     if let Some(body) = request_body {
@@ -16022,8 +18385,16 @@ async fn handle_proxy_request_inner(
             bodyless => bodyless,
         };
     }
-    let proxy_headers: &HashMap<String, String> =
-        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    // Build one lightweight mutable hook context for the selected dispatch
+    // branch so request transforms and final hooks observe the same state.
+    // Early-prepared bodies already ran both hook phases above.
+    let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
+        .then(|| ctx.clone_for_final_request_body_hooks());
+    // Keep only the independently owned header map borrowed across dispatch.
+    // When no owned map exists, borrow `ctx.headers` at each use so final-body
+    // deadline provenance can still update the rest of `ctx` without cloning
+    // the hot-path request headers.
+    let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
 
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
@@ -16031,6 +18402,8 @@ async fn handle_proxy_request_inner(
     // backend wire protocol is `ws://` or `wss://` depending on scheme.
     // Stream proxies never reach here (the handler only runs for HTTP).
     if request_protocol == ProxyProtocol::WebSocket && proxy.dispatch_kind.is_http_family() {
+        let initial_response_header_policy_plugins =
+            plugin_cache_view.initial_response_header_policy_plugins();
         // Cross-Site WebSocket Hijacking (CSWSH) protection per RFC 6455 §10.2.
         // When allowed_ws_origins is non-empty, reject upgrades from unlisted origins.
         if !proxy.allowed_ws_origins.is_empty() {
@@ -16054,9 +18427,10 @@ async fn handle_proxy_request_inner(
                     cb_is_half_open_probe,
                 );
                 record_request(&state, 403);
-                return Ok(build_response(
+                return Ok(build_websocket_error_response(
                     StatusCode::FORBIDDEN,
                     r#"{"error":"WebSocket Origin not allowed"}"#,
+                    &initial_response_header_policy_plugins,
                 ));
             }
         }
@@ -16068,14 +18442,15 @@ async fn handle_proxy_request_inner(
                     "websocket requests should never be pre-buffered for before_proxy"
                 );
                 record_request(&state, 500);
-                return Ok(build_response(
+                return Ok(build_websocket_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     r#"{"error":"WebSocket request buffering invariant violated"}"#,
+                    &initial_response_header_policy_plugins,
                 ));
             }
         };
         let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
-        let websocket_proxy_headers = proxy_headers.clone();
+        let websocket_proxy_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
         return handle_websocket_request_authenticated(
             request,
             state,
@@ -16084,6 +18459,7 @@ async fn handle_proxy_request_inner(
             ctx,
             websocket_proxy_headers,
             plugins,
+            initial_response_header_policy_plugins,
             backend_admission_plugins,
             plugin_execution_ns,
             Arc::clone(&epoch),
@@ -16100,6 +18476,7 @@ async fn handle_proxy_request_inner(
             requires_ws_frame_hooks,
             effective_query_string.to_string(),
             strip_len,
+            backend_path_is_policy_bound,
             original_request_path.clone(),
         )
         .await;
@@ -16231,11 +18608,19 @@ async fn handle_proxy_request_inner(
                 );
                 record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
                 if let Some(content_type) = grpc_web_response_content_type {
-                    return Ok(build_grpc_web_error_response(content_type, 14, message));
+                    return Ok(build_grpc_web_error_response(
+                        content_type,
+                        14,
+                        message,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    ));
                 }
-                return Ok(grpc_proxy::build_grpc_error_response(
+                return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                     14, // UNAVAILABLE
                     message,
+                    initial_response_header_policy_plugins.as_ref(),
                 ));
             }
         }
@@ -16320,9 +18705,10 @@ async fn handle_proxy_request_inner(
                 cb_is_half_open_probe,
             );
             record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-            return Ok(grpc_proxy::build_grpc_error_response(
+            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                 14,
                 "backend address blocked by egress policy",
+                initial_response_header_policy_plugins.as_ref(),
             ));
         }
         let grpc_effective_port = grpc_dispatch_proxy.backend_port;
@@ -16412,6 +18798,7 @@ async fn handle_proxy_request_inner(
                     request,
                     state.max_grpc_recv_size_bytes,
                     proxy.backend_read_timeout_ms,
+                    ctx.grpc_deadline_at(),
                 )
                 .await
                 {
@@ -16424,22 +18811,57 @@ async fn handle_proxy_request_inner(
                         return Ok(build_request_body_timeout_response(
                             true,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         ));
+                    }
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {
+                        // Rejection decorators/logging may await external sinks.
+                        // Release the admitted HALF_OPEN probe and any body-phase
+                        // preacquisition before entering that cleanup pipeline.
+                        grpc_probe_guard.disarm();
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            grpc_cb_probe_slot,
+                        );
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        return Ok(finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_buffered_grpc_upload",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                        )
+                        .await);
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(e)) => {
                         record_request(&state, 500);
-                        return Ok(grpc_proxy::build_grpc_error_response(
+                        return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                             13, // INTERNAL
                             &format!("Failed to read gRPC request body: {:?}", e),
+                            initial_response_header_policy_plugins.as_ref(),
                         ));
                     }
                 };
 
             // Store body metadata for plugins that read via ctx.metadata
+            let request_body_size_bytes = grpc_req_body.len().to_string();
             ctx.metadata.insert(
                 "request_body_size_bytes".to_string(),
-                grpc_req_body.len().to_string(),
+                request_body_size_bytes.clone(),
             );
+            if let Some(body_hook_ctx) = deferred_body_hook_ctx.as_mut() {
+                body_hook_ctx.metadata.insert(
+                    "request_body_size_bytes".to_string(),
+                    request_body_size_bytes,
+                );
+            }
 
             // Mirror pre-transform bytes into the shared request-bytes counter
             // so `TransactionSummary.bytes_sent` is populated on the gRPC
@@ -16451,28 +18873,36 @@ async fn handle_proxy_request_inner(
             );
 
             // Transform request body via plugins (e.g., gRPC-Web base64 decoding)
-            let mut hook_headers = proxy_headers.clone();
+            let mut hook_headers = owned_proxy_headers_ref.unwrap_or(&ctx.headers).clone();
             hook_headers
                 .entry(":path".to_string())
                 .or_insert_with(|| path.clone());
+            let grpc_deadline_at = ctx.grpc_deadline_at();
             let grpc_req_body = bytes::Bytes::from(
-                apply_request_body_plugins(&plugins, &hook_headers, grpc_req_body.to_vec()).await,
+                apply_request_body_plugins_with_context(
+                    &plugins,
+                    deferred_body_hook_ctx.as_mut(),
+                    grpc_deadline_at,
+                    &hook_headers,
+                    grpc_req_body.to_vec(),
+                )
+                .await,
             );
 
             // Run on_final_request_body hooks (e.g., protobuf validation)
-            let mut body_hook_ctx = if needs_final_request_body_context {
-                Some(ctx.clone_for_final_request_body_hooks())
-            } else {
-                None
-            };
+            let mut body_hook_ctx = deferred_body_hook_ctx.take();
             let final_body_result = run_final_request_body_hooks(
                 &plugins,
                 body_hook_ctx.as_mut(),
+                grpc_deadline_at,
                 &hook_headers,
                 &grpc_req_body,
             )
             .await;
             if let Some(body_hook_ctx) = body_hook_ctx {
+                if body_hook_ctx.gateway_deadline_response_selected() {
+                    ctx.mark_gateway_deadline_response_selected();
+                }
                 // `clone_for_final_request_body_hooks` omits `request_body`; carry
                 // the original across the metadata swap (no on_final hook touches
                 // it). Disjoint field assignments avoid a whole-`ctx` borrow.
@@ -16568,9 +18998,10 @@ async fn handle_proxy_request_inner(
                 &grpc_backend_url,
                 &state.grpc_pool,
                 &state.dns_cache,
-                proxy_headers,
+                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                 grpc_should_stream,
                 state.max_response_body_size_bytes,
+                ctx.grpc_deadline_at(),
             )
             .await;
             (result, grpc_req_body)
@@ -16604,12 +19035,13 @@ async fn handle_proxy_request_inner(
                     && len > state.max_grpc_recv_size_bytes
                 {
                     record_request(&state, 200);
-                    return Ok(grpc_proxy::build_grpc_error_response(
+                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                         &format!(
                             "gRPC request payload size exceeds maximum of {} bytes",
                             state.max_grpc_recv_size_bytes
                         ),
+                        initial_response_header_policy_plugins.as_ref(),
                     ));
                 }
                 // Fully streaming fast path: forward request body frame-by-
@@ -16652,7 +19084,7 @@ async fn handle_proxy_request_inner(
                             let post_header_upload_timeout_ms =
                                 grpc_proxy::streaming_post_header_upload_timeout_ms_after_proxy_headers(
                                     request.headers(),
-                                    proxy_headers,
+                                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                                     proxy.as_ref(),
                                 );
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
@@ -16718,10 +19150,11 @@ async fn handle_proxy_request_inner(
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
-                    proxy_headers,
+                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     state.max_grpc_recv_size_bytes,
                     body_size_exceeded,
                     upload_observer,
+                    ctx.grpc_deadline_at(),
                 )
                 .await;
                 (result, Bytes::new())
@@ -16734,6 +19167,7 @@ async fn handle_proxy_request_inner(
                     request,
                     state.max_grpc_recv_size_bytes,
                     proxy.backend_read_timeout_ms,
+                    ctx.grpc_deadline_at(),
                 )
                 .await
                 {
@@ -16790,9 +19224,10 @@ async fn handle_proxy_request_inner(
                             &grpc_backend_url,
                             &state.grpc_pool,
                             &state.dns_cache,
-                            proxy_headers,
+                            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                             grpc_should_stream,
                             state.max_response_body_size_bytes,
+                            ctx.grpc_deadline_at(),
                         )
                         .await;
                         (result, grpc_req_body)
@@ -16804,7 +19239,31 @@ async fn handle_proxy_request_inner(
                         return Ok(build_request_body_timeout_response(
                             true,
                             grpc_web_response_content_type,
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         ));
+                    }
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::DeadlineExceeded) => {
+                        grpc_probe_guard.disarm();
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            grpc_cb_probe_slot,
+                        );
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        return Ok(finalize_upload_deadline_rejection(
+                            &plugins,
+                            &mut ctx,
+                            &state,
+                            start_time,
+                            "grpc_deadline_buffered_grpc_upload",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                            grpc_web_response_content_type,
+                        )
+                        .await);
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(error)) => {
                         (Err(error), Bytes::new())
@@ -16817,7 +19276,7 @@ async fn handle_proxy_request_inner(
         let grpc_method = hyper::Method::POST; // gRPC always uses POST
         let grpc_req_headers: hyper::HeaderMap = if grpc_has_retry {
             let mut hm = hyper::HeaderMap::new();
-            for (k, v) in proxy_headers {
+            for (k, v) in owned_proxy_headers_ref.unwrap_or(&ctx.headers) {
                 if let (Ok(name), Ok(val)) = (
                     hyper::header::HeaderName::from_bytes(k.as_bytes()),
                     hyper::header::HeaderValue::from_str(v),
@@ -16864,6 +19323,42 @@ async fn handle_proxy_request_inner(
                 {
                     break;
                 }
+
+                // Resolve and validate the next gRPC retry target before
+                // charging this failure as an intermediate attempt or
+                // entering backoff. A path-changing candidate will never be
+                // dispatched, so the ordinary final-outcome path must record
+                // the failed attempt exactly once without adding retry delay.
+                let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
+                    (&proxy.upstream_id, &grpc_current_target)
+                    && let Some(ref hash_key) = lb_hash_key
+                    && let Some(next) = backend_dispatch::select_next_retry_target(
+                        &state,
+                        &epoch,
+                        &proxy,
+                        prev_target,
+                        hash_key,
+                        &ctx.client_ip,
+                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                    ) {
+                    if !retry_target_preserves_backend_path(
+                        backend_path_is_policy_bound,
+                        &proxy,
+                        &path,
+                        strip_len,
+                        prev_target,
+                        &next,
+                    ) {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            "Aborting gRPC retry because the candidate would change the authorized backend method path"
+                        );
+                        break;
+                    }
+                    Some(next)
+                } else {
+                    None
+                };
 
                 if let Some(permits) = backend_admission_permits.take() {
                     let error_class = match &grpc_result {
@@ -16916,7 +19411,19 @@ async fn handle_proxy_request_inner(
                 }
 
                 let delay = retry::retry_delay(retry_config, grpc_attempt);
-                tokio::time::sleep(delay).await;
+                if let Some(deadline) = ctx.grpc_deadline_at() {
+                    if tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+                        .await
+                        .is_err()
+                    {
+                        grpc_result = Err(GrpcProxyError::ClientDeadlineExceeded(
+                            "gRPC deadline exceeded during retry backoff".to_string(),
+                        ));
+                        break;
+                    }
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
                 grpc_attempt += 1;
 
                 // Save the pre-rotation CB key so that if the rotated target's
@@ -16927,19 +19434,7 @@ async fn handle_proxy_request_inner(
                 let grpc_pre_rotation_target = grpc_current_target.clone();
 
                 // Try a different target on retry if load balancing is configured
-                if let (Some(_upstream_id), Some(prev_target)) =
-                    (&proxy.upstream_id, &grpc_current_target)
-                    && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = backend_dispatch::select_next_retry_target(
-                        &state,
-                        &epoch,
-                        &proxy,
-                        prev_target,
-                        hash_key,
-                        &ctx.client_ip,
-                        proxy_headers,
-                    )
-                {
+                if let Some(next) = next_retry_target {
                     grpc_backend_url = build_backend_url_with_target(
                         &proxy,
                         &path,
@@ -17014,6 +19509,9 @@ async fn handle_proxy_request_inner(
                             content_type,
                             14,
                             "gRPC retry target requires a mesh transport that does not support retries",
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         ));
                     }
                     if grpc_request_is_web_translated
@@ -17021,13 +19519,17 @@ async fn handle_proxy_request_inner(
                             &ctx,
                             14,
                             "gRPC retry target requires a mesh transport that does not support retries",
+                            plugin_cache_view
+                                .initial_response_header_policy_plugins()
+                                .as_ref(),
                         )
                     {
                         return Ok(response);
                     }
-                    return Ok(grpc_proxy::build_grpc_error_response(
+                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         14, // UNAVAILABLE
                         "gRPC retry target requires a mesh transport that does not support retries",
+                        initial_response_header_policy_plugins.as_ref(),
                     ));
                 }
 
@@ -17052,9 +19554,10 @@ async fn handle_proxy_request_inner(
                         "Backend egress policy denied literal-IP gRPC retry target; not dialing"
                     );
                     record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-                    return Ok(grpc_proxy::build_grpc_error_response(
+                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         14,
                         "backend address blocked by egress policy",
+                        initial_response_header_policy_plugins.as_ref(),
                     ));
                 }
 
@@ -17183,9 +19686,10 @@ async fn handle_proxy_request_inner(
                     &grpc_backend_url,
                     &state.grpc_pool,
                     &state.dns_cache,
-                    proxy_headers,
+                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     grpc_should_stream,
                     state.max_response_body_size_bytes,
+                    ctx.grpc_deadline_at(),
                 )
                 .await;
             }
@@ -17245,7 +19749,11 @@ async fn handle_proxy_request_inner(
                 // response is GrpcProxyError::ResponseTooLarge (NOT
                 // ResourceExhausted) and falls to the failure arm below, matching
                 // the HTTP path's ResponseBodyTooLarge -> 502.
-                Err(GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)) => {
+                Err(
+                    GrpcProxyError::ClientDeadlineExceeded(_)
+                    | GrpcProxyError::ResourceExhausted(_)
+                    | GrpcProxyError::Internal(_),
+                ) => {
                     grpc_probe_guard.disarm();
                     cb.record_neutral(grpc_cb_probe_slot);
                 }
@@ -17318,6 +19826,10 @@ async fn handle_proxy_request_inner(
                 // (#1649 R8 finding 1): the body-terminal observer must then be
                 // suppressed so the ended body's `Drop` can't deliver a second
                 // (ClientDisconnect) terminal that neutralizes the deferred success.
+                let pristine_streaming_trailers_only_terminal_metadata =
+                    grpc_body_ended.then(|| {
+                        grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers)
+                    });
                 let mut grpc_recorder_owns_ended_response = false;
                 let grpc_cb_recorded_eagerly = if grpc_skip_final_cb_record {
                     // A rotated retry already recorded (and released) the prior
@@ -17461,9 +19973,21 @@ async fn handle_proxy_request_inner(
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
-                // Hooks may rewrite/remove a Trailers-Only grpc-status in the
-                // initial header block. Seed deferred metadata from the final
-                // client-visible headers; a later real trailer overrides it.
+                if let Some(pristine_terminal_metadata) =
+                    pristine_streaming_trailers_only_terminal_metadata.as_ref()
+                {
+                    // An already-ended Incoming is a true Trailers-Only response.
+                    // Discard policy attempts to rewrite its terminal fields and
+                    // restore the backend's pristine status before emission.
+                    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+                        None,
+                        &mut response_headers,
+                        Some(pristine_terminal_metadata),
+                    );
+                }
+                // Seed deferred metadata from the final client-visible headers.
+                // The snapshot restore above protects a true Trailers-Only status;
+                // a later real trailer on an open stream remains authoritative.
                 grpc_proxy::refresh_grpc_status_metadata(
                     &mut ctx.metadata,
                     &EMPTY_HEADERS,
@@ -17573,8 +20097,13 @@ async fn handle_proxy_request_inner(
                     if body_exceeded {
                         // Request body exceeded the size limit; we're about to
                         // return a trailers-only RESOURCE_EXHAUSTED error. The
-                        // response body never streams, so log synchronously here.
-                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                        // response body never streams, so start terminal logging
+                        // here. An active RPC deadline moves that cleanup to
+                        // owned, bounded detached state.
+                        crate::plugins::log_with_mirror_before_buffered_response(
+                            &plugins, summary, &ctx,
+                        )
+                        .await;
                         None
                     } else {
                         // Streaming gRPC response: defer so the summary reflects
@@ -17597,13 +20126,30 @@ async fn handle_proxy_request_inner(
                     drop(backend_admission_permits.take());
                     drop(grpc_lb_connection_guard.take());
                     record_request(&state, 200);
-                    return Ok(grpc_proxy::build_grpc_error_response(
+                    return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                         "gRPC request payload size exceeds maximum",
+                        initial_response_header_policy_plugins.as_ref(),
                     ));
                 }
 
                 record_request(&state, grpc_streaming.status);
+
+                // A client gRPC deadline is an absolute total-body bound. It
+                // may replace an unpolled backend body with terminal trailers,
+                // so the backend Content-Length cannot remain authoritative.
+                let (grpc_read_timeout_ms, grpc_total_deadline) =
+                    grpc_proxy::grpc_streaming_response_deadline(
+                        grpc_streaming.grpc_deadline_at,
+                        grpc_streaming.response_read_timeout_ms,
+                    );
+                strip_content_length_for_streaming_grpc_deadline(
+                    &mut response_headers,
+                    grpc_total_deadline,
+                );
+                let cl = response_headers
+                    .get("content-length")
+                    .and_then(|v| v.parse::<u64>().ok());
 
                 // Build the response with the live Incoming body — hyper will forward
                 // DATA frames and TRAILERS to the downstream client as they arrive.
@@ -17636,9 +20182,6 @@ async fn handle_proxy_request_inner(
                 // `proxy-connection`, and `keep-alive` are not blocked.
                 // Mirrors the buffered-path strip in `grpc_proxy.rs` so the
                 // two response paths cannot drift.
-                let cl = response_headers
-                    .get("content-length")
-                    .and_then(|v| v.parse::<u64>().ok());
                 // gRPC streaming body deadline (issue #1649): a client
                 // `grpc-timeout` is an end-to-end RPC deadline, honored as an
                 // ABSOLUTE deadline (`grpc_total_deadline`) anchored at request
@@ -17646,12 +20189,6 @@ async fn handle_proxy_request_inner(
                 // applies per frame. See `grpc_streaming_response_deadline` —
                 // shared with the mesh-mTLS `StreamingH2` relay so the two
                 // regimes cannot drift.
-                let (grpc_read_timeout_ms, grpc_total_deadline) =
-                    grpc_proxy::grpc_streaming_response_deadline(
-                        grpc_streaming.client_grpc_deadline_ms,
-                        start_time.elapsed(),
-                        grpc_streaming.response_read_timeout_ms,
-                    );
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
@@ -17810,9 +20347,10 @@ async fn handle_proxy_request_inner(
                                 .with_grpc_status(Some(grpc_proxy::grpc_status::UNAVAILABLE)),
                             );
                         }
-                        return Ok(grpc_proxy::build_grpc_error_response(
+                        return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                             grpc_proxy::grpc_status::UNAVAILABLE,
                             "Internal gateway error",
+                            initial_response_header_policy_plugins.as_ref(),
                         ));
                     }
                 }
@@ -17899,19 +20437,33 @@ async fn handle_proxy_request_inner(
                         &response_headers,
                         &response_trailers,
                     );
+                let initial_response_header_policy_names =
+                    plugin_cache_view.initial_response_header_policy_names();
+                let mut authoritative_trailers_only_terminal_metadata = (response_body.is_empty()
+                    && response_trailers.is_empty())
+                .then(|| grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers));
+                ctx.begin_buffered_initial_response_header_policy(
+                    initial_response_header_policy_names,
+                    &response_headers,
+                    &plugin_response_headers,
+                );
 
                 // after_proxy hooks
                 let mut after_proxy_rejected = false;
+                let mut buffered_initial_response_header_policy_state;
                 {
                     let phase_start = Instant::now();
-                    if let Some(reject) = run_after_proxy_hooks(
+                    let after_proxy_reject = run_after_proxy_hooks(
                         &plugins,
                         &mut ctx,
                         response_status,
                         &mut plugin_response_headers,
                     )
-                    .await
-                    {
+                    .await;
+                    buffered_initial_response_header_policy_state =
+                        ctx.take_buffered_initial_response_header_policy();
+                    if let Some(reject) = after_proxy_reject {
+                        buffered_initial_response_header_policy_state = None;
                         let normalized = normalize_reject_response(
                             StatusCode::from_u16(reject.status_code)
                                 .unwrap_or(StatusCode::BAD_GATEWAY),
@@ -17920,6 +20472,10 @@ async fn handle_proxy_request_inner(
                             true,
                         );
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        authoritative_trailers_only_terminal_metadata =
+                            Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                &normalized.headers,
+                            ));
                         response_status = normalized.http_status.as_u16();
                         response_headers = normalized.headers;
                         plugin_response_headers = response_headers.clone();
@@ -17941,14 +20497,18 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     for plugin in plugins.iter() {
-                        let result = plugin
-                            .on_response_body(
+                        let deadline = ctx.grpc_deadline_at();
+                        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+                            deadline,
+                            plugin.on_response_body(
                                 &mut ctx,
                                 response_status,
                                 &plugin_response_headers,
                                 &response_body,
-                            )
-                            .await;
+                            ),
+                        )
+                        .await
+                        .into_plugin_result(&mut ctx);
                         match result {
                             PluginResult::Continue => {}
                             reject @ PluginResult::Reject { .. }
@@ -17965,11 +20525,16 @@ async fn handle_proxy_request_inner(
                                         &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
+                                authoritative_trailers_only_terminal_metadata =
+                                    Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                        &normalized.headers,
+                                    ));
                                 response_status = normalized.http_status.as_u16();
                                 response_headers = normalized.headers;
                                 plugin_response_headers = response_headers.clone();
                                 response_trailers.clear();
                                 response_body = normalized.body;
+                                buffered_initial_response_header_policy_state = None;
                                 break;
                             }
                         }
@@ -17996,28 +20561,30 @@ async fn handle_proxy_request_inner(
                         plugin_response_headers
                             .insert("content-type".to_string(), grpc_web_ct.to_string());
                     }
-                    let content_type = plugin_response_headers.get("content-type").cloned();
-                    let ct_ref = content_type.as_deref();
-                    for plugin in plugins.iter() {
-                        if let Some(transformed) = plugin
-                            .transform_response_body_with_context(
-                                &mut ctx,
-                                &response_body,
-                                ct_ref,
+                    if transform_buffered_response_body_with_deadline(
+                        &plugins,
+                        &mut ctx,
+                        &mut response_status,
+                        &mut plugin_response_headers,
+                        &mut response_body,
+                        grpc_web_response_content_type,
+                        initial_response_header_policy_plugins.as_ref(),
+                    )
+                    .await
+                    .0
+                    {
+                        authoritative_trailers_only_terminal_metadata =
+                            Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
                                 &plugin_response_headers,
-                            )
-                            .await
-                        {
-                            plugin_response_headers.insert(
-                                "content-length".to_string(),
-                                transformed.len().to_string(),
-                            );
-                            response_body = transformed;
-                            plugin.on_response_body_transformed(
-                                &mut ctx,
-                                &mut plugin_response_headers,
-                            );
-                        }
+                            ));
+                        response_trailers.clear();
+                        buffered_initial_response_header_policy_state = None;
+                    }
+                    if let Some(policy_state) =
+                        buffered_initial_response_header_policy_state.as_mut()
+                    {
+                        Arc::make_mut(policy_state)
+                            .record_later_response_header_mutations(&mut plugin_response_headers);
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
@@ -18025,14 +20592,18 @@ async fn handle_proxy_request_inner(
                 if !after_proxy_rejected {
                     let phase_start = Instant::now();
                     for plugin in plugins.iter() {
-                        let result = plugin
-                            .on_final_response_body(
+                        let deadline = ctx.grpc_deadline_at();
+                        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+                            deadline,
+                            plugin.on_final_response_body(
                                 &mut ctx,
                                 response_status,
                                 &plugin_response_headers,
                                 &response_body,
-                            )
-                            .await;
+                            ),
+                        )
+                        .await
+                        .into_plugin_result(&mut ctx);
                         match result {
                             PluginResult::Continue => {}
                             reject @ PluginResult::Reject { .. }
@@ -18049,6 +20620,10 @@ async fn handle_proxy_request_inner(
                                         &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
+                                authoritative_trailers_only_terminal_metadata =
+                                    Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                        &normalized.headers,
+                                    ));
                                 if let (Some(grpc_web_ct), Some(grpc_status)) =
                                     (grpc_web_response_content_type, normalized.grpc_status)
                                 {
@@ -18056,12 +20631,17 @@ async fn handle_proxy_request_inner(
                                         .grpc_message
                                         .as_deref()
                                         .unwrap_or_else(|| grpc_status_reason(grpc_status));
-                                    let translated =
+                                    let mut translated =
                                         crate::plugins::grpc_web::error_response_for_content_type(
                                             grpc_web_ct,
                                             grpc_status,
                                             message,
                                         );
+                                    finalize_grpc_web_error_response_headers(
+                                        &mut translated,
+                                        &[],
+                                        Some(&normalized.headers),
+                                    );
                                     response_status = 200;
                                     response_headers = translated.headers;
                                     response_body = translated.body;
@@ -18072,6 +20652,7 @@ async fn handle_proxy_request_inner(
                                 }
                                 plugin_response_headers = response_headers.clone();
                                 response_trailers.clear();
+                                buffered_initial_response_header_policy_state = None;
                                 break;
                             }
                         }
@@ -18111,6 +20692,7 @@ async fn handle_proxy_request_inner(
                         &plugin_response_headers,
                         &response_headers,
                         &header_shadowed_trailer_keys,
+                        buffered_initial_response_header_policy_state.as_deref(),
                     );
                     response_headers = plugin_response_headers;
                 }
@@ -18128,9 +20710,13 @@ async fn handle_proxy_request_inner(
                     // and friends ride in the initial HEADERS with END_STREAM.
                     // Trailer values are authoritative on collapse (pre-split
                     // merge order), including over duplicate initial headers.
-                    for (k, v) in response_trailers.drain() {
-                        response_headers.insert(k, v);
-                    }
+                    grpc_proxy::collapse_grpc_trailers_only_with_initial_response_policies(
+                        &mut response_headers,
+                        &mut response_trailers,
+                        &header_shadowed_trailer_keys,
+                        buffered_initial_response_header_policy_state.as_deref(),
+                        authoritative_trailers_only_terminal_metadata.as_ref(),
+                    );
                 } else {
                     // Non-empty gRPC responses must carry grpc-status in a
                     // terminal TRAILERS frame. Strip the view-merged trailer
@@ -18141,23 +20727,15 @@ async fn handle_proxy_request_inner(
                     // keys are never shadowed, so a malformed duplicate
                     // grpc-status initial header is always stripped here:
                     // status must only appear in the trailers.
-                    for k in response_trailers.keys() {
-                        if !header_shadowed_trailer_keys.contains(k) {
-                            response_headers.remove(k);
-                        }
-                    }
+                    grpc_proxy::finalize_buffered_grpc_split_response(
+                        &mut response_headers,
+                        &mut response_trailers,
+                        &header_shadowed_trailer_keys,
+                        buffered_initial_response_header_policy_state.as_deref(),
+                        None,
+                        original_trailer_set_cookie.as_deref(),
+                    );
                 }
-
-                // Re-home a hook-mutated trailer-only `set-cookie` onto the
-                // initial HEADERS (issue #1638) so browsers / gRPC-Web clients
-                // can store it. Runs after the strip loop and before the
-                // gRPC-Web trailer-clear guard and sticky-cookie injection
-                // below — see `rehome_hook_mutated_trailer_set_cookie`.
-                grpc_proxy::rehome_hook_mutated_trailer_set_cookie(
-                    &mut response_headers,
-                    &mut response_trailers,
-                    original_trailer_set_cookie.as_deref(),
-                );
 
                 // A response transform that re-encodes the gRPC terminal
                 // status into the body (e.g. `grpc_web` appends a gRPC-Web
@@ -18216,15 +20794,17 @@ async fn handle_proxy_request_inner(
 
                 if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
                     let phase_start = Instant::now();
-                    for plugin in plugins.iter() {
-                        plugin
-                            .on_response_committed(
-                                &mut ctx,
-                                response_status,
-                                &response_headers,
-                                &response_body,
-                            )
-                            .await;
+                    if run_deadline_bounded_response_committed_hooks(
+                        plugin_cache_view.response_committed_plugins(),
+                        &mut ctx,
+                        &mut response_status,
+                        &mut response_headers,
+                        &mut response_body,
+                        initial_response_header_policy_plugins.as_ref(),
+                    )
+                    .await
+                    {
+                        response_trailers.clear();
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
@@ -18239,16 +20819,18 @@ async fn handle_proxy_request_inner(
 
                 // Log only after committed exporters write their final metadata.
                 if !plugins.is_empty() {
-                    let grpc_resolved_ip = state
-                        .dns_cache
-                        .resolve(
-                            &proxy.backend_host,
-                            proxy.dns_override.as_deref(),
-                            proxy.dns_cache_ttl_seconds,
-                        )
-                        .await
-                        .ok()
-                        .map(|ip| ip.to_string());
+                    let resolve = state.dns_cache.resolve(
+                        &proxy.backend_host,
+                        proxy.dns_override.as_deref(),
+                        proxy.dns_cache_ttl_seconds,
+                    );
+                    let grpc_resolved_ip =
+                        match crate::plugins::await_grpc_deadline(ctx.grpc_deadline_at(), resolve)
+                            .await
+                        {
+                            Ok(result) => result.ok().map(|ip| ip.to_string()),
+                            Err(()) => None,
+                        };
                     let bytes_sent = ctx
                         .bytes_sent_observed
                         .load(std::sync::atomic::Ordering::Acquire);
@@ -18279,7 +20861,10 @@ async fn handle_proxy_request_inner(
                         metadata: clone_log_metadata(&ctx),
                         ..TransactionSummary::default()
                     };
-                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                    crate::plugins::log_with_mirror_before_buffered_response(
+                        &plugins, summary, &ctx,
+                    )
+                    .await;
                 }
 
                 record_request(&state, response_status);
@@ -18309,9 +20894,10 @@ async fn handle_proxy_request_inner(
                 };
 
                 return Ok(resp_builder.body(body).unwrap_or_else(|_| {
-                    grpc_proxy::build_grpc_error_response(
+                    grpc_proxy::build_grpc_error_response_with_policy(
                         grpc_proxy::grpc_status::UNAVAILABLE,
                         "Internal gateway error",
+                        initial_response_header_policy_plugins.as_ref(),
                     )
                 }));
             }
@@ -18333,7 +20919,9 @@ async fn handle_proxy_request_inner(
                 );
                 if !matches!(
                     &e,
-                    GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
+                    GrpcProxyError::ClientDeadlineExceeded(_)
+                        | GrpcProxyError::ResourceExhausted(_)
+                        | GrpcProxyError::Internal(_)
                 ) && let Some(permits) = backend_admission_permits.take()
                 {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
@@ -18346,7 +20934,9 @@ async fn handle_proxy_request_inner(
                 if !grpc_skip_final_cb_record
                     && !matches!(
                         &e,
-                        GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::Internal(_)
+                        GrpcProxyError::ClientDeadlineExceeded(_)
+                            | GrpcProxyError::ResourceExhausted(_)
+                            | GrpcProxyError::Internal(_)
                     )
                 {
                     record_grpc_backend_dispatch_outcome(
@@ -18367,6 +20957,9 @@ async fn handle_proxy_request_inner(
                     state.overload.record_port_exhaustion();
                 }
                 let grpc_code = match &e {
+                    GrpcProxyError::ClientDeadlineExceeded(_) => {
+                        grpc_proxy::grpc_status::DEADLINE_EXCEEDED
+                    }
                     GrpcProxyError::BackendUnavailable { .. } => {
                         grpc_proxy::grpc_status::UNAVAILABLE
                     }
@@ -18380,9 +20973,14 @@ async fn handle_proxy_request_inner(
                 };
                 // Use a generic client-facing message to avoid leaking
                 // internal backend details (hostnames, DNS errors, etc.).
-                let msg = match grpc_code {
-                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED => "Backend deadline exceeded",
-                    grpc_proxy::grpc_status::RESOURCE_EXHAUSTED => "Resource exhausted",
+                let msg = match &e {
+                    GrpcProxyError::ClientDeadlineExceeded(_) => GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                    _ if grpc_code == grpc_proxy::grpc_status::DEADLINE_EXCEEDED => {
+                        "Backend deadline exceeded"
+                    }
+                    _ if grpc_code == grpc_proxy::grpc_status::RESOURCE_EXHAUSTED => {
+                        "Resource exhausted"
+                    }
                     _ => "Backend unavailable",
                 };
 
@@ -18445,7 +21043,10 @@ async fn handle_proxy_request_inner(
                             metadata,
                             ..TransactionSummary::default()
                         };
-                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                        crate::plugins::log_with_mirror_before_buffered_response(
+                            &plugins, summary, &ctx,
+                        )
+                        .await;
                     }
                 } else {
                     crate::runtime_metrics::global_ref().record_grpc_error(
@@ -18466,15 +21067,32 @@ async fn handle_proxy_request_inner(
                 // intermittent `200 + application/grpc` a gRPC-Web caller saw when
                 // a backend read/connect blipped under load (issue #2041).
                 if let Some(content_type) = grpc_web_response_content_type {
-                    return Ok(build_grpc_web_error_response(content_type, grpc_code, msg));
+                    return Ok(build_grpc_web_error_response(
+                        content_type,
+                        grpc_code,
+                        msg,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    ));
                 }
                 if grpc_request_is_web_translated
-                    && let Some(response) =
-                        build_translated_grpc_web_error_response(&ctx, grpc_code, msg)
+                    && let Some(response) = build_translated_grpc_web_error_response(
+                        &ctx,
+                        grpc_code,
+                        msg,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    )
                 {
                     return Ok(response);
                 }
-                return Ok(grpc_proxy::build_grpc_error_response(grpc_code, msg));
+                return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                    grpc_code,
+                    msg,
+                    initial_response_header_policy_plugins.as_ref(),
+                ));
             }
         }
     }
@@ -18619,11 +21237,19 @@ async fn handle_proxy_request_inner(
             let message =
                 format!("HBONE dispatch required for this backend target: {block_reason}");
             if let Some(content_type) = grpc_web_response_content_type {
-                return Ok(build_grpc_web_error_response(content_type, 14, &message));
+                return Ok(build_grpc_web_error_response(
+                    content_type,
+                    14,
+                    &message,
+                    plugin_cache_view
+                        .initial_response_header_policy_plugins()
+                        .as_ref(),
+                ));
             }
-            return Ok(grpc_proxy::build_grpc_error_response(
+            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                 14, // UNAVAILABLE
                 &message,
+                initial_response_header_policy_plugins.as_ref(),
             ));
         }
         record_request(&state, 502);
@@ -18689,14 +21315,32 @@ async fn handle_proxy_request_inner(
                 "sidecar mesh mTLS dispatch required for this backend target: {block_reason}"
             );
             if let Some(content_type) = grpc_web_response_content_type {
-                return Ok(build_grpc_web_error_response(content_type, 14, &message));
+                return Ok(build_grpc_web_error_response(
+                    content_type,
+                    14,
+                    &message,
+                    plugin_cache_view
+                        .initial_response_header_policy_plugins()
+                        .as_ref(),
+                ));
             }
             if grpc_request_is_web_translated
-                && let Some(response) = build_translated_grpc_web_error_response(&ctx, 14, &message)
+                && let Some(response) = build_translated_grpc_web_error_response(
+                    &ctx,
+                    14,
+                    &message,
+                    plugin_cache_view
+                        .initial_response_header_policy_plugins()
+                        .as_ref(),
+                )
             {
                 return Ok(response);
             }
-            return Ok(grpc_proxy::build_grpc_error_response(14, &message));
+            return Ok(grpc_proxy::build_grpc_error_response_with_policy(
+                14,
+                &message,
+                initial_response_header_policy_plugins.as_ref(),
+            ));
         }
         record_request(&state, 502);
         return Ok(build_response(
@@ -18704,25 +21348,21 @@ async fn handle_proxy_request_inner(
             r#"{"error":"Bad Gateway","message":"Sidecar mTLS dispatch required for this backend target"}"#,
         ));
     }
-    let mut current_dispatch_h3 = !requires_response_stream_inspection
+    // The native H3 backend path does not yet bound DNS/connect, response
+    // headers, retry dispatch, and body drains by the client RPC deadline.
+    // Keep deadline-bound untranslated gRPC-Web on the reqwest path, whose
+    // entire exchange is guarded and can still synthesize the browser-visible
+    // status-4 trailer frame before any response bytes are committed.
+    let deadline_bound_grpc_web_pass_through =
+        grpc_web_request && !grpc_request_is_web_translated && ctx.grpc_deadline_at().is_some();
+    let mut current_dispatch_h3 = !deadline_bound_grpc_web_pass_through
+        && !requires_response_stream_inspection
         && supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
-    // Client end-to-end gRPC deadline for a native-gRPC request riding the
-    // generic path (the mesh-mTLS relay; codex r2-2 finding 6). Parsed from
-    // the POST-PLUGIN outbound headers — the same view
-    // `proxy_grpc_request_streaming` parses after its proxy-header merge, so
-    // `before_proxy` plugins that add/replace/remove `grpc-timeout` are
-    // reflected. Captured HERE (pre-dispatch) because `proxy_headers` borrows
-    // `ctx.headers` and cannot outlive the `&mut ctx` plugin hooks below; the
-    // `StreamingH2` response arm anchors the absolute deadline at request
-    // receipt via `grpc_streaming_response_deadline`, exactly like the direct
-    // gRPC pool's streaming arm.
-    let grpc_client_deadline_ms = if request_uses_grpc_content_type {
-        proxy_headers
-            .get("grpc-timeout")
-            .and_then(|v| grpc_proxy::parse_grpc_timeout_value(v))
-    } else {
-        None
-    };
+    // Client end-to-end gRPC deadline for any gRPC-flavored request riding the
+    // generic path (native gRPC or gRPC-Web). The typed instant was anchored at
+    // receipt by policy preflight and survives representation/transport
+    // translation independently of the relative upstream header.
+    let grpc_request_deadline = ctx.grpc_deadline_at();
     let bytes_sent_observed = Arc::clone(&ctx.bytes_sent_observed);
     let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
     let mut skip_final_cb_record = false;
@@ -18746,17 +21386,13 @@ async fn handle_proxy_request_inner(
         let mut final_upstream_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
-        let mut body_hook_ctx = if needs_final_request_body_context {
-            Some(ctx.clone_for_final_request_body_hooks())
-        } else {
-            None
-        };
+        let mut body_hook_ctx = deferred_body_hook_ctx.take();
         let initial_dispatch = proxy_to_backend(
             &state,
             &proxy,
             &current_url,
             &method,
-            proxy_headers,
+            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
             client_request_body,
             upstream_target.as_deref(),
             &plugins,
@@ -18781,6 +21417,9 @@ async fn handle_proxy_request_inner(
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx.take() {
+            if body_hook_ctx.gateway_deadline_response_selected() {
+                ctx.mark_gateway_deadline_response_selected();
+            }
             // `clone_for_final_request_body_hooks` omits `request_body`; carry the
             // original across the metadata swap (no on_final hook touches it).
             // Disjoint field assignments avoid a whole-`ctx` borrow.
@@ -18831,6 +21470,42 @@ async fn handle_proxy_request_inner(
         };
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
+            // Resolve and validate the next retry target before charging this
+            // failure as an intermediate attempt or entering backoff. A
+            // path-changing candidate will not be dispatched, so leave final
+            // accounting to the ordinary post-loop path without delaying the
+            // client first.
+            let next_retry_target = if let (Some(_upstream_id), Some(prev_target)) =
+                (&proxy.upstream_id, &current_target)
+                && let Some(ref hash_key) = lb_hash_key
+                && let Some(next) = backend_dispatch::select_next_retry_target(
+                    &state,
+                    &epoch,
+                    &proxy,
+                    prev_target,
+                    hash_key,
+                    &ctx.client_ip,
+                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                ) {
+                if !retry_target_preserves_backend_path(
+                    backend_path_is_policy_bound,
+                    &proxy,
+                    &path,
+                    strip_len,
+                    prev_target,
+                    &next,
+                ) {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        "Aborting retry because the candidate would change the authorized backend method path"
+                    );
+                    break;
+                }
+                Some(next)
+            } else {
+                None
+            };
+
             if let Some(permits) = backend_admission_permits.take() {
                 permits.record_backend_outcome(BackendAdmissionOutcome {
                     response_status: result.status_code,
@@ -18856,7 +21531,21 @@ async fn handle_proxy_request_inner(
             }
 
             let delay = retry::retry_delay(retry_config, attempt);
-            tokio::time::sleep(delay).await;
+            if let Some(deadline) = ctx.grpc_deadline_at() {
+                if tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+                    .await
+                    .is_err()
+                {
+                    result = client_grpc_deadline_exceeded_response_for_request(
+                        &ctx,
+                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        result.backend_resolved_ip.clone(),
+                    );
+                    break;
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+            }
             attempt += 1;
 
             // Try a different target on retry if load balancing is configured.
@@ -18872,19 +21561,10 @@ async fn handle_proxy_request_inner(
             // result correctly if we break before dispatching to the new
             // target (e.g. its circuit breaker is open).
             let pre_rotation_cb_key = current_cb_target_key.clone();
-            if let (Some(_upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
-                && let Some(ref hash_key) = lb_hash_key
-                && let Some(next) = backend_dispatch::select_next_retry_target(
-                    &state,
-                    &epoch,
-                    &proxy,
-                    prev_target,
-                    hash_key,
-                    &ctx.client_ip,
-                    proxy_headers,
-                )
-            {
-                let target_changed = next.host != prev_target.host || next.port != prev_target.port;
+            if let Some(next) = next_retry_target {
+                let target_changed = current_target.as_ref().is_some_and(|prev_target| {
+                    next.host != prev_target.host || next.port != prev_target.port
+                });
                 current_url = build_backend_url_with_target(
                     &proxy,
                     &path,
@@ -18903,7 +21583,8 @@ async fn handle_proxy_request_inner(
                     // gracefully fall through to reqwest, so an
                     // un-pre-warmed target degrades to the safe path until
                     // the periodic refresh classifies it.
-                    current_dispatch_h3 = !requires_response_stream_inspection
+                    current_dispatch_h3 = !deadline_bound_grpc_web_pass_through
+                        && !requires_response_stream_inspection
                         && supports_native_http3_backend(&state, &proxy, current_target.as_deref());
                 }
             }
@@ -19064,7 +21745,7 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     &current_url,
                     &method,
-                    proxy_headers,
+                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
                     h3_retry_stream_response,
@@ -19082,7 +21763,7 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     &current_url,
                     &method,
-                    proxy_headers,
+                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
                     should_stream && is_last_attempt,
@@ -19113,17 +21794,13 @@ async fn handle_proxy_request_inner(
         }
         (result, current_cb_target_key, final_upstream_target)
     } else {
-        let mut body_hook_ctx = if needs_final_request_body_context {
-            Some(ctx.clone_for_final_request_body_hooks())
-        } else {
-            None
-        };
+        let mut body_hook_ctx = deferred_body_hook_ctx.take();
         let dispatch = proxy_to_backend(
             &state,
             &proxy,
             &backend_url,
             &method,
-            proxy_headers,
+            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
             client_request_body,
             upstream_target.as_deref(),
             &plugins,
@@ -19148,6 +21825,9 @@ async fn handle_proxy_request_inner(
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx {
+            if body_hook_ctx.gateway_deadline_response_selected() {
+                ctx.mark_gateway_deadline_response_selected();
+            }
             // `clone_for_final_request_body_hooks` omits `request_body`; carry the
             // original across the metadata swap (no on_final hook touches it).
             // Disjoint field assignments avoid a whole-`ctx` borrow.
@@ -19520,9 +22200,13 @@ async fn handle_proxy_request_inner(
         let phase_start = Instant::now();
         let mut response_body_reject = None;
         for plugin in plugins.iter() {
-            let result = plugin
-                .on_response_body(&mut ctx, response_status, &response_headers, data)
-                .await;
+            let deadline = ctx.grpc_deadline_at();
+            let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+                deadline,
+                plugin.on_response_body(&mut ctx, response_status, &response_headers, data),
+            )
+            .await
+            .into_plugin_result(&mut ctx);
             match result {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
@@ -19561,21 +22245,16 @@ async fn handle_proxy_request_inner(
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
-        // Clone content-type to avoid borrowing response_headers across the loop.
-        let content_type = response_headers.get("content-type").cloned();
-        let ct_ref = content_type.as_deref();
-        for plugin in plugins.iter() {
-            if let Some(transformed) = plugin
-                .transform_response_body_with_context(&mut ctx, data, ct_ref, &response_headers)
-                .await
-            {
-                // Update Content-Length to reflect the new body size
-                response_headers
-                    .insert("content-length".to_string(), transformed.len().to_string());
-                *data = transformed;
-                plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
-            }
-        }
+        transform_buffered_response_body_with_deadline(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            data,
+            grpc_web_response_content_type,
+            initial_response_header_policy_plugins.as_ref(),
+        )
+        .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
@@ -19588,9 +22267,13 @@ async fn handle_proxy_request_inner(
         let phase_start = Instant::now();
         let mut response_body_reject = None;
         for plugin in plugins.iter() {
-            let result = plugin
-                .on_final_response_body(&mut ctx, response_status, &response_headers, data)
-                .await;
+            let deadline = ctx.grpc_deadline_at();
+            let result = crate::plugins::await_request_plugin_deadline_with_provenance(
+                deadline,
+                plugin.on_final_response_body(&mut ctx, response_status, &response_headers, data),
+            )
+            .await
+            .into_plugin_result(&mut ctx);
             match result {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
@@ -19655,14 +22338,18 @@ async fn handle_proxy_request_inner(
     // precomputed capability bit keeps this phase to one predictable branch
     // when no exporter is configured.
     if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
-        && let ResponseBody::Buffered(ref data) = response_body
+        && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
-        for plugin in plugins.iter() {
-            plugin
-                .on_response_committed(&mut ctx, response_status, &response_headers, data)
-                .await;
-        }
+        run_deadline_bounded_response_committed_hooks(
+            plugin_cache_view.response_committed_plugins(),
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            data,
+            initial_response_header_policy_plugins.as_ref(),
+        )
+        .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
@@ -19802,7 +22489,8 @@ async fn handle_proxy_request_inner(
                     ),
                 )
             } else {
-                crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                crate::plugins::log_with_mirror_before_buffered_response(&plugins, summary, &ctx)
+                    .await;
                 None
             }
         } else {
@@ -19810,6 +22498,23 @@ async fn handle_proxy_request_inner(
         };
 
     record_request(&state, response_status);
+
+    // A streaming deadline can replace an as-yet-unpolled backend body with a
+    // differently sized gRPC-Web frame or native trailers. Strip the backend
+    // length before response headers are committed. H1/H2 builders below then
+    // receive `cl = None`; native-H3 keeps the backend length only for internal
+    // FIN/truncation validation, while the outer deadline wrapper suppresses
+    // that exact size hint so hyper cannot recreate a client Content-Length.
+    let streaming_grpc_deadline = match &response_body {
+        ResponseBody::Streaming { .. }
+        | ResponseBody::StreamingH2(_)
+        | ResponseBody::StreamingH3(_) => ctx.grpc_deadline_at(),
+        ResponseBody::Buffered(_) => None,
+    };
+    strip_content_length_for_streaming_grpc_deadline(
+        &mut response_headers,
+        streaming_grpc_deadline,
+    );
 
     // Build final response
     let mut resp_builder = Response::builder()
@@ -19921,16 +22626,19 @@ async fn handle_proxy_request_inner(
                 // is recorded when the body completes (EOF / policy cut / error /
                 // client disconnect) via the same deferred machinery, rather than
                 // being released early at header time.
-                let inspected = crate::proxy::body::inspected_streaming_body(rx);
+                let mut inspected = crate::proxy::body::inspected_streaming_body(rx);
                 if let Some(permits) = backend_admission_permits.take() {
-                    inspected.with_deferred_backend_admission_outcome(
+                    inspected = inspected.with_deferred_backend_admission_outcome(
                         permits,
                         backend_admission_response_status,
                         backend_admission_elapsed,
-                    )
-                } else {
-                    inspected
+                    );
                 }
+                if let Some(deadline) = ctx.grpc_deadline_at() {
+                    inspected = inspected
+                        .with_client_grpc_deadline(deadline, grpc_web_response_content_type);
+                }
+                inspected
             } else {
                 let cl = response_headers
                     .get("content-length")
@@ -19979,7 +22687,7 @@ async fn handle_proxy_request_inner(
                     );
                 }
 
-                if state.env_config.enable_streaming_latency_tracking {
+                let base = if state.env_config.enable_streaming_latency_tracking {
                     let (tracked_body, metrics) = base.into_tracked(backend_start);
 
                     // Spawn a lightweight deferred task to log the final streaming latency.
@@ -20015,6 +22723,11 @@ async fn handle_proxy_request_inner(
                     }
 
                     tracked_body
+                } else {
+                    base
+                };
+                if let Some(deadline) = ctx.grpc_deadline_at() {
+                    base.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
                 } else {
                     base
                 }
@@ -20055,23 +22768,19 @@ async fn handle_proxy_request_inner(
             // idle (`backend_read_timeout_ms`) regime — no client end-to-end
             // gRPC deadline applies (issue #1649). A NATIVE-gRPC response
             // (the mesh-mTLS relay — the only native-gRPC route into this
-            // arm) instead honors the client's post-plugin `grpc-timeout` as
-            // an ABSOLUTE deadline anchored at request receipt, per-frame
-            // idle disabled — `grpc_streaming_response_deadline` is the same
+            // arm) instead honors the request's typed ABSOLUTE deadline,
+            // anchored at receipt before plugin work, with per-frame idle
+            // disabled — `grpc_streaming_response_deadline` is the same
             // helper the direct gRPC pool's streaming arm uses, falling back
             // to the effective per-target `backend_read_timeout_ms` when the
             // client set no deadline.
             let effective_h2_read_timeout_ms =
                 streaming_h2_read_timeout_ms.unwrap_or(proxy.backend_read_timeout_ms);
-            let (h2_read_timeout_ms, h2_total_deadline) = if streaming_h2_native_grpc {
+            let (h2_read_timeout_ms, h2_total_deadline) =
                 grpc_proxy::grpc_streaming_response_deadline(
-                    grpc_client_deadline_ms,
-                    start_time.elapsed(),
+                    grpc_request_deadline,
                     effective_h2_read_timeout_ms,
-                )
-            } else {
-                (effective_h2_read_timeout_ms, None)
-            };
+                );
             let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
             {
@@ -20079,7 +22788,7 @@ async fn handle_proxy_request_inner(
                     resp.into_body(),
                     cl,
                     h2_read_timeout_ms,
-                    h2_total_deadline,
+                    None,
                 )
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce response-size limits while
@@ -20091,7 +22800,7 @@ async fn handle_proxy_request_inner(
                     cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
-                    h2_total_deadline,
+                    None,
                 )
             } else if use_passthrough {
                 // Response too large to benefit from coalescing — stream
@@ -20103,7 +22812,7 @@ async fn handle_proxy_request_inner(
                     resp.into_body(),
                     cl,
                     h2_read_timeout_ms,
-                    h2_total_deadline,
+                    None,
                 )
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -20111,7 +22820,7 @@ async fn handle_proxy_request_inner(
                     cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
-                    h2_total_deadline,
+                    None,
                 )
             };
             let mut body = if let Some(inspector) = response_inspector {
@@ -20127,6 +22836,13 @@ async fn handle_proxy_request_inner(
             } else {
                 body.with_lb_connection_guard(lb_connection_guard)
             };
+            // The absolute wrapper must observe the inspector's OUTPUT, not
+            // the backend frames it consumed. An inspector may hold a chunk by
+            // returning empty Forward; only bytes yielded by this outer body
+            // are client-visible for the clean-status-4 versus reset decision.
+            if let Some(deadline) = h2_total_deadline {
+                body = body.with_client_grpc_deadline(deadline, grpc_web_response_content_type);
+            }
             // Deferred admission/dispatch outcomes stay on the client-visible
             // body. The least-connections guard moves into the inspection task
             // on a hit so a client cancel cannot under-count a provider-blocked
@@ -20205,6 +22921,14 @@ async fn handle_proxy_request_inner(
             let success_on_drop_after_bytes =
                 h3_success_on_drop_after_response_bytes(inbound_version, client_content_length);
             let backend_content_length = streaming_h3_backend_content_length;
+            // Match the H2/native-H3 regime switch: a client RPC deadline is
+            // the sole response-phase timer. The outer wrapper below enforces
+            // it after inspection, so the inner per-frame idle timer is off.
+            let h3_read_timeout_ms = if grpc_request_deadline.is_some() {
+                0
+            } else {
+                proxy.backend_read_timeout_ms
+            };
             // Method + status thread into `H3FrameSource` so its graceful-close
             // recovery gate uses the same `is_response_body_complete` predicate
             // as the buffered path (HEAD/204/304 no-body responses included).
@@ -20219,7 +22943,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
-                    proxy.backend_read_timeout_ms,
+                    h3_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
@@ -20231,7 +22955,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
-                    proxy.backend_read_timeout_ms,
+                    h3_read_timeout_ms,
                 )
             } else {
                 crate::proxy::body::coalescing_h3_body(
@@ -20242,7 +22966,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
-                    proxy.backend_read_timeout_ms,
+                    h3_read_timeout_ms,
                 )
             };
             let mut body = if let Some(inspector) = response_inspector {
@@ -20258,6 +22982,9 @@ async fn handle_proxy_request_inner(
             } else {
                 body.with_lb_connection_guard(lb_connection_guard)
             };
+            if let Some(deadline) = grpc_request_deadline {
+                body = body.with_client_grpc_deadline(deadline, grpc_web_response_content_type);
+            }
             body = body.with_success_on_drop_after_response_bytes(success_on_drop_after_bytes);
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
@@ -20386,58 +23113,38 @@ pub fn build_backend_url_with_target(
         DispatchKind::TcpTls | DispatchKind::UdpDtls => "https",
     };
 
-    // `strip_len` (RouteMatch::matched_prefix_len) is a byte offset into the
-    // path AFTER encoded-slash normalization: the router matches against
-    // `normalize_encoded_slashes(path)`, which collapses %2f/%252f to '/'.
-    // Slicing that offset out of the RAW `incoming_path` is a coordinate
-    // mismatch — the offset is too small whenever the request contained
-    // encoded slashes (each %2f shrinks 2 bytes, %252f 4), which both forwards
-    // a corrupted tail to the backend (routing-vs-forwarding desync) and can
-    // index into the middle of a multi-byte UTF-8 codepoint, panicking the
-    // request task. Strip from the SAME normalized path the offset was
-    // computed against so the slice is coordinate-correct and on a char
-    // boundary. Normalization is an allocation-free borrow when the path has
-    // no encoded slashes (the common case) and only runs when stripping.
-    let normalized_path = if proxy.strip_listen_path {
-        Some(crate::router_cache::normalize_encoded_slashes(
-            incoming_path,
-        ))
-    } else {
-        None
-    };
-    let remaining_path = match &normalized_path {
-        Some(normalized) => &normalized[strip_len.min(normalized.len())..],
-        None => incoming_path,
-    };
+    with_backend_path_parts(
+        proxy,
+        incoming_path,
+        strip_len,
+        target_path,
+        |backend_path, remaining_path| {
+            let path_layout = backend_path_layout(backend_path, remaining_path);
+            let rendered_host = url_render_host(host);
 
-    let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
+            // Build URL in a single buffer, writing the path segments directly
+            // to avoid an intermediate `full_path` allocation.
+            let capacity = scheme.len()
+                + 3
+                + rendered_host.len()
+                + 6
+                + path_layout.len
+                + if query_string.is_empty() {
+                    0
+                } else {
+                    1 + query_string.len()
+                };
+            let mut url = String::with_capacity(capacity);
+            let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
+            push_backend_path(&mut url, backend_path, remaining_path);
 
-    let path_layout = backend_path_layout(backend_path, remaining_path);
-    let rendered_host = url_render_host(host);
-
-    // Build URL in a single buffer, writing the path segments directly to avoid
-    // an intermediate `full_path` String allocation from format!().
-    let capacity = scheme.len()
-        + 3
-        + rendered_host.len()
-        + 6
-        + path_layout.len
-        + if query_string.is_empty() {
-            0
-        } else {
-            1 + query_string.len()
-        };
-    let mut url = String::with_capacity(capacity);
-    let _ = write!(url, "{}://{}:{}", scheme, rendered_host, port);
-
-    push_backend_path(&mut url, backend_path, remaining_path);
-
-    if !query_string.is_empty() {
-        url.push('?');
-        url.push_str(query_string);
-    }
-
-    url
+            if !query_string.is_empty() {
+                url.push('?');
+                url.push_str(query_string);
+            }
+            url
+        },
+    )
 }
 
 /// Resolve the effective `Proxy` for one backend dispatch, honoring an
@@ -20932,20 +23639,42 @@ pub(crate) async fn proxy_to_backend_retry(
     }
 
     // Resolve backend IP from DNS cache (O(1) cached lookup).
-    let resolved_ip = state
-        .dns_cache
-        .resolve(
-            effective_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await
-        .ok()
-        .map(|ip| ip.to_string());
+    let resolve_backend_ip = state.dns_cache.resolve(
+        effective_host,
+        proxy.dns_override.as_deref(),
+        proxy.dns_cache_ttl_seconds,
+    );
+    let resolved_ip_result = if let Some(deadline) = request_ctx.grpc_deadline_at() {
+        match tokio::time::timeout_at(deadline, resolve_backend_ip).await {
+            Ok(result) => result,
+            Err(_) => {
+                return client_grpc_deadline_exceeded_response_for_request(
+                    request_ctx,
+                    headers,
+                    None,
+                );
+            }
+        }
+    } else {
+        resolve_backend_ip.await
+    };
+    let resolved_ip = resolved_ip_result.ok().map(|ip| ip.to_string());
 
-    let client = match state.connection_pool.get_client(proxy).await {
-        Ok(client) => client,
-        Err(e) => {
+    let client_result = crate::plugins::await_grpc_deadline(
+        request_ctx.grpc_deadline_at(),
+        state.connection_pool.get_client(proxy),
+    )
+    .await;
+    let client = match client_result {
+        Err(()) => {
+            return client_grpc_deadline_exceeded_response_for_request(
+                request_ctx,
+                headers,
+                resolved_ip,
+            );
+        }
+        Ok(Ok(client)) => client,
+        Ok(Err(e)) => {
             error!("Failed to get client from pool for retry: {}", e);
             return retry::BackendResponse {
                 status_code: 502,
@@ -20986,15 +23715,35 @@ pub(crate) async fn proxy_to_backend_retry(
     // "disabled" for both — skip the override so reqwest's default (no timeout)
     // applies. The per-request `connect_timeout` API is provided by a vendored
     // copy of reqwest patched with seanmonstar/reqwest#3017.
+    // Keep the timeout source typed: the outer `await_grpc_deadline` owns the
+    // client RPC deadline, while reqwest owns only operator timeouts that
+    // expire strictly earlier. Installing the same budget in both
+    // places creates a race where reqwest can misclassify client expiry as a
+    // backend failure and train health/adaptive accounting.
+    let client_deadline_remaining = if let Some(deadline) = request_ctx.grpc_deadline_at() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return client_grpc_deadline_exceeded_response_for_request(
+                request_ctx,
+                headers,
+                resolved_ip,
+            );
+        }
+        Some(remaining)
+    } else {
+        None
+    };
     if proxy.backend_connect_timeout_ms > 0 {
-        req_builder = req_builder.connect_timeout(std::time::Duration::from_millis(
-            proxy.backend_connect_timeout_ms,
-        ));
+        let operator_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
+            req_builder = req_builder.connect_timeout(operator_timeout);
+        }
     }
     if proxy.backend_read_timeout_ms > 0 {
-        req_builder = req_builder.timeout(std::time::Duration::from_millis(
-            proxy.backend_read_timeout_ms,
-        ));
+        let operator_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
+            req_builder = req_builder.timeout(operator_timeout);
+        }
     }
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
@@ -21118,7 +23867,21 @@ pub(crate) async fn proxy_to_backend_retry(
 
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
-    let send_result = req_builder.send().await;
+    let send_result = match crate::plugins::await_grpc_deadline(
+        request_ctx.grpc_deadline_at(),
+        req_builder.send(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(()) => {
+            return client_grpc_deadline_exceeded_response_for_request(
+                request_ctx,
+                headers,
+                resolved_ip,
+            );
+        }
+    };
     // Release this retry attempt's in-flight slot the instant `send()` resolves
     // (response headers / dial failure) — BEFORE any response-body collection —
     // so it spans this attempt's dispatch → response-headers window only, never
@@ -21192,8 +23955,23 @@ pub(crate) async fn proxy_to_backend_retry(
                     // Content-Length is within cutoff (and within max_response
                     // _body_size_bytes if set, checked above), so eager
                     // collection is bounded.
+                    let body_read = match crate::plugins::await_grpc_deadline(
+                        request_ctx.grpc_deadline_at(),
+                        response.bytes(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(()) => {
+                            return client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip,
+                            );
+                        }
+                    };
                     buffered_backend_response_from_body_read(
-                        response.bytes().await,
+                        body_read,
                         status,
                         resp_headers,
                         resolved_ip.clone(),
@@ -21220,7 +23998,22 @@ pub(crate) async fn proxy_to_backend_retry(
                 // memory.
                 if state.max_response_body_size_bytes > 0 {
                     let max_size = state.max_response_body_size_bytes;
-                    match collect_response_with_limit(response, max_size).await {
+                    let collected = match crate::plugins::await_grpc_deadline(
+                        request_ctx.grpc_deadline_at(),
+                        collect_response_with_limit(response, max_size),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(()) => {
+                            return client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip,
+                            );
+                        }
+                    };
+                    match collected {
                         Ok((resp_body, _)) => retry::BackendResponse {
                             status_code: status,
                             body: ResponseBody::Buffered(resp_body),
@@ -21239,8 +24032,23 @@ pub(crate) async fn proxy_to_backend_retry(
                         },
                     }
                 } else {
+                    let body_read = match crate::plugins::await_grpc_deadline(
+                        request_ctx.grpc_deadline_at(),
+                        response.bytes(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(()) => {
+                            return client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip,
+                            );
+                        }
+                    };
                     buffered_backend_response_from_body_read(
-                        response.bytes().await,
+                        body_read,
                         status,
                         resp_headers,
                         resolved_ip.clone(),
@@ -21685,16 +24493,26 @@ async fn proxy_to_backend(
     // Resolve backend IP from DNS cache (O(1) cached lookup, <1μs).
     // This is the same cache reqwest will use internally via DnsCacheResolver,
     // so the IP will match the actual connection target.
-    let resolved_ip = state
-        .dns_cache
-        .resolve(
-            effective_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await
-        .ok()
-        .map(|ip| ip.to_string());
+    let resolve_backend_ip = state.dns_cache.resolve(
+        effective_host,
+        proxy.dns_override.as_deref(),
+        proxy.dns_cache_ttl_seconds,
+    );
+    let resolved_ip_result = if let Some(deadline) = request_ctx.grpc_deadline_at() {
+        match tokio::time::timeout_at(deadline, resolve_backend_ip).await {
+            Ok(result) => result,
+            Err(_) => {
+                return backend_dispatch_response(
+                    client_grpc_deadline_exceeded_response_for_request(request_ctx, headers, None),
+                    None,
+                    None,
+                );
+            }
+        }
+    } else {
+        resolve_backend_ip.await
+    };
+    let resolved_ip = resolved_ip_result.ok().map(|ip| ip.to_string());
 
     if dispatch_hbone {
         // 413 on an oversized declared Content-Length BEFORE admission, so a
@@ -21810,6 +24628,7 @@ async fn proxy_to_backend(
             client_request_body,
             upstream_target,
             plugins,
+            request_ctx,
             response_decision_ctx,
             stream_response,
             client_ip,
@@ -21879,6 +24698,7 @@ async fn proxy_to_backend(
             client_request_body,
             plugins,
             ctx,
+            request_ctx.grpc_deadline_at(),
             response_decision_ctx,
             upstream_target,
             client_ip,
@@ -21996,9 +24816,26 @@ async fn proxy_to_backend(
                 Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
             };
             *backend_admission_started_at = Instant::now();
-            let direct_h2_sender = match state.http2_pool.get_sender(direct_h2_proxy).await {
-                Ok(sender) => Some(sender),
-                Err(e) => {
+            let sender_result = crate::plugins::await_grpc_deadline(
+                request_ctx.grpc_deadline_at(),
+                state.http2_pool.get_sender(direct_h2_proxy),
+            )
+            .await;
+            let direct_h2_sender = match sender_result {
+                Err(()) => {
+                    drop(h2_admission_permits.take());
+                    return backend_dispatch_response(
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            resolved_ip,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                Ok(Ok(sender)) => Some(sender),
+                Ok(Err(e)) => {
                     if should_fallback_to_reqwest_after_http2_pool_error(&e) {
                         // The per-pool-key ALPN learning cache was removed
                         // when the capability registry took over classification,
@@ -22105,6 +24942,7 @@ async fn proxy_to_backend(
                         request,
                         plugins,
                         response_decision_ctx,
+                        request_ctx.grpc_deadline_at(),
                         stream_response,
                         client_ip,
                         xff_append_ip,
@@ -22172,9 +25010,25 @@ async fn proxy_to_backend(
     // the force-H1 ALPN/pool-key guarantee on this path rides this rebind, so a
     // first/non-retry request cannot ALPN-negotiate h2 despite DO_NOT_UPGRADE.
     // `proxy_to_backend_retry` rebinds identically for the retry path.
-    let client = match state.connection_pool.get_client(proxy).await {
-        Ok(client) => client,
-        Err(e) => {
+    let client_result = crate::plugins::await_grpc_deadline(
+        request_ctx.grpc_deadline_at(),
+        state.connection_pool.get_client(proxy),
+    )
+    .await;
+    let client = match client_result {
+        Err(()) => {
+            return backend_dispatch_response(
+                client_grpc_deadline_exceeded_response_for_request(
+                    request_ctx,
+                    headers,
+                    resolved_ip,
+                ),
+                None,
+                None,
+            );
+        }
+        Ok(Ok(client)) => client,
+        Ok(Err(e)) => {
             error!(
                 proxy_id = %proxy.id,
                 listen_path = ?proxy.listen_path,
@@ -22226,15 +25080,35 @@ async fn proxy_to_backend(
     // "disabled" for both — skip the override so reqwest's default (no timeout)
     // applies. The per-request `connect_timeout` API is provided by a vendored
     // copy of reqwest patched with seanmonstar/reqwest#3017.
+    // Keep the timeout source typed; see the retry-path companion above.
+    let client_deadline_remaining = if let Some(deadline) = request_ctx.grpc_deadline_at() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return backend_dispatch_response(
+                client_grpc_deadline_exceeded_response_for_request(
+                    request_ctx,
+                    headers,
+                    resolved_ip,
+                ),
+                retained_body,
+                None,
+            );
+        }
+        Some(remaining)
+    } else {
+        None
+    };
     if proxy.backend_connect_timeout_ms > 0 {
-        req_builder = req_builder.connect_timeout(std::time::Duration::from_millis(
-            proxy.backend_connect_timeout_ms,
-        ));
+        let operator_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
+            req_builder = req_builder.connect_timeout(operator_timeout);
+        }
     }
     if proxy.backend_read_timeout_ms > 0 {
-        req_builder = req_builder.timeout(std::time::Duration::from_millis(
-            proxy.backend_read_timeout_ms,
-        ));
+        let operator_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+        if client_deadline_remaining.is_none_or(|remaining| operator_timeout < remaining) {
+            req_builder = req_builder.timeout(operator_timeout);
+        }
     }
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
@@ -22347,11 +25221,20 @@ async fn proxy_to_backend(
                     let body_bytes = apply_request_body_plugins_with_context(
                         plugins,
                         ctx.as_deref_mut(),
+                        request_ctx.grpc_deadline_at(),
                         headers,
                         body_bytes,
                     )
                     .await;
-                    match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
+                    match run_final_request_body_hooks(
+                        plugins,
+                        ctx,
+                        request_ctx.grpc_deadline_at(),
+                        headers,
+                        &body_bytes,
+                    )
+                    .await
+                    {
                         PluginResult::Continue => {}
                         reject @ PluginResult::Reject { .. }
                         | reject @ PluginResult::RejectBinary { .. } => {
@@ -22412,8 +25295,9 @@ async fn proxy_to_backend(
                         (*original_req).into_body(),
                         state.max_request_body_size_bytes,
                     );
-                    match collect_request_body_with_timeout(
+                    match collect_request_body_with_deadline(
                         limited.collect(),
+                        request_ctx.grpc_deadline_at(),
                         proxy.backend_read_timeout_ms,
                     )
                     .await
@@ -22438,17 +25322,24 @@ async fn proxy_to_backend(
                                 None,
                             );
                         }
-                        Err(_) => {
-                            return backend_dispatch_response(
-                                request_body_timeout_backend_response(resolved_ip.clone()),
-                                None,
-                                None,
+                        Err(RequestBodyWaitError::DeadlineExceeded) => {
+                            let response = client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip.clone(),
                             );
+                            return backend_dispatch_response(response, None, None);
+                        }
+                        Err(RequestBodyWaitError::TimedOut) => {
+                            let response =
+                                request_body_timeout_backend_response(resolved_ip.clone());
+                            return backend_dispatch_response(response, None, None);
                         }
                     }
                 } else {
-                    match collect_request_body_with_timeout(
+                    match collect_request_body_with_deadline(
                         (*original_req).into_body().collect(),
+                        request_ctx.grpc_deadline_at(),
                         proxy.backend_read_timeout_ms,
                     )
                     .await
@@ -22477,12 +25368,18 @@ async fn proxy_to_backend(
                                 None,
                             );
                         }
-                        Err(_) => {
-                            return backend_dispatch_response(
-                                request_body_timeout_backend_response(resolved_ip.clone()),
-                                None,
-                                None,
+                        Err(RequestBodyWaitError::DeadlineExceeded) => {
+                            let response = client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip.clone(),
                             );
+                            return backend_dispatch_response(response, None, None);
+                        }
+                        Err(RequestBodyWaitError::TimedOut) => {
+                            let response =
+                                request_body_timeout_backend_response(resolved_ip.clone());
+                            return backend_dispatch_response(response, None, None);
                         }
                     }
                 };
@@ -22499,11 +25396,20 @@ async fn proxy_to_backend(
                 let body_bytes = apply_request_body_plugins_with_context(
                     plugins,
                     ctx.as_deref_mut(),
+                    request_ctx.grpc_deadline_at(),
                     headers,
                     body_bytes,
                 )
                 .await;
-                match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
+                match run_final_request_body_hooks(
+                    plugins,
+                    ctx,
+                    request_ctx.grpc_deadline_at(),
+                    headers,
+                    &body_bytes,
+                )
+                .await
+                {
                     PluginResult::Continue => {}
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
@@ -22640,7 +25546,25 @@ async fn proxy_to_backend(
     // Send
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
-    let send_result = req_builder.send().await;
+    let send_result = match crate::plugins::await_grpc_deadline(
+        request_ctx.grpc_deadline_at(),
+        req_builder.send(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(()) => {
+            return backend_dispatch_response(
+                client_grpc_deadline_exceeded_response_for_request(
+                    request_ctx,
+                    headers,
+                    resolved_ip,
+                ),
+                retained_body,
+                backend_admission_permits,
+            );
+        }
+    };
     // Release the in-flight slot the instant `send()` resolves — i.e. when
     // RESPONSE HEADERS arrive (or the dial failed). This is the only join point
     // reqwest exposes, so under the in-flight reinterpretation it IS the correct
@@ -22751,9 +25675,28 @@ async fn proxy_to_backend(
                         && content_length.is_some_and(|cl| cl <= cutoff)
                         && !is_streaming_content_type(&resp_headers)
                     {
+                        let body_read = match crate::plugins::await_grpc_deadline(
+                            request_ctx.grpc_deadline_at(),
+                            response.bytes(),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(()) => {
+                                return backend_dispatch_response(
+                                    client_grpc_deadline_exceeded_response_for_request(
+                                        request_ctx,
+                                        headers,
+                                        resolved_ip.clone(),
+                                    ),
+                                    retained_body,
+                                    backend_admission_permits,
+                                );
+                            }
+                        };
                         return backend_dispatch_response(
                             buffered_backend_response_from_body_read(
-                                response.bytes().await,
+                                body_read,
                                 status,
                                 resp_headers,
                                 resolved_ip.clone(),
@@ -22802,7 +25745,26 @@ async fn proxy_to_backend(
 
                 // Buffered mode: stream-collect with size limit
                 let max_size = state.max_response_body_size_bytes;
-                match collect_response_with_limit(response, max_size).await {
+                let collected = match crate::plugins::await_grpc_deadline(
+                    request_ctx.grpc_deadline_at(),
+                    collect_response_with_limit(response, max_size),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(()) => {
+                        return backend_dispatch_response(
+                            client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip.clone(),
+                            ),
+                            retained_body,
+                            backend_admission_permits,
+                        );
+                    }
+                };
+                match collected {
                     Ok((resp_body, _)) => retry::BackendResponse {
                         status_code: status,
                         body: ResponseBody::Buffered(resp_body),
@@ -22834,8 +25796,27 @@ async fn proxy_to_backend(
                     && content_length.is_some_and(|cl| cl <= cutoff)
                     && !is_streaming_content_type(&resp_headers)
                 {
+                    let body_read = match crate::plugins::await_grpc_deadline(
+                        request_ctx.grpc_deadline_at(),
+                        response.bytes(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(()) => {
+                            return backend_dispatch_response(
+                                client_grpc_deadline_exceeded_response_for_request(
+                                    request_ctx,
+                                    headers,
+                                    resolved_ip.clone(),
+                                ),
+                                retained_body,
+                                backend_admission_permits,
+                            );
+                        }
+                    };
                     buffered_backend_response_from_body_read(
-                        response.bytes().await,
+                        body_read,
                         status,
                         resp_headers,
                         resolved_ip.clone(),
@@ -22854,8 +25835,27 @@ async fn proxy_to_backend(
                     }
                 }
             } else {
+                let body_read = match crate::plugins::await_grpc_deadline(
+                    request_ctx.grpc_deadline_at(),
+                    response.bytes(),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(()) => {
+                        return backend_dispatch_response(
+                            client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip.clone(),
+                            ),
+                            retained_body,
+                            backend_admission_permits,
+                        );
+                    }
+                };
                 buffered_backend_response_from_body_read(
-                    response.bytes().await,
+                    body_read,
                     status,
                     resp_headers,
                     resolved_ip.clone(),
@@ -23327,6 +26327,16 @@ fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Opt
     })
 }
 
+/// Canonicalize a validated Host/`:authority` value for request signatures.
+/// Default ports are omitted so equivalent HTTP authorities have one signing
+/// representation; non-default ports and bracketed IPv6 literals are retained.
+pub(crate) fn normalize_request_authority_for_signing(
+    value: &str,
+    scheme: Option<&str>,
+) -> Option<String> {
+    normalize_authority_for_consistency(value, scheme).filter(|authority| !authority.is_empty())
+}
+
 /// Validate HTTP/2 and HTTP/3 `Host`/`:authority` consistency before routing.
 ///
 /// RFC 9113 states that `Host` and `:authority` are not permitted to disagree;
@@ -23525,6 +26535,7 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
 fn build_request_body_timeout_response(
     is_grpc_request: bool,
     grpc_web_response_content_type: Option<&str>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Response<ProxyBody> {
     const MESSAGE: &str = "Request body read timed out";
     if let Some(content_type) = grpc_web_response_content_type {
@@ -23532,12 +26543,14 @@ fn build_request_body_timeout_response(
             content_type,
             grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
             MESSAGE,
+            initial_response_header_policy_plugins,
         );
     }
     if is_grpc_request {
-        return grpc_proxy::build_grpc_error_response(
+        return grpc_proxy::build_grpc_error_response_with_policy(
             grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
             MESSAGE,
+            initial_response_header_policy_plugins,
         );
     }
     build_response(
@@ -23795,8 +26808,8 @@ fn mesh_grpc_unavailable_response(
     }
 }
 
-/// Timeout refusal for a gRPC-flavored request on the sidecar mesh-mTLS path
-/// (codex r2-2 finding 6): the direct gRPC pool maps a dispatch timeout
+/// Post-dispatch timeout for a gRPC-flavored request on the sidecar mesh-mTLS
+/// path (codex r2-2 finding 6): the direct gRPC pool maps a dispatch timeout
 /// (`GrpcProxyError::BackendTimeout`) to a Trailers-Only DEADLINE_EXCEEDED
 /// with the generic "Backend deadline exceeded" message — mirror that shape
 /// instead of the plain-HTTP JSON 504. Rides HTTP 200 (gRPC errors carry the
@@ -23822,6 +26835,69 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+    }
+}
+
+/// Client RPC deadline expiry while gateway work is still pending. It has the
+/// same client-visible Trailers-Only status as a backend read timeout, but
+/// remains neutral to backend health, circuit breaking, and adaptive
+/// concurrency because the client-chosen deadline is not a backend signal.
+fn client_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::BackendResponse {
+    let mut response = mesh_grpc_deadline_exceeded_response(resolved_ip);
+    response.headers.insert(
+        "grpc-message".to_string(),
+        GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
+    );
+    response.error_class = Some(retry::ErrorClass::ClientDisconnect);
+    response.connection_error = false;
+    response
+}
+
+pub(crate) fn client_grpc_deadline_exceeded_response_for_request(
+    request_ctx: &RequestContext,
+    request_headers: &HashMap<String, String>,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    // A translated request still runs the normal response plugin chain. Keep
+    // its internal response native so `grpc_web` performs exactly one body
+    // encoding pass. A pass-through gRPC-Web request has no translation marker,
+    // so synthesize its client wire shape here instead.
+    if crate::plugins::grpc_web::request_is_grpc_web_translated(request_ctx) {
+        return client_grpc_deadline_exceeded_response(resolved_ip);
+    }
+    let Some(content_type) = request_headers
+        .get("content-type")
+        .filter(|content_type| crate::plugins::grpc_web::is_grpc_web_content_type(content_type))
+    else {
+        return client_grpc_deadline_exceeded_response(resolved_ip);
+    };
+    let translated = crate::plugins::grpc_web::error_response_for_content_type(
+        crate::plugins::grpc_web::response_content_type(content_type),
+        grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+        GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+    );
+    retry::BackendResponse {
+        status_code: StatusCode::OK.as_u16(),
+        body: ResponseBody::Buffered(translated.body),
+        headers: translated.headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ClientDisconnect),
+    }
+}
+
+fn client_grpc_deadline_exceeded_response_for_optional_request(
+    request_ctx: Option<&RequestContext>,
+    request_headers: &HashMap<String, String>,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    match request_ctx {
+        Some(request_ctx) => client_grpc_deadline_exceeded_response_for_request(
+            request_ctx,
+            request_headers,
+            resolved_ip,
+        ),
+        None => client_grpc_deadline_exceeded_response(resolved_ip),
     }
 }
 
@@ -24632,7 +27708,8 @@ async fn proxy_to_backend_mesh_mtls(
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
-    ctx: Option<&RequestContext>,
+    request_ctx: &RequestContext,
+    response_decision_ctx: Option<&RequestContext>,
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
@@ -24825,14 +27902,14 @@ async fn proxy_to_backend_mesh_mtls(
     let is_grpc_flavored = headers
         .get("content-type")
         .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
-    let is_grpc_web_translated = is_grpc_flavored
-        && ctx.is_some_and(crate::plugins::grpc_web::request_is_grpc_web_translated);
+    let is_grpc_web_translated =
+        is_grpc_flavored && crate::plugins::grpc_web::request_is_grpc_web_translated(request_ctx);
     let is_native_grpc = is_grpc_flavored && !is_grpc_web_translated;
 
-    // Client end-to-end RPC deadline (`grpc-timeout`, post-plugin outbound
-    // headers — the same view the direct gRPC pool parses after its
-    // proxy-header merge; codex r2-2 finding 6). Timeout regimes mirror the
-    // direct pool exactly:
+    // Client end-to-end RPC deadline. Prefer the receipt-anchored monotonic
+    // instant prepared by `grpc_deadline`; parsing the post-plugin header is
+    // only a compatibility fallback for direct internal callers that did not
+    // run the request preflight. Timeout regimes mirror the direct pool:
     //  * NATIVE gRPC (streams) — `streaming_effective_timeout_ms` semantics
     //    for `send_request` (upload + response-header wait): the client
     //    deadline UNCAPPED (it is the end-to-end budget, explicitly covering
@@ -24846,32 +27923,17 @@ async fn proxy_to_backend_mesh_mtls(
     //  * Plain HTTP — the per-phase `backend_read_timeout_ms`, unchanged.
     // Timing out a gRPC-flavored request returns the direct pool's
     // Trailers-Only DEADLINE_EXCEEDED instead of a JSON 504.
-    let client_grpc_deadline_ms = if is_grpc_flavored {
-        headers
-            .get("grpc-timeout")
-            .and_then(|v| grpc_proxy::parse_grpc_timeout_value(v))
+    let receipt_deadline_anchor = tokio::time::Instant::now();
+    let client_grpc_deadline_at = if is_grpc_flavored {
+        request_ctx.grpc_deadline_at().or_else(|| {
+            headers
+                .get("grpc-timeout")
+                .and_then(|value| grpc_proxy::parse_grpc_timeout_value(value))
+                .and_then(|ms| receipt_deadline_anchor.checked_add(Duration::from_millis(ms)))
+        })
     } else {
         None
     };
-    let send_timeout_ms = match client_grpc_deadline_ms {
-        Some(ms) if is_native_grpc => Some(ms),
-        Some(ms) if proxy.backend_read_timeout_ms > 0 => {
-            Some(ms.min(proxy.backend_read_timeout_ms))
-        }
-        Some(ms) => Some(ms),
-        None if proxy.backend_read_timeout_ms > 0 => Some(proxy.backend_read_timeout_ms),
-        None => None,
-    };
-    // Shared absolute deadline for the translated-gRPC-Web buffered regime.
-    // `None` for the other flavors (per-phase timeouts) and on `checked_add`
-    // overflow from a pathologically large client deadline (treated as
-    // unbounded rather than panicking, like the streaming regime).
-    let buffered_grpc_shared_deadline = match (is_grpc_web_translated, client_grpc_deadline_ms) {
-        (true, Some(_)) => send_timeout_ms
-            .and_then(|ms| tokio::time::Instant::now().checked_add(Duration::from_millis(ms))),
-        _ => None,
-    };
-
     let request_body_limit = grpc_proxy::mesh_request_body_limit(
         is_grpc_flavored,
         state.max_request_body_size_bytes,
@@ -24920,7 +27982,12 @@ async fn proxy_to_backend_mesh_mtls(
     // side effects through client retries. The post-header check below remains
     // as a defensive fallback for response-specific decisions.
     if is_native_grpc
-        && native_grpc_mesh_mtls_buffering_conflict_known(stream_response, proxy, plugins, ctx)
+        && native_grpc_mesh_mtls_buffering_conflict_known(
+            stream_response,
+            proxy,
+            plugins,
+            response_decision_ctx,
+        )
     {
         warn!(
             proxy_id = %proxy.id,
@@ -24936,20 +28003,35 @@ async fn proxy_to_backend_mesh_mtls(
     }
 
     let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
-    let mut sender = match state
-        .mesh_mtls_pool
-        .get_sender(
-            proxy,
-            &target.host,
-            target.port,
-            target.dispatch_policy_port(),
-            mtls_port,
-            expected_peer.as_ref(),
-            expected_trust_domain.as_ref(),
-            sni_override,
-        )
-        .await
-    {
+    let get_sender = state.mesh_mtls_pool.get_sender(
+        proxy,
+        &target.host,
+        target.port,
+        target.dispatch_policy_port(),
+        mtls_port,
+        expected_peer.as_ref(),
+        expected_trust_domain.as_ref(),
+        sni_override,
+    );
+    let sender_result = if let Some(deadline) = client_grpc_deadline_at {
+        match tokio::time::timeout_at(deadline, get_sender).await {
+            Ok(result) => result,
+            Err(_) => {
+                return (
+                    client_grpc_deadline_exceeded_response_for_request(
+                        request_ctx,
+                        headers,
+                        resolved_ip,
+                    ),
+                    None,
+                    None,
+                );
+            }
+        }
+    } else {
+        get_sender.await
+    };
+    let mut sender = match sender_result {
         Ok(sender) => sender,
         Err(err) => {
             if is_grpc_flavored {
@@ -24982,12 +28064,19 @@ async fn proxy_to_backend_mesh_mtls(
     };
     // Bound readiness by the connect budget: a pooled-but-saturated connection
     // (stream-cap reached) must not stall the request indefinitely.
-    match tokio::time::timeout(
-        Duration::from_millis(proxy.backend_connect_timeout_ms),
-        sender.ready(),
-    )
-    .await
-    {
+    let connect_deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(proxy.backend_connect_timeout_ms));
+    let ready_deadline = match (client_grpc_deadline_at, connect_deadline) {
+        (Some(client), Some(connect)) => Some(client.min(connect)),
+        (Some(client), None) => Some(client),
+        (None, connect) => connect,
+    };
+    let ready_result = if let Some(deadline) = ready_deadline {
+        tokio::time::timeout_at(deadline, sender.ready()).await
+    } else {
+        Ok(sender.ready().await)
+    };
+    match ready_result {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             if is_grpc_flavored {
@@ -25019,6 +28108,19 @@ async fn proxy_to_backend_mesh_mtls(
                 proxy.backend_connect_timeout_ms
             );
             if is_grpc_flavored {
+                if client_grpc_deadline_at
+                    .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+                {
+                    return (
+                        client_grpc_deadline_exceeded_response_for_request(
+                            request_ctx,
+                            headers,
+                            resolved_ip,
+                        ),
+                        None,
+                        None,
+                    );
+                }
                 return (
                     mesh_grpc_unavailable_response(
                         resolved_ip,
@@ -25045,6 +28147,37 @@ async fn proxy_to_backend_mesh_mtls(
             );
         }
     }
+
+    // Pool acquisition and sender readiness are connect work. Arm the
+    // operator response-read window only after both complete; the client RPC
+    // deadline remains receipt-anchored and therefore still caps the entire
+    // operation. This matches the core/reqwest read-timeout contract.
+    let read_started_at = tokio::time::Instant::now();
+    let backend_read_deadline = if proxy.backend_read_timeout_ms > 0 {
+        read_started_at.checked_add(Duration::from_millis(proxy.backend_read_timeout_ms))
+    } else {
+        None
+    };
+    let grpc_send_deadline = match (client_grpc_deadline_at, backend_read_deadline) {
+        (Some(client), Some(read)) if is_grpc_web_translated => Some(client.min(read)),
+        (Some(client), _) => Some(client),
+        (None, read) => read,
+    };
+    let grpc_send_deadline_is_client = client_grpc_deadline_at
+        .is_some_and(|client| grpc_send_deadline.is_some_and(|effective| client <= effective));
+    // Translated gRPC-Web buffers the response, so request dispatch and body
+    // collection share the same post-read-start operator window. Native gRPC
+    // streams carry the receipt-anchored client deadline into the caller's H2
+    // body wrapper.
+    let buffered_grpc_shared_deadline = if is_grpc_web_translated {
+        client_grpc_deadline_at
+            .map(|client| backend_read_deadline.map_or(client, |read| client.min(read)))
+    } else {
+        None
+    };
+    let buffered_grpc_shared_deadline_is_client = client_grpc_deadline_at.is_some_and(|client| {
+        buffered_grpc_shared_deadline.is_some_and(|effective| client <= effective)
+    });
 
     let uri: hyper::Uri = match backend_url.parse() {
         Ok(uri) => uri,
@@ -25281,17 +28414,13 @@ async fn proxy_to_backend_mesh_mtls(
 
     let backend_req = Request::from_parts(parts, body);
     let send_fut = sender.send_request(backend_req);
-    // `send_request` deadline (upload + response-header wait). One absolute
-    // instant serves every regime: the translated-gRPC-Web shared deadline
-    // when armed, else `send_timeout_ms` (client grpc-timeout for gRPC
-    // flavors, `backend_read_timeout_ms` fallback/plain-HTTP; `None` =
-    // unbounded, including `checked_add` overflow of a pathological client
-    // deadline — same unbounded-rather-than-panic posture as the direct
-    // pool's streaming regime).
-    let send_deadline = match buffered_grpc_shared_deadline {
-        Some(deadline) => Some(deadline),
-        None => send_timeout_ms
-            .and_then(|ms| tokio::time::Instant::now().checked_add(Duration::from_millis(ms))),
+    // `send_request` covers upload plus the response-header wait. The same
+    // absolute RPC instant is reused; retries and earlier gateway work cannot
+    // re-arm it by rewriting a relative header.
+    let send_deadline = if is_grpc_flavored {
+        grpc_send_deadline
+    } else {
+        backend_read_deadline
     };
     let send_result = if let Some(deadline) = send_deadline {
         match tokio::time::timeout_at(deadline, send_fut).await {
@@ -25311,7 +28440,13 @@ async fn proxy_to_backend_mesh_mtls(
                 }
                 warn!(
                     proxy_id = %proxy.id,
-                    timeout_ms = send_timeout_ms.unwrap_or(0),
+                    timeout_ms = send_deadline
+                        .map(|deadline| {
+                            deadline
+                                .saturating_duration_since(read_started_at)
+                                .as_millis()
+                        })
+                        .unwrap_or(0),
                     is_grpc_flavored,
                     "sidecar mTLS timeout waiting for backend response"
                 );
@@ -25320,7 +28455,15 @@ async fn proxy_to_backend_mesh_mtls(
                 // DEADLINE_EXCEEDED); plain HTTP keeps the JSON 504.
                 if is_grpc_flavored {
                     return (
-                        mesh_grpc_deadline_exceeded_response(resolved_ip),
+                        if grpc_send_deadline_is_client {
+                            client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip,
+                            )
+                        } else {
+                            mesh_grpc_deadline_exceeded_response(resolved_ip)
+                        },
                         None,
                         None,
                     );
@@ -25413,7 +28556,7 @@ async fn proxy_to_backend_mesh_mtls(
         stream_response,
         proxy,
         plugins,
-        ctx,
+        response_decision_ctx,
         status,
         &resp_headers,
     );
@@ -25493,10 +28636,23 @@ async fn proxy_to_backend_mesh_mtls(
                 Err(_) => {
                     warn!(
                         proxy_id = %proxy.id,
-                        "sidecar mTLS gRPC-Web response body collection exceeded the client grpc-timeout deadline"
+                        deadline_source = if buffered_grpc_shared_deadline_is_client {
+                            "client"
+                        } else {
+                            "backend_read_policy"
+                        },
+                        "sidecar mTLS gRPC-Web response body collection exceeded its shared deadline"
                     );
                     return (
-                        mesh_grpc_deadline_exceeded_response(resolved_ip),
+                        if buffered_grpc_shared_deadline_is_client {
+                            client_grpc_deadline_exceeded_response_for_request(
+                                request_ctx,
+                                headers,
+                                resolved_ip,
+                            )
+                        } else {
+                            mesh_grpc_deadline_exceeded_response(resolved_ip)
+                        },
                         None,
                         None,
                     );
@@ -25623,6 +28779,33 @@ async fn proxy_to_backend_mesh_mtls(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResponseHeaderDeadlineSource {
+    Client,
+    Operator,
+}
+
+pub(crate) fn response_header_deadline(
+    client_deadline: Option<tokio::time::Instant>,
+    backend_read_timeout_ms: u64,
+    read_started_at: tokio::time::Instant,
+) -> Option<(tokio::time::Instant, ResponseHeaderDeadlineSource)> {
+    let operator_deadline = if backend_read_timeout_ms > 0 {
+        read_started_at.checked_add(Duration::from_millis(backend_read_timeout_ms))
+    } else {
+        None
+    };
+    match (client_deadline, operator_deadline) {
+        (Some(client), Some(operator)) if client <= operator => {
+            Some((client, ResponseHeaderDeadlineSource::Client))
+        }
+        (Some(_), Some(operator)) => Some((operator, ResponseHeaderDeadlineSource::Operator)),
+        (Some(client), None) => Some((client, ResponseHeaderDeadlineSource::Client)),
+        (None, Some(operator)) => Some((operator, ResponseHeaderDeadlineSource::Operator)),
+        (None, None) => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_http2(
     state: &ProxyState,
@@ -25634,6 +28817,7 @@ async fn proxy_to_backend_http2(
     original_req: Request<Incoming>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     ctx: Option<&RequestContext>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
     stream_response: bool,
     client_ip: &str,
     xff_append_ip: &str,
@@ -25834,27 +29018,45 @@ async fn proxy_to_backend_http2(
             }
         }
     };
-    let response = if proxy.backend_read_timeout_ms > 0 {
-        let read_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
-        match tokio::time::timeout(read_timeout, h2_send_fut).await {
+    let read_started_at = tokio::time::Instant::now();
+    let header_deadline = response_header_deadline(
+        grpc_deadline_at,
+        proxy.backend_read_timeout_ms,
+        read_started_at,
+    );
+    let response = if let Some((deadline, deadline_source)) = header_deadline {
+        match tokio::time::timeout_at(deadline, h2_send_fut).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => return map_h2_err(e),
             Err(_) => {
-                warn!(
-                    proxy_id = %proxy.id,
-                    "HTTP/2: read timeout ({}ms) waiting for backend response",
-                    proxy.backend_read_timeout_ms
-                );
-                return retry::BackendResponse {
-                    status_code: 504,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: true,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                };
+                match deadline_source {
+                    ResponseHeaderDeadlineSource::Client => {
+                        return client_grpc_deadline_exceeded_response_for_optional_request(
+                            ctx,
+                            headers,
+                            resolved_ip,
+                        );
+                    }
+                    ResponseHeaderDeadlineSource::Operator => {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            "HTTP/2: read timeout ({}ms) waiting for backend response",
+                            proxy.backend_read_timeout_ms
+                        );
+                        return retry::BackendResponse {
+                            status_code: 504,
+                            body: ResponseBody::Buffered(
+                                r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                            ),
+                            headers: HashMap::new(),
+                            // The request reached the H2 sender; this is a
+                            // response-read failure, not a connect failure.
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip,
+                            error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                        };
+                    }
+                }
             }
         }
     } else {
@@ -25890,13 +29092,20 @@ async fn proxy_to_backend_http2(
         }
     } else {
         // Buffer the full response body
-        let body_bytes = match collect_hyper_body_with_limit(
-            response.into_body(),
-            0,
-            proxy.backend_read_timeout_ms,
-        )
-        .await
-        {
+        let collect =
+            collect_hyper_body_with_limit(response.into_body(), 0, proxy.backend_read_timeout_ms);
+        let collect_result =
+            match crate::plugins::await_grpc_deadline(grpc_deadline_at, collect).await {
+                Ok(result) => result,
+                Err(()) => {
+                    return client_grpc_deadline_exceeded_response_for_optional_request(
+                        ctx,
+                        headers,
+                        resolved_ip,
+                    );
+                }
+            };
+        let body_bytes = match collect_result {
             Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
                 // Defensive: cannot occur with max_size=0 (the size guard is
@@ -26081,6 +29290,7 @@ async fn proxy_to_backend_http3(
     client_request_body: ClientRequestBody,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     mut ctx: Option<&mut RequestContext>,
+    grpc_deadline_at: Option<tokio::time::Instant>,
     // Real, read-only request context for the response-side buffer->stream
     // downgrade (`refine_stream_response_for_content_type`). Distinct from
     // `ctx` above, which is the request-body-hook clone and is `None` for
@@ -26415,8 +29625,9 @@ async fn proxy_to_backend_http3(
                     );
                 }
                 let limited = http_body_util::Limited::new(body, state.max_request_body_size_bytes);
-                match collect_request_body_with_timeout(
+                match collect_request_body_with_deadline(
                     limited.collect(),
+                    grpc_deadline_at,
                     proxy.backend_read_timeout_ms,
                 )
                 .await
@@ -26439,13 +29650,24 @@ async fn proxy_to_backend_http3(
                             None,
                         );
                     }
-                    Err(_) => {
+                    Err(RequestBodyWaitError::TimedOut) => {
                         return (request_body_timeout_backend_response(resolved_ip), None);
+                    }
+                    Err(RequestBodyWaitError::DeadlineExceeded) => {
+                        return (
+                            client_grpc_deadline_exceeded_response_for_optional_request(
+                                ctx.as_deref(),
+                                headers,
+                                resolved_ip,
+                            ),
+                            None,
+                        );
                     }
                 }
             } else {
-                match collect_request_body_with_timeout(
+                match collect_request_body_with_deadline(
                     body.collect(),
+                    grpc_deadline_at,
                     proxy.backend_read_timeout_ms,
                 )
                 .await
@@ -26473,8 +29695,18 @@ async fn proxy_to_backend_http3(
                             None,
                         );
                     }
-                    Err(_) => {
+                    Err(RequestBodyWaitError::TimedOut) => {
                         return (request_body_timeout_backend_response(resolved_ip), None);
+                    }
+                    Err(RequestBodyWaitError::DeadlineExceeded) => {
+                        return (
+                            client_grpc_deadline_exceeded_response_for_optional_request(
+                                ctx.as_deref(),
+                                headers,
+                                resolved_ip,
+                            ),
+                            None,
+                        );
                     }
                 }
             }
@@ -26495,11 +29727,14 @@ async fn proxy_to_backend_http3(
         let request_body = apply_request_body_plugins_with_context(
             plugins,
             ctx.as_deref_mut(),
+            grpc_deadline_at,
             headers,
             request_body,
         )
         .await;
-        match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
+        match run_final_request_body_hooks(plugins, ctx, grpc_deadline_at, headers, &request_body)
+            .await
+        {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 return (
@@ -27481,6 +30716,54 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_signature_authority_normalization_preserves_identity() {
+        assert_eq!(
+            super::normalize_request_authority_for_signing("EXAMPLE.COM:80", Some("http")),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            super::normalize_request_authority_for_signing("EXAMPLE.COM:8443", Some("https")),
+            Some("example.com:8443".to_string())
+        );
+        assert_eq!(
+            super::normalize_request_authority_for_signing("[2001:DB8::1]:443", Some("https")),
+            Some("[2001:db8::1]".to_string())
+        );
+        assert_eq!(
+            super::normalize_request_authority_for_signing("bad:port", Some("http")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_upload_timeout_caps_a_long_rpc_deadline() {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(60))
+            .expect("one minute after now is representable");
+        let upload = std::future::pending::<Result<(), ()>>();
+
+        let result = super::collect_request_body_with_deadline(upload, Some(deadline), 10).await;
+
+        assert!(matches!(result, Err(super::RequestBodyWaitError::TimedOut)));
+    }
+
+    #[tokio::test]
+    async fn rpc_deadline_is_distinguished_from_operator_upload_timeout() {
+        let deadline = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before now is representable");
+        let upload = std::future::pending::<Result<(), ()>>();
+
+        let result =
+            super::collect_request_body_with_deadline(upload, Some(deadline), 60_000).await;
+
+        assert!(matches!(
+            result,
+            Err(super::RequestBodyWaitError::DeadlineExceeded)
+        ));
+    }
+
     #[tokio::test]
     async fn stalled_buffered_probe_times_out_and_releases_slot_neutral() {
         use crate::circuit_breaker::CircuitBreaker;
@@ -27504,7 +30787,7 @@ mod tests {
         let stalled_upload = std::future::pending::<Result<(), ()>>();
         let result = super::collect_request_body_with_timeout(stalled_upload, 10).await;
         assert!(
-            matches!(result, Err(super::RequestBodyBufferError::TimedOut)),
+            matches!(result, Err(super::RequestBodyWaitError::TimedOut)),
             "a never-ending buffered upload must hit the configured deadline"
         );
 
@@ -27523,7 +30806,7 @@ mod tests {
 
     #[test]
     fn request_body_timeout_uses_grpc_deadline_response() {
-        let response = super::build_request_body_timeout_response(true, None);
+        let response = super::build_request_body_timeout_response(true, None, &[]);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
@@ -27539,6 +30822,12 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("application/grpc")
         );
+    }
+
+    #[test]
+    fn websocket_error_fallback_preserves_requested_status() {
+        let response = super::build_websocket_error_fallback_response(StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     use super::*;
@@ -28554,6 +31843,8 @@ mod tests {
 
     struct SyntheticNormalizationProbePlugin;
 
+    struct HeadSkippingSyntheticGuardPlugin;
+
     struct RejectHeaderPlugin;
 
     struct ReplaceRejectPlugin;
@@ -28602,6 +31893,51 @@ mod tests {
             _response_headers: &HashMap<String, String>,
         ) -> Option<Vec<u8>> {
             Some(b"incorrectly-normalized".to_vec())
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for HeadSkippingSyntheticGuardPlugin {
+        fn name(&self) -> &str {
+            "head_skipping_synthetic_guard"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+            !ctx.method.eq_ignore_ascii_case("HEAD")
+        }
+
+        async fn on_response_body(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            _response_headers: &HashMap<String, String>,
+            _body: &[u8],
+        ) -> PluginResult {
+            ctx.metadata
+                .insert("test:synthetic_body_method".to_string(), ctx.method.clone());
+            PluginResult::Reject {
+                status_code: 451,
+                body: "blocked synthetic representation".to_string(),
+                headers: HashMap::new(),
+            }
+        }
+
+        fn applies_after_proxy_on_reject(&self) -> bool {
+            true
+        }
+
+        async fn after_proxy(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            response_headers.insert("x-after-proxy-method".to_string(), ctx.method.clone());
+            PluginResult::Continue
         }
     }
 
@@ -29233,6 +32569,53 @@ mod tests {
 
         assert_eq!(response.http_status, StatusCode::OK);
         assert_eq!(response.body, body);
+    }
+
+    #[tokio::test]
+    async fn synthetic_head_representation_uses_get_guardrails_then_restores_head() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(HeadSkippingSyntheticGuardPlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "HEAD".to_string(),
+            "/api/specz".to_string(),
+        );
+        ctx.metadata.insert(
+            SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY.to_string(),
+            "GET".to_string(),
+        );
+        let mut status = 200;
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let mut body = br#"{"secret":"must be inspected"}"#.to_vec();
+
+        apply_reject_after_proxy_and_synthetic_body_hooks(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, 451);
+        assert_eq!(body, b"blocked synthetic representation");
+        assert_eq!(
+            ctx.metadata
+                .get("test:synthetic_body_method")
+                .map(String::as_str),
+            Some("GET")
+        );
+        assert_eq!(ctx.method, "HEAD");
+        assert_eq!(
+            headers.get("x-after-proxy-method").map(String::as_str),
+            Some("HEAD")
+        );
+        assert!(
+            !ctx.metadata
+                .contains_key(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY)
+        );
     }
 
     #[tokio::test]
@@ -30345,6 +33728,28 @@ mod tests {
     }
 
     #[test]
+    fn client_grpc_deadline_before_dispatch_is_backend_health_neutral() {
+        let resp = client_grpc_deadline_exceeded_response(Some("127.0.0.4".to_string()));
+
+        assert_eq!(resp.status_code, 200);
+        assert!(!resp.connection_error);
+        assert_eq!(resp.error_class, Some(retry::ErrorClass::ClientDisconnect));
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.4"));
+        assert_eq!(
+            resp.headers.get("grpc-status").map(String::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            resp.headers.get("grpc-message").map(String::as_str),
+            Some(GATEWAY_DEADLINE_EXCEEDED_MESSAGE)
+        );
+        let ResponseBody::Buffered(body) = resp.body else {
+            panic!("gRPC client deadline response should be buffered");
+        };
+        assert!(body.is_empty(), "Trailers-Only timeout carries no body");
+    }
+
+    #[test]
     fn mesh_grpc_response_body_too_large_response_is_resource_exhausted_backend_failure() {
         let proxy = test_proxy(ResponseBodyMode::Stream);
         let resp = mesh_grpc_response_body_too_large_response(
@@ -31325,7 +34730,7 @@ mod tests {
 
         let stripped = query_string_after_plugin_strips(
             &ctx,
-            "a=1&access_token=secret&encoded%20token=secret2&keep=2",
+            "a=1&access_token=first&encoded%20token=secret2&access_token=last&keep=2",
         );
 
         assert_eq!(stripped.as_ref(), "a=1&keep=2");
@@ -37822,7 +41227,7 @@ mod tests {
             .find("mesh_inbound_peer_auth_initial_route_mismatch")
             .expect("initial-route PeerAuthentication gate must remain present");
         let first_request_plugin = src
-            .find("match plugin.on_request_received(&mut ctx).await")
+            .find("plugin.on_request_received(&mut ctx),")
             .expect("request plugin phase must remain present");
         assert!(
             initial_gate < first_request_plugin,

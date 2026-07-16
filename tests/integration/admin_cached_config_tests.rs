@@ -1565,6 +1565,115 @@ async fn test_batch_create_consumers_and_proxies() {
 }
 
 #[tokio::test]
+async fn test_batch_create_rejects_hmac_secret_reused_by_persisted_consumer() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let shared_secret = "batch-shared-hmac-secret-at-least-32-characters";
+
+    let existing = json!({
+        "id": "existing-hmac-consumer",
+        "username": "alice",
+        "credentials": {"hmac_auth": [{"secret": shared_secret}]}
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &existing).await;
+    assert_eq!(status, 201, "consumer seed should succeed: {body:?}");
+
+    let conflicting_batch = json!({
+        "consumers": [{
+            "id": "batch-hmac-consumer",
+            "username": "bob",
+            "credentials": {"hmac_auth": [{"secret": shared_secret}]}
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &conflicting_batch).await;
+
+    assert_eq!(status, 400, "batch HMAC reuse must be rejected: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|error| error.contains("Duplicate hmac_auth shared secret"))))
+    );
+    assert!(
+        !body.to_string().contains(shared_secret),
+        "validation response must not disclose the shared secret"
+    );
+}
+
+#[tokio::test]
+async fn non_hmac_credential_update_revalidates_retained_hmac_credentials() {
+    let tc = TestConfig::default();
+    let (state, temp_dir) = create_db_admin_state(&tc).await;
+    let db_path = temp_dir.path().join("test_batch.db");
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let shared_secret = "retained-hmac-secret-at-least-32-characters";
+    let owner = json!({
+        "id": "retained-hmac-owner",
+        "username": "alice",
+        "credentials": {"hmac_auth": [{"secret": shared_secret}]}
+    });
+    let stale = json!({
+        "id": "retained-hmac-stale",
+        "username": "bob",
+        "credentials": {"hmac_auth": [{
+            "secret": "original-hmac-secret-at-least-32-characters"
+        }]}
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &owner).await;
+    assert_eq!(status, 201, "HMAC owner seed failed: {body:?}");
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &stale).await;
+    assert_eq!(status, 201, "stale consumer seed failed: {body:?}");
+
+    // Simulate a legacy/out-of-band row whose HMAC credential no longer agrees
+    // with its datastore index entry. A non-HMAC mutation still rewrites the
+    // complete Consumer and must detect this collision before persistence.
+    let db_url = format!("sqlite:{}?mode=rw", db_path.to_string_lossy());
+    let pool = sqlx::SqlitePool::connect(&db_url)
+        .await
+        .expect("connect raw SQLite pool");
+    sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
+        .bind(json!({"hmac_auth": [{"secret": shared_secret}]}).to_string())
+        .bind("ferrum")
+        .bind("retained-hmac-stale")
+        .execute(&pool)
+        .await
+        .expect("inject stale HMAC credential");
+
+    let (status, body) = admin_put(
+        &base_url,
+        "/consumers/retained-hmac-stale/credentials/keyauth",
+        &token,
+        &json!([{"key": "new-keyauth-credential"}]),
+    )
+    .await;
+
+    assert_eq!(
+        status, 409,
+        "retained HMAC collision was not rejected: {body:?}"
+    );
+    assert!(
+        body.to_string()
+            .contains("Duplicate hmac_auth shared secret"),
+        "collision must be reported by candidate validation, not the datastore backstop: {body:?}"
+    );
+    assert!(
+        !body.to_string().contains(shared_secret),
+        "collision response must not disclose the HMAC secret"
+    );
+    let (status, consumer, _) =
+        admin_get(&base_url, "/consumers/retained-hmac-stale", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        consumer["credentials"].get("keyauth").is_none(),
+        "rejected non-HMAC mutation must not be persisted"
+    );
+}
+
+#[tokio::test]
 async fn test_batch_create_plugin_configs() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
@@ -1775,6 +1884,65 @@ async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
             "unexpected admin validation response: {body}"
         );
     }
+}
+
+#[tokio::test]
+async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (index, (unknown_key, config)) in [
+        ("compress_role", json!({"compress_role": ["system"]})),
+        ("target_rato", json!({"target_rato": 0.9})),
+        ("min_content_token", json!({"min_content_token": 10})),
+        ("max_scan_byte", json!({"max_scan_byte": 4096})),
+        ("preserve_tags", json!({"preserve_tags": "keep"})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let plugin = json!({
+            "id": format!("prompt-compressor-typo-{index}"),
+            "plugin_name": "ai_prompt_compressor",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(status, 400, "unknown compressor key was admitted: {body}");
+        assert!(
+            body.to_string().contains(&format!(
+                "ai_prompt_compressor: unknown config field(s): {unknown_key}"
+            )),
+            "unexpected admin validation response: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_admin_create_rejects_unknown_adaptive_concurrency_policy_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let plugin = json!({
+        "id": "adaptive-limit-typo",
+        "plugin_name": "adaptive_concurrency",
+        "scope": "global",
+        "enabled": true,
+        "config": {"max_limt": 32}
+    });
+
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+    assert_eq!(status, 400, "unknown adaptive key was admitted: {body}");
+    assert!(
+        body.to_string()
+            .contains("adaptive_concurrency: unknown config key 'max_limt'"),
+        "unexpected admin validation response: {body}"
+    );
 }
 
 #[tokio::test]
@@ -2061,6 +2229,276 @@ async fn test_restore_rejects_invalid_plugin_config_before_delete() {
 }
 
 #[tokio::test]
+async fn plugin_delete_rejects_revealing_global_body_transformer_beside_hmac() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let seed = json!({
+        "proxies": [{
+            "id": "delete-shadow-proxy",
+            "listen_path": "/delete-shadow",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "delete-shadow-hmac"},
+                {"plugin_config_id": "delete-shadow-scoped-transformer"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "delete-shadow-global-transformer",
+                "plugin_name": "request_transformer",
+                "scope": "global",
+                "enabled": true,
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "gateway",
+                    "value": "ferrum"
+                }]}
+            },
+            {
+                "id": "delete-shadow-scoped-transformer",
+                "plugin_name": "request_transformer",
+                "scope": "proxy",
+                "proxy_id": "delete-shadow-proxy",
+                "enabled": true,
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "X-Gateway",
+                    "value": "ferrum"
+                }]}
+            },
+            {
+                "id": "delete-shadow-hmac",
+                "plugin_name": "hmac_auth",
+                "scope": "proxy",
+                "proxy_id": "delete-shadow-proxy",
+                "enabled": true,
+                "config": {"clock_skew_seconds": 300}
+            }
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(
+        status, 201,
+        "safe shadowed composition seed failed: {body:?}"
+    );
+
+    let (status, body) = admin_delete(
+        &base_url,
+        "/plugins/config/delete-shadow-scoped-transformer",
+        &token,
+    )
+    .await;
+
+    assert_eq!(status, 400, "unsafe plugin deletion was admitted: {body:?}");
+    assert!(
+        body.to_string()
+            .contains("hmac_auth cannot be combined with request-body transformer"),
+        "unexpected deletion validation response: {body:?}"
+    );
+    let (status, _, _) = admin_get(
+        &base_url,
+        "/plugins/config/delete-shadow-scoped-transformer",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "rejected deletion must retain the shadowing plugin"
+    );
+}
+
+#[tokio::test]
+async fn hmac_composition_admission_is_namespace_scoped() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let client = reqwest::Client::new();
+    let tenant_a = client
+        .post(format!("{base_url}/plugins/config"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Ferrum-Namespace", "tenant-a")
+        .json(&json!({
+            "id": "tenant-a-global-hmac",
+            "plugin_name": "hmac_auth",
+            "scope": "global",
+            "enabled": true,
+            "config": {"clock_skew_seconds": 300}
+        }))
+        .send()
+        .await
+        .expect("create tenant-a HMAC plugin");
+    assert_eq!(tenant_a.status(), reqwest::StatusCode::CREATED);
+
+    let tenant_b = client
+        .post(format!("{base_url}/plugins/config"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Ferrum-Namespace", "tenant-b")
+        .json(&json!({
+            "id": "tenant-b-global-transformer",
+            "plugin_name": "request_transformer",
+            "scope": "global",
+            "enabled": true,
+            "config": {"rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "gateway",
+                "value": "ferrum"
+            }]}
+        }))
+        .send()
+        .await
+        .expect("create tenant-b request transformer");
+    let status = tenant_b.status();
+    let body: Value = tenant_b.json().await.expect("tenant-b response body");
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "plugins in distinct runtime namespace slices must not conflict: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn admin_rejects_custom_request_body_transformer_beside_hmac() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let batch = json!({
+        "proxies": [{
+            "id": "custom-transform-proxy",
+            "listen_path": "/custom-transform",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "custom-transform-hmac"},
+                {"plugin_config_id": "custom-transform-plugin"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "custom-transform-hmac",
+                "plugin_name": "hmac_auth",
+                "scope": "proxy",
+                "proxy_id": "custom-transform-proxy",
+                "enabled": true,
+                "config": {"clock_skew_seconds": 300}
+            },
+            {
+                "id": "custom-transform-plugin",
+                "plugin_name": "example_plugin",
+                "scope": "proxy",
+                "proxy_id": "custom-transform-proxy",
+                "enabled": true,
+                "config": {"request_body_prefix": "custom:"}
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+
+    assert_eq!(
+        status, 400,
+        "custom body transformer was admitted: {body:?}"
+    );
+    assert!(
+        body.to_string().contains("example_plugin"),
+        "composition error must identify the custom transformer: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_rejects_hmac_request_body_transformer_before_delete() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-composition-keep",
+            "listen_path": "/restore-composition-keep",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "restore preservation seed failed: {body:?}");
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-composition-new",
+            "listen_path": "/restore-composition-new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "restore-composition-hmac"},
+                {"plugin_config_id": "restore-composition-transformer"}
+            ]
+        }],
+        "plugin_configs": [
+            {
+                "id": "restore-composition-hmac",
+                "plugin_name": "hmac_auth",
+                "scope": "proxy",
+                "proxy_id": "restore-composition-new",
+                "enabled": true,
+                "config": {"clock_skew_seconds": 300}
+            },
+            {
+                "id": "restore-composition-transformer",
+                "plugin_name": "request_transformer",
+                "scope": "proxy",
+                "proxy_id": "restore-composition-new",
+                "enabled": true,
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "gateway",
+                    "value": "ferrum"
+                }]}
+            }
+        ]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+
+    assert_eq!(status, 400, "unsafe restore was admitted: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .as_array()
+            .is_some_and(|errors| errors
+                .iter()
+                .any(|error| error.as_str().is_some_and(|error| error
+                    .contains("hmac_auth cannot be combined with request-body transformer")))),
+        "unexpected restore validation response: {body:?}"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/restore-composition-keep", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "restore validation must run before destructive deletion"
+    );
+}
+
+#[tokio::test]
 async fn restore_prometheus_owner_conflicts_only_with_other_namespaces() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
@@ -2191,6 +2629,137 @@ async fn test_restore_rolls_back_prior_config_after_mid_import_failure() {
         reqwest::StatusCode::NOT_FOUND,
         "resources committed before the injected failure must be removed"
     );
+}
+
+/// Rollback must faithfully replay the raw pre-restore snapshot even when it
+/// contains a legacy/out-of-band mTLS DNS ambiguity. Normal admission rejects
+/// this state, but applying that new validation to the compensating replay
+/// would first delete the namespace and then make its prior state unrecoverable.
+#[tokio::test]
+async fn restore_rollback_replays_preexisting_ambiguous_mtls_dns_snapshot() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_mtls_dns_rollback.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "consumers": [
+            {
+                "id": "restore-dns-upper",
+                "username": "restore-dns-upper",
+                "credentials": {
+                    "mtls_auth": [{"identity": "API.Example.COM"}]
+                }
+            },
+            {
+                "id": "restore-dns-lower",
+                "username": "restore-dns-lower",
+                "credentials": {
+                    "mtls_auth": [{"identity": "other.example.com"}]
+                }
+            }
+        ],
+        "plugin_configs": [{
+            "id": "restore-dns-policy",
+            "plugin_name": "mtls_auth",
+            "scope": "global",
+            "enabled": true,
+            "config": {"cert_field": "san_dns"}
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "mTLS DNS rollback seed failed: {body:?}");
+
+    // Simulate a pre-fix or out-of-band row. Exact credential uniqueness still
+    // permits this case variant; the active san_dns policy makes the resulting
+    // runtime snapshot ambiguous. The restore snapshot intentionally uses the
+    // raw, non-validating loader so it can preserve this prior durable state.
+    let ambiguous_credentials = json!({
+        "mtls_auth": [{"identity": "api.example.com"}]
+    });
+    sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
+        .bind(ambiguous_credentials.to_string())
+        .bind("ferrum")
+        .bind("restore-dns-lower")
+        .execute(&pool)
+        .await
+        .expect("Failed to inject the pre-existing DNS ambiguity");
+
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_mtls_dns BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-dns-fail' \
+         BEGIN SELECT RAISE(FAIL, 'injected restore persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install mTLS DNS restore fault trigger");
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-dns-fail",
+            "listen_path": "/new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+    assert_eq!(status, 500, "fault-injected restore unexpectedly succeeded");
+    assert_eq!(
+        body["rollback"].as_str(),
+        Some("completed"),
+        "raw ambiguous snapshot must remain rollback-capable: {body:?}"
+    );
+
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, credentials FROM consumers WHERE namespace = ? ORDER BY id")
+            .bind("ferrum")
+            .fetch_all(&pool)
+            .await
+            .expect("Failed to inspect replayed consumers");
+    assert_eq!(rows.len(), 2);
+    let restored_identities: Vec<String> = rows
+        .iter()
+        .map(|(_, credentials)| {
+            serde_json::from_str::<Value>(credentials).unwrap()["mtls_auth"][0]["identity"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        restored_identities,
+        vec!["api.example.com".to_string(), "API.Example.COM".to_string(),],
+        "rollback must replay the exact prior credential casing"
+    );
+    let plugin_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM plugin_configs WHERE namespace = ? AND id = ?")
+            .bind("ferrum")
+            .bind("restore-dns-policy")
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to inspect replayed mTLS policy");
+    assert_eq!(
+        plugin_count, 1,
+        "rollback must restore the active DNS policy"
+    );
+    let failed_proxy_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxies WHERE namespace = ? AND id = ?")
+            .bind("ferrum")
+            .bind("restore-dns-fail")
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to inspect partial restore cleanup");
+    assert_eq!(failed_proxy_count, 0);
 }
 
 /// Restore must remain usable to REPAIR a namespace whose existing config is
@@ -3070,7 +3639,6 @@ async fn test_restore_hashes_consumer_secrets() {
                 "username": "hash_user",
                 "credentials": {
                     "basicauth": [{
-                        "username": "hash_user",
                         "password": "my_secret_password"
                     }]
                 }
@@ -4411,6 +4979,53 @@ async fn test_consumer_crud_create_update_delete() {
     // Verify gone
     let (status, _, _) = admin_get(&base_url, "/consumers/crud-consumer-1", &token).await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn test_consumer_put_preserves_basic_credentials_omitted_from_get_response() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let password_hash = format!("hmac_sha256:{}", "a".repeat(64));
+
+    let consumer = json!({
+        "id": "basic-roundtrip-consumer",
+        "username": "basic_roundtrip_user",
+        "credentials": {
+            "basicauth": [{"password_hash": password_hash.clone()}]
+        }
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
+    assert_eq!(status, 201, "Create consumer failed: {:?}", body);
+
+    let (status, mut roundtrip, _) =
+        admin_get(&base_url, "/consumers/basic-roundtrip-consumer", &token).await;
+    assert_eq!(status, 200);
+    assert!(roundtrip["credentials"].get("basicauth").is_none());
+
+    roundtrip["custom_id"] = json!("basic-roundtrip-custom-id");
+    let (status, body) = admin_put(
+        &base_url,
+        "/consumers/basic-roundtrip-consumer",
+        &token,
+        &roundtrip,
+    )
+    .await;
+    assert_eq!(status, 200, "Round-trip update failed: {:?}", body);
+
+    let (status, backup, _) = admin_get(&base_url, "/backup?resources=consumers", &token).await;
+    assert_eq!(status, 200);
+    let stored = backup["consumers"]
+        .as_array()
+        .expect("backup consumers array")
+        .iter()
+        .find(|consumer| consumer["id"] == "basic-roundtrip-consumer")
+        .expect("updated consumer in backup");
+    assert_eq!(
+        stored["credentials"]["basicauth"][0]["password_hash"].as_str(),
+        Some(password_hash.as_str())
+    );
 }
 
 #[tokio::test]

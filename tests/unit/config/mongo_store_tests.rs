@@ -11,8 +11,12 @@
 use ferrum_edge::_test_support::{
     mongo_migration_lease_acquire_filter_classic, mongo_migration_lease_acquire_update_classic,
     mongo_migration_lease_duration_millis, mongo_migration_lease_renew_update_classic,
-    mongo_pipeline_update_unsupported,
+    mongo_mtls_dns_admission_drop_must_retain, mongo_mtls_dns_admission_lock_filter,
+    mongo_mtls_dns_admission_lock_update, mongo_pipeline_update_unsupported,
+    mtls_dns_policy_requires_consumer_load,
 };
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
+use serde_json::json;
 
 const OWNER: &str = "test-owner-uuid";
 // Fixed client-clock instant so the builders are deterministic (no DateTime::now).
@@ -66,6 +70,74 @@ fn pipeline_update_rejection_excludes_contention_connectivity_and_auth() {
 fn migration_lease_duration_is_120_seconds() {
     // The classic fallback must keep the same 120s lease window as the pipeline.
     assert_eq!(mongo_migration_lease_duration_millis(), 120_000);
+}
+
+#[test]
+fn mtls_dns_admission_lock_has_no_expiry_takeover_path() {
+    let filter = mongo_mtls_dns_admission_lock_filter("default", OWNER);
+    assert_eq!(filter.get_str("_id").unwrap(), "default");
+    assert!(
+        !filter.contains_key("expires_at") && !format!("{filter:?}").contains("expires_at"),
+        "admission lock filter must never admit an expired-owner takeover: {filter:?}"
+    );
+    let clauses = filter.get_array("$or").unwrap();
+    assert_eq!(clauses.len(), 2);
+    assert_eq!(
+        clauses[1].as_document().unwrap().get_str("owner").unwrap(),
+        OWNER
+    );
+
+    let update = mongo_mtls_dns_admission_lock_update(OWNER, NOW_MILLIS);
+    let set = update.get_document("$set").unwrap();
+    assert_eq!(set.get_str("owner").unwrap(), OWNER);
+    assert!(set.get("expires_at").is_none());
+    assert!(
+        update
+            .get_document("$unset")
+            .unwrap()
+            .contains_key("expires_at"),
+        "admission lock must erase any expiry field: {update:?}"
+    );
+}
+
+#[test]
+fn mtls_dns_admission_drop_retains_only_uncertain_mutations() {
+    assert!(
+        mongo_mtls_dns_admission_drop_must_retain(true, false),
+        "a dispatched mutation without a settled outcome must keep the durable fence"
+    );
+    assert!(
+        !mongo_mtls_dns_admission_drop_must_retain(false, false),
+        "pre-mutation validation cancellation may clean up its unused fence"
+    );
+    assert!(
+        !mongo_mtls_dns_admission_drop_must_retain(true, true),
+        "an explicit settled release may retry owner-qualified cleanup"
+    );
+}
+
+#[test]
+fn mtls_dns_policy_gate_skips_consumers_until_san_dns_is_effective() {
+    let now = chrono::Utc::now();
+    let mut config = GatewayConfig {
+        plugin_configs: vec![PluginConfig {
+            id: "dns-mtls".to_string(),
+            namespace: "ferrum".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            enabled: false,
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        }],
+        ..Default::default()
+    };
+    assert!(!mtls_dns_policy_requires_consumer_load(&config));
+    config.plugin_configs[0].enabled = true;
+    assert!(mtls_dns_policy_requires_consumer_load(&config));
 }
 
 #[test]

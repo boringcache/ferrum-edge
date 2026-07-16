@@ -11,7 +11,9 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_credential_rotation
 
-use crate::common::{TestGateway, empty_digest_header, generate_hmac_signature};
+use crate::common::{
+    TestGateway, empty_digest_header, generate_hmac_signature, hmac_authority_from_url,
+};
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
@@ -682,8 +684,8 @@ async fn test_credential_rotation_hmac() {
     let proxy_url = &harness.proxy_base_url;
     let backend_port = harness.backend_port;
 
-    let secret1 = "hmac-rotation-secret-one-aaaa";
-    let secret2 = "hmac-rotation-secret-two-bbbb";
+    let secret1 = "hmac-rotation-secret-one-aaaa-0001";
+    let secret2 = "hmac-rotation-secret-two-bbbb-0002";
     let username = "hmacrotuser";
 
     // ---- Setup: consumer + one hmac credential ----
@@ -749,7 +751,8 @@ async fn test_credential_rotation_hmac() {
         secret: &str,
     ) -> reqwest::Response {
         let date = Utc::now().to_rfc2822();
-        let sig = generate_hmac_signature("GET", "/rot-hmac", &date, secret);
+        let authority = hmac_authority_from_url(url);
+        let sig = generate_hmac_signature("GET", "/rot-hmac", &date, username, &authority, secret);
         let header = format!(
             "hmac username=\"{}\", algorithm=\"hmac-sha256\", signature=\"{}\"",
             username, sig

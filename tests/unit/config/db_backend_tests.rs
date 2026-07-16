@@ -1,4 +1,5 @@
 use chrono::Utc;
+use ferrum_edge::_test_support::admin_mtls_dns_admission_drop_should_release;
 use ferrum_edge::config::db_backend::{
     AtomicClearVerification, DeleteAllResourcesError, DeleteMode, IncrementalResult,
     NamespaceResourceCounts, NamespacedResourceId, classify_atomic_clear_verification,
@@ -23,11 +24,61 @@ fn ambiguous_atomic_clear_verification_classifies_all_outcomes() {
     );
     assert_eq!(
         classify_atomic_clear_verification(prior, Ok::<_, ()>(prior)),
-        AtomicClearVerification::PriorConfigIntact
+        AtomicClearVerification::PriorCountsStillVisible
     );
     assert_eq!(
         classify_atomic_clear_verification(prior, Err::<NamespaceResourceCounts, _>(())),
         AtomicClearVerification::UnknownOutcome
+    );
+    assert_eq!(
+        classify_atomic_clear_verification(
+            NamespaceResourceCounts::default(),
+            Ok::<_, ()>(NamespaceResourceCounts::default()),
+        ),
+        AtomicClearVerification::PriorCountsStillVisible,
+        "an empty prior namespace is still ambiguous while its clear can commit later"
+    );
+}
+
+#[test]
+fn delayed_unknown_clear_cannot_admit_a_post_verification_write() {
+    let prior = NamespaceResourceCounts {
+        proxies: 1,
+        consumers: 1,
+        plugin_configs: 1,
+        upstreams: 1,
+        api_specs: 1,
+    };
+
+    // Model an UnknownTransactionCommitResult whose clear is still delayed
+    // when verification runs. Seeing the prior counts is only a point-in-time
+    // observation; the transaction may become visible after this read.
+    let verification = classify_atomic_clear_verification(prior, Ok::<_, ()>(prior));
+    assert_eq!(
+        verification,
+        AtomicClearVerification::PriorCountsStillVisible
+    );
+    assert!(
+        verification.requires_guard_retention(),
+        "the namespace guard must remain held while the delayed clear can still commit"
+    );
+
+    // A retained guard rejects the hypothetical writer that arrives after
+    // verification. If that writer were admitted, the delayed clear below
+    // could erase a successful response.
+    let guard_released = admin_mtls_dns_admission_drop_should_release(
+        true,
+        !verification.requires_guard_retention(),
+    );
+    assert!(!guard_released);
+
+    let mut visible_post_verification_writes = u8::from(guard_released);
+    let acknowledged_writes = visible_post_verification_writes;
+    // The delayed transaction now commits and clears the namespace.
+    visible_post_verification_writes = 0;
+    assert_eq!(
+        visible_post_verification_writes, acknowledged_writes,
+        "no admitted post-verification write may be lost to a delayed clear"
     );
 }
 

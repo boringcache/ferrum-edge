@@ -39,6 +39,7 @@ use tracing::debug;
 /// a backward NTP/VM/manual clock step suppress periodic cleanup until the wall
 /// clock caught back up. See finding #57.
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Default minimum seconds between full local-cache cleanup scans. The scan
 /// takes write locks across all `DashMap` shards, so it must run at most once
@@ -244,7 +245,19 @@ enum CompletionSkipReason {
     },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RequestDeduplicationRequestState {
+    key: String,
+    fingerprint: String,
+    local_inflight_owner_token: String,
+    redis_lock_token: Option<String>,
+}
+
 pub struct RequestDeduplication {
+    /// Process-unique identity used only to correlate this plugin's hooks on a
+    /// request. Configured plugin IDs are not passed to constructors, and an
+    /// atomic identity remains stable for the lifetime of the shared instance.
+    instance_id: u64,
     /// Header name to read the idempotency key from.
     header_name: String,
     /// Time-to-live for cached responses.
@@ -332,6 +345,7 @@ impl RequestDeduplication {
             });
 
         Ok(Self {
+            instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             header_name,
             ttl,
             inflight_ttl,
@@ -1572,7 +1586,8 @@ impl Plugin for RequestDeduplication {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        ctx.metadata.contains_key(DEDUP_KEY_METADATA)
+        ctx.request_deduplication_state
+            .contains_key(&self.instance_id)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1792,7 +1807,17 @@ impl Plugin for RequestDeduplication {
             LocalDeduplicationAction::Fresh => {}
         }
 
-        // Store the key in metadata so on_final_response_body can cache the response
+        ctx.request_deduplication_state.insert(
+            self.instance_id,
+            RequestDeduplicationRequestState {
+                key: key.clone(),
+                fingerprint: fingerprint.clone(),
+                local_inflight_owner_token: local_inflight_owner_token.clone(),
+                redis_lock_token: redis_lock_token.clone(),
+            },
+        );
+        // Retain the legacy metadata projection for compatibility. Lifecycle
+        // correctness uses the private instance-keyed state above.
         ctx.metadata.insert(DEDUP_KEY_METADATA.to_string(), key);
         ctx.metadata
             .insert(DEDUP_FINGERPRINT_METADATA.to_string(), fingerprint);
@@ -1835,18 +1860,17 @@ impl Plugin for RequestDeduplication {
             return;
         }
 
-        let Some(key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
+        let Some(state) = ctx.request_deduplication_state.get(&self.instance_id) else {
             return;
         };
-        let Some(fingerprint) = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) else {
-            return;
-        };
-
-        if let Some(owner_token) = ctx.metadata.get(DEDUP_LOCAL_INFLIGHT_TOKEN_METADATA) {
-            self.remove_matching_local_inflight(key, fingerprint, owner_token);
-        }
-        if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
-            self.redis_release_inflight(key, fingerprint, token).await;
+        self.remove_matching_local_inflight(
+            &state.key,
+            &state.fingerprint,
+            &state.local_inflight_owner_token,
+        );
+        if let Some(token) = state.redis_lock_token.as_deref() {
+            self.redis_release_inflight(&state.key, &state.fingerprint, token)
+                .await;
         }
     }
 
@@ -1857,25 +1881,18 @@ impl Plugin for RequestDeduplication {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Only cache if we have a dedup key from before_proxy
-        let key = match ctx.metadata.get(DEDUP_KEY_METADATA) {
-            Some(k) => k.clone(),
-            None => return PluginResult::Continue,
+        // Only cache if this exact plugin instance acquired request ownership.
+        let Some(state) = ctx
+            .request_deduplication_state
+            .get(&self.instance_id)
+            .cloned()
+        else {
+            return PluginResult::Continue;
         };
-        let fingerprint = match ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) {
-            Some(fingerprint) => fingerprint.clone(),
-            None => return PluginResult::Continue,
-        };
-        let local_inflight_owner_token = match ctx.metadata.get(DEDUP_LOCAL_INFLIGHT_TOKEN_METADATA)
-        {
-            Some(token) => token.clone(),
-            None => {
-                if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
-                    self.redis_release_inflight(&key, &fingerprint, token).await;
-                }
-                return PluginResult::Continue;
-            }
-        };
+        let key = state.key;
+        let fingerprint = state.fingerprint;
+        let local_inflight_owner_token = state.local_inflight_owner_token;
+        let redis_lock_token = state.redis_lock_token;
 
         // Synthetic short-circuit guard. When a *fresh* request that this plugin
         // marked in-flight is then short-circuited by a later request-phase
@@ -1907,7 +1924,7 @@ impl Plugin for RequestDeduplication {
                 return PluginResult::Continue;
             }
             self.remove_matching_local_inflight(&key, &fingerprint, &local_inflight_owner_token);
-            if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+            if let Some(token) = redis_lock_token.as_deref() {
                 self.redis_release_inflight(&key, &fingerprint, token).await;
             }
             return PluginResult::Continue;
@@ -1978,7 +1995,7 @@ impl Plugin for RequestDeduplication {
                                 &fingerprint,
                                 &local_inflight_owner_token,
                             );
-                            if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                            if let Some(token) = redis_lock_token.as_deref() {
                                 self.redis_release_inflight(&key, &fingerprint, token).await;
                             }
                         }
@@ -1988,7 +2005,7 @@ impl Plugin for RequestDeduplication {
                                 &fingerprint,
                                 &local_inflight_owner_token,
                             );
-                            if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                            if let Some(token) = redis_lock_token.as_deref() {
                                 self.redis_release_inflight(&key, &fingerprint, token).await;
                             }
                         }
@@ -2002,14 +2019,14 @@ impl Plugin for RequestDeduplication {
                     return PluginResult::Continue;
                 }
                 if !retained_inflight
-                    && let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA)
+                    && let Some(token) = redis_lock_token.as_deref()
                 {
                     self.redis_release_inflight(&key, &fingerprint, token).await;
                 }
                 return PluginResult::Continue;
             }
             LocalCompletionAction::Stale => {
-                if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                if let Some(token) = redis_lock_token.as_deref() {
                     self.redis_release_inflight(&key, &fingerprint, token).await;
                 }
                 return PluginResult::Continue;
@@ -2023,12 +2040,12 @@ impl Plugin for RequestDeduplication {
         if self.redis_client.is_some() {
             match self.redis_set(&key, &fingerprint, &cached).await {
                 RedisStoreAction::Stored => {
-                    if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                    if let Some(token) = redis_lock_token.as_deref() {
                         self.redis_release_inflight(&key, &fingerprint, token).await;
                     }
                 }
                 RedisStoreAction::SkippedSize if !retain_inflight_on_skip => {
-                    if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
+                    if let Some(token) = redis_lock_token.as_deref() {
                         self.redis_release_inflight(&key, &fingerprint, token).await;
                     }
                 }
@@ -2081,17 +2098,17 @@ impl Plugin for RequestDeduplication {
             return;
         }
 
-        let Some(key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
+        let Some(state) = ctx.request_deduplication_state.get(&self.instance_id) else {
             return;
         };
-        let Some(fingerprint) = ctx.metadata.get(DEDUP_FINGERPRINT_METADATA) else {
-            return;
-        };
-        if let Some(owner_token) = ctx.metadata.get(DEDUP_LOCAL_INFLIGHT_TOKEN_METADATA) {
-            self.remove_matching_local_inflight(key, fingerprint, owner_token);
-        }
-        if let Some(token) = ctx.metadata.get(DEDUP_REDIS_LOCK_TOKEN_METADATA) {
-            self.redis_release_inflight(key, fingerprint, token).await;
+        self.remove_matching_local_inflight(
+            &state.key,
+            &state.fingerprint,
+            &state.local_inflight_owner_token,
+        );
+        if let Some(token) = state.redis_lock_token.as_deref() {
+            self.redis_release_inflight(&state.key, &state.fingerprint, token)
+                .await;
         }
     }
 

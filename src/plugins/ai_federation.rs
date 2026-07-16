@@ -532,6 +532,17 @@ enum CircuitAdmission {
     Open,
 }
 
+/// Cancellation-safe lease for a half-open probe. Provider dispatch awaits
+/// DNS, connect, response headers, and body reads; dropping that future must
+/// not leave the circuit's single probe slot permanently occupied.
+struct HalfOpenProbeGuard<'a>(&'a ProviderCircuit);
+
+impl Drop for HalfOpenProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.release_probe(CircuitAdmission::HalfOpenProbe);
+    }
+}
+
 impl ProviderCircuit {
     fn new(config: ProviderCircuitConfig) -> Self {
         Self {
@@ -5162,6 +5173,12 @@ impl Plugin for AiFederation {
                 .as_ref()
                 .map(ProviderCircuit::admit)
                 .unwrap_or(CircuitAdmission::Closed);
+            let _half_open_probe_guard = match (provider.circuit.as_ref(), admission) {
+                (Some(circuit), CircuitAdmission::HalfOpenProbe) => {
+                    Some(HalfOpenProbeGuard(circuit))
+                }
+                _ => None,
+            };
             if admission == CircuitAdmission::Open {
                 skipped_open_circuit = true;
                 super::prometheus_metrics::global_registry().record_ai_federation_open_skip();
@@ -6019,6 +6036,27 @@ pub mod test_helpers {
         circuit.record_success("test", probe);
         states.push(circuit_admission_label(circuit.admit()));
         states
+    }
+
+    /// Simulate cancellation after half-open admission and verify the RAII
+    /// lease makes the probe slot immediately available again.
+    pub fn cancelled_half_open_probe_is_released_for_test() -> bool {
+        let circuit = ProviderCircuit::new(ProviderCircuitConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(60),
+            success_threshold: 1,
+        });
+        circuit
+            .open_until_epoch_ms
+            .store(epoch_millis().saturating_sub(1), Ordering::Release);
+        {
+            let admission = circuit.admit();
+            if admission != CircuitAdmission::HalfOpenProbe {
+                return false;
+            }
+            let _cancelled_dispatch = HalfOpenProbeGuard(&circuit);
+        }
+        circuit.admit() == CircuitAdmission::HalfOpenProbe
     }
 
     fn circuit_admission_label(admission: CircuitAdmission) -> &'static str {

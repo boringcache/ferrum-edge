@@ -472,6 +472,31 @@ fn build_config(echo_port: u16, with_host: bool) -> String {
     )
 }
 
+fn build_config_with_h3_gateway_policy(echo_port: u16) -> String {
+    format!(
+        "version: \"1\"\nproxies:\n\
+         \x20 - id: \"echo-http\"\n\
+         \x20   listen_path: \"/\"\n\
+         \x20   backend_scheme: http\n\
+         \x20   backend_host: \"127.0.0.1\"\n\
+         \x20   backend_port: {echo_port}\n\
+         \x20   strip_listen_path: false\n\
+         consumers: []\n\
+         plugin_configs:\n\
+         \x20 - id: \"h3-gateway-error-security\"\n\
+         \x20   plugin_name: security_headers\n\
+         \x20   scope: global\n\
+         \x20   enabled: true\n\
+         \x20   config:\n\
+         \x20     override_existing: false\n\
+         \x20     set:\n\
+         \x20       X-H3-Gateway-Policy: enforced\n\
+         \x20       Content-Type: text/plain\n\
+         \x20       Content-Length: \"999\"\n\
+         \x20       Transfer-Encoding: chunked\n",
+    )
+}
+
 /// Harness that spins up an echo backend + gateway in file mode.
 struct Harness {
     _gateway: TestGateway,
@@ -528,12 +553,19 @@ async fn start_h3_validation_gateway(
     echo_port: u16,
     extra_env: &[(&str, &str)],
 ) -> (TestGateway, u16) {
+    start_h3_validation_gateway_with_config(build_config(echo_port, false), extra_env).await
+}
+
+async fn start_h3_validation_gateway_with_config(
+    config: String,
+    extra_env: &[(&str, &str)],
+) -> (TestGateway, u16) {
     let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let https_port = https_reservation.local_addr().unwrap().port();
     drop(https_reservation);
 
     let mut builder = TestGateway::builder()
-        .mode_file(build_config(echo_port, false))
+        .mode_file(config)
         .log_level("warn")
         .env("FERRUM_ENABLE_HTTP3", "true")
         .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
@@ -1889,9 +1921,11 @@ async fn functional_protocol_validation_h3_request_body_limit_rejects_from_env()
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
 
-    let (mut gateway, https_port) =
-        start_h3_validation_gateway(echo_port, &[("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "8")])
-            .await;
+    let (mut gateway, https_port) = start_h3_validation_gateway_with_config(
+        build_config_with_h3_gateway_policy(echo_port),
+        &[("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "8")],
+    )
+    .await;
 
     let client = Http3Client::insecure().expect("H3 client");
     let url = format!("https://localhost:{https_port}/");
@@ -1923,6 +1957,53 @@ async fn functional_protocol_validation_h3_request_body_limit_rejects_from_env()
             .contains("Request body exceeds maximum size"),
         "unexpected body: {}",
         resp.body_text()
+    );
+
+    // A declared oversized body is rejected from the native H3 server before
+    // dispatch. This is the gateway-error path where initial response-header
+    // policies must be applied and framing headers must remain authoritative.
+    let options = GetOptions::default()
+        .method(Method::POST)
+        .header("content-length", "16");
+    let policy_resp = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        loop {
+            match client.get_with_options(&url, options.clone()).await {
+                Ok(resp) => break resp,
+                Err(err) if std::time::Instant::now() < deadline => {
+                    last_err = Some(err.to_string());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "H3 request with oversized declared body did not complete; last startup error={last_err:?}; final error={err}"
+                    );
+                }
+            }
+        }
+    };
+
+    assert_eq!(
+        policy_resp.status.as_u16(),
+        413,
+        "body={}",
+        policy_resp.body_text()
+    );
+    assert_eq!(
+        policy_resp
+            .headers
+            .get("x-h3-gateway-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("enforced")
+    );
+    assert!(!policy_resp.headers.contains_key("content-length"));
+    assert!(!policy_resp.headers.contains_key("transfer-encoding"));
+    assert_eq!(
+        policy_resp
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
     );
 
     gateway.shutdown();

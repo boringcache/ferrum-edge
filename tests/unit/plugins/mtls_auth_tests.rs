@@ -377,6 +377,7 @@ fn create_stream_ctx_with_cert(
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("TCP Proxy".to_string()),
         listen_port: 5432,
@@ -451,6 +452,27 @@ async fn test_mtls_auth_san_dns_matching_is_ascii_case_insensitive() {
 
     assert_continue(plugin.authenticate(&mut ctx, &index).await);
     assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "alice");
+}
+
+#[tokio::test]
+async fn test_mtls_auth_san_dns_rotation_accepts_certificate_case_variants() {
+    let mut consumer = create_mtls_consumer("c1", "alice", "old.api.example.com");
+    consumer.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([
+            {"identity": "old.api.example.com"},
+            {"identity": "New.API.Example.COM"}
+        ]),
+    );
+    let index = ConsumerIndex::new(&[consumer]);
+    let plugin = MtlsAuth::new(&json!({"cert_field": "san_dns"})).unwrap();
+
+    for certificate_dns in ["OLD.API.EXAMPLE.COM", "new.api.example.com"] {
+        let certificate = create_test_cert("unused-cn", None, Some(certificate_dns));
+        let mut ctx = create_ctx_with_cert(certificate);
+        assert_continue(plugin.authenticate(&mut ctx, &index).await);
+        assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "alice");
+    }
 }
 
 #[tokio::test]
@@ -1545,6 +1567,7 @@ fn create_udp_stream_ctx_with_cert(
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "udp-proxy".to_string(),
         proxy_name: Some("UDP Proxy".to_string()),
         listen_port: 5353,
@@ -1568,6 +1591,7 @@ fn create_udp_stream_ctx_no_cert(consumers: Vec<Consumer>) -> StreamConnectionCo
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "udp-proxy".to_string(),
         proxy_name: Some("UDP Proxy".to_string()),
         listen_port: 5353,
@@ -1634,6 +1658,7 @@ async fn test_mtls_auth_dtls_with_allowed_issuer() {
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "udp-proxy".to_string(),
         proxy_name: Some("UDP Proxy".to_string()),
         listen_port: 5353,
@@ -1673,6 +1698,7 @@ async fn test_mtls_auth_dtls_allowed_issuer_rejects_mismatch() {
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "udp-proxy".to_string(),
         proxy_name: Some("UDP Proxy".to_string()),
         listen_port: 5353,

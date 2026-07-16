@@ -19,7 +19,7 @@ use ferrum_edge::{
     },
     config::{
         db_loader::{DatabaseStore, DbPoolConfig},
-        types::{Proxy, Upstream},
+        types::{Consumer, PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream},
     },
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -347,6 +347,328 @@ fn minimal_json_spec(proxy_id: &str) -> Value {
             "listen_path": format!("/{proxy_id}")
         }
     })
+}
+
+fn json_spec_with_plugin(
+    proxy_id: &str,
+    backend_host: &str,
+    plugin_id: &str,
+    plugin_name: &str,
+    plugin_config: Value,
+) -> Value {
+    json!({
+        "openapi": "3.1.0",
+        "info": {"title": "HMAC replacement candidate", "version": "2.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": backend_host,
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [{
+            "id": plugin_id,
+            "plugin_name": plugin_name,
+            "config": plugin_config
+        }]
+    })
+}
+
+fn hmac_plugin_config() -> Value {
+    json!({"clock_skew_seconds": 300})
+}
+
+fn request_body_transformer_config() -> Value {
+    json!({
+        "rules": [{
+            "operation": "add",
+            "target": "body",
+            "key": "gateway",
+            "value": "ferrum"
+        }]
+    })
+}
+
+fn manual_proxy_plugin(
+    plugin_id: &str,
+    proxy_id: &str,
+    plugin_name: &str,
+    config: Value,
+) -> PluginConfig {
+    PluginConfig {
+        id: plugin_id.to_string(),
+        namespace: "ferrum".to_string(),
+        plugin_name: plugin_name.to_string(),
+        config,
+        scope: PluginScope::Proxy,
+        proxy_id: Some(proxy_id.to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+async fn convert_spec_owned_plugin_to_global(
+    store: &DatabaseStore,
+    proxy_id: &str,
+    plugin_id: &str,
+) {
+    let mut proxy = store
+        .get_proxy("ferrum", proxy_id)
+        .await
+        .expect("get spec proxy")
+        .expect("spec proxy must exist");
+    proxy
+        .plugins
+        .retain(|association| association.plugin_config_id != plugin_id);
+    assert!(
+        store
+            .update_proxy(&proxy)
+            .await
+            .expect("remove association"),
+        "spec proxy must exist while removing the global association"
+    );
+
+    let mut plugin = store
+        .get_plugin_config("ferrum", plugin_id)
+        .await
+        .expect("get spec-owned plugin")
+        .expect("spec-owned plugin must exist");
+    assert!(
+        plugin.api_spec_id.is_some(),
+        "seed plugin must retain spec ownership"
+    );
+    plugin.scope = PluginScope::Global;
+    plugin.proxy_id = None;
+    assert!(
+        store
+            .update_plugin_config(&plugin)
+            .await
+            .expect("promote spec-owned plugin to global"),
+        "spec-owned plugin must exist while promoting it to global"
+    );
+}
+
+async fn attach_manual_proxy_plugin(store: &DatabaseStore, proxy_id: &str, plugin: &PluginConfig) {
+    store
+        .create_plugin_config(plugin)
+        .await
+        .expect("create manual plugin");
+    let mut proxy = store
+        .get_proxy("ferrum", proxy_id)
+        .await
+        .expect("get proxy for manual association")
+        .expect("proxy must exist for manual association");
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: plugin.id.clone(),
+    });
+    assert!(
+        store
+            .update_proxy(&proxy)
+            .await
+            .expect("attach manual plugin"),
+        "proxy must exist while attaching manual plugin"
+    );
+}
+
+async fn assert_put_replaces_removed_spec_owned_global(
+    old_plugin_name: &str,
+    old_plugin_config: Value,
+    incoming_plugin_name: &str,
+    incoming_plugin_config: Value,
+) {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("replace-global-proxy");
+    let old_plugin_id = uid("old-spec-global");
+    let incoming_plugin_id = uid("incoming-spec-plugin");
+    let initial_spec = json_spec_with_plugin(
+        &proxy_id,
+        "old-backend.internal",
+        &old_plugin_id,
+        old_plugin_name,
+        old_plugin_config,
+    );
+    let (post_status, post_body) = client.post_json("/api-specs", &initial_spec).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "initial API spec failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+    convert_spec_owned_plugin_to_global(&store, &proxy_id, &old_plugin_id).await;
+
+    let replacement_spec = json_spec_with_plugin(
+        &proxy_id,
+        "replacement-backend.internal",
+        &incoming_plugin_id,
+        incoming_plugin_name,
+        incoming_plugin_config,
+    );
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &replacement_spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::OK,
+        "removed spec-owned global polluted replacement validation: {put_body}"
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &old_plugin_id)
+            .await
+            .expect("read removed spec-owned global")
+            .is_none(),
+        "removed spec-owned global must be deleted by replacement"
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &incoming_plugin_id)
+            .await
+            .expect("read incoming spec plugin")
+            .is_some(),
+        "incoming spec plugin must be persisted"
+    );
+    let runtime_config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("successful replacement must remain runtime-loadable");
+    assert!(
+        runtime_config
+            .plugin_configs
+            .iter()
+            .all(|plugin| plugin.id != old_plugin_id),
+        "removed spec-owned global leaked into runtime config"
+    );
+    assert!(
+        runtime_config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.id == incoming_plugin_id),
+        "incoming spec plugin missing from runtime config"
+    );
+}
+
+async fn assert_put_rejects_preserved_manual_association(
+    manual_plugin_name: &str,
+    manual_plugin_config: Value,
+    incoming_plugin_name: &str,
+    incoming_plugin_config: Value,
+) {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("preserved-manual-proxy");
+    let manual_plugin_id = uid("manual-plugin");
+    let incoming_plugin_id = uid("incoming-spec-plugin");
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "initial API spec failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+    let manual_plugin = manual_proxy_plugin(
+        &manual_plugin_id,
+        &proxy_id,
+        manual_plugin_name,
+        manual_plugin_config,
+    );
+    attach_manual_proxy_plugin(&store, &proxy_id, &manual_plugin).await;
+
+    let spec_before = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read API spec before rejected PUT")
+        .expect("API spec must exist before rejected PUT");
+    let proxy_before = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("read proxy before rejected PUT")
+        .expect("proxy must exist before rejected PUT");
+    let replacement_spec = json_spec_with_plugin(
+        &proxy_id,
+        "replacement-backend.internal",
+        &incoming_plugin_id,
+        incoming_plugin_name,
+        incoming_plugin_config,
+    );
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &replacement_spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "PUT reported success despite an invalid preserved manual association: {put_body}"
+    );
+    assert!(
+        put_body
+            .to_string()
+            .contains("hmac_auth cannot be combined with request-body transformer"),
+        "missing HMAC composition rejection: {put_body}"
+    );
+
+    let spec_after = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read API spec after rejected PUT")
+        .expect("API spec must survive rejected PUT");
+    assert_eq!(spec_after.content_hash, spec_before.content_hash);
+    assert_eq!(spec_after.resource_hash, spec_before.resource_hash);
+    assert_eq!(spec_after.updated_at, spec_before.updated_at);
+    let proxy_after = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("read proxy after rejected PUT")
+        .expect("proxy must survive rejected PUT");
+    assert_eq!(proxy_after.backend_host, proxy_before.backend_host);
+    assert_eq!(proxy_after.updated_at, proxy_before.updated_at);
+    let associations_after: Vec<&str> = proxy_after
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    assert!(
+        associations_after.contains(&manual_plugin_id.as_str()),
+        "rejected PUT removed the preserved manual association: {associations_after:?}"
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &incoming_plugin_id)
+            .await
+            .expect("read rejected incoming plugin")
+            .is_none(),
+        "rejected incoming spec plugin must not be persisted"
+    );
+    let runtime_config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("rejected replacement must leave the prior runtime config loadable");
+    assert!(
+        runtime_config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.id == proxy_id)
+            .is_some_and(|proxy| {
+                proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == manual_plugin_id)
+            }),
+        "prior runtime config lost the preserved manual association"
+    );
 }
 
 /// Minimal valid YAML spec string.
@@ -1141,6 +1463,327 @@ async fn post_with_failing_plugin_config_returns_422_via_real_validator() {
     );
 }
 
+#[tokio::test]
+async fn post_rejects_hmac_request_body_transformer_composition() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("hmac-transform-proxy");
+    let hmac_id = uid("hmac-plugin");
+    let transformer_id = uid("body-transformer");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "HMAC composition", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [
+            {
+                "id": hmac_id,
+                "plugin_name": "hmac_auth",
+                "config": {"clock_skew_seconds": 300}
+            },
+            {
+                "id": transformer_id,
+                "plugin_name": "request_transformer",
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "gateway",
+                    "value": "ferrum"
+                }]}
+            }
+        ]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "unsafe API-spec plugin bundle was admitted: {body}"
+    );
+    let composition_failure = body["failures"]
+        .as_array()
+        .and_then(|failures| {
+            failures
+                .iter()
+                .find(|failure| failure["resource_type"] == "plugin_composition")
+        })
+        .unwrap_or_else(|| panic!("missing plugin composition failure: {body}"));
+    assert!(
+        composition_failure["errors"]
+            .to_string()
+            .contains("hmac_auth cannot be combined with request-body transformer"),
+        "unexpected composition failure: {composition_failure}"
+    );
+}
+
+#[tokio::test]
+async fn post_mtls_dns_policy_conflict_returns_409() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let mut upper = Consumer {
+        id: uid("mtls-upper"),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: uid("mtls-upper-user"),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    upper.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut lower = upper.clone();
+    lower.id = uid("mtls-lower");
+    lower.username = uid("mtls-lower-user");
+    lower.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "api.example.com"}]),
+    );
+    store
+        .create_consumer(&upper)
+        .await
+        .expect("create exact-case upper identity");
+    store
+        .create_consumer(&lower)
+        .await
+        .expect("create exact-case lower identity before DNS policy activation");
+
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("mtls-dns-conflict-proxy");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "mTLS DNS conflict", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [{
+            "id": uid("mtls-dns-policy"),
+            "plugin_name": "mtls_auth",
+            "config": {"cert_field": "san_dns"}
+        }]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CONFLICT,
+        "mTLS DNS candidate conflict must use the documented 409 response: {body}"
+    );
+}
+
+#[tokio::test]
+async fn put_excludes_removed_spec_owned_global_hmac_before_adding_body_transformer() {
+    assert_put_replaces_removed_spec_owned_global(
+        "hmac_auth",
+        hmac_plugin_config(),
+        "request_transformer",
+        request_body_transformer_config(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn put_excludes_removed_spec_owned_global_body_transformer_before_adding_hmac() {
+    assert_put_replaces_removed_spec_owned_global(
+        "request_transformer",
+        request_body_transformer_config(),
+        "hmac_auth",
+        hmac_plugin_config(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn put_rejects_body_transformer_beside_preserved_manual_hmac_association() {
+    assert_put_rejects_preserved_manual_association(
+        "hmac_auth",
+        hmac_plugin_config(),
+        "request_transformer",
+        request_body_transformer_config(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn put_rejects_hmac_beside_preserved_manual_body_transformer_association() {
+    assert_put_rejects_preserved_manual_association(
+        "request_transformer",
+        request_body_transformer_config(),
+        "hmac_auth",
+        hmac_plugin_config(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn put_rejects_same_id_overlay_of_manual_hmac_plugin_without_mutation() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("same-id-manual-proxy");
+    let manual_plugin_id = uid("same-id-manual-hmac");
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "initial API spec failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+    let manual_plugin = manual_proxy_plugin(
+        &manual_plugin_id,
+        &proxy_id,
+        "hmac_auth",
+        hmac_plugin_config(),
+    );
+    attach_manual_proxy_plugin(&store, &proxy_id, &manual_plugin).await;
+
+    let spec_before = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read API spec before rejected PUT")
+        .expect("API spec must exist before rejected PUT");
+    let proxy_before = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("read proxy before rejected PUT")
+        .expect("proxy must exist before rejected PUT");
+    let replacement_spec = json_spec_with_plugin(
+        &proxy_id,
+        "replacement-backend.internal",
+        &manual_plugin_id,
+        "request_transformer",
+        request_body_transformer_config(),
+    );
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &replacement_spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "same-ID manual plugin overlay was not rejected during validation: {put_body}"
+    );
+    assert!(
+        put_body
+            .to_string()
+            .contains("replacement cannot take ownership"),
+        "same-ID rejection must identify the ownership conflict: {put_body}"
+    );
+
+    let spec_after = store
+        .get_api_spec("ferrum", &spec_id)
+        .await
+        .expect("read API spec after rejected PUT")
+        .expect("API spec must survive rejected PUT");
+    assert_eq!(spec_after.content_hash, spec_before.content_hash);
+    assert_eq!(spec_after.resource_hash, spec_before.resource_hash);
+    assert_eq!(spec_after.updated_at, spec_before.updated_at);
+    let proxy_after = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("read proxy after rejected PUT")
+        .expect("proxy must survive rejected PUT");
+    assert_eq!(proxy_after.backend_host, proxy_before.backend_host);
+    assert_eq!(proxy_after.updated_at, proxy_before.updated_at);
+    assert!(
+        proxy_after
+            .plugins
+            .iter()
+            .any(|association| association.plugin_config_id == manual_plugin_id),
+        "rejected PUT must retain the manual plugin association"
+    );
+    let manual_after = store
+        .get_plugin_config("ferrum", &manual_plugin_id)
+        .await
+        .expect("read manual plugin after rejected PUT")
+        .expect("manual plugin must survive rejected PUT");
+    assert_eq!(manual_after.plugin_name, "hmac_auth");
+    assert_eq!(manual_after.config, manual_plugin.config);
+    assert!(manual_after.api_spec_id.is_none());
+
+    let runtime_config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("rejected replacement must leave the prior runtime config loadable");
+    assert!(
+        runtime_config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.id == manual_plugin_id && plugin.plugin_name == "hmac_auth"),
+        "prior runtime config lost or replaced the manual HMAC plugin"
+    );
+}
+
+#[tokio::test]
+async fn disabled_basic_auth_spec_can_be_staged_before_plugin_construction() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let mut spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Disabled Basic auth staging", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [{
+            "id": uid("basic-auth"),
+            "plugin_name": "basic_auth",
+            "enabled": false,
+            // This unsupported field makes construction fail independently of
+            // the process environment, so successful staging proves that the
+            // disabled import path did not construct the plugin.
+            "config": {"realm": "staged-but-unused"}
+        }]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "disabled Basic auth config should be stageable: {body}"
+    );
+
+    let spec_id = body["id"].as_str().expect("created spec id");
+    spec["x-ferrum-plugins"][0]["enabled"] = json!(true);
+    let (status, body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "enabling must perform plugin construction and fail closed: {body}"
+    );
+    assert!(body["failures"].as_array().is_some_and(|failures| {
+        failures
+            .iter()
+            .any(|failure| failure["resource_type"] == "plugin")
+    }));
+}
+
 // ============================================================================
 // Gap #3: Multiple validation failures aggregated in one 422
 // ============================================================================
@@ -1875,7 +2518,7 @@ async fn post_with_invalid_plugin_id_returns_400() {
             "id": "has spaces and !@#",
             "plugin_name": "cors",
             "scope": "proxy",
-            "config": {}
+            "config": {"allowed_origins": ["*"]}
         }]
     });
 
@@ -2337,7 +2980,7 @@ async fn put_with_empty_plugin_ids_reuses_by_name() {
             "listen_path": listen_path
         },
         "x-ferrum-plugins": [
-            {"id": "", "plugin_name": "cors", "config": {}},
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}},
             {"id": "", "plugin_name": "correlation_id", "config": {}}
         ]
     });
@@ -2407,7 +3050,7 @@ async fn put_with_renamed_plugin_gets_new_id() {
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
     let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
     assert_eq!(
@@ -2483,7 +3126,7 @@ async fn put_with_explicit_plugin_id_overrides_match() {
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
     let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
     assert_eq!(
@@ -2504,7 +3147,7 @@ async fn put_with_explicit_plugin_id_overrides_match() {
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": explicit_id, "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": explicit_id, "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
     let (put_status, put_body) = client
         .put_json(&format!("/api-specs/{spec_id}"), &spec_v2)
@@ -2548,7 +3191,7 @@ async fn put_with_empty_plugin_reuse_and_explicit_duplicate_id_returns_422() {
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
 
     let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
@@ -2576,7 +3219,7 @@ async fn put_with_empty_plugin_reuse_and_explicit_duplicate_id_returns_422() {
             "listen_path": listen_path
         },
         "x-ferrum-plugins": [
-            {"id": "", "plugin_name": "cors", "config": {}},
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}},
             {"id": reused_plugin_id, "plugin_name": "correlation_id", "config": {}}
         ]
     });
@@ -2681,7 +3324,7 @@ async fn post_proxy_plugin_association_to_other_proxy_returns_422() {
             "plugin_name": "cors",
             "scope": "proxy",
             "proxy_id": other_proxy_id,
-            "config": {},
+            "config": {"allowed_origins": ["*"]},
             "enabled": true
         }))
         .expect("other plugin deserialization");
@@ -2735,7 +3378,7 @@ async fn post_proxy_plugin_association_to_other_namespace_returns_422() {
             "namespace": other_namespace,
             "plugin_name": "cors",
             "scope": "proxy_group",
-            "config": {},
+            "config": {"allowed_origins": ["*"]},
             "enabled": true
         }))
         .expect("shared plugin deserialization");
@@ -2805,7 +3448,7 @@ async fn post_proxy_plugin_association_to_global_plugin_returns_422() {
             "namespace": "ferrum",
             "plugin_name": "cors",
             "scope": "global",
-            "config": {},
+            "config": {"allowed_origins": ["*"]},
             "enabled": true
         }))
         .expect("global plugin deserialization");
@@ -2878,7 +3521,7 @@ async fn post_proxy_plugin_association_to_about_to_insert_plugin_succeeds() {
         "x-ferrum-plugins": [{
             "id": plugin_id,
             "plugin_name": "cors",
-            "config": {}
+            "config": {"allowed_origins": ["*"]}
         }]
     });
 
@@ -2921,7 +3564,7 @@ async fn put_keeps_manually_added_proxy_group_plugin_association() {
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": uid("spec-plugin-v1"), "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": uid("spec-plugin-v1"), "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
     let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
     assert_eq!(
@@ -2940,7 +3583,7 @@ async fn put_keeps_manually_added_proxy_group_plugin_association() {
             "namespace": "ferrum",
             "plugin_name": "cors",
             "scope": "proxy_group",
-            "config": {},
+            "config": {"allowed_origins": ["*"]},
             "enabled": true
         }))
         .expect("proxy-group plugin deserialization");
@@ -3376,7 +4019,7 @@ async fn post_spec_with_plugin_priority_override_too_high_returns_422() {
             "id": uid("plugin"),
             "plugin_name": "cors",
             "priority_override": 10001,
-            "config": {}
+            "config": {"allowed_origins": ["*"]}
         }]
     });
 
@@ -3435,7 +4078,7 @@ async fn post_spec_with_duplicate_proxy_plugin_association_returns_422() {
         "namespace": "ferrum",
         "plugin_name": "cors",
         "scope": "proxy_group",
-        "config": {}
+        "config": {"allowed_origins": ["*"]}
     }))
     .expect("plugin deserialization");
     store
@@ -3497,8 +4140,8 @@ async fn put_with_two_id_less_same_name_plugins_identical_configs_is_idempotent(
     // Both plugins have the same plugin_name AND identical config — the
     // extractor allows multiple proxy-scoped instances of the same plugin.
     let two_cors_plugins = json!([
-        {"id": "", "plugin_name": "cors", "config": {}},
-        {"id": "", "plugin_name": "cors", "config": {}}
+        {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}},
+        {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}
     ]);
 
     let spec = json!({
@@ -3585,7 +4228,7 @@ async fn put_with_two_id_less_same_name_plugins_different_configs_returns_422() 
             "backend_port": 443,
             "listen_path": listen_path
         },
-        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["*"]}}]
     });
     let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
     assert_eq!(
@@ -3606,8 +4249,8 @@ async fn put_with_two_id_less_same_name_plugins_different_configs_returns_422() 
             "listen_path": listen_path
         },
         "x-ferrum-plugins": [
-            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["a.example"]}},
-            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["b.example"]}}
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["https://a.example"]}},
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["https://b.example"]}}
         ]
     });
     let (put_status, put_body) = client
@@ -3668,7 +4311,7 @@ async fn put_adds_second_same_name_plugin_when_one_matches_canonically() {
             "listen_path": listen_path
         },
         "x-ferrum-plugins": [
-            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["a.example"]}}
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["https://a.example"]}}
         ]
     });
     let (s1, b1) = client.post_json("/api-specs", &spec_v1).await;
@@ -3688,8 +4331,8 @@ async fn put_adds_second_same_name_plugin_when_one_matches_canonically() {
             "listen_path": listen_path
         },
         "x-ferrum-plugins": [
-            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["a.example"]}},
-            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["b.example"]}}
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["https://a.example"]}},
+            {"id": "", "plugin_name": "cors", "config": {"allowed_origins": ["https://b.example"]}}
         ]
     });
     let (s2, b2) = client
@@ -4084,7 +4727,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
         "x-ferrum-plugins": [{
             "id": uid("plugin"),
             "plugin_name": "cors",
-            "config": {},
+            "config": {"allowed_origins": ["*"]},
             "updated_at": "1970-01-01T00:00:00Z"
         }]
     });
@@ -4317,7 +4960,7 @@ async fn loaded_gateway_config_excludes_api_specs_after_submission() {
         "x-ferrum-plugins": [{
             "id": uid("plugin"),
             "plugin_name": "cors",
-            "config": {}
+            "config": {"allowed_origins": ["*"]}
         }]
     });
 
@@ -4559,7 +5202,7 @@ async fn post_with_duplicate_plugin_ids_returns_error() {
             {
                 "id": "same-id",
                 "plugin_name": "cors",
-                "config": {}
+                "config": {"allowed_origins": ["*"]}
             },
             {
                 "id": "same-id",

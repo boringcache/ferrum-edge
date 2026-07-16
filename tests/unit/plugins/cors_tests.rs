@@ -1,8 +1,8 @@
 //! Tests for the CORS plugin
 
 use ferrum_edge::plugins::cors::CorsPlugin;
-use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
-use serde_json::json;
+use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 fn make_ctx() -> RequestContext {
@@ -41,14 +41,72 @@ fn make_cors_ctx(method: &str, origin: &str) -> RequestContext {
 
 #[tokio::test]
 async fn test_cors_plugin_creation_defaults() {
-    let plugin = CorsPlugin::new(&json!({})).unwrap();
+    let plugin = CorsPlugin::new(&json!({"allowed_origins": ["*"]})).unwrap();
     assert_eq!(plugin.name(), "cors");
     assert_eq!(plugin.priority(), priority::CORS);
     assert_eq!(plugin.priority(), 100);
-    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
     assert!(!plugin.modifies_request_headers());
     assert!(plugin.applies_after_proxy_on_reject());
     assert!(!plugin.is_auth_plugin());
+}
+
+#[test]
+fn test_constructor_rejects_noop_non_object_unknown_and_null_configs() {
+    for config in [
+        json!({}),
+        json!(null),
+        json!(true),
+        json!([]),
+        json!("cors"),
+        json!(42),
+    ] {
+        assert!(
+            CorsPlugin::new(&config).is_err(),
+            "no-op or non-object config must be rejected: {config}"
+        );
+    }
+
+    for config in [
+        json!({"origins": ["https://app.example"]}),
+        json!({"allowed_origins": ["https://app.example"], "allowed_origns": ["*"]}),
+    ] {
+        assert!(
+            CorsPlugin::new(&config).is_err(),
+            "unknown or null config must be rejected: {config}"
+        );
+    }
+
+    for key in [
+        "allowed_origins",
+        "allowed_methods",
+        "allowed_headers",
+        "exposed_headers",
+        "allow_credentials",
+        "max_age",
+        "preflight_continue",
+        "unmatched_preflights",
+    ] {
+        let mut config = json!({"allowed_origins": ["*"]});
+        config[key] = Value::Null;
+        assert!(
+            CorsPlugin::new(&config).is_err(),
+            "null field must be rejected: {key}"
+        );
+    }
+}
+
+#[test]
+fn test_constructor_rejects_padded_method_and_header_tokens() {
+    for config in [
+        json!({"allowed_origins": ["*"], "allowed_methods": [" GET"]}),
+        json!({"allowed_origins": ["*"], "allowed_headers": ["X-Test "]}),
+    ] {
+        let err = CorsPlugin::new(&config)
+            .err()
+            .expect("whitespace-padded policy tokens must be rejected");
+        assert!(err.contains("leading or trailing whitespace"), "got: {err}");
+    }
 }
 
 #[test]
@@ -85,14 +143,26 @@ fn test_constructor_rejects_non_string_origin_entry() {
 }
 
 #[test]
-fn test_constructor_rejects_malformed_exact_origin() {
-    let err = CorsPlugin::new(&json!({
-        "allowed_origins": ["example.com"]
-    }))
-    .err()
-    .expect("exact origins without scheme must be rejected");
+fn test_constructor_validates_every_origin_even_when_list_contains_wildcard() {
+    for config in [
+        json!({"allowed_origins": ["*", 42]}),
+        json!({"allowed_origins": [{"exact": "*"}, {"prefix": ""}]}),
+    ] {
+        assert!(
+            CorsPlugin::new(&config).is_err(),
+            "a wildcard must not hide a malformed sibling matcher: {config}"
+        );
+    }
+}
 
-    assert!(err.contains("invalid origin"), "got: {err}");
+#[test]
+fn test_constructor_rejects_malformed_exact_origin() {
+    for origin in ["example.com", "https://exa\nmple.com"] {
+        assert!(
+            CorsPlugin::new(&json!({"allowed_origins": [origin]})).is_err(),
+            "malformed exact origin must be rejected: {origin:?}"
+        );
+    }
 }
 
 #[test]
@@ -107,14 +177,21 @@ fn test_constructor_rejects_exact_origin_with_empty_authority() {
 }
 
 #[test]
-fn test_constructor_rejects_exact_origin_with_path() {
-    let err = CorsPlugin::new(&json!({
-        "allowed_origins": ["https://example.com/api"]
-    }))
-    .err()
-    .expect("origins with path must be rejected");
+fn test_constructor_rejects_exact_origin_with_raw_post_authority() {
+    for origin in [
+        "https://example.com/api",
+        "https://example.com/foo/..",
+        "https://example.com/%2e%2e",
+        "https://example.com\\foo\\..",
+    ] {
+        for allowed_origins in [json!([origin]), json!([{"exact": origin}])] {
+            let err = CorsPlugin::new(&json!({"allowed_origins": allowed_origins}))
+                .err()
+                .expect("origins with a raw post-authority component must be rejected");
 
-    assert!(err.contains("without path"), "got: {err}");
+            assert!(err.contains("without path"), "got: {err}");
+        }
+    }
 }
 
 #[test]
@@ -131,6 +208,7 @@ fn test_constructor_rejects_malformed_wildcard_origin() {
 #[test]
 fn test_constructor_rejects_invalid_method() {
     let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "allowed_methods": ["GET", "BAD METHOD"]
     }))
     .err()
@@ -142,6 +220,7 @@ fn test_constructor_rejects_invalid_method() {
 #[test]
 fn test_constructor_rejects_empty_allowed_methods() {
     let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "allowed_methods": []
     }))
     .err()
@@ -153,6 +232,7 @@ fn test_constructor_rejects_empty_allowed_methods() {
 #[test]
 fn test_constructor_rejects_invalid_header_name() {
     let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "allowed_headers": ["Content-Type", "Bad Header"]
     }))
     .err()
@@ -164,6 +244,7 @@ fn test_constructor_rejects_invalid_header_name() {
 #[test]
 fn test_constructor_rejects_non_bool_allow_credentials() {
     let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "allow_credentials": "true"
     }))
     .err()
@@ -175,6 +256,7 @@ fn test_constructor_rejects_non_bool_allow_credentials() {
 #[test]
 fn test_constructor_rejects_non_integer_max_age() {
     let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "max_age": -1
     }))
     .err()
@@ -187,6 +269,7 @@ fn test_constructor_rejects_non_integer_max_age() {
 async fn test_cors_plugin_credentials_wildcard_conflict() {
     // allow_credentials with wildcard origins should disable credentials
     let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "allow_credentials": true
     }))
     .unwrap();
@@ -255,6 +338,19 @@ async fn test_preflight_with_allowed_origin() {
                 headers.get("access-control-allow-origin").unwrap(),
                 "https://example.com"
             );
+            for token in [
+                "Origin",
+                "Access-Control-Request-Method",
+                "Access-Control-Request-Headers",
+            ] {
+                assert!(
+                    headers["vary"]
+                        .split(',')
+                        .any(|value| value.trim().eq_ignore_ascii_case(token)),
+                    "missing preflight Vary token {token}: {}",
+                    headers["vary"]
+                );
+            }
         }
         _ => panic!("Expected Reject for preflight"),
     }
@@ -286,7 +382,7 @@ async fn test_preflight_with_disallowed_origin() {
 
 #[tokio::test]
 async fn test_preflight_with_wildcard_origins() {
-    let plugin = CorsPlugin::new(&json!({})).unwrap();
+    let plugin = CorsPlugin::new(&json!({"allowed_origins": ["*"]})).unwrap();
 
     let mut ctx = make_preflight_ctx("https://anything.example.com", "POST");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -301,6 +397,7 @@ async fn test_preflight_with_wildcard_origins() {
 #[tokio::test]
 async fn test_preflight_includes_methods_and_headers() {
     let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "allowed_methods": ["GET", "POST"],
         "allowed_headers": ["Authorization", "Content-Type"]
     }))
@@ -326,6 +423,7 @@ async fn test_preflight_includes_methods_and_headers() {
 #[tokio::test]
 async fn test_preflight_includes_max_age() {
     let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "max_age": 3600
     }))
     .unwrap();
@@ -343,6 +441,7 @@ async fn test_preflight_includes_max_age() {
 #[tokio::test]
 async fn test_preflight_continue_passes_through() {
     let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "preflight_continue": true
     }))
     .unwrap();
@@ -361,8 +460,185 @@ async fn test_preflight_continue_passes_through() {
 }
 
 #[tokio::test]
+async fn test_preflight_continue_replaces_backend_policy_with_complete_gateway_policy() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["PUT"],
+        "allowed_headers": ["X-Custom"],
+        "exposed_headers": ["X-Response"],
+        "allow_credentials": true,
+        "max_age": 600,
+        "preflight_continue": true
+    }))
+    .unwrap();
+    let mut ctx = make_preflight_ctx("https://app.example", "PUT");
+    ctx.headers.insert(
+        "access-control-request-headers".to_string(),
+        "X-Custom".to_string(),
+    );
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut response_headers = HashMap::from([
+        ("access-control-allow-origin".to_string(), "*".to_string()),
+        (
+            "access-control-allow-methods".to_string(),
+            "PUT, DELETE".to_string(),
+        ),
+        (
+            "access-control-allow-headers".to_string(),
+            "X-Custom, Authorization".to_string(),
+        ),
+        ("access-control-max-age".to_string(), "99999".to_string()),
+        ("vary".to_string(), "Accept-Encoding".to_string()),
+    ]);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 202, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers["access-control-allow-origin"],
+        "https://app.example"
+    );
+    assert_eq!(response_headers["access-control-allow-methods"], "PUT");
+    assert_eq!(response_headers["access-control-allow-headers"], "X-Custom");
+    assert_eq!(response_headers["access-control-max-age"], "600");
+    assert_eq!(response_headers["access-control-allow-credentials"], "true");
+    assert_eq!(
+        response_headers["access-control-expose-headers"],
+        "X-Response"
+    );
+    for token in [
+        "Accept-Encoding",
+        "Origin",
+        "Access-Control-Request-Method",
+        "Access-Control-Request-Headers",
+    ] {
+        assert!(
+            response_headers["vary"]
+                .split(',')
+                .any(|value| value.trim().eq_ignore_ascii_case(token)),
+            "missing Vary token {token}: {}",
+            response_headers["vary"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
+    let forward = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": [],
+        "allowed_headers": [],
+        "exposed_headers": [],
+        "unmatched_preflights": "forward"
+    }))
+    .unwrap();
+
+    let mut allowed = make_preflight_ctx("https://app.example", "DELETE");
+    match forward.on_request_received(&mut allowed).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(
+                headers["access-control-allow-origin"],
+                "https://app.example"
+            );
+            assert!(!headers.contains_key("access-control-allow-methods"));
+            assert!(!headers.contains_key("access-control-allow-headers"));
+            assert!(!headers.contains_key("access-control-max-age"));
+        }
+        _ => panic!("matching Istio preflight must be answered locally"),
+    }
+
+    let mut unmatched_preflight = make_preflight_ctx("https://other.example", "DELETE");
+    assert!(matches!(
+        forward.on_request_received(&mut unmatched_preflight).await,
+        PluginResult::Continue
+    ));
+    let mut upstream_headers = HashMap::from([("x-backend".to_string(), "ok".to_string())]);
+    let _ = forward
+        .after_proxy(&mut unmatched_preflight, 299, &mut upstream_headers)
+        .await;
+    assert_eq!(upstream_headers.len(), 1);
+    assert_eq!(upstream_headers["x-backend"], "ok");
+
+    let mut unmatched_actual = make_cors_ctx("DELETE", "https://other.example");
+    assert!(matches!(
+        forward.on_request_received(&mut unmatched_actual).await,
+        PluginResult::Continue
+    ));
+    let mut actual_headers = HashMap::new();
+    let _ = forward
+        .after_proxy(&mut unmatched_actual, 200, &mut actual_headers)
+        .await;
+    assert!(!actual_headers.contains_key("access-control-allow-origin"));
+
+    let mut matched_actual = make_cors_ctx("DELETE", "https://app.example");
+    matched_actual
+        .headers
+        .insert("authorization".to_string(), "Bearer test".to_string());
+    assert!(matches!(
+        forward.on_request_received(&mut matched_actual).await,
+        PluginResult::Continue
+    ));
+    let mut matched_actual_headers = HashMap::new();
+    let _ = forward
+        .after_proxy(&mut matched_actual, 200, &mut matched_actual_headers)
+        .await;
+    assert_eq!(
+        matched_actual_headers["access-control-allow-origin"],
+        "https://app.example"
+    );
+    assert!(!matched_actual_headers.contains_key("access-control-allow-methods"));
+    assert!(!matched_actual_headers.contains_key("access-control-allow-headers"));
+
+    let ignore = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": [],
+        "allowed_headers": [],
+        "exposed_headers": [],
+        "unmatched_preflights": "ignore"
+    }))
+    .unwrap();
+    let mut ignored = make_preflight_ctx("https://other.example", "GET");
+    match ignore.on_request_received(&mut ignored).await {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert!(body.is_empty());
+            assert!(headers.is_empty());
+        }
+        _ => panic!("IGNORE must answer an unmatched preflight locally"),
+    }
+}
+
+#[test]
+fn test_istio_mode_rejects_direct_preflight_continue_combination() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
+        "unmatched_preflights": "forward",
+        "preflight_continue": false
+    }))
+    .err()
+    .expect("the direct and Istio forwarding controls must be mutually exclusive");
+    assert!(err.contains("cannot be combined"), "got: {err}");
+}
+
+#[tokio::test]
 async fn test_preflight_disallowed_method() {
     let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "allowed_methods": ["GET", "POST"]
     }))
     .unwrap();
@@ -387,8 +663,47 @@ async fn test_preflight_disallowed_method() {
 }
 
 #[tokio::test]
+async fn test_actual_request_does_not_apply_preflight_method_or_header_lists() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["GET"],
+        "allowed_headers": ["X-Test"],
+        "exposed_headers": ["X-Response"],
+        "allow_credentials": true
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("DELETE", "https://app.example");
+    ctx.headers
+        .insert("authorization".to_string(), "Bearer test".to_string());
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut response_headers = HashMap::new();
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers["access-control-allow-origin"],
+        "https://app.example"
+    );
+    assert_eq!(
+        response_headers["access-control-expose-headers"],
+        "X-Response"
+    );
+    assert_eq!(response_headers["access-control-allow-credentials"], "true");
+    assert!(!response_headers.contains_key("access-control-allow-methods"));
+    assert!(!response_headers.contains_key("access-control-allow-headers"));
+}
+
+#[tokio::test]
 async fn test_non_options_with_origin_passes_through() {
-    let plugin = CorsPlugin::new(&json!({})).unwrap();
+    let plugin = CorsPlugin::new(&json!({"allowed_origins": ["*"]})).unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://example.com");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -450,7 +765,7 @@ async fn test_options_without_request_method_header_disallowed_origin_returns_40
 
 #[tokio::test]
 async fn test_options_without_request_method_header_allowed_origin_passes_through() {
-    let plugin = CorsPlugin::new(&json!({})).unwrap();
+    let plugin = CorsPlugin::new(&json!({"allowed_origins": ["*"]})).unwrap();
 
     // OPTIONS with Origin but WITHOUT Access-Control-Request-Method = not a preflight
     // Allowed origin should pass through
@@ -520,6 +835,7 @@ async fn test_actual_cors_request_with_credentials() {
 #[tokio::test]
 async fn test_actual_cors_request_with_exposed_headers() {
     let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
         "exposed_headers": ["X-Request-ID", "X-RateLimit-Remaining"]
     }))
     .unwrap();
@@ -541,7 +857,7 @@ async fn test_actual_cors_request_with_exposed_headers() {
 
 #[tokio::test]
 async fn test_non_cors_request_no_headers_added() {
-    let plugin = CorsPlugin::new(&json!({})).unwrap();
+    let plugin = CorsPlugin::new(&json!({"allowed_origins": ["*"]})).unwrap();
 
     // No Origin header
     let mut ctx = make_ctx();
@@ -610,7 +926,7 @@ async fn test_vary_header_set_for_specific_origins() {
 
 #[tokio::test]
 async fn test_vary_header_set_for_wildcard() {
-    let plugin = CorsPlugin::new(&json!({})).unwrap();
+    let plugin = CorsPlugin::new(&json!({"allowed_origins": ["*"]})).unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://example.com");
     let _ = plugin.on_request_received(&mut ctx).await;
@@ -662,6 +978,82 @@ async fn test_case_sensitivity_of_origins() {
         ctx.metadata.get("cors_origin").map(|s| s.as_str()),
         Some("https://Example.com"),
     );
+}
+
+#[tokio::test]
+async fn test_plain_and_object_exact_origins_are_canonicalized_on_the_config_path() {
+    for (configured, request) in [
+        ("HTTPS://EXAMPLE.COM:443", "https://example.com"),
+        ("http://example.com:80", "http://example.com"),
+        ("https://bücher.example", "https://xn--bcher-kva.example"),
+        ("http://127.1:80", "http://127.0.0.1"),
+        (
+            "https://[2001:0db8:0000:0000:0000:ff00:0042:8329]:443",
+            "https://[2001:db8::ff00:42:8329]",
+        ),
+        ("https://example.com:8443", "https://example.com:8443"),
+    ] {
+        for allowed_origins in [json!([configured]), json!([{"exact": configured}])] {
+            let plugin = CorsPlugin::new(&json!({"allowed_origins": allowed_origins})).unwrap();
+            let mut ctx = make_cors_ctx("GET", request);
+            assert!(
+                matches!(
+                    plugin.on_request_received(&mut ctx).await,
+                    PluginResult::Continue
+                ),
+                "configured {configured} should match browser origin {request}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_object_exact_origin_is_canonicalized_and_non_default_port_stays_distinct() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"exact": "http://[2001:0db8:0:0:0:0:0:1]:80"}]
+    }))
+    .unwrap();
+    let mut canonical = make_cors_ctx("GET", "http://[2001:db8::1]");
+    assert!(matches!(
+        plugin.on_request_received(&mut canonical).await,
+        PluginResult::Continue
+    ));
+
+    for allowed_origins in [
+        json!(["https://example.com:8443"]),
+        json!([{"exact": "https://example.com:8443"}]),
+    ] {
+        let non_default = CorsPlugin::new(&json!({"allowed_origins": allowed_origins})).unwrap();
+        let mut mismatch = make_cors_ctx("GET", "https://example.com");
+        assert!(matches!(
+            non_default.on_request_received(&mut mismatch).await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn test_istio_exact_star_has_allow_all_semantics_in_both_forms() {
+    for allowed_origins in [json!([{"exact": "*"}]), json!(["*"])] {
+        let plugin = CorsPlugin::new(&json!({
+            "allowed_origins": allowed_origins,
+            "allowed_methods": [],
+            "allowed_headers": [],
+            "unmatched_preflights": "forward"
+        }))
+        .unwrap();
+        let mut ctx = make_cors_ctx("GET", "https://anything.example");
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut headers = HashMap::new();
+        let _ = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+        assert_eq!(headers["access-control-allow-origin"], "*");
+    }
 }
 
 #[tokio::test]
@@ -817,6 +1209,34 @@ async fn test_wildcard_subdomain_rejects_non_http_scheme() {
         _ => panic!("Expected 403 Reject — non-http scheme must not match wildcard subdomain"),
     }
     assert!(!ctx.metadata.contains_key("cors_origin"));
+}
+
+#[tokio::test]
+async fn test_wildcard_subdomain_rejects_malformed_origin_authority() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.company.com"]
+    }))
+    .unwrap();
+
+    for origin in [
+        "https://user@app.company.com",
+        "https://app.company.com/path",
+        "https://app.company.com?query",
+        "https://app.company.com:99999",
+        "https://app..company.com",
+    ] {
+        let mut ctx = make_cors_ctx("GET", origin);
+        assert!(
+            matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "malformed Origin must not match a wildcard policy: {origin}"
+        );
+    }
 }
 
 // No-regression guard for finding #51: `http://` (not just `https://`) must

@@ -58,7 +58,7 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.request_auth.missing_jwt_rejected` | token-less request on the gated path → 403 (RequestAuth is permissive; the authz `request_principals` ALLOW does not match) |
 | `sidecar.request_auth.invalid_jwt_rejected` | wrong-key signature → 401 `Invalid or unrecognized JWT` (`jwks_auth`) |
 | `sidecar.destination_rule.tcp_connect_timeout` | two-phase timing: the black-holed mesh-mTLS dial fails at ~8s under `connect_timeout_ms: 8000`, then ~2s after a re-render + rollout restart to `2000` — the observed time must **track** the configured value (both windows exclude the built-in 5000ms default) |
-| `sidecar.virtual_service.cors_policy` | VS-derived CORS on the client sidecar: allowed `Origin` → 200 with the origin reflected in `access-control-allow-origin`, `OPTIONS` preflight answered **204 by the sidecar** with `access-control-allow-methods`, disallowed `Origin` → **403** `CORS origin not allowed` (the plugin's own body, never the app marker) |
+| `sidecar.virtual_service.cors_policy` | VS-derived CORS on the client sidecar: allowed `Origin` → backend 200 with the origin reflected, allowed `OPTIONS` preflight → **200 by the sidecar** with `access-control-allow-methods`, and unmatched actual/preflight requests → backend 200 with the app marker and no gateway-added `access-control-allow-origin` (Istio omitted/FORWARD semantics) |
 | `sidecar.destination_rule.tcp_max_connections` | WebSocket flow (`wssvc`, maxConnections=1): one **held** WS session admitted (101), a concurrent second upgrade rejected **503** by the client sidecar's `BackendConnectionGuard` before dialing, and a fresh upgrade admitted after the held session closes — cap enforcement **and** release |
 | `sidecar.config.native_subscribe_delivered` | native MeshSubscribe delivery (issue #2002): a captured client request to `capp` answers 200 with the `-native` marker — capp's inbound routes exist **only** if the ferrum-cp MeshSubscribe stream delivered a slice whose K8s-built `sa/capp` workload resolved locally — **and** capp's JWT-authenticated `GET /mesh/config-drift` reports a received slice with `source_protocol=native` from the ferrum-cp URL and ≥1 service |
 
@@ -79,8 +79,8 @@ workflow runs it right after the fixture). No contract row remains
 with issue #2002 (the in-fixture Ferrum CP above).
 
 This contract is **PR- and release-blocking**: the dedicated workflow's
-result is mirrored into the required CI aggregate by the
-`Mesh E2E Sidecar Live (CI mirror)` job in `ci.yml`, the suite force-runs on
+`Mesh E2E Sidecar Live` gate job is a branch-protection required check
+directly (there is no mirror job in `ci.yml`), the suite force-runs on
 every main push, and `release.yml`'s `validate-release-sha` requires a green
 push run for the tag target before anything ships.
 

@@ -1763,10 +1763,17 @@ pub async fn run(
                                 rejected_delta_tracker.record_accepted();
                             }
                             Err(e) => {
-                                warn!(
-                                    "Authoritative primary incremental poll failed, falling back to full reload: {}",
-                                    e
-                                );
+                                if db_backend::is_incremental_full_reload_required(&e) {
+                                    info!(
+                                        "Consumer change detected; using authoritative full reload for credential rehydration: {}",
+                                        e
+                                    );
+                                } else {
+                                    warn!(
+                                        "Authoritative primary incremental poll failed, falling back to full reload: {}",
+                                        e
+                                    );
+                                }
                                 // Fallback to full config load + full snapshot broadcast
                                 match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
                                     Ok((new_config, sequences)) => {

@@ -1978,6 +1978,77 @@ async fn test_sse_scan_all_unredactable_raw_bytes_fail_closed() {
     }
 }
 
+#[tokio::test]
+async fn test_sse_scan_all_duplicate_structural_members_fail_closed() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let cases = [
+        (
+            "last scalar with LF",
+            "data: {\"id\":\"victim@example.com\",\"id\":\"chunk_1\",\"choices\":[{\"delta\":{\"content\":\"clean\"}}]}\n\n",
+        ),
+        (
+            "escaped-equivalent last key with CRLF",
+            ": preserve this comment\r\nevent: completion\r\ndata: { \"id\" : \"victim@example.com\", \"\\u0069d\" : \"chunk_1\", \"unrelated\" : \"first\", \"unrelated\" : \"second\" }\r\n\r\n",
+        ),
+        (
+            "last semantic value is non-scalar",
+            "data: {\"id\":\"victim@example.com\",\"id\":null,\"choices\":[{\"delta\":{\"content\":\"clean\"}}]}\n\n",
+        ),
+    ];
+
+    for (case, body) in cases {
+        let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+        assert!(
+            matches!(
+                plugin
+                    .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+                    .await,
+                PluginResult::Reject { .. }
+            ),
+            "duplicate structural member did not fail closed ({case}): {body}"
+        );
+        assert!(
+            plugin
+                .transform_response_body(body.as_bytes(), Some("text/event-stream"), &sse_headers())
+                .await
+                .is_none(),
+            "unsafe duplicate structural member produced a transform ({case})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_sse_scan_all_masks_only_last_duplicate_structural_scalar() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ip_address"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    // The only match is the semantic last `id`, expressed with an equivalent
+    // escaped key. It is preserved structurally, so the caller must retain the
+    // original CRLF framing, comment, whitespace, and unrelated duplicates.
+    let body = b": preserve this comment\r\nevent: completion\r\ndata: { \"id\" : \"chunk_0\", \"\\u0069d\" : \"10.0.0.1\", \"unrelated\" : \"first\", \"unrelated\" : \"second\" }\r\n\r\n";
+
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers(), body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .transform_response_body(body, Some("text/event-stream"), &sse_headers())
+            .await
+            .is_none(),
+        "a preserved last structural scalar must leave the exact SSE bytes untouched"
+    );
+}
+
 // ─── #44: max_completion_length is measured in characters, not bytes ──
 
 #[tokio::test]

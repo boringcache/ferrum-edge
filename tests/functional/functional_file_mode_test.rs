@@ -290,6 +290,7 @@ proxies:
     strip_listen_path: true
     plugins:
       - plugin_config_id: "key-auth-plugin"
+      - plugin_config_id: "transaction-debugger-plugin"
 
 consumers:
   - id: "consumer-1"
@@ -306,13 +307,20 @@ plugin_configs:
     scope: proxy
     enabled: true
     config:
-      key_location: "header:X-Api-Key"
+      key_location: "header:X-Tenant-Credential"
+  - id: "transaction-debugger-plugin"
+    proxy_id: "auth-proxy"
+    plugin_name: "transaction_debugger"
+    scope: proxy
+    enabled: true
+    config: {{}}
 "#
     );
 
     let gateway = TestGateway::builder()
         .mode_file(config)
         .log_level("debug")
+        .capture_output()
         .spawn()
         .await
         .expect("start gateway");
@@ -334,7 +342,7 @@ plugin_configs:
     // Test 2: Request with valid API key should succeed and include consumer headers
     let resp = client
         .get(gateway.proxy_url("/auth-api/test"))
-        .header("X-Api-Key", "my-secret-api-key")
+        .header("X-Tenant-Credential", "my-secret-api-key")
         .send()
         .await
         .expect("Authenticated request should complete");
@@ -354,6 +362,23 @@ plugin_configs:
         body.get("x-consumer-custom-id").and_then(|v| v.as_str()),
         Some("cust-42"),
         "X-Consumer-Custom-Id header should be forwarded to backend"
+    );
+    assert!(
+        body.get("x-tenant-credential").is_none(),
+        "accepted API key must be stripped before backend forwarding"
+    );
+
+    sleep(Duration::from_millis(100)).await;
+    let logs = gateway
+        .read_combined_captured_output()
+        .expect("read captured gateway logs");
+    assert!(
+        !logs.contains("my-secret-api-key"),
+        "custom key_auth credential leaked into transaction debugger logs: {logs}"
+    );
+    assert!(
+        logs.contains("***REDACTED***"),
+        "transaction debugger did not record a redacted custom credential header: {logs}"
     );
 
     echo_handle.abort();

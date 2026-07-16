@@ -1057,15 +1057,34 @@ impl MetricsRegistry {
             .observe(summary.latency_gateway_overhead_ms, self.epoch);
 
         if let Some(mesh_key) = mesh_key {
-            let mesh_key = mesh_key.clone();
-            self.mesh_request_counter
-                .entry(mesh_key.clone())
-                .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                .increment(self.epoch);
-            self.mesh_request_duration_buckets
-                .entry(mesh_key)
-                .or_insert_with(|| HistogramBuckets::new(self.epoch))
-                .observe(summary.latency_total_ms, self.epoch);
+            if !prometheus_helpers::mesh_metric_disabled(
+                summary,
+                prometheus_helpers::MeshMetricFamily::RequestCount,
+            ) {
+                let count_key = prometheus_helpers::mesh_request_key_for_family(
+                    summary,
+                    mesh_key,
+                    prometheus_helpers::MeshMetricFamily::RequestCount,
+                );
+                self.mesh_request_counter
+                    .entry(count_key)
+                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                    .increment(self.epoch);
+            }
+            if !prometheus_helpers::mesh_metric_disabled(
+                summary,
+                prometheus_helpers::MeshMetricFamily::RequestDuration,
+            ) {
+                let duration_key = prometheus_helpers::mesh_request_key_for_family(
+                    summary,
+                    mesh_key,
+                    prometheus_helpers::MeshMetricFamily::RequestDuration,
+                );
+                self.mesh_request_duration_buckets
+                    .entry(duration_key)
+                    .or_insert_with(|| HistogramBuckets::new(self.epoch))
+                    .observe(summary.latency_total_ms, self.epoch);
+            }
         }
 
         // Increment the client-disconnect counter whenever the summary flags
@@ -1469,9 +1488,16 @@ impl MetricsRegistry {
             for entry in self.mesh_request_counter.iter() {
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let labels = prometheus_helpers::mesh_label_fragment(entry.key(), None);
+                let counter_gateway_ns_label = if labels.is_empty() {
+                    gateway_ns_label
+                        .strip_prefix(',')
+                        .unwrap_or(gateway_ns_label.as_str())
+                } else {
+                    gateway_ns_label.as_str()
+                };
                 output.push_str(&format!(
                     "ferrum_mesh_requests_total{{{}{}}} {}\n",
-                    labels, gateway_ns_label, count
+                    labels, counter_gateway_ns_label, count
                 ));
             }
         }
@@ -2382,6 +2408,24 @@ mod tests {
     use crate::tls::inventory::{
         TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
     };
+    use std::collections::HashMap;
+
+    fn mesh_summary() -> TransactionSummary {
+        TransactionSummary {
+            proxy_id: Some("orders".to_string()),
+            proxy_name: Some("orders".to_string()),
+            response_status_code: 200,
+            latency_total_ms: 12.0,
+            metadata: HashMap::from([
+                ("mesh.source.workload".to_string(), "frontend".to_string()),
+                (
+                    "mesh.destination.workload".to_string(),
+                    "orders".to_string(),
+                ),
+            ]),
+            ..TransactionSummary::default()
+        }
+    }
 
     fn test_inventory(
         not_before: chrono::DateTime<Utc>,
@@ -2528,5 +2572,83 @@ mod tests {
         assert!(output.contains("cert_id=\"cert-a\""));
         assert!(output.contains("reason=\"source_refresh\""));
         assert!(output.contains("outcome=\"success\""));
+    }
+
+    #[test]
+    fn disabled_mesh_metric_families_stop_recording_independently() {
+        let registry = MetricsRegistry::new();
+        let mut summary = mesh_summary();
+        summary.metadata.insert(
+            prometheus_helpers::MESH_METRICS_DISABLED_METADATA.to_string(),
+            "request_count".to_string(),
+        );
+
+        registry.record(&summary);
+
+        assert!(registry.mesh_request_counter.is_empty());
+        assert_eq!(registry.mesh_request_duration_buckets.len(), 1);
+
+        let registry = MetricsRegistry::new();
+        summary.metadata.insert(
+            prometheus_helpers::MESH_METRICS_DISABLED_METADATA.to_string(),
+            "request_duration".to_string(),
+        );
+        registry.record(&summary);
+        assert_eq!(registry.mesh_request_counter.len(), 1);
+        assert!(registry.mesh_request_duration_buckets.is_empty());
+    }
+
+    #[test]
+    fn metric_overrides_change_only_the_selected_rendered_family() {
+        let registry = MetricsRegistry::new();
+        let mut summary = mesh_summary();
+        summary.metadata.insert(
+            prometheus_helpers::MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
+            "s0,4:edge;r11;".to_string(),
+        );
+
+        registry.record(&summary);
+        let output = registry.render_uncached();
+        let counter = output
+            .lines()
+            .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+            .expect("mesh request counter");
+        let duration = output
+            .lines()
+            .find(|line| line.starts_with("ferrum_mesh_request_duration_ms_count{"))
+            .expect("mesh duration count");
+
+        assert!(counter.contains("source_workload=\"edge\""), "{counter}");
+        assert!(!counter.contains("response_flags="), "{counter}");
+        assert!(
+            duration.contains("source_workload=\"frontend\""),
+            "{duration}"
+        );
+        assert!(duration.contains("response_flags="), "{duration}");
+    }
+
+    #[test]
+    fn reenabled_mesh_metric_records_subsequent_transactions() {
+        let registry = MetricsRegistry::new();
+        let mut disabled = mesh_summary();
+        disabled.metadata.insert(
+            prometheus_helpers::MESH_METRICS_DISABLED_METADATA.to_string(),
+            "request_count".to_string(),
+        );
+        registry.record(&disabled);
+        registry.record(&mesh_summary());
+
+        assert_eq!(registry.mesh_request_counter.len(), 1);
+        assert_eq!(
+            registry
+                .mesh_request_counter
+                .iter()
+                .next()
+                .expect("mesh counter")
+                .value()
+                .value
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 }

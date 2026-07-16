@@ -37,6 +37,8 @@ All fields are optional. Include only the resource types you need to create. Res
 
 Each resource in the arrays uses the same schema as the individual `POST` endpoint for that resource type. The `id`, `created_at`, and `updated_at` fields are auto-generated if omitted.
 
+Plaintext Basic-auth passwords are hashed during batch preparation. This requires `FERRUM_BASIC_AUTH_HMAC_SECRET` to be configured with at least 32 bytes; a missing or weak operator secret returns `500 Internal Server Error` before any batch resource is persisted. Invalid Basic credential shapes remain request errors and return `400`.
+
 #### Consumers
 
 ```json
@@ -432,6 +434,7 @@ Each resource in the batch is validated before any database writes. If validatio
 |--------|-----------|
 | 400 | Invalid JSON body |
 | 403 | Admin API is in read-only mode |
+| 500 | Server-side resource preparation failed, including a missing or weak `FERRUM_BASIC_AUTH_HMAC_SECRET` for plaintext Basic credentials |
 | 503 | No database available |
 
 ## Chunking Strategy

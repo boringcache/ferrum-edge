@@ -1,9 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
+use ferrum_edge::plugins::security_headers::SecurityHeaders;
+use ferrum_edge::plugins::{
+    BufferedInitialResponseHeaderPolicyState, Plugin, RequestContext,
+    response_transformer::ResponseTransformer,
+};
 use ferrum_edge::proxy::build_backend_url;
 use ferrum_edge::proxy::grpc_proxy;
+use serde_json::json;
 
 fn test_proxy() -> Proxy {
     Proxy {
@@ -298,6 +307,166 @@ fn test_grpc_error_response_resource_exhausted() {
     assert_eq!(resp.headers().get("grpc-status").unwrap(), "8");
 }
 
+#[test]
+fn grpc_error_policy_preserves_gateway_terminal_and_transport_authority() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {
+                "X-Synthetic-Policy": "enforced",
+                "Content-Type": "text/plain",
+                "Content-Length": "999",
+                "Transfer-Encoding": "chunked",
+                "Grpc-Status": "0",
+                "Grpc-Message": "policy override",
+                "Grpc-Status-Details-Bin": "hostile"
+            },
+            "remove": []
+        }))
+        .unwrap(),
+    );
+
+    let response = grpc_proxy::build_grpc_error_response_with_policy(
+        grpc_proxy::grpc_status::UNAVAILABLE,
+        "Backend down",
+        &[policy],
+    );
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/grpc"
+    );
+    assert_eq!(response.headers().get("grpc-status").unwrap(), "14");
+    assert_eq!(
+        response.headers().get("grpc-message").unwrap(),
+        "Backend down"
+    );
+    assert_eq!(
+        response.headers().get("x-synthetic-policy").unwrap(),
+        "enforced"
+    );
+    for managed in [
+        "content-length",
+        "transfer-encoding",
+        "grpc-status-details-bin",
+    ] {
+        assert!(
+            response.headers().get(managed).is_none(),
+            "{managed} leaked"
+        );
+    }
+}
+
+#[test]
+fn grpc_web_reject_finalizer_preserves_synthesized_status_without_terminal_overrides() {
+    for (response_content_type, is_text) in [
+        ("application/grpc-web+proto", false),
+        ("application/grpc-web-text+proto", true),
+    ] {
+        let mut response = ferrum_edge::plugins::grpc_web::error_response_for_content_type(
+            response_content_type,
+            14,
+            "backend unavailable",
+        );
+        let finalized_headers = HashMap::from([(
+            "access-control-allow-origin".to_string(),
+            "https://app.example".to_string(),
+        )]);
+
+        ferrum_edge::_test_support::finalize_grpc_web_error_response_headers(
+            &mut response,
+            &[],
+            Some(&finalized_headers),
+        );
+
+        let wire_body = if is_text {
+            BASE64.decode(&response.body).expect("decode text response")
+        } else {
+            response.body
+        };
+        let trailer = String::from_utf8_lossy(&wire_body[5..]);
+        assert!(trailer.contains("grpc-status: 14\r\n"));
+        assert!(trailer.contains("grpc-message: backend unavailable\r\n"));
+    }
+}
+
+#[test]
+fn grpc_web_reject_finalizer_moves_rich_status_details_into_body_trailer() {
+    for (response_content_type, is_text) in [
+        ("application/grpc-web+proto", false),
+        ("application/grpc-web-text+proto", true),
+    ] {
+        let mut response = ferrum_edge::plugins::grpc_web::error_response_for_content_type(
+            response_content_type,
+            7,
+            "denied",
+        );
+        let finalized_headers = HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("grpc-status".to_string(), "7".to_string()),
+            ("grpc-message".to_string(), "denied".to_string()),
+            ("grpc-status-details-bin".to_string(), "AQID".to_string()),
+            (
+                "Access-Control-Expose-Headers".to_string(),
+                "X-Request-ID, grpc-status".to_string(),
+            ),
+        ]);
+
+        ferrum_edge::_test_support::finalize_grpc_web_error_response_headers(
+            &mut response,
+            &[],
+            Some(&finalized_headers),
+        );
+
+        for terminal in ["grpc-status", "grpc-message", "grpc-status-details-bin"] {
+            assert!(!response.headers.contains_key(terminal));
+        }
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some(response_content_type)
+        );
+        let expected_content_length = response.body.len().to_string();
+        assert_eq!(
+            response.headers.get("content-length").map(String::as_str),
+            Some(expected_content_length.as_str())
+        );
+        let exposed_headers = response
+            .headers
+            .get("access-control-expose-headers")
+            .expect("gRPC-Web rejects must expose configured and terminal metadata");
+        for expected in [
+            "grpc-status",
+            "grpc-message",
+            "grpc-status-details-bin",
+            "X-Request-ID",
+        ] {
+            assert!(
+                exposed_headers
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case(expected)),
+                "missing {expected} in {exposed_headers}"
+            );
+        }
+        assert_eq!(
+            exposed_headers
+                .split(',')
+                .filter(|token| token.trim().eq_ignore_ascii_case("grpc-status"))
+                .count(),
+            1,
+            "mandatory exposure must not be duplicated: {exposed_headers}"
+        );
+        let wire_body = if is_text {
+            BASE64.decode(&response.body).expect("decode text response")
+        } else {
+            response.body
+        };
+        let trailer = String::from_utf8_lossy(&wire_body[5..]);
+        assert!(trailer.contains("grpc-status: 7\r\n"));
+        assert!(trailer.contains("grpc-message: denied\r\n"));
+        assert!(trailer.contains("grpc-status-details-bin: AQID\r\n"));
+    }
+}
+
 // --- BackendScheme display and deserialization ---
 //
 // Post-refactor, gRPC is no longer a backend_scheme — it is detected
@@ -411,6 +580,7 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
         &proxy_headers,
         false,
         0,
+        None,
     )
     .await;
     assert!(
@@ -617,6 +787,7 @@ fn reconcile_propagates_hook_edit_of_shadowed_key_into_trailer() {
         &view,
         &original_headers,
         &shadowed,
+        None,
     );
 
     // The sanitized value must scrub the hidden trailer copy too.
@@ -639,6 +810,7 @@ fn reconcile_keeps_backend_trailer_value_for_untouched_shadowed_key() {
         &view,
         &original_headers,
         &shadowed,
+        None,
     );
 
     // An untouched shadowed trailer must keep the backend's true trailing value,
@@ -666,6 +838,7 @@ fn reconcile_drops_hook_removed_keys() {
         &view,
         &original_headers,
         &shadowed,
+        None,
     );
 
     assert_eq!(trailers.get("grpc-status").map(String::as_str), Some("0"));
@@ -691,6 +864,7 @@ fn reconcile_propagates_trailer_only_edit_and_keeps_untouched() {
         &view,
         &original_headers,
         &shadowed,
+        None,
     );
 
     assert_eq!(trailers.get("x-edited").map(String::as_str), Some("edited"));
@@ -733,6 +907,7 @@ fn build_then_reconcile_matches_buffered_writeback_scenario() {
         &view,
         &backend_headers,
         &shadowed,
+        None,
     );
 
     // Terminal status keeps the backend's true trailing values.
@@ -757,6 +932,572 @@ fn build_then_reconcile_matches_buffered_writeback_scenario() {
     // Hook removals suppress both a trailer-only key and a shadowed trailer.
     assert!(!wire_trailers.contains_key("x-removed-trailer"));
     assert!(!wire_trailers.contains_key("x-shadowed-removed"));
+}
+
+#[tokio::test]
+async fn buffered_policy_is_applied_to_initial_headers_without_promoting_trailers() {
+    let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
+    let backend_trailers = grpc_map(&[
+        ("grpc-status", "0"),
+        ("grpc-message", "OK"),
+        ("x-policy", "backend-trailer-value"),
+        ("x-application-trailer", "application-value"),
+    ]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": false,
+            "set": {
+                "X-Policy": "gateway-enforced",
+                "Grpc-Status": "13"
+            },
+            "remove": []
+        }))
+        .unwrap(),
+    );
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
+    let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+
+    let mut wire_trailers = backend_trailers.clone();
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        Some(&policy_state),
+    );
+    let mut initial_headers = plugin_view;
+    grpc_proxy::strip_non_initial_grpc_trailer_fields(
+        &mut initial_headers,
+        &wire_trailers,
+        &shadowed,
+    );
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        Some(&policy_state),
+        &mut initial_headers,
+        None,
+    );
+
+    assert_eq!(
+        initial_headers.get("x-policy").map(String::as_str),
+        Some("gateway-enforced"),
+        "override_existing=false must evaluate against genuine initial headers"
+    );
+    assert!(!initial_headers.contains_key("x-application-trailer"));
+    assert!(!initial_headers.contains_key("grpc-status"));
+    assert!(!initial_headers.contains_key("grpc-message"));
+    assert_eq!(
+        wire_trailers.get("x-policy").map(String::as_str),
+        Some("backend-trailer-value"),
+        "policy enforcement must not promote or relocate the backend trailer value"
+    );
+    assert_eq!(
+        wire_trailers
+            .get("x-application-trailer")
+            .map(String::as_str),
+        Some("application-value")
+    );
+    assert_eq!(
+        wire_trailers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        wire_trailers.get("grpc-message").map(String::as_str),
+        Some("OK")
+    );
+}
+
+#[tokio::test]
+async fn buffered_override_policy_preserves_application_trailer_value() {
+    let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
+    let backend_trailers = grpc_map(&[("grpc-status", "0"), ("x-policy", "application-value")]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": true,
+            "set": { "X-Policy": "gateway-enforced" }
+        }))
+        .unwrap(),
+    );
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
+
+    let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+
+    let mut wire_trailers = backend_trailers;
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        Some(&policy_state),
+    );
+    let mut initial_headers = plugin_view;
+    grpc_proxy::strip_non_initial_grpc_trailer_fields(
+        &mut initial_headers,
+        &wire_trailers,
+        &shadowed,
+    );
+    policy_state.apply_to_initial_headers(&mut initial_headers);
+
+    assert_eq!(
+        initial_headers.get("x-policy").map(String::as_str),
+        Some("gateway-enforced")
+    );
+    assert_eq!(
+        wire_trailers.get("x-policy").map(String::as_str),
+        Some("application-value"),
+        "initial-header policy must not overwrite application metadata"
+    );
+}
+
+#[tokio::test]
+async fn buffered_policy_removal_suppresses_mutated_cookie_and_application_trailers() {
+    let backend_headers = grpc_map(&[
+        ("content-type", "application/grpc"),
+        ("x-powered-by", "backend-header"),
+    ]);
+    let backend_trailers = grpc_map(&[
+        ("grpc-status", "0"),
+        ("set-cookie", "session=backend"),
+        ("x-powered-by", "backend-trailer"),
+        ("x-trailer-only", "backend-trailer"),
+    ]);
+    let original_trailer_set_cookie = backend_trailers.get("set-cookie").cloned();
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    let transformer: Arc<dyn Plugin> = Arc::new(
+        ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "Set-Cookie",
+                "value": "session=mutated"
+            }]
+        }))
+        .unwrap(),
+    );
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {},
+            "remove": ["Set-Cookie", "X-Powered-By", "X-Trailer-Only", "Grpc-Status"]
+        }))
+        .unwrap(),
+    );
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
+
+    let _ = transformer
+        .after_proxy(&mut ctx, 200, &mut plugin_view)
+        .await;
+    policy_state.record_after_proxy_plugin(transformer.as_ref(), &mut plugin_view);
+    assert_eq!(
+        plugin_view.get("set-cookie").map(String::as_str),
+        Some("session=mutated")
+    );
+    let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+
+    let mut wire_trailers = backend_trailers;
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        Some(&policy_state),
+    );
+    let mut initial_headers = plugin_view;
+    grpc_proxy::finalize_buffered_grpc_split_response(
+        &mut initial_headers,
+        &mut wire_trailers,
+        &shadowed,
+        Some(&policy_state),
+        None,
+        original_trailer_set_cookie.as_deref(),
+    );
+
+    for removed_name in ["set-cookie", "x-powered-by", "x-trailer-only"] {
+        assert!(
+            !initial_headers.contains_key(removed_name),
+            "final security policy removal must suppress {removed_name} in initial headers"
+        );
+        assert!(
+            !wire_trailers.contains_key(removed_name),
+            "final security policy removal must suppress {removed_name} in trailers"
+        );
+    }
+    assert!(
+        !initial_headers.contains_key("grpc-status"),
+        "terminal gRPC status must not be promoted to non-empty initial headers"
+    );
+    assert_eq!(
+        wire_trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "policy removal must not disturb terminal gRPC metadata"
+    );
+}
+
+#[tokio::test]
+async fn buffered_policy_state_preserves_later_header_mutator_order() {
+    let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
+    let backend_trailers = grpc_map(&[("grpc-status", "0"), ("x-policy", "backend-trailer")]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": false,
+            "set": { "X-Policy": "gateway-policy" }
+        }))
+        .unwrap(),
+    );
+    let later_mutator: Arc<dyn Plugin> = Arc::new(
+        ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Policy",
+                "value": "later-transformer"
+            }]
+        }))
+        .unwrap(),
+    );
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
+
+    let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+    let _ = later_mutator
+        .after_proxy(&mut ctx, 200, &mut plugin_view)
+        .await;
+    policy_state.record_after_proxy_plugin(later_mutator.as_ref(), &mut plugin_view);
+
+    let mut wire_trailers = backend_trailers;
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        Some(&policy_state),
+    );
+    let mut final_initial_headers = backend_headers;
+    policy_state.apply_to_initial_headers(&mut final_initial_headers);
+    assert_eq!(
+        final_initial_headers.get("x-policy").map(String::as_str),
+        Some("later-transformer"),
+        "a later response-header mutator must retain priority over policy"
+    );
+    assert_eq!(
+        wire_trailers.get("x-policy").map(String::as_str),
+        Some("later-transformer"),
+        "a later generic mutator still owns the application-trailer copy"
+    );
+}
+
+#[test]
+fn buffered_policy_state_tracks_mixed_case_later_mutation() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": { "X-Frame-Options": "DENY" }
+        }))
+        .unwrap(),
+    );
+    let initial_headers = HashMap::new();
+    let mut plugin_view = HashMap::new();
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &initial_headers,
+        &plugin_view,
+    )
+    .unwrap();
+
+    policy.apply_initial_response_header_policy(&mut plugin_view);
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+    plugin_view.insert("X-Frame-Options".to_string(), "later-plugin".to_string());
+    policy_state.record_later_response_header_mutations(&mut plugin_view);
+
+    assert_eq!(
+        plugin_view.get("x-frame-options").map(String::as_str),
+        Some("later-plugin")
+    );
+    assert_eq!(
+        plugin_view
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("x-frame-options"))
+            .count(),
+        1,
+        "later mixed-case mutations must be canonicalized without duplicates"
+    );
+
+    let mut final_initial_headers = HashMap::from([(
+        "X-Frame-Options".to_string(),
+        "stale-mixed-case".to_string(),
+    )]);
+    policy_state.apply_to_initial_headers(&mut final_initial_headers);
+    assert_eq!(
+        final_initial_headers
+            .get("x-frame-options")
+            .map(String::as_str),
+        Some("later-plugin")
+    );
+    assert_eq!(
+        final_initial_headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("x-frame-options"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn buffered_policy_state_preserves_body_transform_validator_removal() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": { "ETag": "\"gateway-policy\"" }
+        }))
+        .unwrap(),
+    );
+    let initial_headers = HashMap::new();
+    let mut plugin_view = HashMap::new();
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &initial_headers,
+        &plugin_view,
+    )
+    .unwrap();
+
+    policy.apply_initial_response_header_policy(&mut plugin_view);
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+    assert_eq!(
+        plugin_view.get("etag").map(String::as_str),
+        Some("\"gateway-policy\"")
+    );
+
+    plugin_view.remove("etag");
+    policy_state.record_later_response_header_mutations(&mut plugin_view);
+    let mut initial_headers = HashMap::new();
+    policy_state.apply_to_initial_headers(&mut initial_headers);
+
+    assert!(
+        !initial_headers.contains_key("etag"),
+        "a body transform must be able to remove a stale policy-owned validator"
+    );
+}
+
+#[test]
+fn buffered_policy_overlay_preserves_transform_owned_content_length() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {
+                "Content-Length": "1",
+                "X-Policy": "gateway-policy"
+            }
+        }))
+        .unwrap(),
+    );
+    let initial_headers = HashMap::new();
+    let mut merged_headers = HashMap::new();
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &initial_headers,
+        &merged_headers,
+    )
+    .unwrap();
+    policy.apply_initial_response_header_policy(&mut merged_headers);
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut merged_headers);
+
+    let mut transformed_headers = grpc_map(&[("content-length", "73")]);
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        Some(&policy_state),
+        &mut transformed_headers,
+        None,
+    );
+    assert_eq!(
+        transformed_headers
+            .get("content-length")
+            .map(String::as_str),
+        Some("73")
+    );
+    assert_eq!(
+        transformed_headers.get("x-policy").map(String::as_str),
+        Some("gateway-policy")
+    );
+
+    let mut absent_content_length = HashMap::new();
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        Some(&policy_state),
+        &mut absent_content_length,
+        None,
+    );
+    assert!(!absent_content_length.contains_key("content-length"));
+}
+
+#[test]
+fn buffered_policy_restores_pristine_terminal_metadata_for_true_trailers_only_shape() {
+    let terminal_headers = grpc_map(&[
+        ("content-type", "application/grpc"),
+        ("grpc-status", "7"),
+        ("grpc-message", "permission denied"),
+    ]);
+    let terminal_snapshot =
+        grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&terminal_headers);
+
+    let mut split_initial_headers = terminal_headers.clone();
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(None, &mut split_initial_headers, None);
+    assert!(!split_initial_headers.contains_key("grpc-status"));
+    assert!(!split_initial_headers.contains_key("grpc-message"));
+
+    let hostile_set: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {
+                "Grpc-Status": "0",
+                "Grpc-Message": "policy override"
+            },
+            "remove": []
+        }))
+        .unwrap(),
+    );
+    let mut trailers_only_initial_headers = terminal_headers.clone();
+    hostile_set.apply_initial_response_header_policy(&mut trailers_only_initial_headers);
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        None,
+        &mut trailers_only_initial_headers,
+        Some(&terminal_snapshot),
+    );
+    assert_eq!(
+        trailers_only_initial_headers
+            .get("grpc-status")
+            .map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(
+        trailers_only_initial_headers
+            .get("grpc-message")
+            .map(String::as_str),
+        Some("permission denied")
+    );
+
+    let hostile_remove: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {},
+            "remove": ["Grpc-Status", "Grpc-Message"]
+        }))
+        .unwrap(),
+    );
+    let mut removed_trailers_only_initial_headers = terminal_headers;
+    hostile_remove.apply_initial_response_header_policy(&mut removed_trailers_only_initial_headers);
+    grpc_proxy::apply_buffered_grpc_initial_response_policy(
+        None,
+        &mut removed_trailers_only_initial_headers,
+        Some(&terminal_snapshot),
+    );
+    assert_eq!(
+        removed_trailers_only_initial_headers
+            .get("grpc-status")
+            .map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(
+        removed_trailers_only_initial_headers
+            .get("grpc-message")
+            .map(String::as_str),
+        Some("permission denied")
+    );
+}
+
+#[tokio::test]
+async fn trailers_only_collapse_enforces_policy_and_preserves_terminal_metadata() {
+    let backend_headers = grpc_map(&[("content-type", "application/grpc")]);
+    let backend_trailers = grpc_map(&[
+        ("grpc-status", "0"),
+        ("grpc-message", "OK"),
+        ("x-policy", "backend-trailer-value"),
+        ("x-application-trailer", "application-value"),
+        ("x-removed-trailer", "remove-me"),
+        ("content-length", "999"),
+    ]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": false,
+            "set": {
+                "X-Policy": "gateway-enforced",
+                "Grpc-Status": "13"
+            },
+            "remove": ["X-Removed-Trailer"]
+        }))
+        .unwrap(),
+    );
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::new(policy.initial_response_header_policy_names().to_vec()),
+        &backend_headers,
+        &plugin_view,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/svc".into());
+    let _ = policy.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+    policy_state.record_after_proxy_plugin(policy.as_ref(), &mut plugin_view);
+
+    let mut wire_trailers = backend_trailers;
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        Some(&policy_state),
+    );
+    grpc_proxy::collapse_grpc_trailers_only_with_initial_response_policies(
+        &mut plugin_view,
+        &mut wire_trailers,
+        &shadowed,
+        Some(&policy_state),
+        None,
+    );
+
+    assert!(wire_trailers.is_empty());
+    assert_eq!(
+        plugin_view.get("x-policy").map(String::as_str),
+        Some("gateway-enforced")
+    );
+    assert_eq!(
+        plugin_view.get("x-application-trailer").map(String::as_str),
+        Some("application-value")
+    );
+    assert!(!plugin_view.contains_key("x-removed-trailer"));
+    assert!(!plugin_view.contains_key("content-length"));
+    assert_eq!(
+        plugin_view.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        plugin_view.get("grpc-message").map(String::as_str),
+        Some("OK")
+    );
 }
 
 // ── GrpcBody::Channel (H3 cross-protocol streaming request body) ──────────────
@@ -1280,52 +2021,31 @@ fn grpc_mesh_fall_through_mesh_mtls_requires_streamable_request_body() {
 // frame.
 
 #[test]
-fn grpc_streaming_response_deadline_client_budget_is_absolute_and_disables_per_frame() {
-    use std::time::Duration;
-    let before = tokio::time::Instant::now();
-    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(
-        Some(5_000),
-        Duration::from_millis(1_000),
-        30_000,
-    );
+fn grpc_streaming_response_deadline_reuses_typed_absolute_and_disables_per_frame() {
+    let absolute = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    let (per_frame_ms, deadline) =
+        grpc_proxy::grpc_streaming_response_deadline(Some(absolute), 30_000);
     assert_eq!(
         per_frame_ms, 0,
         "a client deadline replaces the per-frame idle regime"
     );
-    let deadline = deadline.expect("a sane client budget must arm a deadline");
-    let remaining = deadline.saturating_duration_since(before);
-    // 5s budget minus 1s already elapsed => ~4s remaining. Small slack for
-    // the helper's own `Instant::now()` anchor being taken after `before`.
-    assert!(
-        remaining <= Duration::from_millis(4_100),
-        "deadline must subtract the elapsed request time: {remaining:?}"
-    );
-    assert!(
-        remaining >= Duration::from_millis(3_500),
-        "deadline must preserve the remaining client budget: {remaining:?}"
-    );
+    assert_eq!(deadline, Some(absolute));
 }
 
 #[test]
-fn grpc_streaming_response_deadline_exhausted_budget_is_immediate_not_negative() {
-    use std::time::Duration;
-    // Elapsed time exceeding the budget saturates to zero remaining — the
-    // deadline is "now" (fires on first poll), never a panic or underflow.
-    let before = tokio::time::Instant::now();
+fn grpc_streaming_response_deadline_preserves_already_elapsed_instant() {
+    let expired = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .expect("one minute before now is representable");
     let (per_frame_ms, deadline) =
-        grpc_proxy::grpc_streaming_response_deadline(Some(100), Duration::from_secs(60), 30_000);
+        grpc_proxy::grpc_streaming_response_deadline(Some(expired), 30_000);
     assert_eq!(per_frame_ms, 0);
-    let deadline = deadline.expect("an exhausted budget still arms a deadline");
-    assert!(
-        deadline.saturating_duration_since(before) <= Duration::from_millis(50),
-        "an exhausted budget must produce an already-due deadline"
-    );
+    assert_eq!(deadline, Some(expired));
 }
 
 #[test]
 fn grpc_streaming_response_deadline_no_client_budget_falls_back_per_frame() {
-    let (per_frame_ms, deadline) =
-        grpc_proxy::grpc_streaming_response_deadline(None, std::time::Duration::ZERO, 30_000);
+    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(None, 30_000);
     assert_eq!(
         per_frame_ms, 30_000,
         "without a client deadline the operator read timeout applies per frame"
@@ -1333,32 +2053,18 @@ fn grpc_streaming_response_deadline_no_client_budget_falls_back_per_frame() {
     assert!(deadline.is_none());
     // 0 + None (no client deadline, no operator fallback) = unbounded, for
     // long-lived server/bidi streams that legitimately idle.
-    let (per_frame_ms, deadline) =
-        grpc_proxy::grpc_streaming_response_deadline(None, std::time::Duration::ZERO, 0);
+    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(None, 0);
     assert_eq!(per_frame_ms, 0);
     assert!(deadline.is_none());
 }
 
 #[test]
-fn grpc_streaming_response_deadline_pathological_budget_is_unbounded_not_panic() {
-    // A multi-year client grpc-timeout must NEVER panic the proxy path
-    // (`checked_add`, not `+`). Whether the platform's `Instant` range
-    // absorbs ~584M years is platform-dependent: `None` = degraded to
-    // unbounded; `Some` must be so far in the future it is functionally
-    // unbounded.
-    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(
-        Some(u64::MAX),
-        std::time::Duration::ZERO,
-        30_000,
-    );
-    assert_eq!(per_frame_ms, 0);
-    if let Some(deadline) = deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            remaining > std::time::Duration::from_secs(365 * 24 * 60 * 60),
-            "a non-overflowing pathological budget must still be functionally unbounded: {remaining:?}"
-        );
-    }
+fn grpc_streaming_response_deadline_does_not_rearm_between_consumers() {
+    let absolute = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (_, direct) = grpc_proxy::grpc_streaming_response_deadline(Some(absolute), 10_000);
+    let (_, mesh) = grpc_proxy::grpc_streaming_response_deadline(Some(absolute), 20_000);
+    assert_eq!(direct, mesh);
+    assert_eq!(direct, Some(absolute));
 }
 
 // ── Mesh gRPC limit ordering (codex r2 finding 4) ───────────────────────────

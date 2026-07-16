@@ -121,7 +121,7 @@ async fn test_harness_database_consumer_and_plugin_config() {
     let plugin = PluginConfigBuilder::new("smoke-keyauth", "key_auth")
         .scope("proxy")
         .proxy_id("smoke-proxy")
-        .config_field("key_header", json!("X-API-Key"))
+        .config_field("key_location", json!("header:X-API-Key"))
         .build();
     client
         .post(gw.admin_url("/plugins/config"))

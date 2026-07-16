@@ -10,15 +10,16 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 2. **`authenticate`** — Identifies the consumer (mTLS, JWKS, JWT, API Key, LDAP, Basic Auth, HMAC)
 3. **`authorize`** — Checks consumer permissions and policy decisions (Access Control, OPA, consumer-mode rate limiting)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
-5. **`backend_admission`** — Decides whether the selected backend target can accept one more in-flight request after load balancing
-6. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
-7. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
-8. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
-9. **`on_final_response_body`** — Validates or stores the transformed buffered body and may still replace it (Body Validator, Response Size Limiting, Response Caching)
-10. **`on_response_committed`** — Observe-only exporter hook for the final client-visible buffered status, headers, and body after validators and rejection replacement
-11. **`on_response_stream_terminated`** — Releases state and writes aggregate metadata for streamed, non-buffered responses after terminal success, error, or client disconnect
-12. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
-13. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
+5. **`on_backend_path_resolved`** — Applies opt-in policy to the finalized backend path after routing and initial target selection
+6. **`backend_admission`** — Decides whether the selected backend target can accept one more in-flight request after load balancing
+7. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
+8. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
+9. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
+10. **`on_final_response_body`** — Validates or stores the transformed buffered body and may still replace it (Body Validator, Response Size Limiting, Response Caching)
+11. **`on_response_committed`** — Observe-only exporter hook for the final client-visible buffered status, headers, and body after validators and rejection replacement
+12. **`on_response_stream_terminated`** — Releases state and writes aggregate metadata for streamed, non-buffered responses after terminal success, error, or client disconnect
+13. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
+14. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
 
 ## Custom Plugins
 
@@ -47,7 +48,7 @@ plugin_configs:
     scope: proxy
     proxy_id: public-frontend
     config:
-      origins: ["https://app.example.com"]
+      allowed_origins: ["https://app.example.com"]
 
   # ProxyGroup — shared across a SUBSET of proxies
   # One instance, shared rate limit counters across the group
@@ -65,7 +66,7 @@ plugin_configs:
     plugin_name: key_auth
     scope: proxy_group
     config:
-      key_names: ["x-api-key"]
+      key_location: header:X-API-Key
 
 proxies:
   # Both internal proxies share the same auth + rate limit group plugins
@@ -121,7 +122,9 @@ Use `priority_override` to control the relative execution order of instances tha
 
 ## Multi-Authentication Mode
 
-When a proxy has `auth_mode: multi`, all attached authentication plugins execute sequentially. The first plugin that successfully identifies a consumer attaches that consumer's context. Subsequent auth plugins cannot overwrite it. After all auth plugins run, the Access Control plugin verifies that at least one consumer was identified.
+With `auth_mode: single` (the default), authentication plugins are tried in priority order and the first successful mechanism wins. For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`, and `oauth2_introspection`, a foreign `Authorization` scheme is skipped; other mechanisms are not covered by this guarantee. Any rejection returned by a plugin is terminal. With `auth_mode: multi`, authentication plugins execute sequentially until one establishes a nonblank mapped Consumer or permitted external principal; if none succeeds, a server rejection takes precedence over the last ordinary rejection. When a chain reaches its missing-credential rejection, challenge-less mechanisms are skipped and the first available challenge in plugin priority order is returned.
+
+In either mode, rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, rolling session cookie, or backend token-stripping state for another credential to inherit. Requester-owned cookies from rejected attempts are retained only when authentication ultimately rejects and are merged with the selected rejection's cookies by exact cookie name; a later successful credential discards them. After authentication, the Access Control plugin can apply consumer or group policy.
 
 ## Consumer Identity Headers
 
@@ -1048,38 +1051,52 @@ UDP sessions are logged when the session is cleaned up after idle timeout.
 **Phases**: `log`, `on_stream_disconnect`
 **Protocols**: All (HTTP, gRPC, WebSocket, TCP, UDP)
 
-Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header.
+Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header. Config admission is strict: unknown top-level fields and explicit `null` values are rejected. Nested `labels` and `custom_headers` remain dynamic maps.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `endpoint_url` | string | (required) | Loki push API URL |
-| `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic) |
-| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`) |
-| `labels` | object | `{"service":"ferrum-edge"}` | Static labels applied to every log stream |
+| `endpoint_url` | string | (required) | HTTP(S) Loki push API URL; URL user information is rejected |
+| `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic); leading/trailing whitespace is rejected |
+| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`); names use HTTP token syntax and are at most 65,535 bytes |
+| `labels` | object | `{"service":"ferrum-edge"}` | Static labels; names beginning `__` and reserved `ferrum_emitter` are rejected; names are at most 1,024 characters and values at most 2,048 characters |
 | `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label |
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
 | `gzip` | bool | `true` | Gzip-compress request bodies |
-| `batch_size` | integer | `100` | Max entries per batch |
+| `batch_size` | integer | `100` | Max entries per batch (1–10,000) |
 | `flush_interval_ms` | integer | `1000` | Flush timer interval (minimum 100) |
-| `buffer_capacity` | integer | `10000` | Channel buffer capacity |
-| `max_retries` | integer | `3` | Retry attempts on failure |
-| `retry_delay_ms` | integer | `1000` | Delay between retries |
+| `buffer_capacity` | integer | `10000` | Channel buffer capacity (1–1,000,000) |
+| `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576); the configured serializer's minimum HTTP and stream lines plus static, reserved, and worst-case dynamic label values must fit |
+| `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`) |
+| `max_retries` | integer | `3` | Retries after the initial attempt (0–10) |
+| `retry_delay_ms` | integer | `1000` | Initial exponential-backoff delay (1–60,000 ms) |
+| `schema` | object | (none) | Inline transaction-log schema |
+| `schema_ref` | string | (none) | Named `transaction_log_schema` reference; mutually exclusive with `schema` |
 
-Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, `authorization_header`, or tenant header rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests, which Loki uses for ingestion throttling) are transient signals and are retried within the configured budget.
+HTTP **204 No Content** is Loki's canonical delivery success. A received 204 is treated as committed even if the best-effort response drain is incomplete, because retrying after the sink accepted the batch can duplicate entries. Other 2xx responses from Loki-compatible receivers or intermediaries are accepted only when their response drains completely and is empty. Loki's blocked-ingestion status **260**, non-empty or anomalously drained compatible-success responses, 3xx, and non-retryable 4xx responses are terminal; transport failures, 408, 429, and 5xx retry with capped exponential backoff and full jitter. Response bodies are never logged or retained: they are discarded with a 1 MiB cap and a one-second timeout, and diagnostics contain only status and bounded size/drain classifications.
+
+The outer Loki timestamp is assigned in the plugin's single flush order and is strictly increasing across batches. The original request/session timestamps remain in the structured JSON line, so completion-order batching does not invent event chronology. Ferrum Edge adds a unique `ferrum_emitter` label to each plugin instance; independently ordered replicas and reload generations therefore do not share a Loki stream. Reusing an emitter across generations would be unsafe because old and new cache generations can flush concurrently. Consequently, every replica and every rebuilt Loki plugin generation creates one active Loki stream per remaining label combination until the prior stream ages out. Operators with frequent file/DP/mesh/global reloads should monitor tenant stream utilization, avoid unnecessary rebuilds, and size Loki `max_streams_per_user` (or equivalent compatible-receiver limits) for replica count × generation overlap × label combinations; 429 responses are retried but sustained limit pressure still drops batches after the configured attempts.
+
+Compatibility note: earlier Ferrum Edge releases treated every 2xx status, including Loki's blocked-ingestion 260, as success. This release makes 260 and non-empty/anomalous non-204 2xx responses terminal and accepts empty non-204 2xx responses for compatible receivers. Receivers should prefer the Loki-standard 204 contract.
+
+The channel slot is reserved before serialization. Serialization is capped by `max_entry_bytes`, and retained entry content remains charged to `buffer_max_bytes` until delivery, terminal loss, or shutdown drain completes. Construction reserves the configured serializer's smallest HTTP/stream shape plus maximum admitted proxy-ID and other dynamic label values; request-shaped fields can still make an individual JSON line exceed the configured per-entry limit, in which case that entry is dropped. Pressure drops are non-blocking and diagnostics never contain entry content. Operational logs show only the endpoint scheme/host/port; path, query, authorization, and all custom-header values are redacted from audit records and non-admin config reads. Shared plugin HTTP clients ignore ambient proxy environment variables, while preserving configured DNS, TLS, redirect, and backend-egress policy.
 
 ### `transaction_debugger`
 
-Emits verbose request/response diagnostics via `tracing::debug!` on the `transaction_debug` target. All output flows through the non-blocking writer, avoiding synchronous stdout mutex contention. Sensitive headers are automatically redacted. Enable per-proxy only for debugging — not recommended for production due to information disclosure risk. Requires `FERRUM_LOG_LEVEL=debug` (or `RUST_LOG=transaction_debug=debug`) to see output.
+Emits verbose request/response and terminal diagnostics via `tracing::debug!` on the `transaction_debug` target. All output flows through the non-blocking writer, avoiding synchronous stdout mutex contention. Sensitive headers are automatically redacted. Enable per-proxy only for debugging — not recommended for production due to information disclosure risk. Requires `FERRUM_LOG_LEVEL=debug` (or `RUST_LOG=transaction_debug=debug`) to see output.
+
+The plugin does not capture request or response payloads. The former `log_request_body` and `log_response_body` options are rejected instead of silently accepting no-op body settings. Terminal HTTP/gRPC diagnostics use the final transaction outcome, including dispatch/body errors, client disconnects, completion and byte counts, rejection phase, and non-zero gRPC status. TCP/UDP/DTLS diagnostics include typed disconnect direction, cause, and error classification.
+
+WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic and exactly one additional terminal session diagnostic when the upgraded session ends. When `correlation_id` or `otel_tracing` supplied `request_id` or `trace_id` metadata, the terminal records include the same selected value; all selected metadata passes through the central sensitivity classifier. The plugin never dumps the complete metadata map.
 
 **Priority:** 9200
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `log_request_body` | bool | `false` | Log incoming request body |
-| `log_response_body` | bool | `false` | Log backend response body |
 | `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list |
 
-**Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
+**Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
+
+The configuration object is closed: any key other than `redacted_headers` is rejected. `schema` and `schema_ref` retain their specialized unsupported-schema error.
 
 ### `correlation_id`
 
@@ -1314,7 +1331,7 @@ For UDP+DTLS frontends, the underlying DTLS library exposes only the client leaf
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
 
-For `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, and `san_email`, Ferrum selects only the **first matching value in certificate order**. Later subject attributes or SAN entries are not fallback identities. DNS SAN identities are normalized with ASCII lowercase and compared case-insensitively; every other identity field is compared exactly. Consumer mTLS identities are always exact-unique; while an enabled `san_dns` mTLS policy exists, they must also be unique under ASCII case folding so a DNS certificate cannot resolve ambiguously. Database snapshots that violate the DNS rule are rejected before runtime indexes are published.
+For `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, and `san_email`, Ferrum selects only the **first matching value in certificate order**. Later subject attributes or SAN entries are not fallback identities. DNS SAN identities are normalized with ASCII lowercase and compared case-insensitively; every other identity field is compared exactly. Consumer mTLS identities are always exact-unique; while an enabled `san_dns` mTLS policy exists, they must also be unique under ASCII case folding so a DNS certificate cannot resolve ambiguously. SQL and MongoDB backends serialize Consumer, plugin-policy, and proxy-association admission per namespace, including batch and restore imports, so concurrent admin processes cannot commit conflicting case variants or race a policy activation against a credential update. A restore holds one persistent owner-qualified guard from before its rollback snapshot through the destructive clear, every successful-import batch, and any compensating raw replay; all non-owning namespace resource writers fail closed for that full interval. Cancellation before a protected mutation is dispatched starts bounded owner-qualified cleanup. Cancellation, timeout, shutdown, or process failure after dispatch intentionally retains the fence when the write outcome or a multi-phase restore remains uncertain; definitive settlement releases it. If bounded owner-qualified cleanup itself cannot reach the datastore, the durable fence remains fail-closed, the failure is logged, and the same manual recovery procedure applies. MongoDB admission ownership uses majority-acknowledged, non-expiring writes: a paused writer can never resume after a successor has taken its lock, and an election cannot roll back ownership and reopen a stale writer. After verifying the former process is stopped and the durable outcome, an operator must remove that namespace's orphaned document from `mtls_dns_admission_locks`; an uncertain Mongo operation also pins its connection generation until this recovery. SQL uncertainty leaves `restore_owner` set in the namespace row, including interruption during a dispatched credential mutation, destructive restore phase, or rollback replay. After verifying the former process is stopped and the namespace state, clear that exact owner field before admission resumes. Ordinary identity conflicts return `409 Conflict`; namespace-fence contention returns a redacted `503 Service Unavailable` with `Retry-After: 1`. Batch and restore failures otherwise use those endpoints' documented per-item and rollback responses. File, database, CP/DP, and reload snapshots also reject ambiguity before publishing runtime indexes.
 
 > **`serial` format.** The serial identity is the lowercase hex serial number value — no separators, matching the lowercase of `openssl x509 -serial -noout -in cert.pem` output. DER may include a leading `00` sign-padding byte for positive serials whose high bit is set, but OpenSSL's serial value omits that DER-only pad and Ferrum strips it before lookup (for example, DER bytes `00 C0 01` match stored identity `c001`). Preserve real serial value zeros, but do not add DER sign padding and do not use the colon-separated form from `openssl x509 -text`.
 
@@ -1365,8 +1382,8 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | Parameter | Type | Description |
 |---|---|---|
 | `providers` | Array | Array of identity provider configurations (required) |
-| `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint |
-| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
+| `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or `localhost`; URL userinfo is rejected |
+| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`). HTTPS is required except for literal loopback or `localhost`, and URL userinfo is rejected. SSRF hardening: the discovered `jwks_uri` must use the **same origin** as the discovery URL (scheme, host, and effective port). For IdPs that serve JWKS from a different origin than discovery (e.g. Google `accounts.google.com` → `www.googleapis.com`, and some Azure AD / Okta / Auth0 setups), set `providers[].jwks_uri` directly instead of `discovery_url`. |
 | `providers[].jwks` | String/Object (optional) | Inline JWKS JSON; useful for mesh-provided or static key sets |
 | `providers[].issuer` | String (optional) | Expected JWT `iss` claim — routes tokens to this provider |
 | `providers[].audience` | String (optional) | Expected JWT `aud` claim |
@@ -1400,6 +1417,9 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
+Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. Shared stores use the minimum refresh interval requested by active consumers, and full or incremental reloads reschedule the single refresh worker without dropping cached keys. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement.
+
+Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A rejected refresh retains the last-known-good keys. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
 
 ### `oauth2_introspection`
 
@@ -1477,8 +1497,8 @@ Runs a browser-oriented OpenID Connect relying party flow with authorization cod
 | `providers[].userinfo_endpoint` | String (optional) | UserInfo endpoint used to enrich session claims |
 | `providers[].client_id` | String | OIDC client ID |
 | `providers[].client_auth.method` | String | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, or `none` |
-| `providers[].redirect_uri` | String | Absolute callback URI registered with the provider |
-| `providers[].callback_path` | String | Callback path Ferrum handles (default: path from `redirect_uri`) |
+| `providers[].redirect_uri` | String | Absolute callback URI registered with the provider; its host must match the browser request host before Ferrum issues a challenge (ports are ignored) |
+| `providers[].callback_path` | String | Callback path Ferrum handles (default: `/oauth/callback`); must equal the path in `redirect_uri` |
 | `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`) |
 | `providers[].scopes` | String[] | OIDC scopes; must include `openid` |
 | `providers[].audiences` | String[] | Accepted ID token audiences |
@@ -1492,6 +1512,7 @@ Runs a browser-oriented OpenID Connect relying party flow with authorization cod
 | `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`) |
 | `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`) |
 | `session.max_cookie_bytes` | u64 | Maximum sealed cookie size (default: `8000`) |
+| `session.domain` | String (optional) | Domain for the durable session cookie only; short-lived correlation cookies always remain host-only |
 | `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
 | `behavior.trusted_redirect_hosts` | String[] | Hosts allowed for post-login redirect parameters |
 
@@ -1548,7 +1569,13 @@ Authenticates requests using an API key matched against consumer credentials.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `key_location` | String | `header:X-API-Key` | Where to find the key (`header:<name>` or `query:<name>`) |
+| `key_location` | String | `header:X-API-Key` | Exact location of the key (`header:<name>` or `query:<name>`). Whitespace is not trimmed. |
+| `hide_credentials` | Boolean | `true` | Remove the configured key location before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable credential. |
+
+Header locations must use a valid HTTP header name. Query names must be non-empty
+and contain no whitespace; query names and values use the same percent-decoded
+representation on HTTP/1.1, HTTP/2, and HTTP/3. Unknown configuration fields
+are rejected.
 
 **Consumer credential** (`keyauth`) — array:
 ```yaml
@@ -1560,23 +1587,29 @@ credentials:
 
 ### `basic_auth`
 
-Authenticates using HTTP Basic credentials. Supports `hmac_sha256:<hex>` password hashes derived from `FERRUM_BASIC_AUTH_HMAC_SECRET`. A default secret is provided but **must be changed in production**.
+Authenticates using HTTP Basic credentials. Every HTTP 401 response advertises `Basic realm="ferrum-edge", charset="UTF-8"`. Password hashes use the exact `hmac_sha256:<64 lowercase hex>` form derived from `FERRUM_BASIC_AUTH_HMAC_SECRET`.
 
 **Priority:** 1300
 
-**Config**: None required.
+**Config**: The plugin object is empty. `FERRUM_BASIC_AUTH_HMAC_SECRET` is mandatory whenever the plugin is enabled and must contain at least 32 bytes of unique random material. There is no default. Rotating the secret invalidates all existing hashes, so replace the hashes in the same rollout.
+
+Admin API writes may supply exactly one of `password` or `password_hash`; plaintext passwords are hashed and removed before persistence. File-mode configuration must supply only `password_hash` so plaintext credentials never enter observable runtime configuration.
+
+Ordinary Consumer API responses omit the entire `basicauth` credential type so the strict request/backup hash schema is never populated with a synthetic placeholder. The authenticated `/backup` endpoint remains intentionally unredacted for restoration.
+
+Basic authentication normalizes password-verification work to the configured credential rotation limit to reduce username and rotation-state timing signals. Apply an authentication rate-limit policy as an additional control against online guessing.
 
 **Consumer credential** (`basicauth`) — array:
 ```yaml
 credentials:
   basicauth:
-    - password_hash: "hmac_sha256:ab3f..."
-    - password_hash: "hmac_sha256:new..."
+    - password_hash: "hmac_sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    - password_hash: "hmac_sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ```
 
 ### `hmac_auth`
 
-Authenticates requests using HMAC signatures with mandatory request-body integrity protection (RFC 9421 / RFC 3230).
+Authenticates requests using Ferrum's versioned HMAC authorization scheme with mandatory request-body integrity protection. RFC 9530 defines the accepted `Content-Digest` representation; Ferrum's `Authorization: hmac` field and signing base are not RFC 9421 HTTP Message Signatures.
 
 **Priority:** 1400
 
@@ -1593,24 +1626,31 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 - `algorithm` is optional and defaults to `hmac-sha256`
 - Supported algorithms: `hmac-sha256`, `hmac-sha512`
 - Unknown algorithms are rejected
+- Auth-param names are ASCII case-insensitive. Quoted values support HTTP quoted-pair escaping, so configured usernames containing commas, quotes, or backslashes remain representable. Malformed quotes and duplicate recognized parameters are rejected.
 - Requests must include a valid `Date` header (RFC 2822 or RFC 3339) within the configured skew window
 
 **Signing string**:
 
 ```text
-{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
+ferrum-hmac-v1\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
 ```
 
-where `{PATH}` is the request path component only, `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query), and `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Binding the query string means altering or adding query parameters invalidates the signature; clients must sign the byte-for-byte raw query string the gateway receives. Including the digest header means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
+`{NAMESPACE}` is the namespace of the matched proxy (the default is `ferrum`) and HMAC Consumer identity lookup is restricted to that namespace. `{USERNAME}` is the decoded username auth-param. `{AUTHORITY}` is the validated request authority with an ASCII-lowercased hostname, no trailing DNS dot, no default `:80`/`:443` port, and any explicit non-default port retained; bracketed IPv6 remains bracketed. `{PATH}` is the request path component only and `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query). `DIGEST_HEADER_VALUE` is the literal value of the selected digest field. Binding namespace, username, and authority prevents a captured signature from being relabeled to another Consumer, namespace, or virtual host; binding the raw query prevents query alteration.
+
+For RFC 9530 `Content-Digest`, use structured-field byte-sequence syntax such as `sha-256=:<base64-of-sha256-of-body>:`. Legacy `Digest` compatibility accepts `sha-256=<base64-of-sha256-of-body>`. SHA-512 is also supported. Ferrum verifies the digest against the original client bytes and signs its literal field value.
+
+`hmac_auth` authenticates the client-to-gateway representation. It cannot be combined on one proxy with a plugin that transforms the request body: configuration fails closed instead of forwarding an Authorization signature and digest that describe different bytes. The HMAC pre-authentication path also enforces a 10 MiB hard body ceiling even when the general request-body limit is unlimited.
+
+> **HBONE limitation:** `hmac_auth` is incompatible with HBONE CONNECT and rejects it with 401. Ferrum must preserve CONNECT DATA for tunnel relay and cannot buffer it for digest verification.
 
 > **Replay protection is a freshness window, not single-use.** The signed `Date` header bounds requests to `now ± clock_skew_seconds`; there is no nonce/seen-signature store, so a captured valid request can be replayed verbatim until the window elapses. Keep `clock_skew_seconds` tight for non-idempotent routes and do not rely on `hmac_auth` alone for them.
 
-**Consumer credential** (`hmac_auth`) — array:
+**Consumer credential** (`hmac_auth`) — array. Every secret must contain at least 32 non-whitespace characters and must not be shared by different Consumers within one namespace. Separate namespaces may reuse the same secret:
 ```yaml
 credentials:
   hmac_auth:
-    - secret: "shared-secret"
-    - secret: "new-secret"
+    - secret: "shared-secret-at-least-32-characters"
+    - secret: "rotated-secret-at-least-32-characters"
 ```
 
 ### ldap_auth
@@ -1621,20 +1661,20 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `ldap_url` | string | (required) | LDAP server URL. Use `ldaps://` or `ldap://` with `starttls: true`; embedded URL credentials are rejected |
+| `ldap_url` | string | (required) | LDAP server URL. Use `ldaps://` or `ldap://` with `starttls: true`; embedded URL credentials are rejected. Hostnames retain their configured identity for TLS/SNI while each connection dials a freshly resolved, policy-screened IP |
 | `bind_dn_template` | string | (none) | Direct bind DN template with `{username}` placeholder (e.g., `uid={username},ou=users,dc=example,dc=com`) |
 | `search_base_dn` | string | (none) | Base DN for search-then-bind user search |
 | `search_filter` | string | (none) | LDAP search filter with `{username}` placeholder (e.g., `(&(objectClass=user)(sAMAccountName={username}))`) |
-| `canonical_identity_attribute` | string | (none) | Required for search-then-bind. The uniquely selected entry must return exactly one value for this attribute; that value becomes the Ferrum identity and Consumer mapping key |
+| `canonical_identity_attribute` | string | (none) | Required for search-then-bind. The uniquely selected entry must return exactly one value for this attribute; that value becomes the Ferrum identity, Consumer mapping key, custom group-filter `{username}`, and default `memberUid` value |
 | `service_account_dn` | string | (none) | DN for the service account used in search-then-bind |
 | `service_account_password` | string | (none) | Password for the service account |
 | `group_base_dn` | string | (none) | Base DN for group membership search (required when `required_groups` is set) |
-| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` remains the presented login value even when the canonical identity differs. Default checks `member`, `uniqueMember`, and `memberUid`; custom-filter matches are rechecked against the returned group entry using those attributes before authorization |
+| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` is the authenticated canonical identity (the presented username for direct bind, or `canonical_identity_attribute` for search-then-bind). Default checks `member`, `uniqueMember`, and canonical-identity `memberUid`; custom-filter matches are rechecked against the returned group entry using those attributes before authorization |
 | `required_groups` | string[] | `[]` | List of LDAP/AD group names the user must belong to (OR logic — at least one must match) |
 | `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups`; LDAP attribute-name matching is case-insensitive |
 | `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
 | `allow_plaintext` | bool | `false` | Development-only override for non-loopback `ldap://` without STARTTLS. Credentials have no transport confidentiality when enabled |
-| `connect_timeout_seconds` | u64 | `5` | Per-connection and per-operation timeout (1–300s), also sent as the LDAP server-side search time limit |
+| `connect_timeout_seconds` | u64 | `5` | Shared DNS-resolution/TCP/TLS establishment bound per connection plus the per-operation timeout (1–300s), also sent as the LDAP server-side search time limit |
 | `request_timeout_seconds` | u64 | `max(15, connect timeout)` | Strict wall-clock deadline (1–300s) for the complete uncached authentication and group-check flow. Set it explicitly to use a shorter deadline than an individual operation |
 | `max_concurrent_requests` | u64 | `64` | Per-plugin cap (1–1,024) on concurrent uncached LDAP flows; excess requests fail immediately |
 | `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (`0` = disabled, maximum `86400`). Cache keys are process-random HMACs over the presented username/password |
@@ -1644,7 +1684,7 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 **Authentication modes** (must configure one):
 
 1. **Direct bind** — set `bind_dn_template` with `{username}` placeholder. Fastest option, no service account needed.
-2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `canonical_identity_attribute`, `service_account_dn`, and `service_account_password`. The service account performs a size-limited search, which must return exactly one entry, then the plugin binds as that user. The configured canonical attribute—not the client-supplied username—is exported and used for Consumer mapping.
+2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `canonical_identity_attribute`, `service_account_dn`, and `service_account_password`. The service account performs a size-limited search, which must return exactly one entry, then the plugin binds as that user. The configured canonical attribute—not the client-supplied username—is exported and used for Consumer mapping and username-based group authorization.
 
 **Example — Direct bind:**
 ```yaml
@@ -1688,9 +1728,13 @@ A directory outage or a misconfigured service account therefore returns `500` (`
 
 **Group search and service accounts:** When `required_groups` is set, the group-membership search binds with the service account if one is configured. With direct bind and **no** service account, the search runs over an **anonymous** bind — many directories deny anonymous reads of group objects / `member` attributes, in which case the search returns no entries and an entitled user is wrongly denied (`403`). The plugin logs a startup warning for this configuration and a per-request warning when an anonymous group search returns zero entries. **Configure a service account whenever you use `required_groups`** unless the directory is known to permit anonymous group searches.
 
-For custom `group_filter` values, a required group returned by the initial search is not sufficient proof of membership. The plugin performs a base-scope search against that exact group DN and authorizes it only when the directory confirms the bound user's DN or presented username through `member`, `uniqueMember`, or `memberUid`. This prevents a static filter branch from returning an allowed group for every successfully bound user without downloading large group membership attributes.
+For custom `group_filter` values, a required group returned by the initial search is not sufficient proof of membership. The plugin performs a base-scope search against that exact group DN and authorizes it only when the directory confirms the bound user's DN or authenticated canonical identity through `member`, `uniqueMember`, or `memberUid`. This prevents a static filter branch from returning an allowed group for every successfully bound user without downloading large group membership attributes.
+
+In search-then-bind deployments that use POSIX `memberUid` or `{username}` in a custom group filter, configure `canonical_identity_attribute` to the authoritative directory attribute whose value those groups store. If groups store a different identifier than the desired Ferrum/Consumer identity, use DN-based `member`/`uniqueMember` membership or a `{user_dn}` custom filter. A mismatch fails closed as non-membership; the plugin never falls back to the client-presented login. Direct bind is unchanged because its authenticated canonical identity is the presented login.
 
 **TLS and revocation:** `ldaps://` and STARTTLS connections use rustls with the gateway's CA settings (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`). When a CRL is configured (`FERRUM_TLS_CRL_FILE_PATH`) and verification is not disabled, revoked LDAP server certificates are rejected — the same revocation guarantee as the proxy backend, DTLS, frontend mTLS, and rustls logging-sink surfaces.
+
+**Dial-time DNS and egress policy:** Every LDAP connection is established from a fresh A+AAAA lookup that bypasses positive and negative DNS caches while still honoring configured static overrides and hosts files. The complete candidate set is screened under the active `BackendEgressPolicy` before any socket opens, and each candidate is screened again immediately before its TCP dial. A mixed allowed/denied answer or a reconnect that rebinds to denied space therefore fails closed. Direct bind, the service-account and end-user connections in search-then-bind, and a separate group-search connection all repeat this process. The concrete screened address is passed to `ldap3` without replacing the configured hostname, so LDAPS/STARTTLS certificate and SNI verification continue to use the operator-configured LDAP name. DNS, candidate connection attempts, and TLS/STARTTLS establishment share `connect_timeout_seconds`.
 
 Non-loopback plaintext `ldap://` endpoints are rejected by default because LDAP simple bind sends reusable service-account and user passwords without transport confidentiality. `allow_plaintext: true` is an explicit development-only escape hatch for isolated test environments. Literal loopback addresses and `localhost` remain available for local integration testing without the override.
 
@@ -1881,13 +1925,15 @@ UDP+DTLS streams via certificate-based consumer mapping.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. |
-| `disallowed_consumers` | String[] | `[]` | Consumer usernames explicitly denied. Takes precedence over every allow rule. |
-| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. |
-| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. |
-| `allow_authenticated_identity` | bool | `false` | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
+| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. |
+| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy. All checks use `HashSet<String>` for O(1) membership.
+Whitespace-only rule admission follows Rust `str::trim` Unicode `White_Space`
+semantics; accepted rule values are still stored and matched byte-for-byte.
 
 `allow_authenticated_identity: true` cannot be combined with an allow-list
 (`allowed_consumers` or `allowed_groups`): the allow-list matches mapped Consumer
@@ -1896,7 +1942,13 @@ so the combination would silently bypass the allow-list for every
 externally-authenticated-but-unmapped caller. The combination is rejected at
 config validation. The `disallowed_consumers` deny-list is still applied to the
 external identity string, so it may be combined with `allow_authenticated_identity`
-to revoke a compromised principal.
+to revoke a compromised principal. External identities longer than the 4096-character
+exact-rule bound fail closed instead of bypassing the deny-list.
+
+An authenticated external identity that is not enabled by this policy is an
+authorization denial: HTTP requests receive 403 and native gRPC requests receive
+trailers-only `PERMISSION_DENIED` (status 7). Requests with no meaningful mapped
+or external identity receive HTTP 401 / gRPC `UNAUTHENTICATED` (status 16).
 
 **Evaluation order:** deny (consumer username → group) → allow (consumer username → group).
 If both `allowed_consumers` and `allowed_groups` are set, matching _either_ grants access.
@@ -1958,7 +2010,7 @@ Delegates HTTP request authorization to [Open Policy Agent](https://www.openpoli
 | `include_client_ip` | Boolean | `true` | Include `input.client_ip`. |
 | `include_service` | Boolean | `true` | Include matched proxy/service data. |
 | `reject_duplicate_query_keys` | Boolean | `true` | Before calling OPA, reject conflicting duplicate query values (for example `id=1&id=2`) with `deny_status` / `deny_body`. Identical duplicates pass. Set `false` for intentional repeated-key APIs, or set `include_query: false` when policy does not inspect query data. |
-| `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; built-in sensitive headers are always redacted. |
+| `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; built-in sensitive headers and active authentication credential headers are always omitted. |
 | `redact_query_keys` | String[] | `[]` | Additional query parameter names to omit from `input.query`, matched case-insensitively. Built-in credential names and query locations used by authentication plugins are omitted automatically. |
 
 Unknown or misspelled top-level OPA config keys are rejected at config load.
@@ -1969,7 +2021,7 @@ Allow decisions:
 - An object with `allow: true` at `decision_pointer` also continues the request.
 - Any other value denies with the configured policy-denial response.
 
-Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, and `x-forwarded-authorization` before sending `input.headers` to OPA. Query parameters with common credential names (including `api_key`, `access_token`, `id_token`, `jwt`, and `token`) and present custom query locations configured by authentication plugins are omitted from `input.query`, even when multi-auth succeeds through a different mechanism. Set `include_query_credentials: true` only when the policy service is explicitly trusted to receive credential material; operator-specified `redact_query_keys` still apply.
+Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, and `x-forwarded-authorization` before sending `input.headers` to OPA. Active custom authentication credential headers, including configured `key_auth` header locations, are also omitted automatically. Query parameters with common credential names (including `api_key`, `access_token`, `id_token`, `jwt`, and `token`) and present custom query locations configured by authentication plugins are omitted from `input.query`, even when multi-auth succeeds through a different mechanism. Set `include_query_credentials: true` only when the policy service is explicitly trusted to receive credential material; operator-specified `redact_query_keys` still apply.
 
 `include_body` collection occurs only after authentication succeeds, so a `401` does not retain an OPA body copy. OPA's positive `max_body_bytes` limit is always enforced, including when `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`. Successful OPA responses are streamed through the positive `max_response_bytes` ceiling before JSON parsing; body contents are never written to OPA error logs.
 
@@ -2048,13 +2100,16 @@ For HTTP and gRPC, admission runs after load balancing selects the backend targe
 
 **Behavior notes:**
 
+- **Reload continuity** is keyed by the plugin configuration's namespace and ID. Compatible cache rebuilds preserve learned limits and count permits held by streaming bodies or WebSocket sessions against the replacement plugin; requests that pinned an older compatible cache view may still admit against the shared counters, but use the replacement admission bounds and cannot train them with retired feedback. Limit-bound changes clamp the shared learned limit at publication. Strict scale-out that only adds concrete effective targets or protected proxy-group associations while preserving every old target key, scope, and route meaning is compatible when `max_tracked_keys` is not lowered, so a long-lived old-target permit does not block admission to the new target. A `key_by`, plugin-scope, effective route-override destination or execution order, effective target retirement/replacement (including service-discovery replacement), policy-coverage contraction/remap, lowering `max_tracked_keys`, or a transition involving an ambiguous zero-target route establishes an independent tracking space. Retired permits finish against their detached state; retired cache and load-balancer views cannot admit, repopulate, or train the replacement policy. That retired-view generation check fails closed even in `shadow_mode`: shadow mode bypasses only a current target's adaptive limit, never structural generation ownership. Service-discovery churn outside a policy's selected subset and route-plugin edits that cannot change its destination remain compatible. Removing and later recreating a policy starts new state, as does removing the last proxy/proxy-group association and later reattaching it.
+- **Failure recovery** is cohort-aware. Every concurrent backend failure or high-latency sample applies its own multiplicative decrease, bounded by `min_limit`, and invalidates additive-growth credit for requests admitted before that decrease. The lower limit must admit a later healthy cohort before it can grow again, so completion ordering and a large `increase_step` cannot immediately erase the backoff.
+- **Unknown configuration keys are rejected.** Misspelled limit, scope, tracking, sampling, shadow, or header fields fail startup/write/reload validation instead of falling back to defaults.
 - **Streaming responses** record their latency sample at TTFB (response-header arrival) while the in-flight slot is held for the full body. Unlike a WebSocket session this slot is still transient (it frees when the body completes), so streaming keeps the normal growth behavior rather than the handshake-style suppression above. For very long-lived streaming/SSE backends this means the limit can grow on fast TTFB while slots stay tied up for the stream duration.
 - **`target_latency_multiplier`** is relative to the *minimum* observed backend latency, which is tracked as a monotonically-decreasing baseline that does not decay back up. A single unusually-fast response (a tiny `200`, a `304`, a cache hit) permanently lowers the baseline and tightens the target, which can keep the limit pinned low. Prefer a multiplier with headroom (the `1.5` default is conservative) for backends whose latency varies widely.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `key_by` | String | `proxy_target` | Limit scope: `proxy_target` keys by proxy plus selected backend, `upstream_target` keys by upstream plus selected backend when the proxy uses an upstream, and `backend_target` shares one limit per backend endpoint across every proxy using this plugin instance. |
-| `max_tracked_keys` | u64 | `10000` | Maximum number of distinct target keys this plugin instance tracks, bounding memory under high-cardinality (e.g. wildcard upstream) traffic. The cap bounds the limiter's own memory only: a target beyond it **fails open** — admitted without adaptive limiting rather than rejected — so a new target is never black-holed and `shadow_mode` never rejects. Tracked targets continue to be admitted subject to their adaptive limit. |
+| `max_tracked_keys` | u64 | `10000` | Maximum number of distinct target keys this stable plugin policy tracks across compatible reloads, bounding memory under high-cardinality (e.g. wildcard upstream) traffic. The cap bounds the limiter's own memory only: a target beyond it **fails open** — admitted without adaptive limiting rather than rejected — until the policy is removed/recreated or the process restarts. Tracked targets continue to be admitted subject to their adaptive limit. |
 | `min_limit` | u64 | `1` | Lower bound for the adaptive in-flight request limit. Must be greater than zero. |
 | `initial_limit` | u64 | `32` | Starting in-flight request limit for a new target key. Must be between `min_limit` and `max_limit`. |
 | `max_limit` | u64 | `1024` | Upper bound for the adaptive in-flight request limit. Must be at least `min_limit`. |
@@ -2062,8 +2117,8 @@ For HTTP and gRPC, admission runs after load balancing selects the backend targe
 | `target_latency_multiplier` | f64 | `1.5` | Target latency threshold as a multiple of the learned minimum observed backend latency. Must be finite and greater than `1.0`. |
 | `decrease_ratio` | f64 | `0.8` | Multiplicative decrease applied after a failure signal or high latency. Must be greater than `0` and less than `1`. |
 | `increase_step` | u64 | `1` | Additive increase applied when the target is saturated and latency remains within the target. |
-| `shadow_mode` | bool | `false` | Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. |
-| `expose_headers` | bool | `false` | Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on rejection responses. |
+| `shadow_mode` | bool | `false` | Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. Retired cache/load-balancer views and requests crossing a structural generation handoff still fail closed so they cannot repopulate the replacement tracking space. |
+| `expose_headers` | bool | `false` | Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Generation-handoff rejections omit them because those transitions have no truthful per-target limit or in-flight value. |
 
 ```yaml
 plugin_name: adaptive_concurrency
@@ -2082,11 +2137,11 @@ config:
 
 ### `ip_restriction`
 
-Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP — via both `on_request_received` (HTTP-family) and `on_stream_connect` (TCP/UDP).
+Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP/TLS, and UDP/DTLS — via both `on_request_received` (HTTP-family) and `on_stream_connect` (stream-family).
 
 **Priority:** 150
 
-**Supported protocols:** All (HTTP, gRPC, WebSocket, TCP, UDP)
+**Supported protocols:** All (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP/TLS, UDP/DTLS)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -2096,7 +2151,9 @@ Restricts access based on client IP address or CIDR range. Runs on every protoco
 
 At least one of `allow` or `deny` must be configured. Empty config or both lists empty rejects plugin creation.
 
-Rules are validated and pre-parsed at config load time into integer bitmasks; invalid IP/CIDR entries reject plugin creation instead of being silently ignored. The hot path is pure integer comparison — no per-request string parsing. Supports IPv4 (`/0`–`/32`) and IPv6 (`/0`–`/128`); IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching so a malformed `X-Forwarded-For` entry never silently bypasses a deny rule.
+The config must be an object containing only `allow`, `deny`, and `mode`. Unknown or misspelled properties, explicit `null` values, malformed arrays, and non-string/empty rules reject the candidate configuration. File/admin/database/CP-DP admission therefore cannot publish a typo as a broader effective policy, and a rejected reload keeps the last-known-good plugin generation.
+
+Rules are validated and compiled at config load time into sorted, merged numeric intervals; duplicates, overlaps, and adjacent ranges collapse without changing inclusive CIDR boundaries. Invalid IP/CIDR entries reject plugin creation instead of being silently ignored. IPv4 rule octets must use canonical unsigned decimal notation, so ambiguous forms such as `010.1.2.3` and `+10.1.2.3` are rejected. Request-time lookup is allocation-free, lock-free, and O(log n) in the number of non-overlapping intervals rather than a scan of configured rules. The authoritative client IP is parsed and canonicalized once per request, TCP connection, or UDP/DTLS session and the typed value is reused by every attached `ip_restriction` instance. IPv4-mapped IPv6 identities normalize to IPv4 before policy; mapped CIDR rules therefore accept only `/96`–`/128`, which map to IPv4 `/0`–`/32`, while shorter mapped prefixes are rejected as ambiguous. Native IPv6 CIDRs accept `/0`–`/128`; IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching. A malformed authoritative client IP always fails closed. Debug-level construction logs expose only the selected mode and effective IPv4/IPv6 interval counts, never configured addresses.
 
 When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
 
@@ -2281,20 +2338,27 @@ config:
 
 ### `fault_injection`
 
-Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; TCP/UDP stream proxies run the same decision in `on_stream_connect`. Stream rejects close the frontend connection/session, so HTTP status/body/grpc-status fields only have downstream meaning for HTTP-family protocols.
+Injects controlled failures for chaos testing. HTTP-family requests run in `before_proxy` after authentication, authorization, and consumer rate limiting; raw TCP proxies run the same decision in `on_stream_connect`. UDP and DTLS are not supported: their listener/session loops cannot safely wait inside a plugin delay without head-of-line blocking unrelated datagrams. TCP admission races fault delays against client resets and transport errors while preserving valid read-half closes, and all fault delays are capped at one minute. Stream rejects close the frontend connection, so HTTP status/body fields only have downstream meaning for HTTP-family protocols.
+
+When route-sensitive backend-path policy such as `grpc_method_router` is active, the HTTP-family fault decision runs only after the backend-effective method is authorized. A denied rewritten method therefore returns the policy rejection without first sleeping or receiving a synthetic fault response. Proxies without backend-path policy retain the ordinary `before_proxy` ordering.
 
 **Priority:** 2940
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `abort.status_code` | u16 | required when `abort` is set | Final HTTP status to return, 200-599 |
-| `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0 |
-| `abort.grpc_status` | u32 (optional) | — | gRPC status trailer to emit on gRPC rejects, 0-16 |
+| `abort.percentage` | f64 | required when `abort` is set | Abort probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
+| `abort.grpc_status` | u32 (optional) | — | gRPC status to emit only for actual native gRPC requests (excluding gRPC-Web and WebSocket even if an earlier plugin rewrites or preserves `application/grpc`), 0-16 |
 | `abort.body` | String | `""` | HTTP response body for aborts |
-| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-3,600,000 ms |
-| `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0 |
+| `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-60,000 ms |
+| `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
+| `runtime_overlay_scope` | String or null (optional) | — | RTDS scope with at least one non-whitespace character (outer whitespace is trimmed) for `ferrum.fault_injection.<scope>.{abort,delay}_percent`; null is equivalent to omission |
 
-Each plugin instance owns its own sampling counter, so proxy-scoped and proxy-group-scoped instances make independent decisions. The plugin rejects no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
+Each plugin instance owns a process-random sampling stream and makes independent delay/abort rolls. Multiple scoped instances therefore all decide in configured priority order: a delaying instance does not suppress a later sibling, while the first abort naturally short-circuits the remaining plugin chain. Route-local VirtualService faults still deduplicate against proxy-scoped faults through a private source marker, so route translation does not accidentally stack the same policy surface. The plugin rejects static no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
+
+`abort` and `delay` may be omitted or set to `null` to represent an unused side, but at least one must be an object. `runtime_overlay_scope: null` is likewise equivalent to omitting the optional scope. RTDS zero materialization treats a null sibling exactly like an omitted sibling, so removing the only configured side disables that plugin instance for the accepted generation.
+
+When `runtime_overlay_scope` is set, a mesh request epoch captures the matching RTDS values atomically with the plugin config. Missing or malformed keys fall back independently to the static percentage. RTDS layers are ordered lexicographically by Runtime resource name, with later names winning; duplicate Runtime names are rejected. A numeric RTDS value may be `0` to temporarily disable one configured fault kind.
 
 ```yaml
 plugin_name: fault_injection
@@ -2307,6 +2371,7 @@ config:
   delay:
     duration_ms: 250
     percentage: 10.0
+  runtime_overlay_scope: checkout
 ```
 
 ---
@@ -2318,16 +2383,24 @@ config:
 Handles Cross-Origin Resource Sharing at the gateway level.
 
 **Priority:** 100
+**Supported protocols:** HTTP, gRPC (including gRPC-Web)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_origins` | (String \| Object)[] | `["*"]` | Permitted origins. Each entry is a string (`"*"`, an exact `scheme://host[:port]` origin, or a `*.suffix.com` wildcard subdomain) or an Istio `StringMatch` object with one of `exact` / `prefix` / `regex` (literal prefix / RE2 full match). |
-| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Allowed methods |
-| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Allowed headers |
+| `allowed_origins` | (String \| Object)[] | required | Permitted origins. Use `["*"]` only for intentional allow-all. Exact origins are canonicalized at config load; `*.suffix.com` is the native wildcard-subdomain form. Istio objects use exactly one of `exact` / `prefix` / `regex`; exact `*` is Istio allow-all. |
+| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
+| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
 | `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` |
 | `max_age` | u64 | `86400` | Preflight cache duration in seconds |
-| `preflight_continue` | bool | `false` | Pass preflight requests to backend |
+| `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
+| `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |
+
+The root config must be an object. Unknown keys, explicit `null`, malformed
+values, and an omitted `allowed_origins` policy fail startup/reload instead of
+falling back to wildcard access. Multiple attached CORS instances compose
+origin/credential/exposure policy on actual requests and additionally
+intersect method/header/max-age policy on preflight.
 
 See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshooting.
 
@@ -2340,10 +2413,12 @@ Detects and blocks bot traffic based on the User-Agent header. `blocked_patterns
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `blocked_patterns` | String[] | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Setting this field replaces the defaults. Setting it to `[]` is valid only when `allow_missing_user_agent: false` creates a missing-header reject path; an allow-list alone is not enforcement. |
-| `allow_list` | String[] | `[]` | User-Agent tokens that always pass, evaluated before `blocked_patterns` (allow wins). Case-insensitive and word-boundary anchored, so an entry only matches when it appears as a standalone token. |
-| `allow_missing_user_agent` | bool | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. |
-| `custom_response_code` | u16 | `403` | HTTP status code for blocked requests. Values outside 100–599 (or non-numeric) are coerced to 403. |
+| `blocked_patterns` | String[] \| null | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Array entries are trimmed and must be nonblank. An array replaces the defaults; `null` or omission installs the defaults. Setting this field to `[]` is valid only when `allow_missing_user_agent: false` creates a missing-header reject path; an allow-list alone is not enforcement. |
+| `allow_list` | String[] \| null | `[]` | User-Agent tokens that always pass, evaluated before `blocked_patterns` (allow wins). Entries are trimmed, must be nonblank, and are matched case-insensitively with word-boundary anchors. `null` or omission installs an empty list. |
+| `allow_missing_user_agent` | bool \| null | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. `null` or omission selects `true`. |
+| `custom_response_code` | u16 \| null | `403` | For non-gRPC requests, the final 4xx or 5xx HTTP status for blocked requests. Native gRPC maps it to `grpc-status` under HTTP 200. Only 400–599 is accepted; informational, no-body, out-of-range, and non-integer values are rejected. `null` or omission selects 403. |
+
+Configuration must be a top-level object. The only accepted keys are `blocked_patterns`, `allow_list`, `allow_missing_user_agent`, and `custom_response_code`; unknown keys are rejected instead of falling back to defaults. Pattern entry whitespace follows Rust `str::trim` Unicode `White_Space` semantics. Non-gRPC rejections use the fixed JSON body `{"error":"Forbidden"}` with `Content-Type: application/json`, and never reflect the client-controlled User-Agent. Native gRPC rejections instead use an empty-body HTTP 200 trailers-only response: the configured HTTP code is mapped through the gateway's standard HTTP-to-gRPC mapping into `grpc-status`, and the fixed error text becomes `grpc-message: Forbidden`.
 
 ```yaml
 plugin_name: bot_detection
@@ -2554,21 +2629,21 @@ Rules are evaluated in order — first match wins. Regex paths use the same `~` 
 
 ### `spec_expose`
 
-Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a `/specz` sub-path of each proxy's listen path. When a `GET` request arrives at `{listen_path}/specz`, the plugin fetches the specification from the configured upstream URL and returns it to the caller. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
+Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a canonical `/specz` sub-path of each proxy's listen path. `GET` returns the configured specification and `HEAD` carries that GET representation through response-body transforms and guards before returning the same final status and representation headers (including `Content-Type`, `Content-Length`, and `X-Content-Type-Options`) with no wire body. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
 
 Useful for providing a common, discoverable pattern for API specifications across enterprise-wide APIs.
 
 **Priority:** 210 | **Phase:** `on_request_received` | **Protocols:** HTTP only
 
-**Only works with prefix-based `listen_path` proxies.** Regex listen paths (`~` prefix) are skipped — the plugin continues without intercepting. Host-only or port-only routing is not supported.
+**Only works with prefix-based `listen_path` proxies.** Regex (`~`) and exact (`=`) listen paths are skipped — the plugin continues without intercepting. Host-only or port-only routing is not supported. A trailing separator is normalized when composing the resource: both `/api` and `/api/` expose `/api/specz`. The double-slash alias `/api//specz`, encoded separators, and extra path segments are deliberately not intercepted. Query strings do not change the canonical match.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https` scheme; other schemes (e.g., `file://`) are rejected at plugin load time. |
-| `content_type` | String | _(upstream)_ | Override the response `Content-Type`. When omitted, the upstream response's `Content-Type` is passed through (so YAML specs return as YAML, JSON as JSON, etc.). |
-| `tls_no_verify` | bool | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Defaults to the gateway's global `FERRUM_TLS_NO_VERIFY` setting. Useful for internal endpoints with self-signed certificates. |
-| `cache_ttl_seconds` | u64 | `300` | TTL for the in-process spec body cache. The first `/specz` request fetches the spec from `spec_url` and caches it in memory; subsequent requests within the TTL window are served directly from the cache without re-fetching. Failed fetches are never cached — every failure is retried on the next request. Set to `0` to disable caching entirely (every request re-fetches). |
-| `max_response_body_bytes` | u64 | `26214400` | Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
+| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https`; URL userinfo is rejected. Paths and queries may route or authorize the origin request, but diagnostics include only the credential-free origin. |
+| `content_type` | String or null | _(upstream)_ | Trusted response `Content-Type` override, not restricted by the upstream allow-list. When omitted or null, only the supported spec media types listed below are preserved; other or missing upstream values fall back to `application/octet-stream`. |
+| `tls_no_verify` | bool or null | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Omitted or null uses the gateway's global setting. When verification is enabled and a custom gateway CA bundle is configured, failure to load or parse it rejects the plugin generation rather than widening trust to public roots. |
+| `cache_ttl_seconds` | u64 or null | `300` | TTL for the in-process positive spec cache. Omitted or null uses 300 seconds. `0` disables durable positive caching, but callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay. Failed fetches are negatively cached with bounded exponential backoff for every TTL setting. |
+| `max_response_body_bytes` | u64 or null | `26214400` | Maximum upstream spec response body size to buffer and cache. Omitted or null uses 25 MiB. The body is streamed with this cap, so oversized responses are rejected before they can grow memory without bound. |
 
 ```yaml
 # Example: Expose an OpenAPI spec for an API behind /my/api/v1
@@ -2592,9 +2667,11 @@ config:
   cache_ttl_seconds: 0
 ```
 
-**Error handling:** If the upstream spec URL is unreachable or returns a non-2xx status, the plugin returns a `502` JSON error response. The `spec_url` hostname is pre-warmed via DNS at startup alongside other backend hostnames. Failed fetches are NOT cached, so a transient upstream error is retried on the very next request.
+**Content-Type handling:** Without an explicit override, the media type (case-insensitive, before any `;` parameters) must be one of `application/json`, `application/openapi+json`, `application/openapi+yaml`, `application/vnd.oai.openapi`, `application/vnd.oai.openapi+json`, `application/yaml`, `application/x-yaml`, `application/wsdl+xml`, `application/vnd.sun.wadl+xml`, `application/xml`, `text/yaml`, `text/xml`, or `text/plain`. Matching values are preserved verbatim, including parameters; all other or missing values become `application/octet-stream`. An explicit `content_type` is operator-trusted and bypasses this upstream allow-list. Every successful response includes `X-Content-Type-Options: nosniff`.
 
-**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting the gateway clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway.
+**Error handling and admission:** If the upstream spec URL is unreachable, oversized, unreadable, or returns a non-2xx status, the plugin returns a `502` JSON error with `Retry-After`. One outbound fetch is active per plugin instance, failed completions are negatively cached with exponential backoff from 1 to 30 seconds, and cached failures report the whole seconds remaining in that window. At most 32 cache-miss callers (including the fetcher) are admitted. Excess callers receive `503` with `Retry-After` immediately rather than accumulating behind the fetch. The `spec_url` hostname is pre-warmed via DNS; logs include only its credential-free origin, never the configured path, query, fragment, or URL userinfo.
+
+**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min) and capped by `max_response_body_bytes` (default 25 MiB). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting or reloading the plugin clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway. With a zero TTL, there is no durable positive cache: callers admitted before a fetch completes share that completion by generation, while a later request immediately starts a new fetch.
 
 **Interaction with other plugins:** The plugin runs at priority 210 — after CORS (100), IP restriction (150), and bot detection (200), but before all authentication plugins (950+). This means blocked IPs and bots cannot access `/specz`, CORS preflight responses work correctly for browser-based spec consumers, and all authentication and authorization plugins are skipped for `/specz` requests.
 
@@ -2691,6 +2768,39 @@ Body rules support the same dot-notation features as `request_transformer`: nest
 Adds secure response header defaults and strips common fingerprinting headers
 after the backend response is available. It also runs for plugin rejection
 responses so locally generated errors receive the same response hardening.
+Policy is enforced on the client-visible initial-header boundary for ordinary
+HTTP responses, buffered native gRPC, gRPC-Web binary/text, and HTTP/1.1,
+HTTP/2, and HTTP/3 WebSocket success and gateway-failure handshakes. Native
+gRPC status and application metadata remain trailers; a security policy field
+is reapplied to initial headers rather than promoting a backend trailer value.
+For a genuine Trailers-Only response whose terminal metadata is carried in the
+initial END_STREAM HEADERS, Ferrum snapshots reserved gRPC fields before hooks
+and restores that pristine backend value after policy, so `set` and `remove`
+cannot redefine the RPC outcome.
+On buffered gRPC and gRPC-Web responses, a final policy removal suppresses both
+the initial-header compatibility copy and the application-trailer copy, while
+a final set/override remains initial-header policy and preserves the backend's
+application trailer. The final replay runs after trailer-only cookie rehoming
+and preserves the transport-owned `Content-Length` produced by the last body
+transform.
+
+Post-routing gateway-generated initial HEADERS use the same precomputed policy
+slice: this includes plain HTTP method-filter responses and native-gRPC method,
+deadline, size-limit, backend-unavailable, and mesh fail-closed errors across
+H1/H2/H3 frontends. Protocol-owned gRPC status/message/content type and
+Content-Length/transfer framing remain authoritative. Pre-routing errors such
+as overload, malformed request, 0-RTT, and route-miss responses have no resolved
+plugin configuration and do not apply route policy.
+
+Configuration is fail-closed: unknown top-level keys and unknown keys inside
+the `hsts` object reject startup or reload, retaining the last-known-good
+runtime configuration on reload. Header names use the complete HTTP
+field-name token grammar, are limited to 65,535 ASCII bytes, and are
+canonicalized to lowercase. Configured values must pass the same `HeaderValue`
+validation as the downstream H1/H2/H3 response builders: C0 controls other
+than horizontal tab, DEL, and non-ASCII characters are rejected. Invalid-name
+diagnostics identify the `set` or `remove` entry and render at most 96 escaped
+bytes of the hostile name before a truncation marker.
 
 **Priority:** 4080
 
@@ -2702,8 +2812,8 @@ responses so locally generated errors receive the same response hardening.
 | `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, or an object may set `max_age`, `include_subdomains`, and `preload`. |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
-| `set` | object/null | `{}` | Additional headers to set. Values must be strings and header values must not contain CR, LF, or NUL. |
-| `remove` | string[]/null | `["server","x-powered-by"]` | Header names to remove case-insensitively; `null` disables built-in removals. |
+| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar and values must pass downstream HTTP header-value validation. |
+| `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively; `null` disables built-in removals. |
 | `override_existing` | bool | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. |
 
 ```yaml
@@ -3176,7 +3286,7 @@ Supports both encoding modes:
 - **Binary** (`application/grpc-web`, `application/grpc-web+proto`): same length-prefixed framing as native gRPC — request body passes through unchanged.
 - **Text** (`application/grpc-web-text`, `application/grpc-web-text+proto`): base64-encoded binary frames — decoded on request and re-encoded on response.
 
-On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. On the response path, it embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` back to the original gRPC-Web variant.
+On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. On the response path, `grpc_web` embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` back to the original gRPC-Web variant.
 
 **Priority:** 260 (runs before `grpc_method_router` at 275)
 **Protocols:** HTTP, gRPC
@@ -3195,7 +3305,7 @@ config:
 
 ### `grpc_method_router`
 
-Parses the gRPC path (`/package.Service/Method`) and enables per-method access control and rate limiting. Populates `grpc_service`, `grpc_method`, and `grpc_full_method` metadata for downstream plugins.
+Enables per-method access control and rate limiting for canonical gRPC paths (`/package.Service/Method`). The security decision uses the backend-effective path after URI rewrites, listen-path stripping, proxy/target backend-path composition, and initial load-balancer target selection. It then refreshes `grpc_service`, `grpc_method`, and `grpc_full_method` metadata with the method actually authorized for backend dispatch. When a deferred pre-proxy function can mutate routing headers, its already-previewed target remains pinned across the external invocation; those mutations are forwarded only after gateway identity and egress baggage policy are restored, and cannot steer the current request onto an unpreviewed method. Retry rotation may change the backend host or port only while preserving the assembled authorized path, including proxy-path fallback; a path-changing candidate aborts the retry. Late policy rejections retain native gRPC or gRPC-Web wire framing as appropriate for the client, including gRPC-Web over HTTP/3.
 
 **Priority:** 275
 **Protocol:** gRPC only
@@ -3216,11 +3326,15 @@ Parses the gRPC path (`/package.Service/Method`) and enables per-method access c
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit.
+Each configured method accepts one optional leading slash and must use protobuf identifier grammar: `package.Service/Method`, with dot-separated service segments. Leading/trailing whitespace is normalized. Byte-identical duplicates are rejected by OpenAPI `uniqueItems`; duplicates that become equal only after trimming or slash normalization are rejected at runtime because JSON Schema cannot express canonical equality for array entries or object keys.
 
-The plugin requires at least one rule (`allow_methods`, `deny_methods`, or `method_rate_limits`) — an empty config is rejected. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+Each rate limit entry is `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit. In Redis mode, `redis_url` and `redis_key_prefix` must be non-empty, the URL must use `redis://` or `rediss://` with an authority, and pool/connect/health numeric settings must be positive.
 
-Populates `ctx.metadata` with `grpc_service`, `grpc_method`, and `grpc_full_method` in the `on_request_received` phase.
+The plugin requires at least one effective rule (`allow_methods`, a non-empty `deny_methods`, or a non-empty `method_rate_limits`) — an empty config is rejected. An explicitly empty `allow_methods` is valid block-all policy. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+
+`on_request_received` may populate provisional client-path metadata for early consumers. After the first backend target is selected, `on_backend_path_resolved` clears those three fields and replaces them from the backend-effective method before enforcing allow/deny/rate policy. A deferred external routing-header hook runs only after a non-state-consuming access preview and cannot change that selected target. An invalid backend-effective gRPC path fails closed for every policy shape, including deny-only and rate-only configurations. Retries may rotate hosts or ports but do not rotate to a target-specific path that would change the already authorized method.
+
+The backend-path boundary is shared by the HTTP/1.1 + HTTP/2 handler (including gRPC-Web requests classified as gRPC) and the HTTP/3 frontend, including its H3-to-H2 gRPC bridge.
 
 **Counter storage** (`sync_mode`): gRPC method rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter and falls back to local counters while Redis is unavailable.
 
@@ -3248,20 +3362,29 @@ Manages the `grpc-timeout` metadata header at the gateway. Can enforce maximum d
 **Priority:** 3050
 **Protocol:** gRPC only
 
+When backend-effective method policy such as `grpc_method_router` is active,
+deadline injection and terminal deadline rejection run after that finalized
+method-policy boundary. Without a backend-path policy, `grpc_deadline` retains
+its ordinary `before_proxy` position and behavior.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_deadline_ms` | u64 (optional) | *(none)* | Cap incoming deadlines to this value (milliseconds). Must be positive — `0` is rejected at plugin load time (it would reject every request). |
 | `default_deadline_ms` | u64 (optional) | *(none)* | Inject `grpc-timeout` when client omits it. Must be positive — `0` is rejected. If both are set, `default_deadline_ms` cannot exceed `max_deadline_ms`. |
 | `subtract_gateway_processing` | bool | `false` | Subtract elapsed gateway time before forwarding |
-| `reject_no_deadline` | bool | `false` | Reject requests missing `grpc-timeout` (gRPC clients receive normalized `grpc-status`) |
+| `reject_no_deadline` | bool | `false` | Reject requests missing a positive `grpc-timeout` (native H2/H3 clients receive HTTP 200 with a non-OK trailers-only `grpc-status`) |
 
-The plugin requires at least one rule — empty configs are rejected at load time so it cannot be a no-op. Parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), `n` (nanoseconds). Malformed values (non-ASCII, non-digit, or unknown unit) are treated as missing and fall back to `default_deadline_ms` if configured — they never panic the worker.
+The plugin requires at least one effective rule — empty configs and configs containing only `false` boolean rules are rejected at load time so it cannot be a no-op. Configuration is strict: unknown keys, explicit `null`, and incorrect field types are rejected with the property name. This prevents a misspelled enforcement rule from silently weakening policy.
+
+It parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), `n` (nanoseconds). Zero values are not deadlines and are treated as missing, so they cannot satisfy `reject_no_deadline`. Positive sub-millisecond values are rounded up to one millisecond. Other malformed values (non-ASCII, non-digit, oversized, or unknown unit) are treated as missing and fall back to `default_deadline_ms` if configured — they never panic the worker.
 
 Forwarded deadlines are re-encoded to stay within the gRPC wire-format limit of 8 digits, preserving millisecond precision whenever it fits.
 
-When `subtract_gateway_processing` is true and the remaining deadline is zero or negative, returns gRPC status `DEADLINE_EXCEEDED` (status code 4) using the trailers-only response pattern.
+The gateway establishes one monotonic absolute deadline at request receipt, before IP/geo/bot restrictions, authentication, authorization, body buffering, or plugin I/O. This phase-0 ordering is intentional and fail closed: when `reject_no_deadline` is enabled, a missing or malformed deadline is rejected before security plugins, so the deadline-policy response can precede the `401`/`403` that the same request would otherwise receive. It prevents unauthenticated requests from bypassing the configured total RPC resource ceiling. That same instant bounds connection acquisition, all H2/H3 attempts and retry backoff, and response headers/body/trailers. The header sent to a backend remains a relative duration; when `subtract_gateway_processing` is true it is derived from the absolute deadline. Later plugin instances and transports reuse the typed instant and never subtract elapsed time from that rewritten header again.
 
-Populates `ctx.metadata` with `grpc_original_deadline_ms` and `grpc_adjusted_deadline_ms`.
+When the absolute deadline is exhausted, the gateway returns gRPC status `DEADLINE_EXCEEDED` (status code 4). Upload expiry in every buffering phase uses the normal finalized rejection lifecycle, so rejection decorators, committed observers, gRPC-Web response translation/CORS, logging, and admission cleanup are not skipped. If H2 or H3 response headers were already committed but no client-visible DATA bytes were forwarded, it emits a terminal status-4 trailer frame; after partial DATA it aborts the stream because a complete gRPC message boundary cannot be assumed. Response-inspector buffering does not count as client-visible DATA. H3 downstream writes and coalescer flushes are bounded by the same absolute instant, preventing QUIC flow-control stalls from outliving the RPC. Deadline-capable streaming relays remove an upstream `Content-Length` before committing headers because the terminal replacement has a different representation length.
+
+When this plugin is configured, it populates `ctx.metadata` with `grpc_original_deadline_ms` and `grpc_adjusted_deadline_ms`. Merely sending a parseable `grpc-timeout` header without a `grpc_deadline` policy does not create those plugin-policy transaction-log fields.
 
 ```yaml
 plugin_name: grpc_deadline
@@ -3285,12 +3408,19 @@ Mirror response metadata (status code, response size, latency) is logged as a se
 | `mirror_host` | String | **(required)** | Hostname or IP of the mirror target |
 | `mirror_port` | Integer | 80/443 | Port of the mirror target (default based on protocol) |
 | `mirror_protocol` | String | `"http"` | `"http"` or `"https"` |
-| `mirror_path` | String | _(none)_ | Override the request path for the mirror. When unset, uses the original request path |
+| `mirror_path` | String | _(none)_ | Override the request path for the mirror. When unset, uses the backend-effective authorized path if backend-path policy is active; otherwise uses the original request path |
 | `percentage` | Float | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 | `mirror_request_body` | Boolean | `true` | Whether to include the request body in the mirror request |
 | `max_response_body_bytes` | Integer | `1048576` | Cap on bytes read from a mirror response when sizing it. Only consulted when the response has no `content-length` header — streaming aborts as soon as the limit is crossed and the truncated count is recorded. The mirror task discards the bytes after sizing, so this only bounds memory pressure from a misbehaving mirror endpoint streaming an unbounded body to a fire-and-forget task. Default is 1 MiB |
 
 When `mirror_request_body` is enabled, the plugin preserves binary payloads (including gRPC protobuf) using a binary-safe body store. Non-UTF-8 request bodies are mirrored correctly.
+
+When route-sensitive backend-path policy such as `grpc_method_router` is
+active, an unset `mirror_path` follows the finalized path that passed policy
+enforcement. This prevents a rewritten, unauthorized client method from being
+replayed to the shadow destination. An explicit `mirror_path` remains an
+operator override, and proxies without backend-path policy retain the original
+request path default.
 
 ```yaml
 plugin_name: request_mirror
@@ -3629,15 +3759,15 @@ Use this only when the normal backend has equivalent authentication, model allow
 - `ai_transcript_audit` (2924) stages transcript capture before guardrails; `ai_prompt_shield` (2925) scans/redacts PII before federation
 - `ai_semantic_firewall` (2968) blocks semantic prompt injection, exfiltration, tool-abuse, and topic-policy violations before semantic cache or federation
 - `ai_request_guard` (2975) validates model, tokens, temperature before federation
-- `ai_prompt_compressor` (4055) compresses the authoritative request body after request decompression
-- `ai_federation` (4060) routes that final transformed body to a provider and writes token metadata to `ctx.metadata`
+- `ai_prompt_compressor` (4055) boundedly shortens admitted OpenAI Chat/Text Completions plaintext, stages compatible metadata while limiting private wire-result reuse to 65,536 bytes, records authoritative wire stats after request decompression, and uses a bounded representation-preserving fallback so configured preserve markers cannot bypass sanitation; successful compression rewrites reserialize the complete JSON body
+- `ai_federation` (4060) routes that final transformed body to a provider before backend dispatch and writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 
 **Metadata and metrics:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, and `ai_federation_provider` use the same transaction keys as `ai_token_metrics`. Circuit observations use `ai_federation_circuit_last_provider`, `ai_federation_circuit_last_state`, `ai_federation_circuit_open_skips`, and `ai_federation_circuit_half_open_probes`. `/metrics` exposes the provider-name-free `ferrum_ai_federation_circuits_open` gauge and `ferrum_ai_federation_circuits_{opened,closed}_total`, `ferrum_ai_federation_circuit_half_open_probes_total`, and `ferrum_ai_federation_circuit_open_skips_total` counters. Removing/reloading an open configured circuit decrements the gauge; transition/probe logs carry only the restricted provider name, never an endpoint or credential. When `multimodal_mode: text_only_with_warning` drops non-text parts, the plugin also writes `ai_federation_multimodal_mode`, `ai_federation_multimodal_dropped_parts`, `ai_federation_multimodal_dropped_types`, `ai_federation_multimodal_dropped_roles`, and `ai_federation_multimodal_provider`.
 
 **TLS trust chain:** Because this plugin bypasses the normal proxy dispatch and makes outbound HTTP calls via the shared `PluginHttpClient`, it uses **global TLS settings only** — `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides (`backend_tls_server_ca_cert_path`, `backend_tls_client_cert_path`, `backend_tls_verify_server_cert`) and CRL checking do not apply. For providers behind private endpoints (e.g., Azure Private Link, VPC endpoints), add the internal CA to the global CA bundle PEM file. Note that when `FERRUM_TLS_CA_BUNDLE_PATH` is set, webpki/system roots are excluded (CA exclusivity) — include public root CAs in the bundle if some providers are public and others use internal CAs.
 
-`base_url` requires HTTPS by default. Set `allow_plaintext: true` only for an explicitly trusted cleartext endpoint; this does not enable redirect following. URL userinfo, queries, and fragments are rejected so credentials remain in dedicated fields. Azure resource/deployment/API-version, Vertex region/project, AWS region, and request-selected path models use strict component grammars. Google service-account OAuth is pinned to `https://oauth2.googleapis.com/token`. Logs use redacted endpoint placeholders, and all explicitly built shared-client paths disable ambient HTTP proxy discovery. The shared client's pre-existing final `reqwest::Client::new()` escape hatch remains only if every policy-preserving builder itself fails; the repository-wide ambient-proxy advisory remains open for that exceptional path and dedicated plugin clients.
+`base_url` requires HTTPS by default. Set `allow_plaintext: true` only for an explicitly trusted cleartext endpoint; this does not enable redirect following. URL userinfo, queries, and fragments are rejected so credentials remain in dedicated fields. Azure resource/deployment/API-version, Vertex region/project, AWS region, and request-selected path models use strict component grammars. Google service-account OAuth is pinned to `https://oauth2.googleapis.com/token`. Logs use redacted endpoint placeholders, and every shared-client construction path disables ambient HTTP proxy discovery, including the policy-preserving fallback builders. The repository-wide ambient-proxy advisory remains open for dedicated plugin clients outside this shared client.
 
 Federation parses the authoritative final JSON once and serializes that canonical value into every provider request. Duplicate object names therefore cannot leave one parser-evaluated representation for policy while sending a different raw representation to the provider; malformed provider success shapes are likewise rejected before a client response is committed.
 
@@ -4242,12 +4372,12 @@ Request buffering is only enabled for matching JSON `POST` requests without a no
 | `compress_roles` | String[] | `["user"]` | Message roles whose `content` is compressed (case-insensitive; non-empty). When it includes `user`, the legacy top-level `prompt` is compressed too. |
 | `target_ratio` | Number | `0.5` | Fraction of word-tokens to keep. `0.5` ≈ 50% reduction; `0.3` is more aggressive. Strictly between 0 and 1. |
 | `min_content_tokens` | Integer | `200` | Estimated-token floor per content string; shorter content is passed through unchanged. |
-| `max_scan_bytes` | Integer | `1048576` | Skip compression when the request body exceeds this size. |
-| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` is kept verbatim and the markers are stripped. ASCII letters, digits, `-`, `_`. |
+| `max_scan_bytes` | Integer | `1048576` | Skip statistical compression when the request body exceeds this size; configured marker sanitation remains active through the hard 1 MiB body/output bound. |
+| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` is kept verbatim and the markers are stripped. At most 64 ASCII letters, digits, `-`, `_`. |
 
 The filter scores each word by stop-word membership, length, in-document rarity, and a proper-noun signal, then drops the lowest-scoring words until `target_ratio` is met. Fenced code blocks, inline code, URLs, numbers, `snake_case`/identifier tokens, uppercase acronyms, and negations (`not`, `never`, `cannot`, …) are always preserved. Token counts are estimated (~4 characters per token); no model tokenizer is embedded.
 
-Runs after `compression` so opt-in request decompression exposes plaintext prompt JSON before this plugin rewrites the request body. It rewrites `ctx.metadata["request_body"]` for compatibility and re-derives the authoritative bytes in `transform_request_body`. `ai_federation` consumes that final body, so decompressed/compressed prompts cannot bypass its provider path. Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When a field is rewritten, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
+Runs after `compression` so opt-in request decompression exposes plaintext prompt JSON before this plugin rewrites the authoritative request body. Its per-request gate buffers candidate JSON `POST` bodies; `before_proxy` rewrites `ctx.metadata["request_body"]` for already-plaintext compatibility and stores bounded private stage state; `transform_request_body_with_context` owns the authoritative upstream bytes and counters; and `on_final_request_body_with_context` rejects an unsanitizable decoded marker-bearing surface before dispatch. `ai_federation` consumes that final body after the transform, so plaintext and opt-in compressed uploads use the same governed representation. Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When a field is statistically rewritten, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
 
 ```yaml
 plugin_name: ai_prompt_compressor
@@ -4441,7 +4571,7 @@ config:
 
 `sessions.max_sessions` and `sessions.session_ttl_seconds` bound downstream MCP sessions; idle or oldest sessions are evicted before accepting new `initialize` calls. The cap check, in-memory eviction, and insert are serialized (so concurrent `initialize` calls cannot grow the store past `max_sessions`) in a single scan, while the evicted sessions' upstream `DELETE` cleanup is issued concurrently *after* that critical section so eviction never blocks new sessions behind upstream network round trips. In `aggregate_router` mode the gateway mints a synthetic downstream session id and never forwards it upstream: routed calls strip the downstream session header and carry only a mediated upstream session id when one exists. Server ids must be URI-safe (`[A-Za-z0-9._-]`) because they appear in public `mcp://` resource URIs, and `sessions.downstream_session_header`/`sessions.upstream_session_header` must be valid HTTP header names; both are checked at config validation. `validation.validate_tool_results` is reserved and rejected if set to `true` until result validation is implemented. `initialize_upstreams: startup` is accepted as a V1 alias for `lazy` because MCP upstream initialization requires a downstream client session. In `aggregate_router` mode, advertising a capability with no dedicated dispatch — `capabilities.advertise_completions`, `capabilities.advertise_logging`, or `capabilities.advertise_tasks` — requires `capabilities.passthrough_unknown_methods: true` so those methods (`completion/complete`, `logging/*`, `tasks/*`) are routed to the primary upstream instead of advertised without support. If `observability.log_raw_arguments` is enabled, raw MCP tool arguments are copied into request metadata and may contain secrets or PII; prefer the default argument hashing unless the logging path is explicitly protected.
 
-**Discovery, catalogs, and locking.** Discovery catalogs are cached **per downstream session**, not gateway-wide, because an upstream MCP server may expose different tools/resources/prompts per initialized session (client identity/capabilities); a shared catalog could leak or hide entries across users. Catalog refresh is serialized per session (not globally) and upstream `initialize` is serialized per `(session, server)`, so a slow upstream throttles only the affected session/server rather than blocking discovery or initialization for unrelated clients. A consequence of per-session catalogs is that each new session performs its own upstream discovery. Cached resource-template routes are refreshed against their selected resource server after `discovery.cache_ttl_seconds`; a successful refresh removes withdrawn routes, while a transient refresh failure serves the previously discovered route stale until the next per-server retry window so long-lived sessions remain available. A URI that was never discovered still fails closed. Tool-only servers are not queried for resource templates. When two upstreams produce the same public tool or prompt name after namespacing, the colliding name is skipped from discovery for **all** colliding upstreams (logged as a warning) so it can never route to the wrong upstream, while the rest of the catalog stays usable. Exact resource and resource-template public URIs include the validated-unique server id (`mcp://{server_id}/...`), so their public keys cannot collide across upstreams; defensive duplicate-key suppression for exact resources uses the same fail-closed state. Collision tombstones survive any degraded refresh for their family and are cleared only after every attempted upstream in that family lists successfully, so a temporary outage cannot choose a winner. A failing upstream likewise degrades only itself: each per-server `tools/list` / `prompts/list` / `resources/list` / `resources/templates/list` failure (transport error, non-2xx status, or JSON-RPC error) keeps that upstream's last-good entries for that family served stale and retried on the next refresh window, while every other upstream and family refreshes normally — one unavailable upstream does not fail the whole aggregate catalog. Stale carried entries pass through the same collision handling as fresh ones, and only currently enabled and exposed servers can carry entries forward, so disabled or removed servers still drop out of the catalog. Degraded upstreams are surfaced as warning logs and bounded `mcp.catalog_degraded` metadata (sorted `server:family` pairs). Availability is tracked per catalog family and separately from entry count: if every attempted upstream for the requested family fails before that family has ever listed successfully, that family returns JSON-RPC `-32006` while healthy families remain usable; a prior successful empty list is last-good state and continues to return an empty catalog during a later outage. A partially refreshed catalog retries failed families on the normal `discovery.cache_ttl_seconds` window; when every attempted family is wholly unavailable, the catalog remains stale and the next request retries.
+**Discovery, catalogs, and locking.** Discovery catalogs are cached **per downstream session**, not gateway-wide, because an upstream MCP server may expose different tools/resources/prompts per initialized session (client identity/capabilities); a shared catalog could leak or hide entries across users. Catalog refresh is serialized per session (not globally) and upstream `initialize` is serialized per `(session, server)`, so a slow upstream throttles only the affected session/server rather than blocking discovery or initialization for unrelated clients. A consequence of per-session catalogs is that each new session performs its own upstream discovery. Cached resource-template routes are refreshed against their selected resource server after `discovery.cache_ttl_seconds`; a successful refresh removes withdrawn routes, while a transient refresh failure serves the previously discovered route stale until the next per-server retry window so long-lived sessions remain available. A URI that was never discovered still fails closed. Tool-only servers are not queried for resource templates. When two upstreams produce the same public tool or prompt name after namespacing, the colliding name is skipped from discovery for **all** colliding upstreams (logged as a warning) so it can never route to the wrong upstream, while the rest of the catalog stays usable. Exact resource and resource-template public URIs include the validated-unique server id (`mcp://{server_id}/...`), so their public keys cannot collide across upstreams; defensive duplicate-key suppression for exact resources uses the same fail-closed state. Collision tombstones survive degraded refreshes and are cleared only after every attempted upstream in that family lists successfully, so a temporary outage cannot choose a winner. Per-family tombstone retention is bounded by `validation.max_catalog_items_per_list` multiplied by the number of attempted upstream lists, the aggregate number of items one refresh can contribute. If repeated degraded refreshes exceed that history bound, the gateway retains one bounded overflow marker and returns JSON-RPC `-32006` for the entire affected family until a fully authoritative refresh rebuilds its collision state; it never selects attacker-ordered tombstones or temporarily republishes a formerly ambiguous route. A failing upstream otherwise degrades only itself: each per-server `tools/list` / `prompts/list` / `resources/list` / `resources/templates/list` failure (transport error, non-2xx status, or JSON-RPC error) keeps that upstream's last-good entries for that family served stale and retried on the next refresh window, while every other upstream and family refreshes normally — one unavailable upstream does not fail the whole aggregate catalog. Stale carried entries pass through the same collision handling as fresh ones, and only currently enabled and exposed servers can carry entries forward, so disabled or removed servers still drop out of the catalog. Degraded upstreams are surfaced as warning logs and bounded `mcp.catalog_degraded` metadata (sorted `server:family` pairs). Availability is tracked per catalog family and separately from entry count: if every attempted upstream for the requested family fails before that family has ever listed successfully, that family returns JSON-RPC `-32006` while healthy families remain usable; a prior successful empty list is last-good state and continues to return an empty catalog during a later outage. A partially refreshed catalog retries failed families on the normal `discovery.cache_ttl_seconds` window; when every attempted family is wholly unavailable, the catalog remains stale and the next request retries.
 
 **Protocol version negotiation.** `endpoint.protocol_versions` is ordered: the first entry is the gateway's preferred version. In `aggregate_router` mode, `initialize` echoes a supported requested `protocolVersion` and otherwise negotiates per the MCP lifecycle — the successful initialize result carries the preferred supported version (recorded as `mcp.protocol_version_negotiated` metadata) and the session is minted on that version instead of rejecting the client. Post-initialize requests remain fail-closed: an `MCP-Protocol-Version` header naming an unsupported version is rejected with HTTP 400.
 

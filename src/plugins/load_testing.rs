@@ -347,6 +347,10 @@ impl Plugin for LoadTesting {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        true
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

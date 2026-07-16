@@ -15,6 +15,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
+use hyper::header::{HeaderValue, RETRY_AFTER};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -23,7 +24,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
@@ -35,8 +36,9 @@ use crate::admin::backup::{
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
-    AtomicClearVerification, DatabaseBackend, NamespaceResourceCounts, SnapshotDataIntegrityError,
-    classify_atomic_clear_verification,
+    BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
+    NamespaceResourceCounts, SnapshotDataIntegrityError, classify_atomic_clear_verification,
+    is_mtls_dns_admission_unavailable,
 };
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
@@ -2712,12 +2714,19 @@ fn prepare_batch_items<R: crud::AdminResource>(
     now: chrono::DateTime<Utc>,
     validation_ctx: &crud::ValidationCtx<'_>,
     validation_errors: &mut Vec<String>,
-) {
+) -> Result<(), String> {
     for item in items {
-        if let Err(errors) = crud::prepare_batch_resource(item, namespace, now, validation_ctx) {
-            extend_prefixed_errors(validation_errors, kind, item.id(), errors);
+        match crud::prepare_batch_resource(item, namespace, now, validation_ctx) {
+            Ok(()) => {}
+            Err(crud::BatchPreparationError::Validation(errors)) => {
+                extend_prefixed_errors(validation_errors, kind, item.id(), errors);
+            }
+            Err(crud::BatchPreparationError::Internal(error)) => {
+                return Err(format!("{} '{}': {}", kind, item.id(), error));
+            }
         }
     }
+    Ok(())
 }
 
 async fn load_consumer_in_namespace(
@@ -2735,16 +2744,30 @@ async fn load_consumer_in_namespace(
     }
 }
 
-fn hash_credential_if_needed(
+pub(crate) fn basic_auth_credential_error_status(
+    error: &crate::config::types::BasicAuthCredentialPreparationError,
+) -> StatusCode {
+    match error {
+        crate::config::types::BasicAuthCredentialPreparationError::InvalidCredential(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        crate::config::types::BasicAuthCredentialPreparationError::ServerConfiguration(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+pub(crate) fn hash_credential_if_needed(
     cred_type: &str,
     cred_value: &mut Value,
 ) -> Result<(), Box<Response<Full<Bytes>>>> {
     if cred_type == "basicauth"
         && let Err(e) = crud::hash_basic_auth_credentials(cred_value)
     {
+        let status = basic_auth_credential_error_status(&e);
         return Err(Box::new(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": e}),
+            status,
+            &json!({"error": e.to_string()}),
         )));
     }
     Ok(())
@@ -2796,13 +2819,46 @@ async fn ensure_mtls_consumer_candidate(
     }
 }
 
+async fn ensure_hmac_consumer_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match crud::hmac_consumer_candidate_errors(db, namespace, consumer).await {
+        Ok(errors) if errors.is_empty() => Ok(()),
+        Ok(errors) => Err(Box::new(json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": errors.join("; ")}),
+        ))),
+        Err(error) => Err(Box::new(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&error),
+        ))),
+    }
+}
+
 async fn persist_consumer_update(
     db: &dyn DatabaseBackend,
     mut consumer: Consumer,
     success_status: StatusCode,
+    mode: &BatchConfigWriteMode,
+    admission: &MtlsDnsAdmissionOperation,
 ) -> Response<Full<Bytes>> {
+    // Every credential endpoint rewrites the complete Consumer and rebuilds
+    // its credential index entries. Revalidate retained HMAC credentials even
+    // when the requested mutation targets another credential type, so stale or
+    // out-of-band duplicates fail before the datastore uniqueness backstop.
+    if !consumer.credential_entries("hmac_auth").is_empty()
+        && let Err(response) =
+            ensure_hmac_consumer_candidate(db, &consumer.namespace, &consumer).await
+    {
+        return *response;
+    }
     consumer.updated_at = Utc::now();
-    match db.update_consumer(&consumer).await {
+    match admission
+        .run_mutation(db.update_consumer(&consumer, mode))
+        .await
+    {
         // The consumer vanished between the namespace-scoped load and the
         // write (concurrent delete) — not-found, not a phantom success.
         Ok(false) => consumer_not_found_response(),
@@ -2815,6 +2871,239 @@ async fn persist_consumer_update(
         }
         Err(e) => crud::consumer_persist_error_response(&e),
     }
+}
+
+const MTLS_DNS_ADMISSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum MtlsDnsAdmissionMutationState {
+    NotStarted = 0,
+    InFlightOrUncertain = 1,
+    Settled = 2,
+}
+
+impl MtlsDnsAdmissionMutationState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::NotStarted,
+            1 => Self::InFlightOrUncertain,
+            2 => Self::Settled,
+            _ => Self::InFlightOrUncertain,
+        }
+    }
+
+    fn release_on_drop(self) -> bool {
+        matches!(self, Self::NotStarted | Self::Settled)
+    }
+}
+
+#[derive(Clone)]
+struct MtlsDnsAdmissionOperation {
+    guard_owner: String,
+    mutation_state: Arc<AtomicU8>,
+}
+
+impl MtlsDnsAdmissionOperation {
+    fn guard_owner(&self) -> &str {
+        &self.guard_owner
+    }
+
+    async fn run_mutation<T, F>(&self, mutation: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.mutation_state.store(
+            MtlsDnsAdmissionMutationState::InFlightOrUncertain as u8,
+            Ordering::Release,
+        );
+        let result = mutation.await;
+        self.mutation_state.store(
+            MtlsDnsAdmissionMutationState::Settled as u8,
+            Ordering::Release,
+        );
+        result
+    }
+}
+
+struct MtlsDnsAdmissionGuardLifecycle {
+    db: Arc<dyn DatabaseBackend>,
+    namespace: String,
+    guard_owner: String,
+    mutation_state: Arc<AtomicU8>,
+    armed: bool,
+}
+
+impl MtlsDnsAdmissionGuardLifecycle {
+    async fn acquire(db: Arc<dyn DatabaseBackend>, namespace: &str) -> Result<Self, anyhow::Error> {
+        let namespace = namespace.to_string();
+        let acquire_db = db.clone();
+        let acquire_namespace = namespace.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let _acquire_task = tokio::spawn(async move {
+            let result = acquire_db
+                .acquire_mtls_dns_admission_guard(&acquire_namespace)
+                .await
+                .map(|guard_owner| Self::new(acquire_db, &acquire_namespace, guard_owner));
+            // If the request disappeared while acquisition was in flight, the
+            // undelivered lifecycle is dropped here and starts bounded cleanup.
+            let _ = result_tx.send(result);
+        });
+        result_rx.await.map_err(|_| {
+            anyhow::anyhow!("mTLS DNS admission guard acquisition task stopped unexpectedly")
+        })?
+    }
+
+    fn new(db: Arc<dyn DatabaseBackend>, namespace: &str, guard_owner: String) -> Self {
+        Self {
+            db,
+            namespace: namespace.to_string(),
+            guard_owner,
+            mutation_state: Arc::new(AtomicU8::new(
+                MtlsDnsAdmissionMutationState::NotStarted as u8,
+            )),
+            armed: true,
+        }
+    }
+
+    fn operation(&self) -> MtlsDnsAdmissionOperation {
+        MtlsDnsAdmissionOperation {
+            guard_owner: self.guard_owner.clone(),
+            mutation_state: self.mutation_state.clone(),
+        }
+    }
+
+    fn guard_owner(&self) -> &str {
+        &self.guard_owner
+    }
+
+    fn retain_uncertain(&self) {
+        self.mutation_state.store(
+            MtlsDnsAdmissionMutationState::InFlightOrUncertain as u8,
+            Ordering::Release,
+        );
+    }
+
+    async fn release(&mut self) -> Result<(), anyhow::Error> {
+        let result = self
+            .db
+            .release_mtls_dns_admission_guard(&self.namespace, &self.guard_owner)
+            .await;
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+impl Drop for MtlsDnsAdmissionGuardLifecycle {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state =
+            MtlsDnsAdmissionMutationState::from_u8(self.mutation_state.load(Ordering::Acquire));
+        if !state.release_on_drop() {
+            warn!(
+                namespace = %self.namespace,
+                "mTLS DNS admission guard retained because a dispatched mutation has an uncertain outcome"
+            );
+            return;
+        }
+
+        let db = self.db.clone();
+        let namespace = self.namespace.clone();
+        let guard_owner = self.guard_owner.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _cleanup_task = runtime.spawn(async move {
+                match tokio::time::timeout(
+                    MTLS_DNS_ADMISSION_CLEANUP_TIMEOUT,
+                    db.release_mtls_dns_admission_guard(&namespace, &guard_owner),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => error!(
+                        namespace = %namespace,
+                        error = %error,
+                        "mTLS DNS admission guard cancellation cleanup failed"
+                    ),
+                    Err(_) => error!(
+                        namespace = %namespace,
+                        "mTLS DNS admission guard cancellation cleanup timed out"
+                    ),
+                }
+            });
+        } else {
+            error!(
+                namespace = %namespace,
+                "mTLS DNS admission guard cancellation cleanup could not start during runtime shutdown"
+            );
+        }
+    }
+}
+
+pub(crate) fn mtls_dns_admission_unavailable_response() -> Response<Full<Bytes>> {
+    let mut response = json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({"error": MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE}),
+    );
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+// External tests reach this through the lib target's `_test_support` shim;
+// the bin target recompiles this module without that caller.
+#[allow(dead_code)]
+pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
+    mutation_started: bool,
+    outcome_settled: bool,
+) -> bool {
+    let state = if outcome_settled {
+        MtlsDnsAdmissionMutationState::Settled
+    } else if mutation_started {
+        MtlsDnsAdmissionMutationState::InFlightOrUncertain
+    } else {
+        MtlsDnsAdmissionMutationState::NotStarted
+    };
+    state.release_on_drop()
+}
+
+/// Hold the datastore namespace guard across an admin read/modify/write
+/// sequence. Cancellation before dispatch or after a definitive result starts
+/// a bounded owner-qualified cleanup task. Cancellation while a mutation may
+/// be in flight deliberately retains the non-expiring fail-closed fence.
+async fn with_mtls_dns_admission_guard<F, Fut>(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    operation: F,
+) -> Response<Full<Bytes>>
+where
+    F: FnOnce(MtlsDnsAdmissionOperation) -> Fut,
+    Fut: std::future::Future<Output = Response<Full<Bytes>>>,
+{
+    let mut guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db, namespace).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            warn!(
+                namespace = %namespace,
+                error = %error,
+                "mTLS DNS admission guard could not be acquired"
+            );
+            return mtls_dns_admission_unavailable_response();
+        }
+    };
+    let response = operation(guard.operation()).await;
+    if let Err(error) = guard.release().await {
+        error!(
+            namespace = %namespace,
+            error = %error,
+            "mTLS DNS admission guard retained after credential operation; manual recovery may be required"
+        );
+    }
+    response
 }
 
 fn apply_payload_namespace(payload: &mut RestorePayload, namespace: &str) {
@@ -3086,68 +3375,103 @@ async fn validate_batch_route_override_conflicts(
     Ok(())
 }
 
+fn payload_persist_error_message(error: &anyhow::Error) -> String {
+    if is_mtls_dns_admission_unavailable(error) {
+        MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
+    } else {
+        error.to_string()
+    }
+}
+
 async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
     halt_on_error: bool,
-) -> (PersistCounts, Vec<String>) {
+    mode: &BatchConfigWriteMode,
+) -> (PersistCounts, Vec<String>, bool) {
     let mut counts = PersistCounts::default();
     let mut errors = Vec::new();
+    let mut admission_unavailable = false;
     let should_continue = |errors: &[String]| !halt_on_error || errors.is_empty();
 
     if should_continue(&errors) && !payload.consumers.is_empty() {
-        match db.batch_create_consumers(&payload.consumers).await {
+        match db.batch_create_consumers(&payload.consumers, mode).await {
             Ok(n) => counts.consumers = n,
-            Err(e) => errors.push(format!("consumers: {}", e)),
+            Err(e) => {
+                admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                errors.push(format!(
+                    "consumers: {}",
+                    crud::consumer_persist_error_message(&e)
+                ));
+            }
         }
     }
     if should_continue(&errors) && !payload.upstreams.is_empty() {
-        match db.batch_create_upstreams(&payload.upstreams).await {
+        match db.batch_create_upstreams(&payload.upstreams, mode).await {
             Ok(n) => counts.upstreams = n,
-            Err(e) => errors.push(format!("upstreams: {}", e)),
+            Err(e) => {
+                admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                let message = payload_persist_error_message(&e);
+                errors.push(format!("upstreams: {message}"));
+            }
         }
     }
     if should_continue(&errors) && !payload.proxies.is_empty() {
         match db
-            .batch_create_proxies_without_plugins(&payload.proxies)
+            .batch_create_proxies_without_plugins(&payload.proxies, mode)
             .await
         {
             Ok(n) => counts.proxies = n,
-            Err(e) => errors.push(format!("proxies: {}", e)),
+            Err(e) => {
+                admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                let message = payload_persist_error_message(&e);
+                errors.push(format!("proxies: {message}"));
+            }
         }
     }
     if should_continue(&errors) && !payload.plugin_configs.is_empty() {
         match db
-            .batch_create_plugin_configs(&payload.plugin_configs)
+            .batch_create_plugin_configs(&payload.plugin_configs, mode)
             .await
         {
             Ok(n) => counts.plugin_configs = n,
-            Err(e) => errors.push(format!("plugin_configs: {}", e)),
+            Err(e) => {
+                admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                let message = payload_persist_error_message(&e);
+                errors.push(format!("plugin_configs: {message}"));
+            }
         }
     }
     if should_continue(&errors)
         && !payload.proxies.is_empty()
-        && let Err(e) = db.batch_attach_proxy_plugins(&payload.proxies).await
+        && let Err(e) = db.batch_attach_proxy_plugins(&payload.proxies, mode).await
     {
-        errors.push(format!("proxy_plugins: {}", e));
+        admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+        let message = payload_persist_error_message(&e);
+        errors.push(format!("proxy_plugins: {message}"));
     }
 
-    (counts, errors)
+    (counts, errors, admission_unavailable)
 }
 
 async fn rollback_failed_restore(
     db: &dyn DatabaseBackend,
     namespace: &str,
     snapshot: &RestorePayload,
+    guard_owner: &str,
 ) -> Result<(), Vec<String>> {
-    if let Err(error) = db.delete_all_resources(namespace).await {
-        return Err(vec![format!(
-            "failed to clear partially imported config: {}",
-            error
-        )]);
+    let mode = BatchConfigWriteMode::RestoreRollbackReplay {
+        guard_owner: guard_owner.to_string(),
+    };
+    let mut errors = Vec::new();
+    if let Err(error) = db.delete_all_resources(namespace, &mode).await {
+        errors.push(format!(
+            "failed to clear partially imported config: {error}"
+        ));
+    } else {
+        let (_, persist_errors, _) = persist_payload_resources(db, snapshot, false, &mode).await;
+        errors.extend(persist_errors);
     }
-
-    let (_, errors) = persist_payload_resources(db, snapshot, false).await;
     if errors.is_empty() {
         Ok(())
     } else {
@@ -3168,19 +3492,40 @@ async fn finish_failed_restore(
     namespace: &str,
     restore_errors: Vec<String>,
     snapshot: &RestoreSnapshot,
+    guard: &mut MtlsDnsAdmissionGuardLifecycle,
 ) -> Response<Full<Bytes>> {
-    let (rollback_status, rollback_errors) =
-        match rollback_failed_restore(db.as_ref(), namespace, &snapshot.payload).await {
-            Ok(()) => ("completed", None),
-            Err(errors) => {
-                error!(
-                    "Restore: rollback failed for namespace '{}': {}",
-                    namespace,
-                    errors.join("; ")
-                );
-                ("incomplete", Some(errors))
-            }
-        };
+    let guard_owner = guard.guard_owner().to_string();
+    let operation = guard.operation();
+    let (mut rollback_status, mut rollback_errors) = match operation
+        .run_mutation(rollback_failed_restore(
+            db.as_ref(),
+            namespace,
+            &snapshot.payload,
+            &guard_owner,
+        ))
+        .await
+    {
+        Ok(()) => ("completed", None),
+        Err(errors) => {
+            error!(
+                "Restore: rollback failed for namespace '{}': {}",
+                namespace,
+                errors.join("; ")
+            );
+            ("incomplete", Some(errors))
+        }
+    };
+    if let Err(error) = guard.release().await {
+        error!(
+            namespace = %namespace,
+            error = %error,
+            "Restore: rollback guard could not be released"
+        );
+        rollback_status = "incomplete";
+        rollback_errors
+            .get_or_insert_with(Vec::new)
+            .push("failed to release restore admission guard".to_string());
+    }
 
     let event = audit::AuditEvent::new(
         actor,
@@ -3242,7 +3587,15 @@ async fn finish_atomic_delete_failure(
     actor: &AuditActor,
     namespace: &str,
     delete_error: String,
+    guard: &mut MtlsDnsAdmissionGuardLifecycle,
 ) -> Response<Full<Bytes>> {
+    if let Err(error) = guard.release().await {
+        error!(
+            namespace = %namespace,
+            error = %error,
+            "Restore: admission guard could not be released after definitive clear abort"
+        );
+    }
     let event = audit::AuditEvent::new(
         actor,
         "restore",
@@ -3274,7 +3627,9 @@ async fn finish_unknown_atomic_delete_failure(
     actor: &AuditActor,
     namespace: &str,
     delete_error: String,
+    guard: &MtlsDnsAdmissionGuardLifecycle,
 ) -> Response<Full<Bytes>> {
+    guard.retain_uncertain();
     let event = audit::AuditEvent::new(
         actor,
         "restore",
@@ -3293,7 +3648,7 @@ async fn finish_unknown_atomic_delete_failure(
     json_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         &json!({
-            "error": "Restore failed while clearing existing config; the atomic clear outcome could not be verified. Manual recovery is required.",
+            "error": "Restore failed while clearing existing config; the atomic clear outcome could not be verified. The namespace admission guard was retained and manual recovery is required.",
             "restore_errors": [format!("failed to clear existing config: {}", delete_error)],
             "rollback": "unknown_outcome",
         }),
@@ -3360,54 +3715,70 @@ async fn handle_update_credentials(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut cred_value) {
         return Ok(*resp);
     }
-    let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
-        Ok(consumer) => consumer,
-        Err(resp) => return Ok(*resp),
-    };
-    let before = consumer.clone();
-    consumer
-        .credentials
-        .insert(cred_type.to_string(), cred_value);
-    consumer.normalize_fields();
+    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        let mode = BatchConfigWriteMode::GuardedAdmission {
+            guard_owner: admission.guard_owner().to_string(),
+        };
+        let mut consumer =
+            match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+                Ok(consumer) => consumer,
+                Err(resp) => return *resp,
+            };
+        let before = consumer.clone();
+        consumer
+            .credentials
+            .insert(cred_type.to_string(), cred_value);
+        consumer.normalize_fields();
 
-    if let Err(field_errors) = consumer.validate_fields() {
-        return Ok(invalid_credential_fields_response(&field_errors));
-    }
-    if let Some(normalized_credential) = consumer.credentials.get(cred_type)
-        && let Err(resp) = ensure_credential_unique(
-            db.as_ref(),
-            namespace,
-            consumer_id,
-            cred_type,
-            normalized_credential,
-        )
-        .await
-    {
-        return Ok(*resp);
-    }
-    if cred_type == "mtls_auth"
-        && let Err(resp) = ensure_mtls_consumer_candidate(db.as_ref(), namespace, &consumer).await
-    {
-        return Ok(*resp);
-    }
-
-    let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
-    if response.status().is_success() {
-        let event = audit::AuditEvent::new(
-            actor,
-            "update_credentials",
-            "consumer_credentials",
-            consumer_id,
-            namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
-            ),
-        );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-            log_audit_enqueue_failure(&error);
+        if let Err(field_errors) = consumer.validate_fields() {
+            return invalid_credential_fields_response(&field_errors);
         }
-    }
+        if let Some(normalized_credential) = consumer.credentials.get(cred_type)
+            && let Err(resp) = ensure_credential_unique(
+                db.as_ref(),
+                namespace,
+                consumer_id,
+                cred_type,
+                normalized_credential,
+            )
+            .await
+        {
+            return *resp;
+        }
+        if cred_type == "mtls_auth"
+            && let Err(resp) =
+                ensure_mtls_consumer_candidate(db.as_ref(), namespace, &consumer).await
+        {
+            return *resp;
+        }
+        let response = persist_consumer_update(
+            db.as_ref(),
+            consumer.clone(),
+            StatusCode::OK,
+            &mode,
+            &admission,
+        )
+        .await;
+        if response.status().is_success() {
+            let event = audit::AuditEvent::new(
+                actor,
+                "update_credentials",
+                "consumer_credentials",
+                consumer_id,
+                namespace,
+                audit::credential_update_diff(
+                    cred_type,
+                    crud::consumer_audit_body(&before),
+                    crud::consumer_audit_body(&consumer),
+                ),
+            );
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+                log_audit_enqueue_failure(&error);
+            }
+        }
+        response
+    })
+    .await;
     Ok(response)
 }
 
@@ -3436,30 +3807,45 @@ async fn handle_delete_credentials(
     };
     let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
 
-    let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
-        Ok(consumer) => consumer,
-        Err(resp) => return Ok(*resp),
-    };
-    let before = consumer.clone();
-    consumer.credentials.remove(cred_type);
-    let response =
-        persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::NO_CONTENT).await;
-    if response.status().is_success() {
-        let event = audit::AuditEvent::new(
-            actor,
-            "delete_credentials",
-            "consumer_credentials",
-            consumer_id,
-            namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
-            ),
-        );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-            log_audit_enqueue_failure(&error);
+    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        let mode = BatchConfigWriteMode::GuardedAdmission {
+            guard_owner: admission.guard_owner().to_string(),
+        };
+        let mut consumer =
+            match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+                Ok(consumer) => consumer,
+                Err(resp) => return *resp,
+            };
+        let before = consumer.clone();
+        consumer.credentials.remove(cred_type);
+        let response = persist_consumer_update(
+            db.as_ref(),
+            consumer.clone(),
+            StatusCode::NO_CONTENT,
+            &mode,
+            &admission,
+        )
+        .await;
+        if response.status().is_success() {
+            let event = audit::AuditEvent::new(
+                actor,
+                "delete_credentials",
+                "consumer_credentials",
+                consumer_id,
+                namespace,
+                audit::credential_update_diff(
+                    cred_type,
+                    crud::consumer_audit_body(&before),
+                    crud::consumer_audit_body(&consumer),
+                ),
+            );
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+                log_audit_enqueue_failure(&error);
+            }
         }
-    }
+        response
+    })
+    .await;
     Ok(response)
 }
 
@@ -3503,75 +3889,91 @@ async fn handle_append_credential(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut new_cred) {
         return Ok(*resp);
     }
-    let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
-        Ok(consumer) => consumer,
-        Err(resp) => return Ok(*resp),
-    };
-    let before = consumer.clone();
-    let new_value = match consumer.credentials.get(cred_type) {
-        Some(Value::Array(arr)) => {
-            let mut new_arr = arr.clone();
-            new_arr.push(new_cred);
-            Value::Array(new_arr)
+    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        let mode = BatchConfigWriteMode::GuardedAdmission {
+            guard_owner: admission.guard_owner().to_string(),
+        };
+        let mut consumer =
+            match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+                Ok(consumer) => consumer,
+                Err(resp) => return *resp,
+            };
+        let before = consumer.clone();
+        let new_value = match consumer.credentials.get(cred_type) {
+            Some(Value::Array(arr)) => {
+                let mut new_arr = arr.clone();
+                new_arr.push(new_cred);
+                Value::Array(new_arr)
+            }
+            _ => Value::Array(vec![new_cred]),
+        };
+
+        let limit = max_credentials_per_type();
+        if let Value::Array(ref arr) = new_value
+            && arr.len() > limit
+        {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!(
+                    "Cannot exceed {} credentials per type (currently {})",
+                    limit, arr.len()
+                )}),
+            );
         }
-        _ => Value::Array(vec![new_cred]),
-    };
+        consumer
+            .credentials
+            .insert(cred_type.to_string(), new_value);
+        consumer.normalize_fields();
 
-    let limit = max_credentials_per_type();
-    if let Value::Array(ref arr) = new_value
-        && arr.len() > limit
-    {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!(
-                "Cannot exceed {} credentials per type (currently {})",
-                limit, arr.len()
-            )}),
-        ));
-    }
-    consumer
-        .credentials
-        .insert(cred_type.to_string(), new_value);
-    consumer.normalize_fields();
-
-    if let Err(field_errors) = consumer.validate_fields() {
-        return Ok(invalid_credential_fields_response(&field_errors));
-    }
-    if let Some(normalized_credential) = consumer.credentials.get(cred_type)
-        && let Err(resp) = ensure_credential_unique(
+        if let Err(field_errors) = consumer.validate_fields() {
+            return invalid_credential_fields_response(&field_errors);
+        }
+        if let Some(normalized_credential) = consumer.credentials.get(cred_type)
+            && let Err(resp) = ensure_credential_unique(
+                db.as_ref(),
+                namespace,
+                consumer_id,
+                cred_type,
+                normalized_credential,
+            )
+            .await
+        {
+            return *resp;
+        }
+        if cred_type == "mtls_auth"
+            && let Err(resp) =
+                ensure_mtls_consumer_candidate(db.as_ref(), namespace, &consumer).await
+        {
+            return *resp;
+        }
+        let response = persist_consumer_update(
             db.as_ref(),
-            namespace,
-            consumer_id,
-            cred_type,
-            normalized_credential,
+            consumer.clone(),
+            StatusCode::OK,
+            &mode,
+            &admission,
         )
-        .await
-    {
-        return Ok(*resp);
-    }
-    if cred_type == "mtls_auth"
-        && let Err(resp) = ensure_mtls_consumer_candidate(db.as_ref(), namespace, &consumer).await
-    {
-        return Ok(*resp);
-    }
-
-    let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
-    if response.status().is_success() {
-        let event = audit::AuditEvent::new(
-            actor,
-            "append_credential",
-            "consumer_credentials",
-            consumer_id,
-            namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
-            ),
-        );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-            log_audit_enqueue_failure(&error);
+        .await;
+        if response.status().is_success() {
+            let event = audit::AuditEvent::new(
+                actor,
+                "append_credential",
+                "consumer_credentials",
+                consumer_id,
+                namespace,
+                audit::credential_update_diff(
+                    cred_type,
+                    crud::consumer_audit_body(&before),
+                    crud::consumer_audit_body(&consumer),
+                ),
+            );
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+                log_audit_enqueue_failure(&error);
+            }
         }
-    }
+        response
+    })
+    .await;
     Ok(response)
 }
 
@@ -3613,62 +4015,78 @@ async fn handle_delete_credential_by_index(
     };
     let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
 
-    let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
-        Ok(consumer) => consumer,
-        Err(resp) => return Ok(*resp),
-    };
-    let before = consumer.clone();
-    let cred_value = match consumer.credentials.get_mut(cred_type) {
-        Some(value) => value,
-        None => {
-            return Ok(json_response(
-                StatusCode::NOT_FOUND,
-                &json!({"error": format!("No '{}' credentials found", cred_type)}),
-            ));
-        }
-    };
-
-    match cred_value {
-        Value::Array(arr) => {
-            if index >= arr.len() {
-                return Ok(json_response(
+    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        let mode = BatchConfigWriteMode::GuardedAdmission {
+            guard_owner: admission.guard_owner().to_string(),
+        };
+        let mut consumer =
+            match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+                Ok(consumer) => consumer,
+                Err(resp) => return *resp,
+            };
+        let before = consumer.clone();
+        let cred_value = match consumer.credentials.get_mut(cred_type) {
+            Some(value) => value,
+            None => {
+                return json_response(
                     StatusCode::NOT_FOUND,
-                    &json!({"error": format!(
-                        "Credential index {} out of range (have {} entries)",
-                        index, arr.len()
-                    )}),
-                ));
+                    &json!({"error": format!("No '{}' credentials found", cred_type)}),
+                );
             }
-            arr.remove(index);
-            if arr.is_empty() {
-                consumer.credentials.remove(cred_type);
-            }
-        }
-        _ => {
-            return Ok(json_response(
-                StatusCode::NOT_FOUND,
-                &json!({"error": format!("No '{}' credentials found", cred_type)}),
-            ));
-        }
-    }
+        };
 
-    let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
-    if response.status().is_success() {
-        let event = audit::AuditEvent::new(
-            actor,
-            "delete_credential",
-            "consumer_credentials",
-            consumer_id,
-            namespace,
-            audit::update_diff(
-                crud::consumer_response_body(&before),
-                crud::consumer_response_body(&consumer),
-            ),
-        );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-            log_audit_enqueue_failure(&error);
+        match cred_value {
+            Value::Array(arr) => {
+                if index >= arr.len() {
+                    return json_response(
+                        StatusCode::NOT_FOUND,
+                        &json!({"error": format!(
+                            "Credential index {} out of range (have {} entries)",
+                            index, arr.len()
+                        )}),
+                    );
+                }
+                arr.remove(index);
+                if arr.is_empty() {
+                    consumer.credentials.remove(cred_type);
+                }
+            }
+            _ => {
+                return json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": format!("No '{}' credentials found", cred_type)}),
+                );
+            }
         }
-    }
+
+        let response = persist_consumer_update(
+            db.as_ref(),
+            consumer.clone(),
+            StatusCode::OK,
+            &mode,
+            &admission,
+        )
+        .await;
+        if response.status().is_success() {
+            let event = audit::AuditEvent::new(
+                actor,
+                "delete_credential",
+                "consumer_credentials",
+                consumer_id,
+                namespace,
+                audit::credential_update_diff(
+                    cred_type,
+                    crud::consumer_audit_body(&before),
+                    crud::consumer_audit_body(&consumer),
+                ),
+            );
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+                log_audit_enqueue_failure(&error);
+            }
+        }
+        response
+    })
+    .await;
     Ok(response)
 }
 
@@ -3697,10 +4115,20 @@ fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClien
         })
 }
 
-fn validate_plugin_config_definition(
+pub(crate) fn validate_plugin_config_definition(
     pc: &PluginConfig,
     http_client: plugins::PluginHttpClient,
 ) -> Result<(), String> {
+    let known_plugins = plugins::available_plugins();
+    if !known_plugins.contains(&pc.plugin_name.as_str()) {
+        return Err(format!(
+            "Unknown plugin name '{}'. Available plugins: {:?}",
+            pc.plugin_name, known_plugins
+        ));
+    }
+    if !pc.enabled {
+        return Ok(());
+    }
     plugins::validate_plugin_config_with_http_client(&pc.plugin_name, &pc.config, http_client)
 }
 
@@ -4054,38 +4482,58 @@ async fn handle_batch_create(
     let known_plugins = crate::plugins::available_plugins();
     let mut validation_errors: Vec<String> = Vec::new();
 
-    prepare_batch_items(
+    if let Err(error) = prepare_batch_items(
         &mut batch.consumers,
         "Consumer",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
-    prepare_batch_items(
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
+    if let Err(error) = prepare_batch_items(
         &mut batch.upstreams,
         "Upstream",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
-    prepare_batch_items(
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
+    if let Err(error) = prepare_batch_items(
         &mut batch.proxies,
         "Proxy",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
-    prepare_batch_items(
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
+    if let Err(error) = prepare_batch_items(
         &mut batch.plugin_configs,
         "PluginConfig",
         namespace,
         now,
         &validation_ctx,
         &mut validation_errors,
-    );
+    ) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": error}),
+        ));
+    }
 
     for plugin_config in &batch.plugin_configs {
         if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
@@ -4187,11 +4635,52 @@ async fn handle_batch_create(
             if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
                 validation_errors.extend(errors);
             }
+            // Match single-resource admission: legacy duplicates are already
+            // quarantined at load time and must not block unrelated batch
+            // writes. Re-evaluate the authoritative candidate only when this
+            // batch submits a Consumer that carries HMAC credentials.
+            if batch
+                .consumers
+                .iter()
+                .any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
+                && let Err(errors) = candidate_config.validate_unique_hmac_credentials()
+            {
+                validation_errors.extend(errors);
+            }
         }
         Err(error) => validation_errors.push(format!(
-            "Failed to load namespace config for mTLS candidate validation: {}",
+            "Failed to load namespace config for credential candidate validation: {}",
             error
         )),
+    }
+
+    if !batch.proxies.is_empty() || !batch.plugin_configs.is_empty() {
+        match crud::validate_hmac_request_transform_candidates(
+            db.as_ref(),
+            state,
+            namespace,
+            &batch.proxies,
+            &batch.plugin_configs,
+            None,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(
+                crud::AfterValidateError::BadRequest(errors)
+                | crud::AfterValidateError::Conflict(errors),
+            ) => {
+                validation_errors.extend(errors);
+            }
+            Err(crud::AfterValidateError::Db(error)) => validation_errors.push(format!(
+                "Failed to load config for HMAC request-transform candidate validation: {}",
+                error
+            )),
+            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
+                "HMAC request-transform candidate validation returned an unexpected response"
+                    .to_string(),
+            ),
+        }
     }
 
     match ValidationPipeline::new(&mut batch_config)
@@ -4459,7 +4948,13 @@ async fn handle_batch_create(
         ));
     }
 
-    let (created, errors) = persist_payload_resources(db.as_ref(), &batch, true).await;
+    let (created, errors, admission_unavailable) =
+        persist_payload_resources(db.as_ref(), &batch, true, &BatchConfigWriteMode::Admission)
+            .await;
+
+    if admission_unavailable && !created.any() {
+        return Ok(mtls_dns_admission_unavailable_response());
+    }
 
     let mut response = json!({
         "created": {
@@ -4799,6 +5294,30 @@ async fn handle_restore(
                 }
             }
         }
+        match crud::validate_hmac_request_transform_restore_candidate(state, &temp_config) {
+            Ok(()) => {}
+            Err(
+                crud::AfterValidateError::BadRequest(errors)
+                | crud::AfterValidateError::Conflict(errors),
+            ) => {
+                validation_errors.extend(errors);
+            }
+            Err(crud::AfterValidateError::Db(error)) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Restore aborted: HMAC request-transform composition could not be validated: {}. Existing config was NOT deleted.",
+                            error
+                        )
+                    }),
+                ));
+            }
+            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
+                "HMAC request-transform candidate validation returned an unexpected response"
+                    .to_string(),
+            ),
+        }
         if !validation_errors.is_empty() {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
@@ -4826,6 +5345,36 @@ async fn handle_restore(
         ));
     }
 
+    // Acquire one datastore owner before the authoritative rollback snapshot
+    // and retain it through clear, import, and any compensating replay. This is
+    // the cross-process counterpart to the in-process admission mutex above.
+    let mut restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            warn!(
+                namespace = %namespace,
+                error = %error,
+                "Restore: namespace admission guard could not be acquired"
+            );
+            if crate::config::db_loader::is_transient_database_error(&error) {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": "Restore aborted: the pre-snapshot namespace admission guard could not be acquired because the database is unavailable. Existing config was NOT deleted; retry once the database is reachable.",
+                        "restore_errors": ["failed to acquire the pre-snapshot namespace admission guard: database unavailable"],
+                        "failure_class": "connectivity",
+                    }),
+                ));
+            }
+            return Ok(mtls_dns_admission_unavailable_response());
+        }
+    };
+    let restore_mode = BatchConfigWriteMode::GuardedAdmission {
+        guard_owner: restore_guard.guard_owner().to_string(),
+    };
+
     // Snapshot the namespace before deletion so a failure in any independently
     // committed import chunk (or a partial clear) can be compensated on every
     // database backend. The snapshot loads RAW rows from the primary without the
@@ -4837,6 +5386,13 @@ async fn handle_restore(
     let snapshot = match snapshot_namespace_for_rollback(db.as_ref(), namespace).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
+            if let Err(release_error) = restore_guard.release().await {
+                error!(
+                    namespace = %namespace,
+                    error = %release_error,
+                    "Restore: admission guard could not be released after snapshot failure"
+                );
+            }
             let data_integrity = error
                 .downcast_ref::<SnapshotDataIntegrityError>()
                 .map(ToString::to_string);
@@ -4868,10 +5424,19 @@ async fn handle_restore(
 
     // Phase 3: Delete all existing resources in the namespace (safe: payload is
     // validated and the prior state has been snapshotted from the primary above).
-    if let Err(e) = db.delete_all_resources(namespace).await {
+    let delete_operation = restore_guard.operation();
+    if let Err(e) = delete_operation
+        .run_mutation(db.delete_all_resources(namespace, &restore_mode))
+        .await
+    {
         error!("Restore: failed to delete existing resources: {}", e);
         if e.mode().is_atomic() {
             if e.has_unknown_commit_result() {
+                // The server may have committed even though the client did not
+                // receive an acknowledgement. Retain the fence across
+                // cancellation until an owner-qualified verification resolves
+                // that ambiguity.
+                restore_guard.retain_uncertain();
                 let verification = db.count_namespace_resources(namespace).await;
                 if let Err(error) = &verification {
                     error!(
@@ -4880,44 +5445,30 @@ async fn handle_restore(
                         "Restore: failed to verify ambiguous atomic clear outcome"
                     );
                 }
-                return Ok(
-                    match classify_atomic_clear_verification(
-                        snapshot.resource_counts(),
-                        verification,
-                    ) {
-                        AtomicClearVerification::ClearCommitted => {
-                            finish_failed_restore(
-                                state,
-                                db.clone(),
-                                actor,
-                                namespace,
-                                vec![format!("failed to clear existing config: {}", e)],
-                                &snapshot,
-                            )
-                            .await
-                        }
-                        AtomicClearVerification::PriorConfigIntact => {
-                            finish_atomic_delete_failure(
-                                state,
-                                db.clone(),
-                                actor,
-                                namespace,
-                                e.to_string(),
-                            )
-                            .await
-                        }
-                        AtomicClearVerification::UnknownOutcome => {
-                            finish_unknown_atomic_delete_failure(
-                                state,
-                                db.clone(),
-                                actor,
-                                namespace,
-                                e.to_string(),
-                            )
-                            .await
-                        }
-                    },
-                );
+                let clear_verification =
+                    classify_atomic_clear_verification(snapshot.resource_counts(), verification);
+                return Ok(if clear_verification.requires_guard_retention() {
+                    finish_unknown_atomic_delete_failure(
+                        state,
+                        db.clone(),
+                        actor,
+                        namespace,
+                        e.to_string(),
+                        &restore_guard,
+                    )
+                    .await
+                } else {
+                    finish_failed_restore(
+                        state,
+                        db.clone(),
+                        actor,
+                        namespace,
+                        vec![format!("failed to clear existing config: {}", e)],
+                        &snapshot,
+                        &mut restore_guard,
+                    )
+                    .await
+                });
             }
             // A definitive atomic abort retains the prior config, including
             // api_specs. Preserve the short-circuit and do not re-clear it.
@@ -4927,6 +5478,7 @@ async fn handle_restore(
                 actor,
                 namespace,
                 e.to_string(),
+                &mut restore_guard,
             )
             .await);
         }
@@ -4940,16 +5492,30 @@ async fn handle_restore(
             namespace,
             vec![format!("failed to clear existing config: {}", e)],
             &snapshot,
+            &mut restore_guard,
         )
         .await);
     }
+
+    // A cancelled restore after a successful clear is still an incomplete
+    // multi-phase mutation even though the clear itself settled. Keep the
+    // fence until import or compensating rollback reaches a definitive result.
+    restore_guard.retain_uncertain();
 
     info!("Restore: cleared existing config, beginning import");
 
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
-    let (created, errors) = persist_payload_resources(db.as_ref(), &payload, false).await;
+    let import_operation = restore_guard.operation();
+    let (created, errors, _) = import_operation
+        .run_mutation(persist_payload_resources(
+            db.as_ref(),
+            &payload,
+            false,
+            &restore_mode,
+        ))
+        .await;
 
     info!(
         "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
@@ -4971,9 +5537,31 @@ async fn handle_restore(
             namespace,
             errors.join("; ")
         );
-        return Ok(
-            finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot).await,
+        return Ok(finish_failed_restore(
+            state,
+            db.clone(),
+            actor,
+            namespace,
+            errors,
+            &snapshot,
+            &mut restore_guard,
+        )
+        .await);
+    }
+
+    if let Err(error) = restore_guard.release().await {
+        error!(
+            namespace = %namespace,
+            error = %error,
+            "Restore: completed writes but retained the namespace admission guard"
         );
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "error": "Restore outcome requires manual verification; the namespace admission guard was retained",
+                "restore_errors": ["failed to release restore admission guard"],
+            }),
+        ));
     }
 
     let event = audit::AuditEvent::new(
@@ -5197,12 +5785,20 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     crate::config::types::redact_consumer_credentials(consumer)
 }
 
-fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
+fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
+    crate::config::types::redact_consumer_credentials_for_audit(consumer)
+}
+
+fn hash_consumer_secrets(
+    consumer: &mut Consumer,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     crate::config::types::hash_consumer_secrets(consumer)
 }
 
 /// Hash passwords in basicauth credential payloads where the credential type is known.
-fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<(), String> {
+fn hash_credential_passwords(
+    cred: &mut serde_json::Value,
+) -> Result<(), crate::config::types::BasicAuthCredentialPreparationError> {
     crate::config::types::hash_credential_passwords(cred)
 }
 
@@ -5498,6 +6094,20 @@ async fn handle_node_waypoint_identities_get(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_unique_conflict_response_redacts_mongo_credential_metadata() {
+        let secret = "must-not-escape-hmac-secret-at-least-32-characters";
+        let error = anyhow::anyhow!(
+            "E11000 duplicate key error dup key: {{ namespace: ferrum, credentials.hmac_auth.secret: {} }}",
+            secret
+        );
+
+        let message = crud::consumer_persist_error_message(&error);
+        assert!(message.contains("conflicts with another Consumer"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("credentials.hmac_auth.secret"));
+    }
 
     #[test]
     fn namespace_scoped_routes_cover_tenant_resources_only() {

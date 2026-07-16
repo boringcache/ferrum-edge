@@ -2438,7 +2438,9 @@ paths:
         Returns the merged runtime overlay built from every
         `envoy.service.runtime.v3.Runtime` layer the mesh xDS client has
         received. Each layer's top-level fields are flattened into a single
-        keyed map; later layers override earlier ones on key conflicts.
+        keyed map. Runtime resources are sorted lexicographically by name;
+        later names override earlier ones on key conflicts, and duplicate
+        names are rejected without replacing the last accepted set.
 
         Field values are typed:
         - `number` — `f64`
@@ -2448,11 +2450,10 @@ paths:
           Envoy `FractionalPercent` (`denominator` is one of `hundred`,
           `ten_thousand`, `million`)
 
-        Every proxy-accepted slice fans the overlay out to three live consumers:
+        Every proxy-accepted slice publishes the overlay to live consumers:
         - `ferrum.fault_injection.<scope>.abort_percent` /
-          `.delay_percent` rewires fault injection percentages on
-          `fault_injection` plugins that declared the matching
-          `runtime_overlay_scope`.
+          `.delay_percent` are captured atomically in the request epoch of
+          `fault_injection` plugins that declared the matching scope.
         - `ferrum.request_transformer.<scope>.enabled` /
           `ferrum.response_transformer.<scope>.enabled` short-circuit the
           opted-in header / query / body transformers.
@@ -3024,7 +3025,12 @@ paths:
         Returns successful admin API mutation events for the selected namespace.
         Requires an admin-role JWT. Each event includes actor, action, resource
         identity, timestamp, and a JSON diff. Consumer credential data is
-        redacted before it is written to the audit log.
+        redacted before it is written to the audit log. Sensitive plugin
+        configuration is redacted as well; Loki endpoint paths/queries,
+        authorization, and all custom-header values are never persisted in
+        the diff. Basic credential
+        mutations remain visible by type and action, but values, entry fields,
+        shape, and count are replaced by one stable `[REDACTED]` marker.
       tags: [Audit]
       parameters:
         - name: actor
@@ -3095,6 +3101,9 @@ paths:
 
         All fields within each resource follow the same schema as the
         individual create endpoints. IDs are auto-generated if omitted.
+        Plaintext Basic-auth passwords require a configured
+        `FERRUM_BASIC_AUTH_HMAC_SECRET` of at least 32 bytes; missing or weak
+        operator configuration fails the batch with 500 before persistence.
       tags: [Batch]
       requestBody:
         required: true
@@ -3129,8 +3138,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Backup & Restore ────────────────────────────────────────────────
   /backup:
@@ -3210,8 +3221,11 @@ paths:
         **Replacement operation** — snapshots the current namespace, deletes
         all existing resources, and imports the provided configuration. If any
         import (or the delete) step fails, Ferrum clears the partial state and
-        reapplies the snapshot. Requires `?confirm=true` query parameter to
-        prevent accidental invocation.
+        reapplies the snapshot. One persistent namespace-scoped datastore guard
+        spans that compensating clear and every replay batch, so other
+        DNS-sensitive writers cannot interleave with the rollback-only raw
+        replay. Requires `?confirm=true` query parameter to prevent accidental
+        invocation.
 
         The recovery snapshot uses a **non-validating raw load** from the
         primary, so an already-invalid-but-present namespace (the case an
@@ -3335,10 +3349,19 @@ paths:
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
           description: >-
-            Restore aborted because the prior configuration could not be
-            snapshotted for rollback (database/connectivity failure). Existing
-            config was NOT deleted; retry once the database is reachable. Also
-            returned when the admin API is otherwise unavailable.
+            Restore aborted because the pre-snapshot namespace guard could not
+            be acquired or the prior configuration could not be snapshotted for
+            rollback. A database/connectivity failure has `failure_class:
+            connectivity`. Existing config was NOT deleted; retry once the
+            database is reachable. Guard contention or an intentionally retained
+            uncertain operation instead returns the stable retryable
+            namespace-admission error.
+          headers:
+            Retry-After:
+              description: Present as `1` for namespace-admission contention.
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/json:
               schema:
@@ -3350,12 +3373,12 @@ paths:
                   failure_class:
                     type: string
                     enum: [connectivity]
-                    description: Distinguishes a retryable snapshot availability failure from stored-data corruption.
+                    description: Distinguishes a retryable guard/snapshot availability failure from stored-data corruption.
                   restore_errors:
                     type: array
                     items:
                       type: string
-                    description: The snapshot/connectivity error that caused the abort
+                    description: The guard, snapshot, or connectivity error that caused the abort
 
   # ── Proxies ─────────────────────────────────────────────────────────
   /proxies:
@@ -3424,13 +3447,13 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnly"
         "409":
-          description: Conflict — `listen_path` already exists, or stream proxy `listen_port` conflicts with another proxy, a gateway reserved port, or is not available on the host
+          description: Conflict — `listen_path` already exists, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /proxies/{id}:
     parameters:
@@ -3490,13 +3513,13 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: Conflict — `listen_path` already exists on another proxy, or stream proxy `listen_port` conflicts with another proxy, a gateway reserved port, or is not available on the host
+          description: Conflict — `listen_path` already exists on another proxy, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteProxy
@@ -3511,8 +3534,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Consumers ───────────────────────────────────────────────────────
   /consumers:
@@ -3580,8 +3605,12 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /consumers/{id}:
     parameters:
@@ -3614,6 +3643,10 @@ paths:
     put:
       operationId: updateConsumer
       summary: Update a consumer
+      description: >-
+        When `basicauth` is omitted from the request, an existing Basic
+        credential type is preserved; use `DELETE
+        /consumers/{id}/credentials/basicauth` to remove it.
       tags: [Consumers]
       requestBody:
         required: true
@@ -3636,8 +3669,12 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteConsumer
@@ -3652,8 +3689,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /consumers/{consumer_id}/credentials/{cred_type}:
     parameters:
@@ -3715,8 +3754,10 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     post:
       operationId: appendConsumerCredential
@@ -3752,8 +3793,10 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteConsumerCredentials
@@ -3768,8 +3811,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /consumers/{consumer_id}/credentials/{cred_type}/{index}:
     parameters:
@@ -3816,8 +3861,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Plugins ─────────────────────────────────────────────────────────
   /plugins:
@@ -3988,8 +4035,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /plugins/config/{id}:
     parameters:
@@ -4044,8 +4093,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deletePluginConfig
@@ -4060,8 +4111,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Upstreams ────────────────────────────────────────────────────────
   /upstreams:
@@ -4126,7 +4179,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /upstreams/{id}:
     parameters:
@@ -4182,7 +4235,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
       operationId: deleteUpstream
       summary: Delete an upstream
@@ -4197,7 +4250,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Namespaces ──────────────────────────────────────────────────────
   /namespaces:
@@ -4491,7 +4544,7 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnly"
         "409":
-          description: A spec already exists for this proxy ID, or a resource name / listen_path conflicts
+          description: A spec already exists for this proxy ID, a resource name / listen_path conflicts, or the embedded plugin associations would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -4523,7 +4576,7 @@ paths:
                   - $ref: "#/components/schemas/ApiSpecValidationError"
                   - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /api-specs/{id}:
     parameters:
@@ -4717,7 +4770,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle
+          description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle, or the replacement would make mTLS DNS identities ambiguous
           content:
             application/json:
               schema:
@@ -4748,7 +4801,7 @@ paths:
                   - $ref: "#/components/schemas/ApiSpecValidationError"
                   - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteApiSpec
@@ -4788,8 +4841,10 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /api-specs/by-proxy/{proxy_id}:
     parameters:
@@ -5019,7 +5074,7 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Conflict:
-      description: Resource already exists or conflicts with an existing resource
+      description: Resource already exists, conflicts with an existing resource, or the mutation would make mTLS DNS identities ambiguous
       content:
         application/json:
           schema:
@@ -5042,6 +5097,28 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    NamespaceAdmissionUnavailable:
+      description: >-
+        The mutation is temporarily unavailable. For namespace contention, the
+        namespace is fenced by another mutation or an intentionally retained
+        uncertain operation; retry after the indicated delay. Operators must
+        recover a retained uncertain fence before retries can succeed.
+      headers:
+        Retry-After:
+          required: false
+          description: >-
+            Minimum delay in seconds before retrying; present for
+            namespace-admission contention.
+          schema:
+            type: integer
+            minimum: 1
+            example: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: Namespace mutation is temporarily unavailable; retry later
     NotImplemented:
       description: Capability is not available in this build
       content:
@@ -5809,7 +5886,13 @@ components:
         diff:
           type: object
           additionalProperties: true
-          description: Redacted JSON before/after diff for the successful mutation
+          description: >-
+            Redacted JSON diff for the successful mutation. Basic credential
+            changes expose only the credential type, action, and a stable
+            `[REDACTED]` marker, never values, entry fields, shape, or count.
+            Sensitive plugin configuration is also redacted; loki_logging
+            endpoint paths/queries, authorization, and custom-header values
+            are never persisted.
 
     AuditEventListResponse:
       type: object
@@ -6343,8 +6426,15 @@ components:
       enum: [single, multi]
       default: single
       description: |
-        `single` — first successful auth plugin wins.
-        `multi` — all auth plugins run; no single rejection blocks the request.
+        `single` — auth plugins run in priority order until the first success.
+        For `basic_auth` and the Bearer-token mechanisms `jwt_auth`, `jwks_auth`,
+        and `oauth2_introspection`, a foreign `Authorization` scheme is skipped;
+        other mechanisms are not covered by this guarantee. Any rejection
+        returned by a plugin is terminal.
+        `multi` — auth plugins run sequentially until one succeeds. If none
+        succeeds, a server rejection takes precedence over the last ordinary
+        rejection; an all-missing chain returns the first available challenge
+        in plugin priority order, skipping challenge-less mechanisms.
 
     PluginAssociation:
       type: object
@@ -6400,6 +6490,8 @@ components:
             Credential values that serve as lookup keys must be unique across all
             consumers and across all entries within arrays. Max entries per type is
             controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
+            Ordinary Consumer responses omit `basicauth` entirely; authenticated
+            backup responses retain canonical unredacted values for restoration.
           properties:
             keyauth:
               type: array
@@ -6412,7 +6504,7 @@ components:
               items:
                 $ref: "#/components/schemas/BasicAuthCredential"
               minItems: 1
-              description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`.
+              description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`; omitted from ordinary Consumer responses.
             jwt:
               type: array
               items:
@@ -6424,7 +6516,7 @@ components:
               items:
                 $ref: "#/components/schemas/HmacAuthCredential"
               minItems: 1
-              description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username in Authorization header; all secrets tried.
+              description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username within the matched proxy namespace; all secrets tried.
             mtls_auth:
               type: array
               items:
@@ -6470,25 +6562,40 @@ components:
       properties:
         key:
           type: string
+          minLength: 1
+          pattern: "\\S"
           description: >-
-            API key value. Must be globally unique across all consumers.
+            API key value. Must be non-empty after trimming and globally unique
+            across all consumers.
       description: "API key credential for the `key_auth` authentication plugin."
 
     BasicAuthCredential:
       type: object
+      additionalProperties: false
+      oneOf:
+        - required: [password]
+        - required: [password_hash]
       properties:
         password:
           type: string
+          minLength: 1
+          maxLength: 4096
+          pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           writeOnly: true
           description: >-
             Plaintext password (automatically hashed on write using HMAC-SHA256
             with the server secret `FERRUM_BASIC_AUTH_HMAC_SECRET`). Mutually
-            exclusive with `password_hash`.
+            exclusive with `password_hash`. Must not contain ASCII control bytes
+            other than horizontal tab, line feed, and carriage return.
         password_hash:
           type: string
+          maxLength: 76
+          pattern: "^hmac_sha256:[0-9a-f]{64}$"
           description: >-
-            Pre-hashed password in `hmac_sha256:<hex>` format (constant-time,
-            ~1μs). On read, this field is always returned instead of `password`.
+            Pre-hashed password in `hmac_sha256:<64 lowercase hex>` format
+            (constant-time, ~1μs). Ordinary Consumer responses omit the
+            entire `basicauth` credential type; authenticated backups return
+            this canonical unredacted value for restoration.
       description: >-
         Basic auth credential for the `basic_auth` plugin. Supply either
         `password` (auto-hashed) or `password_hash` (pre-hashed). Indexed by
@@ -6513,16 +6620,21 @@ components:
     HmacAuthCredential:
       type: object
       required: [secret]
+      additionalProperties: false
       properties:
         secret:
           type: string
+          minLength: 32
           writeOnly: true
           description: >-
-            Shared secret for HMAC signature computation and verification.
+            Shared secret for HMAC signature computation and verification. Must
+            contain at least 32 non-whitespace characters and must not be
+            shared by different Consumers within one namespace. Separate
+            namespaces may reuse the same secret.
       description: >-
         HMAC auth credential for the `hmac_auth` plugin. Consumer is looked up
-        by username in the Authorization header; all secrets are tried until one
-        verifies the signature.
+        by username within the matched proxy namespace; all secrets are tried
+        until one verifies the namespace-bound signature.
 
     MtlsAuthCredential:
       type: object
@@ -6544,8 +6656,12 @@ components:
             all other certificate fields are compared exactly. Identities are
             always exact-unique across consumers and, while an enabled san_dns
             mTLS policy exists, must also be unique under ASCII case folding.
-            Database snapshots that violate the DNS rule are rejected before
-            runtime indexes are published.
+            Persistent backends serialize Consumer, policy, and proxy-association
+            admission per namespace so concurrent case variants or policy races
+            cannot commit ambiguity; ordinary conflicting CRUD writes return
+            409. Batch and restore use their documented per-item and rollback
+            responses. File, database, CP/DP, and reload snapshots reject
+            violations before runtime indexes are published.
       description: >-
         mTLS auth credential for the `mtls_auth` plugin. Indexed for O(1)
         lookup by certificate identity.
@@ -6584,15 +6700,22 @@ components:
           type: object
           default: {}
           description: >-
-            Plugin-specific JSON configuration. Validated on create/update and
-            again when the plugin is instantiated at config reload time.
-            Enabled plugin configs are validation-fatal when the plugin cache is
-            built: unknown plugin names or invalid plugin-specific config block
-            gateway startup in file mode, and on DB/CP polling the new config
-            snapshot is rejected as a whole (the gateway keeps serving the
-            prior good config). Disabled plugin configs are not instantiated.
-            See
-            `PluginConfigs` section for per-plugin schema definitions.
+            Plugin-specific JSON configuration. Resource-level size and depth
+            constraints are always validated. Plugin-specific construction is
+            performed on create/update and config reload only when `enabled` is
+            true. Enabled plugin configs are validation-fatal when the plugin
+            cache is built: unknown plugin names or invalid plugin-specific
+            config block gateway startup in file mode, and on DB/CP polling the
+            new config snapshot is rejected as a whole (the gateway keeps
+            serving the prior good config). Disabled plugin configs are stored
+            without construction, allowing secret-dependent plugins such as
+            `basic_auth` to be staged before their runtime secret is provisioned.
+            Enabling performs full validation. See `PluginConfigs` section for
+            per-plugin schema definitions. Viewer/operator responses use the
+            audit-safe projection while admin responses remain raw. For
+            loki_logging, that projection preserves only endpoint
+            scheme/host/port and redacts the path, query, authorization, and
+            every custom-header value.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
@@ -6607,6 +6730,9 @@ components:
         enabled:
           type: boolean
           default: true
+          description: >-
+            Whether the plugin is active. Disabled configs are stored but not
+            constructed; enabling them performs full plugin-specific validation.
         priority_override:
           type: [integer, "null"]
           minimum: 0
@@ -6893,6 +7019,7 @@ components:
               plugin_name:
                 const: bot_detection
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/BotDetectionConfig"
@@ -7139,6 +7266,7 @@ components:
               plugin_name:
                 const: ai_prompt_compressor
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/AiPromptCompressorConfig"
@@ -10385,28 +10513,69 @@ components:
 
     LokiLoggingConfig:
       type: object
-      description: "Plugin: loki_logging — Ships transaction logs to Grafana Loki via the push API in batched, label-grouped streams. Supports gzip compression, multi-tenant headers, and bearer/basic auth."
+      additionalProperties: false
+      description: >-
+        Plugin: loki_logging — Ships transaction logs to Grafana Loki via the
+        push API in bounded, label-grouped streams. HTTP 204 is the canonical
+        success response; other 2xx responses are accepted only when their body
+        drains completely and is empty. Loki's blocked-ingestion status 260,
+        non-empty/anomalous compatible-success responses, and every other
+        non-retryable response are terminal; 408, 429, and 5xx responses use
+        bounded exponential backoff with jitter. Explicit nulls and unknown
+        top-level fields are rejected.
       required:
         - endpoint_url
       properties:
         endpoint_url:
           type: string
-          description: Loki push API URL (e.g. http://loki:3100/loki/api/v1/push). Must be http:// or https://
+          format: uri
+          pattern: '^[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
+          description: >-
+            Loki push API URL (for example,
+            http://loki:3100/loki/api/v1/push). URL user information is
+            rejected; use authorization_header or custom_headers instead.
+            Path and query components are redacted from operational and
+            non-admin diagnostics.
         authorization_header:
           type: string
-          description: Full Authorization header value (e.g. "Bearer <token>" or "Basic <b64>")
+          minLength: 1
+          pattern: '^[\u0021-\u007E](?:[\u0009\u0020-\u007E]*[\u0021-\u007E])?$'
+          description: >-
+            Full Authorization header value (e.g. "Bearer <token>" or
+            "Basic <b64>"). Leading and trailing whitespace is rejected.
         custom_headers:
           type: object
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 65535
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties:
             type: string
-          description: Extra HTTP headers (e.g. X-Scope-OrgID for multi-tenant Loki)
+            pattern: '^[\u0009\u0020-\u007E]*$'
+          description: >-
+            Extra HTTP headers (for example, X-Scope-OrgID for multi-tenant
+            Loki). Names use HTTP token syntax and are at most 65,535 ASCII
+            bytes. All values are redacted from audit records and non-admin
+            config reads.
         labels:
           type: object
+          propertyNames:
+            pattern: '^(?!__)(?!ferrum_emitter$)[a-zA-Z_][a-zA-Z0-9_]{0,1023}$'
           additionalProperties:
             type: string
+            maxLength: 2048
           default:
             service: ferrum-edge
-          description: Static labels merged into every Loki stream. Keep cardinality low — labels are indexed
+          description: >-
+            Static labels merged into every Loki stream. Keep cardinality low
+            because labels are indexed. Names beginning with __ and the
+            reserved ferrum_emitter label are rejected. Ferrum Edge adds a
+            unique ferrum_emitter value per plugin instance so independently
+            ordered emitters never share a Loki stream. Each replica and each
+            rebuilt plugin generation therefore consumes a distinct active
+            stream for every other label combination; size Loki
+            max_streams_per_user limits and reload cadence accordingly.
         include_proxy_id_label:
           type: boolean
           default: true
@@ -10423,6 +10592,7 @@ components:
           type: integer
           default: 100
           minimum: 1
+          maximum: 10000
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -10432,16 +10602,45 @@ components:
         max_retries:
           type: integer
           default: 3
-          description: Retry attempts on failed batch delivery. 4xx other than 408/429 aborts immediately
+          minimum: 0
+          maximum: 10
+          description: >-
+            Retries after the initial delivery attempt. Only transport
+            failures, 408, 429, and 5xx retry. A received 204 is committed even
+            when its best-effort body drain is anomalous, avoiding duplicates.
         retry_delay_ms:
           type: integer
           default: 1000
-          description: Delay in milliseconds between retry attempts
+          minimum: 1
+          maximum: 60000
+          description: Initial exponential-backoff delay in milliseconds
         buffer_capacity:
           type: integer
           default: 10000
           minimum: 1
+          maximum: 1000000
           description: Channel capacity — new entries are dropped when full
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: >-
+            Maximum retained bytes for one serialized JSON line plus its Loki
+            labels. Configuration is rejected unless the configured
+            serializer's minimum HTTP and stream lines plus static, reserved,
+            and worst-case dynamic label values fit this budget. Request-shaped
+            fields can still make an individual serialized line exceed the
+            budget; those oversized entries are dropped before enqueue.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 1024
+          maximum: 268435456
+          description: >-
+            Per-plugin retained-content byte budget across queued, batched,
+            and retrying entries. Must be at least max_entry_bytes; entries
+            are dropped non-blockingly when the budget is exhausted.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -10534,16 +10733,13 @@ components:
 
     TransactionDebuggerConfig:
       type: object
-      description: "Plugin: transaction_debugger — Emits verbose request/response diagnostics via tracing::debug on the transaction_debug target. Requires FERRUM_LOG_LEVEL=debug to see output."
+      additionalProperties: false
+      description: >-
+        Plugin: transaction_debugger — Emits verbose request/response and
+        terminal diagnostics via tracing::debug on the transaction_debug
+        target. Request and response payloads are never captured. Requires
+        FERRUM_LOG_LEVEL=debug to see output. Unsupported keys are rejected.
       properties:
-        log_request_body:
-          type: boolean
-          default: false
-          description: Log incoming request body
-        log_response_body:
-          type: boolean
-          default: false
-          description: Log backend response body
         redacted_headers:
           type: array
           items:
@@ -11144,6 +11340,7 @@ components:
 
     JwksAuthConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: jwks_auth — Multi-provider JWKS JWT validation with claim-based authorization."
       required: [providers]
       properties:
@@ -11151,10 +11348,11 @@ components:
           type: array
           items:
             type: object
+            additionalProperties: false
             properties:
               jwks_uri:
                 type: string
-                description: Direct URL to the IdP's JWKS endpoint
+                description: Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or localhost endpoints. URL userinfo is rejected.
               discovery_url:
                 type: string
                 description: >-
@@ -11162,7 +11360,8 @@ components:
                   jwks_uri must use the same origin as the discovery URL
                   (scheme, host, and effective port). For IdPs that serve JWKS
                   from a different origin than discovery, configure jwks_uri
-                  directly instead.
+                  directly instead. HTTPS is required except for literal
+                  loopback or localhost endpoints. URL userinfo is rejected.
               jwks:
                 oneOf:
                   - type: string
@@ -11183,6 +11382,7 @@ components:
                 type: array
                 items:
                   type: object
+                  additionalProperties: false
                   required: [name]
                   properties:
                     name:
@@ -11502,8 +11702,11 @@ components:
                     type: string
               redirect_uri:
                 type: string
+                description: Absolute callback URI registered with the provider. Before issuing a browser challenge, Ferrum requires its host to match the validated request Host/:authority; DNS comparison is case-insensitive, IP literals compare by address, and ports are ignored. Trailing-dot DNS callback hosts and missing, malformed, or cross-host request authorities fail closed before state or cookies are issued.
               callback_path:
                 type: string
+                default: /oauth/callback
+                description: Callback path handled by Ferrum; must equal the path in redirect_uri.
               logout_path:
                 type: string
                 default: /oauth/logout
@@ -11583,6 +11786,7 @@ components:
               default: lax
             domain:
               type: string
+              description: Optional Domain attribute for the durable session cookie. The short-lived browser correlation cookie always remains host-only and never inherits this value.
             path:
               type: string
               default: /
@@ -11678,12 +11882,25 @@ components:
 
     KeyAuthConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: key_auth — API key authentication."
       properties:
         key_location:
           type: string
           default: "header:X-API-Key"
-          description: "Where to find the key (header:<name> or query:<name>)"
+          pattern: "^(header:[!#$%&'*+.^_`|~0-9A-Za-z-]+|query:\\S+)$"
+          description: >-
+            Exact credential location (header:<name> or query:<name>).
+            Whitespace is not trimmed; header names must be valid HTTP tokens,
+            and query names must be non-empty and contain no whitespace.
+        hide_credentials:
+          type: boolean
+          default: true
+          description: >-
+            Remove the configured API-key header or query parameter before
+            forwarding an authenticated request upstream, including when
+            another mechanism wins a multi-auth chain. Disable only when a
+            legacy backend explicitly requires the reusable credential.
 
     BasicAuthConfig:
       type: object
@@ -11706,6 +11923,9 @@ components:
         directory permits anonymous reads of group objects, so a service account
         is recommended. TLS connections (`ldaps://`/STARTTLS) honor the gateway
         CRL (`FERRUM_TLS_CRL_FILE_PATH`), rejecting revoked server certificates.
+        Every connection/reconnection performs an uncached A+AAAA lookup, screens
+        the complete candidate set and each imminent dial under the active backend
+        egress policy, and retains the configured hostname for TLS/SNI verification.
         Non-loopback plaintext `ldap://` is rejected unless the development-only
         `allow_plaintext` override is explicitly enabled. Search-then-bind requires
         a canonical identity attribute, rejects ambiguous searches, and exports the
@@ -11767,7 +11987,7 @@ components:
           pattern: "^ldaps?://"
           not:
             pattern: "^ldaps?://[^/?#]*@"
-          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected."
+          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected. Each connection freshly resolves and policy-screens all A/AAAA candidates while retaining this hostname for TLS/SNI verification."
           example: "ldaps://ldap.example.com:636"
         bind_dn_template:
           type: string
@@ -11788,7 +12008,7 @@ components:
         canonical_identity_attribute:
           type: string
           minLength: 1
-          description: "Required for search-then-bind. Exactly one value from the uniquely selected entry becomes the authenticated identity and Consumer mapping key (for example uid or sAMAccountName). Attribute-name matching is LDAP case-insensitive."
+          description: "Required for search-then-bind. Exactly one value from the uniquely selected entry becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive."
         service_account_dn:
           type: string
           minLength: 1
@@ -11806,7 +12026,7 @@ components:
         group_filter:
           type: string
           minLength: 1
-          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the presented login value; canonical_identity_attribute controls the exported Ferrum identity. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
+          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity: the presented username for direct bind, or canonical_identity_attribute for search-then-bind. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
         required_groups:
           type: array
           items:
@@ -11832,7 +12052,7 @@ components:
           default: 5
           minimum: 1
           maximum: 300
-          description: "Per-connection and per-operation timeout in seconds; also applied as the server-side LDAP search time limit"
+          description: "Per-connection DNS resolution, candidate TCP/TLS establishment, and per-operation timeout in seconds; also applied as the server-side LDAP search time limit"
         request_timeout_seconds:
           type: integer
           format: uint64
@@ -11866,7 +12086,17 @@ components:
 
     HmacAuthConfig:
       type: object
-      description: "Plugin: hmac_auth — HMAC signature verification with mandatory request-body integrity protection (RFC 9421 / RFC 3230). Requests must include a Digest or Content-Digest header that matches the request body; the digest header value and the raw query string are folded into the HMAC signing string (METHOD\\nPATH\\nQUERY\\nDATE\\nDIGEST), so altering query parameters or the body invalidates the signature. Note: the signed Date header provides a bounded freshness window (now ± clock_skew_seconds), not single-use replay prevention — there is no nonce store, so a captured valid request can be replayed within the window. Consumer credentials store the shared secret."
+      description: >-
+        Plugin: hmac_auth — Ferrum-specific versioned HMAC authorization with
+        mandatory request-body integrity protection. RFC 9530 defines
+        Content-Digest; this is not RFC 9421 HTTP Message Signatures. Requests
+        must include Digest or Content-Digest matching the original body.
+        Version 1 signs the matched proxy namespace, credential identity,
+        normalized authority, method, path, raw query, Date, and literal digest
+        value. HBONE CONNECT and
+        request-body-transformer compositions fail closed. The
+        pre-authentication body path has a 10 MiB hard ceiling. Date provides a
+        bounded freshness window, not single-use replay prevention.
       properties:
         clock_skew_seconds:
           type: integer
@@ -12489,11 +12719,11 @@ components:
                         type: integer
                         format: uint64
                         minimum: 1
-                        maximum: 3600000
+                        maximum: 60000
                         description: |
                           Sleep duration in milliseconds before dispatch
                           when the percentile roll hits. Bounded to
-                          `[1, 3_600_000]` (1 ms to 1 hour).
+                          `[1, 60_000]` (1 ms to 1 minute).
                       percentage:
                         type: number
                         format: double
@@ -12502,7 +12732,10 @@ components:
                         description: |
                           Percent of matching requests that trigger the
                           delay. `0.0` is rejected at config load time
-                          (omit the action to disable it instead).
+                          (omit the action to disable it instead). Positive
+                          values below one 64-bit sampler bucket round up
+                          to that first bucket so every accepted value can
+                          trigger.
                   abort:
                     type: object
                     additionalProperties: false
@@ -12517,17 +12750,20 @@ components:
                         format: double
                         exclusiveMinimum: 0
                         maximum: 100
+                        description: |
+                          Percent of matching requests that abort. Positive
+                          values below one 64-bit sampler bucket round up to
+                          that first bucket so every accepted value can trigger.
                       grpc_status:
                         type: integer
                         minimum: 0
                         maximum: 16
                         description: |
                           Optional gRPC status code emitted only when the
-                          matching request is detected as gRPC
-                          (`content-type: application/grpc[+...]`,
-                          excluding `application/grpc-web*`). Plain-HTTP
-                          requests on the same rule never receive a
-                          stray `grpc-status` header.
+                          immutable pre-plugin request flavor is native
+                          gRPC. Plain HTTP, WebSocket, and gRPC-Web requests
+                          never receive a stray `grpc-status` header even if
+                          an earlier hook rewrites `content-type`.
                       body:
                         type: [string, "null"]
                         description: Optional response body; empty when omitted.
@@ -12624,6 +12860,11 @@ components:
         Auto-injected by mesh mode on every applicable topology; reserved
         plugin id `__mesh_workload_metrics`. Standalone use is supported on
         non-mesh gateways that want Istio-style workload labels in logs.
+
+        Runtime admission permits at most 32 distinct custom tag names across
+        `custom_tags` and `custom_header_tags` combined. The individual
+        `maxProperties: 32` bounds remain for generated clients, but the
+        cross-property combined total cannot be expressed mechanically.
       properties:
         node_id:
           type: string
@@ -12667,14 +12908,27 @@ components:
           description: Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD).
         custom_tags:
           type: object
+          maxProperties: 32
           additionalProperties:
             type: string
-          description: Custom tags injected into every transaction's metadata.
+            maxLength: 1024
+          description: |
+            Custom tags injected into transaction metadata and exported spans.
+            Names are limited to 128 ASCII letters, digits, `.`, `_`, or `-`
+            and cannot collide with reserved, sensitive, `mesh.*`, trace, or
+            authorization keys. This map and `custom_header_tags` may contain
+            at most 32 distinct tag names combined.
         custom_header_tags:
           type: object
+          maxProperties: 32
           additionalProperties:
             type: string
-          description: Custom tags populated from request headers (`tag_name -> header_name`).
+          description: |
+            Custom tags populated from request headers (`tag_name ->
+            header_name`). Credential-bearing source headers and reserved or
+            sensitive destination names are rejected; runtime values over 1024
+            bytes are omitted. This map and `custom_tags` may contain at most
+            32 distinct tag names combined.
         metrics:
           type: object
           description: |
@@ -12687,9 +12941,20 @@ components:
                 type: object
                 required: [name, operation]
                 properties:
+                  metric:
+                    type: string
+                    description: |
+                      Metric family targeted by this override. Supported values
+                      are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum
+                      metric names, and `ALL_METRICS`; omitted means all metrics.
+                      Recognized Istio standard families Ferrum does not emit
+                      are accepted and ignored with a bounded construction-time
+                      warning; unknown families remain configuration errors.
                   name:
                     type: string
-                    description: Tag name to override.
+                    description: |
+                      Tag name to override. Accepts Istio names such as
+                      `source_workload` and Ferrum `mesh.*` label names.
                   operation:
                     type: object
                     required: [type]
@@ -12706,13 +12971,24 @@ components:
                         description: Replacement tag name when `type` is `rename`.
                       value:
                         type: string
-                        description: Replacement tag value when `type` is `set`.
+                        maxLength: 256
+                        description: |
+                          Replacement tag value when `type` is `set`. OpenAPI
+                          `maxLength` counts Unicode characters; runtime
+                          admission separately enforces at most 256 UTF-8 bytes,
+                          so multibyte values may be rejected below 256
+                          characters.
               description: Per-metric tag overrides translated from the Istio Telemetry CRD.
             disabled_metrics:
               type: array
               items:
                 type: string
-              description: Names of metrics suppressed by this workload (Istio Telemetry CRD).
+              description: |
+                Names of metrics suppressed by this workload. Supported values
+                are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum metric
+                names, and `ALL_METRICS`. Recognized Istio standard families
+                Ferrum does not emit are accepted and ignored with a bounded
+                construction-time warning; unknown families remain errors.
         tracing_providers:
           type: array
           items:
@@ -12945,15 +13221,58 @@ components:
               default: 10000
               description: Maximum nonce cache entries before eviction sweep
 
+    CorsExactOrigin:
+      oneOf:
+        - type: string
+          const: "*"
+        - type: string
+          minLength: 1
+          pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?:\[[0-9A-Fa-f:.]+\]|[^:/?#@\s]+)(?::[0-9]+)?$'
+      description: >-
+        Exact HTTP(S) origin. The runtime URL parser additionally validates the
+        host and port and canonicalizes scheme/host case, default ports, IDNA,
+        IPv4, and IPv6. Exact `*` is Istio's allow-all value.
+
+    CorsAllowedOriginString:
+      oneOf:
+        - $ref: '#/components/schemas/CorsExactOrigin'
+        - type: string
+          minLength: 3
+          pattern: '^\*\.[^*/:\s]+$'
+          description: Native wildcard-subdomain matcher such as `*.example.com`.
+
     CorsConfig:
       type: object
-      description: "Plugin: cors — Cross-Origin Resource Sharing."
+      additionalProperties: false
+      required: [allowed_origins]
+      description: |
+        Plugin: cors — Cross-Origin Resource Sharing. Unknown keys, null values,
+        non-object configs, and an omitted origin policy are rejected. Actual
+        requests evaluate origin/credentials/exposure behavior; method/header
+        allow-lists and max age govern preflight only.
+      allOf:
+        - if:
+            not:
+              required: [unmatched_preflights]
+          then:
+            properties:
+              allowed_methods:
+                minItems: 1
+                default: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+              allowed_headers:
+                minItems: 1
+                default: ["Accept", "Authorization", "Content-Type", "Origin", "X-Requested-With"]
+              max_age:
+                default: 86400
+        - not:
+            required: [preflight_continue, unmatched_preflights]
       properties:
         allowed_origins:
           type: array
+          minItems: 1
           items:
             oneOf:
-              - type: string
+              - $ref: '#/components/schemas/CorsAllowedOriginString'
               - type: object
                 additionalProperties: false
                 minProperties: 1
@@ -12964,43 +13283,62 @@ components:
                   multi-key objects are rejected at config time.
                 properties:
                   exact:
-                    type: string
-                    description: Exact origin match (case-insensitive).
+                    $ref: '#/components/schemas/CorsExactOrigin'
+                    description: >-
+                      Exact origin, canonicalized at config time (scheme/host
+                      case, IDNA, IP serialization, and default ports). The
+                      exact value `*` has Istio's documented allow-all meaning.
                   prefix:
                     type: string
+                    minLength: 1
                     description: >-
                       Literal byte-prefix of the request Origin header
                       (case-sensitive), e.g. "https://app.".
                   regex:
                     type: string
+                    minLength: 1
                     description: >-
                       RE2 pattern that must FULLY match the request Origin
                       header. Compiled (and size-bounded) at config time; an
                       invalid pattern is rejected.
-          default: ["*"]
           description: >-
-            Permitted origins. Each entry is either a string (`"*"` for any
-            origin, an exact `scheme://host[:port]` origin matched
-            case-insensitively, or a `*.suffix.com` wildcard-subdomain pattern)
+            Required permitted-origin policy. Each entry is either a string
+            (`"*"` for intentional allow-all, an exact `scheme://host[:port]`
+            origin canonicalized on the cold config path, or a
+            `*.suffix.com` wildcard-subdomain pattern)
             or an Istio `StringMatch`-shaped object carrying exactly one of
-            `exact` / `prefix` / `regex`. A matching origin is reflected verbatim
-            into `Access-Control-Allow-Origin`.
+            `exact` / `prefix` / `regex`. Prefix and regex retain literal Istio
+            matcher semantics and are not broadened by exact canonicalization.
         allowed_methods:
           type: array
           items:
             type: string
-          default: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-          description: Allowed methods
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: >-
+            Preflight-only allowed methods returned in
+            Access-Control-Allow-Methods. This list is not evaluated against
+            the actual request method. Omission uses the native direct-plugin
+            default; with `unmatched_preflights`, omission/empty preserves
+            Istio's empty list.
         allowed_headers:
           type: array
           items:
             type: string
-          default: ["Accept", "Authorization", "Content-Type", "Origin", "X-Requested-With"]
-          description: Allowed headers
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: >-
+            Preflight-only allowed request headers returned in
+            Access-Control-Allow-Headers. This list is not evaluated against
+            headers on the actual request. Omission uses the native
+            direct-plugin default; with `unmatched_preflights`, omission/empty
+            preserves Istio's empty list.
         exposed_headers:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: []
           description: Response headers exposed to browser JavaScript
         allow_credentials:
@@ -13010,12 +13348,27 @@ components:
         max_age:
           type: integer
           format: uint64
-          default: 86400
-          description: Preflight cache duration in seconds
+          minimum: 0
+          description: >-
+            Preflight cache duration in seconds. Native direct-plugin omission
+            defaults to 86400; translated Istio omission remains absent.
         preflight_continue:
           type: boolean
           default: false
-          description: Pass preflight requests to backend
+          description: >-
+            Pass allowed preflights to the backend. Backend status/body are
+            retained, but every Access-Control response field is replaced by
+            the complete gateway-authoritative policy.
+        unmatched_preflights:
+          type: string
+          enum: [forward, ignore]
+          description: >-
+            Istio projection marker. `forward` preserves omitted,
+            `UNSPECIFIED`, and `FORWARD` behavior; `ignore` returns a local 200
+            without CORS authorization fields. Its presence also preserves
+            omitted/empty method and header lists and omitted max age instead
+            of applying native direct-plugin defaults. It is mutually exclusive
+            with `preflight_continue`.
 
     OpaPluginConfig:
       type: object
@@ -13191,14 +13544,17 @@ components:
             - authorization
             - proxy-authorization
             - cookie
+            - api-key
             - x-api-key
+            - x-goog-api-key
             - x-auth-token
             - x-csrf-token
             - x-xsrf-token
             - x-forwarded-authorization
           description: >-
             Additional request headers to redact from `input.headers`. Built-in
-            sensitive headers are always redacted.
+            sensitive headers and active authentication credential headers are
+            always omitted.
         redact_query_keys:
           type: array
           items:
@@ -13224,7 +13580,10 @@ components:
         keys are rejected. `allow_authenticated_identity=true` cannot be combined
         with an allow-list (`allowed_consumers`/`allowed_groups`) because the
         allow-list is not applied to unmapped external identities. Use
-        ip_restriction for IP/CIDR rules.
+        ip_restriction for IP/CIDR rules. Rule entries match principal values
+        byte-for-byte (no trimming) and must contain at least one
+        non-whitespace character. Whitespace admission follows Rust
+        `str::trim` Unicode `White_Space` semantics.
       allOf:
         - anyOf:
             - required: [allowed_consumers]
@@ -13267,6 +13626,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             Consumer usernames that are explicitly allowed. Empty list disables
@@ -13275,14 +13637,24 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 4096
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
-            Consumer usernames that are explicitly denied. Takes precedence
-            over every allow rule.
+            Consumer usernames or, when allow_authenticated_identity is true,
+            exact external principals that are explicitly denied. Takes
+            precedence over every allow rule. The 4096-character bound is
+            independent of the 255-character gateway Consumer username ceiling
+            so JWT, OIDC, and SPIFFE-style principals can be revoked; longer
+            external identities fail closed at runtime.
         allowed_groups:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             ACL group names that are explicitly allowed. The check matches if
@@ -13291,6 +13663,9 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             ACL group names that are explicitly denied. If any of the consumer's
@@ -13302,7 +13677,8 @@ components:
           description: >-
             Allow requests whose `ctx.authenticated_identity` is set by an
             external auth plugin (e.g. jwks_auth) even when no gateway Consumer
-            was mapped. Cannot be combined with an allow-list
+            was mapped. Empty or whitespace-only identities are unauthenticated.
+            Cannot be combined with an allow-list
             (`allowed_consumers`/`allowed_groups`); the deny-list
             `disallowed_consumers` is still applied to the external identity.
 
@@ -13325,6 +13701,7 @@ components:
 
     AdaptiveConcurrencyConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: adaptive_concurrency — Target-aware backend admission for
         upstream survival. Runs after load balancing for HTTP, gRPC, native
@@ -13347,7 +13724,7 @@ components:
           format: uint64
           default: 10000
           minimum: 1
-          description: Maximum number of distinct target keys this plugin instance will track, bounding limiter memory for high-cardinality wildcard upstreams. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503), running unlimited until key churn or a config reload frees a tracked slot. Existing keys continue to be admitted subject to their adaptive limit.
+          description: Maximum number of distinct target keys this stable plugin policy will track, bounding limiter memory for high-cardinality wildcard upstreams. State is retained across compatible config reloads. Lowering this value or changing the policy's effective subset-filtered backend targets, route-override destinations, or route execution order publishes an independent tracking space; retired permits finish against detached state, while retired cache and load-balancer views cannot admit, repopulate, or train the replacement. Service-discovery changes outside the policy's selected subset remain compatible. When the cap is reached, new target keys fail open — they are admitted without adaptive limiting (never rejected with a 503) until the policy is removed/recreated, its route key space changes, or the process restarts. Existing keys continue to be admitted subject to their adaptive limit.
         min_limit:
           type: integer
           format: uint64
@@ -13394,14 +13771,15 @@ components:
         shadow_mode:
           type: boolean
           default: false
-          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit.
+          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. Retired cache/load-balancer views and requests crossing a structural generation handoff still fail closed so they cannot repopulate the replacement tracking space.
         expose_headers:
           type: boolean
           default: false
-          description: Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on rejection responses.
+          description: Include `x-adaptive-concurrency-limit` and `x-adaptive-concurrency-inflight` on genuine per-target limit rejections. Generation-handoff rejections omit them because no truthful per-target limit or in-flight value exists.
 
     IpRestrictionConfig:
       type: object
+      additionalProperties: false
       anyOf:
         - required: [allow]
           properties:
@@ -13413,17 +13791,28 @@ components:
               minItems: 1
       description: >-
         Plugin: ip_restriction — IP/CIDR allow/deny enforcement. Rules are
-        validated and pre-parsed at config load time; invalid IPv4/IPv6
-        addresses or CIDR prefixes reject plugin creation. Supports IPv4 exact
-        and CIDR (`/0`-`/32`) and IPv6 exact and CIDR (`/0`-`/128`); IPv6 zone
-        identifiers (e.g. `%eth0`) on rules or client IPs are stripped before
-        matching. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
-        At least one of `allow` or `deny` is required.
+        validated and compiled at config load time into sorted, merged numeric
+        intervals; invalid IPv4/IPv6 addresses or CIDR prefixes reject plugin
+        creation. Request lookup is allocation-free, lock-free, and logarithmic
+        in the number of non-overlapping intervals. The authoritative client IP
+        is parsed/canonicalized once per request or stream session and reused by
+        every plugin instance. IPv4 octets must use canonical unsigned decimal
+        notation (for example, `010.1.2.3` and `+10.1.2.3` are rejected).
+        Supports IPv4 exact and CIDR (`/0`-`/32`) and native IPv6 exact and CIDR
+        (`/0`-`/128`). IPv4-mapped IPv6 rules normalize to IPv4, so mapped CIDRs
+        accept only `/96`-`/128` (equivalent to IPv4 `/0`-`/32`); shorter mapped
+        prefixes are rejected as ambiguous. IPv6 zone identifiers (e.g. `%eth0`)
+        on rules or client IPs are stripped before matching. Runs on every
+        protocol — HTTP, gRPC, WebSocket, TCP, UDP, and DTLS. Config must be an
+        object, unknown properties and null values are rejected, and at least
+        one of `allow` or `deny` must be non-empty.
       properties:
         allow:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: '.*\S.*'
           default: []
           description: >-
             Allowed IP addresses or CIDR ranges (IPv4 or IPv6). Empty list
@@ -13432,6 +13821,8 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: '.*\S.*'
           default: []
           description: >-
             Denied IP addresses or CIDR ranges (IPv4 or IPv6). Always takes
@@ -13449,8 +13840,22 @@ components:
 
     BotDetectionConfig:
       type: object
+      additionalProperties: false
+      allOf:
+        - if:
+            required: [blocked_patterns]
+            properties:
+              blocked_patterns:
+                type: array
+                maxItems: 0
+          then:
+            required: [allow_missing_user_agent]
+            properties:
+              allow_missing_user_agent:
+                const: false
       description: >-
         Plugin: bot_detection — case-insensitive User-Agent matching.
+        Configuration must be an object and unknown properties are rejected.
         `blocked_patterns` are substring matches; `allow_list` entries are
         word-boundary matches and are consulted before blocked patterns, so a
         User-Agent that contains a blocked substring can still pass if it also
@@ -13461,12 +13866,15 @@ components:
         (empty `blocked_patterns` while missing User-Agent headers are allowed)
         is rejected; an allow-list alone is not enforcement. The User-Agent is
         client-controlled and spoofable, so this is a coarse filter, not strong
-        bot verification. HTTP-family only.
+        bot verification. Pattern entry whitespace follows Rust `str::trim`
+        Unicode `White_Space` semantics. HTTP-family only.
       properties:
         blocked_patterns:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default:
             - curl
             - wget
@@ -13480,35 +13888,48 @@ components:
             - php/
           description: >-
             User-Agent substrings to reject (case-insensitive). Specifying this
-            field replaces the defaults entirely. Setting it to `[]` is valid
-            only when `allow_missing_user_agent: false` creates a missing-header
-            reject path; an allow-list alone is not enforcement.
+            field with an array replaces the defaults entirely. Entries are
+            trimmed and must contain a non-whitespace character. `null` is the
+            same as omission and installs the documented defaults. Setting the
+            field to `[]` is valid only when `allow_missing_user_agent: false`
+            creates a missing-header reject path; an allow-list alone is not
+            enforcement.
         allow_list:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             User-Agent tokens that always pass, evaluated before
             `blocked_patterns` (allow wins). Matching is case-insensitive and
             word-boundary anchored, so an entry only matches when it appears as
-            a standalone token in the User-Agent.
+            a standalone token in the User-Agent. Entries are trimmed and must
+            contain a non-whitespace character. `null` is the same as omission
+            and installs an empty allow list.
         allow_missing_user_agent:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: >-
             When true (default), requests with no User-Agent header pass — this
             keeps health-check and load-balancer probes working. Set to false
-            to reject them with `custom_response_code`.
+            to reject them with `custom_response_code`. `null` is the same as
+            omission and selects `true`.
         custom_response_code:
-          type: integer
+          type: [integer, "null"]
           format: uint16
-          minimum: 100
+          minimum: 400
           maximum: 599
           default: 403
           description: >-
-            HTTP status code returned for rejected requests. Values outside
-            100–599 (or non-numeric values) are silently coerced to 403.
+            For non-gRPC requests, the final 4xx or 5xx HTTP status returned
+            with the JSON rejection body. Native gRPC requests instead return
+            an empty-body HTTP 200 trailers-only error with this HTTP status
+            mapped to `grpc-status` and `Forbidden` in `grpc-message`. Values
+            outside 400–599, including informational and no-body status codes,
+            and non-integer values are rejected. `null` is the same as omission
+            and selects 403.
 
     RequestTransformerConfig:
       type: object
@@ -13656,12 +14077,14 @@ components:
 
     SecurityHeadersConfig:
       type: object
-      description: "Plugin: security_headers — Injects response security headers (secure defaults) and strips fingerprinting headers in after_proxy."
+      additionalProperties: false
+      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected."
       properties:
         content_type_options:
           oneOf:
             - type: boolean
             - type: string
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
           default: nosniff
           description: "X-Content-Type-Options. true = nosniff (default); a string sets a custom value; false/null disables."
@@ -13669,6 +14092,7 @@ components:
           oneOf:
             - type: boolean
             - type: string
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
           default: SAMEORIGIN
           description: "X-Frame-Options. Default SAMEORIGIN; string overrides; false disables."
@@ -13676,6 +14100,7 @@ components:
           oneOf:
             - type: boolean
             - type: string
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
           default: strict-origin-when-cross-origin
           description: "Referrer-Policy. Default strict-origin-when-cross-origin; string overrides; false disables."
@@ -13684,8 +14109,10 @@ components:
           oneOf:
             - type: boolean
             - type: string
+              pattern: '^[\u0009\u0020-\u007E]*$'
             - type: "null"
             - type: object
+              additionalProperties: false
               properties:
                 max_age:
                   type: integer
@@ -13699,21 +14126,32 @@ components:
                   default: false
         content_security_policy:
           type: [string, "null"]
+          pattern: '^[\u0009\u0020-\u007E]*$'
           description: "Content-Security-Policy value (opt-in; application-specific)."
         permissions_policy:
           type: [string, "null"]
+          pattern: '^[\u0009\u0020-\u007E]*$'
           description: "Permissions-Policy value (opt-in)."
         set:
           type: [object, "null"]
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 65535
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties:
             type: string
-          description: "Arbitrary response headers to set (name -> value). Values must not contain CR, LF, or NUL."
+            pattern: '^[\u0009\u0020-\u007E]*$'
+          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
         remove:
           type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            maxLength: 65535
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: [server, x-powered-by]
-          description: "Response header names to strip (case-insensitive). Defaults to Server and X-Powered-By; set [] to strip nothing."
+          description: "Valid HTTP field names (maximum 65,535 ASCII bytes) to strip case-insensitively. Names are canonicalized to lowercase. Defaults to Server and X-Powered-By; set [] to strip nothing."
         override_existing:
           type: boolean
           default: true
@@ -14402,10 +14840,10 @@ components:
     FaultInjectionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; stream faults run on stream connect."
+      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; raw TCP faults run on stream connect. UDP and DTLS are not supported."
       properties:
         abort:
-          type: object
+          type: [object, "null"]
           additionalProperties: false
           properties:
             status_code:
@@ -14417,36 +14855,52 @@ components:
               type: number
               exclusiveMinimum: 0
               maximum: 100
-              description: Abort probability as a percentage
+              description: Abort probability as a percentage. Positive values below one 64-bit sampler bucket round up to that first bucket.
             grpc_status:
               type: integer
               minimum: 0
               maximum: 16
-              description: Optional gRPC status trailer emitted for gRPC rejects
+              description: Optional gRPC status emitted only for native application/grpc requests; plain HTTP, WebSocket, and gRPC-Web rejects omit it
             body:
               type: string
               default: ""
               description: HTTP response body returned with the abort
           required: [status_code, percentage]
         delay:
-          type: object
+          type: [object, "null"]
           additionalProperties: false
           properties:
             duration_ms:
               type: integer
               format: uint64
               minimum: 1
-              maximum: 3600000
-              description: Delay duration before continuing or aborting
+              maximum: 60000
+              description: Delay duration before continuing or aborting, capped at one minute
             percentage:
               type: number
               exclusiveMinimum: 0
               maximum: 100
-              description: Delay probability as a percentage
+              description: Delay probability as a percentage. Positive values below one 64-bit sampler bucket round up to that first bucket.
           required: [duration_ms, percentage]
+        runtime_overlay_scope:
+          type: [string, "null"]
+          pattern: '\S'
+          description: |
+            Optional RTDS scope containing at least one non-whitespace
+            character; null is equivalent to omission, and leading and
+            trailing whitespace is trimmed. The accepted request epoch captures
+            `ferrum.fault_injection.<scope>.abort_percent` and `.delay_percent`
+            atomically with this plugin config. Missing or malformed keys fall
+            back independently to the static percentage.
       anyOf:
         - required: [abort]
+          properties:
+            abort:
+              type: object
         - required: [delay]
+          properties:
+            delay:
+              type: object
 
     BodyValidatorConfig:
       type: object
@@ -14838,30 +15292,32 @@ components:
 
     SpecExposeConfig:
       type: object
-      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) on a /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s) to avoid hitting the upstream document store on every /specz request; failures are not cached."
+      additionalProperties: false
+      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) for GET and HEAD on the canonical /specz sub-path. HEAD retains the GET representation through response-body policy, then returns the final status and representation headers without a wire body. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are capped by max_response_body_bytes and cached in-process for cache_ttl_seconds (default 300s). Failed fetches are coalesced and negatively cached with bounded exponential backoff; excess cache-miss waiters receive HTTP 503 with Retry-After."
       required:
         - spec_url
       properties:
         spec_url:
           type: string
-          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml)"
+          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml). URL userinfo is rejected. Paths and queries may be used for origin routing or signed access, but are omitted from gateway diagnostics."
         content_type:
-          type: string
-          description: "Override the response Content-Type. When omitted, the upstream response's Content-Type is passed through."
+          type: [string, "null"]
+          description: "Trusted response Content-Type override; it is not restricted by the upstream allow-list. When omitted or null, only supported spec media types are preserved from upstream (case-insensitive media-type comparison, with original parameters retained); every other or missing value falls back to application/octet-stream."
         tls_no_verify:
-          type: boolean
-          description: "Skip TLS certificate verification when fetching the spec. Defaults to the gateway's FERRUM_TLS_NO_VERIFY setting."
+          type: [boolean, "null"]
+          description: "Skip TLS certificate verification when fetching the spec. Omitted or null defaults to the gateway's FERRUM_TLS_NO_VERIFY setting. When verification is enabled and a gateway CA bundle is configured, load or parse failure rejects plugin construction instead of widening trust."
         cache_ttl_seconds:
-          type: integer
+          type: [integer, "null"]
           format: uint64
+          minimum: 0
           default: 300
-          description: "Time-to-live for the in-process spec body cache (seconds). The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Failed fetches are never cached. Set to 0 to disable caching entirely (every request re-fetches)."
+          description: "Time-to-live for the in-process spec body cache (seconds). Omitted or null defaults to 300. The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Set to 0 to disable durable positive caching; callers admitted before an in-flight fetch completes still share that fetch regardless of scheduling delay, while later requests immediately re-fetch. Failed fetches use bounded negative-cache backoff regardless of this value."
         max_response_body_bytes:
-          type: integer
+          type: [integer, "null"]
           format: uint64
           minimum: 1
           default: 26214400
-          description: "Maximum upstream spec response body size to buffer and cache. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth."
+          description: "Maximum upstream spec response body size to buffer and cache. Omitted or null defaults to 26214400. The body is streamed with this cap so oversized responses are rejected with HTTP 502 before unbounded memory growth."
 
     LoadTestingConfig:
       type: object
@@ -15231,33 +15687,64 @@ components:
       type: object
       description: >-
         Plugin: grpc_method_router — Per-method access control and rate limiting
-        for gRPC services. Parses the gRPC path (/package.Service/Method) and
-        populates grpc_service, grpc_method, grpc_full_method metadata. Rate-limit
-        counter storage supports only local memory and Redis; database-backed
-        counters are intentionally unsupported.
+        for gRPC services. Authorizes the backend-effective gRPC path after
+        route rewrites, listen-path stripping, backend-path composition, and
+        initial target selection, then populates grpc_service, grpc_method, and
+        grpc_full_method metadata with that final method. At least one access or
+        rate rule is required. Rate-limit counter storage supports only local
+        memory and Redis; database-backed counters are intentionally unsupported.
+      allOf:
+        - anyOf:
+            - required: [allow_methods]
+            - required: [deny_methods]
+              properties:
+                deny_methods:
+                  minItems: 1
+            - required: [method_rate_limits]
+              properties:
+                method_rate_limits:
+                  minProperties: 1
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
       properties:
         allow_methods:
           type: array
+          uniqueItems: true
           items:
             type: string
+            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
           description: >-
             Only these gRPC methods are permitted (allowlist). Each entry is a
-            full method path like /package.Service/Method.
+            full method path like /package.Service/Method. Leading/trailing
+            whitespace and one optional leading slash are normalized by the
+            runtime. Duplicate normalized forms are rejected at runtime; JSON
+            Schema uniqueItems can reject only byte-identical duplicates.
         deny_methods:
           type: array
+          uniqueItems: true
           items:
             type: string
+            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
           default: []
           description: >-
             These gRPC methods are explicitly blocked. Deny takes precedence
-            over allow.
+            over allow. Duplicate normalized forms are rejected at runtime;
+            JSON Schema uniqueItems can reject only byte-identical duplicates.
         method_rate_limits:
           type: object
+          propertyNames:
+            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
           additionalProperties:
             $ref: "#/components/schemas/RateSpec"
           description: >-
             Per-method rate limits keyed by full method path
-            (e.g., /myapp.UserService/CreateUser).
+            (e.g., /myapp.UserService/CreateUser). Duplicate normalized keys
+            cannot be expressed by JSON Schema and are rejected at runtime.
         limit_by:
           type: string
           enum: [ip, consumer]
@@ -15272,6 +15759,8 @@ components:
           description: "gRPC method rate-limit counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported."
         redis_url:
           type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
           description: "Redis connection URL. Required when sync_mode is 'redis'."
         redis_tls:
           type: boolean
@@ -15279,10 +15768,12 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
+          minLength: 1
           default: "ferrum:grpc_method_router"
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
           description: Number of multiplexed Redis connections
         redis_username:
@@ -15293,10 +15784,12 @@ components:
           description: Redis password
         redis_connect_timeout_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Redis connection timeout in seconds
         redis_health_check_interval_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Health check ping interval when Redis is unavailable
 
@@ -15318,17 +15811,34 @@ components:
 
     GrpcDeadlineConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: grpc_deadline — Manages the grpc-timeout metadata header.
-        Supports all gRPC timeout units (H, M, S, m, u, n).
+        Supports all gRPC timeout units (H, M, S, m, u, n). At least one
+        effective rule is required. When both deadline values are configured,
+        default_deadline_ms must be less than or equal to max_deadline_ms;
+        runtime validation enforces this cross-field relationship.
+      anyOf:
+        - required: [max_deadline_ms]
+        - required: [default_deadline_ms]
+        - required: [subtract_gateway_processing]
+          properties:
+            subtract_gateway_processing:
+              const: true
+        - required: [reject_no_deadline]
+          properties:
+            reject_no_deadline:
+              const: true
       properties:
         max_deadline_ms:
           type: integer
           format: uint64
+          minimum: 1
           description: Cap incoming deadlines to this value (milliseconds)
         default_deadline_ms:
           type: integer
           format: uint64
+          minimum: 1
           description: Inject grpc-timeout when client omits it
         subtract_gateway_processing:
           type: boolean
@@ -15340,8 +15850,10 @@ components:
           type: boolean
           default: false
           description: >-
-            Reject requests missing grpc-timeout with HTTP 400. Takes
-            precedence over default_deadline_ms.
+            Reject requests missing a positive grpc-timeout. Takes precedence
+            over default_deadline_ms. Native H2/H3 gRPC clients receive HTTP
+            200 with a non-OK grpc-status in the trailers-only header block;
+            the internal plugin rejection status is not exposed as HTTP 400.
 
     AiSemanticFirewallBuiltinPackConfig:
       oneOf:
@@ -16246,7 +16758,20 @@ components:
 
     AiPromptCompressorConfig:
       type: object
-      description: "Plugin: ai_prompt_compressor — Shortens LLM prompt text to reduce token usage, cost, and latency using a model-free statistical (extractive) filter. Rewrites messages[].content (per role) and the legacy top-level prompt in OpenAI-shaped chat/completions bodies. Code blocks, inline code, URLs, numbers, and identifiers are preserved verbatim, and negations are always kept. No model files, network calls, or external services are used."
+      additionalProperties: false
+      allOf:
+        - if:
+            required: [request_family]
+            properties:
+              request_family:
+                const: text_completions
+          then:
+            properties:
+              compress_roles:
+                contains:
+                  type: string
+                  pattern: '^\s*[Uu][Ss][Ee][Rr]\s*$'
+      description: "Plugin: ai_prompt_compressor — Shortens LLM prompt text to reduce token usage, cost, and latency using a bounded model-free statistical (extractive) filter. Rewrites messages[].content (per role) and the legacy top-level prompt only for admitted OpenAI Chat Completions or Text Completions representations. Code blocks, inline code, URLs, Unicode numbers, common identifiers, and negations are preserved verbatim. Configured preserve markers use a bounded representation-preserving fallback whenever statistical compression is skipped. Successful compression rewrites reserialize the complete JSON body. No model files, network calls, or external services are used."
       properties:
         compress_roles:
           type: array
@@ -16266,18 +16791,26 @@ components:
         min_content_tokens:
           type: integer
           minimum: 0
+          maximum: 131072
           default: 200
           description: "Estimated-token floor per content string. Content below this is passed through unchanged so short prompts are not mangled. Token counts are estimated (~4 characters per token); no model tokenizer is embedded."
         max_scan_bytes:
           type: integer
           minimum: 1
+          maximum: 1048576
           default: 1048576
-          description: "Skip compression when the request body exceeds this size."
+          description: "Skip statistical compression when the request body exceeds this size. Configured preserve-marker sanitation remains active up to the immutable 1048576-byte hard body/output maximum and fails closed above it. Eligible prompt text is additionally capped at 524288 bytes, 32768 combined whitespace/tokenizer/marker work units, 256 rewritable fields, and 1024 preserve markers per body. A transformed body is staged beside request metadata for wire-path reuse only when it is at most 65536 bytes."
         preserve_tag:
           type: string
           minLength: 1
+          maxLength: 64
           pattern: '^[A-Za-z0-9_-]+$'
-          description: "Optional marker name. Text wrapped in <TAG>...</TAG> is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Name may contain ASCII letters, digits, '-', and '_'."
+          description: "Optional marker name. Text wrapped in <TAG>...</TAG> is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Nested spans are flattened while preserving their text; unmatched and JSON-escaped markers are stripped deterministically from every admitted request family even when statistical compression is skipped. Name may contain at most 64 ASCII letters, digits, '-', and '_'."
+        request_family:
+          type: string
+          enum: [auto, chat_completions, text_completions]
+          default: auto
+          description: "Request-family gate. 'auto' requires a body shape matching the standard endpoint path suffix (/chat/completions or /completions). A fixed family is an explicit opt-in for compatible custom endpoint paths and still rejects malformed, provider-native, or ambiguous body shapes."
 
     AiResponseGuardConfig:
       type: object
@@ -17935,6 +18468,7 @@ components:
         max_requests:
           type: integer
           format: uint64
+          minimum: 1
           description: Maximum requests allowed in the window
         window_seconds:
           type: integer

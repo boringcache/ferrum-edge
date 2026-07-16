@@ -1,7 +1,7 @@
 use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::{
     HTTP_GRPC_PROTOCOLS, MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult,
-    RequestContext, TransactionSummary, log_with_mirror, priority,
+    RequestContext, TransactionSummary, create_plugin, log_with_mirror, priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -103,6 +103,33 @@ async fn test_mirror_result_logging_is_detached_from_primary_path() {
     assert!(!summaries[0].mirror);
     assert!(summaries[1].mirror);
     assert_eq!(summaries[1].response_status_code, 204);
+}
+
+#[tokio::test]
+async fn expired_grpc_deadline_does_not_suppress_transaction_logging() {
+    let deadline_plugin = create_plugin("grpc_deadline", &json!({ "default_deadline_ms": 1 }))
+        .unwrap()
+        .unwrap();
+    let logger = Arc::new(CapturingMirrorLogger {
+        summaries: Mutex::new(Vec::new()),
+    });
+    let plugins: Vec<Arc<dyn Plugin>> = vec![deadline_plugin, logger.clone()];
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(matches!(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
+        PluginResult::Continue
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    log_with_mirror(&plugins, &TransactionSummary::default(), &ctx).await;
+
+    assert_eq!(
+        logger.summaries.lock().unwrap().len(),
+        1,
+        "client-visible deadline expiry must not suppress the gateway audit record"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +612,70 @@ fn test_mirror_path_override() {
         PluginHttpClient::default(),
     );
     assert!(plugin.is_ok());
+}
+
+#[tokio::test]
+async fn test_backend_path_policy_mirror_uses_authorized_effective_path() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request_line = String::from_utf8_lossy(&request)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let _ = tx.send(request_line);
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "percentage": 100
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx_with_proxy();
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/allowed.Service/Rewritten",
+    );
+    let mut headers = HashMap::new();
+
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let _ = ctx.collect_mirror_result().await;
+
+    let request_line = rx.await.expect("mirror request line");
+    assert!(
+        request_line.starts_with("POST /allowed.Service/Rewritten?"),
+        "mirror must use the backend-effective authorized path, got {request_line:?}"
+    );
+    assert!(
+        !request_line.contains("/api/users"),
+        "mirror must not replay the unauthorized original path"
+    );
 }
 
 // ---------------------------------------------------------------------------

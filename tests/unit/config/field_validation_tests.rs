@@ -11,6 +11,7 @@ use ferrum_edge::config::types::{
     MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, MeshSdConfig, PassiveHealthCheck,
     PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider, ServiceDiscoveryConfig,
     SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
+    validate_basic_auth_hmac_secret,
 };
 use ferrum_edge::modes::mesh::config::MeshTrafficPolicyTls;
 use std::collections::HashMap;
@@ -136,7 +137,7 @@ fn make_plugin_config(id: &str) -> PluginConfig {
         id: id.into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
@@ -569,6 +570,92 @@ fn test_consumer_credential_control_chars() {
         errs.iter()
             .any(|e| e.contains("credentials.keyauth[0].key") && e.contains("control"))
     );
+}
+
+#[test]
+fn test_consumer_basicauth_accepts_one_plaintext_or_canonical_hash() {
+    for credential in [
+        serde_json::json!({"password": "admin-write-password"}),
+        serde_json::json!({"password_hash": format!("hmac_sha256:{}", "a".repeat(64))}),
+    ] {
+        let mut consumer = make_consumer("test", "alice");
+        consumer
+            .credentials
+            .insert("basicauth".into(), serde_json::json!([credential]));
+        assert!(consumer.validate_fields().is_ok());
+    }
+}
+
+#[test]
+fn test_consumer_basicauth_rejects_unusable_entries() {
+    let invalid_credentials = [
+        serde_json::json!({}),
+        serde_json::json!({"password": "secret", "password_hash": format!("hmac_sha256:{}", "a".repeat(64))}),
+        serde_json::json!({"password": "secret", "unexpected": true}),
+        serde_json::json!({"password": ""}),
+        serde_json::json!({"password": "embedded\0null"}),
+        serde_json::json!({"password": 42}),
+        serde_json::json!({"password_hash": "hmac_sha256:not-hex"}),
+        serde_json::json!({"password_hash": format!("hmac_sha256:{}", "A".repeat(64))}),
+        serde_json::json!({"password_hash": 42}),
+    ];
+
+    for credential in invalid_credentials {
+        let mut consumer = make_consumer("test", "alice");
+        consumer
+            .credentials
+            .insert("basicauth".into(), serde_json::json!([credential]));
+        let errors = consumer.validate_fields().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("credentials.basicauth[0]")),
+            "unexpected errors: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn test_basic_auth_hmac_secret_requires_32_bytes() {
+    assert!(validate_basic_auth_hmac_secret(&"x".repeat(31)).is_err());
+    assert!(validate_basic_auth_hmac_secret(&"x".repeat(32)).is_ok());
+}
+
+#[test]
+fn test_consumer_keyauth_requires_nonempty_string_key() {
+    for credential in [
+        serde_json::json!({}),
+        serde_json::json!({"kee": "misspelled"}),
+        serde_json::json!({"key": 42}),
+        serde_json::json!({"key": ""}),
+        serde_json::json!({"key": "   "}),
+    ] {
+        let mut consumer = make_consumer("test", "alice");
+        consumer
+            .credentials
+            .insert("keyauth".into(), serde_json::json!([credential]));
+
+        let errors = consumer
+            .validate_fields()
+            .expect_err("malformed keyauth credentials must fail closed");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("credentials.keyauth[0].key")),
+            "unexpected errors: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn test_consumer_keyauth_accepts_valid_rotation_array() {
+    let mut consumer = make_consumer("test", "alice");
+    consumer.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "current-key"}, {"key": "next-key"}]),
+    );
+
+    assert!(consumer.validate_fields().is_ok());
 }
 
 #[test]

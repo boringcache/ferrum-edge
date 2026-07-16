@@ -18,12 +18,17 @@
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::types::{GatewayConfig, PluginScope};
 use tracing::{error, warn};
 
+use crate::adaptive_concurrency::{
+    AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
+    adaptive_concurrency_scope,
+};
 use crate::config::types::PluginConfig;
-use crate::plugins::utils::jwks_cache::retain_active_uris;
+use crate::plugins::utils::jwks_cache::retain_active_requirements;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
 };
@@ -33,9 +38,9 @@ use crate::plugins::{
 // ---------------------------------------------------------------------------
 
 use crate::plugins::{
-    PluginResult, RequestContext, ResponseStreamInspector, StreamConnectionContext,
-    StreamTransactionSummary, TransactionSummary, UdpDatagramContext, UdpDatagramVerdict,
-    WebSocketFrameDirection,
+    BackendPathPolicyPhase, PluginResult, RequestContext, ResponseStreamInspector,
+    StreamConnectionContext, StreamTransactionSummary, TransactionSummary, UdpDatagramContext,
+    UdpDatagramVerdict, WebSocketFrameDirection,
 };
 use async_trait::async_trait;
 
@@ -46,8 +51,53 @@ struct PriorityOverridePlugin {
     priority: u16,
 }
 
+/// Per-chain CORS wrapper. It avoids mutating a shared plugin instance when a
+/// proxy-group or global CORS policy participates in a multiple-instance chain
+/// for only some proxies.
+struct DeferredCorsPlugin {
+    inner: Arc<dyn Plugin>,
+}
+
+#[async_trait]
+impl Plugin for DeferredCorsPlugin {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn priority(&self) -> u16 {
+        self.inner.priority()
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        self.inner.supported_protocols()
+    }
+
+    async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        ctx.cors_state.defer_finalization = true;
+        self.inner.on_request_received(ctx).await
+    }
+
+    fn is_deferred_cors_wrapper(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        false
+    }
+}
+
 const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";
 const MESH_ROUTE_DISPATCH_FINALIZER_NAME: &str = "__mesh_route_dispatch_finalizer";
+const CORS_NAME: &str = "cors";
 
 /// Cache-internal sentinel placed immediately after the last route-dispatch
 /// instance. Individual instances stage fail-closed misses on `RequestContext`;
@@ -130,6 +180,79 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
     Ok(())
 }
 
+/// Install one aggregate CORS boundary after every attached CORS instance has
+/// evaluated the request. The chain must remain contiguous so an intervening
+/// short-circuit plugin cannot bypass a later CORS policy.
+fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), String> {
+    plugins.retain(|plugin| plugin.name() != crate::plugins::cors::CORS_FINALIZER_NAME);
+    let Some(first_index) = plugins.iter().position(|plugin| plugin.name() == CORS_NAME) else {
+        return Ok(());
+    };
+    let Some(last_index) = plugins
+        .iter()
+        .rposition(|plugin| plugin.name() == CORS_NAME)
+    else {
+        return Err("cors cache invariant lost its first instance".to_string());
+    };
+    if first_index == last_index {
+        return Ok(());
+    }
+    if plugins[first_index..=last_index].iter().any(|plugin| {
+        plugin.name() != CORS_NAME
+            && plugin
+                .supported_protocols()
+                .iter()
+                .any(|protocol| crate::plugins::HTTP_GRPC_PROTOCOLS.contains(protocol))
+    }) {
+        return Err(
+            "cors instances must remain contiguous in HTTP/gRPC chains so their origin and preflight method/header policies can be intersected before any request short-circuits; remove priority overrides that interleave another HTTP/gRPC plugin"
+                .to_string(),
+        );
+    }
+    for plugin in &mut plugins[first_index..=last_index] {
+        if plugin.name() == CORS_NAME && !plugin.is_deferred_cors_wrapper() {
+            *plugin = Arc::new(DeferredCorsPlugin {
+                inner: Arc::clone(plugin),
+            });
+        }
+    }
+    let priority = plugins[last_index].priority();
+    plugins.insert(
+        last_index + 1,
+        Arc::new(crate::plugins::cors::CorsFinalizer::new(priority)),
+    );
+    Ok(())
+}
+
+/// HMAC authenticates the exact client-visible request body and digest. A later
+/// body transform would make the backend-visible bytes disagree with the
+/// signed `Digest`/`Content-Digest` and `Authorization` fields. Reject that
+/// composition at cache build time instead of forwarding stale integrity
+/// metadata or silently weakening authentication.
+fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
+    for protocol in ALL_PROXY_PROTOCOLS {
+        if !plugins
+            .iter()
+            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+            .any(|plugin| plugin.name() == "hmac_auth")
+        {
+            continue;
+        }
+        if let Some(transformer) = plugins
+            .iter()
+            .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+            .find(|plugin| plugin.modifies_request_body())
+        {
+            return Err(format!(
+                "hmac_auth cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; HMAC authenticates the client-to-gateway representation and Ferrum will not forward stale signed digest metadata",
+                transformer.name(),
+                protocol
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Plugin for PriorityOverridePlugin {
     fn name(&self) -> &str {
@@ -137,6 +260,12 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn priority(&self) -> u16 {
         self.priority
+    }
+    fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
+        self.inner.prepare_grpc_deadline(ctx)
+    }
+    fn requires_grpc_deadline_preflight(&self) -> bool {
+        self.inner.requires_grpc_deadline_preflight()
     }
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.on_request_received(ctx).await
@@ -150,6 +279,9 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
         self.inner.mark_query_credentials_for_redaction(ctx);
+    }
+    fn request_headers_to_redact(&self) -> &[String] {
+        self.inner.request_headers_to_redact()
     }
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.authorize(ctx).await
@@ -169,6 +301,14 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_request_body_before_authenticate(&self) -> bool {
         self.inner.requires_request_body_before_authenticate()
     }
+    fn should_buffer_request_body_before_authenticate(
+        &self,
+        ctx: &RequestContext,
+        consumer_index: &crate::consumer_index::ConsumerIndex,
+    ) -> bool {
+        self.inner
+            .should_buffer_request_body_before_authenticate(ctx, consumer_index)
+    }
     fn requires_request_body_before_authorize(&self) -> bool {
         self.inner.requires_request_body_before_authorize()
     }
@@ -177,6 +317,9 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn needs_request_body_bytes(&self) -> bool {
         self.inner.needs_request_body_bytes()
+    }
+    fn needs_request_body_digests(&self) -> bool {
+        self.inner.needs_request_body_digests()
     }
     fn needs_request_body_text(&self) -> bool {
         self.inner.needs_request_body_text()
@@ -190,6 +333,26 @@ impl Plugin for PriorityOverridePlugin {
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
         self.inner.before_proxy(ctx, headers).await
+    }
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        self.inner.defer_before_proxy_until_backend_path_resolved()
+    }
+    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
+        self.inner
+            .deferred_before_proxy_may_change_routing_headers()
+    }
+    fn requires_backend_path_resolution(&self) -> bool {
+        self.inner.requires_backend_path_resolution()
+    }
+    async fn on_backend_path_resolved(
+        &self,
+        ctx: &mut RequestContext,
+        backend_path: &str,
+        phase: BackendPathPolicyPhase,
+    ) -> PluginResult {
+        self.inner
+            .on_backend_path_resolved(ctx, backend_path, phase)
+            .await
     }
     fn enable_deferred_unmatched_rejection(&self) {
         self.inner.enable_deferred_unmatched_rejection();
@@ -216,6 +379,19 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .after_proxy(ctx, response_status, response_headers)
             .await
+    }
+    fn is_initial_response_header_policy(&self) -> bool {
+        self.inner.is_initial_response_header_policy()
+    }
+    fn apply_initial_response_header_policy(
+        &self,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner
+            .apply_initial_response_header_policy(response_headers);
+    }
+    fn initial_response_header_policy_names(&self) -> &[String] {
+        self.inner.initial_response_header_policy_names()
     }
     fn may_modify_response_content_type(
         &self,
@@ -257,6 +433,12 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn applies_after_proxy_on_reject(&self) -> bool {
         self.inner.applies_after_proxy_on_reject()
+    }
+    fn may_replace_rejection_response(&self) -> bool {
+        self.inner.may_replace_rejection_response()
+    }
+    fn warn_on_rejection_response_replacement(&self) -> bool {
+        self.inner.warn_on_rejection_response_replacement()
     }
     fn requires_response_body_buffering(&self) -> bool {
         self.inner.requires_response_body_buffering()
@@ -565,6 +747,9 @@ impl Plugin for PriorityOverridePlugin {
     fn active_jwks_uris(&self) -> Vec<String> {
         self.inner.active_jwks_uris()
     }
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+        self.inner.active_jwks_refresh_requirements()
+    }
 }
 
 /// Try to create a plugin and apply `priority_override` from the plugin config.
@@ -575,9 +760,24 @@ impl Plugin for PriorityOverridePlugin {
 /// fail-open behavior.
 fn try_create_plugin(
     pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
     http_client: &PluginHttpClient,
+    current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
+    staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
-    match create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone()) {
+    let created = if pc.plugin_name == "adaptive_concurrency" {
+        create_adaptive_concurrency_plugin(
+            pc,
+            gateway_config,
+            http_client,
+            current_adaptive_states,
+            staged_adaptive_states,
+        )
+    } else {
+        create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone())
+    };
+
+    match created {
         Ok(Some(plugin)) => {
             let plugin: Arc<dyn Plugin> = if let Some(priority) = pc.priority_override {
                 Arc::new(PriorityOverridePlugin {
@@ -644,11 +844,1175 @@ type RequestBufferingMap = HashMap<String, bool>;
 type WsFrameMap = HashMap<String, bool>;
 /// Map from proxy_group plugin_config_id to its shared plugin instance.
 type ProxyGroupInstanceMap = HashMap<String, ProxyGroupPluginInstance>;
+type HmacCompositionPluginMap<'a> =
+    HashMap<(&'a str, &'a str), (&'a PluginConfig, Arc<dyn Plugin>)>;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct AdaptiveConcurrencyPolicyId {
+    namespace: String,
+    plugin_config_id: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AdaptiveConcurrencyRouteKey {
+    scope: String,
+    host: Option<String>,
+    port: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AdaptiveConcurrencyRouteOverride {
+    proxy_id: String,
+    plugin_name: String,
+    effective_priority: u16,
+    destination_fingerprint: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AdaptiveConcurrencyUpstreamRoute {
+    scope: String,
+    upstream_id: String,
+    subset: Option<String>,
+    backend_port: u16,
+    port_override_keys: Vec<u16>,
+    resolved_port_override_keys: Vec<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AdaptiveConcurrencyRouteDefinition {
+    protected_proxy_ids: Vec<String>,
+    keys: Vec<AdaptiveConcurrencyRouteKey>,
+    overrides: Vec<AdaptiveConcurrencyRouteOverride>,
+    upstream_routes: Vec<AdaptiveConcurrencyUpstreamRoute>,
+}
+
+#[derive(Clone)]
+struct AdaptiveConcurrencyInstance {
+    limiter: Arc<AdaptiveConcurrencyLimiter>,
+    config: Arc<AdaptiveConcurrencyConfig>,
+    config_value: serde_json::Value,
+    scope: PluginScope,
+    proxy_id: Option<String>,
+    route_definition: AdaptiveConcurrencyRouteDefinition,
+    generation: u64,
+    reset_tracking_space: bool,
+}
+
+type AdaptiveConcurrencyInstanceMap =
+    HashMap<AdaptiveConcurrencyPolicyId, AdaptiveConcurrencyInstance>;
+
+fn adaptive_concurrency_policy_id(pc: &PluginConfig) -> AdaptiveConcurrencyPolicyId {
+    AdaptiveConcurrencyPolicyId {
+        namespace: pc.namespace.clone(),
+        plugin_config_id: pc.id.clone(),
+    }
+}
+
+fn adaptive_definition_matches(
+    state: &AdaptiveConcurrencyInstance,
+    pc: &PluginConfig,
+    route_definition: &AdaptiveConcurrencyRouteDefinition,
+) -> bool {
+    state.config_value == pc.config
+        && state.scope == pc.scope
+        && state.proxy_id == pc.proxy_id
+        && state.route_definition.eq(route_definition)
+}
+
+fn scoped_plugin_config_applies_to_proxy(
+    pc: &PluginConfig,
+    proxy: &crate::config::types::Proxy,
+) -> bool {
+    match &pc.scope {
+        PluginScope::Global => false,
+        PluginScope::Proxy => {
+            pc.proxy_id.as_deref() == Some(proxy.id.as_str())
+                && proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == pc.id)
+        }
+        PluginScope::ProxyGroup => proxy
+            .plugins
+            .iter()
+            .any(|association| association.plugin_config_id == pc.id),
+    }
+}
+
+fn plugin_config_effectively_applies_to_proxy(
+    pc: &PluginConfig,
+    proxy: &crate::config::types::Proxy,
+    config: &GatewayConfig,
+) -> bool {
+    if !pc.enabled {
+        return false;
+    }
+    match &pc.scope {
+        PluginScope::Global => !config.plugin_configs.iter().any(|candidate| {
+            candidate.enabled
+                && candidate.plugin_name == pc.plugin_name
+                && scoped_plugin_config_applies_to_proxy(candidate, proxy)
+        }),
+        PluginScope::Proxy | PluginScope::ProxyGroup => {
+            scoped_plugin_config_applies_to_proxy(pc, proxy)
+        }
+    }
+}
+
+fn target_matches_subset(
+    upstream: &crate::config::types::Upstream,
+    target: &crate::config::types::UpstreamTarget,
+    subset_name: Option<&str>,
+) -> bool {
+    let Some(subset_name) = subset_name else {
+        return true;
+    };
+    upstream
+        .subsets
+        .as_ref()
+        .and_then(|subsets| subsets.iter().find(|subset| subset.name == subset_name))
+        .is_some_and(|subset| {
+            subset
+                .labels
+                .iter()
+                .all(|(key, value)| target.tags.get(key) == Some(value))
+        })
+}
+
+fn push_upstream_route(
+    keys: &mut Vec<AdaptiveConcurrencyRouteKey>,
+    upstream_routes: &mut Vec<AdaptiveConcurrencyUpstreamRoute>,
+    scope: String,
+    upstream_id: &str,
+    subset: Option<&str>,
+    backend_port: u16,
+    upstream: Option<&crate::config::types::Upstream>,
+) {
+    let port_override_keys = upstream
+        .map(adaptive_concurrency_port_override_keys)
+        .unwrap_or_default();
+    let resolved_port_override_keys = upstream
+        .map(adaptive_concurrency_resolved_port_override_keys)
+        .unwrap_or_default();
+    let port_scope = upstream.and_then(|upstream| {
+        adaptive_concurrency_upstream_port_scope(
+            backend_port,
+            &port_override_keys,
+            &resolved_port_override_keys,
+            &upstream.targets,
+        )
+    });
+    upstream_routes.push(AdaptiveConcurrencyUpstreamRoute {
+        scope: scope.clone(),
+        upstream_id: upstream_id.to_string(),
+        subset: subset.map(ToOwned::to_owned),
+        backend_port,
+        port_override_keys,
+        resolved_port_override_keys,
+    });
+    let key_count = keys.len();
+    if let Some(upstream) = upstream {
+        keys.extend(
+            upstream
+                .targets
+                .iter()
+                .filter(|target| target_matches_subset(upstream, target, subset))
+                .filter(|target| {
+                    port_scope.is_none_or(|port| target.dispatch_policy_port() == port)
+                })
+                .map(|target| AdaptiveConcurrencyRouteKey {
+                    scope: scope.clone(),
+                    host: Some(target.host.clone()),
+                    port: Some(target.port),
+                }),
+        );
+    }
+    if keys.len() == key_count {
+        // Preserve the route source while service discovery has no effective
+        // target for this upstream/subset.
+        keys.push(AdaptiveConcurrencyRouteKey {
+            scope,
+            host: None,
+            port: None,
+        });
+    }
+}
+
+fn adaptive_concurrency_port_override_keys(upstream: &crate::config::types::Upstream) -> Vec<u16> {
+    let mut keys = upstream.port_overrides.keys().copied().collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys
+}
+
+fn adaptive_concurrency_resolved_port_override_keys(
+    upstream: &crate::config::types::Upstream,
+) -> Vec<u16> {
+    let mut keys = upstream
+        .port_overrides
+        .iter()
+        .filter_map(|(port, value)| {
+            crate::config::types::ResolvedPortOverride::from_upstream_override(value).map(|_| *port)
+        })
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+fn adaptive_concurrency_upstream_port_scope(
+    backend_port: u16,
+    port_override_keys: &[u16],
+    resolved_port_override_keys: &[u16],
+    targets: &[crate::config::types::UpstreamTarget],
+) -> Option<u16> {
+    if port_override_keys.is_empty() || targets.is_empty() {
+        return None;
+    }
+
+    let mut full_coverage_port = None;
+    let mut full_coverage_count = 0usize;
+    for port in port_override_keys {
+        if targets
+            .iter()
+            .all(|target| target.dispatch_policy_port() == *port)
+        {
+            full_coverage_count += 1;
+            full_coverage_port = Some(*port);
+        }
+    }
+    let dispatch_port = if full_coverage_count == 1 {
+        full_coverage_port.unwrap_or(backend_port)
+    } else {
+        backend_port
+    };
+    (resolved_port_override_keys
+        .binary_search(&dispatch_port)
+        .is_ok()
+        && targets
+            .iter()
+            .any(|target| target.dispatch_policy_port() == dispatch_port))
+    .then_some(dispatch_port)
+}
+
+fn push_direct_route_key(
+    keys: &mut Vec<AdaptiveConcurrencyRouteKey>,
+    key_by: AdaptiveConcurrencyKeyBy,
+    proxy: &crate::config::types::Proxy,
+    host: &str,
+    port: u16,
+) {
+    keys.push(AdaptiveConcurrencyRouteKey {
+        scope: adaptive_concurrency_scope(key_by, proxy, None),
+        host: Some(normalize_adaptive_concurrency_direct_host(host)),
+        port: Some(port),
+    });
+}
+
+fn normalize_adaptive_concurrency_direct_host(host: &str) -> String {
+    // GatewayConfig::normalize_fields delegates configured destinations to
+    // Proxy::normalize_fields and Upstream::normalize_fields. Route overrides
+    // bypass those host fields, so mirror their lowercase contract here.
+    host.trim().to_ascii_lowercase()
+}
+
+fn route_override_priority(pc: &PluginConfig) -> u16 {
+    pc.priority_override
+        .unwrap_or(match pc.plugin_name.as_str() {
+            "ai_stream_router" => crate::plugins::priority::AI_STREAM_ROUTER,
+            "mcp_gateway" => crate::plugins::priority::MCP_GATEWAY,
+            "mesh_route_dispatch" => crate::plugins::priority::MESH_ROUTE_DISPATCH,
+            _ => crate::plugins::priority::DEFAULT,
+        })
+}
+
+fn effective_route_override_configs_for_proxy<'a>(
+    proxy: &crate::config::types::Proxy,
+    config: &'a GatewayConfig,
+) -> Vec<&'a PluginConfig> {
+    const ROUTE_OVERRIDE_PLUGINS: &[&str] =
+        &["ai_stream_router", "mcp_gateway", "mesh_route_dispatch"];
+    let mut route_configs = Vec::new();
+
+    // Match PluginCache construction order before its stable priority sort:
+    // globals, proxy-scoped configs in config order, then proxy-group configs
+    // in association order.
+    route_configs.extend(config.plugin_configs.iter().filter(|pc| {
+        pc.scope == PluginScope::Global
+            && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+            && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
+    }));
+    route_configs.extend(config.plugin_configs.iter().filter(|pc| {
+        pc.scope == PluginScope::Proxy
+            && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+            && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
+    }));
+    for association in &proxy.plugins {
+        if let Some(pc) = config.plugin_configs.iter().find(|pc| {
+            pc.id == association.plugin_config_id
+                && pc.scope == PluginScope::ProxyGroup
+                && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+                && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
+        }) {
+            route_configs.push(pc);
+        }
+    }
+    route_configs.sort_by_key(|pc| route_override_priority(pc));
+    route_configs
+}
+
+fn url_destination_fingerprint(url: &str) -> serde_json::Value {
+    let parse_source = url.replace("{model}", "__FERRUM_MODEL__");
+    if let Ok(parsed) = url::Url::parse(&parse_source)
+        && let (Some(host), Some(port)) = (parsed.host_str(), parsed.port_or_known_default())
+    {
+        return serde_json::json!({
+            "host": host.to_ascii_lowercase(),
+            "port": port
+        });
+    }
+    // Invalid route configs fail their own constructor validation. Retaining
+    // the raw value here keeps staged fingerprinting deterministic until that
+    // validation rejects the generation.
+    serde_json::Value::String(url.to_string())
+}
+
+fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Value {
+    match pc.plugin_name.as_str() {
+        "mesh_route_dispatch" => {
+            let normalized_config =
+                crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value_normalized(
+                    &pc.config,
+                )
+                .ok()
+                .and_then(|config| serde_json::to_value(config).ok());
+            let fingerprint_config = normalized_config.as_ref().unwrap_or(&pc.config);
+            let rules = fingerprint_config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .map(|rules| {
+                    rules
+                        .iter()
+                        .map(|rule| {
+                            let redirects = rule
+                                .get("redirect")
+                                .is_some_and(|redirect| !redirect.is_null());
+                            let destination = if redirects {
+                                None
+                            } else {
+                                rule.get("destination")
+                                    .and_then(serde_json::Value::as_object)
+                            };
+                            let upstream_id = destination
+                                .and_then(|value| value.get("upstream_id"))
+                                .cloned();
+                            let backend_host = destination
+                                .and_then(|value| value.get("backend_host"))
+                                .map(|value| {
+                                    value.as_str().map_or_else(
+                                        || value.clone(),
+                                        |host| {
+                                            serde_json::Value::String(
+                                                normalize_adaptive_concurrency_direct_host(host),
+                                            )
+                                        },
+                                    )
+                                });
+                            let backend_port = destination
+                                .and_then(|value| value.get("backend_port"))
+                                .cloned();
+                            let backend_tls = destination
+                                .and_then(|value| value.get("backend_tls"))
+                                .cloned();
+                            let requires_node_waypoint_authz = destination
+                                .and_then(|value| value.get("requires_node_waypoint_authz"))
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
+                            serde_json::json!({
+                                "match": rule
+                                    .get("match")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({})),
+                                "destination": {
+                                    "upstream_id": upstream_id,
+                                    "backend_host": backend_host,
+                                    "backend_port": backend_port,
+                                    "backend_tls": backend_tls,
+                                    "requires_node_waypoint_authz": requires_node_waypoint_authz
+                                },
+                                // Redirect presence suppresses backend dispatch; its
+                                // response-only fields do not affect limiter keys.
+                                "redirects": redirects
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "reject_unmatched": fingerprint_config
+                    .get("reject_unmatched")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                "rules": rules
+            })
+        }
+        "ai_stream_router" => {
+            let enabled = pc
+                .config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if !enabled {
+                return serde_json::json!({"enabled": false});
+            }
+            let mut providers = pc
+                .config
+                .get("providers")
+                .and_then(serde_json::Value::as_array)
+                .map(|providers| {
+                    providers
+                        .iter()
+                        .enumerate()
+                        .map(|(index, provider)| {
+                            let priority = provider
+                                .get("priority")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or((index as u64).saturating_add(1));
+                            serde_json::json!({
+                                "priority": priority,
+                                "model_patterns": provider
+                                    .get("model_patterns")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!([])),
+                                "destination": provider
+                                    .get("endpoint")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(url_destination_fingerprint)
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            providers.sort_by_key(|provider| {
+                provider
+                    .get("priority")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(u64::MAX)
+            });
+            serde_json::json!({
+                "enabled": true,
+                "fail_on_missing_model": pc
+                    .config
+                    .get("fail_on_missing_model")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                "fail_on_no_matching_provider": pc
+                    .config
+                    .get("fail_on_no_matching_provider")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                "providers": providers
+            })
+        }
+        "mcp_gateway" => {
+            let enabled = pc
+                .config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if !enabled {
+                return serde_json::json!({"enabled": false});
+            }
+            let mut servers = pc
+                .config
+                .get("servers")
+                .and_then(serde_json::Value::as_object)
+                .map(|servers| {
+                    servers
+                        .iter()
+                        .map(|(server_id, server)| {
+                            let enabled = server
+                                .get("enabled")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(true);
+                            if !enabled {
+                                return serde_json::json!({
+                                    "server_id": server_id,
+                                    "enabled": false
+                                });
+                            }
+                            serde_json::json!({
+                                "server_id": server_id,
+                                "namespace": server.get("namespace").cloned(),
+                                "enabled": true,
+                                "expose_tools": server
+                                    .get("expose_tools")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(true),
+                                "expose_resources": server
+                                    .get("expose_resources")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false),
+                                "expose_prompts": server
+                                    .get("expose_prompts")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false),
+                                "destination": server
+                                    .get("upstream_url")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(url_destination_fingerprint)
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            servers.sort_by(|left, right| {
+                left.get("server_id")
+                    .and_then(serde_json::Value::as_str)
+                    .cmp(&right.get("server_id").and_then(serde_json::Value::as_str))
+            });
+            serde_json::json!({
+                "enabled": true,
+                "mode": pc.config.get("mode").cloned(),
+                "endpoint_path": pc
+                    .config
+                    .get("endpoint")
+                    .and_then(|value| value.get("path"))
+                    .cloned(),
+                "namespace_separator": pc
+                    .config
+                    .get("discovery")
+                    .and_then(|value| value.get("namespace_separator"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("."),
+                "passthrough_unknown_methods": pc
+                    .config
+                    .get("capabilities")
+                    .and_then(|value| value.get("passthrough_unknown_methods"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                "servers": servers
+            })
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn collect_route_override_destinations(
+    route_pc: &PluginConfig,
+    proxy: &crate::config::types::Proxy,
+    key_by: AdaptiveConcurrencyKeyBy,
+    config: &GatewayConfig,
+    keys: &mut Vec<AdaptiveConcurrencyRouteKey>,
+    upstream_routes: &mut Vec<AdaptiveConcurrencyUpstreamRoute>,
+) {
+    match route_pc.plugin_name.as_str() {
+        "mesh_route_dispatch" => {
+            let Some(rules) = route_pc
+                .config
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return;
+            };
+            for destination in rules
+                .iter()
+                .filter(|rule| {
+                    !rule
+                        .get("redirect")
+                        .is_some_and(|redirect| !redirect.is_null())
+                })
+                .filter_map(|rule| {
+                    rule.get("destination")
+                        .and_then(serde_json::Value::as_object)
+                })
+            {
+                if let Some(upstream_id) = destination
+                    .get("upstream_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let subset = if proxy.upstream_id.as_deref() == Some(upstream_id) {
+                        proxy.upstream_subset.as_deref()
+                    } else {
+                        None
+                    };
+                    let upstream = config
+                        .upstreams
+                        .iter()
+                        .find(|upstream| upstream.id == upstream_id);
+                    push_upstream_route(
+                        keys,
+                        upstream_routes,
+                        adaptive_concurrency_scope(key_by, proxy, Some(upstream_id)),
+                        upstream_id,
+                        subset,
+                        proxy.backend_port,
+                        upstream,
+                    );
+                } else if let (Some(host), Some(port)) = (
+                    destination
+                        .get("backend_host")
+                        .and_then(serde_json::Value::as_str),
+                    destination
+                        .get("backend_port")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|port| u16::try_from(port).ok()),
+                ) {
+                    push_direct_route_key(keys, key_by, proxy, host, port);
+                }
+            }
+        }
+        "ai_stream_router" => {
+            if route_pc
+                .config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                return;
+            }
+            if let Some(providers) = route_pc
+                .config
+                .get("providers")
+                .and_then(serde_json::Value::as_array)
+            {
+                for endpoint in providers.iter().filter_map(|provider| {
+                    provider.get("endpoint").and_then(serde_json::Value::as_str)
+                }) {
+                    let parse_source = endpoint.replace("{model}", "__FERRUM_MODEL__");
+                    if let Ok(parsed) = url::Url::parse(&parse_source)
+                        && let (Some(host), Some(port)) =
+                            (parsed.host_str(), parsed.port_or_known_default())
+                    {
+                        push_direct_route_key(keys, key_by, proxy, host, port);
+                    }
+                }
+            }
+        }
+        "mcp_gateway" => {
+            if route_pc
+                .config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                return;
+            }
+            if let Some(servers) = route_pc
+                .config
+                .get("servers")
+                .and_then(serde_json::Value::as_object)
+            {
+                for upstream_url in servers
+                    .values()
+                    .filter(|server| {
+                        server
+                            .get("enabled")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(true)
+                    })
+                    .filter_map(|server| {
+                        server
+                            .get("upstream_url")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                {
+                    if let Ok(parsed) = url::Url::parse(upstream_url)
+                        && let (Some(host), Some(port)) =
+                            (parsed.host_str(), parsed.port_or_known_default())
+                    {
+                        push_direct_route_key(keys, key_by, proxy, host, port);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn adaptive_concurrency_route_definition(
+    pc: &PluginConfig,
+    key_by: AdaptiveConcurrencyKeyBy,
+    config: &GatewayConfig,
+) -> AdaptiveConcurrencyRouteDefinition {
+    let mut protected_proxy_ids = Vec::new();
+    let mut keys = Vec::new();
+    let mut overrides = Vec::new();
+    let mut upstream_routes = Vec::new();
+    for proxy in &config.proxies {
+        if !plugin_config_effectively_applies_to_proxy(pc, proxy, config) {
+            continue;
+        }
+        protected_proxy_ids.push(proxy.id.clone());
+
+        for route_pc in effective_route_override_configs_for_proxy(proxy, config) {
+            collect_route_override_destinations(
+                route_pc,
+                proxy,
+                key_by,
+                config,
+                &mut keys,
+                &mut upstream_routes,
+            );
+            overrides.push(AdaptiveConcurrencyRouteOverride {
+                proxy_id: proxy.id.clone(),
+                plugin_name: route_pc.plugin_name.clone(),
+                effective_priority: route_override_priority(route_pc),
+                destination_fingerprint: route_override_destination_fingerprint(route_pc),
+            });
+        }
+
+        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            let upstream = config
+                .upstreams
+                .iter()
+                .find(|upstream| upstream.id == upstream_id);
+            push_upstream_route(
+                &mut keys,
+                &mut upstream_routes,
+                adaptive_concurrency_scope(key_by, proxy, Some(upstream_id)),
+                upstream_id,
+                proxy.upstream_subset.as_deref(),
+                proxy.backend_port,
+                upstream,
+            );
+        } else {
+            push_direct_route_key(
+                &mut keys,
+                key_by,
+                proxy,
+                &proxy.backend_host,
+                proxy.backend_port,
+            );
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    // Proxy ordering in GatewayConfig is not execution ordering. Stable-sort
+    // only by proxy ID so the effective route-plugin order within each proxy
+    // remains visible to compatibility checks.
+    overrides.sort_by(|left, right| left.proxy_id.cmp(&right.proxy_id));
+    protected_proxy_ids.sort_unstable();
+    protected_proxy_ids.dedup();
+    upstream_routes.sort_unstable();
+    upstream_routes.dedup();
+    AdaptiveConcurrencyRouteDefinition {
+        protected_proxy_ids,
+        keys,
+        overrides,
+        upstream_routes,
+    }
+}
+
+fn adaptive_concurrency_effective_lb_keys(
+    route_definition: &AdaptiveConcurrencyRouteDefinition,
+    load_balancer: &crate::load_balancer::LoadBalancerCacheInner,
+) -> Vec<AdaptiveConcurrencyRouteKey> {
+    let mut keys = Vec::new();
+    for route in &route_definition.upstream_routes {
+        let key_count = keys.len();
+        if let Some(upstream) = load_balancer.upstreams().get(&route.upstream_id) {
+            let port_scope = adaptive_concurrency_upstream_port_scope(
+                route.backend_port,
+                &route.port_override_keys,
+                &route.resolved_port_override_keys,
+                &upstream.targets,
+            );
+            keys.extend(
+                upstream
+                    .targets
+                    .iter()
+                    .filter(|target| {
+                        target_matches_subset(upstream, target, route.subset.as_deref())
+                    })
+                    .filter(|target| {
+                        port_scope.is_none_or(|port| target.dispatch_policy_port() == port)
+                    })
+                    .map(|target| AdaptiveConcurrencyRouteKey {
+                        scope: route.scope.clone(),
+                        host: Some(target.host.clone()),
+                        port: Some(target.port),
+                    }),
+            );
+        }
+        if keys.len() == key_count {
+            keys.push(AdaptiveConcurrencyRouteKey {
+                scope: route.scope.clone(),
+                host: None,
+                port: None,
+            });
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+fn adaptive_concurrency_has_zero_target_sentinel(keys: &[AdaptiveConcurrencyRouteKey]) -> bool {
+    keys.iter()
+        .any(|key| key.host.is_none() && key.port.is_none())
+}
+
+/// Existing target keys keep their counters during strict scale-out. Any
+/// retirement/replacement requires an independent tracking space, as do
+/// expansions involving the zero-target sentinel because it identifies a route
+/// source rather than a concrete limiter key and can collide across sources
+/// sharing one scope.
+fn adaptive_concurrency_key_space_requires_reset(
+    current: &[AdaptiveConcurrencyRouteKey],
+    replacement: &[AdaptiveConcurrencyRouteKey],
+) -> bool {
+    if current == replacement {
+        return false;
+    }
+    if adaptive_concurrency_has_zero_target_sentinel(current)
+        || adaptive_concurrency_has_zero_target_sentinel(replacement)
+    {
+        return true;
+    }
+    !current
+        .iter()
+        .all(|key| replacement.binary_search(key).is_ok())
+}
+
+fn adaptive_concurrency_route_definition_requires_reset(
+    current: &AdaptiveConcurrencyRouteDefinition,
+    replacement: &AdaptiveConcurrencyRouteDefinition,
+) -> bool {
+    if current == replacement {
+        return false;
+    }
+    let existing_proxy_scopes_preserved = current.protected_proxy_ids.iter().all(|proxy_id| {
+        replacement
+            .protected_proxy_ids
+            .binary_search(proxy_id)
+            .is_ok()
+    });
+    let existing_override_semantics_preserved =
+        current.protected_proxy_ids.iter().all(|proxy_id| {
+            current
+                .overrides
+                .iter()
+                .filter(|route| route.proxy_id.as_str() == proxy_id.as_str())
+                .eq(replacement
+                    .overrides
+                    .iter()
+                    .filter(|route| route.proxy_id.as_str() == proxy_id.as_str()))
+        });
+    if !existing_proxy_scopes_preserved
+        || !existing_override_semantics_preserved
+        || adaptive_concurrency_has_zero_target_sentinel(&current.keys)
+        || adaptive_concurrency_has_zero_target_sentinel(&replacement.keys)
+        || !current
+            .upstream_routes
+            .iter()
+            .all(|route| replacement.upstream_routes.binary_search(route).is_ok())
+    {
+        return true;
+    }
+    adaptive_concurrency_key_space_requires_reset(&current.keys, &replacement.keys)
+}
+
+fn adaptive_concurrency_lb_key_space_changed(
+    instance: &AdaptiveConcurrencyInstance,
+    current: &crate::load_balancer::LoadBalancerCacheInner,
+    replacement: &crate::load_balancer::LoadBalancerCacheInner,
+) -> bool {
+    let current_keys = adaptive_concurrency_effective_lb_keys(&instance.route_definition, current);
+    let replacement_keys =
+        adaptive_concurrency_effective_lb_keys(&instance.route_definition, replacement);
+    adaptive_concurrency_key_space_requires_reset(&current_keys, &replacement_keys)
+}
+
+fn retained_adaptive_concurrency_states(
+    current: &AdaptiveConcurrencyInstanceMap,
+    config: &GatewayConfig,
+) -> AdaptiveConcurrencyInstanceMap {
+    let mut retained = HashMap::new();
+    for pc in &config.plugin_configs {
+        if !pc.enabled
+            || pc.plugin_name != "adaptive_concurrency"
+            || !adaptive_concurrency_policy_is_active(pc, config)
+        {
+            continue;
+        }
+        let identity = adaptive_concurrency_policy_id(pc);
+        if let Some(existing) = current.get(&identity) {
+            let route_definition =
+                adaptive_concurrency_route_definition(pc, existing.config.key_by, config);
+            if adaptive_definition_matches(existing, pc, &route_definition) {
+                retained.insert(identity, existing.clone());
+            }
+        }
+    }
+    retained
+}
+
+fn adaptive_concurrency_policy_is_active(pc: &PluginConfig, config: &GatewayConfig) -> bool {
+    match &pc.scope {
+        PluginScope::Global => true,
+        PluginScope::Proxy => pc.proxy_id.as_deref().is_some_and(|proxy_id| {
+            config.proxies.iter().any(|proxy| {
+                proxy.id == proxy_id
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == pc.id)
+            })
+        }),
+        PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == pc.id)
+        }),
+    }
+}
+
+fn include_adaptive_concurrency_route_rebuilds(
+    current: &AdaptiveConcurrencyInstanceMap,
+    config: &GatewayConfig,
+    proxy_ids_to_rebuild: &mut HashSet<String>,
+    rebuild_adaptive_globals: &mut bool,
+) {
+    for (identity, existing) in current {
+        let Some(pc) = config.plugin_configs.iter().find(|pc| {
+            pc.enabled
+                && pc.plugin_name == "adaptive_concurrency"
+                && pc.namespace == identity.namespace
+                && pc.id == identity.plugin_config_id
+        }) else {
+            continue;
+        };
+        let route_definition =
+            adaptive_concurrency_route_definition(pc, existing.config.key_by, config);
+        if route_definition == existing.route_definition {
+            continue;
+        }
+
+        match &pc.scope {
+            PluginScope::Global => {
+                *rebuild_adaptive_globals = true;
+                proxy_ids_to_rebuild.extend(config.proxies.iter().map(|proxy| proxy.id.clone()));
+            }
+            PluginScope::Proxy => {
+                if let Some(proxy_id) = pc.proxy_id.as_ref() {
+                    proxy_ids_to_rebuild.insert(proxy_id.clone());
+                }
+            }
+            PluginScope::ProxyGroup => {
+                proxy_ids_to_rebuild.extend(
+                    config
+                        .proxies
+                        .iter()
+                        .filter(|proxy| {
+                            proxy
+                                .plugins
+                                .iter()
+                                .any(|association| association.plugin_config_id == pc.id)
+                        })
+                        .map(|proxy| proxy.id.clone()),
+                );
+            }
+        }
+    }
+}
+
+fn create_adaptive_concurrency_plugin(
+    pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
+    http_client: &PluginHttpClient,
+    current: &AdaptiveConcurrencyInstanceMap,
+    staged: &mut AdaptiveConcurrencyInstanceMap,
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    let identity = adaptive_concurrency_policy_id(pc);
+    let parsed = Arc::new(crate::plugins::adaptive_concurrency::parse_config_value(
+        &pc.config,
+    )?);
+    let route_definition = adaptive_concurrency_route_definition(pc, parsed.key_by, gateway_config);
+    if let Some(existing) = staged.get(&identity) {
+        if !adaptive_definition_matches(existing, pc, &route_definition) {
+            return Err(format!(
+                "adaptive_concurrency: plugin config identity '{}:{}' resolves to conflicting policy definitions",
+                pc.namespace, pc.id
+            ));
+        }
+        return Ok(Some(Arc::new(
+            crate::plugins::adaptive_concurrency::AdaptiveConcurrency::with_shared_limiter(
+                Arc::clone(&existing.config),
+                Arc::clone(&existing.limiter),
+                existing.generation,
+            ),
+        )));
+    }
+
+    let (limiter, generation, reset_tracking_space) = if let Some(existing) = current.get(&identity)
+    {
+        let generation = existing.generation.checked_add(1).ok_or_else(|| {
+            format!(
+                "adaptive_concurrency: plugin config '{}:{}' exhausted its reload generation counter",
+                pc.namespace, pc.id
+            )
+        })?;
+        let structural_change = existing.config.key_by != parsed.key_by
+            || parsed.max_tracked_keys < existing.config.max_tracked_keys
+            || existing.scope != pc.scope
+            || existing.proxy_id != pc.proxy_id
+            || adaptive_concurrency_route_definition_requires_reset(
+                &existing.route_definition,
+                &route_definition,
+            );
+        // Keep the generation lifecycle shared so pinned retired cache views
+        // are rejected after a structural cutover. The limiter rotates its
+        // target-tracking space at commit, allowing permits from the detached
+        // space to finish without blocking or training the replacement.
+        (Arc::clone(&existing.limiter), generation, structural_change)
+    } else {
+        (
+            Arc::new(AdaptiveConcurrencyLimiter::new(
+                http_client.pool_shard_amount(),
+            )),
+            1,
+            false,
+        )
+    };
+
+    let plugin = crate::plugins::adaptive_concurrency::AdaptiveConcurrency::with_shared_limiter(
+        Arc::clone(&parsed),
+        Arc::clone(&limiter),
+        generation,
+    );
+    staged.insert(
+        identity,
+        AdaptiveConcurrencyInstance {
+            limiter,
+            config: parsed,
+            config_value: pc.config.clone(),
+            scope: pc.scope.clone(),
+            proxy_id: pc.proxy_id.clone(),
+            route_definition,
+            generation,
+            reset_tracking_space,
+        },
+    );
+    Ok(Some(Arc::new(plugin)))
+}
 
 #[derive(Clone)]
 struct ProxyGroupPluginInstance {
     plugin: Arc<dyn Plugin>,
     config: PluginConfig,
+}
+
+/// Built-in plugin types whose constructed instance can participate in the
+/// HMAC request-body composition invariant. Keep this list aligned with
+/// `Plugin::modifies_request_body()` implementations. Registered custom
+/// plugins are also constructed because their capability is defined by their
+/// `Plugin` implementation rather than a core allowlist.
+const HMAC_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
+    "hmac_auth",
+    "request_transformer",
+    "compression",
+    "grpc_web",
+    "ai_prompt_shield",
+    "ai_stream_router",
+    "mcp_gateway",
+    "ai_prompt_compressor",
+    "ai_request_guard",
+];
+
+/// Validate the HMAC/request-body-transform invariant against a candidate
+/// config before an admin Proxy or PluginConfig write is persisted. Runtime
+/// cache construction repeats the same check as a fail-closed backstop.
+pub(crate) fn validate_hmac_request_transform_candidate(
+    config: &GatewayConfig,
+    http_client: &PluginHttpClient,
+) -> Result<(), String> {
+    if !config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.enabled && plugin.plugin_name == "hmac_auth")
+    {
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    let mut global_plugins = Vec::new();
+    let mut scoped_plugins: HmacCompositionPluginMap<'_> = HashMap::new();
+    let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
+    let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+    let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+
+    for plugin_config in &config.plugin_configs {
+        if !plugin_config.enabled
+            || (!HMAC_COMPOSITION_PLUGIN_NAMES.contains(&plugin_config.plugin_name.as_str())
+                && !custom_plugin_names.contains(&plugin_config.plugin_name.as_str()))
+        {
+            continue;
+        }
+        match try_create_plugin(
+            plugin_config,
+            config,
+            http_client,
+            &current_adaptive_states,
+            &mut staged_adaptive_states,
+        ) {
+            Ok(Some(plugin)) if plugin_config.scope == PluginScope::Global => {
+                global_plugins.push(plugin);
+            }
+            Ok(Some(plugin)) => {
+                scoped_plugins.insert(
+                    (plugin_config.namespace.as_str(), plugin_config.id.as_str()),
+                    (plugin_config, plugin),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => errors.push(error),
+        }
+    }
+
+    for proxy in &config.proxies {
+        let mut merged = global_plugins.clone();
+        let global_ptrs: HashSet<usize> = merged
+            .iter()
+            .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
+            .collect();
+        for association in &proxy.plugins {
+            let Some((plugin_config, plugin)) = scoped_plugins.get(&(
+                proxy.namespace.as_str(),
+                association.plugin_config_id.as_str(),
+            )) else {
+                continue;
+            };
+            let applies = match plugin_config.scope {
+                PluginScope::Proxy => plugin_config.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                PluginScope::ProxyGroup => plugin_config.proxy_id.is_none(),
+                PluginScope::Global => false,
+            };
+            if !applies {
+                continue;
+            }
+            remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
+            merged.push(Arc::clone(plugin));
+        }
+        if let Err(error) = validate_hmac_request_transform_composition(&merged) {
+            errors.push(format!("proxy_id={}: {error}", proxy.id));
+        }
+    }
+
+    if let Err(error) = validate_hmac_request_transform_composition(&global_plugins) {
+        errors.push(format!("global plugins: {error}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} HMAC request-transform composition error(s): {}",
+            errors.len(),
+            errors.join("; ")
+        ))
+    }
 }
 
 fn remove_shadowed_global_plugin(
@@ -694,7 +2058,9 @@ impl PluginCapabilities {
     pub const HAS_RESPONSE_COMMITTED_HOOK: u16 = 1 << 8;
     pub const HAS_RESPONSE_STREAM_HOOKS: u16 = 1 << 9;
     pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
-    pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 11;
+    pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
+    pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
+    pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -706,12 +2072,25 @@ impl PluginCapabilities {
 /// Built at config reload time so the hot path does zero filtering or allocation.
 #[derive(Clone)]
 pub struct PluginPhaseData {
+    /// gRPC deadline-policy plugins only, in configured priority order.
+    pub grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Auth plugins only (pre-filtered from the protocol plugin list).
     pub auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Authorization plugins only (pre-filtered from the protocol plugin list).
     pub authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Backend-admission plugins only (pre-filtered from the protocol plugin list).
     pub backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Plugins that inspect the backend-effective path after route resolution.
+    pub backend_path_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Credential-bearing request header names used by safe downstream views.
+    pub request_headers_to_redact: Arc<Vec<String>>,
+    /// Deterministic initial-response header policy plugins, already filtered
+    /// and kept in configured priority order for protocol boundary paths.
+    pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Unique canonical field names touched by initial-response policy.
+    pub initial_response_header_policy_names: Arc<Vec<String>>,
+    /// Final committed-response observers only, in configured priority order.
+    pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
 }
@@ -720,9 +2099,18 @@ pub struct PluginPhaseData {
 fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut caps = 0u16;
     let mut auth = Vec::new();
+    let mut grpc_deadline = Vec::new();
     let mut authorize = Vec::new();
     let mut backend_admission = Vec::new();
+    let mut backend_path = Vec::new();
+    let mut request_headers_to_redact = Vec::new();
+    let mut initial_response_header_policy_plugins = Vec::new();
+    let mut initial_response_header_policy_names = Vec::new();
+    let mut response_committed = Vec::new();
     for p in plugins {
+        if p.requires_grpc_deadline_preflight() {
+            grpc_deadline.push(Arc::clone(p));
+        }
         if p.is_auth_plugin() {
             caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
             auth.push(Arc::clone(p));
@@ -732,6 +2120,29 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.is_backend_admission_plugin() {
             backend_admission.push(Arc::clone(p));
+        }
+        if p.requires_backend_path_resolution() {
+            caps |= PluginCapabilities::HAS_BACKEND_PATH_PLUGINS;
+            backend_path.push(Arc::clone(p));
+        }
+        if p.deferred_before_proxy_may_change_routing_headers() {
+            caps |= PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS;
+        }
+        if p.is_initial_response_header_policy() {
+            initial_response_header_policy_plugins.push(Arc::clone(p));
+            for name in p.initial_response_header_policy_names() {
+                if !initial_response_header_policy_names.contains(name) {
+                    initial_response_header_policy_names.push(name.clone());
+                }
+            }
+        }
+        for header in p.request_headers_to_redact() {
+            if !request_headers_to_redact
+                .iter()
+                .any(|known: &String| known.eq_ignore_ascii_case(header))
+            {
+                request_headers_to_redact.push(header.clone());
+            }
         }
         if p.modifies_request_headers() {
             caps |= PluginCapabilities::MODIFIES_REQUEST_HEADERS;
@@ -762,15 +2173,22 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
+            response_committed.push(Arc::clone(p));
         }
         if p.requires_response_stream_hooks() {
             caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;
         }
     }
     PluginPhaseData {
+        grpc_deadline_plugins: Arc::new(grpc_deadline),
         auth_plugins: Arc::new(auth),
         authorize_plugins: Arc::new(authorize),
         backend_admission_plugins: Arc::new(backend_admission),
+        backend_path_plugins: Arc::new(backend_path),
+        request_headers_to_redact: Arc::new(request_headers_to_redact),
+        initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
+        initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
+        response_committed_plugins: Arc::new(response_committed),
         capabilities: PluginCapabilities(caps),
     }
 }
@@ -808,6 +2226,11 @@ struct ProtocolSnapshot {
     proxy: HashMap<String, HashMap<ProxyProtocol, ProtocolEntry>>,
     /// Global fallback: protocol → ProtocolEntry
     global: HashMap<ProxyProtocol, ProtocolEntry>,
+    /// HTTP plugin view plus the two native-gRPC policies that are compatible
+    /// with recognized H3 gRPC-Web requests.
+    grpc_web_proxy: HashMap<String, ProtocolEntry>,
+    /// Global fallback for the composed H3 gRPC-Web view.
+    grpc_web_global: ProtocolEntry,
 }
 
 const ALL_PROXY_PROTOCOLS: [ProxyProtocol; 5] = [
@@ -827,18 +2250,42 @@ fn build_protocol_entry(plugins: &[Arc<dyn Plugin>], proto: ProxyProtocol) -> Pr
     }
 }
 
+const H3_GRPC_WEB_NATIVE_POLICY_PLUGINS: [&str; 2] = ["grpc_method_router", "grpc_deadline"];
+
+fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
+    // The merged proxy list is already in configured priority/config order.
+    // Filtering it once preserves that order, retains every ordinary HTTP
+    // guardrail, and includes each compatible native-gRPC policy instance at
+    // most once even if a future implementation supports both protocols.
+    let plugins = Arc::new(
+        plugins
+            .iter()
+            .filter(|plugin| {
+                plugin.supported_protocols().contains(&ProxyProtocol::Http)
+                    || (H3_GRPC_WEB_NATIVE_POLICY_PLUGINS.contains(&plugin.name())
+                        && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let phase = build_phase_data(&plugins);
+    ProtocolEntry { plugins, phase }
+}
+
 /// Build the full protocol snapshot from the plugin map + global fallback.
 fn build_protocol_snapshot(
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
 ) -> ProtocolSnapshot {
     let mut proxy = HashMap::with_capacity(proxy_map.len());
+    let mut grpc_web_proxy = HashMap::with_capacity(proxy_map.len());
     for (proxy_id, plugins) in proxy_map {
         let mut inner = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
         for &proto in &ALL_PROXY_PROTOCOLS {
             inner.insert(proto, build_protocol_entry(plugins, proto));
         }
         proxy.insert(proxy_id.clone(), inner);
+        grpc_web_proxy.insert(proxy_id.clone(), build_grpc_web_protocol_entry(plugins));
     }
 
     let mut global = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
@@ -846,26 +2293,36 @@ fn build_protocol_snapshot(
         global.insert(proto, build_protocol_entry(globals, proto));
     }
 
-    ProtocolSnapshot { proxy, global }
+    let grpc_web_global = build_grpc_web_protocol_entry(globals);
+
+    ProtocolSnapshot {
+        proxy,
+        global,
+        grpc_web_proxy,
+        grpc_web_global,
+    }
 }
 
 /// Collect all JWKS URIs actively referenced by `jwks_auth` plugin instances
 /// across all proxies and global plugins. Used to clean up stale JWKS cache
 /// entries (and abort their background refresh tasks) on config reload.
-fn collect_active_jwks_uris(
+fn collect_active_jwks_requirements(
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
-) -> HashSet<String> {
-    let mut uris = HashSet::new();
-    for plugins in proxy_map.values() {
-        for plugin in plugins.iter() {
-            uris.extend(plugin.active_jwks_uris());
+) -> HashMap<String, Duration> {
+    let mut requirements = HashMap::new();
+    for plugin in globals
+        .iter()
+        .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
+    {
+        for (uri, interval) in plugin.active_jwks_refresh_requirements() {
+            requirements
+                .entry(uri)
+                .and_modify(|current: &mut Duration| *current = (*current).min(interval))
+                .or_insert(interval);
         }
     }
-    for plugin in globals {
-        uris.extend(plugin.active_jwks_uris());
-    }
-    uris
+    requirements
 }
 
 fn start_background_tasks(
@@ -917,6 +2374,10 @@ pub(crate) struct PluginCacheInner {
     /// across incremental updates so rebuilt proxies can keep sharing state
     /// with unchanged proxies when the proxy-group config itself did not change.
     proxy_group_plugins: ProxyGroupInstanceMap,
+    /// Stable adaptive-concurrency policies keyed by namespace + plugin config
+    /// ID. Replacement plugin objects share these limiters so live permits and
+    /// learned target state remain coherent across cache generations.
+    adaptive_concurrency_instances: AdaptiveConcurrencyInstanceMap,
 }
 
 impl PluginCacheInner {
@@ -932,6 +2393,7 @@ impl PluginCacheInner {
         requires_ws_frame: WsFrameMap,
         global_requires_ws_frame: bool,
         proxy_group_plugins: ProxyGroupInstanceMap,
+        adaptive_concurrency_instances: AdaptiveConcurrencyInstanceMap,
     ) -> Self {
         Self {
             proxy_plugins,
@@ -944,6 +2406,55 @@ impl PluginCacheInner {
             requires_ws_frame,
             global_requires_ws_frame,
             proxy_group_plugins,
+            adaptive_concurrency_instances,
+        }
+    }
+
+    pub(crate) fn prepare_adaptive_concurrency_generations(&self) {
+        for instance in self.adaptive_concurrency_instances.values() {
+            instance
+                .limiter
+                .prepare_policy_generation(instance.generation, instance.reset_tracking_space);
+        }
+    }
+
+    pub(crate) fn commit_adaptive_concurrency_generations(&self) {
+        for instance in self.adaptive_concurrency_instances.values() {
+            instance.limiter.commit_policy_generation(
+                instance.generation,
+                Arc::clone(&instance.config),
+                instance.reset_tracking_space,
+            );
+        }
+    }
+
+    pub(crate) fn prepare_adaptive_concurrency_lb_generation(
+        &self,
+        generation: u64,
+        current: &crate::load_balancer::LoadBalancerCacheInner,
+        replacement: &crate::load_balancer::LoadBalancerCacheInner,
+    ) {
+        for instance in self.adaptive_concurrency_instances.values() {
+            let reset_tracking_space =
+                adaptive_concurrency_lb_key_space_changed(instance, current, replacement);
+            instance
+                .limiter
+                .prepare_lb_generation(generation, reset_tracking_space);
+        }
+    }
+
+    pub(crate) fn commit_adaptive_concurrency_lb_generation(
+        &self,
+        generation: u64,
+        current: &crate::load_balancer::LoadBalancerCacheInner,
+        replacement: &crate::load_balancer::LoadBalancerCacheInner,
+    ) {
+        for instance in self.adaptive_concurrency_instances.values() {
+            let reset_tracking_space =
+                adaptive_concurrency_lb_key_space_changed(instance, current, replacement);
+            instance
+                .limiter
+                .commit_lb_generation(generation, reset_tracking_space);
         }
     }
 
@@ -983,6 +2494,16 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    pub(crate) fn get_grpc_deadline_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.grpc_deadline_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub(crate) fn get_authorize_plugins(
         &self,
         proxy_id: &str,
@@ -1000,6 +2521,56 @@ impl PluginCacheInner {
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
         self.protocol_entry(proxy_id, protocol)
             .map(|entry| Arc::clone(&entry.phase.backend_admission_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn get_backend_path_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.backend_path_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn get_request_headers_to_redact(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<String>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.request_headers_to_redact))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn get_initial_response_header_policy_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.initial_response_header_policy_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn get_initial_response_header_policy_names(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<String>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.initial_response_header_policy_names))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn get_response_committed_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.response_committed_plugins))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
@@ -1039,12 +2610,56 @@ impl PluginCacheInner {
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> PluginCacheRequestView {
+        let capabilities = self.get_capabilities(proxy_id, protocol);
+        let backend_path_plugins = capabilities
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+            .then(|| self.get_backend_path_plugins(proxy_id, protocol));
         PluginCacheRequestView {
             plugins: self.get_plugins_for_protocol(proxy_id, protocol),
+            grpc_deadline_plugins: self.get_grpc_deadline_plugins(proxy_id, protocol),
             auth_plugins: self.get_auth_plugins(proxy_id, protocol),
             authorize_plugins: self.get_authorize_plugins(proxy_id, protocol),
             backend_admission_plugins: self.get_backend_admission_plugins(proxy_id, protocol),
-            capabilities: self.get_capabilities(proxy_id, protocol),
+            backend_path_plugins,
+            request_headers_to_redact: self.get_request_headers_to_redact(proxy_id, protocol),
+            initial_response_header_policy_plugins: self
+                .get_initial_response_header_policy_plugins(proxy_id, protocol),
+            initial_response_header_policy_names: self
+                .get_initial_response_header_policy_names(proxy_id, protocol),
+            response_committed_plugins: self.get_response_committed_plugins(proxy_id, protocol),
+            capabilities,
+            requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
+            requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
+            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_id),
+        }
+    }
+
+    pub(crate) fn grpc_web_request_view(&self, proxy_id: &str) -> PluginCacheRequestView {
+        let entry = self
+            .protocol_snapshot
+            .grpc_web_proxy
+            .get(proxy_id)
+            .unwrap_or(&self.protocol_snapshot.grpc_web_global);
+        let capabilities = entry.phase.capabilities;
+        let backend_path_plugins = capabilities
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+            .then(|| Arc::clone(&entry.phase.backend_path_plugins));
+        PluginCacheRequestView {
+            plugins: Arc::clone(&entry.plugins),
+            grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
+            auth_plugins: Arc::clone(&entry.phase.auth_plugins),
+            authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
+            backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
+            backend_path_plugins,
+            request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
+            initial_response_header_policy_plugins: Arc::clone(
+                &entry.phase.initial_response_header_policy_plugins,
+            ),
+            initial_response_header_policy_names: Arc::clone(
+                &entry.phase.initial_response_header_policy_names,
+            ),
+            response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
+            capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
             requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_id),
@@ -1060,9 +2675,15 @@ impl PluginCacheInner {
 #[derive(Clone)]
 pub struct PluginCacheRequestView {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    backend_path_plugins: Option<Arc<Vec<Arc<dyn Plugin>>>>,
+    request_headers_to_redact: Arc<Vec<String>>,
+    initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    initial_response_header_policy_names: Arc<Vec<String>>,
+    response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -1073,6 +2694,11 @@ impl PluginCacheRequestView {
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.plugins)
+    }
+
+    /// Get the pre-filtered synchronous gRPC deadline-policy chain.
+    pub fn grpc_deadline_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.grpc_deadline_plugins.as_slice()
     }
 
     /// Get pre-computed auth plugins from this request view.
@@ -1088,6 +2714,34 @@ impl PluginCacheRequestView {
     /// Get pre-computed backend admission plugins from this request view.
     pub fn backend_admission_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.backend_admission_plugins)
+    }
+
+    /// Get plugins that inspect the finalized backend path.
+    pub fn backend_path_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.backend_path_plugins
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Get credential-bearing request headers precomputed for safe downstream views.
+    pub fn request_headers_to_redact(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.request_headers_to_redact)
+    }
+
+    /// Get the pre-filtered deterministic initial-response header policy chain.
+    pub fn initial_response_header_policy_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
+        Arc::clone(&self.initial_response_header_policy_plugins)
+    }
+
+    /// Get canonical field names touched by initial-response policy.
+    pub fn initial_response_header_policy_names(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.initial_response_header_policy_names)
+    }
+
+    /// Get the pre-filtered committed-response observer chain.
+    pub fn response_committed_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.response_committed_plugins.as_slice()
     }
 
     /// Get pre-computed capability bitset from this request view.
@@ -1192,6 +2846,14 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
     ) -> Result<Arc<PluginCacheInner>, String> {
+        Self::build_inner_with_prior_adaptive_states(config, http_client, &HashMap::new())
+    }
+
+    fn build_inner_with_prior_adaptive_states(
+        config: &GatewayConfig,
+        http_client: &PluginHttpClient,
+        current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
+    ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         let (
             proxy_map,
@@ -1203,7 +2865,8 @@ impl PluginCache {
             ws_frame_map,
             global_needs_ws_frame,
             proxy_group_plugins,
-        ) = Self::build_cache(config, http_client)?;
+            adaptive_concurrency_instances,
+        ) = Self::build_cache(config, http_client, current_adaptive_states)?;
         let snapshot = build_protocol_snapshot(&proxy_map, &globals);
 
         Ok(Arc::new(PluginCacheInner::new(
@@ -1217,6 +2880,7 @@ impl PluginCache {
             ws_frame_map,
             global_needs_ws_frame,
             proxy_group_plugins,
+            adaptive_concurrency_instances,
         )))
     }
 
@@ -1224,11 +2888,18 @@ impl PluginCache {
         &self,
         config: &GatewayConfig,
     ) -> Result<Arc<PluginCacheInner>, String> {
-        Self::build_inner(config, &self.http_client)
+        let current = self.inner.load();
+        Self::build_inner_with_prior_adaptive_states(
+            config,
+            &self.http_client,
+            &current.adaptive_concurrency_instances,
+        )
     }
 
     pub(crate) fn store_inner(&self, inner: Arc<PluginCacheInner>) {
-        self.inner.store(inner);
+        inner.prepare_adaptive_concurrency_generations();
+        self.inner.store(Arc::clone(&inner));
+        inner.commit_adaptive_concurrency_generations();
     }
 
     pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {
@@ -1236,8 +2907,9 @@ impl PluginCache {
     }
 
     pub(crate) fn retain_active_uris_for_inner(inner: &PluginCacheInner) {
-        let active_uris = collect_active_jwks_uris(&inner.proxy_plugins, &inner.global_plugins);
-        retain_active_uris(&active_uris);
+        let requirements =
+            collect_active_jwks_requirements(&inner.proxy_plugins, &inner.global_plugins);
+        retain_active_requirements(&requirements);
     }
 
     /// Build a request-scoped view of plugin-cache values for one proxy/protocol.
@@ -1250,9 +2922,10 @@ impl PluginCache {
         inner.request_view(proxy_id, protocol)
     }
 
-    /// Atomically rebuild the cache when config changes.
-    /// Old plugin instances (including rate limiter state) are dropped
-    /// only after all in-flight requests using them complete.
+    /// Atomically rebuild the cache when config changes. Most old plugin
+    /// instances are dropped only after in-flight requests release them;
+    /// adaptive-concurrency policies additionally carry coherent admission
+    /// state into compatible replacement generations.
     ///
     /// Returns `Err` if any enabled plugin config cannot be resolved or fails validation.
     pub fn rebuild(&self, config: &GatewayConfig) -> Result<(), String> {
@@ -1287,6 +2960,17 @@ impl PluginCache {
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_prometheus_metrics_ownership(config)?;
         let mut plugin_errors: Vec<String> = Vec::new();
+        let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
+        let mut rebuild_adaptive_globals = false;
+        include_adaptive_concurrency_route_rebuilds(
+            &current.adaptive_concurrency_instances,
+            config,
+            &mut proxy_ids_to_rebuild,
+            &mut rebuild_adaptive_globals,
+        );
+        let global_plugins_changed = rebuild_globals || rebuild_adaptive_globals;
+        let mut adaptive_concurrency_instances =
+            retained_adaptive_concurrency_states(&current.adaptive_concurrency_instances, config);
 
         // Rebuild globals if any global plugin config changed
         let new_globals = if rebuild_globals {
@@ -1313,7 +2997,13 @@ impl PluginCache {
                 if pc.plugin_name != "transaction_log_schema" {
                     continue;
                 }
-                match try_create_plugin(pc, &self.http_client) {
+                match try_create_plugin(
+                    pc,
+                    config,
+                    &self.http_client,
+                    &current.adaptive_concurrency_instances,
+                    &mut adaptive_concurrency_instances,
+                ) {
                     Ok(Some(plugin)) => global_plugins.push(plugin),
                     Ok(None) => {}
                     Err(e) => {
@@ -1331,7 +3021,13 @@ impl PluginCache {
                     continue; // already constructed
                 }
                 if pc.scope == PluginScope::Global {
-                    match try_create_plugin(pc, &self.http_client) {
+                    match try_create_plugin(
+                        pc,
+                        config,
+                        &self.http_client,
+                        &current.adaptive_concurrency_instances,
+                        &mut adaptive_concurrency_instances,
+                    ) {
                         Ok(Some(plugin)) => global_plugins.push(plugin),
                         Ok(None) => {}
                         Err(e) => {
@@ -1342,6 +3038,52 @@ impl PluginCache {
                 }
             }
             global_plugins.sort_by_key(|p| p.priority());
+            if let Err(e) = install_cors_finalizer(&mut global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
+            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
+            if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
+            Arc::new(global_plugins)
+        } else if rebuild_adaptive_globals {
+            // Route compatibility can require a fresh global adaptive view
+            // without any global PluginConfig changing. Replace only those
+            // wrappers so unrelated stateful globals retain their Arc/state.
+            let mut global_plugins = current
+                .global_plugins
+                .iter()
+                .filter(|plugin| plugin.name() != "adaptive_concurrency")
+                .cloned()
+                .collect::<Vec<_>>();
+            for pc in &config.plugin_configs {
+                if !pc.enabled
+                    || pc.scope != PluginScope::Global
+                    || pc.plugin_name != "adaptive_concurrency"
+                {
+                    continue;
+                }
+                match try_create_plugin(
+                    pc,
+                    config,
+                    &self.http_client,
+                    &current.adaptive_concurrency_instances,
+                    &mut adaptive_concurrency_instances,
+                ) {
+                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("Config reload: {}", e);
+                        plugin_errors.push(e);
+                    }
+                }
+            }
+            global_plugins.sort_by_key(|plugin| plugin.priority());
+            if let Err(e) = install_cors_finalizer(&mut global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
@@ -1391,6 +3133,12 @@ impl PluginCache {
                     return None;
                 }
                 let pc = proxy_group_configs.get(id.as_str())?;
+                if pc.plugin_name == "adaptive_concurrency"
+                    && !adaptive_concurrency_instances
+                        .contains_key(&adaptive_concurrency_policy_id(pc))
+                {
+                    return None;
+                }
                 if same_proxy_group_plugin_config(&existing.config, pc) {
                     Some((id.clone(), existing.clone()))
                 } else {
@@ -1428,7 +3176,13 @@ impl PluginCache {
             if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
-                        match try_create_plugin(pc, &self.http_client) {
+                        match try_create_plugin(
+                            pc,
+                            config,
+                            &self.http_client,
+                            &current.adaptive_concurrency_instances,
+                            &mut adaptive_concurrency_instances,
+                        ) {
                             Ok(Some(plugin)) => {
                                 // Detect when an auto-emitted plugin instance
                                 // (Istio VirtualService translator helpers) is
@@ -1488,7 +3242,13 @@ impl PluginCache {
                         remove_shadowed_global_plugin(&mut merged, &global_ptrs, plugin.name());
                         merged.push(plugin);
                     } else {
-                        match try_create_plugin(pc, &self.http_client) {
+                        match try_create_plugin(
+                            pc,
+                            config,
+                            &self.http_client,
+                            &current.adaptive_concurrency_instances,
+                            &mut adaptive_concurrency_instances,
+                        ) {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     pc.id.clone(),
@@ -1526,7 +3286,13 @@ impl PluginCache {
             }
 
             merged.sort_by_key(|p| p.priority());
+            if let Err(e) = install_cors_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
+            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
             new_map.insert(proxy.id.clone(), Arc::new(merged));
@@ -1587,8 +3353,10 @@ impl PluginCache {
         // Rebuild protocol snapshot (plugins + phase data) for changed proxies.
         // Clone-and-patch from the current snapshot so unchanged proxies are preserved.
         let mut new_proxy_proto = current.protocol_snapshot.proxy.clone();
+        let mut new_grpc_web_proxy = current.protocol_snapshot.grpc_web_proxy.clone();
         for id in removed_proxy_ids {
             new_proxy_proto.remove(id);
+            new_grpc_web_proxy.remove(id);
         }
         for proxy in &config.proxies {
             if proxy_ids_to_rebuild.contains(&proxy.id)
@@ -1599,9 +3367,10 @@ impl PluginCache {
                     inner.insert(proto, build_protocol_entry(plugins, proto));
                 }
                 new_proxy_proto.insert(proxy.id.clone(), inner);
+                new_grpc_web_proxy.insert(proxy.id.clone(), build_grpc_web_protocol_entry(plugins));
             }
         }
-        let new_global_proto = if rebuild_globals {
+        let new_global_proto = if global_plugins_changed {
             let mut g = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
             for &proto in &ALL_PROXY_PROTOCOLS {
                 g.insert(proto, build_protocol_entry(&new_globals, proto));
@@ -1610,22 +3379,27 @@ impl PluginCache {
         } else {
             current.protocol_snapshot.global.clone()
         };
+        let new_grpc_web_global = if global_plugins_changed {
+            build_grpc_web_protocol_entry(&new_globals)
+        } else {
+            current.protocol_snapshot.grpc_web_global.clone()
+        };
 
-        let new_global_requires_buffering = if rebuild_globals {
+        let new_global_requires_buffering = if global_plugins_changed {
             new_globals
                 .iter()
                 .any(|p| p.requires_response_body_buffering())
         } else {
             current.global_requires_buffering
         };
-        let new_global_requires_request_buffering = if rebuild_globals {
+        let new_global_requires_request_buffering = if global_plugins_changed {
             new_globals
                 .iter()
                 .any(|p| p.requires_request_body_buffering())
         } else {
             current.global_requires_request_buffering
         };
-        let new_global_requires_ws_frame = if rebuild_globals {
+        let new_global_requires_ws_frame = if global_plugins_changed {
             new_globals.iter().any(|p| p.requires_ws_frame_hooks())
         } else {
             current.global_requires_ws_frame
@@ -1648,10 +3422,13 @@ impl PluginCache {
             ProtocolSnapshot {
                 proxy: new_proxy_proto,
                 global: new_global_proto,
+                grpc_web_proxy: new_grpc_web_proxy,
+                grpc_web_global: new_grpc_web_global,
             },
             new_ws_frame,
             new_global_requires_ws_frame,
             group_plugin_instances,
+            adaptive_concurrency_instances,
         )))
     }
 
@@ -1841,6 +3618,7 @@ impl PluginCache {
     fn build_cache(
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
+        current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
     ) -> Result<
         (
             ProxyPluginMap,
@@ -1852,11 +3630,14 @@ impl PluginCache {
             WsFrameMap,
             bool,
             ProxyGroupInstanceMap,
+            AdaptiveConcurrencyInstanceMap,
         ),
         String,
     > {
         // Step 1: Create all enabled global plugins (shared across proxies)
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+        let mut adaptive_concurrency_instances =
+            retained_adaptive_concurrency_states(current_adaptive_states, config);
 
         // Pre-index proxy-scoped plugin configs by proxy_id for O(1) lookup
         // instead of scanning all plugin_configs for every proxy (O(P×C) → O(P+C)).
@@ -1889,7 +3670,13 @@ impl PluginCache {
             if pc.plugin_name != "transaction_log_schema" {
                 continue;
             }
-            match try_create_plugin(pc, http_client) {
+            match try_create_plugin(
+                pc,
+                config,
+                http_client,
+                current_adaptive_states,
+                &mut adaptive_concurrency_instances,
+            ) {
                 Ok(Some(plugin)) => global_plugins.push(plugin),
                 Ok(None) => {}
                 Err(e) => plugin_errors.push(e),
@@ -1906,7 +3693,13 @@ impl PluginCache {
                 continue; // already constructed above
             }
             if pc.scope == PluginScope::Global {
-                match try_create_plugin(pc, http_client) {
+                match try_create_plugin(
+                    pc,
+                    config,
+                    http_client,
+                    current_adaptive_states,
+                    &mut adaptive_concurrency_instances,
+                ) {
                     Ok(Some(plugin)) => global_plugins.push(plugin),
                     Ok(None) => {}
                     Err(e) => plugin_errors.push(e),
@@ -1958,7 +3751,13 @@ impl PluginCache {
             if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
-                        match try_create_plugin(pc, http_client) {
+                        match try_create_plugin(
+                            pc,
+                            config,
+                            http_client,
+                            current_adaptive_states,
+                            &mut adaptive_concurrency_instances,
+                        ) {
                             Ok(Some(plugin)) => {
                                 // Remove only GLOBAL plugins of the same name —
                                 // other proxy-scoped instances are preserved,
@@ -1994,7 +3793,13 @@ impl PluginCache {
                         merged.push(plugin);
                     } else {
                         // First proxy to reference this group plugin — create the instance
-                        match try_create_plugin(pc, http_client) {
+                        match try_create_plugin(
+                            pc,
+                            config,
+                            http_client,
+                            current_adaptive_states,
+                            &mut adaptive_concurrency_instances,
+                        ) {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     pc.id.clone(),
@@ -2025,7 +3830,13 @@ impl PluginCache {
 
             // Sort by priority so execution order is deterministic
             merged.sort_by_key(|p| p.priority());
+            if let Err(e) = install_cors_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
+            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
 
@@ -2047,7 +3858,13 @@ impl PluginCache {
         // Sort and validate the global fallback list before committing the
         // staged registry so ordering errors reject the whole cache build.
         global_plugins.sort_by_key(|p| p.priority());
+        if let Err(e) = install_cors_finalizer(&mut global_plugins) {
+            plugin_errors.push(format!("global plugins: {e}"));
+        }
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
+            plugin_errors.push(format!("global plugins: {e}"));
+        }
+        if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
 
@@ -2096,6 +3913,7 @@ impl PluginCache {
             ws_frame_map,
             global_needs_ws_frame,
             group_plugin_instances,
+            adaptive_concurrency_instances,
         ))
     }
 }

@@ -10,15 +10,19 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_auth_acl
 
-use crate::common::{TestGateway, empty_digest_header, generate_hmac_signature};
+use crate::common::{
+    TestGateway, empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_digest,
+    hmac_authority_from_url,
+};
 
 use base64::Engine;
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
-fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
+pub(super) fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("test-key-1".to_string());
     encode(
@@ -29,7 +33,7 @@ fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> Str
     .expect("Failed to encode RS256 token")
 }
 
-fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
+pub(super) fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     let pem_str = std::str::from_utf8(public_key_pem).expect("Invalid public key PEM");
@@ -176,7 +180,7 @@ impl AuthTestHarness {
         let gw = TestGateway::builder()
             .jwt_secret("test-admin-jwt-secret-key-1234567890")
             .jwt_issuer("ferrum-edge-auth-test")
-            .basic_auth_hmac_secret("test-hmac-server-secret")
+            .basic_auth_hmac_secret("test-hmac-server-secret-0123456789abcdef")
             .log_level("info")
             .spawn()
             .await?;
@@ -191,6 +195,291 @@ impl AuthTestHarness {
     fn generate_admin_token(&self) -> Result<String, Box<dyn std::error::Error>> {
         Ok(self._gw.admin_token())
     }
+}
+
+fn content_digest_sha256(body: &[u8]) -> String {
+    format!(
+        "sha-256=:{}:",
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body))
+    )
+}
+
+fn hmac_authorization_for_digest(
+    method: &str,
+    path: &str,
+    date: &str,
+    authority: &str,
+    digest: &str,
+) -> String {
+    let signature = generate_hmac_signature_with_digest(
+        method,
+        path,
+        date,
+        "alice",
+        authority,
+        "alice-hmac-shared-secret-at-least-32-bytes",
+        digest,
+    );
+    format!(r#"hmac username="alice", algorithm="hmac-sha256", signature="{signature}""#)
+}
+
+async fn send_raw_h1_hmac_request(
+    proxy_port: u16,
+    method: &str,
+    digest: &str,
+    framing_headers: &str,
+    wire_body: &[u8],
+) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let authority = format!("127.0.0.1:{proxy_port}");
+    let date = Utc::now().to_rfc2822();
+    let authorization =
+        hmac_authorization_for_digest(method, "/hmacauth", &date, &authority, digest);
+    let request = format!(
+        "{method} /hmacauth HTTP/1.1\r\nHost: {authority}\r\nAuthorization: {authorization}\r\nDate: {date}\r\nContent-Digest: {digest}\r\n{framing_headers}Connection: close\r\n\r\n"
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect raw H1 HMAC request");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write raw H1 HMAC headers");
+    stream
+        .write_all(wire_body)
+        .await
+        .expect("write raw H1 HMAC body");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read raw H1 HMAC response");
+    let response = String::from_utf8_lossy(&response);
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .expect("raw H1 HMAC response status")
+}
+
+async fn send_declared_oversized_invalid_h1_hmac_request(
+    proxy_port: u16,
+    date: &str,
+    username: &str,
+    signing_secret: &str,
+) -> (u16, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let authority = format!("127.0.0.1:{proxy_port}");
+    let digest = empty_digest_header();
+    let signature = generate_hmac_signature(
+        "POST",
+        "/hmacauth",
+        date,
+        username,
+        &authority,
+        signing_secret,
+    );
+    let authorization =
+        format!(r#"hmac username="{username}", algorithm="hmac-sha256", signature="{signature}""#);
+    let request = format!(
+        "POST /hmacauth HTTP/1.1\r\nHost: {authority}\r\nAuthorization: {authorization}\r\nDate: {date}\r\nDigest: {digest}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        10 * 1024 * 1024 + 1
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect declared-oversized HMAC request");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write declared-oversized HMAC headers");
+
+    // An invalid credential must be rejected from headers alone. Sending the
+    // advertised body would race the early response and can surface a client-
+    // side BrokenPipe even when the gateway behaves correctly.
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("timed out waiting for early HMAC rejection")
+        .expect("read early HMAC rejection");
+
+    let header_end = response
+        .windows(b"\r\n\r\n".len())
+        .position(|window| window == b"\r\n\r\n")
+        .expect("raw H1 HMAC response headers");
+    let status = String::from_utf8_lossy(&response[..header_end])
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("raw H1 HMAC response status");
+    (status, response[header_end + 4..].to_vec())
+}
+
+async fn send_h2_hmac_request(
+    proxy_port: u16,
+    method: &str,
+    digest: &str,
+    content_length: Option<&str>,
+    body_after_headers: Option<&[u8]>,
+) -> u16 {
+    let authority = format!("127.0.0.1:{proxy_port}");
+    let date = Utc::now().to_rfc2822();
+    let authorization =
+        hmac_authorization_for_digest(method, "/hmacauth", &date, &authority, digest);
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect H2 HMAC request");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, connection) = h2::client::handshake(stream)
+        .await
+        .expect("H2 HMAC handshake");
+    let connection_task = tokio::spawn(connection);
+    let mut request = hyper::Request::builder()
+        .method(method)
+        .uri(format!("http://{authority}/hmacauth"))
+        .header("authorization", authorization)
+        .header("date", date)
+        .header("content-digest", digest);
+    if let Some(content_length) = content_length {
+        request = request.header("content-length", content_length);
+    }
+    let request = request.body(()).expect("build H2 HMAC request");
+    let end_stream_on_headers = body_after_headers.is_none();
+    let (response, mut request_body) = sender
+        .send_request(request, end_stream_on_headers)
+        .expect("send H2 HMAC headers");
+    if let Some(body) = body_after_headers {
+        request_body
+            .send_data(bytes::Bytes::copy_from_slice(body), true)
+            .expect("send H2 HMAC DATA");
+    }
+    let response = response.await.expect("receive H2 HMAC response");
+    let status = response.status().as_u16();
+    // HEAD may legally advertise the corresponding GET payload length while
+    // sending no DATA. The low-level h2 client does not apply Hyper's
+    // method-aware response-body semantics, so driving its generic body
+    // validator can turn that valid response into a local PROTOCOL_ERROR.
+    if method != "HEAD" {
+        let mut response_body = response.into_body();
+        while let Some(data) = response_body.data().await {
+            data.expect("read H2 HMAC response DATA");
+        }
+    }
+    drop(sender);
+    connection_task.abort();
+    status
+}
+
+async fn assert_empty_body_hmac_regressions(proxy_port: u16) {
+    let empty_digest = content_digest_sha256(&[]);
+    let incorrect_empty_digest = content_digest_sha256(b"not empty");
+
+    // In H1, absent framing proves an empty request body for every method.
+    // These methods cover the traditional bodyless set, DELETE, and a body
+    // method without framing.
+    for method in ["GET", "HEAD", "OPTIONS", "DELETE", "POST"] {
+        assert_eq!(
+            send_raw_h1_hmac_request(proxy_port, method, &empty_digest, "", &[]).await,
+            200,
+            "H1 {method} without framing should accept the empty-body digest"
+        );
+        assert_eq!(
+            send_raw_h1_hmac_request(proxy_port, method, &incorrect_empty_digest, "", &[]).await,
+            401,
+            "H1 {method} without framing must reject a signed non-empty digest"
+        );
+    }
+
+    for (framing_headers, wire_body, label) in [
+        ("Content-Length: 0\r\n", &[][..], "Content-Length: 0"),
+        (
+            "Transfer-Encoding: chunked\r\n",
+            &b"0\r\n\r\n"[..],
+            "empty chunked body",
+        ),
+    ] {
+        assert_eq!(
+            send_raw_h1_hmac_request(
+                proxy_port,
+                "POST",
+                &empty_digest,
+                framing_headers,
+                wire_body,
+            )
+            .await,
+            200,
+            "H1 POST with {label} should accept the empty-body digest"
+        );
+        assert_eq!(
+            send_raw_h1_hmac_request(
+                proxy_port,
+                "POST",
+                &incorrect_empty_digest,
+                framing_headers,
+                wire_body,
+            )
+            .await,
+            401,
+            "H1 POST with {label} must reject a signed non-empty digest"
+        );
+    }
+
+    // H2 relies on END_STREAM, not method or framing headers. An END_STREAM on
+    // the request headers proves emptiness even for body methods.
+    for method in ["GET", "HEAD", "OPTIONS", "DELETE", "POST"] {
+        assert_eq!(
+            send_h2_hmac_request(proxy_port, method, &empty_digest, None, None).await,
+            200,
+            "H2 {method} with header END_STREAM should accept the empty-body digest"
+        );
+        assert_eq!(
+            send_h2_hmac_request(proxy_port, method, &incorrect_empty_digest, None, None).await,
+            401,
+            "H2 {method} with header END_STREAM must reject a signed non-empty digest"
+        );
+    }
+
+    assert_eq!(
+        send_h2_hmac_request(proxy_port, "POST", &empty_digest, Some("0"), None).await,
+        200,
+        "H2 Content-Length: 0 should accept the empty-body digest"
+    );
+    assert_eq!(
+        send_h2_hmac_request(proxy_port, "POST", &incorrect_empty_digest, Some("0"), None,).await,
+        401,
+        "H2 Content-Length: 0 must reject a signed non-empty digest"
+    );
+
+    // Keep the H2 request open at header time, then finish with empty DATA.
+    // The proxy must collect through END_STREAM rather than infer emptiness
+    // from GET plus absent Content-Length.
+    assert_eq!(
+        send_h2_hmac_request(proxy_port, "GET", &empty_digest, None, Some(&[])).await,
+        200,
+        "open H2 GET ending with empty DATA should authenticate"
+    );
+    assert_eq!(
+        send_h2_hmac_request(proxy_port, "GET", &incorrect_empty_digest, None, Some(&[]),).await,
+        401,
+        "open H2 GET ending with empty DATA must verify the final empty digest"
+    );
+
+    let one_byte_digest = content_digest_sha256(b"x");
+    assert_eq!(
+        send_h2_hmac_request(proxy_port, "GET", &one_byte_digest, None, Some(b"x")).await,
+        200,
+        "open H2 GET must collect and verify DATA without Content-Length"
+    );
+    assert_eq!(
+        send_h2_hmac_request(proxy_port, "GET", &empty_digest, None, Some(b"x")).await,
+        401,
+        "open H2 GET must never infer empty while DATA can still arrive"
+    );
 }
 
 /// Simple echo HTTP server that returns request info.
@@ -566,8 +855,8 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
         .expect("Denied external identity request failed");
     assert_eq!(
         denied.status().as_u16(),
-        401,
-        "without allow_authenticated_identity, external identity should still be rejected by ACL"
+        403,
+        "an authenticated external identity outside the Consumer allow-list is forbidden"
     );
 }
 
@@ -645,7 +934,7 @@ async fn test_auth_acl_comprehensive() {
         &auth_header,
         "consumer-alice",
         "hmac_auth",
-        &json!({"secret": "alice-hmac-shared-secret"}),
+        &json!({"secret": "alice-hmac-shared-secret-at-least-32-bytes"}),
     )
     .await
     .unwrap();
@@ -1255,11 +1544,19 @@ async fn test_auth_acl_comprehensive() {
     // ==========================================
 
     println!("\n=== HMAC AUTH TESTS ===");
+    let hmac_authority = hmac_authority_from_url(proxy_url);
 
     // Test 17: HMAC Auth — valid signature
     println!("\n--- Test 17: HMAC Auth — Valid Signature ---");
     let date = Utc::now().to_rfc2822();
-    let signature = generate_hmac_signature("GET", "/hmacauth", &date, "alice-hmac-shared-secret");
+    let signature = generate_hmac_signature(
+        "GET",
+        "/hmacauth",
+        &date,
+        "alice",
+        &hmac_authority,
+        "alice-hmac-shared-secret-at-least-32-bytes",
+    );
     let hmac_header = format!(
         "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
         signature
@@ -1281,10 +1578,21 @@ async fn test_auth_acl_comprehensive() {
     assert!(body["echo"].as_bool().unwrap_or(false));
     println!("✓ Valid HMAC signature accepted");
 
+    // Focused regression coverage for the preverified HMAC cache and the
+    // shared H1/H2 request-body classification boundary.
+    assert_empty_body_hmac_regressions(harness._gw.proxy_port).await;
+
     // Test 18: HMAC Auth — wrong secret (bad signature)
     println!("\n--- Test 18: HMAC Auth — Wrong Secret ---");
     let date = Utc::now().to_rfc2822();
-    let bad_sig = generate_hmac_signature("GET", "/hmacauth", &date, "wrong-secret");
+    let bad_sig = generate_hmac_signature(
+        "GET",
+        "/hmacauth",
+        &date,
+        "alice",
+        &hmac_authority,
+        "wrong-secret",
+    );
     let hmac_header = format!(
         "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
         bad_sig
@@ -1306,7 +1614,14 @@ async fn test_auth_acl_comprehensive() {
 
     // Test 19: HMAC Auth — missing Date header (replay protection)
     println!("\n--- Test 19: HMAC Auth — Missing Date Header ---");
-    let sig_no_date = generate_hmac_signature("GET", "/hmacauth", "", "alice-hmac-shared-secret");
+    let sig_no_date = generate_hmac_signature(
+        "GET",
+        "/hmacauth",
+        "",
+        "alice",
+        &hmac_authority,
+        "alice-hmac-shared-secret-at-least-32-bytes",
+    );
     let hmac_header = format!(
         "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
         sig_no_date
@@ -1328,7 +1643,14 @@ async fn test_auth_acl_comprehensive() {
     // Test 20: HMAC Auth — unknown consumer
     println!("\n--- Test 20: HMAC Auth — Unknown Consumer ---");
     let date = Utc::now().to_rfc2822();
-    let sig = generate_hmac_signature("GET", "/hmacauth", &date, "some-secret");
+    let sig = generate_hmac_signature(
+        "GET",
+        "/hmacauth",
+        &date,
+        "nonexistent",
+        &hmac_authority,
+        "some-secret",
+    );
     let hmac_header = format!(
         "hmac username=\"nonexistent\", algorithm=\"hmac-sha256\", signature=\"{}\"",
         sig
@@ -1347,6 +1669,31 @@ async fn test_auth_acl_comprehensive() {
         "HMAC for unknown consumer should return 401"
     );
     println!("✓ HMAC for unknown consumer rejected with 401");
+
+    // Regression: wrong and unknown credentials must reject before an oversized
+    // body reaches the HMAC plug-in's 10 MiB collection limit. Exact response
+    // parity prevents the former 413-vs-401 username-enumeration oracle.
+    println!("\n--- HMAC Auth — Oversized Invalid Credential Parity ---");
+    let oversized_date = Utc::now().to_rfc2822();
+    let (known_wrong_status, known_wrong_body) = send_declared_oversized_invalid_h1_hmac_request(
+        harness._gw.proxy_port,
+        &oversized_date,
+        "alice",
+        "wrong-secret-that-cannot-authenticate-alice",
+    )
+    .await;
+    let (unknown_status, unknown_body) = send_declared_oversized_invalid_h1_hmac_request(
+        harness._gw.proxy_port,
+        &oversized_date,
+        "nonexistent",
+        "wrong-secret-that-cannot-authenticate-anyone",
+    )
+    .await;
+
+    assert_eq!(known_wrong_status, 401);
+    assert_eq!(unknown_status, known_wrong_status);
+    assert_eq!(unknown_body, known_wrong_body);
+    println!("✓ Oversized known-invalid and unknown HMAC credentials return identical 401s");
 
     // Test 21: HMAC Auth — missing Authorization header
     println!("\n--- Test 21: HMAC Auth — Missing Auth Header ---");
@@ -1623,19 +1970,10 @@ async fn test_auth_acl_comprehensive() {
     assert!(resp.status().is_success());
     let consumer_json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(consumer_json["username"], "alice");
-    // Verify password_hash is redacted
-    if let Some(basicauth) = consumer_json["credentials"]["basicauth"]
-        .as_array()
-        .and_then(|entries| entries.first())
-        .and_then(|entry| entry.as_object())
-        && let Some(hash) = basicauth.get("password_hash")
-    {
-        assert_eq!(
-            hash.as_str().unwrap(),
-            "[REDACTED]",
-            "Password hash should be redacted in API response"
-        );
-    }
+    assert!(
+        consumer_json["credentials"].get("basicauth").is_none(),
+        "Basic-auth credentials should be omitted from API responses"
+    );
     println!("✓ Consumer credentials properly redacted");
 
     // Test 37: List consumers
@@ -2230,8 +2568,8 @@ async fn test_hmac_auth_plus_acl() {
     let admin_url = &harness.admin_base_url;
     let proxy_url = &harness.proxy_base_url;
 
-    let alice_hmac = "hmac-alice-shared-secret-aaa";
-    let mallory_hmac = "hmac-mallory-shared-secret-zzz";
+    let alice_hmac = "hmac-alice-shared-secret-aaa-0001";
+    let mallory_hmac = "hmac-mallory-shared-secret-zzz-0002";
 
     create_consumer(&client, admin_url, &auth_header, "hmac-alice", "hmac-alice")
         .await
@@ -2315,9 +2653,14 @@ async fn test_hmac_auth_plus_acl() {
 
     tokio::time::sleep(Duration::from_secs(4)).await;
 
-    fn signed_request(path: &str, username: &str, secret: &str) -> (String, String) {
+    fn signed_request(
+        path: &str,
+        username: &str,
+        authority: &str,
+        secret: &str,
+    ) -> (String, String) {
         let date = Utc::now().to_rfc2822();
-        let signature = generate_hmac_signature("GET", path, &date, secret);
+        let signature = generate_hmac_signature("GET", path, &date, username, authority, secret);
         let header = format!(
             "hmac username=\"{}\", algorithm=\"hmac-sha256\", signature=\"{}\"",
             username, signature
@@ -2326,7 +2669,9 @@ async fn test_hmac_auth_plus_acl() {
     }
 
     // Allow list — alice OK, mallory blocked
-    let (header, date) = signed_request("/hmac-acl-allow", "hmac-alice", alice_hmac);
+    let hmac_authority = hmac_authority_from_url(proxy_url);
+    let (header, date) =
+        signed_request("/hmac-acl-allow", "hmac-alice", &hmac_authority, alice_hmac);
     let resp = client
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
@@ -2341,7 +2686,12 @@ async fn test_hmac_auth_plus_acl() {
         resp.status()
     );
 
-    let (header, date) = signed_request("/hmac-acl-allow", "hmac-mallory", mallory_hmac);
+    let (header, date) = signed_request(
+        "/hmac-acl-allow",
+        "hmac-mallory",
+        &hmac_authority,
+        mallory_hmac,
+    );
     let resp = client
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
@@ -2358,7 +2708,12 @@ async fn test_hmac_auth_plus_acl() {
     );
 
     // Allow list — bad signature still returns 401, not 403
-    let (header, date) = signed_request("/hmac-acl-allow", "hmac-alice", "totally-wrong-secret");
+    let (header, date) = signed_request(
+        "/hmac-acl-allow",
+        "hmac-alice",
+        &hmac_authority,
+        "totally-wrong-secret",
+    );
     let resp = client
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
@@ -2375,7 +2730,12 @@ async fn test_hmac_auth_plus_acl() {
     );
 
     // Deny list — mallory blocked, alice OK
-    let (header, date) = signed_request("/hmac-acl-deny", "hmac-mallory", mallory_hmac);
+    let (header, date) = signed_request(
+        "/hmac-acl-deny",
+        "hmac-mallory",
+        &hmac_authority,
+        mallory_hmac,
+    );
     let resp = client
         .get(format!("{}/hmac-acl-deny", proxy_url))
         .header("Authorization", header)
@@ -2391,7 +2751,8 @@ async fn test_hmac_auth_plus_acl() {
         resp.status()
     );
 
-    let (header, date) = signed_request("/hmac-acl-deny", "hmac-alice", alice_hmac);
+    let (header, date) =
+        signed_request("/hmac-acl-deny", "hmac-alice", &hmac_authority, alice_hmac);
     let resp = client
         .get(format!("{}/hmac-acl-deny", proxy_url))
         .header("Authorization", header)

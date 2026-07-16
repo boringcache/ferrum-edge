@@ -12,10 +12,16 @@ Ferrum Edge uses a trait-based plugin system. All plugins implement the `Plugin`
 Request received
   │
   ▼
-on_request_received()           ── can reject
+Route matching                  ── unmatched requests return 404 here
   │
   ▼
-Route matching
+Allowed-method admission       ── matched disallowed methods return 405 here
+  │
+  ▼
+Native gRPC POST admission     ── non-POST native gRPC is rejected here
+  │
+  ▼
+on_request_received()           ── can reject; matched/allowed requests only
   │
   ▼
 authenticate()                  ── can reject (auth plugins only)
@@ -51,11 +57,19 @@ on_final_response_body()        ── can reject (post-transform validation)
 on_response_committed()         ── observe-only final buffered status/body
   │
   ▼
-log()                           ── fire-and-forget
+log()                           ── awaited sequentially on buffered responses
   │
   ▼
-Response sent to client
+Buffered response returned to the embedded HTTP server, then sent to the client
 ```
+
+Streamed responses have a different terminal path. For hyper-owned H1/H2 and
+gRPC bodies, the handler returns the response first; body completion then
+spawns `on_response_stream_terminated()` and sequential `log()` hooks. Native
+H3 drives the body to completion inside its handler and then awaits the
+terminal and log hooks before that handler returns. See
+[Transaction log hook timing](#transaction-log-hook-timing) for lifecycle and
+shutdown guidance.
 
 ### WebSocket Frame Lifecycle (per-frame, after upgrade)
 
@@ -91,6 +105,7 @@ Each plugin file must export a `create_plugin` factory function that returns
 // custom_plugins/my_header_injector.rs
 
 use async_trait::async_trait;
+use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,19 +119,53 @@ pub struct MyHeaderInjector {
     header_value: String,
 }
 
+const MAX_CUSTOM_HEADER_NAME_BYTES: usize = 256;
+const MAX_CUSTOM_HEADER_VALUE_BYTES: usize = 8 * 1024;
+
 impl MyHeaderInjector {
     // Constructor MUST return Result<Self, String>.
     // Return Err for invalid or missing required config values.
     pub fn new(config: &Value) -> Result<Self, String> {
+        let config = config
+            .as_object()
+            .ok_or_else(|| "my_header_injector config must be a JSON object".to_string())?;
+        for key in config.keys() {
+            if !matches!(key.as_str(), "header_name" | "header_value") {
+                return Err(format!(
+                    "my_header_injector config contains unknown key '{key}'; expected only 'header_name' and 'header_value'"
+                ));
+            }
+        }
+
+        let header_name = match config.get("header_name") {
+            None => "X-My-Header".to_string(),
+            Some(Value::String(value)) => value.clone(),
+            Some(_) => return Err("header_name must be a string when present".to_string()),
+        };
+        if header_name.len() > MAX_CUSTOM_HEADER_NAME_BYTES {
+            return Err(format!(
+                "header_name must be at most {MAX_CUSTOM_HEADER_NAME_BYTES} bytes"
+            ));
+        }
+        HeaderName::from_bytes(header_name.as_bytes())
+            .map_err(|error| format!("header_name must be a valid HTTP header name: {error}"))?;
+
+        let header_value = match config.get("header_value") {
+            None => "hello".to_string(),
+            Some(Value::String(value)) => value.clone(),
+            Some(_) => return Err("header_value must be a string when present".to_string()),
+        };
+        if header_value.len() > MAX_CUSTOM_HEADER_VALUE_BYTES {
+            return Err(format!(
+                "header_value must be at most {MAX_CUSTOM_HEADER_VALUE_BYTES} bytes"
+            ));
+        }
+        HeaderValue::from_str(&header_value)
+            .map_err(|error| format!("header_value must be a valid HTTP header value: {error}"))?;
+
         Ok(Self {
-            header_name: config["header_name"]
-                .as_str()
-                .unwrap_or("X-My-Header")
-                .to_string(),
-            header_value: config["header_value"]
-                .as_str()
-                .unwrap_or("hello")
-                .to_string(),
+            header_name,
+            header_value,
         })
     }
 }
@@ -158,6 +207,8 @@ Your `new()` constructor must validate the plugin config and return `Err(String)
 
 - **Required fields are missing** — if the plugin cannot function without a field, return an error (don't silently default to a no-op).
 - **Values are invalid** — reject malformed regexes, unknown enum variants, out-of-range numbers, unparseable URLs.
+- **The config shape is unexpected** — reject non-object roots, unknown keys, and present values of the wrong JSON type. Apply an optional field's default only when that field is omitted.
+- **A value crosses a typed protocol boundary** — parse header names/values, URLs, CIDRs, and similar values in the constructor and apply an explicit size bound before retaining them.
 - **The plugin would have no effect** — e.g., a rate limiter with no rate windows, a size limiter with `max_bytes=0`, a transformer with no rules.
 
 Sensible defaults for optional fields (e.g., `limit_by` defaulting to `"ip"`) are fine — only return `Err` for fields where there is no safe default.
@@ -218,7 +269,7 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 
 | Method | Phase | Can Reject? | Typical Use |
 |--------|-------|-------------|-------------|
-| `on_request_received(&mut ctx)` | Pre-routing | Yes | IP filtering, request validation, early termination |
+| `on_request_received(&mut ctx)` | Post-route, post-allowed-method admission | Yes | IP filtering, request validation, early termination for matched/allowed requests |
 | `authenticate(&mut ctx, &consumer_index)` | Authentication | Yes | Verify identity (JWT, API key, custom tokens) |
 | `authorize(&mut ctx)` | Authorization | Yes | Check permissions, enforce rate limits |
 | `before_proxy(&mut ctx, &mut headers)` | Pre-backend | Yes | Transform request headers, add tracing IDs. **Read request headers from `headers`, not `ctx.headers`** (see note below) |
@@ -231,14 +282,59 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `on_response_committed(&mut ctx, status, &headers, &body)` | Post-backend (buffered commit) | No | Export the final client-visible buffered response after validators and rejection replacement; opt in with `requires_response_committed_hook()` |
 | `response_stream_inspector(&ctx, status, content_type)` | Post-backend (streaming) | No (can truncate) | Create one stateful, per-response body inspector |
 | `on_response_stream_terminated(&mut ctx, status, outcome)` | Post-backend (streaming terminal) | No | Clean up/account for streaming state and write aggregate transaction metadata before logging; does not receive body bytes |
-| `log(&summary)` | Logging | No | Send transaction data to external systems |
+| `log(&summary)` | Logging | No | Hand transaction data to a bounded sink; timing depends on response ownership |
 | `on_ws_frame(proxy_id, connection_id, direction, &message)` | WebSocket frame | Close* | Inspect/transform per-frame WebSocket traffic |
 
 \*`on_ws_frame` cannot return `PluginResult::Reject`. Instead, return `Some(Message::Close(...))` to close the connection in both directions. Return `None` for passthrough, or `Some(transformed_message)` to replace the frame.
 
 **Streaming inspectors:** A `ResponseStreamInspector` runs after response headers have been committed. It can forward, hold, or terminate the remaining body, but it cannot change the response status or retract bytes already sent.
 
+**`on_request_received` routing boundary:** This hook runs only after a route
+matches and that proxy's `allowed_methods` check succeeds. At that point
+`ctx.matched_proxy` is populated and the hook runs over the resolved view of
+applicable global and proxy/proxy-group-scoped plugins. An unmatched request
+returns 404 without running any global or scoped `on_request_received` hook. A
+matched request with a disallowed method returns 405 without running either
+kind of hook. Native gRPC requests must also use `POST` before this hook runs.
+A matched non-POST native gRPC request is rejected before global or scoped
+hooks even when `allowed_methods` permits it. H1, H2, and H3 share these blind
+spots. Terminal transaction logging is separate; do not use this ordinary
+request hook as a count of every connection or response the gateway handled.
+
 **`before_proxy` header parameter**: In `before_proxy`, always read request headers from the `headers` parameter, **not** from `ctx.headers`. The proxy handler avoids cloning the headers HashMap when no plugin modifies them — it moves headers out of `ctx.headers` into the `headers` parameter via `std::mem::take()`, leaving `ctx.headers` empty during the call. After `before_proxy` completes, headers are moved back. This means `ctx.headers.get("content-type")` returns `None` inside `before_proxy`, while `headers.get("content-type")` returns the actual value. If your plugin calls helper methods that need request headers, pass the `headers` parameter through rather than reading `ctx.headers` in the helper. This only affects `before_proxy` — other phases like `authenticate` and `on_request_received` can safely read `ctx.headers`.
+
+### Transaction log hook timing
+
+`log()` is sequential within one transaction: Ferrum awaits each configured
+plugin in priority/config order. Where that wait occurs depends on who owns the
+response body:
+
+- Buffered responses, buffered rejections/errors, and other synchronous
+  terminal paths normally await every `log()` hook before the handler returns
+  the response. Direct endpoint or filesystem I/O in the hook therefore adds
+  latency, and multiple slow hooks add that latency serially. Buffered H1/H2
+  requests with an active absolute gRPC deadline are the exception: Ferrum
+  moves their owned terminal log state to a five-second detached cleanup task
+  so a blocked sink cannot delay the terminal RPC response.
+- Hyper-owned streamed H1/H2 and gRPC bodies return from the handler before the
+  body is complete. At terminal body completion, Ferrum spawns one task that
+  awaits `on_response_stream_terminated()` and then all `log()` hooks in
+  sequence. The work can be lost if no Tokio runtime remains or the runtime
+  shuts down before the task finishes.
+- Native H3 owns and drives its QUIC body inside the request handler. After the
+  body terminates, it synchronously awaits terminal hooks and sequential
+  `log()` hooks before the handler completes. It does not use the detached
+  hyper-body logger.
+
+For potentially slow I/O, use an explicitly bounded channel whose sender,
+worker, cancellation state, and retry budget are owned by the plugin instance.
+Start the worker in `start_background_tasks()` only after the cache generation
+is accepted, define an explicit queue-full policy, and close/signal the worker
+when the instance is dropped. Do not spawn one unbounded task per transaction.
+Because `Drop` cannot await and runtime shutdown can still cancel a worker,
+durability-sensitive sinks should persist records before acknowledging them or
+hand off to an external collector with its own drain protocol; a custom plugin
+must not claim lossless shutdown merely because it uses a background task.
 
 ### Lifecycle Hooks — TCP/UDP Streams
 
@@ -263,7 +359,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn should_buffer_request_body(&self, &ctx) -> bool` | Delegates | Per-request decision on whether to buffer. Defaults to `requires_request_body_buffering()`. Override for conditional buffering (e.g., only for certain content types). |
 | `fn requires_response_body_buffering(&self) -> bool` | `false` | Config-time upper bound. Set to `true` if the plugin may need the complete response body. |
 | `fn should_buffer_response_body(&self, &ctx) -> bool` | Delegates | Per-request refinement. Defaults to `requires_response_body_buffering()` and may skip buffering for irrelevant requests. |
-| `fn should_buffer_response_body_for_content_type(&self, &ctx, content_type, status, &headers) -> bool` | Delegates | Post-header refinement on supported dispatch paths. This is narrowing-only: it may release a response selected for buffering, but cannot force a streaming response to buffer. |
+| `fn should_buffer_response_body_for_content_type(&self, &ctx, content_type, status, &headers) -> bool` | Delegates | Post-header refinement on supported dispatch paths. Inspect status and the full header map (including `Content-Encoding`) when representation metadata affects safety. This is narrowing-only: it may release a response selected for buffering, but cannot force a streaming response to buffer. |
 | `fn may_modify_response_content_type(&self, &ctx, backend_content_type) -> bool` | `false` | Set when `after_proxy` may relabel the backend `Content-Type`; this prevents an unsafe buffer-to-stream downgrade. The answer must match the current request and backend type exactly. |
 | `fn requires_response_stream_hooks(&self) -> bool` | `false` | Config-time opt-in for streaming response inspection. |
 | `fn response_stream_inspector(&self, &ctx, status, content_type) -> Option<Box<dyn ResponseStreamInspector>>` | `None` | Create state owned by one eligible streaming response, or return `None` for passthrough. |
@@ -303,7 +399,7 @@ Plugins execute in priority order (lowest number first) within each lifecycle ph
 | Band | Range | Purpose | Built-in Examples |
 |------|-------|---------|-------------------|
 | Observability | 0–99 | Tracing, correlation | otel_tracing (25), correlation_id (50) |
-| Preflight | 100–999 | CORS, IP filtering, termination, bot detection | cors (100), request_termination (125), ip_restriction (150), bot_detection (200), grpc_method_router (275) |
+| Preflight | 100–999 | Matched-request CORS, IP filtering, termination, bot detection | cors (100), request_termination (125), ip_restriction (150), bot_detection (200), grpc_method_router (275) |
 | Authentication | 950–1499 | Identity verification | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), basic_auth (1300), hmac_auth (1400) |
 | Authorization | 2000–2099 | Access control, throttling | access_control (2000), tcp_connection_throttle (2050) |
 | Request Validation | 2800–2999 | Size limits, rate limits, body validation | request_size_limiting (2800), ws_message_size_limiting (2810), graphql (2850), rate_limiting (2900), ws_rate_limiting (2910), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
@@ -472,7 +568,7 @@ See the [response-body streaming guide](docs/response_body_streaming.md) for the
 
 ### Buffer the complete response
 
-`requires_response_body_buffering()` is the config-time upper bound. `should_buffer_response_body()` may narrow it using request context. On dispatch paths that support the post-header downgrade, `should_buffer_response_body_for_content_type()` gets one final opportunity to narrow the decision after the backend status and headers arrive. The content-type hook cannot turn a streaming decision into buffering; returning `true` where `should_buffer_response_body()` returned `false` has no effect. See the response-body streaming guide for the current protocol coverage.
+`requires_response_body_buffering()` is the config-time upper bound. `should_buffer_response_body()` may narrow it using request context. On dispatch paths that support the post-header downgrade, `should_buffer_response_body_for_content_type()` gets one final opportunity to narrow the decision after the backend status and headers arrive. Despite its historical name, this hook must consider any response header that determines whether the buffered hook can inspect the representation. In particular, do not release non-identity `Content-Encoding` bytes when correctness depends on a bounded final decode or fail-closed rejection. The content-type hook cannot turn a streaming decision into buffering; returning `true` where `should_buffer_response_body()` returned `false` has no effect. See the response-body streaming guide for the current protocol coverage.
 
 ```rust
 #[async_trait]
@@ -719,11 +815,27 @@ pub struct MyRateLimiter {
 }
 
 impl MyRateLimiter {
-    pub fn new(config: &Value) -> Self {
-        Self {
-            counts: Arc::new(DashMap::new()),
-            max_requests: config["max_requests"].as_u64().unwrap_or(100),
+    pub fn new(config: &Value) -> Result<Self, String> {
+        let config = config
+            .as_object()
+            .ok_or_else(|| "my_rate_limiter config must be a JSON object".to_string())?;
+        for key in config.keys() {
+            if key != "max_requests" {
+                return Err(format!("unknown my_rate_limiter config key: {key}"));
+            }
         }
+        let max_requests = match config.get("max_requests") {
+            None => 100,
+            Some(Value::Number(value)) => value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "max_requests must be a positive integer".to_string())?,
+            Some(_) => return Err("max_requests must be an integer when present".to_string()),
+        };
+        Ok(Self {
+            counts: Arc::new(DashMap::new()),
+            max_requests,
+        })
     }
 }
 ```
@@ -790,14 +902,32 @@ pub struct MyWebhookPlugin {
 }
 
 impl MyWebhookPlugin {
-    pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
-        Self {
-            http_client,
-            webhook_url: config["webhook_url"]
-                .as_str()
-                .unwrap_or("http://localhost:8080/webhook")
-                .to_string(),
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        let config = config
+            .as_object()
+            .ok_or_else(|| "my_webhook config must be a JSON object".to_string())?;
+        for key in config.keys() {
+            if key != "webhook_url" {
+                return Err(format!("unknown my_webhook config key: {key}"));
+            }
         }
+        let webhook_url = match config.get("webhook_url") {
+            None => "http://localhost:8080/webhook".to_string(),
+            Some(Value::String(value)) if value.len() <= 2048 => value.clone(),
+            Some(Value::String(_)) => {
+                return Err("webhook_url must be at most 2048 bytes".to_string());
+            }
+            Some(_) => return Err("webhook_url must be a string when present".to_string()),
+        };
+        let parsed = url::Url::parse(&webhook_url)
+            .map_err(|error| format!("webhook_url must be a valid URL: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("webhook_url scheme must be http or https".to_string());
+        }
+        Ok(Self {
+            http_client,
+            webhook_url,
+        })
     }
 }
 ```
@@ -809,7 +939,7 @@ pub fn create_plugin(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
-    Ok(Some(Arc::new(MyWebhookPlugin::new(config, http_client))))
+    Ok(Some(Arc::new(MyWebhookPlugin::new(config, http_client)?)))
 }
 
 pub fn failure_policy() -> PluginFailurePolicy {
@@ -1071,7 +1201,7 @@ ferrum-edge/
 ├── build.rs                   # Auto-discovers plugins + migrations at compile time
 ├── custom_plugins/            # YOUR PLUGINS GO HERE — just drop .rs files
 │   ├── mod.rs                 # Thin shim (includes build-script-generated code)
-│   ├── example_plugin.rs      # Working example — header injection (can be removed)
+│   ├── example_plugin.rs      # Working example — header/body transforms (can be removed)
 │   ├── example_audit_plugin.rs # Working example — database migrations (can be removed)
 │   ├── my_header_injector.rs  # Your plugin
 │   └── my_custom_auth.rs      # Your plugin
@@ -1310,6 +1440,8 @@ docker build -t my-ferrum-edge .
 
 Add tests directly in your plugin file or in a separate test module:
 
+<!-- custom-plugin-guide-test: fallible-constructor-result -->
+
 ```rust
 #[cfg(test)]
 mod tests {
@@ -1317,9 +1449,9 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn test_my_plugin_adds_header() {
+    async fn test_my_plugin_adds_header() -> Result<(), String> {
         let config = json!({ "header_name": "X-Test", "header_value": "hello" });
-        let plugin = MyHeaderInjector::new(&config);
+        let plugin = MyHeaderInjector::new(&config)?;
 
         let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
@@ -1330,10 +1462,15 @@ mod tests {
 
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert!(matches!(result, PluginResult::Continue));
-        assert_eq!(headers.get("X-Test"), Some(&"hello".to_string()));
+        assert_eq!(headers.get("X-Test").map(String::as_str), Some("hello"));
+        Ok(())
     }
 }
 ```
+
+The repository's external unit suite compiles this fallible-constructor pattern
+and checks the marked Markdown snippet so a later signature edit cannot silently
+restore a method call on `Result<MyHeaderInjector, String>`.
 
 Run tests:
 
@@ -1351,6 +1488,8 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] `create_plugin()` factory function exported with signature `(config: &Value, http_client: PluginHttpClient) -> Result<Option<Arc<dyn Plugin>>, String>`
 - [ ] `failure_policy()` metadata function exported with the desired `PluginFailurePolicy`
 - [ ] `fn name()` returns the file name (without `.rs`)
+- [ ] Constructor rejects non-object roots, unknown keys, present wrong types, and invalid/oversized protocol values
+- [ ] `on_request_received()` logic does not assume it will observe unmatched 404 or matched 405 responses
 - [ ] Priority set appropriately for the execution phase
 - [ ] `supported_protocols()` returns the correct protocol set
 - [ ] `is_auth_plugin()` returns `true` if it's an auth plugin
@@ -1361,6 +1500,7 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] A plugin that relabels response `Content-Type` declares `may_modify_response_content_type()` with the same conditions as `after_proxy()`
 - [ ] `requires_ws_frame_hooks()` returns `true` if it implements `on_ws_frame()`
 - [ ] `warmup_hostnames()` returns external hosts if applicable
+- [ ] Slow `log()` I/O uses a bounded, lifecycle-owned handoff with explicit overflow and shutdown behavior
 - [ ] If using database tables: `plugin_migrations()` exported with versioned migrations
 - [ ] If using database tables: table names prefixed to avoid collisions
 - [ ] If using database tables: `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` tested

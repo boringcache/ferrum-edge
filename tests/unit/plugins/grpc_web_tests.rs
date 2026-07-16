@@ -138,6 +138,8 @@ async fn test_translated_error_response_binary_uses_grpc_web_trailer_frame() {
         response.headers.get("x-grpc-web").map(String::as_str),
         Some("1")
     );
+    assert!(!response.headers.contains_key("grpc-status"));
+    assert!(!response.headers.contains_key("grpc-message"));
     assert_eq!(
         response
             .headers
@@ -170,6 +172,8 @@ async fn test_translated_error_response_text_base64_encodes_trailer_frame() {
         response.headers.get("x-grpc-web").map(String::as_str),
         Some("1")
     );
+    assert!(!response.headers.contains_key("grpc-status"));
+    assert!(!response.headers.contains_key("grpc-message"));
     let decoded = BASE64.decode(&response.body).unwrap();
     let payload = grpc_web_trailer_payload(&decoded);
     assert!(payload.contains("grpc-status: 14\r\n"));
@@ -195,6 +199,8 @@ fn test_error_response_for_content_type_text_base64_encodes_trailer_frame() {
         response.headers.get("x-grpc-web").map(String::as_str),
         Some("1")
     );
+    assert!(!response.headers.contains_key("grpc-status"));
+    assert!(!response.headers.contains_key("grpc-message"));
     let decoded = BASE64.decode(&response.body).unwrap();
     let payload = grpc_web_trailer_payload(&decoded);
     assert!(payload.contains("grpc-status: 14\r\n"));
@@ -1019,13 +1025,40 @@ async fn test_full_roundtrip_text() {
 #[test]
 fn test_is_grpc_web_content_type() {
     use ferrum_edge::_test_support::is_grpc_web_content_type;
-    assert!(is_grpc_web_content_type("application/grpc-web"));
-    assert!(is_grpc_web_content_type("application/grpc-web+proto"));
-    assert!(is_grpc_web_content_type("application/grpc-web-text"));
-    assert!(is_grpc_web_content_type("application/grpc-web-text+proto"));
-    assert!(is_grpc_web_content_type("  Application/gRPC-Web  "));
-    assert!(!is_grpc_web_content_type("application/grpc"));
-    assert!(!is_grpc_web_content_type("application/json"));
+    for content_type in [
+        "application/grpc-web",
+        "application/grpc-web+proto",
+        "application/grpc-web+json",
+        "application/grpc-web-text",
+        "application/grpc-web-text+proto",
+        "application/grpc-web-text+custom",
+        "  Application/gRPC-Web  ",
+        "application/grpc-web; charset=utf-8",
+        "application/grpc-web-text+proto \t; charset = \"utf-8\"; version=1",
+    ] {
+        assert!(
+            is_grpc_web_content_type(content_type),
+            "valid gRPC-Web media type was rejected: {content_type}"
+        );
+    }
+
+    for content_type in [
+        "application/grpc",
+        "application/json",
+        "application/grpc-website",
+        "application/grpc-web-textual",
+        "application/grpc-web+",
+        "application/grpc-web++proto",
+        "application/grpc-web/extra",
+        "application/grpc-web;",
+        "application/grpc-web; charset",
+        "application/grpc-web; charset=\"unterminated",
+    ] {
+        assert!(
+            !is_grpc_web_content_type(content_type),
+            "deceptive or malformed media type was accepted: {content_type}"
+        );
+    }
 }
 
 #[test]
@@ -1033,8 +1066,12 @@ fn test_is_grpc_web_text() {
     use ferrum_edge::_test_support::is_grpc_web_text;
     assert!(is_grpc_web_text("application/grpc-web-text"));
     assert!(is_grpc_web_text("application/grpc-web-text+proto"));
+    assert!(is_grpc_web_text(
+        " Application/Grpc-Web-Text+json ; charset=utf-8 "
+    ));
     assert!(!is_grpc_web_text("application/grpc-web"));
     assert!(!is_grpc_web_text("application/grpc-web+proto"));
+    assert!(!is_grpc_web_text("application/grpc-web-textual"));
 }
 
 #[test]
@@ -1059,6 +1096,19 @@ fn test_response_content_type() {
     assert_eq!(
         response_content_type("Application/Grpc-Web-Text+Proto"),
         "application/grpc-web-text+proto"
+    );
+    assert_eq!(
+        response_content_type("Application/Grpc-Web+Proto ; charset=utf-8"),
+        "application/grpc-web+proto"
+    );
+    assert_eq!(
+        response_content_type("application/grpc-web-text+json; charset=utf-8"),
+        "application/grpc-web-text"
+    );
+    assert_eq!(
+        response_content_type("application/grpc-website"),
+        "application/grpc-web",
+        "unrecognized values must never be reflected"
     );
 }
 

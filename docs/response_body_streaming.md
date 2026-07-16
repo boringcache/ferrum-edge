@@ -197,13 +197,14 @@ let should_stream = match proxy.response_body_mode {
 };
 ```
 
-### Content-Type-Aware Downgrade (after response headers)
+### Response-Header-Aware Downgrade (after response headers)
 
 The pre-flight decision above runs *before* the backend request is sent, so it
-cannot see the response `Content-Type` and conservatively buffers whenever any
+cannot see the response headers and conservatively buffers whenever any
 plugin *might* need the body. Once the backend response headers arrive, the
 gateway re-checks the decision per response: if **no** plugin needs the body for
-the actual `Content-Type`, a response that was going to be buffered is
+the actual status, `Content-Type`, `Content-Encoding`, and other representation
+metadata, a response that was going to be buffered is
 **downgraded to streaming** instead. The main beneficiary is `waf` with
 `response_body_inspection` enabled — a non-allowlisted/binary response
 (`application/octet-stream`, images, video, …) is streamed rather than buffered
@@ -218,14 +219,37 @@ buffering plugin reports that it does not need that content type; the MCP and
 A2A gateways use this for `text/event-stream`, whose retry decision is complete
 from status and headers and whose body must not be collected to EOF.
 
+Because this check can only release a previously buffered response, complete-body
+inspectors must treat opaque representation metadata conservatively. For example,
+`ai_semantic_firewall` keeps eligible complete origin responses with any
+non-identity `Content-Encoding` buffered even when `Content-Type` is missing or
+non-JSON. Its final hook then decodes supported gzip/Brotli within the inspection
+cap and routes empty, malformed, unsupported, or oversized encodings through the
+configured `on_error` policy (fail-closed by default). Partial responses (`206`
+or `Content-Range`) follow the same bounded encoded-body decision as complete
+responses: decodable governed content remains inspectable, while malformed
+fragments follow the configured uninspectable-body policy. Unencoded JSON
+partials also remain subject to normal inspection. Unencoded unrelated event
+streams also keep streaming; complete origin-encoded event streams stay buffered
+for bounded decode because stream inspectors cannot parse compressed wire bytes.
+After decoding, an SSE media type keeps SSE frame parsing unless the complete
+payload is a valid standalone JSON document; this preserves later `data:` frames
+after JSON-looking SSE preludes while still inspecting bare JSON mislabeled as
+SSE. Once an encoded event stream is governed, every assembled non-empty,
+non-`[DONE]` `data:` payload must parse as JSON; one unparseable frame makes the
+decoded representation uninspectable and routes the whole response through
+`on_error` instead of inspecting only its parseable subset. No encoding (or an
+identity-only encoding list) still lets ordinary non-AI text stream, and a
+gateway-planned compression transform is not mistaken for already-encoded
+origin bytes, including when a later header hook switches between supported gzip
+and Brotli output.
+
 **Protocol coverage.** The downgrade applies on the HTTP/1.1 + HTTP/2 (reqwest),
-direct-HTTP/2, and HBONE backend paths. **Native HTTP/3**, the **HTTP/3
-cross-protocol bridge**, and **gRPC** keep the pre-flight buffering decision —
-the HTTP/3 pool selects streaming vs. buffered at request time, before headers
-exist. As a result, the *same* WAF + `response_body_mode` configuration can show
-different memory/latency behavior depending on the backend protocol: an
-HTTP/3-served binary response may be buffered where the HTTP/1.1/2-served one
-streams.
+direct-HTTP/2, HBONE, native-HTTP/3 header-first, and HTTP/3 cross-protocol
+backend paths. Native HTTP/3 opens a streaming response to obtain the headers,
+then either retains that stream for bounded collection or releases it to the
+client. **gRPC** keeps the pre-flight buffering decision so its framing and
+trailer semantics remain intact.
 
 **Content-Type relabel safety.** The downgrade keys off the **backend's**
 response `Content-Type`, but it is suppressed when an active plugin reports that
@@ -358,8 +382,11 @@ Helper constructors:
 Use `response_body_mode: buffer` when:
 
 - A plugin needs to inspect or transform the **response body** (not just headers)
-- You are debugging response content with `transaction_debugger` and `log_response_body: true`
 - Your responses are small and the latency difference is negligible
+
+`transaction_debugger` does not capture payloads and does not require buffer
+mode. It reports final body completion, byte counts, disconnects, and typed
+streaming errors from the terminal transaction summary instead.
 
 Note: response body size limits are now enforced via `SizeLimitedStreamingResponse` even when Content-Length is absent — explicit buffer mode is no longer required for size enforcement.
 

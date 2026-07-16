@@ -2162,10 +2162,17 @@ pub async fn run(
                                 }
                             }
                             Err(e) => {
-                                warn!(
-                                    "Authoritative primary incremental poll failed, falling back to full reload: {}",
-                                    e
-                                );
+                                if db_backend::is_incremental_full_reload_required(&e) {
+                                    info!(
+                                        "Consumer change detected; using authoritative full reload for credential rehydration: {}",
+                                        e
+                                    );
+                                } else {
+                                    warn!(
+                                        "Authoritative primary incremental poll failed, falling back to full reload: {}",
+                                        e
+                                    );
+                                }
                                 match load_full_config_with_sequence(&db_poll, &poll_namespace).await
                                 {
                                     Ok((new_config, sequence)) => {

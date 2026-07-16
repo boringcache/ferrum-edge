@@ -81,6 +81,51 @@ fn file_mode_yaml_for_h3(port: u16) -> String {
     serde_yaml::to_string(&config).expect("yaml serialize")
 }
 
+fn file_mode_yaml_for_h3_with_terminal_security(port: u16, remove_terminal: bool) -> String {
+    let security_config = if remove_terminal {
+        json!({
+            "set": {"X-Security-Policy": "gateway-enforced"},
+            "remove": ["Grpc-Status", "Grpc-Message", "Grpc-Status-Details-Bin"],
+        })
+    } else {
+        json!({
+            "override_existing": true,
+            "set": {
+                "X-Security-Policy": "gateway-enforced",
+                "Grpc-Status": "0",
+                "Grpc-Message": "policy override",
+                "Grpc-Status-Details-Bin": "hostile",
+            },
+            "remove": [],
+        })
+    };
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted-h3",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "native-h3-terminal-security",
+            "plugin_name": "security_headers",
+            "scope": "global",
+            "enabled": true,
+            "config": security_config,
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
 /// GET the backend capability registry and return the single entry (tests
 /// configure a single proxy so the registry should hold exactly one).
 /// Returns `None` when the registry is empty (probe hasn't completed).
@@ -174,6 +219,19 @@ async fn spawn_h3_harness_with_explicit_https_port(
     pool_warmup_enabled: bool,
     refresh_interval_secs: Option<u64>,
 ) -> (GatewayHarness, String, u16) {
+    spawn_h3_harness_with_explicit_https_port_and_config(
+        file_mode_yaml_for_h3(backend_port),
+        pool_warmup_enabled,
+        refresh_interval_secs,
+    )
+    .await
+}
+
+async fn spawn_h3_harness_with_explicit_https_port_and_config(
+    yaml: String,
+    pool_warmup_enabled: bool,
+    refresh_interval_secs: Option<u64>,
+) -> (GatewayHarness, String, u16) {
     const STARTUP_ATTEMPTS: u32 = 3;
     let mut last_error = None;
     for attempt in 1..=STARTUP_ATTEMPTS {
@@ -186,9 +244,8 @@ async fn spawn_h3_harness_with_explicit_https_port(
 
         let scratch = tempfile::tempdir().expect("scratch");
         let (ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-ca");
-        let yaml = file_mode_yaml_for_h3(backend_port);
         let mut builder = GatewayHarness::builder()
-            .file_config(yaml)
+            .file_config(yaml.clone())
             .log_level("info")
             .capture_output()
             .max_attempts(1)
@@ -2960,6 +3017,106 @@ async fn h3_native_grpc_unary_preserves_body_and_trailers() {
         "H3 backend must have received the proxied gRPC POST (native H3 dispatch); \
          recorded: {received:#?}\n--- logs ---\n{logs}"
     );
+}
+
+async fn assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(remove_terminal: bool) {
+    let ca = TestCa::new("phase-h3-grpc-trailers-only").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+    let _tcp_backend =
+        spawn_grpc_probe_tcp_backend(tcp_res.into_listener(), cert.clone(), key.clone());
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeadersEndStream(vec![
+            (":status", "200".to_string()),
+            ("content-type", "application/grpc".to_string()),
+            ("grpc-status", "7".to_string()),
+            ("grpc-message", "permission denied".to_string()),
+            ("grpc-status-details-bin", "AQID".to_string()),
+        ]))
+        .step(H3Step::StallFor(Duration::from_secs(1)))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let config = file_mode_yaml_for_h3_with_terminal_security(backend_port, remove_terminal);
+    let (harness, _ca_pem, _https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(config, false, Some(1)).await;
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected native H3 dispatch; entry: {entry:#?}"
+    );
+
+    let resp = match h3_grpc_post(&harness, "/api/echo.Echo/Denied", grpc_frame(b"ping")).await {
+        Ok(resp) => resp,
+        Err(error) => {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("native H3 Trailers-Only request failed: {error}\n--- logs ---\n{logs}");
+        }
+    };
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "unexpected status; logs:\n{logs}"
+    );
+    assert!(
+        resp.body_bytes.is_empty(),
+        "Trailers-Only body must be empty"
+    );
+    assert_eq!(
+        resp.headers
+            .get("x-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("gateway-enforced")
+    );
+    assert!(
+        resp.headers.get("grpc-status").is_none(),
+        "native H3 relays terminal metadata on the trailer channel"
+    );
+    assert_eq!(
+        resp.grpc_status(),
+        Some(7),
+        "trailers: {:#?}",
+        resp.trailers
+    );
+    assert_eq!(resp.grpc_message().as_deref(), Some("permission denied"));
+    assert_eq!(
+        resp.trailers
+            .as_ref()
+            .and_then(|trailers| trailers.get("grpc-status-details-bin"))
+            .and_then(|value| value.to_str().ok()),
+        Some("AQID")
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received
+            .iter()
+            .any(|request| request.method == "POST" && request.path.ends_with("/echo.Echo/Denied")),
+        "H3-only backend must receive the proxied request; received: {received:#?}\nlogs:\n{logs}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_grpc_trailers_only_resists_hostile_terminal_set() {
+    assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_grpc_trailers_only_resists_terminal_removal() {
+    assert_h3_native_grpc_trailers_only_preserves_terminal_metadata(true).await;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

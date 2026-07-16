@@ -308,7 +308,17 @@ proxies:
     strip_listen_path: true
 
 consumers: []
-plugin_configs: []
+plugin_configs:
+  - id: "grpc-security-policy"
+    plugin_name: security_headers
+    scope: global
+    enabled: true
+    config:
+      set:
+        X-Synthetic-Policy: "enforced"
+        Grpc-Status: "0"
+        Grpc-Message: "policy override"
+      remove: []
 "#,
         backend_port, backend_port
     );
@@ -374,7 +384,53 @@ proxies:
       - "GET"
 
 consumers: []
-plugin_configs: []
+plugin_configs:
+  - id: "grpc-method-filter-security"
+    plugin_name: security_headers
+    scope: global
+    enabled: true
+    config:
+      set:
+        X-Synthetic-Policy: "enforced"
+        Content-Type: "text/plain"
+        Content-Length: "999"
+        Transfer-Encoding: "chunked"
+        Grpc-Status: "0"
+        Grpc-Message: "policy override"
+      remove: []
+"#,
+        backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+fn write_grpc_terminal_remove_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "grpc-terminal-remove-proxy"
+    listen_path: "/grpc-remove"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+
+consumers: []
+plugin_configs:
+  - id: "grpc-terminal-remove-security"
+    plugin_name: security_headers
+    scope: global
+    enabled: true
+    config:
+      set:
+        X-Synthetic-Policy: "enforced"
+      remove:
+        - Grpc-Status
+        - Grpc-Message
 "#,
         backend_port
     );
@@ -878,11 +934,62 @@ async fn test_grpc_error_status_forwarding() {
         Some("method not found"),
         "Gateway should forward grpc-message"
     );
+    assert_eq!(
+        headers.get("x-synthetic-policy").map(String::as_str),
+        Some("enforced"),
+        "true Trailers-Only metadata must survive hostile initial-header policy"
+    );
 
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_grpc_error_status_forwarding PASSED");
+}
+
+/// A true Trailers-Only backend response carries terminal metadata in its
+/// initial END_STREAM HEADERS. Route policy must not erase that authority.
+#[ignore]
+#[tokio::test]
+async fn test_grpc_trailers_only_terminal_metadata_survives_security_removal() {
+    let backend_port = free_port().await;
+    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_grpc_terminal_remove_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    let gateway_addr = format!("127.0.0.1:{}", gateway_port);
+
+    let (status, headers, body) = send_grpc_request(
+        &gateway_addr,
+        "/grpc-remove/my.EchoService/Denied",
+        b"",
+        &[
+            ("x-test-grpc-status", "7"),
+            ("x-test-grpc-message", "permission denied"),
+        ],
+    )
+    .await
+    .expect("Trailers-Only request should complete");
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
+    assert_eq!(
+        headers.get("grpc-message").map(String::as_str),
+        Some("permission denied")
+    );
+    assert_eq!(
+        headers.get("x-synthetic-policy").map(String::as_str),
+        Some("enforced")
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
 }
 
 /// End-to-end test: gRPC metadata (HTTP/2 headers) forwarding through the gateway.
@@ -968,6 +1075,11 @@ async fn test_grpc_backend_unavailable() {
     assert!(
         headers.contains_key("grpc-message"),
         "Should include a grpc-message explaining the error"
+    );
+    assert_eq!(
+        headers.get("x-synthetic-policy").map(String::as_str),
+        Some("enforced"),
+        "post-routing UNAVAILABLE must carry initial-response policy"
     );
 
     let _ = gateway.kill();
@@ -1234,6 +1346,10 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
 
     assert_eq!(status, 200, "gRPC route miss should return HTTP 200");
     assert!(body.is_empty(), "gRPC route miss should be trailers-only");
+    assert!(
+        !headers.contains_key("x-synthetic-policy"),
+        "pre-routing route misses have no resolved policy configuration"
+    );
     assert_eq!(
         headers.get("grpc-status").map(|s| s.as_str()),
         Some("5"),
@@ -1265,6 +1381,19 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
             .is_some_and(|msg| msg.contains("Method Not Allowed")),
         "Method filter rejection should preserve the reject message"
     );
+    assert_eq!(
+        headers2.get("x-synthetic-policy").map(String::as_str),
+        Some("enforced")
+    );
+    assert_eq!(
+        headers2.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert_ne!(
+        headers2.get("content-length").map(String::as_str),
+        Some("999")
+    );
+    assert!(!headers2.contains_key("transfer-encoding"));
 
     let _ = gateway.kill();
     let _ = gateway.wait();

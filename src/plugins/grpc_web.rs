@@ -133,27 +133,191 @@ fn parse_expose_headers(config: &Value) -> Result<Vec<String>, String> {
     Ok(parsed)
 }
 
-fn has_ascii_case_insensitive_prefix(value: &str, prefix: &str) -> bool {
-    value
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GrpcWebMode {
+    Binary,
+    Text,
 }
 
-fn contains_proto_suffix(value: &str) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GrpcWebMediaType {
+    mode: GrpcWebMode,
+    proto_suffix: bool,
+}
+
+#[inline]
+fn is_ows(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+#[inline]
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(|byte| is_ows(*byte)) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(|byte| is_ows(*byte)) {
+        value = &value[..value.len() - 1];
+    }
     value
-        .as_bytes()
-        .windows("+proto".len())
-        .any(|window| window.eq_ignore_ascii_case(b"+proto"))
+}
+
+#[inline]
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+#[inline]
+fn is_suffix_tchar(byte: u8) -> bool {
+    // The gRPC-Web media type permits one optional `+subtype`. Treat another
+    // `+` as a second suffix boundary rather than part of that subtype so
+    // deceptive values cannot grow arbitrary valid-looking tails.
+    byte != b'+' && is_tchar(byte)
+}
+
+fn valid_grpc_web_parameters(mut value: &[u8]) -> bool {
+    while !value.is_empty() {
+        while value.first().is_some_and(|byte| is_ows(*byte)) {
+            value = &value[1..];
+        }
+        if value.first() != Some(&b';') {
+            return false;
+        }
+        value = &value[1..];
+        while value.first().is_some_and(|byte| is_ows(*byte)) {
+            value = &value[1..];
+        }
+
+        let name_len = value.iter().take_while(|byte| is_tchar(**byte)).count();
+        if name_len == 0 {
+            return false;
+        }
+        value = &value[name_len..];
+        while value.first().is_some_and(|byte| is_ows(*byte)) {
+            value = &value[1..];
+        }
+        if value.first() != Some(&b'=') {
+            return false;
+        }
+        value = &value[1..];
+        while value.first().is_some_and(|byte| is_ows(*byte)) {
+            value = &value[1..];
+        }
+
+        if value.first() == Some(&b'"') {
+            value = &value[1..];
+            let mut closed = false;
+            let mut index = 0;
+            while index < value.len() {
+                match value[index] {
+                    b'"' => {
+                        value = &value[index + 1..];
+                        closed = true;
+                        break;
+                    }
+                    b'\\' => {
+                        index += 1;
+                        if index >= value.len()
+                            || !(value[index] == b'\t'
+                                || value[index] == b' '
+                                || value[index].is_ascii_graphic()
+                                || value[index] >= 0x80)
+                        {
+                            return false;
+                        }
+                    }
+                    byte if byte == b'\t'
+                        || byte == b' '
+                        || byte == b'!'
+                        || (b'#'..=b'[').contains(&byte)
+                        || (b']'..=b'~').contains(&byte)
+                        || byte >= 0x80 => {}
+                    _ => return false,
+                }
+                index += 1;
+            }
+            if !closed {
+                return false;
+            }
+        } else {
+            let value_len = value.iter().take_while(|byte| is_tchar(**byte)).count();
+            if value_len == 0 {
+                return false;
+            }
+            value = &value[value_len..];
+        }
+
+        while value.first().is_some_and(|byte| is_ows(*byte)) {
+            value = &value[1..];
+        }
+        if !value.is_empty() && value.first() != Some(&b';') {
+            return false;
+        }
+    }
+    true
+}
+
+fn grpc_web_media_type(ct: &str) -> Option<GrpcWebMediaType> {
+    let value = trim_ows(ct.as_bytes());
+    let parameter_start = value.iter().position(|byte| *byte == b';');
+    let (essence, parameters) = match parameter_start {
+        Some(index) => (trim_ows(&value[..index]), &value[index..]),
+        None => (value, &[][..]),
+    };
+    if !valid_grpc_web_parameters(parameters) {
+        return None;
+    }
+
+    let classify = |base: &[u8], mode| {
+        let prefix = essence.get(..base.len())?;
+        if !prefix.eq_ignore_ascii_case(base) {
+            return None;
+        }
+        let suffix = &essence[base.len()..];
+        if suffix.is_empty() {
+            return Some(GrpcWebMediaType {
+                mode,
+                proto_suffix: false,
+            });
+        }
+        let subtype = suffix.strip_prefix(b"+")?;
+        if subtype.is_empty() || !subtype.iter().all(|byte| is_suffix_tchar(*byte)) {
+            return None;
+        }
+        Some(GrpcWebMediaType {
+            mode,
+            proto_suffix: subtype.eq_ignore_ascii_case(b"proto"),
+        })
+    };
+
+    classify(APPLICATION_GRPC_WEB_TEXT.as_bytes(), GrpcWebMode::Text)
+        .or_else(|| classify(APPLICATION_GRPC_WEB.as_bytes(), GrpcWebMode::Binary))
 }
 
 /// Check if a content-type indicates a gRPC-Web request.
 pub(crate) fn is_grpc_web_content_type(ct: &str) -> bool {
-    has_ascii_case_insensitive_prefix(ct.trim(), APPLICATION_GRPC_WEB)
+    grpc_web_media_type(ct).is_some()
 }
 
 /// Check if a gRPC-Web content-type uses text (base64) encoding.
 pub(crate) fn is_grpc_web_text(ct: &str) -> bool {
-    has_ascii_case_insensitive_prefix(ct.trim(), APPLICATION_GRPC_WEB_TEXT)
+    grpc_web_media_type(ct).is_some_and(|media_type| media_type.mode == GrpcWebMode::Text)
 }
 
 /// True when the `grpc_web` plugin translated this request from gRPC-Web to
@@ -172,9 +336,66 @@ pub fn request_is_grpc_web_translated(ctx: &RequestContext) -> bool {
     ctx.metadata.contains_key(META_GRPC_WEB_MODE)
 }
 
+/// Retain a recognized client representation for gateway-generated errors
+/// without claiming that request translation occurred. H3 uses this for
+/// pass-through deployments that intentionally omit the `grpc_web` plugin:
+/// policy and error shaping remain gRPC-Web-aware, while backend dispatch
+/// stays on the original plain-HTTP transport because the mode marker above is
+/// absent.
+pub(crate) fn retain_client_content_type_for_errors(ctx: &mut RequestContext, content_type: &str) {
+    if grpc_web_media_type(content_type).is_some() {
+        ctx.metadata.insert(
+            META_GRPC_WEB_ORIGINAL_CT.to_string(),
+            response_content_type(content_type).to_string(),
+        );
+    }
+}
+
+pub(crate) fn client_uses_grpc_web(ctx: &RequestContext) -> bool {
+    ctx.metadata.contains_key(META_GRPC_WEB_ORIGINAL_CT)
+}
+
+pub(crate) fn retained_response_content_type(ctx: &RequestContext) -> Option<&'static str> {
+    ctx.metadata
+        .get(META_GRPC_WEB_ORIGINAL_CT)
+        .map(|content_type| response_content_type(content_type))
+}
+
 pub struct GrpcWebErrorResponse {
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    terminal_headers: HashMap<String, String>,
+}
+
+/// Rebuild a synthesized error's body trailer frame after finalized rejection
+/// metadata has been merged into its temporary header map. Preserve the
+/// originally selected status/message when decorators contribute no terminal
+/// fields, while letting case-insensitive finalized fields replace them.
+pub(crate) fn rebuild_error_body_from_headers(response: &mut GrpcWebErrorResponse) {
+    let response_ct = response
+        .headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or(APPLICATION_GRPC_WEB);
+    let mut trailer_headers = response.terminal_headers.clone();
+    for (name, value) in &response.headers {
+        if is_valid_trailer_header(name).is_none() {
+            continue;
+        }
+        if let Some(existing) = trailer_headers
+            .keys()
+            .find(|existing| existing.eq_ignore_ascii_case(name))
+            .cloned()
+        {
+            trailer_headers.remove(&existing);
+        }
+        trailer_headers.insert(name.clone(), value.clone());
+    }
+    let mut body = build_trailer_frame(&trailer_headers);
+    if is_grpc_web_text(response_ct) {
+        body = BASE64.encode(&body).into_bytes();
+    }
+    response.body = body;
 }
 
 /// Build the client-visible gRPC-Web error shape for an early gateway refusal
@@ -184,25 +405,37 @@ pub fn error_response_for_content_type(
     status: u32,
     message: &str,
 ) -> GrpcWebErrorResponse {
-    let mut headers = HashMap::with_capacity(5);
+    let response_ct = response_content_type(response_ct);
+    let mut headers = HashMap::with_capacity(3);
     headers.insert("content-type".to_string(), response_ct.to_string());
     headers.insert("x-grpc-web".to_string(), "1".to_string());
     headers.insert(
         "access-control-expose-headers".to_string(),
         BASE_EXPOSE_HEADERS_VALUE.to_string(),
     );
-    headers.insert("grpc-status".to_string(), status.to_string());
-    headers.insert("grpc-message".to_string(), message.to_string());
 
-    let mut body = build_trailer_frame(&headers);
+    // gRPC-Web carries terminal metadata in its body trailer frame, never as
+    // native response headers. Keep a separate trailer map so an early gateway
+    // refusal has the same client-visible shape as a transformed backend
+    // response.
+    let trailer_headers = HashMap::from([
+        ("grpc-status".to_string(), status.to_string()),
+        ("grpc-message".to_string(), message.to_string()),
+    ]);
+    let mut body = build_trailer_frame(&trailer_headers);
     if is_grpc_web_text(response_ct) {
         body = BASE64.encode(&body).into_bytes();
     }
-    GrpcWebErrorResponse { headers, body }
+    GrpcWebErrorResponse {
+        headers,
+        body,
+        terminal_headers: trailer_headers,
+    }
 }
 
-/// Build the client-visible gRPC-Web error shape for a translated request that
-/// happens before normal response hooks can run.
+/// Build the client-visible gRPC-Web error shape for a recognized request that
+/// happens before normal response hooks can run. The retained representation
+/// may belong to a translated request or an intentional H3 pass-through.
 pub fn translated_error_response(
     ctx: &RequestContext,
     status: u32,
@@ -311,17 +544,28 @@ pub(crate) fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
 ///
 /// Preserves the +proto suffix if present.
 pub(crate) fn response_content_type(original_ct: &str) -> &'static str {
-    let original_ct = original_ct.trim();
-    if has_ascii_case_insensitive_prefix(original_ct, APPLICATION_GRPC_WEB_TEXT) {
-        if contains_proto_suffix(original_ct) {
-            "application/grpc-web-text+proto"
-        } else {
-            "application/grpc-web-text"
+    match grpc_web_media_type(original_ct) {
+        Some(GrpcWebMediaType {
+            mode: GrpcWebMode::Text,
+            proto_suffix: true,
+        }) => "application/grpc-web-text+proto",
+        Some(GrpcWebMediaType {
+            mode: GrpcWebMode::Text,
+            proto_suffix: false,
+        }) => "application/grpc-web-text",
+        Some(GrpcWebMediaType {
+            mode: GrpcWebMode::Binary,
+            proto_suffix: true,
+        }) => "application/grpc-web+proto",
+        Some(GrpcWebMediaType {
+            mode: GrpcWebMode::Binary,
+            proto_suffix: false,
+        }) => "application/grpc-web",
+        None => {
+            // Callers classify before reaching this mapper. Keep the fallback
+            // fixed rather than reflecting an unrecognized Content-Type.
+            "application/grpc-web"
         }
-    } else if contains_proto_suffix(original_ct) {
-        "application/grpc-web+proto"
-    } else {
-        "application/grpc-web"
     }
 }
 

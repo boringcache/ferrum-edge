@@ -891,6 +891,29 @@ pub(crate) fn trace_exporters_from_providers(
         .collect()
 }
 
+pub(crate) fn validate_trace_provider_endpoints(
+    providers: &[TracingProvider],
+) -> Result<(), String> {
+    for provider in providers {
+        match provider {
+            TracingProvider::Zipkin { url } => {
+                validate_endpoint_for_provider("Zipkin", url)?;
+            }
+            TracingProvider::Datadog { agent_url, .. } => {
+                let endpoint = datadog_traces_endpoint(agent_url)?;
+                validate_endpoint_for_provider("Datadog", &endpoint)?;
+            }
+            TracingProvider::Lightstep { collector_url, .. } => {
+                validate_endpoint_for_provider("Lightstep", collector_url)?;
+            }
+            TracingProvider::OpenTelemetry { endpoint } => {
+                validate_endpoint_for_provider("OTLP", endpoint)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse custom headers from the `headers` config field.
 /// Accepts an object like `{"x-honeycomb-team": "abc", "X-Scope-OrgID": "123"}`.
 fn parse_custom_headers(value: Option<&Value>) -> Result<Vec<(String, String)>, String> {

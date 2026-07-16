@@ -249,6 +249,15 @@ pub fn update_diff(before: Value, after: Value) -> Value {
     json!({ "before": before, "after": after })
 }
 
+pub fn credential_update_diff(credential_type: &str, before: Value, after: Value) -> Value {
+    json!({
+        "credential_type": credential_type,
+        "credential_change": "[REDACTED]",
+        "before": before,
+        "after": after,
+    })
+}
+
 pub fn delete_diff(before: Value) -> Value {
     json!({ "before": before })
 }

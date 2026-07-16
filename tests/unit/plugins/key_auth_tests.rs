@@ -32,7 +32,9 @@ fn test_key_auth_plugin_contract() {
     assert_eq!(plugin.priority(), 1200);
     assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
     assert!(plugin.is_auth_plugin());
-    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.modifies_request_headers());
+    assert_eq!(plugin.request_headers_to_redact(), &["x-api-key"]);
+    assert!(!plugin.requires_decoded_query_params());
     assert!(!plugin.modifies_request_body());
     assert!(!plugin.requires_request_body_before_before_proxy());
     assert!(!plugin.requires_request_body_before_authenticate());
@@ -52,6 +54,18 @@ fn test_key_auth_rejects_invalid_config() {
         json!({"key_location": "cookie:token"}),
         json!({"key_location": "header:"}),
         json!({"key_location": "query:"}),
+        json!({"hide_credentials": "yes"}),
+        json!({"key_location": "header:Not A Header"}),
+        json!({"key_location": "header:X@Api"}),
+        json!({"key_location": "header:X\u{7f}Api"}),
+        json!({"key_location": "header:X-Àpi"}),
+        json!({"key_location": " header:X-API-Key"}),
+        json!({"key_location": "header:X-API-Key "}),
+        json!({"key_location": "header: X-API-Key"}),
+        json!({"key_location": "query: api_key"}),
+        json!({"key_location": "query:api_key "}),
+        json!({"key_location": "query:   "}),
+        json!({"key_location": "query:tenant key"}),
     ];
 
     for config in invalid_configs {
@@ -60,6 +74,39 @@ fn test_key_auth_rejects_invalid_config() {
             "config should be rejected: {config}"
         );
     }
+}
+
+#[test]
+fn test_key_auth_rejects_unknown_config_fields() {
+    for config in [
+        json!({"key_lcoation": "query:api_key"}),
+        json!({"key_names": ["X-API-Key"]}),
+        json!({"aaa": true, "zzz": false}),
+    ] {
+        let err = KeyAuth::new(&config)
+            .err()
+            .expect("unknown key_auth fields must fail closed");
+        assert!(err.contains("unknown configuration field"), "{err}");
+    }
+}
+
+#[test]
+fn test_key_auth_accepts_valid_mixed_case_header_token() {
+    let plugin = KeyAuth::new(&json!({
+        "key_location": "header:X-Tenant_Key~V2"
+    }))
+    .expect("valid HTTP token characters should be accepted");
+
+    assert_eq!(plugin.request_headers_to_redact(), &["x-tenant_key~v2"]);
+}
+
+#[test]
+fn test_query_key_auth_requests_decoded_h3_query_params() {
+    let plugin = KeyAuth::new(&json!({"key_location": "query:api_key"})).unwrap();
+
+    assert!(plugin.requires_decoded_query_params());
+    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.request_headers_to_redact().is_empty());
 }
 
 #[tokio::test]
@@ -81,6 +128,53 @@ async fn test_key_auth_plugin_successful_auth() {
     let result = plugin.authenticate(&mut valid_ctx, &consumer_index).await;
     assert_continue(result);
     assert!(valid_ctx.identified_consumer.is_some());
+}
+
+#[tokio::test]
+async fn test_key_auth_strips_successful_header_credential_before_proxy() {
+    let plugin = KeyAuth::new(&json!({
+        "key_location": "header:X-Tenant-Credential"
+    }))
+    .unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let mut ctx = create_test_context();
+    ctx.headers.insert(
+        "X-Tenant-Credential".to_string(),
+        "test-api-key".to_string(),
+    );
+
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    assert!(
+        backend_headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("x-tenant-credential"))
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_can_explicitly_preserve_successful_header_credential() {
+    let plugin = KeyAuth::new(&json!({
+        "key_location": "header:X-API-Key",
+        "hide_credentials": false
+    }))
+    .unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("X-API-Key".to_string(), "test-api-key".to_string());
+
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    assert!(!plugin.modifies_request_headers());
+    assert_eq!(
+        backend_headers.get("X-API-Key").map(String::as_str),
+        Some("test-api-key")
+    );
 }
 
 #[tokio::test]
@@ -153,6 +247,43 @@ async fn test_key_auth_plugin_query_parameter() {
             .map(String::as_str),
         Some("true")
     );
+    let mut backend_headers = valid_ctx.headers.clone();
+    assert_continue(
+        plugin
+            .before_proxy(&mut valid_ctx, &mut backend_headers)
+            .await,
+    );
+    assert!(!valid_ctx.query_params.contains_key("api_key"));
+    assert_eq!(
+        valid_ctx
+            .metadata
+            .get("auth.strip_query_param.api_key")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_can_explicitly_preserve_successful_query_credential() {
+    let plugin = KeyAuth::new(&json!({
+        "key_location": "query:api_key",
+        "hide_credentials": false
+    }))
+    .unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    let mut ctx = create_test_context();
+    ctx.query_params
+        .insert("api_key".to_string(), "test-api-key".to_string());
+
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    assert_eq!(
+        ctx.query_params.get("api_key").map(String::as_str),
+        Some("test-api-key")
+    );
+    assert!(!ctx.metadata.contains_key("auth.strip_query_param.api_key"));
 }
 
 #[tokio::test]

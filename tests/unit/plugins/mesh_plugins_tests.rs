@@ -13,6 +13,7 @@ use ferrum_edge::modes::mesh::config::{
 use ferrum_edge::modes::mesh::slice::MeshSlice;
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::{
     Plugin, PluginFailurePolicy, PluginResult, RequestContext, StreamConnectionContext,
     available_plugins, create_plugin, plugin_failure_policy,
@@ -189,6 +190,7 @@ fn stream_context() -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: None,
         listen_port: 15443,
@@ -2685,6 +2687,7 @@ async fn workload_metrics_on_stream_connect_adds_source_identity_metadata() {
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("payments-tcp".to_string()),
         listen_port: 15432,
@@ -5466,6 +5469,868 @@ async fn workload_metrics_outbound_listener_stamps_mesh_direction_outbound() {
     );
 }
 
+fn workload_metrics_tracing_plugin() -> WorkloadMetrics {
+    WorkloadMetrics::new(&json!({
+        "sampling_percentage": 100.0
+    }))
+    .expect("tracing workload metrics config")
+}
+
+fn trace_header_remover(header: &str) -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [{
+            "operation": "remove",
+            "target": "header",
+            "key": header
+        }]
+    }))
+    .expect("trace header removal config")
+}
+
+fn trace_header_replacer(header: &str, value: &str) -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": header,
+            "value": value
+        }]
+    }))
+    .expect("trace header replacement config")
+}
+
+fn trace_header_adder(header: &str, value: &str) -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [{
+            "operation": "add",
+            "target": "header",
+            "key": header,
+            "value": value
+        }]
+    }))
+    .expect("trace header addition config")
+}
+
+fn inbound_trace_headers() -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "traceparent".to_string(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+        ),
+        ("tracestate".to_string(), "vendor=value".to_string()),
+    ])
+}
+
+fn assert_no_http_trace_metadata(ctx: &RequestContext) {
+    for key in [
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "trace_sampled",
+        "traceparent",
+        "tracestate",
+    ] {
+        assert!(
+            !ctx.metadata.contains_key(key),
+            "accepted transformed request retained stale {key}: {:?}",
+            ctx.metadata
+        );
+    }
+}
+
+#[tokio::test]
+async fn workload_metrics_propagates_valid_traceparent_replacement_as_authoritative() {
+    let metrics = workload_metrics_tracing_plugin();
+    let original_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let replacement_trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let replacement_parent_span_id = "bbbbbbbbbbbbbbbb";
+    let replacement_traceparent =
+        format!("00-{replacement_trace_id}-{replacement_parent_span_id}-00");
+    let transformer = trace_header_replacer("TraceParent", &replacement_traceparent);
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some(original_trace_id)
+    );
+    assert_eq!(
+        ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("true")
+    );
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let transformed_traceparent = headers
+        .remove("traceparent")
+        .expect("transformer replaced traceparent");
+    headers.insert("TraceParent".to_string(), transformed_traceparent);
+    headers
+        .remove("tracestate")
+        .expect("inbound tracestate retained");
+    headers.insert("TraceState".to_string(), "replacement=value".to_string());
+
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let propagated = headers
+        .get("traceparent")
+        .expect("replacement traceparent propagated");
+    assert!(propagated.starts_with(&format!("00-{replacement_trace_id}-")));
+    assert!(propagated.ends_with("-00"));
+    assert!(!propagated.contains(original_trace_id));
+    assert_eq!(
+        headers
+            .keys()
+            .filter(|name| name.eq_ignore_ascii_case("traceparent"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        headers.get("tracestate").map(String::as_str),
+        Some("replacement=value")
+    );
+    assert!(!headers.contains_key("TraceState"));
+    assert_eq!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some(replacement_trace_id)
+    );
+    assert_eq!(
+        ctx.metadata.get("parent_span_id").map(String::as_str),
+        Some(replacement_parent_span_id)
+    );
+    assert_ne!(
+        ctx.metadata.get("span_id").map(String::as_str),
+        Some(replacement_parent_span_id)
+    );
+    assert_eq!(
+        ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        ctx.metadata.get("traceparent").map(String::as_str),
+        Some(propagated.as_str())
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_propagates_valid_traceparent_added_by_transformer() {
+    let metrics = workload_metrics_tracing_plugin();
+    let replacement_trace_id = "cccccccccccccccccccccccccccccccc";
+    let replacement_parent_span_id = "dddddddddddddddd";
+    let replacement_traceparent =
+        format!("00-{replacement_trace_id}-{replacement_parent_span_id}-00");
+    let transformer = trace_header_adder("TraceParent", &replacement_traceparent);
+    let mut ctx = request_context(None);
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let local_trace_id = ctx
+        .metadata
+        .get("trace_id")
+        .cloned()
+        .expect("locally sampled trace ID");
+    assert_ne!(local_trace_id, replacement_trace_id);
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let propagated = headers
+        .get("traceparent")
+        .expect("transformer-added traceparent propagated");
+    assert!(propagated.starts_with(&format!("00-{replacement_trace_id}-")));
+    assert!(propagated.ends_with("-00"));
+    assert!(!propagated.contains(&local_trace_id));
+    assert_eq!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some(replacement_trace_id)
+    );
+    assert_eq!(
+        ctx.metadata.get("parent_span_id").map(String::as_str),
+        Some(replacement_parent_span_id)
+    );
+    assert_eq!(
+        ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("false")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_does_not_restore_b3_context_removed_by_transformer() {
+    let metrics = workload_metrics_tracing_plugin();
+    let transformer = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "header", "key": "X-B3-TraceId"},
+            {"operation": "remove", "target": "header", "key": "X-B3-SpanId"},
+            {"operation": "remove", "target": "header", "key": "X-B3-Sampled"}
+        ]
+    }))
+    .expect("B3 removal config");
+    let original_trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut ctx = request_context(None);
+    ctx.headers = HashMap::from([
+        ("x-b3-traceid".to_string(), original_trace_id.to_string()),
+        ("x-b3-spanid".to_string(), "bbbbbbbbbbbbbbbb".to_string()),
+        ("x-b3-sampled".to_string(), "1".to_string()),
+    ]);
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some(original_trace_id)
+    );
+    assert!(ctx.metadata.contains_key("traceparent"));
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("traceparent")
+                && !name.eq_ignore_ascii_case("b3")
+                && !name.to_ascii_lowercase().starts_with("x-b3-"))
+    );
+    assert!(!ctx.metadata.contains_key("traceparent"));
+    assert_no_http_trace_metadata(&ctx);
+
+    let mut response_headers = HashMap::new();
+    let result = metrics
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!response_headers.contains_key("traceparent"));
+}
+
+#[tokio::test]
+async fn workload_metrics_propagates_final_valid_b3_replacement() {
+    let metrics = workload_metrics_tracing_plugin();
+    let replacement_trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let replacement_parent_span_id = "ffffffffffffffff";
+    let transformer = RequestTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "update",
+                "target": "header",
+                "key": "X-B3-TraceId",
+                "value": replacement_trace_id
+            },
+            {
+                "operation": "update",
+                "target": "header",
+                "key": "X-B3-SpanId",
+                "value": replacement_parent_span_id
+            },
+            {
+                "operation": "update",
+                "target": "header",
+                "key": "X-B3-Sampled",
+                "value": "0"
+            }
+        ]
+    }))
+    .expect("B3 replacement config");
+    let original_trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut ctx = request_context(None);
+    ctx.headers = HashMap::from([
+        ("x-b3-traceid".to_string(), original_trace_id.to_string()),
+        ("x-b3-spanid".to_string(), "bbbbbbbbbbbbbbbb".to_string()),
+        ("x-b3-sampled".to_string(), "1".to_string()),
+    ]);
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    for (lower, mixed) in [
+        ("x-b3-traceid", "X-B3-TraceId"),
+        ("x-b3-spanid", "X-B3-SpanId"),
+        ("x-b3-sampled", "X-B3-Sampled"),
+    ] {
+        let value = headers.remove(lower).expect("transformed B3 header");
+        headers.insert(mixed.to_string(), value);
+    }
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let propagated = headers
+        .get("traceparent")
+        .expect("replacement B3 context propagated as W3C");
+    assert!(propagated.starts_with(&format!("00-{replacement_trace_id}-")));
+    assert!(propagated.ends_with("-00"));
+    assert!(!propagated.contains(original_trace_id));
+    assert_eq!(
+        ctx.metadata.get("parent_span_id").map(String::as_str),
+        Some(replacement_parent_span_id)
+    );
+    assert_eq!(
+        ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("false")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_sampling_only_b3_uses_final_transformed_headers() {
+    let metrics = workload_metrics_tracing_plugin();
+
+    let mut removed_ctx = request_context(None);
+    removed_ctx
+        .headers
+        .insert("b3".to_string(), "1".to_string());
+    let result = metrics.on_request_received(&mut removed_ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        removed_ctx
+            .metadata
+            .get("trace_sampled")
+            .map(String::as_str),
+        Some("true")
+    );
+    let remover = trace_header_remover("b3");
+    let mut removed_headers = removed_ctx.headers.clone();
+    let result = remover
+        .before_proxy(&mut removed_ctx, &mut removed_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics
+        .before_proxy(&mut removed_ctx, &mut removed_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_no_http_trace_metadata(&removed_ctx);
+    assert!(!removed_headers.contains_key("traceparent"));
+
+    let mut flipped_ctx = request_context(None);
+    flipped_ctx
+        .headers
+        .insert("x-b3-sampled".to_string(), "1".to_string());
+    let result = metrics.on_request_received(&mut flipped_ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let flipper = trace_header_replacer("x-b3-sampled", "0");
+    let mut flipped_headers = flipped_ctx.headers.clone();
+    let result = flipper
+        .before_proxy(&mut flipped_ctx, &mut flipped_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics
+        .before_proxy(&mut flipped_ctx, &mut flipped_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        flipped_ctx
+            .metadata
+            .get("trace_sampled")
+            .map(String::as_str),
+        Some("false")
+    );
+    assert!(!flipped_ctx.metadata.contains_key("trace_id"));
+    assert!(!flipped_headers.contains_key("traceparent"));
+
+    let mut added_ctx = request_context(None);
+    let result = metrics.on_request_received(&mut added_ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        added_ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("true")
+    );
+    let adder = trace_header_adder("x-b3-sampled", "0");
+    let mut added_headers = added_ctx.headers.clone();
+    let result = adder.before_proxy(&mut added_ctx, &mut added_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics
+        .before_proxy(&mut added_ctx, &mut added_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        added_ctx.metadata.get("trace_sampled").map(String::as_str),
+        Some("false")
+    );
+    assert!(!added_ctx.metadata.contains_key("trace_id"));
+    assert!(!added_headers.contains_key("traceparent"));
+}
+
+#[tokio::test]
+async fn workload_metrics_rebuilds_custom_header_tags_from_final_headers() {
+    let metrics = WorkloadMetrics::new(&json!({
+        "custom_tags": {"fallback": "literal"},
+        "custom_header_tags": {
+            "tenant": "x-tenant",
+            "fallback": "x-fallback"
+        }
+    }))
+    .expect("custom header tag config");
+    let remover = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "header", "key": "X-Tenant"},
+            {"operation": "remove", "target": "header", "key": "X-Fallback"}
+        ]
+    }))
+    .expect("custom header removal config");
+    let mut ctx = request_context(None);
+    ctx.headers = HashMap::from([
+        ("x-tenant".to_string(), "early-tenant".to_string()),
+        ("x-fallback".to_string(), "early-header".to_string()),
+    ]);
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("tenant").map(String::as_str),
+        Some("early-tenant")
+    );
+    assert_eq!(
+        ctx.metadata.get("fallback").map(String::as_str),
+        Some("early-header")
+    );
+    let mut headers = ctx.headers.clone();
+    let result = remover.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("tenant"));
+    assert_eq!(
+        ctx.metadata.get("fallback").map(String::as_str),
+        Some("literal"),
+        "a removed header falls back to the configured literal tag"
+    );
+
+    let oversized = "x".repeat(1025);
+    let oversized_transformer = trace_header_replacer("X-Tenant", &oversized);
+    let mut oversized_ctx = request_context(None);
+    oversized_ctx
+        .headers
+        .insert("x-tenant".to_string(), "early-tenant".to_string());
+    let result = metrics.on_request_received(&mut oversized_ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let mut oversized_headers = oversized_ctx.headers.clone();
+    let result = oversized_transformer
+        .before_proxy(&mut oversized_ctx, &mut oversized_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics
+        .before_proxy(&mut oversized_ctx, &mut oversized_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!oversized_ctx.metadata.contains_key("tenant"));
+}
+
+#[tokio::test]
+async fn workload_metrics_does_not_restore_traceparent_removed_by_transformer() {
+    let metrics = workload_metrics_tracing_plugin();
+    let transformer = trace_header_remover("traceparent");
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+    assert!(
+        transformer.priority() < metrics.priority(),
+        "request_transformer must finalize request headers before workload_metrics"
+    );
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("trace_id"));
+    assert!(ctx.metadata.contains_key("traceparent"));
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!headers.contains_key("traceparent"));
+    let tracestate = headers
+        .remove("tracestate")
+        .expect("transformer leaves inbound tracestate");
+    headers.insert("TraceState".to_string(), tracestate);
+
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("traceparent")
+                && !name.eq_ignore_ascii_case("tracestate"))
+    );
+    assert!(!ctx.metadata.contains_key("traceparent"));
+    assert!(!ctx.metadata.contains_key("tracestate"));
+    assert_no_http_trace_metadata(&ctx);
+
+    let mut response_headers = HashMap::new();
+    let result = metrics
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!response_headers.contains_key("traceparent"));
+}
+
+#[tokio::test]
+async fn workload_metrics_drops_added_tracestate_with_malformed_final_parent() {
+    let metrics = workload_metrics_tracing_plugin();
+    let transformer = RequestTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "update",
+                "target": "header",
+                "key": "TraceParent",
+                "value": "malformed"
+            },
+            {
+                "operation": "add",
+                "target": "header",
+                "key": "TraceState",
+                "value": "added=value"
+            }
+        ]
+    }))
+    .expect("malformed W3C replacement config");
+    let mut ctx = request_context(None);
+    ctx.headers.insert(
+        "TraceParent".to_string(),
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+    );
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("trace_id"));
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let malformed = headers
+        .remove("traceparent")
+        .expect("transformer replaced traceparent");
+    headers.insert("TraceParent".to_string(), malformed);
+    let added_tracestate = headers
+        .remove("tracestate")
+        .expect("transformer added tracestate");
+    headers.insert("TraceState".to_string(), added_tracestate);
+
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("traceparent")
+                && !name.eq_ignore_ascii_case("tracestate"))
+    );
+    assert!(!ctx.metadata.contains_key("traceparent"));
+    assert!(!ctx.metadata.contains_key("tracestate"));
+    assert_no_http_trace_metadata(&ctx);
+}
+
+#[tokio::test]
+async fn workload_metrics_final_b3_context_does_not_retain_captured_tracestate() {
+    let metrics = workload_metrics_tracing_plugin();
+    let b3_trace_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let b3_parent_span_id = "ffffffffffffffff";
+    let transformer = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "header", "key": "TraceParent"},
+            {
+                "operation": "add",
+                "target": "header",
+                "key": "X-B3-TraceId",
+                "value": b3_trace_id
+            },
+            {
+                "operation": "add",
+                "target": "header",
+                "key": "X-B3-SpanId",
+                "value": b3_parent_span_id
+            },
+            {
+                "operation": "add",
+                "target": "header",
+                "key": "X-B3-Sampled",
+                "value": "1"
+            }
+        ]
+    }))
+    .expect("final B3 context config");
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("tracestate"))
+    );
+    assert!(!ctx.metadata.contains_key("tracestate"));
+    assert!(
+        headers
+            .get("traceparent")
+            .expect("final B3 context propagates as W3C")
+            .starts_with(&format!("00-{b3_trace_id}-"))
+    );
+    assert_eq!(
+        ctx.metadata.get("trace_id").map(String::as_str),
+        Some(b3_trace_id)
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_does_not_restore_tracestate_removed_by_transformer() {
+    let metrics = workload_metrics_tracing_plugin();
+    let transformer = trace_header_remover("tracestate");
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!headers.contains_key("tracestate"));
+
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(headers.contains_key("traceparent"));
+    assert!(!headers.contains_key("tracestate"));
+    assert!(!ctx.metadata.contains_key("tracestate"));
+}
+
+#[tokio::test]
+async fn workload_metrics_keeps_unchanged_valid_trace_headers() {
+    let metrics = workload_metrics_tracing_plugin();
+    let transformer = trace_header_remover("x-private");
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let propagated = headers
+        .get("traceparent")
+        .expect("valid traceparent propagated");
+    assert!(propagated.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
+    assert!(propagated.ends_with("-01"));
+    assert_ne!(
+        propagated,
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    );
+    assert_eq!(
+        headers.get("tracestate").map(String::as_str),
+        Some("vendor=value")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_keeps_early_trace_context_for_reject_observability() {
+    let metrics = workload_metrics_tracing_plugin();
+    let mut ctx = request_context(None);
+    ctx.headers = inbound_trace_headers();
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    // Authorization rejects before `before_proxy`, so the early context must
+    // remain available to the rejection response and transaction summary.
+    let mut response_headers = HashMap::new();
+    let result = metrics
+        .after_proxy(&mut ctx, 403, &mut response_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(response_headers.contains_key("traceparent"));
+    assert!(ctx.metadata.contains_key("trace_id"));
+    assert!(ctx.metadata.contains_key("span_id"));
+}
+
+#[tokio::test]
+async fn workload_metrics_rebuilds_source_identity_after_baggage_transform() {
+    let metrics = WorkloadMetrics::new(&json!({
+        "namespace": "payments",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
+        "labels": {"app": "checkout"},
+        "trusted_hbone_assertors": ["spiffe://cluster.local/assertor"]
+    }))
+    .expect("workload metrics config");
+    let transformer = trace_header_remover("baggage");
+    let mut ctx = request_context(Some("spiffe://cluster.local/assertor"));
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    ctx.headers.insert(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/storefront/sa/frontend".to_string(),
+    );
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.namespace")
+            .map(String::as_str),
+        Some("storefront")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.service_account")
+            .map(String::as_str),
+        Some("frontend")
+    );
+
+    let mut headers = ctx.headers.clone();
+    let result = transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/assertor")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.trust_domain")
+            .map(String::as_str),
+        Some("cluster.local")
+    );
+    assert!(!ctx.metadata.contains_key("mesh.source.namespace"));
+    assert!(!ctx.metadata.contains_key("mesh.source.service_account"));
+    assert_eq!(
+        ctx.metadata.get("mesh.source.workload").map(String::as_str),
+        Some("unknown")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_node_waypoint_http_outbound_uses_asserted_pod_before_baggage() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "topology": "node_waypoint",
+        "namespace": "istio-system",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/istio-system/sa/waypoint",
+        "labels": {
+            "service.istio.io/canonical-name": "node-waypoint"
+        },
+        "trusted_hbone_assertors": [
+            "spiffe://cluster.local/ns/storefront/sa/frontend"
+        ]
+    }))
+    .expect("plugin config");
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "reviews-proxy",
+        "name": "reviews",
+        "namespace": "default",
+        "hosts": ["reviews.default.svc.cluster.local"],
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .expect("proxy fixture");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/storefront/sa/frontend"));
+    ctx.node_waypoint_pod_uid = Some([7; 16]);
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    ctx.matched_proxy = Some(Arc::new(proxy));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/attacker/sa/spoofed".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.namespace")
+            .map(String::as_str),
+        Some("storefront")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.source.workload").map(String::as_str),
+        Some("frontend")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.destination.workload")
+            .map(String::as_str),
+        Some("reviews")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_non_waypoint_outbound_keeps_local_source_semantics() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/local-client",
+        "labels": {"app": "local-client"}
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/remote/sa/transport-peer"));
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/local-client")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.source.workload").map(String::as_str),
+        Some("local-client")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_node_waypoint_inbound_keeps_peer_as_source() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/reviews",
+        "labels": {"app": "reviews"}
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/storefront/sa/frontend"));
+    ctx.node_waypoint_pod_uid = Some([8; 16]);
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.destination.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/reviews")
+    );
+}
+
 #[tokio::test]
 async fn workload_metrics_unstamped_request_does_not_emit_direction_metadata() {
     // Non-mesh listeners (file / db / cp / dp) leave `mesh_direction = None`.
@@ -5486,6 +6351,7 @@ async fn workload_metrics_stream_inbound_listener_stamps_mesh_direction() {
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: None,
         listen_port: 15432,

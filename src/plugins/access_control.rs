@@ -35,6 +35,13 @@ use tracing::warn;
 
 use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 
+// External principals (JWT/OIDC subjects, SPIFFE IDs, LDAP DNs, and similar)
+// are not gateway Consumer usernames and can legitimately exceed the internal
+// username ceiling. Keep an independent finite bound for exact deny rules and
+// fail closed for larger external identities so no admitted principal is too
+// large to revoke through this plugin.
+const MAX_EXTERNAL_IDENTITY_LENGTH: usize = 4096;
+
 pub struct AccessControl {
     /// O(1) consumer allow list (empty = no restriction).
     allowed_consumers: HashSet<String>,
@@ -60,10 +67,23 @@ impl AccessControl {
         reject_removed_ip_keys(object)?;
         reject_unknown_keys(object)?;
 
-        let allowed = parse_string_set(object, "allowed_consumers")?;
-        let disallowed = parse_string_set(object, "disallowed_consumers")?;
-        let allowed_groups = parse_string_set(object, "allowed_groups")?;
-        let disallowed_groups = parse_string_set(object, "disallowed_groups")?;
+        let allowed = parse_string_set(
+            object,
+            "allowed_consumers",
+            crate::config::types::MAX_USERNAME_LENGTH,
+        )?;
+        let disallowed =
+            parse_string_set(object, "disallowed_consumers", MAX_EXTERNAL_IDENTITY_LENGTH)?;
+        let allowed_groups = parse_string_set(
+            object,
+            "allowed_groups",
+            crate::config::types::MAX_ACL_GROUP_LENGTH,
+        )?;
+        let disallowed_groups = parse_string_set(
+            object,
+            "disallowed_groups",
+            crate::config::types::MAX_ACL_GROUP_LENGTH,
+        )?;
         let allow_authenticated_identity =
             parse_bool(object, "allow_authenticated_identity")?.unwrap_or(false);
         let has_allow_rules = !allowed.is_empty() || !allowed_groups.is_empty();
@@ -107,6 +127,7 @@ impl AccessControl {
         identified_consumer: Option<&crate::config::types::Consumer>,
         authenticated_identity: Option<&str>,
     ) -> PluginResult {
+        let authenticated_identity = super::meaningful_identity(authenticated_identity);
         let consumer = match identified_consumer {
             Some(consumer) => consumer,
             None => {
@@ -120,9 +141,21 @@ impl AccessControl {
                     // not consulted here; `new()` rejects combining it with
                     // `allow_authenticated_identity`, so `has_allow_rules` is always
                     // false on this path.
+                    if identity.chars().count() > MAX_EXTERNAL_IDENTITY_LENGTH {
+                        warn!(
+                            client_ip = %client_ip,
+                            plugin = "access_control",
+                            reason = "external_identity_too_long",
+                            "External identity exceeded access-control admission bound"
+                        );
+                        return PluginResult::Reject {
+                            status_code: 403,
+                            body: r#"{"error":"Identity is not allowed"}"#.into(),
+                            headers: HashMap::new(),
+                        };
+                    }
                     if self.disallowed_consumers.contains(identity) {
                         warn!(
-                            consumer = %identity,
                             client_ip = %client_ip,
                             plugin = "access_control",
                             reason = "external_identity_disallowed",
@@ -135,6 +168,14 @@ impl AccessControl {
                         };
                     }
                     return PluginResult::Continue;
+                }
+                if authenticated_identity.is_some() {
+                    warn!(client_ip = %client_ip, plugin = "access_control", reason = "external_identity_not_authorized", "Authenticated external identity rejected by access control");
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"Authenticated identity is not authorized"}"#.into(),
+                        headers: HashMap::new(),
+                    };
                 }
                 warn!(client_ip = %client_ip, plugin = "access_control", reason = "no_consumer", "No consumer identified for access control");
                 return PluginResult::Reject {
@@ -238,6 +279,7 @@ fn reject_unknown_keys(object: &serde_json::Map<String, Value>) -> Result<(), St
 fn parse_string_set(
     object: &serde_json::Map<String, Value>,
     field: &str,
+    max_length: usize,
 ) -> Result<HashSet<String>, String> {
     let Some(value) = object.get(field) else {
         return Ok(HashSet::new());
@@ -252,9 +294,21 @@ fn parse_string_set(
         let Some(raw) = entry.as_str() else {
             return Err(format!("access_control: '{field}' entries must be strings"));
         };
-        if raw.is_empty() {
+        // Rules are stored byte-for-byte. Principals are never canonicalized:
+        // Consumer usernames may legally carry padding and external identity
+        // claims are preserved byte-for-byte (`meaningful_identity`), so
+        // trimming a rule like " alice " would silently rewrite it to a value
+        // that can never match the padded principal it targets — a fail-open
+        // deny-list. Only whitespace-only entries are rejected.
+        if raw.trim().is_empty() {
             return Err(format!(
-                "access_control: '{field}' entries must be non-empty strings"
+                "access_control: '{field}' entries must contain non-whitespace characters"
+            ));
+        }
+        let raw_length = raw.chars().count();
+        if raw_length > max_length {
+            return Err(format!(
+                "access_control: '{field}' entries must not exceed {max_length} characters"
             ));
         }
         parsed.insert(raw.to_string());

@@ -1,9 +1,12 @@
 //! Tests for access_control plugin
 
+use ferrum_edge::_test_support::normalize_reject_response;
 use ferrum_edge::config::types::{BackendScheme, Consumer};
 use ferrum_edge::plugins::{
-    HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, access_control::AccessControl, priority,
+    HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, PluginResult, access_control::AccessControl, priority,
 };
+use ferrum_edge::proxy::grpc_proxy::grpc_status;
+use hyper::StatusCode;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +19,7 @@ fn create_stream_context(
     ferrum_edge::plugins::StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("TCP Proxy".to_string()),
         listen_port: 5432,
@@ -114,6 +118,112 @@ async fn test_access_control_rejects_invalid_config_types() {
             "config should fail validation: {config}"
         );
     }
+}
+
+#[tokio::test]
+async fn test_access_control_rejects_blank_rules() {
+    for field in [
+        "allowed_consumers",
+        "disallowed_consumers",
+        "allowed_groups",
+        "disallowed_groups",
+    ] {
+        for value in ["   ", "\t", "\n", "\r\n"] {
+            let mut object = serde_json::Map::new();
+            object.insert(field.to_string(), json!([value]));
+            let config = serde_json::Value::Object(object);
+            assert!(
+                AccessControl::new(&config).is_err(),
+                "{field} must reject {value:?}"
+            );
+        }
+    }
+
+    assert!(
+        AccessControl::new(&json!({
+            "allowed_consumers": ["a".repeat(256)]
+        }))
+        .is_err()
+    );
+    assert!(
+        AccessControl::new(&json!({
+            "allowed_groups": ["a".repeat(256)]
+        }))
+        .is_err()
+    );
+    assert!(
+        AccessControl::new(&json!({
+            "disallowed_consumers": ["a".repeat(4097)],
+            "allow_authenticated_identity": true
+        }))
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn test_access_control_rules_match_padded_principals_byte_for_byte() {
+    // Principals are never canonicalized: Consumer usernames may legally carry
+    // whitespace padding and external identity claims are preserved
+    // byte-for-byte. Rules must therefore be stored byte-for-byte too — a
+    // trimmed rule could never match the padded principal it targets, turning
+    // the deny-list fail-open.
+
+    // Padded deny rule revokes a padded signed external identity.
+    let deny_external = AccessControl::new(&json!({
+        "allow_authenticated_identity": true,
+        "disallowed_consumers": [" alice "]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some(" alice ".to_string());
+    assert_reject(deny_external.authorize(&mut ctx).await, Some(403));
+
+    // The padded rule targets exactly " alice "; the distinct principal
+    // "alice" is not covered by it.
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("alice".to_string());
+    assert_continue(deny_external.authorize(&mut ctx).await);
+
+    // Padded deny rule matches a padded Consumer username.
+    let deny_consumer = AccessControl::new(&json!({
+        "disallowed_consumers": [" alice "]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(" alice ", vec![])));
+    assert_reject(deny_consumer.authorize(&mut ctx).await, Some(403));
+
+    // Padded group deny rule matches the identical padded acl_group only.
+    let deny_group = AccessControl::new(&json!({
+        "disallowed_groups": ["  contractors  "]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "testuser",
+        vec!["  contractors  "],
+    )));
+    assert_reject(deny_group.authorize(&mut ctx).await, Some(403));
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "testuser",
+        vec!["contractors"],
+    )));
+    assert_continue(deny_group.authorize(&mut ctx).await);
+
+    // Padded allow rule admits exactly the padded username, nothing else.
+    let allow_padded = AccessControl::new(&json!({
+        "allowed_consumers": [" alice "]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(" alice ", vec![])));
+    assert_continue(allow_padded.authorize(&mut ctx).await);
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups("alice", vec![])));
+    assert_reject(allow_padded.authorize(&mut ctx).await, Some(403));
 }
 
 #[tokio::test]
@@ -327,7 +437,64 @@ async fn test_access_control_authenticated_identity_still_rejected_when_disabled
     ctx.identified_consumer = None;
     ctx.authenticated_identity = Some("oidc-user-123".to_string());
     let result = plugin.authorize(&mut ctx).await;
-    assert_reject(result, Some(401));
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_access_control_grpc_distinguishes_authorization_from_authentication() {
+    let plugin = AccessControl::new(&json!({
+        "allowed_consumers": ["admin"]
+    }))
+    .unwrap();
+
+    for (identity, http_status, expected_grpc_status) in [
+        (Some("external-user"), 403, grpc_status::PERMISSION_DENIED),
+        (None, 401, grpc_status::UNAUTHENTICATED),
+    ] {
+        let mut ctx = create_test_context();
+        ctx.identified_consumer = None;
+        ctx.authenticated_identity = identity.map(str::to_string);
+        let PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } = plugin.authorize(&mut ctx).await
+        else {
+            panic!("ACL must reject this identity state");
+        };
+        assert_eq!(status_code, http_status);
+
+        let normalized = normalize_reject_response(
+            StatusCode::from_u16(status_code).unwrap(),
+            body.as_bytes(),
+            &headers,
+            true,
+        );
+        assert_eq!(normalized.http_status, StatusCode::OK);
+        assert!(normalized.body.is_empty());
+        assert_eq!(normalized.grpc_status, Some(expected_grpc_status));
+        let expected_grpc_status = expected_grpc_status.to_string();
+        assert_eq!(
+            normalized.headers.get("grpc-status").map(String::as_str),
+            Some(expected_grpc_status.as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_access_control_blank_external_identity_is_unauthenticated() {
+    let plugin = AccessControl::new(&json!({
+        "allow_authenticated_identity": true
+    }))
+    .unwrap();
+
+    for identity in ["", "   ", "\t\n"] {
+        let mut ctx = create_test_context();
+        ctx.identified_consumer = None;
+        ctx.authenticated_identity = Some(identity.to_string());
+        let result = plugin.authorize(&mut ctx).await;
+        assert_reject(result, Some(401));
+    }
 }
 
 #[tokio::test]
@@ -373,6 +540,39 @@ async fn test_access_control_disallowed_external_identity_is_rejected() {
     ctx.authenticated_identity = Some("alice".to_string());
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_access_control_can_revoke_long_external_identity_exactly() {
+    let long_identity = format!("spiffe://example.test/workload/{}", "a".repeat(300));
+    let plugin = AccessControl::new(&json!({
+        "disallowed_consumers": [long_identity],
+        "allow_authenticated_identity": true
+    }))
+    .unwrap();
+
+    let mut denied = create_test_context();
+    denied.identified_consumer = None;
+    denied.authenticated_identity = Some(long_identity.clone());
+    assert_reject(plugin.authorize(&mut denied).await, Some(403));
+
+    let mut distinct = create_test_context();
+    distinct.identified_consumer = None;
+    distinct.authenticated_identity = Some(format!("{long_identity}-other"));
+    assert_continue(plugin.authorize(&mut distinct).await);
+}
+
+#[tokio::test]
+async fn test_access_control_fails_closed_for_external_identity_beyond_rule_bound() {
+    let plugin = AccessControl::new(&json!({
+        "allow_authenticated_identity": true
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("a".repeat(4097));
+
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
 }
 
 #[tokio::test]

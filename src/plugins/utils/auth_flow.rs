@@ -7,6 +7,8 @@ use crate::config::types::Consumer;
 use crate::consumer_index::ConsumerIndex;
 use crate::plugins::{PluginResult, RequestContext};
 
+use super::auth_attempt::AuthenticationAttempt;
+
 /// What an auth plugin extracted from the request.
 #[derive(Debug, Clone)]
 pub enum ExtractedCredential {
@@ -37,7 +39,13 @@ pub enum ExtractedCredential {
 /// [`ExtractedCredential::HmacAuth`].
 #[derive(Debug, Clone)]
 pub struct HmacAuthCredential {
+    /// Namespace of the matched proxy. HMAC identity resolution is scoped to
+    /// this namespace and the value is bound into the signing base.
+    pub namespace: String,
     pub username: String,
+    /// Canonical client-request authority bound into the versioned signature
+    /// base so a captured request cannot cross virtual-host boundaries.
+    pub authority: String,
     pub algorithm: String,
     pub signature: String,
     pub date: String,
@@ -47,12 +55,13 @@ pub struct HmacAuthCredential {
     /// into the signing string so query parameters cannot be altered without
     /// invalidating the HMAC. Empty when the request had no query.
     pub query: String,
-    /// Value of the `Digest:` (RFC 3230) or `Content-Digest:` (RFC 9421)
+    /// Value of legacy `Digest:` or RFC 9530 `Content-Digest:`
     /// header.
     pub digest_header: String,
-    /// Buffered request body bytes used to verify `digest_header`. Empty when
-    /// the request has no body.
-    pub request_body: Vec<u8>,
+    /// Hashes of the sole forwarding buffer used to verify `digest_header`
+    /// without retaining another full request-body copy.
+    pub request_body_sha256: [u8; 32],
+    pub request_body_sha512: [u8; 64],
 }
 
 /// Shared auth verification result, mapped to PluginResult by the dispatcher.
@@ -82,6 +91,9 @@ impl VerifyOutcome {
         external_identity: Option<String>,
         external_identity_header: Option<String>,
     ) -> Self {
+        let external_identity = external_identity.filter(|identity| !identity.trim().is_empty());
+        let external_identity_header =
+            external_identity_header.filter(|identity_header| !identity_header.trim().is_empty());
         Self::Success {
             consumer,
             external_identity,
@@ -121,6 +133,12 @@ macro_rules! impl_auth_plugin {
                 $protocols
             }
 
+            fn authentication_challenge(&self) -> Option<&'static str> {
+                <$ty as crate::plugins::utils::auth_flow::AuthMechanism>::authentication_challenge(
+                    self,
+                )
+            }
+
             async fn authenticate(
                 &self,
                 ctx: &mut crate::plugins::RequestContext,
@@ -139,6 +157,10 @@ pub(crate) use impl_auth_plugin;
 #[async_trait]
 pub trait AuthMechanism: Send + Sync {
     fn mechanism_name(&self) -> &'static str;
+
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        None
+    }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential;
 
@@ -178,60 +200,158 @@ async fn run_auth_impl<M: AuthMechanism>(
             debug!("{}: no credential present", mechanism.mechanism_name());
             PluginResult::Continue
         }
-        ExtractedCredential::InvalidFormat(body) => reject(401, body),
-        credential => match mechanism.verify(credential, consumer_index).await {
-            VerifyOutcome::Success {
-                consumer,
-                external_identity,
-                external_identity_header,
-            } => {
-                let consumer_identified = consumer.is_some();
-                let external_identity_identified =
-                    allow_external_identity && external_identity.is_some();
-
-                if let Some(consumer) = consumer
-                    && ctx.identified_consumer.is_none()
-                {
-                    debug!(
-                        "{}: identified consumer '{}'",
-                        mechanism.mechanism_name(),
-                        consumer.username
-                    );
-                    ctx.identified_consumer = Some(consumer);
-                }
-
-                if allow_external_identity {
-                    if let Some(external_identity) = external_identity {
-                        ctx.authenticated_identity = Some(external_identity);
-                    }
-                    if let Some(external_identity_header) = external_identity_header {
-                        ctx.authenticated_identity_header = Some(external_identity_header);
-                    }
-                }
-
-                if ctx.auth_method.is_none()
-                    && (consumer_identified || external_identity_identified)
-                {
-                    ctx.auth_method = Some(mechanism.mechanism_name());
-                }
+        ExtractedCredential::InvalidFormat(body) => {
+            reject(401, body, mechanism.authentication_challenge())
+        }
+        credential => match commit_authentication_attempt(
+            ctx,
+            AuthenticationAttempt::new(),
+            mechanism.verify(credential, consumer_index).await,
+            mechanism.mechanism_name(),
+            allow_external_identity,
+        ) {
+            Ok(_) => PluginResult::Continue,
+            Err(VerifyOutcome::InvalidFormat(body))
+            | Err(VerifyOutcome::Invalid(body))
+            | Err(VerifyOutcome::ConsumerNotFound(body))
+            | Err(VerifyOutcome::VerificationFailed(body)) => {
+                reject(401, body, mechanism.authentication_challenge())
+            }
+            Err(VerifyOutcome::Forbidden(body)) => reject(403, body, None),
+            Err(VerifyOutcome::Internal(body)) => reject(500, body, None),
+            Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
                 PluginResult::Continue
             }
-            VerifyOutcome::NotApplicable => PluginResult::Continue,
-            VerifyOutcome::InvalidFormat(body)
-            | VerifyOutcome::Invalid(body)
-            | VerifyOutcome::ConsumerNotFound(body)
-            | VerifyOutcome::VerificationFailed(body) => reject(401, body),
-            VerifyOutcome::Forbidden(body) => reject(403, body),
-            VerifyOutcome::Internal(body) => reject(500, body),
         },
     }
 }
 
-fn reject(status_code: u16, body: String) -> PluginResult {
+/// Commit one authentication attempt transactionally.
+///
+/// `Ok(true)` means the attempt established a nonblank Consumer or a permitted
+/// nonblank external principal. `Ok(false)` means it was not applicable or
+/// produced no usable principal, so every staged mutation was discarded.
+/// Verification errors are returned unchanged for the caller's protocol-
+/// specific rejection mapping.
+pub fn commit_authentication_attempt(
+    ctx: &mut RequestContext,
+    attempt: AuthenticationAttempt,
+    outcome: VerifyOutcome,
+    auth_method: &'static str,
+    allow_external_identity: bool,
+) -> Result<bool, VerifyOutcome> {
+    let VerifyOutcome::Success {
+        consumer,
+        external_identity,
+        external_identity_header,
+    } = outcome
+    else {
+        return match outcome {
+            VerifyOutcome::NotApplicable => Ok(false),
+            rejection => Err(rejection),
+        };
+    };
+
+    let consumer = consumer.filter(|consumer| !consumer.username.trim().is_empty());
+    let external_identity = if allow_external_identity {
+        nonblank_identity(external_identity)
+    } else {
+        None
+    };
+    // A display/header claim is meaningful only when the same attempt supplied
+    // a usable external principal. A blank header simply falls back to the
+    // external identity through RequestContext::backend_consumer_username().
+    let external_identity_header = external_identity
+        .as_ref()
+        .and_then(|_| external_identity_header.filter(|header| !header.trim().is_empty()));
+
+    if consumer.is_none() && external_identity.is_none() {
+        return Ok(false);
+    }
+
+    let principal_already_committed = request_principal_is_committed(ctx);
+
+    // Cleanup is additive for every accepted credential that reaches this
+    // boundary. The dispatcher normally stops after its first success; direct
+    // or custom callers still cannot erase cleanup already requested. Failed
+    // and principal-less attempts never reach this boundary.
+    attempt.commit_credential_cleanup(ctx);
+
+    if !principal_already_committed {
+        if let Some(consumer) = consumer {
+            debug!(
+                "{}: identified consumer '{}'",
+                auth_method, consumer.username
+            );
+            ctx.identified_consumer = Some(consumer);
+        }
+        ctx.authenticated_identity = external_identity;
+        ctx.authenticated_identity_header = external_identity_header;
+        if ctx.auth_method.is_none() {
+            ctx.auth_method = Some(auth_method);
+        }
+        attempt.commit_principal_state(ctx);
+    }
+
+    Ok(true)
+}
+
+/// Whether this attempt could become the first accepted request principal.
+/// Callers with irreversible side effects can use this as a non-mutating
+/// preflight before performing them; the final commit still revalidates the
+/// outcome at the transaction boundary.
+pub fn authentication_attempt_can_commit(
+    ctx: &RequestContext,
+    outcome: &VerifyOutcome,
+    allow_external_identity: bool,
+) -> bool {
+    if request_principal_is_committed(ctx) {
+        return false;
+    }
+    let VerifyOutcome::Success {
+        consumer,
+        external_identity,
+        ..
+    } = outcome
+    else {
+        return false;
+    };
+    consumer
+        .as_ref()
+        .is_some_and(|consumer| !consumer.username.trim().is_empty())
+        || (allow_external_identity
+            && external_identity
+                .as_deref()
+                .is_some_and(|identity| !identity.trim().is_empty()))
+}
+
+fn request_principal_is_committed(ctx: &RequestContext) -> bool {
+    ctx.identified_consumer
+        .as_ref()
+        .is_some_and(|consumer| !consumer.username.trim().is_empty())
+        || ctx
+            .authenticated_identity
+            .as_deref()
+            .is_some_and(|identity| !identity.trim().is_empty())
+}
+
+/// Retain an identity claim byte-for-byte when it contains a non-whitespace
+/// principal, otherwise treat it as missing before Consumer lookup.
+pub fn nonblank_identity(identity: Option<String>) -> Option<String> {
+    identity.filter(|value| !value.trim().is_empty())
+}
+
+fn reject(status_code: u16, body: String, challenge: Option<&'static str>) -> PluginResult {
+    let mut headers = HashMap::new();
+    if status_code == 401
+        && let Some(challenge) = challenge
+    {
+        headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
+    }
     PluginResult::Reject {
         status_code,
         body,
-        headers: HashMap::new(),
+        headers,
     }
 }
 
@@ -499,6 +619,28 @@ mod tests {
 
         run_auth_external_identity(&mechanism, &mut ctx, &index).await;
 
+        assert!(ctx.effective_identity().is_none());
+        assert!(ctx.auth_method.is_none());
+    }
+
+    #[tokio::test]
+    async fn blank_external_identity_does_not_authenticate() {
+        let mechanism = FakeMechanism {
+            extracted: ExtractedCredential::BearerToken("token".to_string()),
+            outcome: VerifyOutcome::Success {
+                consumer: None,
+                external_identity: Some("   \t".to_string()),
+                external_identity_header: Some(" \n".to_string()),
+            },
+        };
+        let mut ctx = test_ctx();
+        let index = ConsumerIndex::new(&[]);
+
+        let result = run_auth_external_identity(&mechanism, &mut ctx, &index).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(ctx.authenticated_identity.is_none());
+        assert!(ctx.authenticated_identity_header.is_none());
         assert!(ctx.effective_identity().is_none());
         assert!(ctx.auth_method.is_none());
     }

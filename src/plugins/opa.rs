@@ -263,7 +263,8 @@ impl Opa {
         let mut headers = Map::with_capacity(ctx.headers.len());
         for (name, value) in &ctx.headers {
             let lower = name.to_ascii_lowercase();
-            if self.redact_headers.contains(&lower) {
+            if self.redact_headers.contains(&lower) || ctx.request_header_requires_redaction(&lower)
+            {
                 continue;
             }
             headers.insert(lower, Value::String(value.clone()));
@@ -723,7 +724,9 @@ fn default_redact_headers() -> HashSet<String> {
         "authorization",
         "proxy-authorization",
         "cookie",
+        "api-key",
         "x-api-key",
+        "x-goog-api-key",
         "x-auth-token",
         "x-csrf-token",
         "x-xsrf-token",

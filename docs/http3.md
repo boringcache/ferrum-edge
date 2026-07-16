@@ -45,11 +45,15 @@ Every H3 request goes through the same plugin lifecycle as H1/H2 (route match �
 | `HttpPool` | `WebSocket` | [H3 WebSocket bridge](#websocket-over-http3-rfc-9220-extended-connect) (`ws://` backend over plaintext H1.1) |
 | `TcpRaw` / `TcpTls` / `UdpRaw` / `UdpDtls` | — | Never routed here (stream proxies route on `listen_port`) |
 
-The `HttpFlavor` is computed once per request by `detect_http_flavor()` in `src/proxy/backend_dispatch.rs` — the same helper H1/H2 uses — so classification is identical on both fronts:
+The original wire `HttpFlavor` is computed once per request by `detect_http_flavor()` in `src/proxy/backend_dispatch.rs` — the same helper H1/H2 uses:
 
-- `application/grpc*` content-type → `Grpc`
+- native `application/grpc` content types (excluding gRPC-Web) → `Grpc`
 - HTTP/1.1 `Upgrade: websocket`, H2 Extended CONNECT `:protocol=websocket` (RFC 8441), or H3 Extended CONNECT `:protocol=websocket` (RFC 9220) → `WebSocket`
 - Everything else → `Plain`
+
+The strict gRPC-Web media-type classifier recognizes only `application/grpc-web` and `application/grpc-web-text`, with an optional `+subtype` and optional media-type parameters. The shared wire classifier deliberately leaves those requests `Plain` so the `grpc_web` plugin retains ownership of binary/text request-body translation. The H3 frontend immediately promotes a recognized gRPC-Web request to an effective `Grpc` **policy** flavor while retaining both its `Http` plugin-cache key and original gRPC-Web response content type. Its precomputed request view contains the ordinary priority-ordered HTTP chain plus only `grpc_method_router` and `grpc_deadline` from the native-gRPC chain, without duplicate instances. POST validation, request limits, and fail-closed method/deadline policy consume the effective flavor; early and later rejections use the retained content type to emit the browser-facing gRPC-Web trailer-frame representation. Backend transport is promoted to native gRPC only when the `grpc_web` plugin stamps its trusted translation marker after rewriting the request. Without that plugin, the original `Plain` transport and gRPC-Web content type pass through to the backend, preserving existing deployments while policy recognition remains fail closed. When that pass-through request has an absolute RPC deadline, both H3 frontends and H1/H2 frontends bypass the native backend-H3 pool and use the deadline-aware reqwest bridge; the deadline covers client-pool acquisition, dispatch, upload, response headers, and response-body collection so the browser can receive the canonical status-4 trailer frame. Extended CONNECT classification takes precedence, so a WebSocket request cannot be promoted by a spoofed gRPC-Web content type.
+
+The native-gRPC composition is limited to the deadline and method-policy parity described here; it does not opt every gRPC-only plugin into gRPC-Web. Issue #2499 and advisory GHSA-m7x6-wqw2-3mvm remain the broader protocol-classification follow-up, and this deadline work does not claim or close either one.
 
 ## Native H3 fast path
 
@@ -59,7 +63,7 @@ When the matched proxy has `backend_scheme: https`, the concrete backend target 
 - Response body: streamed back via `CoalescingH3Body` / `DirectH3Body` with the coalesce knobs below.
 - Zero copies of the body to userspace at either end; h3's chunks are `Bytes` pass-throughs.
 
-The same native QUIC fast path now also serves **`Grpc`** flavor via `dispatch_grpc_native_h3()`: the gRPC request frames stream over `request_streaming_body()`, the response body streams back through the shared QUIC coalescer, and the terminal `grpc-status` / `grpc-message` trailer is forwarded verbatim (after response-direction hop-by-hop stripping). This is the **only** path that can reach an H3-only gRPC backend, because the gRPC pool (`GrpcConnectionPool`) speaks only HTTP/2 (h2 TLS / h2c). It is gated to the streamable case (no retry / body-plugin buffering, no reqwest-forcing plugin); unary, server-streaming, and client-streaming RPCs are supported (the request stream is drained before the response is read, exactly like the cross-protocol bridge buffers it), while full bidirectional streaming and the retry/body-buffering cases fall through to the H2 gRPC bridge. CB / passive-health key off the HTTP transport status (gRPC failures ride on HTTP 200); the adaptive-concurrency sample maps a non-OK backend `grpc-status` to a 5xx, matching the H2 streaming gRPC bridge.
+The same native QUIC fast path now also serves **`Grpc`** flavor via `dispatch_grpc_native_h3()`: the gRPC request frames stream over `request_streaming_body()`, the response body streams back through the shared QUIC coalescer, and the terminal `grpc-status` / `grpc-message` trailer is forwarded verbatim (after response-direction hop-by-hop stripping). This is the **only** path that can reach an H3-only gRPC backend, because the gRPC pool (`GrpcConnectionPool`) speaks only HTTP/2 (h2 TLS / h2c). It is gated to the streamable case (no retry / body-plugin buffering, no reqwest-forcing plugin); unary, server-streaming, and client-streaming RPCs are supported (the request stream is drained before the response is read, exactly like the cross-protocol bridge buffers it), while full bidirectional streaming and the retry/body-buffering cases fall through to the H2 gRPC bridge. Every downstream DATA/coalescer write is deadline-biased: expiry before the first client-visible DATA completes with `grpc-status: 4`, including simultaneous readiness, while expiry after any visible DATA resets because a length-prefixed message may be partial. CB / passive-health key off the HTTP transport status (gRPC failures ride on HTTP 200); the adaptive-concurrency sample maps a non-OK backend `grpc-status` to a 5xx, matching the H2 streaming gRPC bridge.
 
 The streaming request-body pool path retries a stale cached H3 connection only when `H3PoolError::request_on_wire()` is false. At that boundary `send_request` did not open a backend stream and the borrowed frontend body has not been polled, so reconnecting to the same target is safe. Post-wire failures are never replayed: body bytes may already have reached the backend, and automatically retrying a gRPC `POST` could execute it twice. The same pre-wire reconnect covers the hyper-`Incoming` streaming variants used by the H1/H2 frontend → H3 backend path (`request_streaming_incoming_body` / `request_with_target_streaming_incoming_body`): because the `Incoming` body is moved into the request, a pre-wire failure hands the still-unpolled body back to the pool caller alongside the error, and the caller replays it once on a fresh connection under the same `request_on_wire()` gate.
 
@@ -128,22 +132,22 @@ For every dispatch case that is **not** served by a native H3 path — i.e. anyt
 Flow:
 
 1. **Pre-dispatch plugin phases + LB + circuit breaker** already ran in the H3 listener; the bridge receives the resolved `backend_url`, `upstream_target`, `cb_target_key`, the already-processed `proxy_headers`, the prebuffered request body (if any plugin phase collected it), plus `&mut ctx`, the pre-resolved plugin list, and the sticky-cookie flag so the bridge can run the response-side hook pipeline.
-2. **`on_final_request_body`** — when the caller prebuffered the body, the bridge runs `apply_request_body_plugins` (transforms) then `run_final_request_body_hooks` (validators). A reject here short-circuits without ever calling the backend — Plain emits a JSON error, Grpc emits a trailers-only gRPC error.
+2. **`on_final_request_body`** — when the caller prebuffered the body, the bridge runs `apply_request_body_plugins` (transforms) then `run_final_request_body_hooks` (validators). A reject here short-circuits without ever calling the backend — ordinary Plain emits a JSON error, native Grpc emits a trailers-only gRPC error, and recognized gRPC-Web emits its client-facing trailer frame in both translated and pass-through configurations.
 3. **Request dispatch** — Plain flavor opens a reqwest request with a streaming body (see [buffering policy](#buffering-policy)) and honors `backend_read_timeout_ms`; Grpc flavor calls `proxy_grpc_request_from_bytes()` with a buffered `Bytes` and streams the response when no retry / body-buffering plugin forces buffering.
 4. **`after_proxy` + sticky cookie** — once response headers arrive, the bridge runs `run_after_proxy_hooks` so response-transformer, CORS-response, compression-advertise, etc. see the cross-protocol path. A reject aborts the backend response and writes the plugin's body instead. Then `inject_sticky_cookie` adds the LB sticky-session cookie when the selection requested it.
 5. **Response normalization + body hooks** — buffered native-H3 and cross-protocol responses first run provider/protocol normalization, then `on_response_body`, ordinary response transforms, and `on_final_response_body`. This is the same order as H1/H2, so policy plugins inspect the client-visible representation (for example OpenAI-shaped SSE rather than provider-native Anthropic events). Streaming responses use the staged `ResponseStreamInspector` chain; protocol normalizers run before policy inspectors.
 6. **Response write** — response headers are mapped onto `http::Response<()>` and sent via `stream.send_response()`. The body is streamed into `stream.send_data()` with the same coalescing window the native H3 writer uses (see [Coalescing](#coalescing-and-frame-cadence)).
-7. **gRPC trailers** — forwarded via `stream.send_trailers()` so `grpc-status` / `grpc-message` survive the cross-protocol hop. See [gRPC trailers](#grpc-trailers-over-h3). Backend failures map to DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED / UNAVAILABLE / INTERNAL based on `GrpcProxyError` variant — not collapsed to UNAVAILABLE.
+7. **gRPC trailers** — forwarded via `stream.send_trailers()` for native gRPC, or embedded by the `grpc_web` plugin in the client-facing response-body trailer frame, so `grpc-status` / `grpc-message` survive the cross-protocol hop. See [gRPC trailers](#grpc-trailers-over-h3). Backend failures map to DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED / UNAVAILABLE / INTERNAL based on `GrpcProxyError` variant — not collapsed to UNAVAILABLE.
 8. **Outcome** — `record_backend_outcome()` updates the circuit breaker, passive health, and least-latency LB signals exactly as the H1/H2 path does.
 9. **Transaction summary** — the H3 listener builds the same `TransactionSummary` shape that the native H3 path emits and calls `log_with_mirror()`, so log plugins (http_logging, statsd, prometheus, …) see a consistent record regardless of dispatch kind.
 
-**Early-response cancellation**: in the streaming-request path, the bridge drives the H3 recv reader and `reqwest::send()` concurrently via `tokio::select!` biased toward the send future. If the backend produces a final response before the client finishes uploading (auth reject, early 413, etc.), the bridge breaks out and drops the reader — no stranded task on `recv_data()`.
+**Early-response cancellation**: in the streaming-request path, the bridge drives the H3 recv reader and `reqwest::send()` concurrently via `tokio::select!`. For recognized gRPC-Web, the absolute RPC deadline is the first biased arm, so a withheld upload or response headers cannot retain the backend request, admission permit, or half-open probe. Otherwise a backend final response before the client finishes uploading (auth reject, early 413, etc.) breaks out and drops the reader — no stranded task on `recv_data()`.
 
 ## Buffering policy
 
 Mirrors the H1/H2 proxy path's plugin-driven decision (see `ClientRequestBody::{Streaming, Buffered}` in `src/proxy/mod.rs`): stream the request body by default, buffer only when a plugin explicitly demands the body pre-`before_proxy` or when the caller pre-buffered it upstream.
 
-Every buffered upload drain — including bodies required before `authenticate` or `before_proxy` — is bounded by the proxy's `backend_read_timeout_ms`; `0` explicitly disables the deadline. Plain HTTP timeouts return `408`, while gRPC requests complete with trailers-only `DEADLINE_EXCEEDED`, matching the H1/H2 paths.
+Every buffered upload drain — including bodies required before `authenticate`, `authorize`, or `before_proxy` — is bounded by the proxy's `backend_read_timeout_ms`; `0` explicitly disables that operator timeout. A configured client RPC deadline is an independent absolute ceiling. When it expires during any buffered upload phase, the result follows the ordinary finalized rejection lifecycle before the response is written: immediately-ready rejection decorators and committed observers see the canonical result, gRPC-Web translation preserves their synchronous headers (including CORS), and rejection logging plus permit/probe accounting complete. A hook still pending at expiry continues with later eligible cleanup hooks on owned state under a detached bound and cannot retain the terminal write. Plain HTTP operator timeouts return `408`, while gRPC request timeouts complete with trailers-only `DEADLINE_EXCEEDED`, matching the H1/H2 paths.
 
 **Plain flavor — request body streamed via an mpsc bridge.** `reqwest::Body::wrap_stream` requires a `'static + Send + Sync` stream, which cannot directly hold the `&mut RequestStream` borrow the H3 listener already has on the shared request stream. The bridge uses a bounded `tokio::sync::mpsc` channel:
 
@@ -155,7 +159,7 @@ Every buffered upload drain — including bodies required before `authenticate` 
 
 If the caller pre-buffered the body (a plugin collected it during `before_proxy`), the bridge is skipped and the `Vec<u8>` is handed to reqwest directly — one allocation, no channel overhead.
 
-**Grpc flavor — request body buffered, response streamed when safe.** `proxy_grpc_request_from_bytes()` takes `Bytes` for retry-safe framing and trailer handling, so the request body is collected up-front (unary gRPC request bodies are small and this is a cross-protocol fallback path; streaming gRPC request bodies through the bridge would require a new `GrpcBody` variant in `GrpcConnectionPool` and is tracked as future optimization). The RESPONSE is streamed whenever no retry is configured AND no plugin forces response-body buffering — server-streaming / bidi gRPC RPCs flow frame-by-frame through the bridge rather than accumulating fully in memory before the first byte reaches the H3 client. When retries or body-buffering plugins are configured, the response is buffered so the retry/plugin layer can inspect it before forwarding.
+**Grpc flavor — request body buffered, response streamed when safe.** `proxy_grpc_request_from_bytes()` takes `Bytes` for retry-safe framing and trailer handling, so the request body is collected up-front (unary gRPC request bodies are small and this is a cross-protocol fallback path; streaming gRPC request bodies through the bridge would require a new `GrpcBody` variant in `GrpcConnectionPool` and is tracked as future optimization). The RESPONSE is streamed whenever no retry is configured AND no plugin forces response-body buffering — server-streaming / bidi gRPC RPCs flow frame-by-frame through the bridge rather than accumulating fully in memory before the first byte reaches the H3 client. The relay consumes the request-scoped absolute gRPC deadline after headers: before client-visible DATA it completes with status-4 trailers, after partial DATA it resets the stream, and without a client deadline it retains the operator per-frame read timeout. Every downstream H3 header, DATA, coalescer flush, trailer, and FIN write in that relay is raced against the same absolute deadline, so exhausted QUIC flow-control credit cannot retain the upstream response indefinitely. A zero-DATA terminal status gets one immediate write opportunity; if flow control would block, the gateway resets the response and drops/cancels the upstream body. It removes backend `Content-Length` before committing deadline-capable response headers. When retries or body-buffering plugins are configured, the response is buffered so the retry/plugin layer can inspect it before forwarding.
 
 **Response body — always streamed with coalescing.** See below.
 
@@ -178,6 +182,32 @@ The coalesce loop is identical across the two paths — source of bytes differs 
 - **Buffered gRPC response** — the gRPC pool extracts trailers into a `HashMap<String, String>` before returning; the bridge converts them to a `HeaderMap` and sends via `send_trailers()` after the data frames.
 - **Streaming gRPC response** — the bridge polls hyper `Incoming::frame()`; when a `Frame::trailers()` variant is seen, the `HeaderMap` is stashed, the data loop exits cleanly, and the stashed trailers are forwarded via `send_trailers()`.
 
+Buffered response hooks receive a compatibility view containing both initial
+headers and trailers. Before the H3 response is written, Ferrum restores the
+original provenance, reapplies the prefiltered `security_headers` policy to the
+initial header map, and keeps `grpc-status`, `grpc-message`, status details, and
+application metadata on the trailer channel whenever the backend supplied a
+real trailers frame, including split responses with an empty DATA body. A final
+security-policy removal is authoritative across both compatibility copies: it
+also suppresses trailer-only or header-shadowed application metadata, and runs
+after any hook-mutated trailer cookie is rehomed. A final policy set/override
+remains initial-header policy and preserves the backend's application trailer.
+A backend Trailers-Only response that already carries terminal status in its
+END_STREAM initial HEADERS and has no trailers frame keeps that status there;
+Ferrum snapshots the reserved terminal fields from the pristine backend
+headers before response hooks run, then restores that authoritative snapshot,
+so policy replay cannot remove or replace it. This is also the path used after
+gRPC-Web binary or text response framing, so security policy cannot disappear
+with the native trailer map.
+
+After route resolution, HTTP/3 method-filter errors and native-gRPC gateway
+errors (including request deadlines, size limits, backend unavailability, and
+mesh fail-closed responses) also apply the route's precomputed initial-response
+policy before the initial HEADERS write. gRPC status/message, content type, and
+transport framing are restored after policy. Errors rejected before a route is
+resolved have no plugin configuration and therefore remain outside this policy
+boundary.
+
 Either way, `grpc-status` reaches the H3 client intact.
 
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
@@ -190,6 +220,14 @@ gateway authenticates, authorizes, runs the `before_proxy` plugin chain,
 opens a backend WebSocket connection, replies `:status = 200`, and then
 bridges WebSocket frames between the QUIC stream and the backend
 WebSocket for the lifetime of the session.
+
+The `security_headers` initial-response policy runs on the RFC 9220 `200`
+handshake and on gateway-generated H3 WebSocket failures. Transport-managed
+fields are stripped at the final emission boundary after response hooks; JSON
+failures default `Content-Type: application/json` there when no intentional
+content type survives. The backend-negotiated `Sec-WebSocket-Protocol` is then
+restored on success. H3 never emits the HTTP/1.1-only `Upgrade`, `Connection`,
+or `Sec-WebSocket-Accept` fields.
 
 ### Wire-level handshake
 

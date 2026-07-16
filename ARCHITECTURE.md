@@ -75,7 +75,7 @@ src/
 ├── plugins/                   # Plugin system (75+ built-in plugins)
 │   ├── mod.rs                 # Plugin framework, registry, and priority constants
 │   ├── access_control.rs      # Consumer-based authorization
-│   ├── basic_auth.rs          # HTTP Basic auth with bcrypt
+│   ├── basic_auth.rs          # HTTP Basic auth with HMAC-SHA256 password hashes
 │   ├── body_transform.rs      # Request/response body transformation
 │   ├── body_validator.rs      # JSON/XML request body validation
 │   ├── bot_detection.rs       # Bot detection and mitigation

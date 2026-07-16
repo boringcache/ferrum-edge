@@ -1,6 +1,7 @@
-use ferrum_edge::plugins::{GRPC_ONLY_PROTOCOLS, PluginResult, create_plugin, priority};
+use ferrum_edge::plugins::{
+    BackendPathPolicyPhase, GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, create_plugin, priority,
+};
 use serde_json::json;
-use std::collections::HashMap;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
@@ -11,6 +12,16 @@ fn create_grpc_context(path: &str) -> ferrum_edge::plugins::RequestContext {
     ctx.headers
         .insert("content-type".to_string(), "application/grpc".to_string());
     ctx
+}
+
+async fn enforce_effective_path(
+    plugin: &dyn Plugin,
+    ctx: &mut ferrum_edge::plugins::RequestContext,
+) -> PluginResult {
+    let path = ctx.path.clone();
+    plugin
+        .on_backend_path_resolved(ctx, &path, BackendPathPolicyPhase::Enforce)
+        .await
 }
 
 // ── Plugin creation ──
@@ -29,6 +40,7 @@ fn test_plugin_creation() {
     assert!(!plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
     assert!(!plugin.requires_request_body_buffering());
+    assert!(plugin.requires_backend_path_resolution());
     assert!(!plugin.applies_after_proxy_on_reject());
 }
 
@@ -130,6 +142,90 @@ async fn test_path_with_extra_slashes_no_metadata() {
     assert!(!ctx.metadata.contains_key("grpc_service"));
 }
 
+#[tokio::test]
+async fn test_backend_effective_rewrite_refreshes_metadata_before_enforcement() {
+    let config = json!({
+        "allow_methods": ["/public.Service/Allowed"],
+        "deny_methods": ["/admin.Service/Delete"]
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_context("/public.Service/Allowed");
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+    assert_eq!(
+        ctx.metadata.get("grpc_full_method").map(String::as_str),
+        Some("public.Service/Allowed")
+    );
+
+    let result = plugin
+        .on_backend_path_resolved(
+            &mut ctx,
+            "/admin.Service/Delete",
+            BackendPathPolicyPhase::Enforce,
+        )
+        .await;
+    assert_reject(result, Some(403));
+    assert_eq!(
+        ctx.metadata.get("grpc_service").map(String::as_str),
+        Some("admin.Service")
+    );
+    assert_eq!(
+        ctx.metadata.get("grpc_method").map(String::as_str),
+        Some("Delete")
+    );
+    assert_eq!(
+        ctx.metadata.get("grpc_full_method").map(String::as_str),
+        Some("admin.Service/Delete")
+    );
+}
+
+#[tokio::test]
+async fn test_stripped_prefix_is_enforced_as_backend_effective_method() {
+    let config = json!({"deny_methods": ["/pkg.Svc/Denied"]});
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_context("/prefix/pkg.Svc/Denied");
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+    assert!(!ctx.metadata.contains_key("grpc_full_method"));
+
+    let result = plugin
+        .on_backend_path_resolved(&mut ctx, "/pkg.Svc/Denied", BackendPathPolicyPhase::Enforce)
+        .await;
+    assert_reject(result, Some(403));
+    assert_eq!(
+        ctx.metadata.get("grpc_full_method").map(String::as_str),
+        Some("pkg.Svc/Denied")
+    );
+}
+
+#[tokio::test]
+async fn test_invalid_backend_effective_rewrite_clears_provisional_metadata() {
+    let config = json!({"deny_methods": ["/pkg.Svc/Denied"]});
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_context("/public.Service/Allowed");
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+    assert!(ctx.metadata.contains_key("grpc_full_method"));
+
+    let result = plugin
+        .on_backend_path_resolved(
+            &mut ctx,
+            "/invalid/extra/segment",
+            BackendPathPolicyPhase::Enforce,
+        )
+        .await;
+    assert_reject(result, Some(403));
+    assert!(!ctx.metadata.contains_key("grpc_service"));
+    assert!(!ctx.metadata.contains_key("grpc_method"));
+    assert!(!ctx.metadata.contains_key("grpc_full_method"));
+}
+
 // ── Allow list enforcement ──
 
 #[tokio::test]
@@ -144,8 +240,7 @@ async fn test_allow_list_permits_listed_method() {
     let mut ctx = create_grpc_context("/pkg.Svc/Allowed");
     let _ = plugin.on_request_received(&mut ctx).await;
 
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_continue(result);
 }
 
@@ -161,8 +256,7 @@ async fn test_allow_list_blocks_unlisted_method() {
     let mut ctx = create_grpc_context("/pkg.Svc/NotAllowed");
     let _ = plugin.on_request_received(&mut ctx).await;
 
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_reject(result, Some(403));
 }
 
@@ -180,8 +274,7 @@ async fn test_deny_list_blocks_listed_method() {
     let mut ctx = create_grpc_context("/pkg.Svc/Dangerous");
     let _ = plugin.on_request_received(&mut ctx).await;
 
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_reject(result, Some(403));
 }
 
@@ -197,8 +290,7 @@ async fn test_deny_list_allows_unlisted_method() {
     let mut ctx = create_grpc_context("/pkg.Svc/Safe");
     let _ = plugin.on_request_received(&mut ctx).await;
 
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_continue(result);
 }
 
@@ -215,8 +307,7 @@ async fn test_deny_wins_over_allow() {
     let mut ctx = create_grpc_context("/pkg.Svc/Method");
     let _ = plugin.on_request_received(&mut ctx).await;
 
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_reject(result, Some(403));
 }
 
@@ -236,8 +327,7 @@ async fn test_method_rate_limiting_within_limit() {
     for _ in 0..5 {
         let mut ctx = create_grpc_context("/pkg.Svc/Create");
         let _ = plugin.on_request_received(&mut ctx).await;
-        let mut headers = HashMap::new();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
         assert_continue(result);
     }
 }
@@ -257,17 +347,40 @@ async fn test_method_rate_limiting_exceeded() {
     for _ in 0..2 {
         let mut ctx = create_grpc_context("/pkg.Svc/Create");
         let _ = plugin.on_request_received(&mut ctx).await;
-        let mut headers = HashMap::new();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
         assert_continue(result);
     }
 
     // Third should be rate limited
     let mut ctx = create_grpc_context("/pkg.Svc/Create");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_reject(result, Some(429));
+}
+
+#[tokio::test]
+async fn test_backend_path_preview_does_not_charge_method_rate_limit() {
+    let config = json!({
+        "method_rate_limits": {
+            "/pkg.Svc/Create": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_grpc_context("/pkg.Svc/Create");
+
+    for _ in 0..2 {
+        let result = plugin
+            .on_backend_path_resolved(&mut ctx, "/pkg.Svc/Create", BackendPathPolicyPhase::Preview)
+            .await;
+        assert_continue(result);
+    }
+
+    let first_enforcement = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
+    assert_continue(first_enforcement);
+    let second_enforcement = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
+    assert_reject(second_enforcement, Some(429));
 }
 
 #[tokio::test]
@@ -285,20 +398,17 @@ async fn test_different_methods_have_independent_limits() {
     // Exhaust Create limit
     let mut ctx = create_grpc_context("/pkg.Svc/Create");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
 
     let mut ctx = create_grpc_context("/pkg.Svc/Create");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_reject(result, Some(429));
 
     // Delete should still work
     let mut ctx = create_grpc_context("/pkg.Svc/Delete");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_continue(result);
 }
 
@@ -317,8 +427,7 @@ async fn test_unlimited_method_passes_even_with_other_limits() {
     for _ in 0..10 {
         let mut ctx = create_grpc_context("/pkg.Svc/Read");
         let _ = plugin.on_request_received(&mut ctx).await;
-        let mut headers = HashMap::new();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
         assert_continue(result);
     }
 }
@@ -340,13 +449,11 @@ async fn test_rate_limiting_by_consumer() {
     // Consumer 1 exhausts limit
     let mut ctx = create_grpc_context("/pkg.Svc/Create");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
 
     let mut ctx = create_grpc_context("/pkg.Svc/Create");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_reject(result, Some(429));
 
     // Different consumer should pass (different IP, no consumer set)
@@ -354,8 +461,7 @@ async fn test_rate_limiting_by_consumer() {
     ctx.client_ip = "10.0.0.2".to_string();
     ctx.identified_consumer = None;
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_continue(result);
 }
 
@@ -372,8 +478,7 @@ async fn test_rejection_body_format() {
 
     let mut ctx = create_grpc_context("/pkg.Svc/Blocked");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
 
     match result {
         PluginResult::Reject {
@@ -401,16 +506,16 @@ async fn test_rejection_body_escapes_untrusted_method_path() {
 
     let mut ctx = create_grpc_context("/pkg.Svc/Bad\"Method");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
 
     match result {
         PluginResult::Reject { body, .. } => {
             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(
                 parsed["error"],
-                "gRPC method 'pkg.Svc/Bad\"Method' is not permitted"
+                "backend-effective gRPC method path could not be parsed"
             );
+            assert!(!body.contains("Bad\\\"Method"));
         }
         _ => panic!("Expected Reject"),
     }
@@ -430,14 +535,12 @@ async fn test_rate_limit_rejection_includes_headers() {
     // Exhaust limit
     let mut ctx = create_grpc_context("/pkg.Svc/Create");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
 
     // Second request should be rejected with rate limit headers
     let mut ctx = create_grpc_context("/pkg.Svc/Create");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
 
     match result {
         PluginResult::Reject {
@@ -473,8 +576,7 @@ async fn test_tracked_keys_count() {
     // Trigger some rate checks
     let mut ctx = create_grpc_context("/pkg.Svc/A");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
 
     assert_eq!(plugin.tracked_keys_count(), Some(1));
 }
@@ -486,6 +588,20 @@ fn test_empty_config_returns_error() {
     let result = create_plugin("grpc_method_router", &json!({}));
     let err = result.err().expect("Empty config should return Err");
     assert!(err.contains("no rules configured"), "got: {err}");
+}
+
+#[test]
+fn test_empty_additive_rules_return_error() {
+    for config in [
+        json!({"deny_methods": []}),
+        json!({"method_rate_limits": {}}),
+    ] {
+        let result = create_plugin("grpc_method_router", &config);
+        let err = result
+            .err()
+            .expect("empty additive rule should be rejected");
+        assert!(err.contains("no rules configured"), "got: {err}");
+    }
 }
 
 // ── Constructor validation: limit_by ──
@@ -596,6 +712,23 @@ fn test_warmup_hostnames_for_redis() {
 // ── Constructor validation: rate-limit specs ──
 
 #[test]
+fn test_zero_max_requests_rejected() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/svc/M": { "max_requests": 0, "window_seconds": 60 }
+            }
+        }),
+    );
+    let err = result.err().expect("max_requests=0 should be rejected");
+    assert!(
+        err.contains("'max_requests' must be greater than zero"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn test_zero_window_seconds_rejected() {
     let result = create_plugin(
         "grpc_method_router",
@@ -689,6 +822,26 @@ fn test_invalid_method_rate_limit_key_rejected() {
 }
 
 #[test]
+fn test_duplicate_rate_limit_key_rejected_after_normalization() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/svc/M": { "max_requests": 5, "window_seconds": 60 },
+                "svc/M": { "max_requests": 5, "window_seconds": 60 }
+            }
+        }),
+    );
+    let err = result
+        .err()
+        .expect("duplicate normalized rate-limit key must be rejected");
+    assert!(
+        err.contains("duplicate method_rate_limits entry"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn test_database_sync_mode_rejected() {
     let result = create_plugin(
         "grpc_method_router",
@@ -771,16 +924,14 @@ async fn test_rate_limiting_by_authenticated_identity() {
     ctx.identified_consumer = None;
     ctx.authenticated_identity = Some("jwks-user@example.com".to_string());
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
 
     // Same identity again — should be rate limited
     let mut ctx = create_grpc_context("/pkg.Svc/Create");
     ctx.identified_consumer = None;
     ctx.authenticated_identity = Some("jwks-user@example.com".to_string());
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_reject(result, Some(429));
 
     // Different authenticated_identity should pass (separate bucket)
@@ -788,8 +939,7 @@ async fn test_rate_limiting_by_authenticated_identity() {
     ctx.identified_consumer = None;
     ctx.authenticated_identity = Some("other-user@example.com".to_string());
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_continue(result);
 }
 
@@ -810,22 +960,20 @@ async fn test_consumer_takes_precedence_over_authenticated_identity() {
     ctx.authenticated_identity = Some("jwks-identity".to_string());
     // ctx.identified_consumer is set by create_test_context() -> "testuser"
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
 
     // Same consumer again — should be rate limited (keyed by "testuser")
     let mut ctx = create_grpc_context("/pkg.Svc/Create");
     ctx.authenticated_identity = Some("jwks-identity".to_string());
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_reject(result, Some(429));
 }
 
-// ── Non-parseable path: additive policies pass through, allow-list fails closed ──
+// ── Non-parseable backend-effective paths fail closed for every policy shape ──
 
 #[tokio::test]
-async fn test_unparseable_path_skips_enforcement() {
+async fn test_unparseable_path_fails_closed_under_deny_list() {
     let config = json!({
         "deny_methods": ["/pkg.Svc/Method"]
     });
@@ -835,15 +983,13 @@ async fn test_unparseable_path_skips_enforcement() {
 
     let mut ctx = create_grpc_context("/not-a-grpc-path");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
+    assert_reject(result, Some(403));
+    assert!(!ctx.metadata.contains_key("grpc_full_method"));
 }
 
 #[tokio::test]
-async fn test_unparseable_path_skips_enforcement_rate_limit_only() {
-    // Rate-limit-only config is additive: an unparseable path matches no
-    // configured method, so there is nothing to enforce and it continues.
+async fn test_unparseable_path_fails_closed_under_rate_limit_only() {
     let config = json!({
         "method_rate_limits": {
             "/pkg.Svc/Create": { "max_requests": 1, "window_seconds": 60 }
@@ -855,9 +1001,9 @@ async fn test_unparseable_path_skips_enforcement_rate_limit_only() {
 
     let mut ctx = create_grpc_context("/svc/method/extra");
     let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
+    assert_reject(result, Some(403));
+    assert!(!ctx.metadata.contains_key("grpc_full_method"));
 }
 
 // Regression for finding #21: under a strict allow-list (deny-by-default), a
@@ -891,8 +1037,7 @@ async fn test_unparseable_path_fails_closed_under_allow_list() {
             "path {path:?} unexpectedly parsed; test no longer exercises the fail-closed branch"
         );
 
-        let mut headers = HashMap::new();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
         assert_reject(result, Some(403));
     }
 }
@@ -915,7 +1060,6 @@ async fn test_allow_list_still_permits_listed_method_after_fail_closed_fix() {
         "pkg.Svc/Allowed"
     );
 
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = enforce_effective_path(plugin.as_ref(), &mut ctx).await;
     assert_continue(result);
 }

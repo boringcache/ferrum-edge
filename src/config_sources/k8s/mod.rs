@@ -41,8 +41,8 @@ use crate::config::types::{
 };
 use crate::identity::spiffe::TrustDomain;
 use crate::modes::mesh::config::{MeshConfig, WorkloadSelector};
+use crate::plugins::utils::fault_roll::MAX_FAULT_DELAY_MS;
 
-const MAX_FAULT_DELAY_MS: u64 = 3_600_000;
 const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1364,20 +1364,48 @@ pub(crate) fn request_termination_plugin_for_proxy(
 /// historical proxy-scoped `fault_injection` plugin emission which could
 /// not be collapsed with sibling routes — moving fault to the dispatch
 /// rule eliminates the previous fail-closed escape hatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouteLocalFaultDelay {
+    pub requested_ms: u64,
+    pub applied_ms: u64,
+}
+
+impl RouteLocalFaultDelay {
+    pub(crate) fn was_clamped(self) -> bool {
+        self.requested_ms != self.applied_ms
+    }
+}
+
+/// Resolve the effective delay for one route-local Istio fault. Istio accepts
+/// durations above Ferrum's one-minute runtime cap, so those values are
+/// clamped instead of silently dropping an otherwise valid fault action. The
+/// translator and status writer share this predicate to keep warning/status
+/// visibility in lockstep with the emitted rule.
+pub(crate) fn route_local_fault_delay_for_rule(fault: &Value) -> Option<RouteLocalFaultDelay> {
+    let delay_obj = fault.as_object()?.get("delay")?.as_object()?;
+    let delay_str = delay_obj.get("fixedDelay")?.as_str()?;
+    let requested_ms = parse_istio_duration_ms(delay_str)?;
+    if requested_ms == 0 || istio_fault_percentage(delay_obj).is_none() {
+        return None;
+    }
+    Some(RouteLocalFaultDelay {
+        requested_ms,
+        applied_ms: requested_ms.min(MAX_FAULT_DELAY_MS),
+    })
+}
+
 pub(crate) fn route_local_fault_value_for_rule(fault: &Value) -> Option<Value> {
     let obj = fault.as_object()?;
     let mut config = serde_json::Map::new();
 
-    if let Some(delay_obj) = obj.get("delay").and_then(Value::as_object)
-        && let Some(delay_str) = delay_obj.get("fixedDelay").and_then(Value::as_str)
-        && let Some(ms) = parse_istio_duration_ms(delay_str)
-        && (1..=MAX_FAULT_DELAY_MS).contains(&ms)
+    if let Some(delay) = route_local_fault_delay_for_rule(fault)
+        && let Some(delay_obj) = obj.get("delay").and_then(Value::as_object)
         && let Some(percentage) = istio_fault_percentage(delay_obj)
     {
         config.insert(
             "delay".to_string(),
             serde_json::json!({
-                "duration_ms": ms,
+                "duration_ms": delay.applied_ms,
                 "percentage": percentage,
             }),
         );

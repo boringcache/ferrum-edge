@@ -1,22 +1,76 @@
 //! Tests for ldap_auth plugin — config validation and credential extraction.
 //!
-//! Note: These tests validate plugin construction (config validation) and
-//! credential parsing from the Authorization header. Actual LDAP server
-//! interaction is not tested here since it requires a real LDAP server;
-//! those scenarios are covered by integration/functional tests.
+//! The protocol-mock tests below also exercise bind, search-then-bind, and
+//! group-authorization behavior through the public plugin interface. Live
+//! directory behavior is covered by the LDAP service-integration suite.
 
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, PoolConfig};
 use ferrum_edge::consumer_index::ConsumerIndex;
+use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{
-    HTTP_FAMILY_PROTOCOLS, Plugin, PluginHttpClient, RequestContext,
+    HTTP_FAMILY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
     ldap_auth::{LDAP_AUTH_MAX_CACHE_TTL_SECONDS, LdapAuth},
     priority,
 };
+use hickory_resolver::proto::{
+    op::Message,
+    rr::{RData, Record, RecordType},
+};
 use serde_json::json;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::Duration;
 
 use super::plugin_utils::{assert_continue, assert_reject};
 
 fn http_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+fn production_egress_policy() -> BackendEgressPolicy {
+    BackendEgressPolicy::from_allow_ips(BackendAllowIps::Both)
+}
+
+fn http_client_with_dns(
+    resolver_addr: SocketAddr,
+    policy: BackendEgressPolicy,
+    ca_bundle_path: Option<&str>,
+) -> PluginHttpClient {
+    http_client_with_dns_config(
+        DnsConfig {
+            resolver_addresses: Some(resolver_addr.to_string()),
+            try_tcp_on_error: false,
+            ..DnsConfig::default()
+        },
+        policy,
+        ca_bundle_path,
+    )
+}
+
+fn http_client_with_dns_config(
+    mut config: DnsConfig,
+    policy: BackendEgressPolicy,
+    ca_bundle_path: Option<&str>,
+) -> PluginHttpClient {
+    config.backend_allow_ips = policy.clone();
+    let dns_cache = DnsCache::new(config);
+    PluginHttpClient::new(
+        &PoolConfig::default(),
+        dns_cache,
+        1_000,
+        0,
+        100,
+        false,
+        ca_bundle_path,
+        Arc::new(Vec::new()),
+        "default",
+        policy,
+        Arc::new(Vec::new()),
+        0,
+    )
 }
 
 fn make_ctx() -> RequestContext {
@@ -900,6 +954,524 @@ async fn spawn_bind_response_ldap_server(result_code: u8) -> (u16, tokio::task::
     (port, task)
 }
 
+#[derive(Clone)]
+enum TestDnsAnswers {
+    Addresses(Vec<IpAddr>),
+    DropQueries,
+}
+
+struct TestDnsServer {
+    addr: SocketAddr,
+    answers: Arc<RwLock<TestDnsAnswers>>,
+    query_count: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestDnsServer {
+    async fn spawn(initial_answers: Vec<IpAddr>) -> Self {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind test DNS server");
+        let addr = socket.local_addr().expect("test DNS server address");
+        let answers = Arc::new(RwLock::new(TestDnsAnswers::Addresses(initial_answers)));
+        let query_count = Arc::new(AtomicUsize::new(0));
+        let task_answers = Arc::clone(&answers);
+        let task_query_count = Arc::clone(&query_count);
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; 2_048];
+            loop {
+                let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
+                    break;
+                };
+                let Ok(request) = Message::from_vec(&buffer[..length]) else {
+                    continue;
+                };
+                let Some(query) = request.queries.first().cloned() else {
+                    continue;
+                };
+                task_query_count.fetch_add(1, Ordering::Relaxed);
+                let current_answers = task_answers.read().expect("read test DNS answers").clone();
+                let TestDnsAnswers::Addresses(addresses) = current_answers else {
+                    continue;
+                };
+
+                let mut response = request.into_response();
+                for address in addresses {
+                    let data = match (query.query_type(), address) {
+                        (RecordType::A, IpAddr::V4(address)) => RData::A(address.into()),
+                        (RecordType::AAAA, IpAddr::V6(address)) => RData::AAAA(address.into()),
+                        _ => continue,
+                    };
+                    response.add_answer(Record::from_rdata(query.name().clone(), 1, data));
+                }
+                let Ok(encoded) = response.to_vec() else {
+                    continue;
+                };
+                let _ = socket.send_to(&encoded, peer).await;
+            }
+        });
+
+        Self {
+            addr,
+            answers,
+            query_count,
+            task,
+        }
+    }
+
+    fn set_answers(&self, answers: TestDnsAnswers) {
+        *self.answers.write().expect("write test DNS answers") = answers;
+    }
+
+    fn queries(&self) -> usize {
+        self.query_count.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for TestDnsServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn spawn_bind_response_ldap_server_at(
+    bind_addr: SocketAddr,
+    result_code: u8,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .expect("bind address-specific LDAP server");
+    let port = listener
+        .local_addr()
+        .expect("address-specific LDAP local addr")
+        .port();
+    let task = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buffer = [0u8; 1_024];
+            let _ = stream.read(&mut buffer).await;
+            let _ = stream.write_all(&bind_response(1, result_code)).await;
+        }
+    });
+    (port, task)
+}
+
+fn assert_backend_rejection_hides_credentials(result: PluginResult, credentials: &[&str]) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 500);
+            assert_eq!(
+                body,
+                r#"{"error":"LDAP authentication temporarily unavailable"}"#
+            );
+            for credential in credentials {
+                assert!(
+                    !body.contains(credential),
+                    "LDAP backend response exposed a bind credential"
+                );
+            }
+        }
+        other => panic!("expected LDAP backend rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_direct_bind_dials_fresh_screened_ipv4_answer() {
+    let (port, ldap_task) = spawn_bind_response_ldap_server(0).await;
+    let dns = TestDnsServer::spawn(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://directory.test:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "allow_plaintext": true,
+            "consumer_mapping": false
+        }),
+        http_client_with_dns(dns.addr, production_egress_policy(), None),
+    )
+    .expect("valid hostname direct-bind config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "user-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert!(dns.queries() >= 2, "dial lookup must query A and AAAA");
+    ldap_task.await.expect("IPv4 LDAP bind server");
+}
+
+#[tokio::test]
+async fn test_direct_bind_dials_fresh_screened_ipv6_answer() {
+    let (port, ldap_task) =
+        spawn_bind_response_ldap_server_at(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0), 0)
+            .await;
+    let dns = TestDnsServer::spawn(vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]).await;
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://directory.test:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "allow_plaintext": true,
+            "consumer_mapping": false
+        }),
+        http_client_with_dns(dns.addr, production_egress_policy(), None),
+    )
+    .expect("valid IPv6 hostname direct-bind config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "user-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    ldap_task.await.expect("IPv6 LDAP bind server");
+}
+
+#[tokio::test]
+async fn test_mixed_ipv4_ipv6_answer_fails_before_any_starttls_dial() {
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mixed-answer LDAP sentinel");
+    let port = listener
+        .local_addr()
+        .expect("mixed-answer LDAP addr")
+        .port();
+    let dns = TestDnsServer::spawn(vec![
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        "fe80::1".parse().expect("link-local IPv6"),
+    ])
+    .await;
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://directory.test:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "starttls": true,
+            "connect_timeout_seconds": 1
+        }),
+        http_client_with_dns(dns.addr, production_egress_policy(), None),
+    )
+    .expect("valid STARTTLS config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "user-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_backend_rejection_hides_credentials(result, &["user-secret"]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err(),
+        "an allowed decoy must not be dialed when any answer is denied"
+    );
+}
+
+#[tokio::test]
+async fn test_search_bind_re_resolves_and_blocks_denied_rebind() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind rebinding LDAP server");
+    let port = listener.local_addr().expect("rebinding LDAP addr").port();
+    let dns = TestDnsServer::spawn(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
+    let answer_state = Arc::clone(&dns.answers);
+    let ldap_task = tokio::spawn(async move {
+        let (mut service_stream, _) = listener.accept().await.expect("accept service bind");
+        read_ldap_message(&mut service_stream).await;
+        service_stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write service bind response");
+        read_ldap_message(&mut service_stream).await;
+        service_stream
+            .write_all(&search_result_entry(
+                2,
+                "uid=alice,ou=users,dc=example,dc=com",
+                &[("uid", &["alice"])],
+            ))
+            .await
+            .expect("write search entry");
+        *answer_state.write().expect("write rebound DNS answer") =
+            TestDnsAnswers::Addresses(vec!["169.254.169.254".parse().expect("metadata IP")]);
+        service_stream
+            .write_all(&search_result_done(2, 0))
+            .await
+            .expect("write search completion");
+        drop(service_stream);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .is_err(),
+            "the post-search user bind must not reach the original LDAP listener"
+        );
+    });
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://directory.test:{port}"),
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})",
+            "canonical_identity_attribute": "uid",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "service-secret",
+            "allow_plaintext": true,
+            "connect_timeout_seconds": 1
+        }),
+        http_client_with_dns(dns.addr, production_egress_policy(), None),
+    )
+    .expect("valid rebinding search-bind config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "user-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_backend_rejection_hides_credentials(result, &["service-secret", "user-secret"]);
+    assert!(
+        dns.queries() >= 4,
+        "service and user connections must each issue fresh A/AAAA lookups"
+    );
+    ldap_task.await.expect("rebinding LDAP server");
+}
+
+#[tokio::test]
+async fn test_literal_denial_is_enforced_at_dial_time() {
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://169.254.169.254:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "allow_plaintext": true,
+            "connect_timeout_seconds": 1
+        }),
+        PluginHttpClient::default_with_backend_allow_ips(production_egress_policy()),
+    )
+    .expect("literal endpoint reaches runtime policy backstop");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "literal-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_backend_rejection_hides_credentials(result, &["literal-secret"]);
+}
+
+#[tokio::test]
+async fn test_plaintext_localhost_exception_rejects_non_loopback_override() {
+    use std::collections::HashMap;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind plaintext-loopback sentinel");
+    let port = listener
+        .local_addr()
+        .expect("plaintext-loopback sentinel addr")
+        .port();
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldap://localhost:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "connect_timeout_seconds": 1
+        }),
+        http_client_with_dns_config(
+            DnsConfig {
+                global_overrides: HashMap::from([("localhost".to_string(), "0.0.0.0".to_string())]),
+                ..DnsConfig::default()
+            },
+            BackendEgressPolicy::unrestricted(),
+            None,
+        ),
+    )
+    .expect("localhost keeps the development loopback exception");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "loopback-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_backend_rejection_hides_credentials(result, &["loopback-secret"]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err(),
+        "the plaintext localhost exception must not follow a non-loopback override"
+    );
+}
+
+#[tokio::test]
+async fn test_dial_resolution_timeout_is_bounded() {
+    let dns = TestDnsServer::spawn(Vec::new()).await;
+    dns.set_answers(TestDnsAnswers::DropQueries);
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://directory.test:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "allow_plaintext": true,
+            "connect_timeout_seconds": 1
+        }),
+        http_client_with_dns(dns.addr, production_egress_policy(), None),
+    )
+    .expect("valid bounded resolver config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "timeout-secret"),
+    );
+    let started = std::time::Instant::now();
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_backend_rejection_hides_credentials(result, &["timeout-secret"]);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "DNS and connection establishment must share the configured bound"
+    );
+    assert!(dns.queries() >= 1, "the test resolver was not queried");
+}
+
+#[tokio::test]
+async fn test_dial_resolver_empty_response_fails_closed() {
+    let dns = TestDnsServer::spawn(Vec::new()).await;
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://missing.directory.test:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "allow_plaintext": true,
+            "connect_timeout_seconds": 1
+        }),
+        http_client_with_dns(dns.addr, production_egress_policy(), None),
+    )
+    .expect("valid resolver-error config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "resolver-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_backend_rejection_hides_credentials(result, &["resolver-secret"]);
+    assert!(dns.queries() >= 2, "both address families must be queried");
+}
+
+#[tokio::test]
+async fn test_ldaps_keeps_configured_hostname_for_certificate_verification() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    let ca_key =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate LDAP test CA key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("LDAP test CA params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .expect("self-sign LDAP test CA");
+    let issuer = Issuer::new(ca_params, ca_key);
+    let leaf_key =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate LDAP leaf key");
+    let leaf_params =
+        CertificateParams::new(vec!["directory.test".to_string()]).expect("LDAP leaf params");
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("sign LDAP leaf");
+
+    let mut ca_file = NamedTempFile::new().expect("create LDAP CA bundle");
+    ca_file
+        .write_all(ca_cert.pem().as_bytes())
+        .expect("write LDAP CA bundle");
+    let certs = rustls_pemfile::certs(&mut leaf_cert.pem().as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse LDAP leaf certificate");
+    let key = rustls_pemfile::private_key(&mut leaf_key.serialize_pem().as_bytes())
+        .expect("parse LDAP leaf key")
+        .expect("LDAP leaf key present");
+    let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("LDAP TLS protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .expect("LDAP TLS server config");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind LDAPS server");
+    let port = listener.local_addr().expect("LDAPS server addr").port();
+    let tls_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept LDAPS connection");
+        let mut stream = TlsAcceptor::from(Arc::new(server_config))
+            .accept(stream)
+            .await
+            .expect("accept hostname-verified TLS");
+        let _request = try_read_ldap_message_bytes(&mut stream)
+            .await
+            .expect("read LDAPS bind");
+        stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write LDAPS bind response");
+    });
+    let dns = TestDnsServer::spawn(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": format!("ldaps://directory.test:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "consumer_mapping": false,
+            "connect_timeout_seconds": 2
+        }),
+        http_client_with_dns(
+            dns.addr,
+            production_egress_policy(),
+            ca_file.path().to_str(),
+        ),
+    )
+    .expect("valid hostname-verified LDAPS config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("alice", "tls-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    tls_task.await.expect("LDAPS server");
+}
+
 fn ber_tlv(tag: u8, contents: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(contents.len() + 4);
     encoded.push(tag);
@@ -952,33 +1524,43 @@ fn search_result_done(message_id: u8, result_code: u8) -> Vec<u8> {
     )
 }
 
-async fn read_ldap_message(stream: &mut tokio::net::TcpStream) {
+async fn try_read_ldap_message_bytes<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
 
     let mut header = [0u8; 2];
-    stream
-        .read_exact(&mut header)
-        .await
-        .expect("read LDAP message header");
+    stream.read_exact(&mut header).await?;
     assert_eq!(header[0], 0x30, "LDAP message must be a BER sequence");
     let body_len = if header[1] & 0x80 == 0 {
         usize::from(header[1])
     } else {
         let length_octets = usize::from(header[1] & 0x7f);
         let mut encoded_len = vec![0u8; length_octets];
-        stream
-            .read_exact(&mut encoded_len)
-            .await
-            .expect("read LDAP long-form length");
+        stream.read_exact(&mut encoded_len).await?;
         encoded_len
             .into_iter()
             .fold(0usize, |length, octet| (length << 8) | usize::from(octet))
     };
     let mut body = vec![0u8; body_len];
-    stream
-        .read_exact(&mut body)
+    stream.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+async fn read_ldap_message_bytes(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    try_read_ldap_message_bytes(stream)
         .await
-        .expect("read LDAP message body");
+        .expect("read LDAP message")
+}
+
+async fn read_ldap_message(stream: &mut tokio::net::TcpStream) {
+    let _ = read_ldap_message_bytes(stream).await;
+}
+
+fn ldap_message_contains(message: &[u8], value: &str) -> bool {
+    message
+        .windows(value.len())
+        .any(|window| window == value.as_bytes())
 }
 
 async fn spawn_search_bind_server(
@@ -1119,6 +1701,201 @@ async fn test_search_bind_rejects_ambiguous_results() {
     assert_reject(result, Some(401));
     assert!(ctx.authenticated_identity.is_none());
     task.abort();
+}
+
+async fn assert_search_bind_group_checks_use_canonical_identity(
+    custom_group_filter: Option<&str>,
+    canonical_identity_is_member: bool,
+) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    const PRESENTED_ALIAS: &str = "alice@example.com";
+    const CANONICAL_IDENTITY: &str = "immutable-alice-id";
+    const USER_DN: &str = "uid=alice,ou=users,dc=example,dc=com";
+    const GROUP_DN: &str = "cn=gateway-admins,ou=groups,dc=example,dc=com";
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind canonical group-check LDAP server");
+    let port = listener
+        .local_addr()
+        .expect("canonical group-check LDAP local addr")
+        .port();
+    let expects_exact_group_proof = custom_group_filter.is_some();
+    let task = tokio::spawn(async move {
+        let (mut service_stream, _) = listener.accept().await.expect("accept service bind");
+        read_ldap_message(&mut service_stream).await;
+        service_stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write service bind success");
+
+        let user_search = read_ldap_message_bytes(&mut service_stream).await;
+        assert!(
+            ldap_message_contains(&user_search, PRESENTED_ALIAS),
+            "the presented login must remain the user-search input"
+        );
+        service_stream
+            .write_all(&search_result_entry(
+                2,
+                USER_DN,
+                &[("entryUUID", &[CANONICAL_IDENTITY])],
+            ))
+            .await
+            .expect("write canonical user search entry");
+        service_stream
+            .write_all(&search_result_done(2, 0))
+            .await
+            .expect("write canonical user search done");
+        drop(service_stream);
+
+        let (mut user_stream, _) = listener.accept().await.expect("accept selected user bind");
+        read_ldap_message(&mut user_stream).await;
+        user_stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write selected user bind success");
+        drop(user_stream);
+
+        let (mut group_stream, _) = listener.accept().await.expect("accept group service bind");
+        read_ldap_message(&mut group_stream).await;
+        group_stream
+            .write_all(&bind_response(1, 0))
+            .await
+            .expect("write group service bind success");
+
+        let group_search = read_ldap_message_bytes(&mut group_stream).await;
+        assert!(
+            ldap_message_contains(&group_search, CANONICAL_IDENTITY),
+            "group search did not use the authenticated canonical identity"
+        );
+        assert!(
+            ldap_message_contains(&group_search, "memberUid"),
+            "group search did not carry the username-based membership predicate"
+        );
+        assert!(
+            !ldap_message_contains(&group_search, PRESENTED_ALIAS),
+            "group search reused the client-presented alias"
+        );
+        if canonical_identity_is_member {
+            group_stream
+                .write_all(&search_result_entry(
+                    2,
+                    GROUP_DN,
+                    &[("cn", &["gateway-admins"])],
+                ))
+                .await
+                .expect("write required group search entry");
+        }
+        group_stream
+            .write_all(&search_result_done(2, 0))
+            .await
+            .expect("write required group search done");
+
+        if expects_exact_group_proof && canonical_identity_is_member {
+            let exact_group_proof = read_ldap_message_bytes(&mut group_stream).await;
+            assert!(
+                ldap_message_contains(&exact_group_proof, CANONICAL_IDENTITY),
+                "exact returned-group proof did not use the canonical identity"
+            );
+            assert!(
+                ldap_message_contains(&exact_group_proof, "memberUid"),
+                "exact returned-group proof did not carry the memberUid predicate"
+            );
+            assert!(
+                !ldap_message_contains(&exact_group_proof, PRESENTED_ALIAS),
+                "exact returned-group proof reused the client-presented alias"
+            );
+            group_stream
+                .write_all(&search_result_entry(3, GROUP_DN, &[]))
+                .await
+                .expect("write exact returned-group proof");
+            group_stream
+                .write_all(&search_result_done(3, 0))
+                .await
+                .expect("write exact returned-group proof done");
+        }
+
+        if !canonical_identity_is_member {
+            let trailing_request = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                try_read_ldap_message_bytes(&mut group_stream),
+            )
+            .await;
+            match trailing_request {
+                Ok(Ok(request)) => assert!(
+                    !ldap_message_contains(&request, PRESENTED_ALIAS),
+                    "group denial triggered a fallback request using the presented alias"
+                ),
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Ok(Err(error)) => panic!("read trailing group-check request: {error}"),
+                Err(_) => {}
+            }
+        }
+    });
+
+    let mut config = json!({
+        "ldap_url": format!("ldap://127.0.0.1:{port}"),
+        "search_base_dn": "ou=users,dc=example,dc=com",
+        "search_filter": "(mail={username})",
+        "canonical_identity_attribute": "entryUUID",
+        "service_account_dn": "cn=admin,dc=example,dc=com",
+        "service_account_password": "service-secret",
+        "group_base_dn": "ou=groups,dc=example,dc=com",
+        "required_groups": ["gateway-admins"],
+        "consumer_mapping": false
+    });
+    if let Some(group_filter) = custom_group_filter {
+        config["group_filter"] = json!(group_filter);
+    }
+    let plugin = LdapAuth::new(&config, http_client()).expect("valid canonical group-check config");
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header(PRESENTED_ALIAS, "user-secret"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    if canonical_identity_is_member {
+        assert_continue(result);
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some(CANONICAL_IDENTITY)
+        );
+    } else {
+        assert_reject(result, Some(403));
+        assert!(ctx.authenticated_identity.is_none());
+    }
+    task.await.expect("canonical group-check LDAP server");
+}
+
+#[tokio::test]
+async fn test_search_bind_default_member_uid_uses_canonical_identity() {
+    assert_search_bind_group_checks_use_canonical_identity(None, true).await;
+}
+
+#[tokio::test]
+async fn test_search_bind_custom_username_and_exact_proof_use_canonical_identity() {
+    assert_search_bind_group_checks_use_canonical_identity(Some("(memberUid={username})"), true)
+        .await;
+}
+
+#[tokio::test]
+async fn test_search_bind_denies_alias_only_group_membership_without_fallback() {
+    // Model the advisory shape: the presented alias is a memberUid value, but
+    // the authenticated entry's immutable identity is not. The canonical query
+    // therefore returns no groups, and any alias-bearing retry is a bypass.
+    assert_search_bind_group_checks_use_canonical_identity(Some("(memberUid={username})"), false)
+        .await;
 }
 
 async fn assert_group_search_result(

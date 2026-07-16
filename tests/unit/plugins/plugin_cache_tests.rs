@@ -6,7 +6,9 @@ use ferrum_edge::config::types::{
     PluginScope, Proxy,
 };
 use ferrum_edge::config_delta::ConfigDelta;
-use ferrum_edge::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, ProxyProtocol, RequestContext, apply_initial_response_header_policies,
+};
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
@@ -50,7 +52,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "graphql" => json!({"max_depth": 100}),
         "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
         "ai_rate_limiter" => json!({"token_limit": 100000}),
-        "cors" => json!({"origins": ["*"]}),
+        "cors" => json!({"allowed_origins": ["*"]}),
         "response_caching" => json!({"ttl_seconds": 60}),
         "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
         "tcp_logging" => json!({"host": "localhost", "port": 5140}),
@@ -190,6 +192,603 @@ async fn run_before_proxy_chain(
         }
     }
     PluginResult::Continue
+}
+
+async fn run_request_received_chain(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) -> PluginResult {
+    for plugin in plugins {
+        match plugin.on_request_received(ctx).await {
+            PluginResult::Continue => {}
+            reject => return reject,
+        }
+    }
+    PluginResult::Continue
+}
+
+async fn run_after_proxy_chain(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    for plugin in plugins {
+        match plugin.after_proxy(ctx, 200, response_headers).await {
+            PluginResult::Continue => {}
+            reject => return reject,
+        }
+    }
+    PluginResult::Continue
+}
+
+fn cors_config(
+    id: &str,
+    methods: &[&str],
+    headers: &[&str],
+    priority_override: Option<u16>,
+) -> PluginConfig {
+    let mut config = make_plugin_config_with_json(
+        id,
+        "cors",
+        json!({
+            "allowed_origins": ["https://trusted.example"],
+            "allowed_methods": methods,
+            "allowed_headers": headers
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    config.priority_override = priority_override;
+    config
+}
+
+#[tokio::test]
+async fn multiple_cors_instances_intersect_preflight_without_rejecting_actual_requests() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["permissive", "strict"])],
+        vec![
+            cors_config(
+                "permissive",
+                &["GET", "DELETE"],
+                &["X-Shared", "Authorization"],
+                None,
+            ),
+            cors_config("strict", &["GET"], &["X-Shared"], None),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("composed CORS cache");
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    assert_eq!(
+        plugins
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["cors", "cors", "__cors_finalizer"]
+    );
+    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    assert_eq!(
+        grpc_plugins
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["cors", "cors", "__cors_finalizer"],
+        "the deferred chain must retain CORS gRPC-Web protocol support"
+    );
+
+    let mut method_conflict = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "OPTIONS".to_string(),
+        "/api".to_string(),
+    );
+    method_conflict.headers.extend(HashMap::from([
+        ("origin".to_string(), "https://trusted.example".to_string()),
+        (
+            "access-control-request-method".to_string(),
+            "DELETE".to_string(),
+        ),
+    ]));
+    assert!(matches!(
+        run_request_received_chain(&plugins, &mut method_conflict).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+
+    let mut header_conflict = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "OPTIONS".to_string(),
+        "/api".to_string(),
+    );
+    header_conflict.headers.extend(HashMap::from([
+        ("origin".to_string(), "https://trusted.example".to_string()),
+        (
+            "access-control-request-method".to_string(),
+            "GET".to_string(),
+        ),
+        (
+            "access-control-request-headers".to_string(),
+            "Authorization".to_string(),
+        ),
+    ]));
+    assert!(matches!(
+        run_request_received_chain(&plugins, &mut header_conflict).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+
+    let mut allowed = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "OPTIONS".to_string(),
+        "/api".to_string(),
+    );
+    allowed.headers.extend(HashMap::from([
+        ("origin".to_string(), "https://trusted.example".to_string()),
+        (
+            "access-control-request-method".to_string(),
+            "GET".to_string(),
+        ),
+        (
+            "access-control-request-headers".to_string(),
+            "X-Shared".to_string(),
+        ),
+    ]));
+    match run_request_received_chain(&plugins, &mut allowed).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 204);
+            assert_eq!(headers["access-control-allow-methods"], "GET");
+            assert_eq!(headers["access-control-allow-headers"], "X-Shared");
+        }
+        other => panic!("intersected preflight must be answered once, got {other:?}"),
+    }
+
+    let mut actual = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "DELETE".to_string(),
+        "/api".to_string(),
+    );
+    actual
+        .headers
+        .insert("origin".to_string(), "https://trusted.example".to_string());
+    assert!(matches!(
+        run_request_received_chain(&plugins, &mut actual).await,
+        PluginResult::Continue
+    ));
+    let mut actual_response_headers = HashMap::new();
+    assert!(matches!(
+        run_after_proxy_chain(&plugins, &mut actual, &mut actual_response_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        actual_response_headers["access-control-allow-origin"],
+        "https://trusted.example"
+    );
+    assert!(!actual_response_headers.contains_key("access-control-allow-methods"));
+    assert!(!actual_response_headers.contains_key("access-control-allow-headers"));
+
+    let mut actual_header = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    actual_header.headers.extend(HashMap::from([
+        ("origin".to_string(), "https://trusted.example".to_string()),
+        ("authorization".to_string(), "Bearer test".to_string()),
+    ]));
+    assert!(matches!(
+        run_request_received_chain(&plugins, &mut actual_header).await,
+        PluginResult::Continue
+    ));
+
+    let reversed = make_config(
+        vec![make_proxy("p1", "/api", vec!["strict", "permissive"])],
+        vec![
+            cors_config("strict", &["GET"], &["X-Shared"], None),
+            cors_config(
+                "permissive",
+                &["GET", "DELETE"],
+                &["X-Shared", "Authorization"],
+                None,
+            ),
+        ],
+    );
+    cache
+        .rebuild(&reversed)
+        .expect("rebuild reversed CORS cache");
+    let reversed_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let mut reversed_delete = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "OPTIONS".to_string(),
+        "/api".to_string(),
+    );
+    reversed_delete.headers.extend(HashMap::from([
+        ("origin".to_string(), "https://trusted.example".to_string()),
+        (
+            "access-control-request-method".to_string(),
+            "DELETE".to_string(),
+        ),
+    ]));
+    assert!(matches!(
+        run_request_received_chain(&reversed_plugins, &mut reversed_delete).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+
+    let three = make_config(
+        vec![make_proxy("p1", "/api", vec!["wide", "middle", "narrow"])],
+        vec![
+            cors_config("wide", &["GET", "POST"], &["X-A", "X-B"], None),
+            cors_config("middle", &["GET", "POST"], &["X-B"], None),
+            cors_config("narrow", &["GET"], &["X-B"], None),
+        ],
+    );
+    let three_cache = PluginCache::new(&three).expect("three-instance CORS cache");
+    assert_eq!(
+        three_cache
+            .get_plugins("p1")
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["cors", "cors", "cors", "__cors_finalizer"]
+    );
+
+    for ids in [vec!["origin-a", "origin-b"], vec!["origin-b", "origin-a"]] {
+        let mut origin_a = cors_config("origin-a", &["GET"], &["X-Test"], None);
+        origin_a.config["allowed_origins"] = json!(["https://a.example"]);
+        let mut origin_b = cors_config("origin-b", &["GET"], &["X-Test"], None);
+        origin_b.config["allowed_origins"] = json!(["https://b.example"]);
+        let disjoint = make_config(
+            vec![make_proxy("p1", "/api", ids)],
+            vec![origin_a, origin_b],
+        );
+        let disjoint_cache = PluginCache::new(&disjoint).expect("disjoint CORS cache");
+        let disjoint_plugins = disjoint_cache.get_plugins("p1");
+        let mut request = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        request
+            .headers
+            .insert("origin".to_string(), "https://a.example".to_string());
+        assert!(matches!(
+            run_request_received_chain(&disjoint_plugins, &mut request).await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn mixed_native_and_istio_empty_lists_apply_only_to_preflight() {
+    let mut native = cors_config("native", &["GET"], &["Authorization"], None);
+    native.config["exposed_headers"] = json!(["X-Shared", "X-Native"]);
+    native.config["allow_credentials"] = json!(true);
+    let mut istio = cors_config("istio", &[], &[], None);
+    istio.config["exposed_headers"] = json!(["X-Shared"]);
+    istio.config["unmatched_preflights"] = json!("forward");
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["native", "istio"])],
+        vec![native, istio],
+    );
+    let cache = PluginCache::new(&config).expect("mixed native/Istio CORS cache");
+
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        let plugins = cache.get_plugins_for_protocol("p1", protocol);
+        let mut actual = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        actual.headers.extend(HashMap::from([
+            ("origin".to_string(), "https://trusted.example".to_string()),
+            ("authorization".to_string(), "Bearer test".to_string()),
+        ]));
+        assert!(matches!(
+            run_request_received_chain(&plugins, &mut actual).await,
+            PluginResult::Continue
+        ));
+
+        let mut response_headers = HashMap::new();
+        assert!(matches!(
+            run_after_proxy_chain(&plugins, &mut actual, &mut response_headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            response_headers["access-control-allow-origin"],
+            "https://trusted.example"
+        );
+        assert_eq!(
+            response_headers["access-control-expose-headers"],
+            "X-Shared"
+        );
+        assert!(!response_headers.contains_key("access-control-allow-credentials"));
+        assert!(!response_headers.contains_key("access-control-allow-methods"));
+        assert!(!response_headers.contains_key("access-control-allow-headers"));
+
+        let mut preflight = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "OPTIONS".to_string(),
+            "/api".to_string(),
+        );
+        preflight.headers.extend(HashMap::from([
+            ("origin".to_string(), "https://trusted.example".to_string()),
+            (
+                "access-control-request-method".to_string(),
+                "GET".to_string(),
+            ),
+            (
+                "access-control-request-headers".to_string(),
+                "Authorization".to_string(),
+            ),
+        ]));
+        assert!(matches!(
+            run_request_received_chain(&plugins, &mut preflight).await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn multiple_cors_instances_must_remain_contiguous() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-a", "ip", "cors-b"])],
+        vec![
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            make_plugin_config_with_priority(
+                "ip",
+                "ip_restriction",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(150),
+            ),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+        ],
+    );
+    let err = PluginCache::new(&config)
+        .err()
+        .expect("interleaved CORS instances must fail cache construction");
+    assert!(
+        err.contains("cors instances must remain contiguous"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-a", "udp", "cors-b"])],
+        vec![
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            make_plugin_config_with_priority(
+                "udp",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(150),
+            ),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("stream-only CORS interloper is valid");
+
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        assert_eq!(
+            cache
+                .get_plugins_for_protocol("p1", protocol)
+                .iter()
+                .map(|plugin| plugin.name())
+                .collect::<Vec<_>>(),
+            vec!["cors", "cors", "__cors_finalizer"]
+        );
+    }
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("p1", ProxyProtocol::Udp)
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["udp_rate_limiting"]
+    );
+}
+
+#[test]
+fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
+    let initial = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-a", "udp"])],
+        vec![
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            make_plugin_config_with_priority(
+                "udp",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(150),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&initial).expect("initial cache");
+    let stream_interleaved = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-a", "udp", "cors-b"])],
+        vec![
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            make_plugin_config_with_priority(
+                "udp",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(150),
+            ),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+        ],
+    );
+    let stream_delta = ConfigDelta::compute(&initial, &stream_interleaved);
+    let stream_proxy_ids = stream_delta.proxy_ids_needing_plugin_rebuild(&stream_interleaved);
+    cache
+        .apply_delta(
+            &stream_interleaved,
+            &stream_proxy_ids,
+            &stream_delta.removed_proxy_ids,
+            stream_delta.global_plugin_configs_changed,
+        )
+        .expect("delta reload must ignore stream-only interloper");
+    let last_good = cache.get_plugins("p1");
+    assert_eq!(
+        last_good
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["cors", "udp_rate_limiting", "cors", "__cors_finalizer"]
+    );
+
+    let http_interleaved = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-a", "ip", "cors-b"])],
+        vec![
+            cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
+            make_plugin_config_with_priority(
+                "ip",
+                "ip_restriction",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(150),
+            ),
+            cors_config("cors-b", &["GET"], &["X-Test"], Some(200)),
+        ],
+    );
+    let http_delta = ConfigDelta::compute(&stream_interleaved, &http_interleaved);
+    let http_proxy_ids = http_delta.proxy_ids_needing_plugin_rebuild(&http_interleaved);
+    let err = cache
+        .apply_delta(
+            &http_interleaved,
+            &http_proxy_ids,
+            &http_delta.removed_proxy_ids,
+            http_delta.global_plugin_configs_changed,
+        )
+        .expect_err("HTTP-overlapping interloper must reject delta reload");
+    assert!(
+        err.contains("cors instances must remain contiguous in HTTP/gRPC chains"),
+        "got: {err}"
+    );
+    let after_reject = cache.get_plugins("p1");
+    assert_eq!(after_reject.len(), last_good.len());
+    assert!(Arc::ptr_eq(&after_reject[0], &last_good[0]));
+}
+
+#[test]
+fn rejected_cors_reload_retains_the_last_good_snapshot() {
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-wide", "cors-narrow"])],
+        vec![
+            cors_config("cors-wide", &["GET", "DELETE"], &["X-Test"], None),
+            cors_config("cors-narrow", &["GET"], &["X-Test"], None),
+        ],
+    );
+    let cache = PluginCache::new(&valid).expect("initial CORS cache");
+    let before = cache.get_plugins("p1");
+
+    let mut invalid = valid.clone();
+    invalid.plugin_configs[0].config = json!({"origins": ["*"]});
+    invalid.plugin_configs[0].updated_at = Utc::now();
+    assert!(cache.rebuild(&invalid).is_err());
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), before.len());
+    assert!(Arc::ptr_eq(&after[0], &before[0]));
+}
+
+#[test]
+fn cors_delta_reload_installs_and_removes_the_aggregate_boundary() {
+    let initial = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-wide"])],
+        vec![cors_config(
+            "cors-wide",
+            &["GET", "DELETE"],
+            &["X-Test"],
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&initial).expect("initial single-CORS cache");
+    assert_eq!(
+        cache
+            .get_plugins("p1")
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["cors"]
+    );
+
+    let composed = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-wide", "cors-narrow"])],
+        vec![
+            cors_config("cors-wide", &["GET", "DELETE"], &["X-Test"], None),
+            cors_config("cors-narrow", &["GET"], &["X-Test"], None),
+        ],
+    );
+    let composed_delta = ConfigDelta::compute(&initial, &composed);
+    let composed_proxy_ids = composed_delta.proxy_ids_needing_plugin_rebuild(&composed);
+    cache
+        .apply_delta(
+            &composed,
+            &composed_proxy_ids,
+            &composed_delta.removed_proxy_ids,
+            composed_delta.global_plugin_configs_changed,
+        )
+        .expect("install composed CORS chain through delta reload");
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        assert_eq!(
+            cache
+                .get_plugins_for_protocol("p1", protocol)
+                .iter()
+                .map(|plugin| plugin.name())
+                .collect::<Vec<_>>(),
+            vec!["cors", "cors", "__cors_finalizer"]
+        );
+    }
+
+    let reduced = make_config(
+        vec![make_proxy("p1", "/api", vec!["cors-narrow"])],
+        vec![cors_config("cors-narrow", &["GET"], &["X-Test"], None)],
+    );
+    let reduced_delta = ConfigDelta::compute(&composed, &reduced);
+    let reduced_proxy_ids = reduced_delta.proxy_ids_needing_plugin_rebuild(&reduced);
+    cache
+        .apply_delta(
+            &reduced,
+            &reduced_proxy_ids,
+            &reduced_delta.removed_proxy_ids,
+            reduced_delta.global_plugin_configs_changed,
+        )
+        .expect("remove composed CORS boundary through delta reload");
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        assert_eq!(
+            cache
+                .get_plugins_for_protocol("p1", protocol)
+                .iter()
+                .map(|plugin| plugin.name())
+                .collect::<Vec<_>>(),
+            vec!["cors"],
+            "a stale deferred wrapper/finalizer must not survive the reload"
+        );
+    }
 }
 
 #[tokio::test]
@@ -779,6 +1378,49 @@ fn test_registered_custom_plugin_is_resolved_before_unknown_rejection() {
 }
 
 #[test]
+fn test_example_plugin_rebuild_rejects_malformed_config_and_keeps_prior_instance() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "custom-1",
+            "example_plugin",
+            json!({"header_value": "accepted-generation"}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid example plugin cache");
+    let before = cache.get_plugins("p1");
+    assert_eq!(before.len(), 1);
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "custom-1",
+            "example_plugin",
+            json!({"header_value": 7}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("malformed example config must reject cache publication");
+    assert!(error.contains("example_plugin"), "got: {error}");
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted example plugin instance"
+    );
+}
+
+#[test]
 fn test_rebuild_rejects_malformed_body_validator_and_keeps_prior_cache() {
     let config1 = make_config(
         vec![make_proxy("p1", "/api", vec!["pc1"])],
@@ -939,22 +1581,21 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
 
 #[tokio::test]
 async fn test_request_view_precomputes_response_committed_hook_capability() {
-    let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["audit"])],
-        vec![make_plugin_config_with_json(
-            "audit",
-            "ai_transcript_audit",
-            json!({
-                "capture": { "request": true, "response": true },
-                "sink": {
-                    "type": "http",
-                    "endpoint_url": "https://audit.example.com/ingest"
-                }
-            }),
-            PluginScope::Proxy,
-            Some("p1"),
-        )],
+    let mut audit = make_plugin_config_with_json(
+        "audit",
+        "ai_transcript_audit",
+        json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
     );
+    audit.priority_override = Some(125);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
     let cache = PluginCache::new(&config).unwrap();
     let view = cache.request_view("p1", ProxyProtocol::Http);
 
@@ -962,11 +1603,45 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
         view.capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
     );
+    assert_eq!(view.response_committed_plugins().len(), 1);
+    assert_eq!(
+        view.response_committed_plugins()[0].name(),
+        "ai_transcript_audit"
+    );
+    assert_eq!(view.response_committed_plugins()[0].priority(), 125);
     assert!(
         !cache
             .request_view("missing", ProxyProtocol::Http)
             .capabilities()
             .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+    );
+}
+
+#[test]
+fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
+    let mut deadline = make_plugin_config_with_json(
+        "deadline",
+        "grpc_deadline",
+        json!({"default_deadline_ms": 1000}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    deadline.priority_override = Some(120);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["deadline"])],
+        vec![deadline],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    assert_eq!(grpc_view.grpc_deadline_plugins().len(), 1);
+    assert_eq!(grpc_view.grpc_deadline_plugins()[0].name(), "grpc_deadline");
+    assert_eq!(grpc_view.grpc_deadline_plugins()[0].priority(), 120);
+    assert!(
+        cache
+            .request_view("p1", ProxyProtocol::Http)
+            .grpc_deadline_plugins()
+            .is_empty()
     );
 }
 
@@ -1014,6 +1689,27 @@ fn test_request_view_precomputes_authorize_plugins() {
     let authorize_plugins = request_view.authorize_plugins();
     let names: Vec<&str> = authorize_plugins.iter().map(|p| p.name()).collect();
     assert_eq!(names, vec!["access_control", "rate_limiting"]);
+}
+
+#[test]
+fn test_request_view_precomputes_key_auth_header_redaction() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["keyauth"])],
+        vec![make_plugin_config_with_json(
+            "keyauth",
+            "key_auth",
+            json!({"key_location": "header:X-Tenant-Credential"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("p1", ProxyProtocol::Http);
+
+    assert_eq!(
+        view.request_headers_to_redact().as_ref(),
+        &["x-tenant-credential"]
+    );
 }
 
 #[test]
@@ -1129,7 +1825,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 id: "cors-no-body-plugin".to_string(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "cors".to_string(),
-                config: json!({"origins": ["*"]}),
+                config: json!({"allowed_origins": ["*"]}),
                 scope: PluginScope::Proxy,
                 proxy_id: Some("cors-no-body".to_string()),
                 enabled: true,
@@ -2116,7 +2812,7 @@ fn test_get_plugins_for_protocol_filters_by_protocol() {
             make_plugin_config_with_json(
                 "ps2",
                 "cors",
-                json!({"origins": ["*"]}),
+                json!({"allowed_origins": ["*"]}),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
@@ -2162,7 +2858,7 @@ fn test_get_plugins_for_protocol_tcp_excludes_http_family() {
             make_plugin_config_with_json(
                 "ps1",
                 "cors",
-                json!({"origins": ["*"]}),
+                json!({"allowed_origins": ["*"]}),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
@@ -2269,7 +2965,7 @@ fn test_get_plugins_for_protocol_websocket_includes_auth_excludes_cors() {
             make_plugin_config_with_json(
                 "ps3",
                 "cors",
-                json!({"origins": ["*"]}),
+                json!({"allowed_origins": ["*"]}),
                 PluginScope::Proxy,
                 Some("p1"),
             ),
@@ -2838,6 +3534,94 @@ fn test_priority_override_applied_correctly() {
 }
 
 #[tokio::test]
+async fn test_priority_override_delegates_deadline_rejection_replacement_capability() {
+    let mut audit = make_plugin_config_with_json(
+        "audit",
+        "ai_transcript_audit",
+        json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest"
+            }
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    audit.priority_override = Some(100);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["audit"])], vec![audit]);
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 100);
+    assert!(plugins[0].may_replace_rejection_response());
+}
+
+#[test]
+fn test_priority_override_delegates_spec_rejection_replacement_capability() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "spec_expose",
+        json!({"spec_url": "https://example.com/openapi.json"}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(211);
+
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "spec_expose");
+    assert_eq!(plugins[0].priority(), 211);
+    assert!(plugins[0].applies_after_proxy_on_reject());
+    assert!(plugins[0].may_replace_rejection_response());
+    assert!(!plugins[0].warn_on_rejection_response_replacement());
+}
+
+#[test]
+fn test_grpc_backend_path_plugins_are_precomputed_with_priority_override() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["router"])],
+        vec![make_plugin_config_with_priority(
+            "router",
+            "grpc_method_router",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(300),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let grpc_view = cache.request_view("p1", ProxyProtocol::Grpc);
+    assert!(
+        grpc_view
+            .capabilities()
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+    );
+    assert_eq!(grpc_view.backend_path_plugins().len(), 1);
+    assert_eq!(
+        grpc_view.backend_path_plugins()[0].name(),
+        "grpc_method_router"
+    );
+    assert_eq!(grpc_view.backend_path_plugins()[0].priority(), 300);
+
+    let http_view = cache.request_view("p1", ProxyProtocol::Http);
+    assert!(
+        !http_view
+            .capabilities()
+            .has(PluginCapabilities::HAS_BACKEND_PATH_PLUGINS)
+    );
+    assert!(http_view.backend_path_plugins().is_empty());
+}
+
+#[tokio::test]
 async fn test_priority_override_delegates_response_stream_termination_hook() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["ps1"])],
@@ -3123,6 +3907,61 @@ fn test_priority_override_delegates_response_header_refinement_hooks() {
     assert_eq!(plugins[1].name(), "security_headers");
     assert!(plugins[1].may_add_response_cache_control_no_transform(&ctx, &response_headers));
     assert!(plugins[1].may_add_response_strong_etag(&ctx, &response_headers));
+
+    let policy_plugins = cache
+        .request_view("p1", ProxyProtocol::Grpc)
+        .initial_response_header_policy_plugins();
+    assert_eq!(policy_plugins.len(), 1);
+    assert_eq!(policy_plugins[0].name(), "security_headers");
+    let mut policy_headers = HashMap::new();
+    apply_initial_response_header_policies(&policy_plugins, &mut policy_headers);
+    assert_eq!(
+        policy_headers.get("cache-control").map(String::as_str),
+        Some("no-transform")
+    );
+}
+
+#[test]
+fn test_initial_response_policy_plan_preserves_multiple_instance_priority_order() {
+    let mut first = make_plugin_config_with_json(
+        "sh-first",
+        "security_headers",
+        json!({ "set": { "X-Order": "first", "X-Removed": "first" }, "remove": [] }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    first.priority_override = Some(100);
+    let mut second = make_plugin_config_with_json(
+        "sh-second",
+        "security_headers",
+        json!({ "set": { "X-Order": "second" }, "remove": ["X-Removed"] }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second.priority_override = Some(200);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["sh-second", "sh-first"])],
+        vec![second, first],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("p1", ProxyProtocol::WebSocket);
+    let policy_plugins = view.initial_response_header_policy_plugins();
+    let mut headers = HashMap::new();
+
+    assert_eq!(policy_plugins.len(), 2);
+    let policy_names = view.initial_response_header_policy_names();
+    assert_eq!(
+        policy_names
+            .iter()
+            .filter(|name| name.as_str() == "x-order")
+            .count(),
+        1,
+        "multiple policy instances must share one precomputed provenance name"
+    );
+    assert!(policy_names.iter().any(|name| name == "x-removed"));
+    apply_initial_response_header_policies(&policy_plugins, &mut headers);
+    assert_eq!(headers.get("x-order").map(String::as_str), Some("second"));
+    assert!(!headers.contains_key("x-removed"));
 }
 
 #[test]
@@ -3703,6 +4542,56 @@ fn test_modifies_request_headers_flag_computed() {
 }
 
 #[test]
+fn test_hmac_auth_rejects_request_body_transformer_composition() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["hmac", "transform"])],
+        vec![
+            make_plugin_config("hmac", "hmac_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "gateway",
+                        "value": "ferrum"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("composition must fail closed");
+    assert!(error.contains("hmac_auth cannot be combined"));
+    assert!(error.contains("request_transformer"));
+    assert!(error.contains("protocol Http"));
+}
+
+#[test]
+fn test_hmac_auth_allows_header_only_request_transformer() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["hmac", "transform"])],
+        vec![
+            make_plugin_config("hmac", "hmac_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "transform",
+                "request_transformer",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+
+    assert!(PluginCache::new(&config).is_ok());
+}
+
+#[test]
 fn test_modifies_request_headers_flag_false_when_no_plugin_modifies() {
     // stdout_logging does not modify request headers
     let config = make_config(
@@ -3749,6 +4638,43 @@ fn test_decoded_query_params_capability_preserved_with_priority_override() {
     assert!(
         caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
         "mesh_route_dispatch query-param rules must opt HTTP/3 into decoded query materialization"
+    );
+}
+
+#[test]
+fn test_key_auth_query_location_enables_decoded_h3_query_capability() {
+    let query_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["keyauth"])],
+        vec![make_plugin_config_with_json(
+            "keyauth",
+            "key_auth",
+            json!({"key_location": "query:api_key"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let query_cache = PluginCache::new(&query_config).unwrap();
+    assert!(
+        query_cache
+            .get_capabilities("p1", ProxyProtocol::Http)
+            .has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS)
+    );
+
+    let header_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["keyauth"])],
+        vec![make_plugin_config_with_json(
+            "keyauth",
+            "key_auth",
+            json!({"key_location": "header:X-API-Key"}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let header_cache = PluginCache::new(&header_config).unwrap();
+    assert!(
+        !header_cache
+            .get_capabilities("p1", ProxyProtocol::Http)
+            .has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS)
     );
 }
 
@@ -4118,6 +5044,129 @@ fn test_default_priority_used_when_no_override() {
     // cors (100) should come before key_auth (1200)
     assert_eq!(plugins[0].name(), "cors");
     assert_eq!(plugins[1].name(), "key_auth");
+}
+
+#[test]
+fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_policies() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["dedup", "grpc-web", "method-router", "deadline"],
+        )],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "method-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "deadline",
+                "grpc_deadline",
+                json!({"default_deadline_ms": 1000}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("plugin cache");
+    let view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+
+    assert!(
+        view.plugins
+            .iter()
+            .any(|name| name == "request_deduplication")
+    );
+    assert!(view.plugins.iter().any(|name| name == "grpc_web"));
+    assert_eq!(
+        view.plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_method_router")
+            .count(),
+        1
+    );
+    assert_eq!(
+        view.plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_deadline")
+            .count(),
+        1
+    );
+    assert_eq!(view.grpc_deadline_plugins, vec!["grpc_deadline"]);
+    assert_eq!(view.backend_path_plugins, vec!["grpc_method_router"]);
+
+    let merged_names = cache
+        .get_plugins("p1")
+        .iter()
+        .filter(|plugin| {
+            plugin.supported_protocols().contains(&ProxyProtocol::Http)
+                || (["grpc_method_router", "grpc_deadline"].contains(&plugin.name())
+                    && plugin.supported_protocols().contains(&ProxyProtocol::Grpc))
+        })
+        .map(|plugin| plugin.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        view.plugins, merged_names,
+        "the precomputed composed view must preserve merged priority/config order"
+    );
+
+    let reloaded = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["grpc-web", "method-router", "deadline"],
+        )],
+        vec![
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "method-router",
+                "grpc_method_router",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "deadline",
+                "grpc_deadline",
+                json!({"default_deadline_ms": 1000}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    cache
+        .apply_delta(
+            &reloaded,
+            &std::collections::HashSet::from(["p1".to_string()]),
+            &[],
+            false,
+        )
+        .expect("gRPC-Web composed view delta rebuild");
+    let reloaded_view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+    assert!(
+        !reloaded_view
+            .plugins
+            .iter()
+            .any(|name| name == "request_deduplication")
+    );
+    assert_eq!(
+        reloaded_view
+            .plugins
+            .iter()
+            .filter(|name| name.as_str() == "grpc_deadline")
+            .count(),
+        1
+    );
 }
 
 #[test]

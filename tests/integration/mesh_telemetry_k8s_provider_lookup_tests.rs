@@ -1,8 +1,15 @@
+use std::collections::HashMap;
+
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
-use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TelemetryTracingMode, TracingProvider};
+use ferrum_edge::modes::mesh::config::{
+    MeshTracingConfig, TagOverrideOperation, TelemetryTracingMode, TracingProvider,
+};
+use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, TransactionSummary};
 use serde_json::{Value, json};
 
 fn options() -> K8sTranslationOptions {
@@ -70,6 +77,12 @@ fn translated_tracing(objects: &[K8sObject]) -> (MeshTracingConfig, Vec<String>)
         .clone()
         .expect("tracing config");
     (tracing, result.warnings)
+}
+
+fn telemetry_translation_error(spec: Value) -> String {
+    translate_k8s_objects(&[telemetry(spec)], options())
+        .expect_err("Telemetry translation must fail")
+        .to_string()
 }
 
 #[test]
@@ -357,4 +370,500 @@ fn k8s_telemetry_match_mode_server_plus_client_union_becomes_client_and_server()
     }))]);
 
     assert_eq!(tracing.mode, Some(TelemetryTracingMode::ClientAndServer));
+}
+
+#[tokio::test]
+async fn translated_unsupported_standard_metric_families_do_not_omit_plugin() {
+    let oversized_ignored_literal =
+        serde_json::to_string(&"x".repeat(257)).expect("serialize ignored metric literal");
+    let translation = translate_k8s_objects(
+        &[telemetry(json!({
+            "metrics": [{
+                "overrides": [
+                    {
+                        "match": {"metric": "REQUEST_SIZE"},
+                        "disabled": true,
+                        "tagOverrides": {
+                            "request_bytes": {
+                                "operation": "UPSERT",
+                                "value": "request.host"
+                            }
+                        }
+                    },
+                    {
+                        "match": {"metric": "RESPONSE_SIZE"},
+                        "disabled": true,
+                        "tagOverrides": {
+                            "response_bytes": {
+                                "operation": "UPSERT",
+                                "value": oversized_ignored_literal
+                            }
+                        }
+                    },
+                    {
+                        "match": {"metric": "REQUEST_DURATION"},
+                        "disabled": true
+                    }
+                ]
+            }]
+        }))],
+        options(),
+    )
+    .expect("translation succeeds");
+    let metrics = translation
+        .config
+        .mesh
+        .expect("mesh config")
+        .telemetry_resources[0]
+        .config
+        .metrics
+        .clone()
+        .expect("metrics config");
+    let plugin = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/frontend",
+        "labels": {"app": "frontend"},
+        "metrics": serde_json::to_value(metrics).expect("serialize metrics")
+    }))
+    .expect("recognized non-emitted standard families must not omit workload_metrics");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/frontend")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.metrics.disabled")
+            .map(String::as_str),
+        Some("request_duration"),
+        "supported family policy must survive while size-family policy is ignored"
+    );
+}
+
+#[tokio::test]
+async fn translated_disabled_override_without_match_suppresses_all_mesh_metrics() {
+    let translation = translate_k8s_objects(
+        &[telemetry(json!({
+            "metrics": [{
+                "overrides": [{"disabled": true}]
+            }]
+        }))],
+        options(),
+    )
+    .expect("disabled override without match defaults to ALL_METRICS");
+    let metrics = translation
+        .config
+        .mesh
+        .expect("mesh config")
+        .telemetry_resources[0]
+        .config
+        .metrics
+        .clone()
+        .expect("metrics config");
+    assert_eq!(metrics.disabled_metrics, vec!["ALL_METRICS"]);
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/frontend",
+        "labels": {"app": "frontend"},
+        "metrics": serde_json::to_value(metrics).expect("serialize metrics")
+    }))
+    .expect("translated ALL_METRICS policy");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.metrics.disabled")
+            .map(String::as_str),
+        Some("request_count,request_duration")
+    );
+
+    let registry = MetricsRegistry::new();
+    registry.record(&TransactionSummary {
+        namespace: "default".to_string(),
+        timestamp_received: "2026-07-15T00:00:00Z".to_string(),
+        client_ip: "10.0.0.2".to_string(),
+        http_method: "GET".to_string(),
+        request_path: "/".to_string(),
+        proxy_id: Some("frontend".to_string()),
+        response_status_code: 200,
+        latency_total_ms: 12.0,
+        latency_backend_total_ms: 8.0,
+        metadata: ctx.metadata,
+        ..TransactionSummary::default()
+    });
+    let output = registry.render_uncached();
+    assert!(
+        !output.contains("ferrum_mesh_requests_total{"),
+        "ALL_METRICS must suppress the emitted counter family"
+    );
+    assert!(
+        !output.contains("ferrum_mesh_request_duration_ms_bucket{"),
+        "ALL_METRICS must suppress the emitted histogram family"
+    );
+}
+
+#[test]
+fn workload_metrics_still_rejects_unknown_or_malformed_metric_policy() {
+    let unknown = WorkloadMetrics::new(&json!({
+        "metrics": {"disabled_metrics": ["NOT_AN_ISTIO_METRIC"]}
+    }));
+    let unknown_error = match unknown {
+        Ok(_) => panic!("unknown metric family must be rejected"),
+        Err(error) => error,
+    };
+    assert!(unknown_error.contains("unsupported disabled metric"));
+
+    let malformed_translation = translate_k8s_objects(
+        &[telemetry(json!({
+            "metrics": [{
+                "overrides": [{
+                    "match": {"metric": 7},
+                    "disabled": true
+                }]
+            }]
+        }))],
+        options(),
+    )
+    .expect_err("non-string Istio metric selector must be rejected");
+    assert!(
+        malformed_translation
+            .to_string()
+            .contains("match.metric must be a string")
+    );
+
+    let malformed = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": 7,
+                "name": "source_workload",
+                "operation": {"type": "remove"}
+            }]
+        }
+    }));
+    let malformed_error = match malformed {
+        Ok(_) => panic!("non-string metric selector must be rejected"),
+        Err(error) => error,
+    };
+    assert!(malformed_error.contains("must be a string"));
+}
+
+#[tokio::test]
+async fn k8s_telemetry_header_default_is_fallback_and_present_header_wins() {
+    let translation = translate_k8s_objects(
+        &[telemetry(json!({
+            "tracing": [{
+                "customTags": {
+                    "tenant": {
+                        "header": {
+                            "name": "x-tenant",
+                            "defaultValue": "unknown"
+                        }
+                    }
+                }
+            }]
+        }))],
+        options(),
+    )
+    .expect("header custom tag with default translates");
+    let tracing = translation
+        .config
+        .mesh
+        .expect("mesh config")
+        .telemetry_resources[0]
+        .config
+        .tracing
+        .clone()
+        .expect("tracing config");
+    assert_eq!(
+        tracing.custom_tags.get("tenant").map(String::as_str),
+        Some("unknown")
+    );
+    assert_eq!(
+        tracing.custom_header_tags.get("tenant").map(String::as_str),
+        Some("x-tenant")
+    );
+
+    let plugin = WorkloadMetrics::new(&json!({
+        "custom_tags": tracing.custom_tags,
+        "custom_header_tags": tracing.custom_header_tags,
+    }))
+    .expect("translated custom tags construct workload_metrics");
+
+    let mut absent_ctx =
+        RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut absent_headers = HashMap::new();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut absent_ctx, &mut absent_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        absent_ctx.metadata.get("tenant").map(String::as_str),
+        Some("unknown")
+    );
+
+    let mut present_ctx =
+        RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut present_headers = HashMap::from([("x-tenant".to_string(), "acme".to_string())]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut present_ctx, &mut present_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        present_ctx.metadata.get("tenant").map(String::as_str),
+        Some("acme")
+    );
+}
+
+#[test]
+fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
+    let too_many_custom_tags = (0..33)
+        .map(|index| {
+            let tag = if index < 17 {
+                json!({"literal": {"value": "v"}})
+            } else {
+                json!({"header": {"name": format!("x-tag-{index}")}})
+            };
+            (format!("tag_{index}"), tag)
+        })
+        .collect::<serde_json::Map<String, Value>>();
+    let too_long_custom_tag_name = [("x".repeat(129), json!({"literal": {"value": "v"}}))]
+        .into_iter()
+        .collect::<serde_json::Map<String, Value>>();
+    let oversized_custom_tag_value = "x".repeat(1025);
+    let oversized_metric_literal =
+        serde_json::to_string(&"x".repeat(257)).expect("serialize metric literal");
+    let cases = vec![
+        (
+            "unsupported metric tag",
+            json!({
+                "metrics": [{
+                    "overrides": [{
+                        "match": {"metric": "REQUEST_COUNT"},
+                        "tagOverrides": {
+                            "request_host": {"operation": "UPSERT", "value": "\"edge\""}
+                        }
+                    }]
+                }]
+            }),
+            "unsupported metric tag 'request_host'",
+        ),
+        (
+            "oversized metric tag value",
+            json!({
+                "metrics": [{
+                    "overrides": [{
+                        "match": {"metric": "REQUEST_COUNT"},
+                        "tagOverrides": {
+                            "source_workload": {
+                                "operation": "UPSERT",
+                                "value": oversized_metric_literal
+                            }
+                        }
+                    }]
+                }]
+            }),
+            "metric tag 'source_workload' value exceeds 256 bytes",
+        ),
+        (
+            "credential-bearing custom header",
+            json!({
+                "tracing": [{
+                    "customTags": {
+                        "tenant": {"header": {"name": "Authorization"}}
+                    }
+                }]
+            }),
+            "cannot copy sensitive header 'Authorization'",
+        ),
+        (
+            "invalid custom header name",
+            json!({
+                "tracing": [{
+                    "customTags": {
+                        "tenant": {"header": {"name": "bad header"}}
+                    }
+                }]
+            }),
+            "has invalid header name 'bad header'",
+        ),
+        (
+            "combined custom tag count",
+            json!({
+                "tracing": [{"customTags": Value::Object(too_many_custom_tags)}]
+            }),
+            "custom tag count exceeds 32",
+        ),
+        (
+            "custom tag name bound",
+            json!({
+                "tracing": [{
+                    "customTags": Value::Object(too_long_custom_tag_name)
+                }]
+            }),
+            "invalid custom tag name",
+        ),
+        (
+            "custom tag value bound",
+            json!({
+                "tracing": [{
+                    "customTags": {
+                        "tenant": {"literal": {"value": oversized_custom_tag_value}}
+                    }
+                }]
+            }),
+            "custom tag 'tenant' value exceeds 1024 bytes",
+        ),
+        (
+            "reserved custom tag collision",
+            json!({
+                "tracing": [{
+                    "customTags": {
+                        "trace_id": {"literal": {"value": "attacker-controlled"}}
+                    }
+                }]
+            }),
+            "custom tag name 'trace_id' is reserved or sensitive",
+        ),
+        (
+            "unknown disabled metric",
+            json!({
+                "metrics": [{
+                    "overrides": [{
+                        "match": {"metric": "NOT_AN_ISTIO_METRIC"},
+                        "disabled": true
+                    }]
+                }]
+            }),
+            "unsupported disabled metric 'NOT_AN_ISTIO_METRIC'",
+        ),
+        (
+            "unknown tag override operation",
+            json!({
+                "metrics": [{
+                    "overrides": [{
+                        "match": {"metric": "REQUEST_COUNT"},
+                        "tagOverrides": {
+                            "source_workload": {"operation": "RENAME"}
+                        }
+                    }]
+                }]
+            }),
+            "operation 'RENAME' is unsupported",
+        ),
+        (
+            "invalid tracing provider endpoint",
+            json!({
+                "tracing": [{
+                    "providers": [{
+                        "name": "opentelemetry",
+                        "endpoint": "not a URL"
+                    }]
+                }]
+            }),
+            "OTLP: 'endpoint' must be a valid URL",
+        ),
+    ];
+
+    for (name, spec, expected) in cases {
+        let error = telemetry_translation_error(spec);
+        assert!(
+            error.contains(expected),
+            "{name} should fail visibly with '{expected}', got: {error}"
+        );
+    }
+}
+
+#[test]
+fn k8s_telemetry_metric_upsert_rejects_missing_empty_and_cel_values() {
+    let cases = [
+        (
+            "missing value",
+            json!({"operation": "UPSERT"}),
+            "UPSERT value is required",
+        ),
+        (
+            "empty value",
+            json!({"operation": "UPSERT", "value": ""}),
+            "UPSERT value is required",
+        ),
+        (
+            "attribute expression",
+            json!({"operation": "UPSERT", "value": "request.host"}),
+            "CEL expressions are unsupported",
+        ),
+        (
+            "function expression",
+            json!({"operation": "UPSERT", "value": "string(destination.port)"}),
+            "CEL expressions are unsupported",
+        ),
+    ];
+
+    for (name, tag_override, expected) in cases {
+        let error = telemetry_translation_error(json!({
+            "metrics": [{
+                "overrides": [{
+                    "match": {"metric": "REQUEST_COUNT"},
+                    "tagOverrides": {"source_workload": tag_override}
+                }]
+            }]
+        }));
+        assert!(
+            error.contains(expected),
+            "{name} should fail visibly with '{expected}', got: {error}"
+        );
+    }
+}
+
+#[test]
+fn k8s_telemetry_metric_upsert_accepts_double_quoted_string_literal() {
+    let translation = translate_k8s_objects(
+        &[telemetry(json!({
+            "metrics": [{
+                "overrides": [{
+                    "match": {"metric": "REQUEST_COUNT"},
+                    "tagOverrides": {
+                        "source_workload": {
+                            "operation": "UPSERT",
+                            "value": "\"edge\""
+                        }
+                    }
+                }]
+            }]
+        }))],
+        options(),
+    )
+    .expect("double-quoted string literal translates");
+    let metrics = translation
+        .config
+        .mesh
+        .expect("mesh config")
+        .telemetry_resources[0]
+        .config
+        .metrics
+        .clone()
+        .expect("metrics config");
+
+    assert_eq!(metrics.tag_overrides.len(), 1);
+    assert_eq!(
+        metrics.tag_overrides[0].metric.as_deref(),
+        Some("REQUEST_COUNT")
+    );
+    assert!(matches!(
+        &metrics.tag_overrides[0].operation,
+        TagOverrideOperation::Set { value } if value == "edge"
+    ));
 }

@@ -16,6 +16,8 @@
 //! - **No redirect following**: outbound calls reach only the configured
 //!   endpoint; server-chosen 3xx targets (e.g. a cloud metadata IP) are never
 //!   followed — SSRF defense-in-depth
+//! - **No ambient proxies**: `HTTP_PROXY`, `HTTPS_PROXY`, and related process
+//!   variables cannot redirect plugin traffic around gateway egress policy
 //!
 //! # Usage for plugin authors
 //!
@@ -229,10 +231,9 @@ impl PluginTlsPosture {
 /// bundle to platform/webpki roots.
 ///
 /// If even this minimal builder fails, build a no-DNS fallback that still keeps
-/// redirects disabled and applies the caller's TLS posture. If that cannot be
-/// constructed either, drop custom TLS posture but keep redirects disabled. A
-/// process without a usable minimal reqwest TLS/client backend fails during
-/// construction rather than silently widening the redirect policy.
+/// redirects and ambient proxies disabled and applies the caller's TLS posture.
+/// If that cannot be constructed either, drop custom TLS posture but retain
+/// those two non-negotiable egress controls.
 fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     tls_posture: &PluginTlsPosture,
@@ -271,13 +272,20 @@ fn build_dns_cached_fallback_client(
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
-                    // Invariant: this final builder has no operator-provided
-                    // certificates, proxy settings, resolver, or pool tuning;
-                    // only reqwest's compiled-in client/TLS backend remains.
-                    // `reqwest::Client::new()` would assert the same invariant
-                    // internally while re-enabling default redirects, which is
-                    // forbidden for credential-bearing plugin egress.
-                    .expect("minimal no-redirect reqwest client backend must initialize")
+                    .unwrap_or_else(|e3| {
+                        // The production gateway builds this shared client
+                        // before its initial plugin cache. Full and delta
+                        // cache rebuilds clone that existing client and never
+                        // re-enter this builder.
+                        //
+                        // Invariant: a bare reqwest builder with no custom
+                        // resolver, TLS material, proxy, or redirect policy
+                        // has no fallible operator input. If reqwest ever
+                        // breaks that invariant, aborting client construction
+                        // is safer than silently re-enabling ambient proxy
+                        // routing.
+                        panic!("Failed to build fail-closed minimal plugin HTTP client: {e3}")
+                    })
             }
         }
     })
@@ -499,8 +507,10 @@ impl PluginHttpClient {
         // resolver they would use the OS resolver, bypassing execute_request's
         // literal-only guard and letting a hostname that resolves — or rebinds —
         // to a denied IP (e.g. 169.254.169.254) be dialed before the real
-        // runtime plugin is ever built. The fresh cache is cheap and short-lived
-        // (validation is a cold path), and mirrors the runtime client's screen.
+        // runtime plugin is ever built. (jwks_auth construction is now pure;
+        // other networked validators still need this protection.) The fresh
+        // cache is cheap and short-lived (validation is a cold path), and
+        // mirrors the runtime client's screen.
         let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig {
             backend_allow_ips: backend_allow_ips.clone(),
             ..Default::default()

@@ -1,14 +1,17 @@
 use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
-    db_wrap_mysql_isolation_read_error, is_config_validation_rejection, parse_auth_mode,
-    parse_scheme, statement_timeout_sql,
+    db_wrap_mysql_isolation_read_error, is_config_validation_rejection,
+    mysql_mtls_dns_admission_lock_insert_sql, parse_auth_mode, parse_scheme, statement_timeout_sql,
 };
-use ferrum_edge::config::db_backend::DatabaseBackend;
+use ferrum_edge::config::db_backend::{
+    BatchConfigWriteMode, DatabaseBackend, is_incremental_full_reload_required,
+    is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
+};
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginConfig, PluginScope, Upstream,
-    UpstreamTarget,
+    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
+    PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use serde_json::json;
 use sqlx::error::{DatabaseError, ErrorKind};
@@ -16,6 +19,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct TestDatabaseError {
@@ -54,6 +58,17 @@ impl DatabaseError for TestDatabaseError {
     fn kind(&self) -> ErrorKind {
         ErrorKind::Other
     }
+}
+
+#[test]
+fn mysql_mtls_dns_lock_insert_takes_an_exclusive_duplicate_key_lock() {
+    let sql = mysql_mtls_dns_admission_lock_insert_sql();
+    assert!(sql.contains("ON DUPLICATE KEY UPDATE"), "{sql}");
+    assert!(
+        sql.contains("updated_at = mtls_dns_admission_locks.updated_at"),
+        "{sql}"
+    );
+    assert!(!sql.contains("INSERT IGNORE"), "{sql}");
 }
 
 fn make_upstream(id: &str) -> Upstream {
@@ -405,6 +420,118 @@ async fn consumer_credential_index_enforces_keyauth_uniqueness() {
 }
 
 #[tokio::test]
+async fn consumer_credential_index_enforces_namespace_scoped_hmac_uniqueness() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("consumer_hmac_credential_index.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    let secret = "datastore-unique-hmac-secret-at-least-32-characters";
+
+    let mut tenant_a_owner = make_consumer("c1", "alice");
+    tenant_a_owner.namespace = "tenant-a".to_string();
+    tenant_a_owner.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": secret }, { "secret": secret }]),
+    );
+    store.create_consumer(&tenant_a_owner).await.unwrap();
+
+    let mut tenant_a_conflict = make_consumer("c2", "bob");
+    tenant_a_conflict.namespace = "tenant-a".to_string();
+    tenant_a_conflict
+        .credentials
+        .insert("hmac_auth".to_string(), json!([{ "secret": secret }]));
+    let error = store
+        .create_consumer(&tenant_a_conflict)
+        .await
+        .expect_err("a second consumer in one namespace must not claim the HMAC secret");
+    let message = error.to_string();
+    assert!(
+        message.contains("consumer_credential_index")
+            || message.contains("UNIQUE")
+            || message.contains("constraint"),
+        "unexpected duplicate-HMAC error: {message}"
+    );
+
+    let mut tenant_b_owner = make_consumer("c1", "carol");
+    tenant_b_owner.namespace = "tenant-b".to_string();
+    tenant_b_owner
+        .credentials
+        .insert("hmac_auth".to_string(), json!([{ "secret": secret }]));
+    store
+        .create_consumer(&tenant_b_owner)
+        .await
+        .expect("the HMAC index must preserve namespace isolation");
+
+    let original_secret = "transaction-preserved-hmac-secret-at-least-32-characters";
+    let mut rotating = make_consumer("c3", "dave");
+    rotating.namespace = "tenant-a".to_string();
+    rotating.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": original_secret }]),
+    );
+    store.create_consumer(&rotating).await.unwrap();
+    rotating
+        .credentials
+        .insert("hmac_auth".to_string(), json!([{ "secret": secret }]));
+    store
+        .update_consumer(&rotating, &BatchConfigWriteMode::Admission)
+        .await
+        .expect_err("a conflicting HMAC update must roll back atomically");
+    let stored = store.get_consumer("tenant-a", "c3").await.unwrap().unwrap();
+    assert_eq!(
+        stored.credentials["hmac_auth"],
+        json!([{ "secret": original_secret }])
+    );
+}
+
+#[tokio::test]
+async fn incremental_consumer_change_requires_full_reload_for_hmac_rehydration() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("consumer_incremental_full_reload.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": "first-hmac-secret-at-least-32-characters" }]),
+    );
+    store.create_consumer(&consumer).await.unwrap();
+    let accepted_sequence = store.latest_change_sequence("ferrum").await.unwrap();
+
+    consumer.credentials.insert(
+        "hmac_auth".to_string(),
+        json!([{ "secret": "repaired-hmac-secret-at-least-32-characters" }]),
+    );
+    assert!(
+        store
+            .update_consumer(&consumer, &BatchConfigWriteMode::Admission)
+            .await
+            .unwrap()
+    );
+
+    let error = match store
+        .load_incremental_config("ferrum", accepted_sequence)
+        .await
+    {
+        Ok(_) => panic!("consumer deltas must escalate to an authoritative full reload"),
+        Err(error) => error,
+    };
+    assert!(is_incremental_full_reload_required(&error));
+
+    let reloaded = store.load_full_config("ferrum").await.unwrap();
+    assert_eq!(reloaded.consumers.len(), 1);
+    assert_eq!(
+        reloaded.consumers[0].credentials["hmac_auth"],
+        json!([{ "secret": "repaired-hmac-secret-at-least-32-characters" }])
+    );
+}
+
+#[tokio::test]
 async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("consumer_mtls_identity_index.db");
@@ -441,7 +568,7 @@ async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
     assert_eq!(loaded.consumers[0].username, "alice");
 
     let now = chrono::Utc::now();
-    store
+    let error = store
         .create_plugin_config(&PluginConfig {
             id: "dns-mtls".to_string(),
             plugin_name: "mtls_auth".to_string(),
@@ -456,12 +583,15 @@ async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
             updated_at: now,
         })
         .await
-        .unwrap();
-    let error = store
+        .expect_err("activating san_dns must atomically reject the ambiguous snapshot");
+    assert!(is_mtls_dns_identity_conflict(&error));
+
+    let loaded = store
         .load_full_config("ferrum")
         .await
-        .expect_err("DNS identity collisions must reject the runtime snapshot");
-    assert!(is_config_validation_rejection(&error));
+        .expect("the rejected policy must not leave an invalid runtime snapshot");
+    assert_eq!(loaded.consumers.len(), 2);
+    assert!(loaded.plugin_configs.is_empty());
 
     let mut c3 = make_consumer("c3", "carol");
     c3.credentials.insert(
@@ -479,6 +609,283 @@ async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
             || message.contains("constraint"),
         "unexpected exact duplicate-identity error: {message}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_sqlite_stores_serialize_mtls_dns_consumer_admission() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("mtls_dns_cross_process_consumers.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store_a =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    let store_b =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+
+    let now = chrono::Utc::now();
+    store_a
+        .create_plugin_config(&PluginConfig {
+            id: "dns-mtls".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    let mut upper = make_consumer("upper", "alice");
+    upper.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut lower = make_consumer("lower", "bob");
+    lower.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "api.example.com"}]),
+    );
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let barrier_a = barrier.clone();
+    let barrier_b = barrier.clone();
+    let (upper_result, lower_result) = tokio::join!(
+        async {
+            barrier_a.wait().await;
+            store_a.create_consumer(&upper).await
+        },
+        async {
+            barrier_b.wait().await;
+            store_b.create_consumer(&lower).await
+        }
+    );
+
+    assert_ne!(upper_result.is_ok(), lower_result.is_ok());
+    let conflict = upper_result.err().or_else(|| lower_result.err()).unwrap();
+    assert!(is_mtls_dns_identity_conflict(&conflict), "{conflict:#}");
+
+    let loaded = store_a.load_full_config("ferrum").await.unwrap();
+    assert_eq!(loaded.consumers.len(), 1);
+    loaded
+        .validate_unique_mtls_dns_identities()
+        .expect("the persisted winner must remain unambiguous");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_sqlite_stores_atomically_serialize_policy_association_and_identity_update() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("mtls_dns_cross_process_association.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store_a =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    let store_b =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+
+    let mut owner = make_consumer("owner", "alice");
+    owner.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "API.Example.COM"}]),
+    );
+    store_a.create_consumer(&owner).await.unwrap();
+    let rotating = make_consumer("rotating", "bob");
+    store_a.create_consumer(&rotating).await.unwrap();
+
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "api",
+        "namespace": "ferrum",
+        "hosts": ["api.test"],
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .unwrap();
+    store_a.create_proxy(&proxy).await.unwrap();
+    let now = chrono::Utc::now();
+    store_a
+        .create_plugin_config(&PluginConfig {
+            id: "dns-mtls".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some(proxy.id.clone()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    let mut associated_proxy = proxy.clone();
+    associated_proxy.plugins.push(PluginAssociation {
+        plugin_config_id: "dns-mtls".to_string(),
+    });
+    let mut rotated_consumer = rotating.clone();
+    rotated_consumer.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "api.example.com"}]),
+    );
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let barrier_a = barrier.clone();
+    let barrier_b = barrier.clone();
+    let (association_result, rotation_result) = tokio::join!(
+        async {
+            barrier_a.wait().await;
+            store_a.update_proxy(&associated_proxy).await
+        },
+        async {
+            barrier_b.wait().await;
+            store_b
+                .update_consumer(&rotated_consumer, &BatchConfigWriteMode::Admission)
+                .await
+        }
+    );
+
+    let association_succeeded = matches!(&association_result, Ok(true));
+    let rotation_succeeded = matches!(&rotation_result, Ok(true));
+    assert_ne!(association_succeeded, rotation_succeeded);
+    let conflict = association_result
+        .err()
+        .or_else(|| rotation_result.err())
+        .unwrap();
+    assert!(is_mtls_dns_identity_conflict(&conflict), "{conflict:#}");
+
+    let loaded = store_a.load_full_config("ferrum").await.unwrap();
+    loaded
+        .validate_unique_mtls_dns_identities()
+        .expect("association and credential admission must commit as one valid order");
+    let stored_proxy = store_a.get_proxy("ferrum", "api").await.unwrap().unwrap();
+    let stored_consumer = store_a
+        .get_consumer("ferrum", "rotating")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        !stored_proxy.plugins.is_empty(),
+        !stored_consumer.credentials.contains_key("mtls_auth")
+    );
+}
+
+#[tokio::test]
+async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_batches() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("mtls_dns_restore_guard.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store_a =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    let store_b =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+
+    let guard_owner = store_a
+        .acquire_mtls_dns_admission_guard("ferrum")
+        .await
+        .unwrap();
+    let replay_mode = BatchConfigWriteMode::RestoreRollbackReplay {
+        guard_owner: guard_owner.clone(),
+    };
+    store_a
+        .delete_all_resources("ferrum", &replay_mode)
+        .await
+        .expect("the guard owner must be able to clear the partial restore state");
+    let replayed = make_consumer("replayed", "alice");
+    store_a
+        .batch_create_consumers(&[replayed], &replay_mode)
+        .await
+        .expect("the guard owner must be able to replay a batch");
+
+    // Credential handlers acquire this same owner before reading the
+    // Consumer, then borrow it for the full update. Pin that reentrant path so
+    // a future refactor cannot move the cross-process lock back after the read.
+    let guarded_mode = BatchConfigWriteMode::GuardedAdmission {
+        guard_owner: guard_owner.clone(),
+    };
+    let mut guarded_consumer = store_a
+        .get_consumer("ferrum", "replayed")
+        .await
+        .unwrap()
+        .unwrap();
+    guarded_consumer
+        .credentials
+        .insert("keyauth".to_string(), json!([{ "key": "guarded-key" }]));
+    DatabaseBackend::update_consumer(&store_a, &guarded_consumer, &guarded_mode)
+        .await
+        .expect("the pre-read guard owner must be able to persist the credential update");
+    store_a
+        .batch_create_upstreams(&[make_upstream("guarded-upstream")], &guarded_mode)
+        .await
+        .expect("the restore owner must be able to persist its upstream batch");
+
+    let wrong_owner_mode = BatchConfigWriteMode::RestoreRollbackReplay {
+        guard_owner: "not-the-owner".to_string(),
+    };
+    let wrong_owner = store_b
+        .batch_create_consumers(
+            &[make_consumer("wrong-owner", "mallory")],
+            &wrong_owner_mode,
+        )
+        .await
+        .expect_err("a replay must not borrow another rollback's guard");
+    assert!(is_mtls_dns_admission_unavailable(&wrong_owner));
+    assert!(
+        wrong_owner.to_string().contains("guarded operation owns"),
+        "unexpected wrong-owner rejection: {wrong_owner:#}"
+    );
+
+    let blocked = store_b
+        .create_consumer(&make_consumer("concurrent", "bob"))
+        .await
+        .expect_err("another admin process must remain blocked between replay batches");
+    assert!(is_mtls_dns_admission_unavailable(&blocked));
+    assert!(
+        blocked.to_string().contains("guarded operation owns"),
+        "unexpected rollback-guard rejection: {blocked:#}"
+    );
+    let blocked_upstream = store_b
+        .create_upstream(&make_upstream("concurrent-upstream"))
+        .await
+        .expect_err("another admin process must not mutate upstreams during restore");
+    assert!(is_mtls_dns_admission_unavailable(&blocked_upstream));
+    assert!(
+        blocked_upstream
+            .to_string()
+            .contains("guarded operation owns"),
+        "unexpected upstream restore-guard rejection: {blocked_upstream:#}"
+    );
+
+    store_a
+        .release_mtls_dns_admission_guard("ferrum", &guard_owner)
+        .await
+        .unwrap();
+    let lost_owner = store_a
+        .batch_create_upstreams(&[make_upstream("lost-owner")], &guarded_mode)
+        .await
+        .expect_err("a released guard owner must not authorize another mutation");
+    assert!(is_mtls_dns_admission_unavailable(&lost_owner));
+    store_b
+        .create_consumer(&make_consumer("after-release", "carol"))
+        .await
+        .expect("normal admission must resume after persistent guard release");
 }
 
 #[tokio::test]
@@ -552,6 +959,181 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_row
 }
 
 #[tokio::test]
+async fn mtls_dns_admission_loads_consumers_only_for_effective_dns_policy() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("mtls_dns_policy_fast_path.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    store
+        .create_consumer(&make_consumer("malformed", "alice"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
+        .bind("not-json")
+        .bind("ferrum")
+        .bind("malformed")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+    store
+        .create_consumer(&make_consumer("fast-path", "bob"))
+        .await
+        .expect("ordinary admission must not decode all Consumers without a DNS policy");
+
+    let now = chrono::Utc::now();
+    let error = store
+        .create_plugin_config(&PluginConfig {
+            id: "dns-mtls".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect_err("enabling san_dns must take the full Consumer validation path");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to parse credentials JSON"),
+        "unexpected full-path error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn mtls_dns_repair_deletes_may_only_reduce_existing_ambiguity() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("mtls_dns_repair_delete.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut upper = make_consumer("upper", "alice");
+    upper.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut lower = make_consumer("lower", "bob");
+    lower.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "api.example.com"}]),
+    );
+    store.create_consumer(&upper).await.unwrap();
+    store.create_consumer(&lower).await.unwrap();
+    store
+        .create_consumer(&make_consumer("unrelated", "carol"))
+        .await
+        .unwrap();
+
+    let now = chrono::Utc::now();
+    store
+        .create_plugin_config(&PluginConfig {
+            id: "dns-mtls".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: false,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE plugin_configs SET enabled = 1 WHERE namespace = ? AND id = ?")
+        .bind("ferrum")
+        .bind("dns-mtls")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .delete_consumer("ferrum", "unrelated")
+            .await
+            .expect("an unrelated delete must remain available as an operator repair action")
+    );
+    assert!(
+        store
+            .delete_consumer("ferrum", "upper")
+            .await
+            .expect("deleting one conflicting owner must repair the ambiguity")
+    );
+
+    let loaded = store.load_full_config("ferrum").await.unwrap();
+    assert_eq!(loaded.consumers.len(), 1);
+    loaded
+        .validate_unique_mtls_dns_identities()
+        .expect("repair delete must leave a valid DNS identity index");
+}
+
+#[tokio::test]
+async fn load_full_config_rejects_hmac_request_body_transform_composition() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("cp_hmac_transform_validation.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    for (id, plugin_name, config) in [
+        (
+            "cp-global-hmac",
+            "hmac_auth",
+            json!({"clock_skew_seconds": 300}),
+        ),
+        (
+            "cp-global-transformer",
+            "request_transformer",
+            json!({"rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "gateway",
+                "value": "ferrum"
+            }]}),
+        ),
+    ] {
+        store
+            .create_plugin_config(&PluginConfig {
+                id: id.to_string(),
+                plugin_name: plugin_name.to_string(),
+                namespace: "ferrum".to_string(),
+                config,
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+    }
+
+    let error = store
+        .load_full_config("ferrum")
+        .await
+        .expect_err("CP/database loaders must reject an unsafe HMAC plugin chain");
+    assert!(
+        is_config_validation_rejection(&error),
+        "composition failure must use the shared semantic rejection marker: {error}"
+    );
+}
+
+#[tokio::test]
 async fn consumer_credential_index_updates_on_consumer_update() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("consumer_credential_index_update.db");
@@ -577,7 +1159,10 @@ async fn consumer_credential_index_updates_on_consumer_update() {
         "mtls_auth".to_string(),
         json!([{ "identity": "spiffe://example.test/ns/default/sa/alice-v2" }]),
     );
-    store.update_consumer(&consumer).await.unwrap();
+    store
+        .update_consumer(&consumer, &BatchConfigWriteMode::Admission)
+        .await
+        .unwrap();
 
     assert!(
         store

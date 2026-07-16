@@ -924,7 +924,12 @@ impl Plugin for CompressionPlugin {
             None => return PluginResult::Continue,
         };
 
-        // Record the decision for transform_response_body.
+        // Record authoritative ownership outside public plugin metadata so
+        // response security hooks can distinguish gateway-planned compression
+        // from an encoded origin response without trusting a spoofable key.
+        ctx.mark_gateway_response_compression(algorithm.content_encoding());
+
+        // Retain the existing observable decision metadata.
         ctx.metadata.insert(
             RESPONSE_ALGORITHM_METADATA_KEY.to_string(),
             algorithm.content_encoding().to_string(),
@@ -1030,12 +1035,12 @@ impl Plugin for CompressionPlugin {
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // The algorithm decision was made in `after_proxy` and recorded in
-        // request metadata. Its presence proves the gateway, not the origin,
-        // committed a response encoding. Encode according to the final
-        // Content-Encoding header so a later supported header rewrite (for
-        // example `br` -> `gzip`) still leaves headers and body consistent.
+        // private request-context state. Its presence proves the gateway, not
+        // the origin, committed a response encoding. Encode according to the
+        // final Content-Encoding header so a later supported header rewrite
+        // (for example `br` -> `gzip`) still leaves headers and body consistent.
         let encoding = response_headers.get("content-encoding")?;
-        ctx.metadata.get(RESPONSE_ALGORITHM_METADATA_KEY)?;
+        ctx.gateway_response_compression_algorithm()?;
         let encoding = if encoding.eq_ignore_ascii_case("gzip") {
             "gzip"
         } else if encoding.eq_ignore_ascii_case("br") {

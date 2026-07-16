@@ -24,9 +24,9 @@ Summary of current behavior (see the canonical doc for detail and code
 citations):
 
 - **Gating.** The workflow **gates** PRs and `main` pushes. Its `gate` job
-  fails on any upstream-conformance or black-box failure, and `ci.yml`'s
-  `Gateway API Conformance (CI mirror)` job feeds that result into the aggregate
-  `Tests` gate as a required success. It is not advisory.
+  (`Gateway API Conformance`) fails on any upstream-conformance or black-box
+  failure and is a branch-protection required check directly — there is no
+  mirror job in `ci.yml`. It is not advisory.
 - **Triggers.** `pull_request`, `push` to `main`, weekly `schedule`
   (Mondays 07:00 UTC), and manual `workflow_dispatch`. A path-filter `changes`
   job skips the heavy lab when no routing / translation / chart / image / proto

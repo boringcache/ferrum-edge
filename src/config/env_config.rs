@@ -1883,10 +1883,10 @@ pub struct EnvConfig {
     /// remains the source of truth.
     pub real_ip_header: Option<String>,
 
-    /// HMAC-SHA256 server secret for the basic_auth plugin. Password hashes
-    /// prefixed with "hmac_sha256:" are verified using this key. Must be set
-    /// to a unique, random value in production.
-    /// If unset, an insecure default is used and a warning is logged at startup.
+    /// HMAC-SHA256 server secret for the basic_auth plugin. Mandatory when that
+    /// plugin is enabled; must be a unique random value of at least 32 bytes.
+    /// There is no default. Rotating it invalidates all existing Basic-auth
+    /// password hashes.
     /// Note: Also resolved via `resolve_ferrum_var()` in `basic_auth.rs` and
     /// `admin/mod.rs` for use sites that don't have `EnvConfig` in scope.
     #[allow(dead_code)]

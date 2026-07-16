@@ -13,12 +13,12 @@
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::LazyLock;
 
 /// Maximum length for resource IDs.
-const MAX_ID_LENGTH: usize = 254;
+pub(crate) const MAX_ID_LENGTH: usize = 254;
 
 // ---- Field length limits (aligned with DB schema VARCHAR widths) ----
 
@@ -81,6 +81,17 @@ pub const MAX_CREDENTIALS_SIZE: usize = 65_536; // 64 KiB
 pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
 /// Minimum length for JWT secrets (admin API and consumer credentials).
 pub const MIN_JWT_SECRET_LENGTH: usize = 32;
+/// Minimum length for hmac_auth shared secrets.
+pub const MIN_HMAC_SECRET_LENGTH: usize = 32;
+
+/// Effective strength of an hmac_auth secret: whitespace does not count
+/// toward [`MIN_HMAC_SECRET_LENGTH`]. Shared by admission-time field
+/// validation and the full-load quarantine so the two policies cannot drift.
+pub(crate) fn hmac_secret_strength(secret: &str) -> usize {
+    secret.chars().filter(|ch| !ch.is_whitespace()).count()
+}
+/// Minimum byte length for the server-side Basic-auth HMAC secret.
+pub const MIN_BASIC_AUTH_HMAC_SECRET_LENGTH: usize = 32;
 /// Default maximum number of credential entries per type (for zero-downtime rotation).
 /// Overridable at runtime via `FERRUM_MAX_CREDENTIALS_PER_TYPE` env var / conf file.
 pub const DEFAULT_MAX_CREDENTIALS_PER_TYPE: usize = 2;
@@ -91,6 +102,73 @@ pub fn max_credentials_per_type() -> usize {
     crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_CREDENTIALS_PER_TYPE")
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_CREDENTIALS_PER_TYPE)
+}
+
+/// Validate the shared Basic-auth HMAC secret without exposing its value.
+pub fn validate_basic_auth_hmac_secret(secret: &str) -> Result<(), String> {
+    if secret.len() < MIN_BASIC_AUTH_HMAC_SECRET_LENGTH {
+        return Err(format!(
+            "FERRUM_BASIC_AUTH_HMAC_SECRET must be at least {} bytes",
+            MIN_BASIC_AUTH_HMAC_SECRET_LENGTH
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) enum BasicAuthCredentialPreparationError {
+    InvalidCredential(String),
+    ServerConfiguration(String),
+}
+
+impl std::fmt::Display for BasicAuthCredentialPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCredential(message) | Self::ServerConfiguration(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+fn basic_auth_credential_error(
+    credential: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&'static str> {
+    if credential.len() != 1 {
+        return Some("must contain exactly one of 'password' or 'password_hash'");
+    }
+
+    if let Some(password) = credential.get("password") {
+        return match password.as_str() {
+            Some("") => Some("password must not be empty"),
+            Some(password) if password.len() > MAX_CREDENTIAL_VALUE_LENGTH => {
+                Some("password must not exceed 4096 bytes")
+            }
+            Some(password) if contains_control_chars(password) => {
+                Some("password must not contain control characters")
+            }
+            Some(_) => None,
+            None => Some("password must be a string"),
+        };
+    }
+
+    if let Some(password_hash) = credential.get("password_hash") {
+        let valid = password_hash.as_str().is_some_and(|password_hash| {
+            password_hash
+                .strip_prefix("hmac_sha256:")
+                .is_some_and(|hex_hash| {
+                    hex_hash.len() == 64
+                        && hex_hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        });
+        return (!valid).then_some(
+            "password_hash must be a string in 'hmac_sha256:<64 lowercase hex>' format",
+        );
+    }
+
+    Some("must contain exactly one of 'password' or 'password_hash'")
 }
 /// Maximum number of ACL groups per consumer.
 pub const MAX_ACL_GROUPS_PER_CONSUMER: usize = 500;
@@ -3509,6 +3587,127 @@ impl GatewayConfig {
         duplicates
     }
 
+    /// Cross-Consumer hmac_auth shared-secret collisions within each
+    /// namespace. HMAC signs the credential identity, but a secret reused by
+    /// two Consumers in one namespace would still collapse their trust
+    /// boundary. Reuse across namespaces and intra-consumer reuse (rotation
+    /// entries sharing one secret) are allowed; the secret value itself is
+    /// never included in the error message.
+    fn hmac_credential_uniqueness_errors(&self) -> Vec<String> {
+        let mut seen_hmac: HashMap<(&str, &str), &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+
+        for consumer in &self.consumers {
+            for entry in consumer.credential_entries("hmac_auth") {
+                if let Some(secret) = entry.get("secret").and_then(|s| s.as_str())
+                    && let Some(existing_id) = seen_hmac
+                        .insert((consumer.namespace.as_str(), secret), consumer.id.as_str())
+                    && existing_id != consumer.id
+                {
+                    duplicates.push(format!(
+                        "Duplicate hmac_auth shared secret in consumer '{}' (conflicts with consumer '{}' in namespace '{}')",
+                        consumer.id, existing_id, consumer.namespace
+                    ));
+                }
+            }
+        }
+
+        duplicates
+    }
+
+    /// Validate only the cross-Consumer hmac_auth shared-secret constraint.
+    /// Admin candidate checks use this narrower surface so unrelated legacy
+    /// keyauth/basicauth collisions do not block HMAC configuration repairs.
+    pub fn validate_unique_hmac_credentials(&self) -> Result<(), Vec<String>> {
+        let duplicates = self.hmac_credential_uniqueness_errors();
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Fail-closed handling of hmac_auth credential policy at full-load time:
+    /// strip the `hmac_auth` credential from every consumer whose stored
+    /// entries violate the secret policy (non-array credential, empty array,
+    /// malformed entry, missing/non-string secret, or fewer than
+    /// [`MIN_HMAC_SECRET_LENGTH`] non-whitespace characters) or whose secret
+    /// is already claimed by an earlier-loaded consumer in the same namespace
+    /// (first-loaded consumer wins; the SQL and Mongo full loaders sort by
+    /// id). The same secret may be reused in a different namespace.
+    ///
+    /// Admin write-time validation rejects NEW violations; this guard covers
+    /// pre-existing and out-of-band rows, mirroring
+    /// [`Self::quarantine_colliding_consumer_identities`]. A stripped
+    /// credential fails closed: the hmac_auth plugin returns 401 for a
+    /// consumer with no hmac_auth entries. Returns one human-readable message
+    /// per quarantined credential (never containing the secret); callers log
+    /// these at `error!` severity.
+    pub fn quarantine_invalid_hmac_credentials(&mut self) -> Vec<String> {
+        let mut claimed: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut messages = Vec::new();
+
+        for consumer in &mut self.consumers {
+            let Some(value) = consumer.credentials.get("hmac_auth") else {
+                continue;
+            };
+            let secrets: Option<Vec<String>> = match value.as_array() {
+                Some(entries) if !entries.is_empty() => entries
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .as_object()
+                            .filter(|obj| obj.len() == 1)
+                            .and_then(|obj| obj.get("secret"))
+                            .and_then(|secret| secret.as_str())
+                            .filter(|secret| hmac_secret_strength(secret) >= MIN_HMAC_SECRET_LENGTH)
+                            .map(str::to_owned)
+                    })
+                    .collect(),
+                _ => None,
+            };
+            let Some(secrets) = secrets else {
+                consumer.credentials.remove("hmac_auth");
+                messages.push(format!(
+                    "Quarantined hmac_auth credential of consumer '{}': a stored entry \
+                     is malformed or its secret has fewer than {} non-whitespace \
+                     characters — the credential is excluded from this config load so \
+                     the weak secret cannot authenticate. Repair the stored credential \
+                     to restore it.",
+                    consumer.id, MIN_HMAC_SECRET_LENGTH
+                ));
+                continue;
+            };
+            let namespace_claims = claimed.entry(consumer.namespace.clone()).or_default();
+            match secrets
+                .iter()
+                .find_map(|secret| namespace_claims.get(secret))
+            {
+                Some(other_id) => {
+                    let other_id = other_id.clone();
+                    consumer.credentials.remove("hmac_auth");
+                    messages.push(format!(
+                        "Quarantined hmac_auth credential of consumer '{}': its shared \
+                         secret is also claimed by consumer '{}' in namespace '{}' — the credential is \
+                         excluded from this config load to prevent cross-Consumer \
+                         signature forgery. Rotate one of the secrets to restore it.",
+                        consumer.id, other_id, consumer.namespace
+                    ));
+                }
+                None => {
+                    for secret in secrets {
+                        namespace_claims
+                            .entry(secret)
+                            .or_insert_with(|| consumer.id.clone());
+                    }
+                }
+            }
+        }
+
+        messages
+    }
+
     /// Validate only the exact and effective-DNS mTLS identity constraints.
     /// Admin candidate checks use this narrower surface so unrelated legacy
     /// keyauth/basicauth collisions do not block mTLS configuration repairs.
@@ -3524,7 +3723,8 @@ impl GatewayConfig {
 
     /// Validate that consumer credentials are unique across all consumers.
     ///
-    /// Checks keyauth API keys, basicauth usernames, and mTLS identities.
+    /// Checks keyauth API keys, basicauth usernames, HMAC shared secrets, and
+    /// mTLS identities.
     /// mTLS identities are exact by default and additionally ASCII-case-folded
     /// when an effective `san_dns` mTLS policy can consume the DNS lookup index.
     /// If two consumers share the same credential, the ConsumerIndex silently
@@ -3559,6 +3759,7 @@ impl GatewayConfig {
             }
         }
 
+        duplicates.extend(self.hmac_credential_uniqueness_errors());
         duplicates.extend(self.mtls_credential_uniqueness_errors());
 
         if duplicates.is_empty() {
@@ -3571,28 +3772,7 @@ impl GatewayConfig {
     /// Reject case-variant identities before publishing the lower-cased DNS
     /// lookup index. Exact-match mTLS policies remain case-sensitive.
     pub fn validate_unique_mtls_dns_identities(&self) -> Result<(), Vec<String>> {
-        let is_dns_identity_plugin = |plugin: &PluginConfig| {
-            plugin.enabled
-                && plugin.plugin_name == "mtls_auth"
-                && plugin
-                    .config
-                    .get("cert_field")
-                    .and_then(|value| value.as_str())
-                    == Some("san_dns")
-        };
-        // The plugin cache keeps globals as the fallback for every proxy ID
-        // absent from its association map, including synthesized mesh relays.
-        // Local associations can shadow a global on registered proxies, but
-        // cannot make that global dormant for unknown proxy IDs.
-        let dns_identity_matching_enabled =
-            self.plugin_configs.iter().any(|plugin| {
-                plugin.scope == PluginScope::Global && is_dns_identity_plugin(plugin)
-            }) || self
-                .effective_mtls_auth_plugins_by_proxy()
-                .into_iter()
-                .flat_map(|(_, plugins)| plugins)
-                .any(&is_dns_identity_plugin);
-        if !dns_identity_matching_enabled {
+        if !self.has_effective_mtls_dns_identity_policy() {
             return Ok(());
         }
 
@@ -3624,6 +3804,75 @@ impl GatewayConfig {
         } else {
             Err(duplicates)
         }
+    }
+
+    /// Whether the proxy/plugin graph can consume the case-folded DNS identity
+    /// index. Persistence uses this policy-only predicate before loading the
+    /// namespace's Consumers, which keeps ordinary guarded CRUD O(policy graph)
+    /// when no enabled `san_dns` policy exists.
+    pub(crate) fn has_effective_mtls_dns_identity_policy(&self) -> bool {
+        let is_dns_identity_plugin = |plugin: &PluginConfig| {
+            plugin.enabled
+                && plugin.plugin_name == "mtls_auth"
+                && plugin
+                    .config
+                    .get("cert_field")
+                    .and_then(|value| value.as_str())
+                    == Some("san_dns")
+        };
+        // The plugin cache keeps globals as the fallback for every proxy ID
+        // absent from its association map, including synthesized mesh relays.
+        // Local associations can shadow a global on registered proxies, but
+        // cannot make that global dormant for unknown proxy IDs.
+        self.plugin_configs
+            .iter()
+            .any(|plugin| plugin.scope == PluginScope::Global && is_dns_identity_plugin(plugin))
+            || self
+                .effective_mtls_auth_plugins_by_proxy()
+                .into_iter()
+                .flat_map(|(_, plugins)| plugins)
+                .any(&is_dns_identity_plugin)
+    }
+
+    /// Canonical DNS identity owners for every currently ambiguous key.
+    ///
+    /// Delete admission compares the post-delete map with the pre-delete map.
+    /// A delete may retain or reduce restored/out-of-band ambiguity, but it may
+    /// not add a canonical key or a new Consumer owner to one. This permits
+    /// repair-oriented and unrelated deletes without allowing an identity
+    /// collision to be enabled by a policy-graph change.
+    pub(crate) fn mtls_dns_identity_conflicts(&self) -> BTreeMap<String, BTreeSet<String>> {
+        if !self.has_effective_mtls_dns_identity_policy() {
+            return BTreeMap::new();
+        }
+
+        let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for consumer in &self.consumers {
+            for entry in consumer.credential_entries("mtls_auth") {
+                let Some(identity) = entry.get("identity").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                owners
+                    .entry(identity.to_ascii_lowercase())
+                    .or_default()
+                    .insert(consumer.id.clone());
+            }
+        }
+        owners.retain(|_, consumers| consumers.len() > 1);
+        owners
+    }
+
+    pub(crate) fn introduces_new_mtls_dns_identity_conflict(
+        &self,
+        prior: &BTreeMap<String, BTreeSet<String>>,
+    ) -> bool {
+        self.mtls_dns_identity_conflicts()
+            .iter()
+            .any(|(identity, owners)| {
+                !prior
+                    .get(identity)
+                    .is_some_and(|prior_owners| owners.is_subset(prior_owners))
+            })
     }
 
     /// Validate that upstream names are unique when present.
@@ -5574,6 +5823,42 @@ impl Consumer {
                         None => {}
                     }
                 }
+                if cred_type == "hmac_auth" {
+                    if obj.len() != 1 || !obj.contains_key("secret") {
+                        errors.push(format!(
+                            "{} must contain exactly one field named 'secret'",
+                            prefix
+                        ));
+                    }
+                    match obj.get("secret") {
+                        Some(serde_json::Value::String(secret)) => {
+                            let strength = hmac_secret_strength(secret);
+                            if strength < MIN_HMAC_SECRET_LENGTH {
+                                errors.push(format!(
+                                    "{}.secret must be at least {} non-whitespace characters (got {})",
+                                    prefix, MIN_HMAC_SECRET_LENGTH, strength
+                                ));
+                            }
+                        }
+                        Some(_) => errors.push(format!("{}.secret must be a string", prefix)),
+                        None => {}
+                    }
+                }
+                if cred_type == "basicauth"
+                    && let Some(error) = basic_auth_credential_error(obj)
+                {
+                    errors.push(format!("{} {}", prefix, error));
+                }
+                if cred_type == "keyauth" {
+                    match obj.get("key") {
+                        Some(serde_json::Value::String(key)) if !key.trim().is_empty() => {}
+                        Some(serde_json::Value::String(_)) => {
+                            errors.push(format!("{}.key must not be empty", prefix));
+                        }
+                        Some(_) => errors.push(format!("{}.key must be a string", prefix)),
+                        None => errors.push(format!("{}.key is required", prefix)),
+                    }
+                }
                 for (key, val) in *obj {
                     if let Some(s) = val.as_str() {
                         if s.len() > MAX_CREDENTIAL_VALUE_LENGTH {
@@ -5673,9 +5958,10 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
         }
     }
 
-    if let Some(basic) = redacted.credentials.get_mut("basicauth") {
-        redact_field(basic, "password_hash");
-    }
+    // Basic credentials have a strict request/backup schema. Omit the entire
+    // credential type from ordinary Consumer responses so those responses do
+    // not expose values or return a pattern-invalid redaction placeholder.
+    redacted.credentials.remove("basicauth");
     if let Some(hmac) = redacted.credentials.get_mut("hmac_auth") {
         redact_field(hmac, "secret");
     }
@@ -5689,68 +5975,102 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     redacted
 }
 
-pub(crate) fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
-    if let Some(serde_json::Value::Array(arr)) = consumer.credentials.get_mut("basicauth") {
-        for entry in arr.iter_mut() {
-            if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
-                let hash = hash_basic_auth_password(pass).map_err(|e| {
-                    format!(
-                        "Failed to hash password for consumer {}: {}",
-                        consumer.id, e
-                    )
-                })?;
-                entry["password_hash"] = serde_json::json!(hash);
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.remove("password");
-                }
-            }
-        }
+pub fn redact_consumer_credentials_for_audit(consumer: &Consumer) -> Consumer {
+    let mut redacted = redact_consumer_credentials(consumer);
+    if consumer.credentials.contains_key("basicauth") {
+        // Audit events need to show that Basic credentials were present or
+        // changed, but must not disclose values, entry fields, or even the
+        // stored credential shape/cardinality. A single stable marker keeps
+        // the mutation visible without creating a credential side channel.
+        redacted
+            .credentials
+            .insert("basicauth".to_string(), serde_json::json!("[REDACTED]"));
+    }
+    redacted
+}
+
+pub(crate) fn hash_consumer_secrets(
+    consumer: &mut Consumer,
+) -> Result<(), BasicAuthCredentialPreparationError> {
+    if let Some(credentials) = consumer.credentials.get_mut("basicauth") {
+        hash_credential_passwords(credentials)?;
     }
 
     Ok(())
 }
 
-fn hash_basic_auth_password(password: &str) -> Result<String, String> {
+fn hash_basic_auth_password(password: &str) -> Result<String, BasicAuthCredentialPreparationError> {
+    let secret = crate::config::conf_file::resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET");
+    hash_basic_auth_password_with_secret(password, secret.as_deref())
+}
+
+pub(crate) fn hash_basic_auth_password_with_secret(
+    password: &str,
+    secret: Option<&str>,
+) -> Result<String, BasicAuthCredentialPreparationError> {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    let secret = crate::config::conf_file::resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "FERRUM_BASIC_AUTH_HMAC_SECRET must be set to hash basic-auth passwords. \
-             Set it to a unique, random value (>= 32 characters recommended)."
-                .to_string()
-        })?;
+    let secret = secret.ok_or_else(|| {
+        BasicAuthCredentialPreparationError::ServerConfiguration(
+            "FERRUM_BASIC_AUTH_HMAC_SECRET must be set to hash Basic-auth passwords".to_string(),
+        )
+    })?;
+    validate_basic_auth_hmac_secret(secret)
+        .map_err(BasicAuthCredentialPreparationError::ServerConfiguration)?;
 
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| format!("Failed to create HMAC instance: {}", e))?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|error| {
+        BasicAuthCredentialPreparationError::ServerConfiguration(format!(
+            "Failed to create HMAC instance: {error}"
+        ))
+    })?;
     mac.update(password.as_bytes());
     let hash = hex::encode(mac.finalize().into_bytes());
     Ok(format!("hmac_sha256:{}", hash))
 }
 
-pub(crate) fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<(), String> {
+pub(crate) fn hash_credential_passwords(
+    cred: &mut serde_json::Value,
+) -> Result<(), BasicAuthCredentialPreparationError> {
+    fn prepare_entry(
+        entry: &mut serde_json::Value,
+    ) -> Result<(), BasicAuthCredentialPreparationError> {
+        let object = entry.as_object().ok_or_else(|| {
+            BasicAuthCredentialPreparationError::InvalidCredential(
+                "Basic-auth credential entry must be a JSON object".to_string(),
+            )
+        })?;
+        if let Some(error) = basic_auth_credential_error(object) {
+            return Err(BasicAuthCredentialPreparationError::InvalidCredential(
+                format!("Basic-auth credential entry {error}"),
+            ));
+        }
+        let Some(password) = object.get("password").and_then(serde_json::Value::as_str) else {
+            return Ok(());
+        };
+        let hash = hash_basic_auth_password(password)?;
+        let object = entry.as_object_mut().ok_or_else(|| {
+            BasicAuthCredentialPreparationError::InvalidCredential(
+                "Basic-auth credential entry must be a JSON object".to_string(),
+            )
+        })?;
+        object.remove("password");
+        object.insert("password_hash".to_string(), serde_json::json!(hash));
+        Ok(())
+    }
+
     match cred {
-        serde_json::Value::Array(arr) => {
-            for entry in arr.iter_mut() {
-                if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
-                    let hash = hash_basic_auth_password(pass)?;
-                    entry["password_hash"] = serde_json::json!(hash);
-                    if let Some(obj) = entry.as_object_mut() {
-                        obj.remove("password");
-                    }
-                }
+        serde_json::Value::Array(entries) => {
+            for entry in entries {
+                prepare_entry(entry)?;
             }
         }
+        serde_json::Value::Object(_) => prepare_entry(cred)?,
         _ => {
-            if let Some(pass) = cred.get("password").and_then(|p| p.as_str()) {
-                let hash = hash_basic_auth_password(pass)?;
-                cred["password_hash"] = serde_json::json!(hash);
-                if let Some(obj) = cred.as_object_mut() {
-                    obj.remove("password");
-                }
-            }
+            return Err(BasicAuthCredentialPreparationError::InvalidCredential(
+                "Basic-auth credentials must be an object or array".to_string(),
+            ));
         }
     }
 

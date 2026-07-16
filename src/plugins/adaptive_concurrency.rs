@@ -12,7 +12,8 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::adaptive_concurrency::{
-    AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
+    AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimitExceeded,
+    AdaptiveConcurrencyLimiter,
 };
 use crate::plugins::{
     BackendAdmissionContext, BackendAdmissionDecision, HTTP_FAMILY_PROTOCOLS, Plugin,
@@ -21,20 +22,40 @@ use crate::plugins::{
 
 pub struct AdaptiveConcurrency {
     config: Arc<AdaptiveConcurrencyConfig>,
-    limiter: AdaptiveConcurrencyLimiter,
+    limiter: Arc<AdaptiveConcurrencyLimiter>,
+    policy_generation: u64,
 }
 
 impl AdaptiveConcurrency {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let object = config.as_object().ok_or_else(|| {
-            format!("adaptive_concurrency: config must be an object, got: {config}")
-        })?;
-        let config = Arc::new(parse_config(object)?);
+        let config = Arc::new(parse_config_value(config)?);
         Ok(Self {
             config,
-            limiter: AdaptiveConcurrencyLimiter::new(http_client.pool_shard_amount()),
+            limiter: Arc::new(AdaptiveConcurrencyLimiter::new(
+                http_client.pool_shard_amount(),
+            )),
+            policy_generation: 1,
         })
     }
+
+    pub(crate) fn with_shared_limiter(
+        config: Arc<AdaptiveConcurrencyConfig>,
+        limiter: Arc<AdaptiveConcurrencyLimiter>,
+        policy_generation: u64,
+    ) -> Self {
+        Self {
+            config,
+            limiter,
+            policy_generation,
+        }
+    }
+}
+
+pub(crate) fn parse_config_value(config: &Value) -> Result<AdaptiveConcurrencyConfig, String> {
+    let object = config
+        .as_object()
+        .ok_or_else(|| format!("adaptive_concurrency: config must be an object, got: {config}"))?;
+    parse_config(object)
 }
 
 impl Plugin for AdaptiveConcurrency {
@@ -64,25 +85,31 @@ impl Plugin for AdaptiveConcurrency {
 
     fn try_backend_admission(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         admission: &BackendAdmissionContext<'_>,
     ) -> BackendAdmissionDecision {
-        match self.limiter.try_acquire(
+        match self.limiter.try_acquire_for_generation(
             admission.proxy,
             admission.upstream_target,
             Arc::clone(&self.config),
+            self.policy_generation,
+            ctx.lb_generation,
         ) {
             Ok(permit) => BackendAdmissionDecision::Admit(permit),
-            Err(limit) => {
+            Err(AdaptiveConcurrencyLimitExceeded::TargetLimit {
+                current_in_flight,
+                limit,
+                expose_headers,
+            }) => {
                 let mut headers = HashMap::new();
-                if self.config.expose_headers {
+                if expose_headers {
                     headers.insert(
                         "x-adaptive-concurrency-limit".to_string(),
-                        limit.limit.to_string(),
+                        limit.to_string(),
                     );
                     headers.insert(
                         "x-adaptive-concurrency-inflight".to_string(),
-                        limit.current_in_flight.to_string(),
+                        current_in_flight.to_string(),
                     );
                 }
                 BackendAdmissionDecision::Reject {
@@ -91,11 +118,41 @@ impl Plugin for AdaptiveConcurrency {
                     headers,
                 }
             }
+            Err(AdaptiveConcurrencyLimitExceeded::GenerationHandoff) => {
+                BackendAdmissionDecision::Reject {
+                    status_code: 503,
+                    body: br#"{"error":"Upstream concurrency limit reached"}"#.to_vec(),
+                    headers: HashMap::new(),
+                }
+            }
         }
     }
 }
 
 fn parse_config(object: &Map<String, Value>) -> Result<AdaptiveConcurrencyConfig, String> {
+    const ALLOWED_KEYS: &[&str] = &[
+        "key_by",
+        "max_tracked_keys",
+        "min_limit",
+        "initial_limit",
+        "max_limit",
+        "min_samples",
+        "target_latency_multiplier",
+        "decrease_ratio",
+        "increase_step",
+        "shadow_mode",
+        "expose_headers",
+    ];
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "adaptive_concurrency: unknown config key '{unknown}'; allowed keys: {}",
+            ALLOWED_KEYS.join(", ")
+        ));
+    }
+
     let min_limit = optional_u64(object, "min_limit")?.unwrap_or(1);
     let initial_limit = optional_u64(object, "initial_limit")?.unwrap_or(32);
     let max_limit = optional_u64(object, "max_limit")?.unwrap_or(1024);

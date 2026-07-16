@@ -1035,10 +1035,10 @@ async fn fetch_and_install_bundle(
     store: &FederationStore,
     task_generation: u64,
 ) -> Result<bool, String> {
-    // Strip userinfo from the URL we use for logs / metrics so a
-    // credentialed endpoint (`https://user:token@host/...`) does not leak
-    // its token. The request itself still goes to the original URL via
-    // reqwest's normal handling.
+    // Reduce the URL used for logs / metrics to its origin. Credentials may
+    // appear in userinfo, paths, signed query parameters, or fragments; none
+    // of those components may reach the unauthenticated metrics surface.
+    // The request itself still goes to the original URL.
     let endpoint_for_logs = sanitize_endpoint_for_logging(endpoint);
     let request = http_client
         .get()
@@ -1122,16 +1122,12 @@ async fn read_bounded_body(
     Ok(buf)
 }
 
-/// Strip userinfo (`user:password@`) from the URL when logging. Falls back
-/// to a placeholder string if parsing fails — never returns the raw input
-/// for logs.
+/// Reduce a federation URL to its non-sensitive origin for logs and metrics.
+/// Userinfo, path, query, and fragment are discarded. Falls back to a
+/// placeholder if parsing fails and never returns the raw input.
 fn sanitize_endpoint_for_logging(endpoint: &str) -> String {
     match reqwest::Url::parse(endpoint) {
-        Ok(mut url) => {
-            let _ = url.set_username("");
-            let _ = url.set_password(None);
-            url.to_string()
-        }
+        Ok(url) => url.origin().ascii_serialization(),
         Err(_) => "<unparseable>".to_string(),
     }
 }
@@ -1988,11 +1984,17 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_endpoint_strips_userinfo() {
-        let safe = sanitize_endpoint_for_logging("https://user:token@host.example/path");
+    fn sanitize_endpoint_strips_every_credential_bearing_component() {
+        let safe = sanitize_endpoint_for_logging(
+            "https://user:token@host.example:8443/secret/path?sig=query-secret#fragment-secret",
+        );
         assert!(!safe.contains("user"), "userinfo must be stripped: {safe}");
         assert!(!safe.contains("token"), "password must be stripped: {safe}");
-        assert!(safe.contains("host.example"), "host preserved: {safe}");
+        assert!(
+            !safe.contains("secret"),
+            "path/query/fragment stripped: {safe}"
+        );
+        assert_eq!(safe, "https://host.example:8443");
     }
 
     #[test]

@@ -169,7 +169,7 @@ Multi-auth mode executes auth plugins sequentially; first success stops iteratio
 
 | # | Test | Action | Expected |
 |---|------|--------|----------|
-| 36 | Credentials redacted | GET consumer | `password_hash: "[REDACTED]"` |
+| 36 | Credentials redacted | GET consumer | `basicauth` omitted |
 | 37 | List consumers | GET /consumers | Array with >= 3 consumers |
 | 38 | Delete credential | DELETE credential, then auth | 401 (key no longer valid) |
 | 39 | Re-add credential | PUT new credential, then auth | 200 OK (new key works) |
@@ -188,7 +188,7 @@ Multi-auth mode executes auth plugins sequentially; first success stops iteratio
 | `FERRUM_PROXY_HTTP_PORT` | (random) | Proxy HTTP port |
 | `FERRUM_ADMIN_HTTP_PORT` | (random) | Admin API HTTP port |
 | `FERRUM_LOG_LEVEL` | `info` | Logging level |
-| `FERRUM_BASIC_AUTH_HMAC_SECRET` | `test-hmac-server-secret` | HMAC-SHA256 server secret for basic auth password verification |
+| `FERRUM_BASIC_AUTH_HMAC_SECRET` | `test-hmac-server-secret-0123456789abcdef` | HMAC-SHA256 server secret for basic auth password verification (≥32 bytes) |
 
 ## Key Implementation Details
 

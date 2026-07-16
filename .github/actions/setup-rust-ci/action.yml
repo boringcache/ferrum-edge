@@ -5,10 +5,11 @@ description: >-
   (strict) and the optional fast linker (best-effort), configures
   setup-fast-linker, sets up the Swatinem rust-cache, and pre-fetches crate
   dependencies.
-  sccache caches compiler outputs on the current runner only (the cache-service
-  credential is intentionally not exposed to later PR-controlled steps);
-  rust-cache restores Cargo and target directories through GitHub Actions with
-  isolated shared keys so incompatible job/profile/target artifacts do not mix.
+  sccache caches compiler outputs in a bounded local directory (the
+  cache-service credential is intentionally not exposed to later PR-controlled
+  steps); rust-cache persists that directory together with Cargo and target
+  directories using isolated shared keys so incompatible job/profile/target
+  artifacts do not mix.
   Centralizes the setup block so individual jobs only declare their cache key
   and any extra rustup components.
 
@@ -104,6 +105,7 @@ runs:
       uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         shared-key: ${{ inputs.shared-key }}
+        cache-directories: ${{ github.workspace }}/.cache/sccache
 
     - name: Pre-fetch crate dependencies (isolate transient registry flakes)
       shell: bash

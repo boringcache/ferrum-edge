@@ -69,6 +69,36 @@ async fn custom_header_empty_prefix_accepts_raw_header_value() {
 }
 
 #[tokio::test]
+async fn prefixless_authorization_location_skips_foreign_scheme() {
+    let jwks = build_rsa_jwks_from_pem(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ))
+    .to_string();
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "issuer": "https://issuer.example.com",
+                "jwks": jwks,
+                "from_headers": [{"name": "Authorization"}]
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Basic dXNlcjpwYXNz".to_string(),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_continue(result);
+    assert!(ctx.authenticated_identity.is_none());
+}
+
+#[tokio::test]
 async fn custom_header_location_strips_prefix() {
     let plugin = plugin_with_custom_locations();
     let mut ctx = make_ctx();

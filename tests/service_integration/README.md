@@ -11,7 +11,7 @@ deterministic.
 This is its own `[[test]]` crate (declared in the root `Cargo.toml`, entry point
 `mod.rs`), mirroring `tests/secrets_functional/`. It is **not** part of the
 default unit/integration/functional suites; CI runs it as the dedicated
-`test-service-integration` matrix.
+`test-service-integration` job.
 
 ## Why this suite exists
 
@@ -57,9 +57,10 @@ depend on which stream a given image logs to.
 ## CI
 
 `.github/workflows/ci.yml` job `test-service-integration` runs on
-`ubuntu-latest` (Docker available) as a matrix — one isolated job per backend so
-one backend failing does not mask another. It is wired into the `test`
-aggregation gate, so it blocks merge on failure.
+`ubuntu-latest` (Docker available). Consul and LDAP run in one nextest
+`--no-fail-fast` invocation, which preserves per-test reporting and continues
+after one backend fails without allocating a second runner. It is wired into
+the `test` aggregation gate, so it blocks merge on failure.
 
 ## Adding another external service
 
@@ -76,8 +77,8 @@ cloud-SDK variant):
    `ferrum_edge::plugins::create_plugin(name, &config)` and call the relevant
    `Plugin` hook (`authenticate` / `log` / …), or call the integration type
    directly (as `ConsulDiscoverer` is here).
-4. Add a matrix entry (`name` + `filters`) to the `test-service-integration` CI
-   job, and a row to the `test` gate summary.
+4. Add the module filter to the `test-service-integration` nextest invocation;
+   the existing job row in the `test` gate summary covers the expanded suite.
 
 ### Candidates / roadmap
 

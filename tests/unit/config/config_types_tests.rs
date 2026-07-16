@@ -1445,6 +1445,190 @@ fn test_unique_consumer_credentials_duplicate_keyauth() {
 }
 
 #[test]
+fn test_unique_consumer_credentials_duplicate_hmac_secret_is_redacted() {
+    let secret = "same-hmac-secret-at-least-32-characters";
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let errors = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("Duplicate hmac_auth shared secret"));
+    assert!(!errors[0].contains(secret));
+}
+
+#[test]
+fn test_unique_consumer_credentials_allows_hmac_rotation_within_one_consumer() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([
+            {"secret": "first-hmac-secret-at-least-32-characters"},
+            {"secret": "second-hmac-secret-at-least-32-characters"}
+        ]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![consumer];
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+}
+
+#[test]
+fn test_validate_unique_hmac_credentials_narrow_surface() {
+    let secret = "same-hmac-secret-at-least-32-characters";
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    // Unrelated keyauth collision must NOT surface through the narrow check.
+    c1.credentials
+        .insert("keyauth".into(), serde_json::json!([{"key": "same-key"}]));
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    c2.credentials
+        .insert("keyauth".into(), serde_json::json!([{"key": "same-key"}]));
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let errors = config.validate_unique_hmac_credentials().unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("Duplicate hmac_auth shared secret"));
+    assert!(!errors[0].contains(secret));
+
+    config.consumers[1].credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([{"secret": "distinct-hmac-secret-at-least-32-chars!"}]),
+    );
+    assert!(config.validate_unique_hmac_credentials().is_ok());
+}
+
+#[test]
+fn test_hmac_secret_uniqueness_and_quarantine_are_namespace_scoped() {
+    let secret = "namespace-reusable-hmac-secret-at-least-32-characters";
+    let mut tenant_a = make_consumer("shared-id", "alice");
+    tenant_a.namespace = "tenant-a".to_string();
+    tenant_a
+        .credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    let mut tenant_b = make_consumer("shared-id", "bob");
+    tenant_b.namespace = "tenant-b".to_string();
+    tenant_b
+        .credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    let mut config = empty_config();
+    config.consumers = vec![tenant_a, tenant_b];
+
+    assert!(config.validate_unique_hmac_credentials().is_ok());
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+    assert!(config.quarantine_invalid_hmac_credentials().is_empty());
+    assert!(
+        config
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("hmac_auth"))
+    );
+}
+
+#[test]
+fn test_quarantine_hmac_strips_weak_secret_and_keeps_strong() {
+    let weak = "short-secret";
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": weak}]));
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([{"secret": "strong-hmac-secret-at-least-32-characters"}]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let messages = config.quarantine_invalid_hmac_credentials();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("consumer 'c1'"));
+    assert!(!messages[0].contains(weak));
+    assert!(!config.consumers[0].has_credential("hmac_auth"));
+    assert!(config.consumers[1].has_credential("hmac_auth"));
+}
+
+#[test]
+fn test_quarantine_hmac_strips_credential_when_any_rotation_entry_is_weak() {
+    // A single weak rotation entry disables the whole credential — fail
+    // closed rather than letting the weak entry authenticate.
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([
+            {"secret": "strong-hmac-secret-at-least-32-characters"},
+            {"secret": "weak"}
+        ]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![consumer];
+
+    let messages = config.quarantine_invalid_hmac_credentials();
+    assert_eq!(messages.len(), 1);
+    assert!(!config.consumers[0].has_credential("hmac_auth"));
+}
+
+#[test]
+fn test_quarantine_hmac_strips_malformed_credentials() {
+    // Whitespace padding must not count toward the strength minimum.
+    let padded = format!("{}short{}", " ".repeat(20), " ".repeat(20));
+    let shapes = [
+        serde_json::json!([{"secret": 12345}]),
+        serde_json::json!([]),
+        serde_json::json!({"secret": "not-an-array-secret-at-least-32-chars!"}),
+        serde_json::json!([{"no_secret": true}]),
+        serde_json::json!([{
+            "secret": "strong-hmac-secret-at-least-32-characters",
+            "unexpected": true
+        }]),
+        serde_json::json!([{"secret": padded}]),
+    ];
+    for shape in shapes {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer
+            .credentials
+            .insert("hmac_auth".into(), shape.clone());
+        let mut config = empty_config();
+        config.consumers = vec![consumer];
+
+        let messages = config.quarantine_invalid_hmac_credentials();
+        assert_eq!(messages.len(), 1, "shape not quarantined: {shape}");
+        assert!(!config.consumers[0].credentials.contains_key("hmac_auth"));
+    }
+}
+
+#[test]
+fn test_quarantine_hmac_duplicate_secret_first_loaded_consumer_wins() {
+    let secret = "same-hmac-secret-at-least-32-characters";
+    let mut c1 = make_consumer("c1", "alice");
+    // Intra-consumer rotation reuse of one secret is allowed.
+    c1.credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([{"secret": secret}, {"secret": secret}]),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let messages = config.quarantine_invalid_hmac_credentials();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("consumer 'c2'"));
+    assert!(messages[0].contains("consumer 'c1'"));
+    assert!(!messages[0].contains(secret));
+    assert!(config.consumers[0].has_credential("hmac_auth"));
+    assert!(!config.consumers[1].has_credential("hmac_auth"));
+}
+
+#[test]
 fn test_unique_consumer_credentials_no_keyauth_ok() {
     // Consumers without keyauth credentials should not conflict
     let c1 = make_consumer("c1", "alice");
@@ -1969,6 +2153,42 @@ fn test_validate_fields_accepts_valid_jwt_secret() {
         serde_json::json!([{"secret": "this-is-a-valid-jwt-secret-key-32chars"}]),
     );
     assert!(c.validate_fields().is_ok());
+}
+
+#[test]
+fn test_validate_fields_rejects_malformed_or_weak_hmac_secrets() {
+    for credential in [
+        serde_json::json!({}),
+        serde_json::json!({"secret": null}),
+        serde_json::json!({"secret": 42}),
+        serde_json::json!({"secret": ""}),
+        serde_json::json!({"secret": "                                "}),
+        serde_json::json!({"secret": "short-secret"}),
+        serde_json::json!({"secret": "valid-hmac-secret-at-least-32-characters", "extra": true}),
+    ] {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer
+            .credentials
+            .insert("hmac_auth".into(), serde_json::json!([credential]));
+        assert!(
+            consumer.validate_fields().is_err(),
+            "malformed HMAC credential must fail closed: {:?}",
+            consumer.credentials["hmac_auth"]
+        );
+    }
+}
+
+#[test]
+fn test_validate_fields_accepts_strong_hmac_rotation_entries() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([
+            {"secret": "first-hmac-secret-at-least-32-characters"},
+            {"secret": "second-hmac-secret-at-least-32-characters"}
+        ]),
+    );
+    assert!(consumer.validate_fields().is_ok());
 }
 
 #[test]
@@ -2939,7 +3159,7 @@ fn test_plugin_config_priority_override_serde_roundtrip() {
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
@@ -2961,7 +3181,7 @@ fn test_plugin_config_priority_override_absent_in_json() {
     let json = r#"{
         "id": "pc1",
         "plugin_name": "cors",
-        "config": {},
+        "config": {"allowed_origins": ["*"]},
         "scope": "global",
         "enabled": true
     }"#;
@@ -2974,7 +3194,7 @@ fn test_plugin_config_priority_override_null_in_json() {
     let json = r#"{
         "id": "pc1",
         "plugin_name": "cors",
-        "config": {},
+        "config": {"allowed_origins": ["*"]},
         "scope": "global",
         "enabled": true,
         "priority_override": null
@@ -2990,7 +3210,7 @@ fn test_validate_plugin_references_rejects_global_plugin_association() {
         id: "pc1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
@@ -3050,7 +3270,7 @@ fn test_validate_plugin_references_accepts_proxy_group_association() {
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::ProxyGroup,
         proxy_id: None,
         enabled: true,
@@ -3076,7 +3296,7 @@ fn test_validate_plugin_references_proxy_group_shared_across_proxies() {
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::ProxyGroup,
         proxy_id: None,
         enabled: true,
@@ -3106,7 +3326,7 @@ fn test_validate_plugin_references_rejects_proxy_group_with_proxy_id() {
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::ProxyGroup,
         proxy_id: Some("p1".into()), // Invalid: proxy_group must not have proxy_id
         enabled: true,
@@ -3130,7 +3350,7 @@ fn test_plugin_scope_proxy_group_serde_round_trip() {
         id: "pg1".into(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
-        config: serde_json::json!({}),
+        config: serde_json::json!({"allowed_origins": ["*"]}),
         scope: PluginScope::ProxyGroup,
         proxy_id: None,
         enabled: true,

@@ -3631,6 +3631,11 @@ fn provider_circuit_threshold_cooldown_and_half_open_recovery_are_deterministic(
     );
 }
 
+#[test]
+fn cancelled_half_open_provider_attempt_releases_probe_slot() {
+    assert!(test_helpers::cancelled_half_open_probe_is_released_for_test());
+}
+
 #[tokio::test]
 async fn all_open_provider_circuits_fail_fast_and_reload_replaces_state() {
     let primary = MockServer::start().await;

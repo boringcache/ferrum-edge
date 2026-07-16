@@ -185,6 +185,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: "release-${{ matrix.target }}"
+          cache-directories: ${{ github.workspace }}/.cache/sccache
 
       - name: Install protoc and build dependencies (Linux)
         if: runner.os == 'Linux'

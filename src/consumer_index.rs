@@ -13,6 +13,10 @@ pub(crate) struct ConsumerIndexInner {
     keyauth_index: HashMap<String, Arc<Consumer>>,
     basic_index: HashMap<String, Arc<Consumer>>,
     identity_index: HashMap<String, Arc<Consumer>>,
+    /// Namespace-scoped identity index for HMAC authentication. HMAC secrets
+    /// may be reused across namespaces, so the verifier must never resolve a
+    /// signed identity through the process-global JWT/JWKS identity map.
+    hmac_identity_index: HashMap<String, HashMap<String, Arc<Consumer>>>,
     /// mTLS identity index: maps `mtls_auth.identity` -> Consumer for O(1) cert-based auth.
     mtls_index: HashMap<String, Arc<Consumer>>,
     /// DNS SAN identities use RFC case-insensitive matching. Keys are normalized at reload time.
@@ -44,6 +48,7 @@ struct IndexMaps {
     keyauth: HashMap<String, Arc<Consumer>>,
     basic: HashMap<String, Arc<Consumer>>,
     identity: HashMap<String, Arc<Consumer>>,
+    hmac_identity: HashMap<String, HashMap<String, Arc<Consumer>>>,
     mtls: HashMap<String, Arc<Consumer>>,
     mtls_dns: HashMap<String, Arc<Consumer>>,
     all: Vec<Arc<Consumer>>,
@@ -126,6 +131,12 @@ impl ConsumerIndex {
         self.with_inner(|inner| inner.find_by_identity(identity))
     }
 
+    /// O(1) namespace-scoped HMAC lookup by Consumer username, ID, or custom ID.
+    /// No composite-key allocation occurs on the request path.
+    pub fn find_hmac_by_identity(&self, namespace: &str, identity: &str) -> Option<Arc<Consumer>> {
+        self.with_inner(|inner| inner.find_hmac_by_identity(namespace, identity))
+    }
+
     /// O(1) lookup by mTLS identity (for mtls_auth plugin). No allocation.
     pub fn find_by_mtls_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
         self.with_inner(|inner| inner.find_by_mtls_identity(identity))
@@ -161,6 +172,7 @@ impl ConsumerIndex {
         let mut keyauth = current.keyauth_index.clone();
         let mut basic = current.basic_index.clone();
         let mut identity = current.identity_index.clone();
+        let mut hmac_identity = current.hmac_identity_index.clone();
         let mut mtls = current.mtls_index.clone();
         let mut mtls_dns = current.mtls_dns_index.clone();
         let mut all: Vec<Arc<Consumer>> = current.all_consumers.as_ref().clone();
@@ -184,6 +196,7 @@ impl ConsumerIndex {
             let mut old_keyauth_keys: Vec<String> = Vec::new();
             let mut old_basic_keys: Vec<String> = Vec::new();
             let mut old_identity_keys: Vec<String> = Vec::new();
+            let mut old_hmac_identity_keys: Vec<(String, String)> = Vec::new();
             let mut old_mtls_keys: Vec<String> = Vec::new();
             let mut old_mtls_dns_keys: Vec<String> = Vec::new();
 
@@ -217,6 +230,15 @@ impl ConsumerIndex {
                 if let Some(ref custom_id) = consumer.custom_id {
                     old_identity_keys.push(custom_id.clone());
                 }
+                if !consumer.credential_entries("hmac_auth").is_empty() {
+                    old_hmac_identity_keys
+                        .push((consumer.namespace.clone(), consumer.username.clone()));
+                    old_hmac_identity_keys.push((consumer.namespace.clone(), consumer.id.clone()));
+                    if let Some(custom_id) = consumer.custom_id.as_ref() {
+                        old_hmac_identity_keys
+                            .push((consumer.namespace.clone(), custom_id.clone()));
+                    }
+                }
             }
 
             // O(1) removals from credential indexes using collected keys
@@ -242,6 +264,15 @@ impl ConsumerIndex {
                     identity.remove(key);
                 }
             }
+            for (namespace, key) in &old_hmac_identity_keys {
+                if let Some(namespace_index) = hmac_identity.get_mut(namespace)
+                    && let Some(existing) = namespace_index.get(key)
+                    && ids_to_remove.contains(existing.id.as_str())
+                {
+                    namespace_index.remove(key);
+                }
+            }
+            hmac_identity.retain(|_, namespace_index| !namespace_index.is_empty());
             for key in &old_mtls_keys {
                 if let Some(existing) = mtls.get(key)
                     && ids_to_remove.contains(existing.id.as_str())
@@ -265,11 +296,13 @@ impl ConsumerIndex {
                 &mut keyauth,
                 &mut basic,
                 &mut identity,
+                &mut hmac_identity,
                 &mut mtls,
                 &mut mtls_dns,
                 &old_keyauth_keys,
                 &old_basic_keys,
                 &old_identity_keys,
+                &old_hmac_identity_keys,
                 &old_mtls_keys,
                 &old_mtls_dns_keys,
             );
@@ -308,6 +341,7 @@ impl ConsumerIndex {
             if let Some(ref custom_id) = consumer.custom_id {
                 identity.insert(custom_id.clone(), Arc::clone(&arc_consumer));
             }
+            Self::insert_hmac_identities(&mut hmac_identity, &arc_consumer);
         }
 
         // Apply jwt/hmac credential count deltas
@@ -319,6 +353,7 @@ impl ConsumerIndex {
             keyauth_index: keyauth,
             basic_index: basic,
             identity_index: identity,
+            hmac_identity_index: hmac_identity,
             mtls_index: mtls,
             mtls_dns_index: mtls_dns,
             all_consumers: Arc::new(all),
@@ -360,6 +395,7 @@ impl ConsumerIndex {
         let mut mtls_dns = HashMap::with_capacity(consumers.len());
         // identity has up to 3 entries per consumer (username, id, custom_id)
         let mut identity = HashMap::with_capacity(consumers.len() * 3);
+        let mut hmac_identity = HashMap::new();
         let mut all = Vec::with_capacity(consumers.len());
         let mut jwt_count: usize = 0;
         let mut hmac_count: usize = 0;
@@ -378,8 +414,8 @@ impl ConsumerIndex {
                     let prev = keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
                     if let Some(existing) = prev {
                         warn!(
-                            "Credential collision: keyauth key '{}' for consumer '{}' overwrites consumer '{}'",
-                            key, consumer.id, existing.id
+                            "Credential collision: keyauth credential for consumer '{}' overwrites consumer '{}'",
+                            consumer.id, existing.id
                         );
                     }
                 }
@@ -441,17 +477,43 @@ impl ConsumerIndex {
                     );
                 }
             }
+            Self::insert_hmac_identities(&mut hmac_identity, &arc_consumer);
         }
 
         IndexMaps {
             keyauth,
             basic,
             identity,
+            hmac_identity,
             mtls,
             mtls_dns,
             all,
             jwt_count,
             hmac_count,
+        }
+    }
+
+    fn insert_hmac_identities(
+        index: &mut HashMap<String, HashMap<String, Arc<Consumer>>>,
+        consumer: &Arc<Consumer>,
+    ) {
+        if consumer.credential_entries("hmac_auth").is_empty() {
+            return;
+        }
+        let namespace_index = index.entry(consumer.namespace.clone()).or_default();
+        for identity in std::iter::once(consumer.username.as_str())
+            .chain(std::iter::once(consumer.id.as_str()))
+            .chain(consumer.custom_id.as_deref())
+        {
+            let previous = namespace_index.insert(identity.to_string(), Arc::clone(consumer));
+            if let Some(existing) = previous
+                && existing.id != consumer.id
+            {
+                warn!(
+                    "Credential collision: hmac_auth identity '{}' for consumer '{}' overwrites consumer '{}' in namespace '{}'",
+                    identity, consumer.id, existing.id, consumer.namespace
+                );
+            }
         }
     }
 
@@ -461,23 +523,30 @@ impl ConsumerIndex {
         keyauth: &mut HashMap<String, Arc<Consumer>>,
         basic: &mut HashMap<String, Arc<Consumer>>,
         identity: &mut HashMap<String, Arc<Consumer>>,
+        hmac_identity: &mut HashMap<String, HashMap<String, Arc<Consumer>>>,
         mtls: &mut HashMap<String, Arc<Consumer>>,
         mtls_dns: &mut HashMap<String, Arc<Consumer>>,
         keyauth_keys: &[String],
         basic_keys: &[String],
         identity_keys: &[String],
+        hmac_identity_keys: &[(String, String)],
         mtls_keys: &[String],
         mtls_dns_keys: &[String],
     ) {
         let keyauth_keys: HashSet<&str> = keyauth_keys.iter().map(String::as_str).collect();
         let basic_keys: HashSet<&str> = basic_keys.iter().map(String::as_str).collect();
         let identity_keys: HashSet<&str> = identity_keys.iter().map(String::as_str).collect();
+        let hmac_identity_keys: HashSet<(&str, &str)> = hmac_identity_keys
+            .iter()
+            .map(|(namespace, identity)| (namespace.as_str(), identity.as_str()))
+            .collect();
         let mtls_keys: HashSet<&str> = mtls_keys.iter().map(String::as_str).collect();
         let mtls_dns_keys: HashSet<&str> = mtls_dns_keys.iter().map(String::as_str).collect();
 
         if keyauth_keys.is_empty()
             && basic_keys.is_empty()
             && identity_keys.is_empty()
+            && hmac_identity_keys.is_empty()
             && mtls_keys.is_empty()
             && mtls_dns_keys.is_empty()
         {
@@ -511,6 +580,22 @@ impl ConsumerIndex {
                 identity.insert(custom_id.clone(), Arc::clone(consumer));
             }
 
+            if !consumer.credential_entries("hmac_auth").is_empty() {
+                for hmac_identity_value in std::iter::once(consumer.username.as_str())
+                    .chain(std::iter::once(consumer.id.as_str()))
+                    .chain(consumer.custom_id.as_deref())
+                {
+                    if hmac_identity_keys
+                        .contains(&(consumer.namespace.as_str(), hmac_identity_value))
+                    {
+                        hmac_identity
+                            .entry(consumer.namespace.clone())
+                            .or_default()
+                            .insert(hmac_identity_value.to_string(), Arc::clone(consumer));
+                    }
+                }
+            }
+
             for mtls_creds in consumer.credential_entries("mtls_auth") {
                 if let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
                     if mtls_keys.contains(id) {
@@ -532,6 +617,7 @@ impl ConsumerIndexInner {
             keyauth_index: maps.keyauth,
             basic_index: maps.basic,
             identity_index: maps.identity,
+            hmac_identity_index: maps.hmac_identity,
             mtls_index: maps.mtls,
             mtls_dns_index: maps.mtls_dns,
             all_consumers: Arc::new(maps.all),
@@ -553,6 +639,13 @@ impl ConsumerIndexInner {
     /// O(1) lookup by username or ID (for jwt_auth/jwks_auth claim matching). No allocation.
     pub fn find_by_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
         self.identity_index.get(identity).cloned()
+    }
+
+    pub fn find_hmac_by_identity(&self, namespace: &str, identity: &str) -> Option<Arc<Consumer>> {
+        self.hmac_identity_index
+            .get(namespace)
+            .and_then(|namespace_index| namespace_index.get(identity))
+            .cloned()
     }
 
     /// O(1) lookup by mTLS identity (for mtls_auth plugin). No allocation.

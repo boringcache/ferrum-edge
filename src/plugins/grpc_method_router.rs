@@ -2,10 +2,9 @@
 //!
 //! Adds gRPC method-aware proxying capabilities:
 //! - Parses the gRPC path (`/package.Service/Method`) to extract service and method names
-//! - Per-method access control (allow/deny lists)
-//! - Per-method rate limiting with token bucket algorithm
+//! - Enforces access control and rate limits against the backend-effective method
 //! - Populates `grpc_service`, `grpc_method`, and `grpc_full_method` metadata
-//!   for downstream plugins (logging, rate limiting, tracing)
+//!   from that finalized method for downstream response phases
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -19,7 +18,8 @@ use super::utils::rate_limit::{
     RateLimitWindowSpec,
 };
 use super::{
-    GRPC_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
+    BackendPathPolicyPhase, GRPC_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult,
+    ProxyProtocol, RequestContext,
 };
 
 /// Maximum rate-limit state entries before triggering stale eviction.
@@ -267,14 +267,40 @@ fn is_valid_grpc_identifier(value: &str) -> bool {
 fn parse_grpc_path(path: &str) -> Option<(&str, &str)> {
     let path = path.strip_prefix('/')?;
     let (service, method) = path.split_once('/')?;
-    if service.is_empty() || method.is_empty() {
-        return None;
-    }
-    // Method should not contain additional slashes
-    if method.contains('/') {
+    if !is_valid_grpc_service(service) || !is_valid_grpc_identifier(method) {
         return None;
     }
     Some((service, method))
+}
+
+fn grpc_method_metadata(path: &str) -> Option<(String, String, String)> {
+    let (service, method) = parse_grpc_path(path)?;
+    let mut full_method = String::with_capacity(service.len() + 1 + method.len());
+    full_method.push_str(service);
+    full_method.push('/');
+    full_method.push_str(method);
+    Some((service.to_string(), method.to_string(), full_method))
+}
+
+/// Replace the provisional/client-path gRPC metadata as one request-local
+/// operation. `RequestContext` is exclusively borrowed here, so downstream
+/// phases observe either the refreshed method or no gRPC method fields when
+/// the backend-effective path is invalid; stale client-path values cannot
+/// survive a rewrite.
+fn refresh_grpc_method_metadata(
+    ctx: &mut RequestContext,
+    metadata: Option<(String, String, String)>,
+) {
+    ctx.metadata.remove("grpc_service");
+    ctx.metadata.remove("grpc_method");
+    ctx.metadata.remove("grpc_full_method");
+
+    if let Some((service, method, full_method)) = metadata {
+        ctx.metadata.insert("grpc_service".to_string(), service);
+        ctx.metadata.insert("grpc_method".to_string(), method);
+        ctx.metadata
+            .insert("grpc_full_method".to_string(), full_method);
+    }
 }
 
 /// Returns a header map with `content-type: application/grpc`.
@@ -311,19 +337,13 @@ impl Plugin for GrpcMethodRouter {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        // Parse the gRPC path and populate metadata
-        if let Some((service, method)) = parse_grpc_path(&ctx.path) {
-            let mut full_method = String::with_capacity(service.len() + 1 + method.len());
-            full_method.push_str(service);
-            full_method.push('/');
-            full_method.push_str(method);
-            ctx.metadata
-                .insert("grpc_service".to_string(), service.to_string());
-            ctx.metadata
-                .insert("grpc_method".to_string(), method.to_string());
-            ctx.metadata
-                .insert("grpc_full_method".to_string(), full_method);
-        } else {
+        // Populate provisional metadata for early downstream consumers. The
+        // authoritative method is refreshed and enforced only after routing,
+        // rewrites, prefix stripping, and target selection are complete.
+        let metadata = grpc_method_metadata(&ctx.path);
+        let method_is_valid = metadata.is_some();
+        refresh_grpc_method_metadata(ctx, metadata);
+        if !method_is_valid {
             debug!(
                 path = %ctx.path,
                 plugin = "grpc_method_router",
@@ -333,43 +353,35 @@ impl Plugin for GrpcMethodRouter {
         PluginResult::Continue
     }
 
-    async fn before_proxy(
+    fn requires_backend_path_resolution(&self) -> bool {
+        true
+    }
+
+    async fn on_backend_path_resolved(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        backend_path: &str,
+        phase: BackendPathPolicyPhase,
     ) -> PluginResult {
-        // Borrow as &str — avoids a String clone on every gRPC request.
-        // HashSet::contains and HashMap::get both accept &str via Borrow<str>.
-        let full_method: &str = match ctx.metadata.get("grpc_full_method") {
-            Some(m) => m.as_str(),
+        let metadata = grpc_method_metadata(backend_path);
+        refresh_grpc_method_metadata(ctx, metadata);
+        let full_method = match ctx.metadata.get("grpc_full_method") {
+            Some(method) => method.as_str(),
             None => {
-                // Path wasn't parseable as gRPC (on_request_received left
-                // grpc_full_method unset). Deny-list and rate-limit policies are
-                // additive — an unparseable path matches no entry, so there is
-                // nothing to enforce and the request continues. An allow-list,
-                // however, is deny-by-default: only explicitly listed methods may
-                // pass. A request whose :path cannot be parsed (and so could never
-                // match an allow entry) must FAIL CLOSED rather than slip past the
-                // gate. The 403 is normalized to a trailers-only gRPC
-                // PERMISSION_DENIED error by the proxy's reject handling.
-                if self.allow_methods.is_some() {
-                    debug!(
-                        path = %ctx.path,
-                        plugin = "grpc_method_router",
-                        "Rejecting gRPC request with unparseable method path under allow-list"
-                    );
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body: grpc_json_error_body(
-                            "gRPC method path could not be parsed".to_string(),
-                        ),
-                        headers: grpc_content_type_header(),
-                    };
-                }
-                return PluginResult::Continue;
+                debug!(
+                    path = %backend_path,
+                    plugin = "grpc_method_router",
+                    "Rejecting gRPC request with invalid backend-effective method path"
+                );
+                return PluginResult::Reject {
+                    status_code: 403,
+                    body: grpc_json_error_body(
+                        "backend-effective gRPC method path could not be parsed".to_string(),
+                    ),
+                    headers: grpc_content_type_header(),
+                };
             }
         };
-
         // Check deny list first (deny wins over allow)
         if self.deny_methods.contains(full_method) {
             debug!(
@@ -400,7 +412,15 @@ impl Plugin for GrpcMethodRouter {
             };
         }
 
-        // Check per-method rate limits
+        // A deferred routing-header hook performs external work and can return
+        // values that would normally change target selection. Preview access
+        // rules first; the proxy pins that target across the hook, then charges
+        // stateful policy once so one request cannot consume two method buckets.
+        if matches!(phase, BackendPathPolicyPhase::Preview) {
+            return PluginResult::Continue;
+        }
+
+        // Check per-method rate limits on the pinned selected method.
         if let Some(spec) = self.method_rate_limits.get(full_method) {
             let key = self.rate_key(ctx, full_method);
             let outcome = self.check_rate(&key, spec).await;

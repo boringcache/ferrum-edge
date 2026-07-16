@@ -14,9 +14,8 @@ on:
 permissions:
   contents: read
 
-# Cancel a superseded PR/main run on rapid re-push — its CI mirror is
-# cancelled with the CI run that spawned it, so nothing reads the stale run.
-# Manual dispatches share one lane and run to completion.
+# Cancel a superseded PR/main run on rapid re-push. Manual dispatches share one
+# lane and run to completion.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('mesh-e2e-sidecar-live-pr-{0}', github.event.pull_request.number) || (github.event_name == 'push' && format('mesh-e2e-sidecar-live-{0}', github.ref) || 'mesh-e2e-sidecar-live-shared') }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
@@ -204,3 +203,40 @@ jobs:
       - name: Delete kind cluster
         if: always()
         run: kind delete cluster --name "$CLUSTER" || true
+
+  gate:
+    name: Mesh E2E Sidecar Live
+    needs:
+      - changes
+      - mesh-e2e-sidecar-live
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize mesh e2e sidecar live result
+        run: |
+          {
+            echo "## Mesh E2E Sidecar Live"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" = "false" ]; then
+            echo "Skipped live datapath validation: no mesh sidecar, identity, proxy, JWT plugin, GA-contract, image, proto, documentation, configuration, or CI workflow surfaces changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${{ needs.changes.outputs.relevant }}" != "true" ]; then
+            echo "Change detection returned an invalid relevance result: ${{ needs.changes.outputs.relevant }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.mesh-e2e-sidecar-live.result }}" != "success" ]; then
+            echo "Live datapath validation failed or did not complete: ${{ needs.mesh-e2e-sidecar-live.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Live datapath validation passed." >> "$GITHUB_STEP_SUMMARY"

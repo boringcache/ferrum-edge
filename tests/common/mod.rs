@@ -74,5 +74,6 @@ pub use gateway_harness::{
     ensure_gateway_built, explicit_test_binary, shutdown_gateway_child,
 };
 pub use hmac_helpers::{
-    empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_query,
+    empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_digest,
+    generate_hmac_signature_with_query, hmac_authority_from_url,
 };

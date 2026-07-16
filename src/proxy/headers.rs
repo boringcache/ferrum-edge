@@ -373,6 +373,22 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
     }
 }
 
+/// Append a cookie to the proxy's newline-separated multi-value representation.
+/// [`apply_response_headers`] emits each line as a distinct `Set-Cookie` field.
+pub fn append_set_cookie_header(
+    headers: &mut std::collections::HashMap<String, String>,
+    cookie: String,
+) {
+    if let Some(existing) = headers.get_mut("set-cookie") {
+        if !existing.is_empty() {
+            existing.push('\n');
+        }
+        existing.push_str(&cookie);
+    } else {
+        headers.insert("set-cookie".to_string(), cookie);
+    }
+}
+
 /// Apply a response-header map onto a response builder, emitting each
 /// newline-separated `set-cookie` value as its own header line.
 ///

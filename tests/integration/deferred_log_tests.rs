@@ -29,7 +29,7 @@ use http_body::Body as _;
 
 use ferrum_edge::plugins::{
     Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
-    create_response_stream_inspector,
+    create_plugin, create_response_stream_inspector, log_with_mirror_before_buffered_response,
 };
 use ferrum_edge::proxy::ProxyBody;
 use ferrum_edge::proxy::deferred_log::{BodyOutcome, DeferredTransactionLogger};
@@ -76,6 +76,13 @@ struct StreamTerminationCapturingPlugin {
 }
 
 struct PassthroughInspector;
+
+struct OrderedLogPlugin {
+    label: &'static str,
+    events: Arc<Mutex<Vec<&'static str>>>,
+    started: Option<Arc<tokio::sync::Notify>>,
+    release: Option<Arc<tokio::sync::Notify>>,
+}
 
 #[async_trait]
 impl ResponseStreamInspector for PassthroughInspector {
@@ -125,6 +132,24 @@ impl Plugin for StreamTerminationCapturingPlugin {
     async fn log(&self, summary: &TransactionSummary) {
         self.summaries.lock().unwrap().push(summary.clone());
         self.events.lock().unwrap().push("log");
+    }
+}
+
+#[async_trait]
+impl Plugin for OrderedLogPlugin {
+    fn name(&self) -> &str {
+        self.label
+    }
+
+    async fn log(&self, _summary: &TransactionSummary) {
+        self.events.lock().unwrap().push(self.label);
+        if let Some(started) = &self.started {
+            started.notify_one();
+        }
+        if let Some(release) = &self.release {
+            release.notified().await;
+            self.events.lock().unwrap().push("first-finished");
+        }
     }
 }
 
@@ -202,6 +227,107 @@ async fn wait_for_events(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn buffered_logging_without_deadline_awaits_plugins_sequentially() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(OrderedLogPlugin {
+            label: "first-started",
+            events: Arc::clone(&events),
+            started: Some(Arc::clone(&started)),
+            release: Some(Arc::clone(&release)),
+        }),
+        Arc::new(OrderedLogPlugin {
+            label: "second-started",
+            events: Arc::clone(&events),
+            started: None,
+            release: None,
+        }),
+    ];
+    let summary = make_summary_with_status(200);
+    let ctx = make_ctx();
+
+    let log_task = tokio::spawn(async move {
+        log_with_mirror_before_buffered_response(&plugins, summary, &ctx).await;
+    });
+    started.notified().await;
+
+    assert!(
+        !log_task.is_finished(),
+        "the caller must await the first hook"
+    );
+    assert_eq!(events.lock().unwrap().as_slice(), ["first-started"]);
+
+    release.notify_one();
+    log_task.await.expect("buffered log task joined");
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["first-started", "first-finished", "second-started"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deadline_buffered_logging_does_not_await_a_blocked_sink() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(OrderedLogPlugin {
+        label: "deadline-log-started",
+        events: Arc::clone(&events),
+        started: Some(Arc::clone(&started)),
+        release: Some(Arc::clone(&release)),
+    })];
+    let summary = make_summary_with_status(200);
+    let mut ctx = make_ctx();
+    ferrum_edge::_test_support::set_grpc_deadline_budget_for_test(&mut ctx, Some(5_000));
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        log_with_mirror_before_buffered_response(&plugins, summary, &ctx),
+    )
+    .await
+    .expect("deadline-bearing response must not await the blocked log sink");
+
+    started.notified().await;
+    assert_eq!(events.lock().unwrap().as_slice(), ["deadline-log-started"]);
+    release.notify_one();
+    assert_eq!(
+        wait_for_events(&events, 2).await.as_slice(),
+        ["deadline-log-started", "first-finished"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_terminal_logging_is_spawned_after_body_completion() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let plugin: Arc<dyn Plugin> = Arc::new(OrderedLogPlugin {
+        label: "stream-log-started",
+        events: Arc::clone(&events),
+        started: Some(Arc::clone(&started)),
+        release: Some(Arc::clone(&release)),
+    });
+    let logger = DeferredTransactionLogger::new(
+        make_summary_with_status(200),
+        Arc::new(vec![plugin]),
+        make_ctx(),
+    );
+
+    logger.fire(BodyOutcome::success(64));
+    started.notified().await;
+    assert_eq!(events.lock().unwrap().as_slice(), ["stream-log-started"]);
+
+    release.notify_one();
+    let completed = wait_for_events(&events, 2).await;
+    assert_eq!(
+        completed.as_slice(),
+        ["stream-log-started", "first-finished"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn success_outcome_populates_body_fields() {
     let (plugin, captured) = CapturingPlugin::new();
     let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
@@ -264,6 +390,41 @@ async fn fire_invokes_response_stream_termination_before_log() {
         Some("before_summary_log"),
         "metadata written by the terminal hook must reach TransactionSummary"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_grpc_deadline_still_runs_stream_cleanup_before_log() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status = Arc::new(Mutex::new(None));
+    let outcome = Arc::new(Mutex::new(None));
+    let summaries = Arc::new(Mutex::new(Vec::new()));
+    let deadline_plugin = create_plugin(
+        "grpc_deadline",
+        &serde_json::json!({ "default_deadline_ms": 1 }),
+    )
+    .unwrap()
+    .unwrap();
+    let capturing_plugin: Arc<dyn Plugin> = Arc::new(StreamTerminationCapturingPlugin {
+        events: events.clone(),
+        status,
+        outcome,
+        summaries,
+    });
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![deadline_plugin, capturing_plugin]);
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(matches!(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(plugins.as_slice(), &mut ctx,),
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let logger = DeferredTransactionLogger::new(make_summary_with_status(200), plugins, ctx);
+
+    logger.fire(BodyOutcome::error(ErrorClass::ReadWriteTimeout, 0, false));
+
+    let events = wait_for_events(&events, 2).await;
+    assert_eq!(events.as_slice(), ["stream_terminated", "log"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -600,4 +761,217 @@ async fn unpolled_empty_streaming_body_is_not_client_disconnect() {
         "Drop path treats never-polled streaming bodies as successful completion"
     );
     assert_eq!(got.bytes_received, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_deadline_terminal_data_logs_deadline_exceeded() {
+    use futures_util::stream;
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(200);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    let inner = StreamBody::new(stream::pending::<
+        Result<Frame<Bytes>, ferrum_edge::proxy::body::ProxyBodyError>,
+    >());
+    let body = ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(inner));
+    let deadline = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("one second before now is representable");
+    let mut body = ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test(
+        body,
+        deadline,
+        Some("application/grpc-web+proto"),
+    )
+    .with_logger(logger);
+
+    let frame = body
+        .frame()
+        .await
+        .expect("deadline must emit a terminal gRPC-Web DATA frame")
+        .expect("terminal deadline frame must be readable");
+    let data = frame
+        .data_ref()
+        .expect("gRPC-Web terminal metadata is encoded as DATA");
+    assert!(!data.is_empty());
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "terminal DATA must fire one log entry");
+    let got = &captures[0];
+    assert!(got.body_completed);
+    assert!(!got.client_disconnected);
+    assert!(got.body_error_class.is_none());
+    assert_eq!(got.bytes_received, data.len() as u64);
+    assert_eq!(
+        got.metadata.get("grpc_status").map(String::as_str),
+        Some("4"),
+        "the delivered terminal gRPC-Web frame must log DEADLINE_EXCEEDED"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_deadline_after_partial_data_logs_deadline_exceeded() {
+    use futures_util::StreamExt as _;
+    use futures_util::stream;
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(200);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    let source = stream::once(async {
+        Ok::<_, ferrum_edge::proxy::body::ProxyBodyError>(Frame::data(Bytes::from_static(
+            b"partial response",
+        )))
+    })
+    .chain(stream::pending());
+    let body = ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(
+        StreamBody::new(source),
+    ));
+    let deadline = tokio::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(1))
+        .expect("one second after now is representable");
+    let mut body = ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test(
+        body, deadline, None,
+    )
+    .with_logger(logger);
+
+    let data = body
+        .frame()
+        .await
+        .expect("the first DATA frame must remain visible")
+        .expect("the first DATA frame must be readable");
+    assert_eq!(
+        data.data_ref().map(Bytes::as_ref),
+        Some(&b"partial response"[..])
+    );
+    tokio::time::sleep_until(deadline).await;
+    assert!(
+        body.frame()
+            .await
+            .expect("a partial native gRPC response must terminate with an error")
+            .is_err(),
+        "deadline after DATA must surface a terminal body error"
+    );
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1);
+    let got = &captures[0];
+    assert!(!got.body_completed);
+    assert!(got.client_disconnected);
+    assert_eq!(got.body_error_class, Some(ErrorClass::ClientDisconnect));
+    assert_eq!(got.bytes_received, b"partial response".len() as u64);
+    assert_eq!(
+        got.metadata.get("grpc_status").map(String::as_str),
+        Some("4"),
+        "a deadline error after partial DATA must log DEADLINE_EXCEEDED"
+    );
+}
+
+struct HoldingResponseInspector {
+    saw_backend_chunk: Arc<tokio::sync::Notify>,
+    dropped: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ResponseStreamInspector for HoldingResponseInspector {
+    async fn on_chunk(&mut self, _chunk: &[u8]) -> ResponseStreamAction {
+        self.saw_backend_chunk.notify_one();
+        std::future::pending::<ResponseStreamAction>().await
+    }
+}
+
+impl Drop for HoldingResponseInspector {
+    fn drop(&mut self) {
+        self.dropped.notify_one();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_deadline_uses_bytes_emitted_after_stream_inspection() {
+    use futures_util::StreamExt as _;
+    use futures_util::stream;
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let source = stream::once(async {
+        Ok::<_, ferrum_edge::proxy::body::ProxyBodyError>(Frame::data(Bytes::from_static(
+            b"backend bytes held by inspector",
+        )))
+    })
+    .chain(stream::pending());
+    let backend_body = ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(
+        StreamBody::new(source),
+    ));
+    let saw_backend_chunk = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(tokio::sync::Notify::new());
+    let dropped_notified = dropped.notified();
+    let inspected = ferrum_edge::_test_support::inspected_proxy_body_for_test(
+        backend_body,
+        Box::new(HoldingResponseInspector {
+            saw_backend_chunk: Arc::clone(&saw_backend_chunk),
+            dropped: Arc::clone(&dropped),
+        }),
+    );
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        saw_backend_chunk.notified(),
+    )
+    .await
+    .expect("inspector must consume and hold the backend chunk");
+
+    let deadline = tokio::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("one millisecond before now is representable");
+    let mut body = ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test(
+        inspected, deadline, None,
+    );
+    let frame = body
+        .frame()
+        .await
+        .expect("zero client-visible bytes must yield terminal deadline trailers")
+        .expect("deadline trailer frame must be readable");
+    let trailers = frame
+        .trailers_ref()
+        .expect("native gRPC deadline before emitted DATA uses trailers");
+    assert_eq!(
+        trailers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("4")
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), dropped_notified)
+        .await
+        .expect("dropping the deadline receiver must cancel a blocked inspector");
+}
+
+#[tokio::test]
+async fn grpc_deadline_body_does_not_restore_stripped_content_length() {
+    use http_body_util::{BodyExt as _, Full};
+
+    let exact = Full::new(Bytes::from_static(b"backend representation")).map_err(
+        |never: std::convert::Infallible| -> ferrum_edge::proxy::body::ProxyBodyError {
+            match never {}
+        },
+    );
+    let body = ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(exact));
+    assert_eq!(body.size_hint().exact(), Some(22));
+
+    let deadline = tokio::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(1))
+        .expect("one second after now is representable");
+    let body = ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test(
+        body, deadline, None,
+    );
+    assert_eq!(
+        body.size_hint().exact(),
+        None,
+        "the deadline wrapper must not let hyper infer the backend Content-Length"
+    );
 }

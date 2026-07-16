@@ -2,7 +2,7 @@ use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::plugins::utils::auth_flow::ExtractedCredential;
 use ferrum_edge::plugins::utils::cert_hash::{sha256_base64url_no_pad, sha256_hex_lower};
 use ferrum_edge::plugins::utils::claim_resolver::{
-    extract_claim_string, extract_claim_values, parse_claim_path_value,
+    extract_claim_string, extract_claim_string_exact, extract_claim_values, parse_claim_path_value,
 };
 use ferrum_edge::plugins::utils::json_escape::escape_json_string;
 use ferrum_edge::plugins::utils::jwt_verifier::peek_unverified_issuer;
@@ -123,6 +123,30 @@ fn claim_resolver_resolves_hash_inside_path_segment() {
 }
 
 #[test]
+fn claim_resolver_rejects_blank_or_non_string_identity_values() {
+    for claims in [
+        json!({}),
+        json!({"sub": null}),
+        json!({"sub": 42}),
+        json!({"sub": ""}),
+        json!({"sub": "   \t"}),
+    ] {
+        assert_eq!(extract_claim_string(&claims, "sub"), None);
+    }
+}
+
+#[test]
+fn claim_resolver_exact_string_distinguishes_blank_from_missing() {
+    let claims = json!({"display_name": "   \t"});
+
+    assert_eq!(
+        extract_claim_string_exact(&claims, "display_name").as_deref(),
+        Some("   \t")
+    );
+    assert_eq!(extract_claim_string_exact(&claims, "missing"), None);
+}
+
+#[test]
 fn claim_resolver_extracts_space_delimited_and_array_values() {
     let claims = json!({
         "scope": "read write",
@@ -214,6 +238,15 @@ fn token_extract_extracts_bearer_token_from_authorization() {
 }
 
 #[test]
+fn token_extract_treats_foreign_authorization_scheme_as_missing() {
+    let ctx = ctx_with_header("authorization", "Basic dXNlcjpwYXNz");
+    assert!(matches!(
+        extract_authorization_bearer(&ctx),
+        ExtractedCredential::Missing
+    ));
+}
+
+#[test]
 fn token_extract_configured_header_prefix_mismatch_is_missing() {
     let ctx = ctx_with_header("x-token", "Token abc");
     let location = TokenLocation::Header(TokenHeaderLocation {
@@ -222,6 +255,27 @@ fn token_extract_configured_header_prefix_mismatch_is_missing() {
     });
     assert!(matches!(
         extract_from_location(&location, &ctx),
+        TokenLocationExtract::Missing
+    ));
+}
+
+#[test]
+fn token_extract_prefixless_authorization_location_classifies_bearer_scheme() {
+    let location = TokenLocation::Header(TokenHeaderLocation {
+        name: "authorization".to_string(),
+        prefix: None,
+    });
+
+    let bearer_ctx = ctx_with_header("authorization", "Bearer abc");
+    assert!(matches!(
+        extract_from_location(&location, &bearer_ctx),
+        TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token))
+            if token == "abc"
+    ));
+
+    let basic_ctx = ctx_with_header("authorization", "Basic dXNlcjpwYXNz");
+    assert!(matches!(
+        extract_from_location(&location, &basic_ctx),
         TokenLocationExtract::Missing
     ));
 }

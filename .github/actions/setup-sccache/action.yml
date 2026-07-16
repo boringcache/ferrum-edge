@@ -12,6 +12,11 @@ description: >-
   doesn't try to exec a binary that isn't installed. Build still proceeds,
   just without the cache.
 
+  Compiler outputs use a bounded local-disk cache at
+  `${GITHUB_WORKSPACE}/.cache/sccache`. Workflow cache actions persist that
+  directory without exposing their cache-service credential to cargo builds,
+  build scripts, or tests.
+
   The server idle timeout is disabled (`SCCACHE_IDLE_TIMEOUT=0`). The release
   build compiles the large `ferrum-edge` crate as one long rustc invocation
   that can exceed sccache's 600s default; with no new compile requests
@@ -33,15 +38,25 @@ runs:
         # cache service env (ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN) into
         # GITHUB_ENV to force the sccache GHA backend. On GitHub-hosted runners
         # those vars are exposed to actions/* but not to `run:` steps, so the
-        # daemon below transparently falls back to a local-disk cache. Exporting
+        # daemon below uses a local-disk cache. Exporting
         # ACTIONS_RUNTIME_TOKEN would hand the repository cache credential to
         # every later cargo build/test step — which execute PR-controlled
         # build.rs scripts and tests — letting an untrusted fork PR read it and
-        # hit the cache service directly. The local-disk fallback is slower than
-        # a shared GHA cache, but not leaking the token wins. (This is why the
-        # codex "enable sccache GHA backend" suggestion is intentionally not
-        # pursued here.)
+        # hit the cache service directly. Instead, consumers persist the bounded
+        # local directory through Swatinem/rust-cache's `cache-directories`
+        # input. The cache action can restore/save object files with its private
+        # credential, while no token reaches PR-controlled `run:` steps. The
+        # sccache GHA backend therefore remains intentionally disabled; this is
+        # why the codex "enable sccache GHA backend" suggestion is not pursued.
         #
+        # Keep the local store deterministic across runner invocations and cap
+        # it well below GitHub's per-entry limit to control cache eviction
+        # pressure. These values must be set before starting the daemon.
+        export SCCACHE_DIR="${GITHUB_WORKSPACE}/.cache/sccache"
+        export SCCACHE_CACHE_SIZE=2G
+        mkdir -p "${SCCACHE_DIR}"
+        unset SCCACHE_GHA_ENABLED
+
         # Disable the sccache server idle timeout (default 600s). The release
         # build compiles the large `ferrum-edge` lib crate as a single rustc
         # invocation (fat LTO, codegen-units=1) that hovers right around 600s
@@ -50,15 +65,24 @@ runs:
         # then dies with "connection forcibly closed (os error 10054)". 0 = run
         # until the ephemeral runner is torn down.
         export SCCACHE_IDLE_TIMEOUT=0
-        # Restart any server a prior step started so it adopts the timeout above
-        # (a server that's already running keeps the value it started with).
+        # Stop any server a prior step started so no daemon holds stale
+        # settings (a running server keeps the values it started with).
         command -v sccache &> /dev/null && sccache --stop-server > /dev/null 2>&1 || true
         if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+          # The start above is only a health probe. This action runs BEFORE the
+          # cache step that restores ${SCCACHE_DIR} (rust-cache
+          # `cache-directories`), and the local-disk backend indexes its cache
+          # when the server starts — entries unpacked afterwards would never be
+          # hits. Stop the probe server; the first rustc invocation lazily
+          # respawns it AFTER the cache restore, inheriting SCCACHE_* from
+          # GITHUB_ENV, so the persisted cache is actually indexed and reused.
+          sccache --stop-server > /dev/null 2>&1 || true
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          # Persist for build steps in case sccache lazily re-spawns a server.
+          # Persisted for build steps: the lazily-spawned server reads these.
+          echo "SCCACHE_DIR=${SCCACHE_DIR}" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}" >> "$GITHUB_ENV"
           echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
-          echo "sccache enabled (idle timeout disabled)"
+          echo "sccache enabled (2 GiB local cache; idle timeout disabled; server starts lazily after cache restore)"
         else
           echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTC_WRAPPER=" >> "$GITHUB_ENV"

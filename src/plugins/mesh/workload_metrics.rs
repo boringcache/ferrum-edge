@@ -8,22 +8,28 @@ use async_trait::async_trait;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::MeshTrafficDirection;
-use crate::modes::mesh::config::TracingProvider;
+use crate::modes::mesh::config::{MeshMetricsConfig, MeshTracingConfig, TracingProvider};
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
+use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
     IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor, is_trusted_hbone_assertor,
     parse_trust_domain_aliases, parse_trusted_hbone_assertors,
 };
+use crate::plugins::mesh::prometheus_helpers::{
+    MESH_METRICS_DISABLED_METADATA, MESH_REQUEST_COUNT_OVERRIDES_METADATA,
+    MESH_REQUEST_DURATION_OVERRIDES_METADATA, MeshMetricFamily, MeshMetricLabel,
+};
 use crate::plugins::otel_tracing::{
     OtelTracing, SpanData, SpanKind, TraceExporter, build_traceparent, ensure_trace_metadata,
-    trace_exporters_from_providers, trace_is_sampled,
+    trace_exporters_from_providers, trace_is_sampled, validate_trace_provider_endpoints,
 };
 use crate::plugins::utils::PluginHttpClient;
+use crate::plugins::utils::metadata_redaction::is_sensitive_metadata_key;
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
     StreamTransactionSummary, TransactionSummary, priority,
@@ -38,6 +44,21 @@ const MESH_DIRECTION_INBOUND: &str = "inbound";
 const MESH_DIRECTION_OUTBOUND: &str = "outbound";
 const TRACEPARENT_HEADER: &str = "traceparent";
 const TRACESTATE_HEADER: &str = "tracestate";
+const CAPTURED_TRACEPARENT_METADATA: &str = "workload_metrics.captured_traceparent";
+const CAPTURED_TRACESTATE_METADATA: &str = "workload_metrics.captured_tracestate";
+const CAPTURED_B3_METADATA: &str = "workload_metrics.captured_b3";
+const B3_TRACE_HEADERS: [&str; 6] = [
+    "b3",
+    "x-b3-traceid",
+    "x-b3-spanid",
+    "x-b3-parentspanid",
+    "x-b3-sampled",
+    "x-b3-flags",
+];
+const MAX_CUSTOM_TAGS: usize = 32;
+const MAX_CUSTOM_TAG_NAME_BYTES: usize = 128;
+const MAX_CUSTOM_TAG_VALUE_BYTES: usize = 1024;
+const MAX_METRIC_TAG_VALUE_BYTES: usize = 256;
 
 fn mesh_direction_str(direction: MeshTrafficDirection) -> &'static str {
     match direction {
@@ -139,8 +160,10 @@ pub struct WorkloadMetrics {
     custom_tags: HashMap<String, String>,
     /// Custom tags populated from request headers.
     custom_header_tags: HashMap<String, String>,
-    metric_tag_overrides: Vec<MetricTagOverrideConfig>,
-    disabled_metrics: Vec<String>,
+    request_count_tag_overrides: Option<String>,
+    request_duration_tag_overrides: Option<String>,
+    disabled_metrics_marker: Option<String>,
+    custom_trace_attributes_marker: Option<String>,
     /// Provider-specific tracing backends surfaced from Istio Telemetry CRD
     /// via the mesh slice. These also enable trace-context propagation when
     /// span reporting is disabled.
@@ -151,13 +174,6 @@ pub struct WorkloadMetrics {
     /// Which directions of a mesh hop this plugin instance should emit spans
     /// for. Defaults to SERVER-only.
     direction_emit: DirectionEmit,
-}
-
-#[derive(Debug)]
-enum MetricTagOverrideConfig {
-    Remove { name: String },
-    Rename { name: String, new_name: String },
-    Set { name: String, value: String },
 }
 
 impl WorkloadMetrics {
@@ -209,7 +225,7 @@ impl WorkloadMetrics {
             }
             None => None,
         };
-        let custom_tags = config
+        let custom_tags: HashMap<String, String> = config
             .get("custom_tags")
             .and_then(Value::as_object)
             .map(|tags| {
@@ -220,7 +236,7 @@ impl WorkloadMetrics {
                     .collect()
             })
             .unwrap_or_default();
-        let custom_header_tags = config
+        let custom_header_tags: HashMap<String, String> = config
             .get("custom_header_tags")
             .and_then(Value::as_object)
             .map(|tags| {
@@ -231,7 +247,16 @@ impl WorkloadMetrics {
                     .collect()
             })
             .unwrap_or_default();
-        let (metric_tag_overrides, disabled_metrics) = parse_metric_config(config.get("metrics"))?;
+        let ValidatedCustomTags {
+            custom_tags,
+            custom_header_tags,
+            custom_trace_attributes_marker,
+        } = validate_custom_tags(custom_tags, custom_header_tags)?;
+        let ParsedMetricConfig {
+            request_count_tag_overrides,
+            request_duration_tag_overrides,
+            disabled_metrics_marker,
+        } = parse_metric_config(config.get("metrics"), true)?;
         let tracing_providers = parse_tracing_providers(config)?;
         let span_reporting_disabled = config
             .get("span_reporting_disabled")
@@ -266,8 +291,10 @@ impl WorkloadMetrics {
             sampling_percentage,
             custom_tags,
             custom_header_tags,
-            metric_tag_overrides,
-            disabled_metrics,
+            request_count_tag_overrides,
+            request_duration_tag_overrides,
+            disabled_metrics_marker,
+            custom_trace_attributes_marker,
             tracing_providers,
             trace_exporters,
             span_reporting_disabled,
@@ -301,7 +328,9 @@ impl WorkloadMetrics {
         self.insert_common_metadata(&mut ctx.metadata);
         self.apply_telemetry_metadata(&mut ctx.metadata, headers);
         if self.should_ensure_http_trace_context(&ctx.metadata, headers) {
-            import_b3_trace_metadata(&mut ctx.metadata, headers);
+            if !has_valid_traceparent(headers) {
+                import_b3_trace_metadata(&mut ctx.metadata, headers);
+            }
             ensure_trace_metadata(&mut ctx.metadata, headers);
             if let Some(tracestate) = header_value(headers, TRACESTATE_HEADER) {
                 ctx.metadata
@@ -309,6 +338,154 @@ impl WorkloadMetrics {
             }
         }
         let hbone_identity = hbone_identity_from_headers(ctx, headers);
+        let peer_source_identity = self.resolve_peer_source_identity(ctx, hbone_identity.as_ref());
+        // This method runs before authorization and again after request-header
+        // transforms. Rebuild the SPIFFE-derived source identity as one atomic
+        // view so a final peer with fewer path segments cannot retain namespace
+        // or service-account labels from early trusted baggage.
+        clear_source_spiffe_labels(&mut ctx.metadata);
+        ctx.metadata.insert(
+            "mesh.connection_security_policy".to_string(),
+            if ctx.peer_spiffe_id.is_some() || ctx.tls_client_cert_der.is_some() {
+                "mutual_tls"
+            } else {
+                "none"
+            }
+            .to_string(),
+        );
+        ctx.metadata.insert(
+            "mesh.request_protocol".to_string(),
+            request_protocol(ctx, headers).to_string(),
+        );
+        if let Some(direction) = ctx.mesh_direction {
+            ctx.metadata.insert(
+                MESH_DIRECTION_METADATA.to_string(),
+                mesh_direction_str(direction).to_string(),
+            );
+        }
+
+        match ctx.mesh_direction {
+            Some(MeshTrafficDirection::Inbound) => {
+                if let Some(identity) = peer_source_identity.as_ref() {
+                    insert_source_spiffe_labels(&mut ctx.metadata, identity);
+                }
+                self.insert_remote_source_workload_labels(
+                    &mut ctx.metadata,
+                    peer_source_identity.as_ref(),
+                );
+                self.insert_local_destination_workload_labels(&mut ctx.metadata);
+            }
+            Some(MeshTrafficDirection::Outbound) => {
+                // A NodeWaypoint outbound listener serves many captured pods.
+                // Its accept path authenticates the originating pod and stamps
+                // both fields together; use that asserted identity directly so
+                // request baggage cannot spoof it and the shared waypoint is
+                // never reported as the application source. Other outbound
+                // topologies continue to attribute the local workload.
+                let node_waypoint_source_identity = if ctx.node_waypoint_pod_uid.is_some() {
+                    ctx.peer_spiffe_id.as_ref()
+                } else {
+                    None
+                };
+                if let Some(identity) = node_waypoint_source_identity {
+                    insert_source_spiffe_labels(&mut ctx.metadata, identity);
+                    self.insert_remote_source_workload_labels(&mut ctx.metadata, Some(identity));
+                } else {
+                    if let Some(identity) = self.workload_spiffe_id.as_ref() {
+                        insert_source_spiffe_labels(&mut ctx.metadata, identity);
+                    }
+                    self.insert_local_source_workload_labels(&mut ctx.metadata);
+                }
+                if let Some(proxy) = ctx.matched_proxy.as_ref() {
+                    self.insert_proxy_destination_labels(
+                        &mut ctx.metadata,
+                        &proxy.namespace,
+                        proxy.name.as_deref().unwrap_or(&proxy.id),
+                    );
+                }
+            }
+            None => {
+                let source_identity = peer_source_identity
+                    .as_ref()
+                    .or(self.workload_spiffe_id.as_ref());
+                if let Some(identity) = source_identity {
+                    insert_source_spiffe_labels(&mut ctx.metadata, identity);
+                }
+                self.insert_local_source_workload_labels(&mut ctx.metadata);
+                if let Some(proxy) = ctx.matched_proxy.as_ref() {
+                    self.insert_proxy_destination_labels(
+                        &mut ctx.metadata,
+                        &proxy.namespace,
+                        proxy.name.as_deref().unwrap_or(&proxy.id),
+                    );
+                }
+            }
+        }
+    }
+
+    fn reconcile_captured_trace_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> bool {
+        // `on_request_received` imports inbound context early so authorization
+        // rejects remain observable. For accepted requests, request_transformer
+        // runs before this hook and its final header policy is authoritative.
+        // A valid final W3C or B3 value replaces every early-derived trace
+        // field, including locally generated context when the transformer adds
+        // traceparent. When an inbound W3C parent was captured, only a valid
+        // final W3C parent may retain tracestate; a final B3 context can rebuild
+        // its own trace identity but must not inherit orphan W3C state.
+        let captured_traceparent = ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA).is_some();
+        let captured_b3 = ctx.metadata.remove(CAPTURED_B3_METADATA).is_some();
+        let captured_tracestate = ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA).is_some();
+        let final_traceparent = has_valid_traceparent(headers);
+        let final_b3_context = !final_traceparent && has_b3_trace_context(headers);
+        let final_b3_sampling = !final_traceparent && b3_sampling_decision(headers).is_some();
+        let final_trace_signal = final_traceparent || final_b3_context || final_b3_sampling;
+
+        if final_trace_signal {
+            clear_http_trace_metadata(&mut ctx.metadata);
+        }
+
+        if captured_traceparent && !final_traceparent {
+            ctx.metadata.remove(TRACEPARENT_HEADER);
+            ctx.metadata.remove(TRACESTATE_HEADER);
+            // A transformer may remove the captured parent, replace it with
+            // malformed hostile input, or leave/add tracestate independently.
+            // Remove every casing of both W3C headers so neither the cached
+            // parent nor an orphan tracestate can cross the proxy boundary.
+            headers.retain(|name, _| {
+                !name.eq_ignore_ascii_case(TRACEPARENT_HEADER)
+                    && !name.eq_ignore_ascii_case(TRACESTATE_HEADER)
+            });
+        }
+
+        if captured_b3 && !final_traceparent && !final_b3_context && !final_b3_sampling {
+            ctx.metadata.remove(TRACEPARENT_HEADER);
+            headers.retain(|name, _| {
+                !B3_TRACE_HEADERS
+                    .iter()
+                    .any(|header| name.eq_ignore_ascii_case(header))
+            });
+        }
+
+        if captured_tracestate && header_value(headers, TRACESTATE_HEADER).is_none() {
+            ctx.metadata.remove(TRACESTATE_HEADER);
+        }
+
+        let suppress_local_trace = (captured_traceparent || captured_b3) && !final_trace_signal;
+        if suppress_local_trace {
+            clear_http_trace_metadata(&mut ctx.metadata);
+        }
+        suppress_local_trace
+    }
+
+    fn resolve_peer_source_identity(
+        &self,
+        ctx: &mut RequestContext,
+        hbone_identity: Option<&HboneIdentity>,
+    ) -> Option<SpiffeId> {
         // Resolve the source identity using the SAME baggage trust gate as
         // `mesh_authz` (shared `is_trusted_hbone_assertor` predicate) so the
         // telemetry attribution can never diverge from the authorization
@@ -331,11 +508,9 @@ impl WorkloadMetrics {
         let baggage_source_principal = if rejected_udp_source_scope.is_some() {
             None
         } else {
-            hbone_identity
-                .as_ref()
-                .and_then(|identity| identity.source_principal.clone())
+            hbone_identity.and_then(|identity| identity.source_principal.clone())
         };
-        let source_identity = match (ctx.peer_spiffe_id.as_ref(), baggage_source_principal) {
+        match (ctx.peer_spiffe_id.as_ref(), baggage_source_principal) {
             (Some(peer), Some(baggage)) => {
                 if !is_trusted_hbone_assertor(&self.trusted_hbone_assertors, peer) {
                     ctx.metadata.insert(
@@ -364,43 +539,6 @@ impl WorkloadMetrics {
             }
             // No baggage principal: use the authenticated peer identity if any.
             (peer, None) => peer.cloned(),
-        }
-        .or_else(|| self.workload_spiffe_id.clone());
-        ctx.metadata.insert(
-            "mesh.connection_security_policy".to_string(),
-            if ctx.peer_spiffe_id.is_some() || ctx.tls_client_cert_der.is_some() {
-                "mutual_tls"
-            } else {
-                "none"
-            }
-            .to_string(),
-        );
-        ctx.metadata.insert(
-            "mesh.request_protocol".to_string(),
-            request_protocol(ctx, headers).to_string(),
-        );
-        if let Some(direction) = ctx.mesh_direction {
-            ctx.metadata.insert(
-                MESH_DIRECTION_METADATA.to_string(),
-                mesh_direction_str(direction).to_string(),
-            );
-        }
-        if let Some(identity) = source_identity.as_ref() {
-            insert_source_spiffe_labels(&mut ctx.metadata, identity);
-        }
-        self.insert_source_workload_labels(&mut ctx.metadata, source_identity.as_ref());
-        if let Some(proxy) = ctx.matched_proxy.as_ref() {
-            let destination = proxy.name.clone().unwrap_or_else(|| proxy.id.clone());
-            ctx.metadata.insert(
-                "mesh.destination.namespace".to_string(),
-                proxy.namespace.clone(),
-            );
-            ctx.metadata
-                .insert("mesh.destination.workload".to_string(), destination.clone());
-            ctx.metadata
-                .insert("mesh.destination.app".to_string(), destination.clone());
-            ctx.metadata
-                .insert("mesh.destination.service".to_string(), destination);
         }
     }
 
@@ -449,33 +587,40 @@ impl WorkloadMetrics {
                 if sampled { "true" } else { "false" }.to_string(),
             );
         }
+        // This method runs both before authorization and after request
+        // transformers. Clear header-backed values before rebuilding the final
+        // view so a removed or over-limit header cannot leave stale metadata.
+        // Literal values are then reapplied as the documented fallback before a
+        // present valid header takes precedence.
+        for key in self.custom_header_tags.keys() {
+            metadata.remove(key);
+        }
         for (key, value) in &self.custom_tags {
             metadata.insert(key.clone(), value.clone());
         }
         for (key, header_name) in &self.custom_header_tags {
-            if let Some(value) = header_value(headers, header_name) {
+            if let Some(value) = header_value(headers, header_name)
+                && value.len() <= MAX_CUSTOM_TAG_VALUE_BYTES
+            {
                 metadata.insert(key.clone(), value.to_string());
             }
         }
-        for override_config in &self.metric_tag_overrides {
-            match override_config {
-                MetricTagOverrideConfig::Remove { name } => {
-                    metadata.remove(name);
-                }
-                MetricTagOverrideConfig::Rename { name, new_name } => {
-                    if let Some(value) = metadata.remove(name) {
-                        metadata.insert(new_name.clone(), value);
-                    }
-                }
-                MetricTagOverrideConfig::Set { name, value } => {
-                    metadata.insert(name.clone(), value.clone());
-                }
-            }
+        if let Some(marker) = self.custom_trace_attributes_marker.as_ref() {
+            metadata.insert(CUSTOM_TRACE_ATTRIBUTES_METADATA.to_string(), marker.clone());
         }
-        if !self.disabled_metrics.is_empty() {
+        if let Some(marker) = self.disabled_metrics_marker.as_ref() {
+            metadata.insert(MESH_METRICS_DISABLED_METADATA.to_string(), marker.clone());
+        }
+        if let Some(plan) = self.request_count_tag_overrides.as_ref() {
             metadata.insert(
-                "mesh.metrics.disabled".to_string(),
-                self.disabled_metrics.join(","),
+                MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
+                plan.clone(),
+            );
+        }
+        if let Some(plan) = self.request_duration_tag_overrides.as_ref() {
+            metadata.insert(
+                MESH_REQUEST_DURATION_OVERRIDES_METADATA.to_string(),
+                plan.clone(),
             );
         }
     }
@@ -496,20 +641,7 @@ impl WorkloadMetrics {
         false
     }
 
-    fn insert_source_workload_labels(
-        &self,
-        metadata: &mut HashMap<String, String>,
-        source_identity: Option<&SpiffeId>,
-    ) {
-        if let Some(namespace) = metadata
-            .get("mesh.source.namespace")
-            .cloned()
-            .or_else(|| self.namespace.clone())
-        {
-            metadata.insert("mesh.source.namespace".to_string(), namespace);
-        }
-
-        let service_account = metadata.get("mesh.source.service_account").cloned();
+    fn local_workload_labels(&self) -> (&str, &str, &str) {
         let workload = first_label(
             &self.labels,
             &[
@@ -520,8 +652,11 @@ impl WorkloadMetrics {
                 "workload",
             ],
         )
-        .or(service_account.as_deref())
-        .or_else(|| source_identity.and_then(|identity| spiffe_path_value(identity, "sa")))
+        .or_else(|| {
+            self.workload_spiffe_id
+                .as_ref()
+                .and_then(|identity| spiffe_path_value(identity, "sa"))
+        })
         .unwrap_or("unknown");
         let app = first_label(&self.labels, &["app.kubernetes.io/name", "app", "k8s-app"])
             .unwrap_or(workload);
@@ -531,9 +666,67 @@ impl WorkloadMetrics {
         )
         .unwrap_or(workload);
 
+        (workload, app, service)
+    }
+
+    fn insert_local_source_workload_labels(&self, metadata: &mut HashMap<String, String>) {
+        if let Some(namespace) = self.namespace.as_ref() {
+            metadata.insert("mesh.source.namespace".to_string(), namespace.clone());
+        }
+        let (workload, app, service) = self.local_workload_labels();
         metadata.insert("mesh.source.workload".to_string(), workload.to_string());
         metadata.insert("mesh.source.app".to_string(), app.to_string());
         metadata.insert("mesh.source.service".to_string(), service.to_string());
+    }
+
+    fn insert_local_destination_workload_labels(&self, metadata: &mut HashMap<String, String>) {
+        if let Some(identity) = self.workload_spiffe_id.as_ref() {
+            insert_destination_spiffe_labels(metadata, identity);
+        }
+        if let Some(namespace) = self.namespace.as_ref() {
+            metadata.insert("mesh.destination.namespace".to_string(), namespace.clone());
+        }
+        let (workload, app, service) = self.local_workload_labels();
+        metadata.insert(
+            "mesh.destination.workload".to_string(),
+            workload.to_string(),
+        );
+        metadata.insert("mesh.destination.app".to_string(), app.to_string());
+        metadata.insert("mesh.destination.service".to_string(), service.to_string());
+    }
+
+    fn insert_remote_source_workload_labels(
+        &self,
+        metadata: &mut HashMap<String, String>,
+        identity: Option<&SpiffeId>,
+    ) {
+        let workload = identity
+            .and_then(|identity| spiffe_path_value(identity, "sa"))
+            .unwrap_or("unknown");
+        metadata.insert("mesh.source.workload".to_string(), workload.to_string());
+        metadata.insert("mesh.source.app".to_string(), workload.to_string());
+        metadata.insert("mesh.source.service".to_string(), workload.to_string());
+    }
+
+    fn insert_proxy_destination_labels(
+        &self,
+        metadata: &mut HashMap<String, String>,
+        namespace: &str,
+        destination: &str,
+    ) {
+        metadata.insert(
+            "mesh.destination.namespace".to_string(),
+            namespace.to_string(),
+        );
+        metadata.insert(
+            "mesh.destination.workload".to_string(),
+            destination.to_string(),
+        );
+        metadata.insert("mesh.destination.app".to_string(), destination.to_string());
+        metadata.insert(
+            "mesh.destination.service".to_string(),
+            destination.to_string(),
+        );
     }
 
     fn export_span(&self, span: Option<SpanData>) {
@@ -569,6 +762,9 @@ impl WorkloadMetrics {
         summary: &TransactionSummary,
         mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
     ) {
+        if summary.mirror {
+            return;
+        }
         // Service graph aggregates all mesh RED data; trace export below honors sampling.
         crate::plugins::mesh::service_graph::record_transaction_with_mesh_key(summary, mesh_key);
         if !self.should_export_metadata(&summary.metadata) {
@@ -611,17 +807,50 @@ impl Plugin for WorkloadMetrics {
         self.trace_context_enabled()
     }
 
+    async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        // The authorization phase runs after every plugin's request-received
+        // phase. Stamp telemetry here so mesh_authz rejects still retain RED
+        // labels and trace context; before_proxy refreshes the same metadata
+        // after route selection for accepted requests.
+        let headers = std::mem::take(&mut ctx.headers);
+        let captured_traceparent = has_valid_traceparent(&headers);
+        let captured_b3 =
+            has_b3_trace_context(&headers) || b3_sampling_decision(&headers).is_some();
+        let captured_tracestate = header_value(&headers, TRACESTATE_HEADER).is_some();
+        self.annotate_http_context(ctx, &headers);
+        if captured_traceparent && ctx.metadata.contains_key(TRACEPARENT_HEADER) {
+            ctx.metadata.insert(
+                CAPTURED_TRACEPARENT_METADATA.to_string(),
+                "true".to_string(),
+            );
+        }
+        if captured_tracestate && ctx.metadata.contains_key(TRACESTATE_HEADER) {
+            ctx.metadata
+                .insert(CAPTURED_TRACESTATE_METADATA.to_string(), "true".to_string());
+        }
+        if captured_b3 {
+            ctx.metadata
+                .insert(CAPTURED_B3_METADATA.to_string(), "true".to_string());
+        }
+        ctx.headers = headers;
+        PluginResult::Continue
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        let suppress_local_trace = self.reconcile_captured_trace_headers(ctx, headers);
         self.annotate_http_context(ctx, headers);
+        if suppress_local_trace {
+            clear_http_trace_metadata(&mut ctx.metadata);
+        }
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
-            headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
+            set_header_case_insensitive(headers, TRACEPARENT_HEADER, traceparent);
         }
         if let Some(tracestate) = ctx.metadata.get(TRACESTATE_HEADER) {
-            headers.insert(TRACESTATE_HEADER.to_string(), tracestate.clone());
+            set_header_case_insensitive(headers, TRACESTATE_HEADER, tracestate);
         }
         PluginResult::Continue
     }
@@ -632,18 +861,68 @@ impl Plugin for WorkloadMetrics {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // `on_request_received` stamps source labels before `mesh_authz`
+        // evaluates Ambient UDP pod-UID/source-scope evidence. When authz
+        // discards that evidence (`mesh_authz.ignored_udp_source_scope`) and
+        // rejects, `before_proxy` never runs, so restamp here — this hook runs
+        // on the reject path before the rejected transaction summary is built.
+        // The stale baggage-derived source keys are cleared first because the
+        // attesting-peer fallback identity may not carry every SPIFFE path
+        // segment the discarded baggage principal did.
+        if ctx.metadata.contains_key(IGNORED_UDP_SOURCE_SCOPE_METADATA)
+            && ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str)
+                != ctx.peer_spiffe_id.as_ref().map(SpiffeId::as_str)
+        {
+            clear_source_spiffe_labels(&mut ctx.metadata);
+            let headers = std::mem::take(&mut ctx.headers);
+            self.annotate_http_context(ctx, &headers);
+            ctx.headers = headers;
+        }
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
             response_headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
         }
+        // Accepted requests consume these markers in `before_proxy`. Rejects
+        // intentionally retain the early trace context through this hook, then
+        // discard the temporary provenance markers before transaction logging.
+        ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA);
+        ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA);
+        ctx.metadata.remove(CAPTURED_B3_METADATA);
         PluginResult::Continue
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {
-        self.trace_context_enabled()
+        // Always participate in reject-path `after_proxy`: even with tracing
+        // disabled, a mesh_authz UDP source-scope reject needs its RED /
+        // service-graph source labels restamped (see `after_proxy`).
+        true
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let stamped_direction = ctx.mesh_direction;
+        let peer_identity = ctx
+            .authenticated_identity
+            .as_deref()
+            .and_then(|value| SpiffeId::new(value).ok())
+            .or_else(|| {
+                ctx.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("peer_spiffe_id"))
+                    .and_then(|value| SpiffeId::new(value).ok())
+            });
+        let proxy_name = ctx
+            .proxy_name
+            .as_deref()
+            .unwrap_or(ctx.proxy_id.as_str())
+            .to_string();
+        let proxy_namespace = mesh_service_namespace(&proxy_name)
+            .map(str::to_owned)
+            .or_else(|| self.namespace.clone())
+            .unwrap_or_default();
+        let request_protocol = if ctx.backend_scheme.is_udp() {
+            "udp"
+        } else {
+            "tcp"
+        };
         let metadata = ctx.metadata.get_or_insert_with(Default::default);
         self.insert_common_metadata(metadata);
         self.apply_telemetry_metadata(metadata, &HashMap::new());
@@ -658,28 +937,50 @@ impl Plugin for WorkloadMetrics {
         }
         metadata.insert(
             "mesh.connection_security_policy".to_string(),
-            if ctx.tls_client_cert_der.is_some() {
+            if ctx.tls_client_cert_der.is_some() || peer_identity.is_some() {
                 "mutual_tls"
             } else {
                 "none"
             }
             .to_string(),
         );
-        if let Some(identity) = ctx
-            .authenticated_identity
-            .as_deref()
-            .and_then(|value| SpiffeId::new(value).ok())
-            .or_else(|| {
-                metadata
-                    .get("peer_spiffe_id")
-                    .and_then(|value| SpiffeId::new(value).ok())
-            })
-            .or_else(|| self.workload_spiffe_id.clone())
-        {
-            insert_source_spiffe_labels(metadata, &identity);
-            self.insert_source_workload_labels(metadata, Some(&identity));
-        } else {
-            self.insert_source_workload_labels(metadata, None);
+        metadata.insert(
+            "mesh.request_protocol".to_string(),
+            request_protocol.to_string(),
+        );
+        match stamped_direction {
+            Some(MeshTrafficDirection::Inbound) => {
+                if let Some(identity) = peer_identity.as_ref() {
+                    insert_source_spiffe_labels(metadata, identity);
+                }
+                self.insert_remote_source_workload_labels(metadata, peer_identity.as_ref());
+                self.insert_local_destination_workload_labels(metadata);
+            }
+            Some(MeshTrafficDirection::Outbound) => {
+                // Captured L4 egress (NodeWaypoint TCP, Ambient UDP) runs on
+                // the node data plane but carries the originating pod's
+                // verified identity as the authenticated peer. Honor it as
+                // the source so CLIENT spans/labels attribute the traffic to
+                // the captured workload instead of the waypoint/ztunnel.
+                if let Some(identity) = peer_identity.as_ref() {
+                    insert_source_spiffe_labels(metadata, identity);
+                    self.insert_remote_source_workload_labels(metadata, Some(identity));
+                } else {
+                    if let Some(identity) = self.workload_spiffe_id.as_ref() {
+                        insert_source_spiffe_labels(metadata, identity);
+                    }
+                    self.insert_local_source_workload_labels(metadata);
+                }
+                self.insert_proxy_destination_labels(metadata, &proxy_namespace, &proxy_name);
+            }
+            None => {
+                let source_identity = peer_identity.as_ref().or(self.workload_spiffe_id.as_ref());
+                if let Some(identity) = source_identity {
+                    insert_source_spiffe_labels(metadata, identity);
+                }
+                self.insert_local_source_workload_labels(metadata);
+                self.insert_proxy_destination_labels(metadata, &proxy_namespace, &proxy_name);
+            }
         }
         PluginResult::Continue
     }
@@ -762,61 +1063,355 @@ fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, Strin
     }
 }
 
+struct ParsedMetricConfig {
+    request_count_tag_overrides: Option<String>,
+    request_duration_tag_overrides: Option<String>,
+    disabled_metrics_marker: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum MetricSelector {
+    All,
+    Emitted(MeshMetricFamily),
+    RecognizedUnsupported(&'static str),
+}
+
+fn metric_selector(name: &str) -> Option<MetricSelector> {
+    if name.trim().eq_ignore_ascii_case("ALL_METRICS") {
+        return Some(MetricSelector::All);
+    }
+    if let Some(family) = MeshMetricFamily::from_config_name(name) {
+        return Some(MetricSelector::Emitted(family));
+    }
+    match name.trim().to_ascii_uppercase().as_str() {
+        "REQUEST_SIZE" => Some(MetricSelector::RecognizedUnsupported("REQUEST_SIZE")),
+        "RESPONSE_SIZE" => Some(MetricSelector::RecognizedUnsupported("RESPONSE_SIZE")),
+        "TCP_OPENED_CONNECTIONS" => Some(MetricSelector::RecognizedUnsupported(
+            "TCP_OPENED_CONNECTIONS",
+        )),
+        "TCP_CLOSED_CONNECTIONS" => Some(MetricSelector::RecognizedUnsupported(
+            "TCP_CLOSED_CONNECTIONS",
+        )),
+        "TCP_SENT_BYTES" => Some(MetricSelector::RecognizedUnsupported("TCP_SENT_BYTES")),
+        "TCP_RECEIVED_BYTES" => Some(MetricSelector::RecognizedUnsupported("TCP_RECEIVED_BYTES")),
+        "GRPC_REQUEST_MESSAGES" => Some(MetricSelector::RecognizedUnsupported(
+            "GRPC_REQUEST_MESSAGES",
+        )),
+        "GRPC_RESPONSE_MESSAGES" => Some(MetricSelector::RecognizedUnsupported(
+            "GRPC_RESPONSE_MESSAGES",
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_recognized_unsupported_istio_metric_family(name: &str) -> bool {
+    matches!(
+        metric_selector(name),
+        Some(MetricSelector::RecognizedUnsupported(_))
+    )
+}
+
+enum ParsedTagOperation<'a> {
+    Remove,
+    Rename(&'a str),
+    Set(&'a str),
+}
+
+fn parse_tag_operation<'a>(
+    name: &str,
+    operation: &'a serde_json::Map<String, Value>,
+) -> Result<ParsedTagOperation<'a>, String> {
+    match operation.get("type").and_then(Value::as_str) {
+        Some("remove") => Ok(ParsedTagOperation::Remove),
+        Some("rename") => operation
+            .get("new_name")
+            .and_then(Value::as_str)
+            .map(ParsedTagOperation::Rename)
+            .ok_or_else(|| {
+                format!("workload_metrics: new_name is required to rename metric tag '{name}'")
+            }),
+        Some("set") => {
+            let value = operation
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!("workload_metrics: value is required to set metric tag '{name}'")
+                })?;
+            if value.len() > MAX_METRIC_TAG_VALUE_BYTES {
+                return Err(format!(
+                    "workload_metrics: metric tag '{name}' value exceeds {MAX_METRIC_TAG_VALUE_BYTES} bytes"
+                ));
+            }
+            Ok(ParsedTagOperation::Set(value))
+        }
+        Some(operation_type) => Err(format!(
+            "workload_metrics: unsupported operation '{operation_type}' for metric tag '{name}'"
+        )),
+        None => Err(format!(
+            "workload_metrics: operation type is required for metric tag '{name}'"
+        )),
+    }
+}
+
 fn parse_metric_config(
     value: Option<&Value>,
-) -> Result<(Vec<MetricTagOverrideConfig>, Vec<String>), String> {
+    emit_unsupported_family_warning: bool,
+) -> Result<ParsedMetricConfig, String> {
     let Some(metrics) = value else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(ParsedMetricConfig {
+            request_count_tag_overrides: None,
+            request_duration_tag_overrides: None,
+            disabled_metrics_marker: None,
+        });
     };
     let object = metrics
         .as_object()
         .ok_or_else(|| "workload_metrics: 'metrics' must be an object".to_string())?;
-    let disabled_metrics = object
-        .get("disabled_metrics")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|metric| !metric.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
-    let mut tag_overrides = Vec::new();
-    for entry in object
-        .get("tag_overrides")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(name) = entry.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(operation) = entry.get("operation").and_then(Value::as_object) else {
-            continue;
-        };
-        match operation.get("type").and_then(Value::as_str) {
-            Some("remove") => tag_overrides.push(MetricTagOverrideConfig::Remove {
-                name: name.to_string(),
-            }),
-            Some("rename") => {
-                if let Some(new_name) = operation.get("new_name").and_then(Value::as_str) {
-                    tag_overrides.push(MetricTagOverrideConfig::Rename {
-                        name: name.to_string(),
-                        new_name: new_name.to_string(),
-                    });
+    let mut disabled_count = false;
+    let mut disabled_duration = false;
+    let mut ignored_metric_families = BTreeSet::new();
+    if let Some(value) = object.get("disabled_metrics") {
+        let disabled = value.as_array().ok_or_else(|| {
+            "workload_metrics: metrics.disabled_metrics must be an array".to_string()
+        })?;
+        for metric in disabled {
+            let name = metric.as_str().ok_or_else(|| {
+                "workload_metrics: disabled metric names must be strings".to_string()
+            })?;
+            match metric_selector(name) {
+                Some(MetricSelector::All) => {
+                    disabled_count = true;
+                    disabled_duration = true;
+                }
+                Some(MetricSelector::Emitted(MeshMetricFamily::RequestCount)) => {
+                    disabled_count = true;
+                }
+                Some(MetricSelector::Emitted(MeshMetricFamily::RequestDuration)) => {
+                    disabled_duration = true;
+                }
+                Some(MetricSelector::RecognizedUnsupported(canonical)) => {
+                    ignored_metric_families.insert(canonical);
+                }
+                None => {
+                    return Err(format!(
+                        "workload_metrics: unsupported disabled metric '{name}'"
+                    ));
                 }
             }
-            Some("set") => {
-                if let Some(value) = operation.get("value").and_then(Value::as_str) {
-                    tag_overrides.push(MetricTagOverrideConfig::Set {
-                        name: name.to_string(),
-                        value: value.to_string(),
-                    });
-                }
-            }
-            _ => {}
         }
     }
-    Ok((tag_overrides, disabled_metrics))
+
+    let mut request_count_plan = String::new();
+    let mut request_duration_plan = String::new();
+    if let Some(value) = object.get("tag_overrides") {
+        let overrides = value.as_array().ok_or_else(|| {
+            "workload_metrics: metrics.tag_overrides must be an array".to_string()
+        })?;
+        for entry in overrides {
+            let name = entry.get("name").and_then(Value::as_str).ok_or_else(|| {
+                "workload_metrics: metric tag override name is required".to_string()
+            })?;
+            let operation = entry
+                .get("operation")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    format!("workload_metrics: operation is required for metric tag '{name}'")
+                })?;
+            let operation = parse_tag_operation(name, operation)?;
+            let selector = match entry.get("metric") {
+                None | Some(Value::Null) => MetricSelector::All,
+                Some(Value::String(metric)) => metric_selector(metric).ok_or_else(|| {
+                    format!(
+                        "workload_metrics: unsupported metric '{metric}' for tag override '{name}'"
+                    )
+                })?,
+                Some(_) => {
+                    return Err(format!(
+                        "workload_metrics: metric for tag override '{name}' must be a string"
+                    ));
+                }
+            };
+            let emitted_family = match selector {
+                MetricSelector::All => None,
+                MetricSelector::Emitted(family) => Some(family),
+                MetricSelector::RecognizedUnsupported(canonical) => {
+                    ignored_metric_families.insert(canonical);
+                    continue;
+                }
+            };
+            let label = MeshMetricLabel::from_config_name(name)
+                .ok_or_else(|| format!("workload_metrics: unsupported metric tag '{name}'"))?;
+            let encoded = match operation {
+                ParsedTagOperation::Remove => format!("r{};", label.index()),
+                ParsedTagOperation::Rename(new_name) => {
+                    let new_label =
+                        MeshMetricLabel::from_config_name(new_name).ok_or_else(|| {
+                            format!("workload_metrics: unsupported renamed metric tag '{new_name}'")
+                        })?;
+                    format!("n{},{};", label.index(), new_label.index())
+                }
+                ParsedTagOperation::Set(value) => format!(
+                    "s{},{value_len}:{value};",
+                    label.index(),
+                    value_len = value.len()
+                ),
+            };
+            match emitted_family {
+                None => {
+                    request_count_plan.push_str(&encoded);
+                    request_duration_plan.push_str(&encoded);
+                }
+                Some(MeshMetricFamily::RequestCount) => {
+                    request_count_plan.push_str(&encoded);
+                }
+                Some(MeshMetricFamily::RequestDuration) => {
+                    request_duration_plan.push_str(&encoded);
+                }
+            }
+        }
+    }
+
+    if emit_unsupported_family_warning && !ignored_metric_families.is_empty() {
+        let metric_families = ignored_metric_families
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(
+            plugin = "workload_metrics",
+            %metric_families,
+            "ignoring Istio metric-family policy for standard families Ferrum does not emit"
+        );
+    }
+
+    let disabled_marker = match (disabled_count, disabled_duration) {
+        (true, true) => Some("request_count,request_duration".to_string()),
+        (true, false) => Some("request_count".to_string()),
+        (false, true) => Some("request_duration".to_string()),
+        (false, false) => None,
+    };
+    Ok(ParsedMetricConfig {
+        request_count_tag_overrides: (!request_count_plan.is_empty()).then_some(request_count_plan),
+        request_duration_tag_overrides: (!request_duration_plan.is_empty())
+            .then_some(request_duration_plan),
+        disabled_metrics_marker: disabled_marker,
+    })
+}
+
+/// Validate the parts of an Istio Telemetry resource that are projected into
+/// the auto-injected `workload_metrics` plugin.
+///
+/// The Kubernetes translator calls this before reporting the resource as
+/// accepted. Direct/native plugin configuration still runs the same validators
+/// from [`WorkloadMetrics::new`] and retains its hard-error behavior.
+pub(crate) fn validate_istio_telemetry_config(
+    tracing: Option<&MeshTracingConfig>,
+    metrics: Option<&MeshMetricsConfig>,
+) -> Result<(), String> {
+    if let Some(tracing) = tracing {
+        validate_custom_tags(
+            tracing.custom_tags.clone(),
+            tracing.custom_header_tags.clone(),
+        )?;
+        validate_trace_provider_endpoints(&tracing.providers).map_err(|error| {
+            format!("workload_metrics: invalid tracing exporter config: {error}")
+        })?;
+    }
+    if let Some(metrics) = metrics {
+        let metrics = serde_json::to_value(metrics)
+            .map_err(|error| format!("workload_metrics: invalid translated metrics: {error}"))?;
+        parse_metric_config(Some(&metrics), false)?;
+    }
+    Ok(())
+}
+
+struct ValidatedCustomTags {
+    custom_tags: HashMap<String, String>,
+    custom_header_tags: HashMap<String, String>,
+    custom_trace_attributes_marker: Option<String>,
+}
+
+fn validate_custom_tags(
+    custom_tags: HashMap<String, String>,
+    custom_header_tags: HashMap<String, String>,
+) -> Result<ValidatedCustomTags, String> {
+    let mut names: Vec<String> = custom_tags
+        .keys()
+        .chain(custom_header_tags.keys())
+        .cloned()
+        .collect();
+    names.sort();
+    names.dedup();
+    if names.len() > MAX_CUSTOM_TAGS {
+        return Err(format!(
+            "workload_metrics: custom tag count exceeds {MAX_CUSTOM_TAGS}"
+        ));
+    }
+    for name in &names {
+        validate_custom_tag_name(name)?;
+    }
+    for (name, value) in &custom_tags {
+        if value.len() > MAX_CUSTOM_TAG_VALUE_BYTES {
+            return Err(format!(
+                "workload_metrics: custom tag '{name}' value exceeds {MAX_CUSTOM_TAG_VALUE_BYTES} bytes"
+            ));
+        }
+    }
+
+    let mut normalized_header_tags = HashMap::with_capacity(custom_header_tags.len());
+    for (name, header) in custom_header_tags {
+        let header_name =
+            http::header::HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
+                format!("workload_metrics: custom tag '{name}' has invalid header name '{header}'")
+            })?;
+        if is_sensitive_metadata_key(header_name.as_str()) {
+            return Err(format!(
+                "workload_metrics: custom tag '{name}' cannot copy sensitive header '{header}'"
+            ));
+        }
+        normalized_header_tags.insert(name, header_name.as_str().to_string());
+    }
+
+    let marker = (!names.is_empty()).then(|| names.join(","));
+    Ok(ValidatedCustomTags {
+        custom_tags,
+        custom_header_tags: normalized_header_tags,
+        custom_trace_attributes_marker: marker,
+    })
+}
+
+fn validate_custom_tag_name(name: &str) -> Result<(), String> {
+    let allowed = !name.is_empty()
+        && name.len() <= MAX_CUSTOM_TAG_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if !allowed {
+        return Err(format!(
+            "workload_metrics: invalid custom tag name '{name}'"
+        ));
+    }
+    let reserved = name.starts_with("mesh.")
+        || name.starts_with("mesh_authz.")
+        || name.starts_with("workload_metrics.")
+        || matches!(
+            name,
+            "trace_id"
+                | "span_id"
+                | "parent_span_id"
+                | "trace_sampled"
+                | "traceparent"
+                | "tracestate"
+                | "peer_spiffe_id"
+                | "request_protocol"
+                | "response_flags"
+        );
+    if reserved || is_sensitive_metadata_key(name) {
+        return Err(format!(
+            "workload_metrics: custom tag name '{name}' is reserved or sensitive"
+        ));
+    }
+    Ok(())
 }
 
 fn first_label<'a>(labels: &'a HashMap<String, String>, keys: &[&str]) -> Option<&'a str> {
@@ -826,6 +1421,13 @@ fn first_label<'a>(labels: &'a HashMap<String, String>, keys: &[&str]) -> Option
             .map(String::as_str)
             .filter(|value| !value.is_empty())
     })
+}
+
+fn mesh_service_namespace(service: &str) -> Option<&str> {
+    let service_and_namespace = service.split_once(".svc.")?.0;
+    service_and_namespace
+        .rsplit_once('.')
+        .map(|(_, namespace)| namespace)
 }
 
 fn request_protocol(ctx: &RequestContext, headers: &HashMap<String, String>) -> &'static str {
@@ -898,6 +1500,19 @@ fn existing_sampling_decision(
             header_value(headers, TRACEPARENT_HEADER).and_then(traceparent_sampling_decision)
         })
         .or_else(|| b3_sampling_decision(headers))
+}
+
+fn clear_http_trace_metadata(metadata: &mut HashMap<String, String>) {
+    for key in [
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "trace_sampled",
+        TRACEPARENT_HEADER,
+        TRACESTATE_HEADER,
+    ] {
+        metadata.remove(key);
+    }
 }
 
 fn metadata_has_sampling_decision(metadata: &HashMap<String, String>) -> bool {
@@ -1115,10 +1730,26 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
     })
 }
 
+fn set_header_case_insensitive(headers: &mut HashMap<String, String>, name: &str, value: &str) {
+    headers.retain(|header_name, _| !header_name.eq_ignore_ascii_case(name));
+    headers.insert(name.to_string(), value.to_string());
+}
+
 fn has_valid_traceparent(headers: &HashMap<String, String>) -> bool {
     header_value(headers, TRACEPARENT_HEADER)
         .and_then(OtelTracing::parse_traceparent)
         .is_some()
+}
+
+fn clear_source_spiffe_labels(metadata: &mut HashMap<String, String>) {
+    for key in [
+        MESH_SOURCE_PRINCIPAL,
+        MESH_SOURCE_TRUST_DOMAIN,
+        MESH_SOURCE_NAMESPACE,
+        MESH_SOURCE_SERVICE_ACCOUNT,
+    ] {
+        metadata.remove(key);
+    }
 }
 
 fn insert_source_spiffe_labels(metadata: &mut HashMap<String, String>, identity: &SpiffeId) {
@@ -1138,6 +1769,19 @@ fn insert_source_spiffe_labels(metadata: &mut HashMap<String, String>, identity:
     }
 }
 
+fn insert_destination_spiffe_labels(metadata: &mut HashMap<String, String>, identity: &SpiffeId) {
+    metadata.insert(
+        "mesh.destination.principal".to_string(),
+        identity.to_string(),
+    );
+    if let Some(namespace) = spiffe_path_value(identity, "ns") {
+        metadata.insert(
+            "mesh.destination.namespace".to_string(),
+            namespace.to_string(),
+        );
+    }
+}
+
 fn spiffe_path_value<'a>(identity: &'a SpiffeId, key: &str) -> Option<&'a str> {
     let mut segments = identity.path_segments();
     while let Some(segment) = segments.next() {
@@ -1152,6 +1796,57 @@ fn spiffe_path_value<'a>(identity: &'a SpiffeId, key: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
+
+    struct CapturingExporter {
+        spans: Arc<Mutex<Vec<SpanData>>>,
+    }
+
+    impl TraceExporter for CapturingExporter {
+        fn provider_name(&self) -> &'static str {
+            "test"
+        }
+
+        fn hostname(&self) -> Option<&str> {
+            None
+        }
+
+        fn try_export(&self, span: SpanData) -> Result<(), String> {
+            self.spans
+                .lock()
+                .map_err(|_| "test span mutex poisoned".to_string())?
+                .push(span);
+            Ok(())
+        }
+    }
+
+    fn stream_context(
+        direction: MeshTrafficDirection,
+        authenticated_identity: Option<&str>,
+        proxy_name: &str,
+    ) -> StreamConnectionContext {
+        StreamConnectionContext {
+            client_ip: "10.0.0.2".to_string(),
+            direct_client_ip: "10.0.0.2".to_string(),
+            canonical_client_ip: Default::default(),
+            proxy_id: "mesh-stream".to_string(),
+            proxy_name: Some(proxy_name.to_string()),
+            listen_port: 5432,
+            backend_scheme: crate::config::types::BackendScheme::Tcp,
+            consumer_index: Arc::new(crate::consumer_index::ConsumerIndex::new(&[])),
+            identified_consumer: None,
+            authenticated_identity: authenticated_identity.map(str::to_owned),
+            auth_method: None,
+            metadata: None,
+            tls_client_cert_der: None,
+            tls_client_cert_chain_der: None,
+            sni_hostname: None,
+            mesh_direction: Some(direction),
+            node_waypoint_policy_scope: None,
+            first_bytes: None,
+            first_bytes_kind: None,
+        }
+    }
 
     #[test]
     fn custom_header_tags_resolve_request_header_values() {
@@ -1174,6 +1869,481 @@ mod tests {
             Some("constant")
         );
         assert_eq!(metadata.get("tenant").map(String::as_str), Some("acme"));
+        assert_eq!(
+            metadata
+                .get(CUSTOM_TRACE_ATTRIBUTES_METADATA)
+                .map(String::as_str),
+            Some("literal,tenant")
+        );
+    }
+
+    #[test]
+    fn custom_header_tags_reject_credentials_and_trace_control_collisions() {
+        let credential_error = WorkloadMetrics::new(&json!({
+            "custom_header_tags": {"tenant": "authorization"}
+        }))
+        .err()
+        .expect("credential header must be rejected");
+        assert!(credential_error.contains("sensitive header"));
+
+        let reserved_error = WorkloadMetrics::new(&json!({
+            "custom_header_tags": {"trace_sampled": "x-debug"}
+        }))
+        .err()
+        .expect("trace control collision must be rejected");
+        assert!(reserved_error.contains("reserved or sensitive"));
+    }
+
+    #[test]
+    fn custom_header_tag_values_are_bounded() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "custom_header_tags": {"tenant": "x-tenant"}
+        }))
+        .expect("metrics config");
+        let headers = HashMap::from([(
+            "x-tenant".to_string(),
+            "x".repeat(MAX_CUSTOM_TAG_VALUE_BYTES + 1),
+        )]);
+        let mut metadata = HashMap::new();
+
+        metrics.apply_telemetry_metadata(&mut metadata, &headers);
+
+        assert!(!metadata.contains_key("tenant"));
+    }
+
+    #[tokio::test]
+    async fn configured_custom_tags_reach_spans_without_promoting_other_metadata() {
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let mut metrics = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 100.0,
+            "custom_tags": {"region": "east"},
+            "custom_header_tags": {"tenant": "x-tenant"}
+        }))
+        .expect("metrics config");
+        metrics.trace_exporters = vec![Arc::new(CapturingExporter {
+            spans: Arc::clone(&spans),
+        })];
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+        ctx.headers
+            .insert("x-tenant".to_string(), "acme".to_string());
+        metrics.on_request_received(&mut ctx).await;
+        ctx.metadata
+            .insert("unrelated".to_string(), "must-not-export".to_string());
+        let summary = TransactionSummary {
+            metadata: ctx.metadata,
+            ..TransactionSummary::default()
+        };
+
+        metrics.log(&summary).await;
+
+        let spans = spans.lock().expect("span mutex");
+        let span = spans.first().expect("exported span");
+        assert!(
+            span.mesh_attributes
+                .contains(&("region".to_string(), "east".to_string()))
+        );
+        assert!(
+            span.mesh_attributes
+                .contains(&("tenant".to_string(), "acme".to_string()))
+        );
+        assert!(
+            span.mesh_attributes
+                .iter()
+                .all(|(key, _)| key != "unrelated")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_received_stamps_directional_metadata_before_authorization() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "namespace": "payments",
+            "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
+            "labels": {"app": "checkout"}
+        }))
+        .expect("metrics config");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+
+        let result = metrics.on_request_received(&mut ctx).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(!ctx.metadata.contains_key(MESH_SOURCE_PRINCIPAL));
+        assert_eq!(
+            ctx.metadata.get("mesh.source.workload").map(String::as_str),
+            Some("unknown")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.destination.workload")
+                .map(String::as_str),
+            Some("checkout")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.destination.principal")
+                .map(String::as_str),
+            Some("spiffe://cluster.local/ns/payments/sa/checkout")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get(MESH_DIRECTION_METADATA)
+                .map(String::as_str),
+            Some(MESH_DIRECTION_INBOUND)
+        );
+        let summary = TransactionSummary {
+            response_status_code: 403,
+            metadata: ctx.metadata.clone(),
+            ..TransactionSummary::default()
+        };
+        let key = crate::plugins::mesh::prometheus_helpers::mesh_request_key(&summary)
+            .expect("mesh request key before authorization rejection");
+        assert_eq!(key.source_workload.as_ref(), "unknown");
+        assert_eq!(key.destination_workload.as_ref(), "checkout");
+        assert_eq!(key.response_code, 403);
+    }
+
+    #[test]
+    fn inbound_peer_is_source_while_local_workload_is_destination() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "namespace": "payments",
+            "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
+            "labels": {"app": "checkout"}
+        }))
+        .expect("metrics config");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+        ctx.peer_spiffe_id = Some(
+            SpiffeId::new("spiffe://cluster.local/ns/storefront/sa/frontend")
+                .expect("peer SPIFFE ID"),
+        );
+
+        metrics.annotate_http_context(&mut ctx, &HashMap::new());
+
+        assert_eq!(
+            ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
+            Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+        );
+        assert_eq!(
+            ctx.metadata.get("mesh.source.workload").map(String::as_str),
+            Some("frontend")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.destination.workload")
+                .map(String::as_str),
+            Some("checkout")
+        );
+    }
+
+    #[test]
+    fn trusted_hbone_baggage_is_the_inbound_source() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "namespace": "payments",
+            "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
+            "labels": {"app": "checkout"},
+            "trusted_hbone_assertors": [
+                "spiffe://cluster.local/ns/istio-system/sa/ztunnel"
+            ]
+        }))
+        .expect("metrics config");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+        ctx.peer_spiffe_id = Some(
+            SpiffeId::new("spiffe://cluster.local/ns/istio-system/sa/ztunnel")
+                .expect("assertor SPIFFE ID"),
+        );
+        ctx.metadata
+            .insert("request_protocol".to_string(), "hbone".to_string());
+        let headers = HashMap::from([(
+            BAGGAGE_HEADER.to_string(),
+            "source.principal=spiffe%3A%2F%2Fcluster.local%2Fns%2Fstorefront%2Fsa%2Ffrontend"
+                .to_string(),
+        )]);
+
+        metrics.annotate_http_context(&mut ctx, &headers);
+
+        assert_eq!(
+            ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
+            Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+        );
+        assert_eq!(
+            ctx.metadata.get("mesh.source.workload").map(String::as_str),
+            Some("frontend")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh.destination.workload")
+                .map(String::as_str),
+            Some("checkout")
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_source_scope_reject_restamps_source_to_attesting_peer() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "namespace": "payments",
+            "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
+            "labels": {"app": "checkout"},
+            "trusted_hbone_assertors": [
+                "spiffe://cluster.local/ns/istio-system/sa/ztunnel"
+            ]
+        }))
+        .expect("metrics config");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+        ctx.peer_spiffe_id = Some(
+            SpiffeId::new("spiffe://cluster.local/ns/istio-system/sa/ztunnel")
+                .expect("assertor SPIFFE ID"),
+        );
+        ctx.metadata
+            .insert("request_protocol".to_string(), "hbone".to_string());
+        ctx.headers.insert(
+            BAGGAGE_HEADER.to_string(),
+            "source.principal=spiffe%3A%2F%2Fcluster.local%2Fns%2Fstorefront%2Fsa%2Ffrontend"
+                .to_string(),
+        );
+
+        // Request-received attribution runs before authorization and honors
+        // the trusted-assertor baggage.
+        metrics.on_request_received(&mut ctx).await;
+        assert_eq!(
+            ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
+            Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+        );
+
+        // mesh_authz then discards the UDP pod-UID/source-scope evidence
+        // bundle, falls back to the attesting peer, and rejects before
+        // before_proxy can refresh the labels.
+        ctx.metadata.insert(
+            IGNORED_UDP_SOURCE_SCOPE_METADATA.to_string(),
+            "pod_uid_not_bound".to_string(),
+        );
+
+        let mut response_headers = HashMap::new();
+        metrics
+            .after_proxy(&mut ctx, 403, &mut response_headers)
+            .await;
+
+        assert_eq!(
+            ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
+            Some("spiffe://cluster.local/ns/istio-system/sa/ztunnel")
+        );
+        assert_eq!(
+            ctx.metadata.get("mesh.source.workload").map(String::as_str),
+            Some("ztunnel")
+        );
+        assert_eq!(
+            ctx.metadata.get(MESH_SOURCE_NAMESPACE).map(String::as_str),
+            Some("istio-system")
+        );
+    }
+
+    #[test]
+    fn outbound_local_workload_remains_the_source() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "namespace": "storefront",
+            "workload_spiffe_id": "spiffe://cluster.local/ns/storefront/sa/frontend",
+            "labels": {"app": "frontend"}
+        }))
+        .expect("metrics config");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+
+        metrics.annotate_http_context(&mut ctx, &HashMap::new());
+
+        assert_eq!(
+            ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
+            Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+        );
+        assert_eq!(
+            ctx.metadata.get("mesh.source.workload").map(String::as_str),
+            Some("frontend")
+        );
+        assert!(!ctx.metadata.contains_key("mesh.destination.principal"));
+    }
+
+    #[tokio::test]
+    async fn stream_attribution_uses_directional_source_and_destination_roles() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "namespace": "payments",
+            "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
+            "labels": {"app": "checkout"}
+        }))
+        .expect("metrics config");
+        let mut inbound = stream_context(
+            MeshTrafficDirection::Inbound,
+            Some("spiffe://cluster.local/ns/storefront/sa/frontend"),
+            "checkout.payments.svc.cluster.local",
+        );
+        metrics.on_stream_connect(&mut inbound).await;
+        let inbound_summary = TransactionSummary {
+            metadata: inbound.take_metadata(),
+            ..TransactionSummary::default()
+        };
+        let inbound_key =
+            crate::plugins::mesh::prometheus_helpers::mesh_request_key(&inbound_summary)
+                .expect("inbound mesh key");
+        assert_eq!(inbound_key.source_workload.as_ref(), "frontend");
+        assert_eq!(inbound_key.destination_workload.as_ref(), "checkout");
+        assert_eq!(inbound_key.destination_namespace.as_ref(), "payments");
+
+        let mut outbound = stream_context(
+            MeshTrafficDirection::Outbound,
+            None,
+            "reviews.catalog.svc.cluster.local",
+        );
+        metrics.on_stream_connect(&mut outbound).await;
+        let outbound_summary = TransactionSummary {
+            metadata: outbound.take_metadata(),
+            ..TransactionSummary::default()
+        };
+        let outbound_key =
+            crate::plugins::mesh::prometheus_helpers::mesh_request_key(&outbound_summary)
+                .expect("outbound mesh key");
+        assert_eq!(outbound_key.source_workload.as_ref(), "checkout");
+        assert_eq!(
+            outbound_key.destination_workload.as_ref(),
+            "reviews.catalog.svc.cluster.local"
+        );
+        assert_eq!(outbound_key.destination_namespace.as_ref(), "catalog");
+    }
+
+    #[tokio::test]
+    async fn captured_outbound_stream_attributes_asserted_source_workload() {
+        // NodeWaypoint TCP / Ambient UDP capture runs on the node data plane
+        // (ztunnel/waypoint identity) but asserts the originating pod as the
+        // authenticated peer; the CLIENT-side labels must name that pod, not
+        // the capturing data plane.
+        let metrics = WorkloadMetrics::new(&json!({
+            "namespace": "istio-system",
+            "workload_spiffe_id": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+            "labels": {"app": "ztunnel"}
+        }))
+        .expect("metrics config");
+        let mut outbound = stream_context(
+            MeshTrafficDirection::Outbound,
+            Some("spiffe://cluster.local/ns/storefront/sa/frontend"),
+            "reviews.catalog.svc.cluster.local",
+        );
+        metrics.on_stream_connect(&mut outbound).await;
+        let metadata = outbound.take_metadata();
+
+        assert_eq!(
+            metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
+            Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+        );
+        assert_eq!(
+            metadata.get("mesh.source.workload").map(String::as_str),
+            Some("frontend")
+        );
+        assert_eq!(
+            metadata.get(MESH_SOURCE_NAMESPACE).map(String::as_str),
+            Some("storefront")
+        );
+        assert_eq!(
+            metadata
+                .get("mesh.destination.workload")
+                .map(String::as_str),
+            Some("reviews.catalog.svc.cluster.local")
+        );
+    }
+
+    #[test]
+    fn metric_configuration_preserves_family_scope_and_istio_label_names() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "metrics": {
+                "disabled_metrics": ["REQUEST_DURATION"],
+                "tag_overrides": [
+                    {
+                        "metric": "REQUEST_COUNT",
+                        "name": "source_workload",
+                        "operation": {"type": "set", "value": "edge"}
+                    },
+                    {
+                        "metric": "REQUEST_DURATION",
+                        "name": "response_flags",
+                        "operation": {"type": "remove"}
+                    }
+                ]
+            }
+        }))
+        .expect("metric config");
+
+        assert_eq!(
+            metrics.request_count_tag_overrides.as_deref(),
+            Some("s0,4:edge;")
+        );
+        assert_eq!(
+            metrics.request_duration_tag_overrides.as_deref(),
+            Some("r11;")
+        );
+        assert_eq!(
+            metrics.disabled_metrics_marker.as_deref(),
+            Some("request_duration")
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_summary_does_not_duplicate_primary_span_identity() {
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let mut metrics = WorkloadMetrics::new(&json!({})).expect("metrics config");
+        metrics.trace_exporters = vec![Arc::new(CapturingExporter {
+            spans: Arc::clone(&spans),
+        })];
+        let summary = TransactionSummary {
+            metadata: HashMap::from([
+                ("trace_sampled".to_string(), "true".to_string()),
+                (
+                    "trace_id".to_string(),
+                    "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+                ),
+                ("span_id".to_string(), "00f067aa0ba902b7".to_string()),
+            ]),
+            ..TransactionSummary::default()
+        };
+
+        metrics.log(&summary).await;
+        metrics
+            .log(
+                &summary.as_mirror_entry(crate::plugins::MirrorResponseMeta {
+                    mirror_target_url: "https://mirror.example".to_string(),
+                    mirror_response_status_code: Some(200),
+                    mirror_response_size_bytes: Some(0),
+                    mirror_latency_ms: 1.0,
+                    mirror_error: None,
+                }),
+            )
+            .await;
+
+        let spans = spans.lock().expect("span mutex");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(spans[0].span_id, "00f067aa0ba902b7");
     }
 
     #[test]

@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use http::header::HeaderName;
 use serde_json::Map;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 use url::{Host, Url};
@@ -11,29 +12,41 @@ use url::{Host, Url};
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::PluginHttpClient;
+use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::constant_time_eq;
-use super::utils::auth_flow::{AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::auth_flow::{
+    AuthMechanism, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
+    nonblank_identity,
+};
 use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
-    ClaimHeaderMapping, apply_claim_headers_from_metadata, emit_claim_headers_to_metadata,
+    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
     parse_claim_headers, parse_separator,
 };
-use super::utils::claim_resolver::{extract_claim_string, parse_claim_path_value};
+use super::utils::claim_resolver::{
+    extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
+};
 use super::utils::dpop::{self, DpopJtiCache, DpopVerifyInput};
-use super::utils::jwks_cache::get_or_create_jwks_store;
-use super::utils::jwks_store::JwksKeyStore;
+use super::utils::jwks_cache::{
+    DiscoveryStoreCandidate, get_or_create_jwks_store, last_discovered_jwks_uri,
+    remember_discovered_jwks_uri, retire_jwks_store_if_unreferenced,
+};
+use super::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
 use super::utils::jwt_verifier::{JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks};
+use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
-    extract_authorization_bearer, extract_from_location,
-    mark_original_token_stripping_metadata as mark_token_stripping_metadata,
-    mark_present_query_credential_locations, provider_locations_extract_token,
+    extract_authorization_bearer, extract_from_location, mark_present_query_credential_locations,
+    provider_locations_extract_token, stage_original_token_stripping as stage_token_stripping,
 };
 use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
 /// Default JWKS refresh interval: 15 minutes.
-const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
+pub const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
+pub const DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES: usize = 10_000;
+const MAX_DISCOVERY_RESPONSE_BYTES: usize = 128 * 1024;
+const MAX_DISCOVERED_JWKS_URI_BYTES: usize = 8 * 1024;
 const STRIP_AUTHORIZATION_METADATA_KEY: &str = "jwks_auth.strip_authorization";
 const STRIP_HEADER_METADATA_PREFIX: &str = "jwks_auth.strip_header.";
 const CLAIM_HEADER_METADATA_PREFIX: &str = "jwks_auth.claim_header.";
@@ -100,6 +113,11 @@ pub struct JwksAuth {
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
     emit_mesh_request_principal_metadata: bool,
+    http_client: PluginHttpClient,
+    refresh_interval: Duration,
+    discovery_tasks: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    discovery_owner_live: Arc<AtomicBool>,
+    discovery_publication_gate: Arc<Mutex<()>>,
 }
 
 /// A single identity provider configuration.
@@ -140,8 +158,95 @@ struct JwksProvider {
     dpop_jti_cache: Option<Arc<DpopJtiCache>>,
     /// The JWKS key store (shared via global cache).
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
+    jwks_source: JwksSource,
     /// Outbound hosts used by direct JWKS or discovery URLs.
     warmup_hostnames: Vec<String>,
+}
+
+enum JwksSource {
+    Inline,
+    Direct(String),
+    Discovery(String),
+}
+
+const CONFIG_FIELDS: &[&str] = &[
+    "providers",
+    "scope_claim",
+    "role_claim",
+    "consumer_identity_claim",
+    "consumer_header_claim",
+    "claim_headers",
+    "claim_headers_separator",
+    "emit_mesh_request_principal_metadata",
+    "require_exp",
+    "jwks_refresh_interval_secs",
+];
+
+const PROVIDER_FIELDS: &[&str] = &[
+    "jwks_uri",
+    "discovery_url",
+    "jwks",
+    "issuer",
+    "audience",
+    "audiences",
+    "from_headers",
+    "from_params",
+    "forward_original_token",
+    "require_exp",
+    "required_scopes",
+    "required_roles",
+    "scope_claim",
+    "role_claim",
+    "consumer_identity_claim",
+    "consumer_header_claim",
+    "claim_headers",
+    "claim_headers_separator",
+    "require_mtls_binding",
+    "require_dpop",
+    "dpop_clock_skew_secs",
+    "dpop_jti_cache_max_entries",
+    "dpop_jti_ttl_secs",
+];
+
+impl Drop for JwksAuth {
+    fn drop(&mut self) {
+        let _publication = match self.discovery_publication_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.discovery_owner_live.store(false, Ordering::Release);
+        {
+            let tasks = match self.discovery_tasks.get_mut() {
+                Ok(tasks) => tasks,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(tasks) = tasks.take() {
+                for task in tasks {
+                    task.abort();
+                }
+            }
+        }
+
+        // A plugin generation can be discarded after its discovery task
+        // published a candidate into the local slot but before the generation
+        // itself was committed. Release those local owners and retire only
+        // entries that no other committed provider still uses.
+        for provider in &self.providers {
+            if matches!(&provider.jwks_source, JwksSource::Inline) {
+                continue;
+            }
+            let current = provider.jwks_store.swap(Arc::new(None));
+            let jwks_uri = current
+                .as_ref()
+                .as_ref()
+                .filter(|store| store.is_refreshable())
+                .map(|store| store.jwks_uri().to_string());
+            drop(current);
+            if let Some(jwks_uri) = jwks_uri {
+                retire_jwks_store_if_unreferenced(&jwks_uri);
+            }
+        }
+    }
 }
 
 impl JwksAuth {
@@ -149,6 +254,7 @@ impl JwksAuth {
         let config_obj = config
             .as_object()
             .ok_or_else(|| format!("jwks_auth: config must be an object, got: {config}"))?;
+        reject_unknown_fields(config_obj, CONFIG_FIELDS, "config")?;
 
         let refresh_interval_secs = optional_u64(
             config_obj,
@@ -197,6 +303,7 @@ impl JwksAuth {
             let prov_obj = prov_cfg.as_object().ok_or_else(|| {
                 format!("jwks_auth: provider[{idx}] must be an object, got: {prov_cfg}")
             })?;
+            reject_unknown_fields(prov_obj, PROVIDER_FIELDS, &format!("provider[{idx}]"))?;
 
             let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
             let discovery_endpoint = parse_url_field(prov_obj, "discovery_url", idx)?;
@@ -267,7 +374,7 @@ impl JwksAuth {
             }
             let dpop_jti_cache_max_entries =
                 optional_provider_usize(prov_obj, "dpop_jti_cache_max_entries", idx)?
-                    .unwrap_or(50_000);
+                    .unwrap_or(DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES);
             if dpop_jti_cache_max_entries == 0 {
                 return Err(format!(
                     "jwks_auth: 'provider[{idx}].dpop_jti_cache_max_entries' must be greater than 0"
@@ -296,71 +403,24 @@ impl JwksAuth {
             let jwks_store_slot: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>> =
                 Arc::new(ArcSwap::from_pointee(None));
 
-            if let Some(ref jwks_json) = inline_jwks {
+            let jwks_source = if let Some(ref jwks_json) = inline_jwks {
                 let store = JwksKeyStore::from_inline_jwks(jwks_json)?;
                 jwks_store_slot.store(Arc::new(Some(Arc::new(store))));
+                JwksSource::Inline
             } else if let Some(ref uri) = jwks_uri {
-                // Direct jwks_uri — get-or-create shared store immediately
-                let store = get_or_create_jwks_store(uri, &http_client, refresh_interval);
-                jwks_store_slot.store(Arc::new(Some(store)));
+                // Pure construction keeps a local, non-refreshing-yet store so
+                // offline validation needs no Tokio runtime. Runtime startup
+                // replaces it with the process-wide shared store.
+                let store = JwksKeyStore::new(uri.clone(), http_client.clone());
+                jwks_store_slot.store(Arc::new(Some(Arc::new(store))));
+                JwksSource::Direct(uri.clone())
             } else if let Some(ref disc_url) = discovery_url {
-                // OIDC discovery — resolve jwks_uri asynchronously with
-                // indefinite retries. The background task keeps trying with
-                // exponential backoff (2s → 4s → … → 5min cap) until discovery
-                // succeeds. Once resolved, the JwksKeyStore's own background
-                // task starts immediately; we publish the store before eager
-                // fetch so cache-retention sees it as active. The eager fetch
-                // then coalesces with that task.
-                //
-                // This ensures a prolonged IdP outage during gateway startup
-                // does not permanently disable the provider — it self-heals
-                // as soon as the IdP comes back.
-                //
-                // Auth behavior while discovery is pending: tokens destined
-                // for this provider are rejected with 401 (fail closed).
-                let slot = jwks_store_slot.clone();
-                let client = http_client.clone();
-                let url = disc_url.clone();
-                let interval = refresh_interval;
-                tokio::spawn(async move {
-                    const INITIAL_BACKOFF_SECS: u64 = 2;
-                    const MAX_BACKOFF_SECS: u64 = 300;
-
-                    let mut attempt: u32 = 0;
-                    loop {
-                        if attempt > 0 {
-                            let backoff_secs = INITIAL_BACKOFF_SECS
-                                .saturating_mul(1u64 << (attempt - 1).min(7))
-                                .min(MAX_BACKOFF_SECS);
-                            let backoff = Duration::from_secs(backoff_secs);
-                            warn!(
-                                "jwks_auth OIDC discovery attempt {} failed — retrying in {:?}",
-                                attempt, backoff
-                            );
-                            tokio::time::sleep(backoff).await;
-                        }
-                        match discover_jwks_uri(&client, &url).await {
-                            Ok(uri) => {
-                                info!("jwks_auth OIDC discovery: resolved jwks_uri={}", uri);
-                                let store = get_or_create_jwks_store(&uri, &client, interval);
-                                slot.store(Arc::new(Some(store.clone())));
-                                if let Err(e) = store.fetch_keys_if_empty().await {
-                                    warn!("jwks_auth OIDC: initial JWKS fetch failed: {}", e);
-                                }
-                                return;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "jwks_auth OIDC discovery attempt {} failed: {} — will keep retrying in background",
-                                    attempt + 1,
-                                    e
-                                );
-                            }
-                        }
-                        attempt = attempt.saturating_add(1);
-                    }
-                });
-            }
+                JwksSource::Discovery(disc_url.clone())
+            } else {
+                return Err(format!(
+                    "jwks_auth: provider[{idx}] has no usable JWKS source"
+                ));
+            };
 
             providers.push(JwksProvider {
                 issuer,
@@ -381,6 +441,7 @@ impl JwksAuth {
                 dpop_clock_skew: Duration::from_secs(dpop_clock_skew_secs),
                 dpop_jti_cache,
                 jwks_store: jwks_store_slot,
+                jwks_source,
                 warmup_hostnames,
             });
         }
@@ -411,6 +472,11 @@ impl JwksAuth {
             strip_authorization_on_success,
             has_custom_query_token_locations,
             emit_mesh_request_principal_metadata,
+            http_client,
+            refresh_interval,
+            discovery_tasks: Mutex::new(None),
+            discovery_owner_live: Arc::new(AtomicBool::new(true)),
+            discovery_publication_gate: Arc::new(Mutex::new(())),
         })
     }
 
@@ -431,6 +497,22 @@ impl JwksAuth {
         }
     }
 
+    /// Per-provider DPoP replay-cache capacities (`None` when DPoP is not
+    /// required). Test-only visibility for default-contract regressions.
+    #[doc(hidden)]
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn dpop_jti_cache_capacities(&self) -> Vec<Option<usize>> {
+        self.providers
+            .iter()
+            .map(|provider| {
+                provider
+                    .dpop_jti_cache
+                    .as_ref()
+                    .map(|cache| cache.max_entries())
+            })
+            .collect()
+    }
+
     fn resolve_identity(
         &self,
         claims: &Value,
@@ -446,26 +528,25 @@ impl JwksAuth {
             .as_deref()
             .unwrap_or(&self.consumer_header_claim);
 
-        let identity = extract_claim_string(claims, effective_identity_claim);
+        let identity = nonblank_identity(extract_claim_string(claims, effective_identity_claim));
         let header_value = if effective_header_claim == effective_identity_claim {
             identity.clone()
         } else {
-            extract_claim_string(claims, effective_header_claim).or_else(|| identity.clone())
+            extract_claim_string_exact(claims, effective_header_claim).or_else(|| identity.clone())
         };
 
         let consumer = if let Some(ref id) = identity {
             match consumer_index.find_by_identity(id) {
                 Some(consumer) => {
                     debug!(
-                        "jwks_auth: identified consumer '{}' via claim '{}'='{}'",
-                        consumer.username, effective_identity_claim, id
+                        "jwks_auth: identified consumer '{}' via configured identity claim",
+                        consumer.username
                     );
                     Some(consumer)
                 }
                 None => {
                     debug!(
-                        "jwks_auth: no consumer found for '{}'='{}' — using external identity",
-                        effective_identity_claim, id
+                        "jwks_auth: no consumer mapping found for configured identity claim — using external principal"
                     );
                     None
                 }
@@ -620,9 +701,9 @@ impl JwksAuth {
         Ok(())
     }
 
-    fn emit_claim_headers(
+    fn stage_claim_headers(
         &self,
-        ctx: &mut RequestContext,
+        attempt: &mut AuthenticationAttempt,
         claims: &Value,
         provider: &JwksProvider,
     ) {
@@ -638,7 +719,7 @@ impl JwksAuth {
             .claim_headers_separator
             .as_deref()
             .unwrap_or(&self.claim_headers_separator);
-        emit_claim_headers_to_metadata(ctx, claims, mappings, separator);
+        emit_claim_headers_to_attempt(attempt, claims, mappings, separator);
     }
 
     async fn authenticate_request(
@@ -682,51 +763,32 @@ impl JwksAuth {
                     return reject(status, body);
                 }
 
-                match self.resolve_identity(&claims, provider, consumer_index) {
-                    VerifyOutcome::Success {
-                        consumer,
-                        external_identity,
-                        external_identity_header,
-                    } => {
-                        let consumer_identified = consumer.is_some();
-                        let external_identity_identified = external_identity.is_some();
+                let mut attempt = AuthenticationAttempt::new();
+                if self.emit_mesh_request_principal_metadata {
+                    stage_mesh_request_principal_metadata(&claims, &mut attempt);
+                }
+                self.stage_claim_headers(&mut attempt, &claims, provider);
+                if !provider.forward_original_token {
+                    stage_original_token_stripping(&mut attempt, provider);
+                }
 
-                        if let Some(consumer) = consumer
-                            && ctx.identified_consumer.is_none()
-                        {
-                            debug!("jwks_auth: identified consumer '{}'", consumer.username);
-                            ctx.identified_consumer = Some(consumer);
-                        }
-
-                        if let Some(external_identity) = external_identity {
-                            ctx.authenticated_identity = Some(external_identity);
-                        }
-                        if let Some(external_identity_header) = external_identity_header {
-                            ctx.authenticated_identity_header = Some(external_identity_header);
-                        }
-
-                        if ctx.auth_method.is_none()
-                            && (consumer_identified || external_identity_identified)
-                        {
-                            ctx.auth_method = Some("jwks_auth");
-                        }
-                        if self.emit_mesh_request_principal_metadata {
-                            set_mesh_request_principal_metadata(&claims, ctx);
-                        }
-                        self.emit_claim_headers(ctx, &claims, provider);
-
-                        if !provider.forward_original_token {
-                            mark_original_token_stripping_metadata(ctx, provider);
-                        }
+                match commit_authentication_attempt(
+                    ctx,
+                    attempt,
+                    self.resolve_identity(&claims, provider, consumer_index),
+                    "jwks_auth",
+                    true,
+                ) {
+                    Ok(_) => PluginResult::Continue,
+                    Err(VerifyOutcome::InvalidFormat(body))
+                    | Err(VerifyOutcome::Invalid(body))
+                    | Err(VerifyOutcome::ConsumerNotFound(body))
+                    | Err(VerifyOutcome::VerificationFailed(body)) => reject(401, body),
+                    Err(VerifyOutcome::Forbidden(body)) => reject(403, body),
+                    Err(VerifyOutcome::Internal(body)) => reject(500, body),
+                    Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
                         PluginResult::Continue
                     }
-                    VerifyOutcome::NotApplicable => PluginResult::Continue,
-                    VerifyOutcome::InvalidFormat(body)
-                    | VerifyOutcome::Invalid(body)
-                    | VerifyOutcome::ConsumerNotFound(body)
-                    | VerifyOutcome::VerificationFailed(body) => reject(401, body),
-                    VerifyOutcome::Forbidden(body) => reject(403, body),
-                    VerifyOutcome::Internal(body) => reject(500, body),
                 }
             }
         }
@@ -863,9 +925,9 @@ enum JwksExtractedCredential {
     Missing,
 }
 
-fn mark_original_token_stripping_metadata(ctx: &mut RequestContext, provider: &JwksProvider) {
-    mark_token_stripping_metadata(
-        ctx,
+fn stage_original_token_stripping(attempt: &mut AuthenticationAttempt, provider: &JwksProvider) {
+    stage_token_stripping(
+        attempt,
         &provider.token_locations,
         STRIP_AUTHORIZATION_METADATA_KEY,
         STRIP_HEADER_METADATA_PREFIX,
@@ -889,6 +951,63 @@ impl super::Plugin for JwksAuth {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         crate::plugins::HTTP_FAMILY_PROTOCOLS
+    }
+
+    fn start_background_tasks(&self) -> Result<(), String> {
+        let mut task_slot = self
+            .discovery_tasks
+            .lock()
+            .map_err(|_| "jwks_auth: discovery task state lock poisoned".to_string())?;
+        if task_slot.is_some() {
+            return Ok(());
+        }
+
+        let has_remote_source = self
+            .providers
+            .iter()
+            .any(|provider| !matches!(&provider.jwks_source, JwksSource::Inline));
+        if !has_remote_source {
+            *task_slot = Some(Vec::new());
+            return Ok(());
+        }
+
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| "jwks_auth: live JWKS startup requires a Tokio runtime".to_string())?;
+        let mut tasks = Vec::new();
+        for provider in &self.providers {
+            match &provider.jwks_source {
+                JwksSource::Inline => {}
+                JwksSource::Direct(uri) => {
+                    let store =
+                        get_or_create_jwks_store(uri, &self.http_client, self.refresh_interval);
+                    provider.jwks_store.store(Arc::new(Some(store)));
+                }
+                JwksSource::Discovery(discovery_url) => {
+                    // Equivalent replacement generations acquire the last
+                    // validated store synchronously. Rediscovery still runs,
+                    // but an IdP outage cannot erase usable verification keys.
+                    if let Some(uri) = last_discovered_jwks_uri(discovery_url) {
+                        let store = get_or_create_jwks_store(
+                            &uri,
+                            &self.http_client,
+                            self.refresh_interval,
+                        );
+                        provider.jwks_store.store(Arc::new(Some(store)));
+                    }
+                    tasks.push(spawn_discovery_task(
+                        &runtime,
+                        Arc::clone(&provider.jwks_store),
+                        self.http_client.clone(),
+                        discovery_url.clone(),
+                        self.refresh_interval,
+                        Arc::clone(&self.discovery_owner_live),
+                        Arc::clone(&self.discovery_publication_gate),
+                    ));
+                }
+            }
+        }
+        *task_slot = Some(tasks);
+        Ok(())
     }
 
     async fn authenticate(
@@ -944,7 +1063,7 @@ impl super::Plugin for JwksAuth {
             ctx.metadata
                 .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
         }
-        apply_claim_headers_from_metadata(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
+        apply_claim_headers_from_context(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
         PluginResult::Continue
     }
 
@@ -977,6 +1096,13 @@ impl super::Plugin for JwksAuth {
         uris
     }
 
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+        self.active_jwks_uris()
+            .into_iter()
+            .map(|uri| (uri, self.refresh_interval))
+            .collect()
+    }
+
     fn requires_decoded_query_params(&self) -> bool {
         self.has_custom_query_token_locations
     }
@@ -985,6 +1111,144 @@ impl super::Plugin for JwksAuth {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn spawn_discovery_task(
+    runtime: &tokio::runtime::Handle,
+    slot: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
+    client: PluginHttpClient,
+    discovery_url: String,
+    refresh_interval: Duration,
+    owner_live: Arc<AtomicBool>,
+    publication_gate: Arc<Mutex<()>>,
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn(async move {
+        const INITIAL_BACKOFF_SECS: u64 = 2;
+        const MAX_BACKOFF_SECS: u64 = 300;
+
+        let mut attempt: u32 = 0;
+        loop {
+            if attempt > 0 {
+                let backoff_secs = INITIAL_BACKOFF_SECS
+                    .saturating_mul(1u64 << (attempt - 1).min(7))
+                    .min(MAX_BACKOFF_SECS);
+                let backoff = Duration::from_secs(backoff_secs);
+                warn!(
+                    "jwks_auth OIDC discovery attempt {} failed — retrying in {:?}",
+                    attempt, backoff
+                );
+                tokio::time::sleep(backoff).await;
+            }
+
+            match discover_jwks_uri(&client, &discovery_url).await {
+                Ok(uri) => {
+                    info!(
+                        "jwks_auth OIDC discovery resolved a JWKS endpoint at {}",
+                        redacted_jwks_uri(&uri)
+                    );
+                    let mut candidate = DiscoveryStoreCandidate::acquire(
+                        &uri,
+                        &client,
+                        refresh_interval,
+                    );
+                    let Some(store) = candidate.store().cloned() else {
+                        warn!(
+                            "jwks_auth OIDC: discovery candidate disappeared before publication"
+                        );
+                        return;
+                    };
+                    let previous = slot.load().as_ref().as_ref().cloned();
+
+                    if previous
+                        .as_ref()
+                        .is_some_and(|current| current.jwks_uri() == uri)
+                    {
+                        let _publication = match publication_gate.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        if !owner_live.load(Ordering::Acquire) {
+                            return;
+                        }
+                        remember_discovered_jwks_uri(&discovery_url, &uri);
+                        candidate.publish();
+                        return;
+                    }
+
+                    let previous_has_keys = previous.as_ref().is_some_and(|store| store.has_keys());
+                    if previous_has_keys {
+                        match store.fetch_keys_if_empty().await {
+                            Ok(_) if store.has_keys() => {}
+                            Ok(_) => {
+                                warn!(
+                                    "jwks_auth OIDC: discovered replacement JWKS endpoint has no usable keys; retaining last-known-good store"
+                                );
+                                drop(store);
+                                attempt = attempt.saturating_add(1);
+                                continue;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    "jwks_auth OIDC: replacement JWKS fetch failed: {}; retaining last-known-good store",
+                                    error
+                                );
+                                drop(store);
+                                attempt = attempt.saturating_add(1);
+                                continue;
+                            }
+                        }
+                    }
+
+                    let previous_uri = previous
+                        .as_ref()
+                        .map(|current| current.jwks_uri().to_string());
+                    {
+                        let _publication = match publication_gate.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        if !owner_live.load(Ordering::Acquire) {
+                            return;
+                        }
+                        slot.store(Arc::new(Some(Arc::clone(&store))));
+                        remember_discovered_jwks_uri(&discovery_url, &uri);
+                    }
+
+                    if !previous_has_keys
+                        && let Err(error) = store.fetch_keys_if_empty().await
+                    {
+                        warn!("jwks_auth OIDC: initial JWKS fetch failed: {}", error);
+                    }
+
+                    drop(previous);
+                    if let Some(previous_uri) = previous_uri
+                        && previous_uri != uri
+                    {
+                        retire_jwks_store_if_unreferenced(&previous_uri);
+                    }
+                    let _publication = match publication_gate.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if !owner_live.load(Ordering::Acquire) {
+                        let discarded = slot.swap(Arc::new(None));
+                        drop(discarded);
+                        return;
+                    }
+                    candidate.publish();
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        "jwks_auth OIDC discovery attempt {} failed: {} — will keep retrying in background",
+                        attempt + 1,
+                        error
+                    );
+                }
+            }
+            attempt = attempt.saturating_add(1);
+        }
+    })
+}
 
 /// Try to validate a JWT against a single provider's JWKS store.
 async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Option<Value> {
@@ -1008,6 +1272,19 @@ async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Opt
 struct ParsedEndpoint {
     url: String,
     hostname: String,
+}
+
+fn reject_unknown_fields(
+    config: &Map<String, Value>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), String> {
+    for field in config.keys() {
+        if !allowed.contains(&field.as_str()) {
+            return Err(format!("jwks_auth: unknown field '{field}' in {context}"));
+        }
+    }
+    Ok(())
 }
 
 fn optional_u64(
@@ -1101,8 +1378,19 @@ fn parse_url_field(
     let parsed = Url::parse(url).map_err(|e| {
         format!("jwks_auth: 'provider[{provider_idx}].{field}' is not a valid URL: {e}")
     })?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "jwks_auth: 'provider[{provider_idx}].{field}' must not contain URL userinfo"
+        ));
+    }
     match parsed.scheme() {
-        "http" | "https" => {}
+        "https" => {}
+        "http" if is_local_auth_endpoint(&parsed) => {}
+        "http" => {
+            return Err(format!(
+                "jwks_auth: 'provider[{provider_idx}].{field}' must use https except for literal loopback or localhost"
+            ));
+        }
         scheme => {
             return Err(format!(
                 "jwks_auth: 'provider[{provider_idx}].{field}' must use http or https, got: {scheme}"
@@ -1121,6 +1409,15 @@ fn parse_url_field(
         url: url.to_string(),
         hostname,
     }))
+}
+
+fn is_local_auth_endpoint(parsed: &Url) -> bool {
+    match parsed.host() {
+        Some(Host::Domain(hostname)) => hostname.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
 }
 
 fn hostname_from_parsed_url(parsed: &Url) -> Option<String> {
@@ -1239,6 +1536,11 @@ fn parse_token_locations(
                     "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}]' must be an object, got: {header}"
                 )
             })?;
+            reject_unknown_fields(
+                object,
+                &["name", "prefix"],
+                &format!("provider[{provider_idx}].from_headers[{idx}]"),
+            )?;
             let name_value = object.get("name").ok_or_else(|| {
                 format!(
                     "jwks_auth: 'provider[{provider_idx}].from_headers[{idx}].name' is required"
@@ -1375,11 +1677,12 @@ async fn discover_jwks_uri(
     http_client: &PluginHttpClient,
     discovery_url: &str,
 ) -> Result<String, String> {
+    let redacted_discovery_url = redacted_jwks_uri(discovery_url);
     let req = http_client.get().get(discovery_url);
     let response = http_client
-        .execute(req, "jwks_auth_oidc_discovery")
+        .execute_redacted(req, "jwks_auth_oidc_discovery", &redacted_discovery_url)
         .await
-        .map_err(|e| format!("OIDC discovery request failed: {}", e))?;
+        .map_err(|e| format!("OIDC discovery request failed: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -1388,14 +1691,20 @@ async fn discover_jwks_uri(
         ));
     }
 
-    let body: Value = response
-        .json()
+    let body = read_response_body_bounded(response, MAX_DISCOVERY_RESPONSE_BYTES)
         .await
-        .map_err(|e| format!("OIDC discovery response parse failed: {}", e))?;
+        .map_err(|e| format!("OIDC discovery response rejected: {e}"))?;
+    let body: Value = serde_json::from_slice(&body)
+        .map_err(|e| format!("OIDC discovery response parse failed: {e}"))?;
 
     let jwks_uri = body["jwks_uri"]
         .as_str()
         .ok_or_else(|| "OIDC discovery document missing 'jwks_uri' field".to_string())?;
+    if jwks_uri.len() > MAX_DISCOVERED_JWKS_URI_BYTES {
+        return Err(format!(
+            "OIDC discovery jwks_uri exceeds {MAX_DISCOVERED_JWKS_URI_BYTES} bytes"
+        ));
+    }
 
     validate_discovered_jwks_uri(jwks_uri, discovery_url)
 }
@@ -1404,10 +1713,9 @@ async fn discover_jwks_uri(
 ///
 /// Hardening, in order:
 /// 1. The URI must parse as a URL with a non-empty hostname.
-/// 2. The scheme must be `http` or `https` — matching the validation the
-///    operator-configured `jwks_uri`/`discovery_url` already receive in
-///    [`parse_url_field`]. Non-URL schemes (e.g. `file:`, `gopher:`) are
-///    rejected.
+/// 2. The scheme must be `http` or `https`. The same-origin rule below ensures
+///    that a discovered URL cannot weaken the configured discovery transport;
+///    non-URL schemes (e.g. `file:`, `gopher:`) are rejected.
 /// 3. The discovered JWKS URL must use the same origin as the `discovery_url`:
 ///    scheme, host, and effective port must match. This blocks a spoofed or
 ///    tampered discovery document from redirecting the gateway to an attacker-
@@ -1424,6 +1732,10 @@ fn validate_discovered_jwks_uri(jwks_uri: &str, discovery_url: &str) -> Result<S
     let parsed = Url::parse(jwks_uri).map_err(|e| {
         format!("OIDC discovery returned an invalid jwks_uri (not a valid URL): {e}")
     })?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("OIDC discovery returned a jwks_uri containing userinfo".to_string());
+    }
 
     match parsed.scheme() {
         "http" | "https" => {}
@@ -1495,20 +1807,20 @@ fn origin_from_parsed_url(parsed: &Url) -> Option<UrlOrigin> {
 /// string-array leaves in the already-validated token; nested object claims are
 /// materialized only at leaf paths so nested Istio condition keys remain
 /// addressable without serializing whole objects.
-fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext) {
+fn stage_mesh_request_principal_metadata(claims: &Value, attempt: &mut AuthenticationAttempt) {
     if let (Some(iss), Some(sub)) = (
         claims.get("iss").and_then(|v| v.as_str()),
         claims.get("sub").and_then(|v| v.as_str()),
     ) {
-        ctx.metadata
-            .insert("mesh.request_principal".to_string(), format!("{iss}/{sub}"));
+        attempt
+            .stage_principal_metadata("mesh.request_principal".to_string(), format!("{iss}/{sub}"));
     }
 
     // `request.auth.audiences` — string or string-array form.
     if let Some(aud) = claims.get("aud")
         && let Some(audiences) = string_scalar_or_array(aud)
     {
-        ctx.mesh_request_auth_audiences = audiences;
+        attempt.stage_mesh_request_auth_audiences(audiences);
     }
 
     // `request.auth.claims[<name>]` — scalar claims and string arrays only.
@@ -1522,7 +1834,7 @@ fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext)
             if claim_path_segment_is_ambiguous(name) {
                 continue;
             }
-            set_mesh_claim_attribute(name, value, ctx);
+            stage_mesh_claim_attribute(name, value, attempt);
         }
     }
 }
@@ -1531,7 +1843,7 @@ fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext)
 /// `request.auth.claims[...]` matching. String claims render directly; string
 /// arrays stay as lists so one item containing a comma does not broaden policy
 /// matching. Objects and non-string leaves are skipped by this leaf renderer;
-/// object traversal happens in [`set_mesh_claim_attribute`].
+/// object traversal happens in [`stage_mesh_claim_attribute`].
 fn render_claim_leaf_attribute_value(value: &Value) -> Option<JwtAuthAttributeValue> {
     match value {
         Value::String(s) => Some(JwtAuthAttributeValue::Scalar(s.clone())),
@@ -1540,10 +1852,9 @@ fn render_claim_leaf_attribute_value(value: &Value) -> Option<JwtAuthAttributeVa
     }
 }
 
-fn set_mesh_claim_attribute(path: &str, value: &Value, ctx: &mut RequestContext) {
+fn stage_mesh_claim_attribute(path: &str, value: &Value, attempt: &mut AuthenticationAttempt) {
     if let Some(rendered) = render_claim_leaf_attribute_value(value) {
-        ctx.mesh_request_auth_claims
-            .insert(path.to_string(), rendered);
+        attempt.stage_mesh_request_auth_claim(path.to_string(), rendered);
         return;
     }
 
@@ -1559,7 +1870,7 @@ fn set_mesh_claim_attribute(path: &str, value: &Value, ctx: &mut RequestContext)
         nested_path.push_str(path);
         nested_path.push_str("][");
         nested_path.push_str(name);
-        set_mesh_claim_attribute(&nested_path, nested, ctx);
+        stage_mesh_claim_attribute(&nested_path, nested, attempt);
     }
 }
 

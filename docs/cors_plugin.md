@@ -4,13 +4,13 @@ This document explains how to configure the Cross-Origin Resource Sharing (CORS)
 
 ## Overview
 
-The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS) at the gateway level, so backend services do not need to implement CORS themselves. It intercepts preflight `OPTIONS` requests, validates origins and methods, and injects the required `Access-Control-*` response headers on actual cross-origin requests.
+The CORS plugin handles the [CORS protocol](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS) at the gateway level, so backend services do not need to implement CORS themselves. It intercepts preflight `OPTIONS` requests, validates their requested methods and headers, validates origins on actual requests, and injects the required `Access-Control-*` response headers on cross-origin HTTP and gRPC-Web responses.
 
 ### What the plugin does
 
-1. **Preflight interception** -- When a browser sends an `OPTIONS` request with `Origin` and `Access-Control-Request-Method` headers, the plugin validates the origin and requested method against the configured allow-lists. If both pass, it responds with `204 No Content` and all required CORS headers. If either fails, it responds with `403 Forbidden` and a descriptive error body. The request never reaches the backend.
+1. **Preflight interception** -- When a browser sends an `OPTIONS` request with `Origin` and `Access-Control-Request-Method` headers, the native direct plugin validates the origin and requested method against the configured allow-lists. If both pass, it responds with `204 No Content` and all required CORS headers. If either fails, it responds with `403 Forbidden` and a descriptive error body. The request never reaches the backend unless `preflight_continue` is enabled.
 
-2. **Origin and method enforcement** -- Non-preflight requests that carry an `Origin` header are checked against the allowed origins list. Requests from disallowed origins are rejected with `403 Forbidden` and the body `CORS origin not allowed`.
+2. **Actual-request origin enforcement** -- Non-preflight requests that carry an `Origin` header are checked against the allowed origins list. A native direct policy rejects disallowed origins with `403 Forbidden` and the body `CORS origin not allowed`; an Istio projection forwards unmatched actual requests without gateway-added CORS fields. `allowed_methods` and `allowed_headers` are preflight policy only: they never reject an actual request or re-authorize headers on that phase.
 
 3. **Response header injection** -- For allowed cross-origin requests that pass through to the backend, the plugin injects `Access-Control-Allow-Origin`, `Vary`, and optionally `Access-Control-Allow-Credentials` and `Access-Control-Expose-Headers` into the backend response before it reaches the client.
 
@@ -22,13 +22,19 @@ The CORS plugin is configured via the `plugin_configs` section in your YAML conf
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allowed_origins` | `(string \| object)[]` | `["*"]` | Origins permitted to make cross-origin requests. Each entry is either a **string** (`"*"` to allow any origin, an exact `scheme://host[:port]` origin for case-insensitive exact matching, or a wildcard subdomain pattern like `"*.company.com"`) or an **Istio `StringMatch`-shaped object** carrying exactly one of `exact` / `prefix` / `regex` — `{ "prefix": "https://app." }` (literal byte-prefix of the `Origin`, case-sensitive) or `{ "regex": "https://.*\\.example\\.com" }` (RE2 pattern that must fully match the `Origin`). String and object entries can be mixed (see examples below). If `"*"` appears anywhere in the list, all origins are allowed. A matching origin is reflected verbatim into `Access-Control-Allow-Origin`. |
-| `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | HTTP methods returned in the `Access-Control-Allow-Methods` preflight header. Preflight requests for unlisted methods are rejected with 403. |
-| `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Request headers returned in the `Access-Control-Allow-Headers` preflight header. |
+| `allowed_origins` | `(string \| object)[]` | required | Origins permitted to make cross-origin requests. Use `"*"` only for intentional allow-all. Exact `scheme://host[:port]` values are URL-parsed and canonicalized once at config load (scheme/host case, default ports, IDNA, IPv4, and IPv6); request matching remains a direct comparison with no per-request URL parse/allocation. Native `"*.company.com"` matches subdomains. Istio-shaped objects carry exactly one of `exact` / `prefix` / `regex`; exact `*` is Istio allow-all, while prefix and regex retain literal source semantics. |
+| `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only policy returned in `Access-Control-Allow-Methods`. Native preflights for unlisted methods are rejected with 403; the list is not evaluated against an actual request's method. |
+| `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only policy returned in `Access-Control-Allow-Headers`. It is not evaluated against headers on the actual request. |
 | `exposed_headers` | `string[]` | `[]` | Response headers the browser is allowed to access via JavaScript, returned in `Access-Control-Expose-Headers`. |
 | `allow_credentials` | `bool` | `false` | When `true`, sends `Access-Control-Allow-Credentials: true`. Cannot be used with wildcard origins (see below). |
 | `max_age` | `u64` | `86400` | Number of seconds browsers should cache preflight results (`Access-Control-Max-Age`). |
 | `preflight_continue` | `bool` | `false` | When `true`, preflight requests are passed through to the backend instead of being short-circuited by the plugin. Useful if your backend needs to handle `OPTIONS` itself. |
+| `unmatched_preflights` | `forward` or `ignore` | not set | Translation marker used for Istio policies. `forward` represents omitted/`UNSPECIFIED`/`FORWARD`; `ignore` answers unmatched preflights locally with 200 and no CORS authorization fields. Its presence also preserves empty method/header lists and absent max age. Do not combine it with `preflight_continue`. |
+
+The config root must be an object. Unknown keys, explicit `null`, invalid or
+whitespace-padded tokens, and an omitted/empty `allowed_origins` policy are
+rejected during startup or reload. There is no implicit wildcard origin policy;
+write `allowed_origins: ["*"]` when allow-all is intended.
 
 ### Credentials and Wildcard Origins
 
@@ -44,7 +50,8 @@ Allow any origin to access all proxied routes. Suitable for local development.
 plugin_configs:
   - id: "cors-dev"
     plugin_name: "cors"
-    config: {}
+    config:
+      allowed_origins: ["*"]
     scope: global
     enabled: true
 ```
@@ -147,7 +154,7 @@ This allows:
 - `https://company.com` ❌ (bare domain does not match `*.company.com`)
 - `https://evil.com` ❌ (no match)
 
-> **Note:** Wildcard subdomain patterns match the host portion of the origin only. `*.company.com` matches any origin whose host ends with `.company.com`, regardless of scheme or port. The bare domain (`company.com` without a subdomain) does **not** match — add it as a separate exact entry if needed.
+> **Note:** Wildcard subdomain patterns match the host portion of syntactically valid HTTP(S) origins only. `*.company.com` matches any origin whose host ends with `.company.com`, with an optional numeric port. The bare domain (`company.com` without a subdomain) does **not** match — add it as a separate exact entry if needed.
 
 ### Example 5: Prefix / Regex Origin Matchers (Istio `StringMatch`)
 
@@ -177,7 +184,12 @@ This allows:
 
 ### Example 6: Backend Handles OPTIONS
 
-If your backend service implements its own preflight handling and you only want the gateway to add response headers, set `preflight_continue: true`.
+If your backend service implements its own preflight handling and you want it to
+own the `OPTIONS` status/body, set `preflight_continue: true`. Ferrum removes
+every backend `Access-Control-*` field and emits the complete configured gateway
+policy (`Allow-Origin`, `Allow-Methods`, `Allow-Headers`, `Max-Age`, optional
+credentials/exposed headers, and `Vary`). A backend therefore cannot widen the
+gateway policy.
 
 ```yaml
 plugin_configs:
@@ -189,6 +201,37 @@ plugin_configs:
     scope: global
     enabled: true
 ```
+
+## Istio translation semantics
+
+An Istio `VirtualService.http[].corsPolicy` is projected through the gateway and
+mesh slice with source behavior intact:
+
+- omitted, `UNSPECIFIED`, and `FORWARD` unmatched preflights go to the backend;
+- `IGNORE` unmatched preflights receive a local 200 without CORS authorization;
+- unmatched actual requests go to the backend and Ferrum adds no CORS fields;
+- omitted/empty method and header lists stay empty, and omitted `maxAge` stays
+  absent; and
+- `StringMatch.exact: "*"` and legacy `allowOrigin: ["*"]` mean allow-all.
+
+These rules do not alter operator-authored native direct-plugin behavior.
+
+## Multiple instances
+
+When multiple CORS instances attach to one proxy, Ferrum evaluates the complete
+CORS execution chain and emits one phase-appropriate policy. On actual
+requests, origins, exposed headers, and credentials compose restrictively;
+method/header allow-lists and max age are neither intersected nor enforced
+because they govern preflight only. On preflight, allowed methods and request
+headers also intersect and the shortest max age wins, so an empty translated
+Istio list cannot be widened by a permissive native instance. A permissive
+earlier instance cannot short-circuit a stricter later preflight policy.
+
+Priority overrides that interleave another HTTP/gRPC-capable plugin inside the
+CORS block are rejected at cache construction. Stream-only and other plugins
+whose supported protocols do not overlap CORS are ignored by this contiguity
+check because protocol filtering removes them from every CORS execution chain.
+The same rules apply when gRPC-Web requests use the gRPC request-policy chain.
 
 ## Request Flow
 
@@ -280,13 +323,13 @@ Browser                    Gateway (CORS Plugin)
 
 | Header | When Sent | Value |
 |--------|-----------|-------|
-| `Access-Control-Allow-Origin` | Preflight (204) and actual responses | `*` (wildcard) or the specific origin |
+| `Access-Control-Allow-Origin` | Allowed local/forwarded preflights and actual responses | `*` (wildcard) or the specific origin |
 | `Access-Control-Allow-Methods` | Preflight only | Comma-separated list from `allowed_methods` |
 | `Access-Control-Allow-Headers` | Preflight only | Comma-separated list from `allowed_headers` |
 | `Access-Control-Max-Age` | Preflight only | Seconds from `max_age` |
 | `Access-Control-Allow-Credentials` | When `allow_credentials: true` | `true` |
 | `Access-Control-Expose-Headers` | When `exposed_headers` is non-empty | Comma-separated list |
-| `Vary` | Always on allowed responses | `Origin` |
+| `Vary` | Always on allowed responses | Actual: `Origin`. Preflight: `Origin`, `Access-Control-Request-Method`, and `Access-Control-Request-Headers` (including when the last header is absent, so a cached headerless approval cannot satisfy a later header-bearing preflight). Existing backend `Vary` tokens are preserved. |
 
 ## Testing
 
@@ -303,12 +346,12 @@ cargo test --test unit_tests -- cors_tests::test_preflight_with_allowed_origin -
 ### Manual Testing with curl
 
 ```bash
-# Preflight request (should return 204 with CORS headers)
+# Native direct-plugin preflight (should return 204 with CORS headers)
 curl -v -X OPTIONS http://localhost:8000/api/users \
   -H "Origin: https://app.example.com" \
   -H "Access-Control-Request-Method: GET"
 
-# Preflight with disallowed origin (should return 403)
+# Native direct-plugin preflight with disallowed origin (should return 403)
 curl -v -X OPTIONS http://localhost:8000/api/users \
   -H "Origin: https://evil.com" \
   -H "Access-Control-Request-Method: GET"
@@ -322,7 +365,7 @@ curl -v -X OPTIONS http://localhost:8000/api/users \
 curl -v http://localhost:8000/api/users \
   -H "Origin: https://app.example.com"
 
-# Actual request with disallowed origin (should return 403)
+# Native direct-plugin actual request with disallowed origin (should return 403)
 curl -v http://localhost:8000/api/users \
   -H "Origin: https://evil.com"
 

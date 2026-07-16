@@ -24,8 +24,8 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Decide how to handle an unavailable container.
 ///
 /// In CI (`CI` env var set, e.g. GitHub Actions) a container that fails to
-/// start is a HARD failure: the `test-service-integration` matrix runs on
-/// Docker-enabled runners, so an image-pull error, a changed wait condition, or
+/// start is a HARD failure: the `test-service-integration` job runs on a
+/// Docker-enabled runner, so an image-pull error, a changed wait condition, or
 /// broken setup must fail the job rather than let it pass without ever
 /// executing the assertions. Outside CI (no Docker locally) it is a graceful
 /// skip so the suite stays runnable on a developer machine.

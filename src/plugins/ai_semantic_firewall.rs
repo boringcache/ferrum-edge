@@ -983,8 +983,10 @@ impl AiSemanticFirewall {
         let segments = if event_stream {
             let (segments, fully_parsed) =
                 reassemble_sse_response_segments(body, &self.engine.extraction);
-            if (buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx))
-                && (!fully_parsed || segments.is_empty())
+            let streaming_inspection_requested =
+                buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx);
+            if (!fully_parsed && (was_governed || streaming_inspection_requested))
+                || (segments.is_empty() && streaming_inspection_requested)
             {
                 self.set_response_hash(ctx, sha256_hex_bytes(body));
                 return self.engine.handle_uninspectable_buffered_stream(ctx);
@@ -1912,11 +1914,12 @@ impl FirewallEngine {
         }
     }
 
-    /// Disposition for a `buffer`-mode streamed response that yielded no
-    /// inspectable content (uninspectable `data:` events, or no extractable
-    /// content). Buffer mode exists to inspect the stream, so an uninspectable
-    /// body is treated as an inspection failure governed by `on_error`: `reject`
-    /// fails closed (502), `warn`/`allow` (and dry-run) record and deliver.
+    /// Disposition for an event stream whose buffered representation promised
+    /// inspection but yielded uninspectable `data:` events or no extractable
+    /// content. This covers explicit `buffer` mode and an already-governed
+    /// encoded stream after bounded decoding. The inspection failure follows
+    /// `on_error`: `reject` fails closed (502), while `warn`/`allow` (and
+    /// dry-run) record and deliver.
     fn handle_uninspectable_buffered_stream(&self, ctx: &mut RequestContext) -> PluginResult {
         ctx.metadata.insert(
             RESPONSE_INSPECTION_KEY.to_string(),
@@ -1967,7 +1970,7 @@ impl Plugin for AiSemanticFirewall {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.enabled {
+        if !self.needs_governed_request_body() {
             return PluginResult::Continue;
         }
         if ctx.method != "POST" {
@@ -1987,9 +1990,6 @@ impl Plugin for AiSemanticFirewall {
         }
 
         let Some(body) = ctx.metadata.get("request_body").cloned() else {
-            if !self.needs_governed_request_body() {
-                return PluginResult::Continue;
-            }
             return self.engine.handle_uninspectable_body(
                 ctx,
                 Direction::Request,
@@ -2131,7 +2131,7 @@ impl Plugin for AiSemanticFirewall {
         ctx: &RequestContext,
         content_type: Option<&str>,
         response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        response_headers: &HashMap<String, String>,
     ) -> bool {
         if !self.requires_response_body_buffering()
             || ctx.method.eq_ignore_ascii_case("HEAD")
@@ -2140,24 +2140,51 @@ impl Plugin for AiSemanticFirewall {
             return false;
         }
 
-        let Some(content_type) = content_type else {
-            return false;
-        };
+        // The final buffered hook is the only phase that can safely classify
+        // an origin-encoded response by its decoded shape. Keep every eligible
+        // non-identity encoding on the bounded decode path even when the origin
+        // labels it as text/plain, omits Content-Type, or uses an unsupported
+        // encoding that must follow the configured `on_error` policy. This
+        // remains a narrowing-only answer: if the request-level decision
+        // already opted out, this hook must not reverse it.
+        //
+        // This check deliberately precedes the event-stream release below:
+        // streaming inspectors receive wire bytes and cannot parse compressed
+        // SSE. Complete origin-encoded event streams must be decoded by the
+        // buffered final hook too.
+        //
+        // Compression advertises a gateway-planned encoding in `after_proxy`
+        // before the still-plaintext body is transformed. On dispatch paths
+        // that refine after that hook, its private request-context marker
+        // prevents ordinary plaintext from being mistaken for origin-encoded
+        // bytes.
+        if (200..300).contains(&response_status)
+            && !matches!(response_status, 204 | 205)
+            && response_content_encoding_value(ctx, response_headers).is_some()
+            && !gateway_response_compression_planned(ctx, response_headers)
+        {
+            return self.should_buffer_response_body(ctx);
+        }
 
-        if is_event_stream_content_type(content_type) {
+        if content_type.is_some_and(is_event_stream_content_type) {
             // Pin an event stream onto the buffered path only when `buffer` mode
             // actually flagged THIS request from a detected `stream: true` JSON
-            // POST (the request-path marker). Unrelated SSE — a `GET` EventSource
-            // endpoint, or a backend that unexpectedly returns an unbounded
-            // stream — must keep streaming; buffering it would collect until
-            // `max_response_body_size_bytes` and 502 instead. An `inspect`-marked
-            // event stream stays streaming too (the windowed inspector handles it).
-            // A `skip`-marked event stream is the fail-open opt-out's target: it
-            // also keeps streaming (downgrade back to the uninspected path).
+            // POST (the request-path marker). Unencoded unrelated SSE — a `GET`
+            // EventSource endpoint, or a backend that unexpectedly returns an
+            // unbounded stream — must keep streaming; buffering it would collect
+            // until `max_response_body_size_bytes` and 502 instead. An
+            // `inspect`-marked event stream stays streaming too (the windowed
+            // inspector handles it). A `skip`-marked event stream is the
+            // fail-open opt-out's target: it also keeps streaming (downgrade back
+            // to the uninspected path).
             // (Already-buffered bodies are still inspected in `on_response_body`.)
             return self.streaming_response == StreamingResponsePolicy::Buffer
                 && buffer_streaming_marker_set(ctx);
         }
+
+        let Some(content_type) = content_type else {
+            return false;
+        };
 
         if is_json_content_type(content_type) {
             // A marked `inspect` request whose backend returned JSON (not the SSE
@@ -2262,9 +2289,8 @@ impl Plugin for AiSemanticFirewall {
         if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
             return PluginResult::Continue;
         }
-
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
-        let encoded_body = has_non_identity_content_encoding(response_headers)
+        let encoded_body = response_content_encoding_value(ctx, response_headers).is_some()
             && !gateway_response_compression_planned(ctx, response_headers);
         if !response_content_type_is_inspection_candidate(content_type)
             && (encoded_body || !looks_like_json(body))
@@ -2277,10 +2303,12 @@ impl Plugin for AiSemanticFirewall {
                 .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
         }
         if encoded_body {
+            // Candidate media types are governed even though this hook cannot
+            // inspect their wire bytes yet. Preserve that scope marker and let
+            // the final hook perform the bounded decode before enforcing rules
+            // or the configured fail-closed policy.
             self.set_response_hash(ctx, sha256_hex_bytes(body));
-            return self
-                .engine
-                .handle_uninspectable_body(ctx, Direction::Response, "encoded_body");
+            return PluginResult::Continue;
         }
 
         self.inspect_response_bytes(ctx, content_type, body, false)
@@ -2306,14 +2334,26 @@ impl Plugin for AiSemanticFirewall {
         if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
             return PluginResult::Continue;
         }
-
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let was_governed = self.response_hash(ctx).is_some();
         let type_candidate = response_content_type_is_inspection_candidate(content_type);
-        if let Some(encoding) = content_encoding_value(response_headers) {
-            if !was_governed && !type_candidate {
-                return PluginResult::Continue;
-            }
+        // `on_response_body` already classified this plaintext representation
+        // as an ungoverned non-candidate before the compression transform ran.
+        // Do not inflate a gateway-created copy merely to repeat that decision:
+        // a large ordinary page may legitimately exceed the firewall's decoded
+        // inspection cap. The compression plugin's private ownership marker is
+        // required here, so a mislabeled encoded origin response cannot obtain
+        // this release from Content-Type or public metadata alone.
+        if !was_governed
+            && !type_candidate
+            && gateway_response_compression_planned(ctx, response_headers)
+        {
+            return PluginResult::Continue;
+        }
+        // Encoded wire bytes cannot reveal whether a mislabeled response is
+        // JSON. Decode within the hard cap before deciding that it is outside
+        // the firewall's response scope.
+        if let Some(encoding) = response_content_encoding_value(ctx, response_headers) {
             if body.is_empty() {
                 return self.engine.handle_uninspectable_body(
                     ctx,
@@ -2328,7 +2368,8 @@ impl Plugin for AiSemanticFirewall {
                     "encoded_body",
                 );
             };
-            if !type_candidate && !looks_like_json(&decoded) {
+            let decoded_looks_like_json = looks_like_json(&decoded);
+            if !type_candidate && !decoded_looks_like_json {
                 return if was_governed {
                     self.engine.handle_uninspectable_body(
                         ctx,
@@ -2343,8 +2384,22 @@ impl Plugin for AiSemanticFirewall {
             if self.response_hash(ctx) == Some(decoded_hash.as_str()) {
                 return PluginResult::Continue;
             }
+            // A bare JSON document mislabeled as an event stream still needs
+            // JSON extraction. Do not rely on its first byte alone, though:
+            // valid SSE may begin with an ignored JSON-looking field before
+            // later `data:` frames. Preserve the SSE parser unless the entire
+            // decoded representation is one JSON document.
+            let decoded_is_json_document = decoded_looks_like_json
+                && (!is_event_stream_content_type(content_type)
+                    || serde_json::from_slice::<serde::de::IgnoredAny>(strip_json_bom(&decoded))
+                        .is_ok());
+            let decoded_content_type = if decoded_is_json_document {
+                "application/json"
+            } else {
+                content_type
+            };
             return self
-                .inspect_response_bytes(ctx, content_type, &decoded, was_governed)
+                .inspect_response_bytes(ctx, decoded_content_type, &decoded, was_governed)
                 .await;
         }
 
@@ -2995,8 +3050,9 @@ fn extract_response_segments_from_json(
 ///
 /// Returns the segments plus whether the body was **fully inspectable** (valid
 /// UTF-8 and every `data:` payload parsed as JSON). A caller that forced this
-/// stream onto the buffered path (`buffer` mode) uses that flag to fail closed
-/// when part of the body could not be parsed and might hide content.
+/// stream onto the buffered path (`buffer` mode), or that decoded an already
+/// governed encoded stream, uses that flag to fail closed when part of the body
+/// could not be parsed and might hide content.
 fn reassemble_sse_response_segments(
     body: &[u8],
     extraction: &ExtractionConfig,
@@ -4922,13 +4978,30 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 }
 
 fn content_encoding_value(headers: &HashMap<String, String>) -> Option<&str> {
-    header_value(headers, "content-encoding")
+    non_identity_content_encoding_value(header_value(headers, "content-encoding")?)
+}
+
+fn non_identity_content_encoding_value(encoding: &str) -> Option<&str> {
+    let encoding = encoding.trim();
+    encoding
+        .split(',')
         .map(str::trim)
-        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+        .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
+        .then_some(encoding)
 }
 
 fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
     content_encoding_value(headers).is_some()
+}
+
+fn response_content_encoding_value<'a>(
+    ctx: &'a RequestContext,
+    headers: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    ctx.metadata
+        .get(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
+        .and_then(|encoding| non_identity_content_encoding_value(encoding))
+        .or_else(|| content_encoding_value(headers))
 }
 
 fn response_content_type_is_inspection_candidate(content_type: &str) -> bool {
@@ -4936,19 +5009,29 @@ fn response_content_type_is_inspection_candidate(content_type: &str) -> bool {
 }
 
 /// The compression plugin advertises its selected encoding in headers during
-/// `after_proxy`, before it transforms a buffered plaintext body. Its private
-/// algorithm marker distinguishes that planned gateway representation from an
-/// already-encoded origin body at the initial inspection hook.
+/// `after_proxy`, before it transforms a buffered plaintext body. Its
+/// authoritative request-context marker distinguishes that planned gateway
+/// representation from an already-encoded origin body. Public plugin metadata
+/// is intentionally not sufficient to claim ownership of encoded bytes.
 fn gateway_response_compression_planned(
     ctx: &RequestContext,
     headers: &HashMap<String, String>,
 ) -> bool {
+    if ctx
+        .metadata
+        .contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
+    {
+        return false;
+    }
     let Some(encoding) = content_encoding_value(headers) else {
         return false;
     };
-    ctx.metadata
-        .get("compression:algorithm")
-        .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case(encoding))
+    // A later header hook may rewrite one supported gateway encoding to the
+    // other. Compression follows that final header when transforming the body,
+    // so private ownership remains authoritative even when it differs from the
+    // algorithm originally selected.
+    (encoding.eq_ignore_ascii_case("gzip") || encoding.eq_ignore_ascii_case("br"))
+        && ctx.gateway_response_compression_algorithm().is_some()
 }
 
 fn strip_json_bom(body: &[u8]) -> &[u8] {

@@ -24,6 +24,7 @@ use ferrum_edge::config::types::{
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 
 /// Minimal test proxy with safe defaults.
@@ -361,6 +362,308 @@ async fn update_config_rejected_candidate_reports_rejected() {
     assert!(
         state.config.load().proxies.is_empty(),
         "rejected full candidate must not mutate runtime config"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_config_quarantines_invalid_hmac_credentials_before_full_snapshot_swap() {
+    let state = empty_proxy_state();
+    let shared_secret = "shared-hmac-secret-at-least-32-characters";
+    let mut first = test_consumer("c1", "alice");
+    first.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+    let mut duplicate = test_consumer("c2", "bob");
+    duplicate.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+    let mut weak = test_consumer("c3", "carol");
+    weak.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": "too-short"}]),
+    );
+    let mut malformed = test_consumer("c4", "dave");
+    malformed.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{
+            "secret": "strong-hmac-secret-at-least-32-characters",
+            "unexpected": true
+        }]),
+    );
+
+    let outcome = state.update_config(GatewayConfig {
+        consumers: vec![first, duplicate, weak, malformed],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    });
+
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    let config = state.config.load();
+    assert!(config.consumers[0].has_credential("hmac_auth"));
+    assert!(!config.consumers[1].has_credential("hmac_auth"));
+    assert!(!config.consumers[2].has_credential("hmac_auth"));
+    assert!(!config.consumers[3].has_credential("hmac_auth"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_config_preserves_same_hmac_secret_across_namespaces() {
+    let state = empty_proxy_state();
+    let shared_secret = "namespace-reusable-hmac-secret-at-least-32-characters";
+    let mut tenant_a = test_consumer("c1", "alice");
+    tenant_a.namespace = "tenant-a".to_string();
+    tenant_a.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+    let mut tenant_b = test_consumer("c2", "bob");
+    tenant_b.namespace = "tenant-b".to_string();
+    tenant_b.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+
+    assert_eq!(
+        state.update_config(GatewayConfig {
+            consumers: vec![tenant_a, tenant_b],
+            loaded_at: Utc::now(),
+            ..GatewayConfig::default()
+        }),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .config
+            .load()
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("hmac_auth"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_snapshot_rehydrates_quarantined_hmac_after_conflict_repair() {
+    let state = empty_proxy_state();
+    let original_secret = "shared-hmac-secret-at-least-32-characters";
+    let mut first = test_consumer("c1", "alice");
+    first.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": original_secret}]),
+    );
+    let mut second = test_consumer("c2", "bob");
+    second.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": original_secret}]),
+    );
+    assert_eq!(
+        state.update_config(GatewayConfig {
+            consumers: vec![first, second],
+            loaded_at: Utc::now(),
+            ..GatewayConfig::default()
+        }),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(!state.config.load().consumers[1].has_credential("hmac_auth"));
+
+    let mut repaired_first = test_consumer("c1", "alice");
+    repaired_first.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": "rotated-hmac-secret-at-least-32-characters"}]),
+    );
+    let mut rehydrated_second = test_consumer("c2", "bob");
+    rehydrated_second.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": original_secret}]),
+    );
+    assert_eq!(
+        state.update_config(GatewayConfig {
+            consumers: vec![repaired_first, rehydrated_second],
+            loaded_at: Utc::now(),
+            ..GatewayConfig::default()
+        }),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .config
+            .load()
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("hmac_auth"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("security-policy", true);
+    plugin.plugin_name = "security_headers".to_string();
+    plugin.config = serde_json::json!({
+        "hsts": { "max_age": 300, "include_subdomains": true },
+        "set": { "X-Policy": "last-known-good" }
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "security_headers")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "hsts": {
+            "max_age": 300,
+            "include_subdomains": true,
+            "include_subdomain": true
+        },
+        "set": { "X-Policy": "must-not-publish" }
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let outcome = state.update_config(invalid);
+    let ConfigApplyOutcome::Rejected { errors } = outcome else {
+        panic!("unknown nested security_headers key must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("security_headers.hsts") && error.contains("include_subdomain")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["set"]["X-Policy"],
+        "last-known-good"
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "security_headers"),
+        "rejected reload must retain the last-known-good plugin cache"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("ip-policy", true);
+    plugin.plugin_name = "ip_restriction".to_string();
+    plugin.config = serde_json::json!({"allow": ["10.0.0.0/8"]});
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "alow": ["192.0.2.0/24"],
+        "deny": ["203.0.113.0/24"]
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
+        panic!("misspelled ip_restriction allow list must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("ip_restriction") && error.contains("unknown configuration field 'alow'")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config,
+        serde_json::json!({"allow": ["10.0.0.0/8"]})
+    );
+
+    let request_view = state.plugin_cache.request_view("p1", ProxyProtocol::Http);
+    let mut ctx = RequestContext::new(
+        "198.51.100.44".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let result = request_view.plugins()[0]
+        .on_request_received(&mut ctx)
+        .await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "rejected candidate must not replace the last-known-good allow policy"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ldap_plaintext_reload_keeps_last_known_good_dial_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("directory-policy", true);
+    plugin.plugin_name = "ldap_auth".to_string();
+    plugin.config = serde_json::json!({
+        "ldap_url": "ldaps://directory.example.test:636",
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test"
+    });
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "ldap_auth")
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "ldap_url": "ldap://directory.example.test:389",
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=test"
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let outcome = state.update_config(invalid);
+    let ConfigApplyOutcome::Rejected { errors } = outcome else {
+        panic!("remote plaintext LDAP reload must be rejected");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.contains("ldap_auth") && error.contains("STARTTLS or LDAPS") })
+    );
+    assert_eq!(
+        state.config.load().plugin_configs[0].config["ldap_url"],
+        "ldaps://directory.example.test:636"
+    );
+    assert!(
+        state
+            .plugin_cache
+            .request_view("p1", ProxyProtocol::Http)
+            .plugins()
+            .iter()
+            .any(|plugin| plugin.name() == "ldap_auth"),
+        "rejected LDAP reload must retain the last-known-good dial policy"
     );
 }
 

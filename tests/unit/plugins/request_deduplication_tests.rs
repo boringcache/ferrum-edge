@@ -427,6 +427,57 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
 }
 
 #[tokio::test]
+async fn multiple_instances_release_only_their_own_inflight_ownership() {
+    let first = make_plugin(json!({"header_name": "Idempotency-Key"}));
+    let second = make_plugin(json!({"header_name": "X-Second-Idempotency-Key"}));
+    let mut ctx = body_ctx("POST", "/api", br#"{"value":1}"#);
+    let mut headers = keyed_headers("first-key", "example.test", 11);
+    headers.insert(
+        "x-second-idempotency-key".to_string(),
+        "second-key".to_string(),
+    );
+
+    assert!(matches!(
+        first.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    ctx.metadata.insert(
+        "ferrum:release_dedup_inflight_on_commit".to_string(),
+        "true".to_string(),
+    );
+    first
+        .on_response_committed(&mut ctx, 503, &HashMap::new(), b"rejected")
+        .await;
+    second
+        .on_response_committed(&mut ctx, 503, &HashMap::new(), b"rejected")
+        .await;
+
+    let mut retry_ctx = body_ctx("POST", "/api", br#"{"value":1}"#);
+    let mut retry_headers = keyed_headers("first-key", "example.test", 11);
+    retry_headers.insert(
+        "x-second-idempotency-key".to_string(),
+        "second-key".to_string(),
+    );
+    assert!(matches!(
+        first
+            .before_proxy(&mut retry_ctx, &mut retry_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second
+            .before_proxy(&mut retry_ctx, &mut retry_headers)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn test_concurrent_duplicate_returns_conflict() {
     let config = json!({});
     let plugin = make_plugin(config);

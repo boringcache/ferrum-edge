@@ -20,9 +20,25 @@ fn make_ctx(accept_encoding: Option<&str>) -> RequestContext {
     ctx
 }
 
-fn mark_response_algorithm(ctx: &mut RequestContext, encoding: &str) {
-    ctx.metadata
-        .insert("compression:algorithm".to_string(), encoding.to_string());
+async fn plan_response_algorithm(
+    plugin: &CompressionPlugin,
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+    encoding: &str,
+) {
+    ctx.headers
+        .insert("accept-encoding".to_string(), encoding.to_string());
+    response_headers
+        .entry("content-type".to_string())
+        .or_insert_with(|| "application/json".to_string());
+    assert!(matches!(
+        plugin.after_proxy(ctx, 200, response_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers.get("content-encoding").map(String::as_str),
+        Some(encoding)
+    );
 }
 
 // ────────────────────── Config defaults ──────────────────────
@@ -1113,13 +1129,12 @@ async fn test_preserves_accept_encoding_when_disabled() {
 async fn test_gzip_response_compression_roundtrip() {
     let plugin = make_plugin(json!({"min_content_length": 10}));
     let mut ctx = make_ctx(None);
-    mark_response_algorithm(&mut ctx, "gzip");
 
     // Use a repetitive body large enough that gzip overhead is worthwhile
     let original = r#"{"users":[{"name":"alice","email":"alice@example.com","role":"admin"},{"name":"bob","email":"bob@example.com","role":"user"},{"name":"charlie","email":"charlie@example.com","role":"user"},{"name":"dave","email":"dave@example.com","role":"moderator"},{"name":"eve","email":"eve@example.com","role":"user"},{"name":"frank","email":"frank@example.com","role":"admin"},{"name":"grace","email":"grace@example.com","role":"user"},{"name":"heidi","email":"heidi@example.com","role":"user"}]}"#.as_bytes();
 
     let mut resp_headers = HashMap::new();
-    resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    plan_response_algorithm(&plugin, &mut ctx, &mut resp_headers, "gzip").await;
 
     let compressed = plugin
         .transform_response_body_with_context(
@@ -1148,12 +1163,11 @@ async fn test_gzip_response_compression_roundtrip() {
 async fn test_brotli_response_compression_roundtrip() {
     let plugin = make_plugin(json!({"min_content_length": 10}));
     let mut ctx = make_ctx(None);
-    mark_response_algorithm(&mut ctx, "br");
 
     let original = b"Hello, this is a test body that should be compressed with brotli encoding!";
 
-    let mut resp_headers = HashMap::new();
-    resp_headers.insert("content-encoding".to_string(), "br".to_string());
+    let mut resp_headers = HashMap::from([("content-type".to_string(), "text/html".to_string())]);
+    plan_response_algorithm(&plugin, &mut ctx, &mut resp_headers, "br").await;
 
     let compressed = plugin
         .transform_response_body_with_context(&mut ctx, original, Some("text/html"), &resp_headers)
@@ -1181,12 +1195,11 @@ async fn test_brotli_response_compression_roundtrip() {
 async fn test_compresses_tiny_body_when_committed_in_transform() {
     let plugin = make_plugin(json!({"min_content_length": 256}));
     let mut ctx = make_ctx(None);
-    mark_response_algorithm(&mut ctx, "gzip");
 
     let tiny_body = b"small";
 
     let mut resp_headers = HashMap::new();
-    resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    plan_response_algorithm(&plugin, &mut ctx, &mut resp_headers, "gzip").await;
 
     let result = plugin
         .transform_response_body_with_context(
@@ -1213,10 +1226,9 @@ async fn test_compresses_tiny_body_when_committed_in_transform() {
 async fn test_transform_response_body_compresses_when_encoding_already_committed() {
     let plugin = make_plugin(json!({"min_content_length": 10}));
     let mut ctx = make_ctx(None);
-    mark_response_algorithm(&mut ctx, "gzip");
 
     let mut resp_headers = HashMap::new();
-    resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    plan_response_algorithm(&plugin, &mut ctx, &mut resp_headers, "gzip").await;
     resp_headers.insert("cache-control".to_string(), "no-transform".to_string());
 
     let original = b"compressible body";
@@ -1247,9 +1259,9 @@ async fn test_transform_response_body_compresses_when_encoding_already_committed
 async fn test_transform_response_body_uses_final_supported_content_encoding() {
     let plugin = make_plugin(json!({"min_content_length": 10}));
     let mut ctx = make_ctx(None);
-    mark_response_algorithm(&mut ctx, "br");
 
     let mut resp_headers = HashMap::new();
+    plan_response_algorithm(&plugin, &mut ctx, &mut resp_headers, "br").await;
     resp_headers.insert("content-encoding".to_string(), "gzip".to_string());
 
     let original = b"compressible body after final header rewrite";

@@ -866,6 +866,135 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_unknown_ai_prompt_compressor_policy_keys() {
+    for (id, config) in [
+        (
+            "prompt-compressor-role-typo",
+            serde_json::json!({"compress_role": ["system"]}),
+        ),
+        (
+            "prompt-compressor-ratio-typo",
+            serde_json::json!({"target_rato": 0.9}),
+        ),
+        (
+            "prompt-compressor-floor-typo",
+            serde_json::json!({"min_content_token": 10}),
+        ),
+        (
+            "prompt-compressor-cap-typo",
+            serde_json::json!({"max_scan_byte": 4096}),
+        ),
+        (
+            "prompt-compressor-marker-typo",
+            serde_json::json!({"preserve_tags": "keep"}),
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "ai_prompt_compressor",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let err = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file mode must reject unknown compressor config keys");
+        assert!(
+            format!("{err:#}").contains("1 plugin config error(s)"),
+            "unexpected file-load error: {err:#}"
+        );
+    }
+}
+
+#[test]
+fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
+    let document = serde_json::json!({
+        "version": "1",
+        "proxies": [],
+        "consumers": [],
+        "plugin_configs": [{
+            "id": "adaptive-limit-typo",
+            "plugin_name": "adaptive_concurrency",
+            "config": {"max_limt": 32},
+            "scope": "global",
+            "enabled": true
+        }]
+    });
+    let mut file = NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{document}").unwrap();
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file-mode load must reject unknown adaptive_concurrency keys");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("1 plugin config error(s)"),
+        "unexpected file-load error: {message}"
+    );
+}
+
+#[test]
+fn test_file_config_rejects_ip_restriction_typos_and_null_lists() {
+    for (id, config) in [
+        (
+            "ip-allow-typo",
+            serde_json::json!({
+                "alow": ["10.0.0.0/8"],
+                "deny": ["192.0.2.0/24"]
+            }),
+        ),
+        (
+            "ip-null-allow",
+            serde_json::json!({
+                "allow": null,
+                "deny": ["192.0.2.0/24"]
+            }),
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "ip_restriction",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let error = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file-mode load must reject broadened ip_restriction policy");
+        let message = format!("{error:#}");
+        assert!(message.contains("1 plugin config error(s)"), "{message}");
+    }
+}
+
+#[test]
 fn test_optional_fail_open_plugin_validation_is_non_fatal_in_file_mode() {
     let yaml = r#"
 version: "1"
@@ -1139,6 +1268,63 @@ plugin_configs: []
     )
     .unwrap();
     assert_eq!(config2.proxies.len(), 2);
+}
+
+#[test]
+fn test_reload_rejects_case_ambiguous_mtls_dns_policy_candidate() {
+    let exact_policy = r#"
+version: "1"
+proxies: []
+consumers:
+  - id: "upper"
+    username: "alice"
+    credentials:
+      mtls_auth:
+        - identity: "API.Example.COM"
+  - id: "lower"
+    username: "bob"
+    credentials:
+      mtls_auth:
+        - identity: "api.example.com"
+plugin_configs:
+  - id: "mtls-policy"
+    plugin_name: "mtls_auth"
+    scope: "global"
+    enabled: true
+    config:
+      cert_field: "subject_cn"
+"#;
+    let dns_policy = exact_policy.replace("subject_cn", "san_dns");
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", exact_policy).unwrap();
+    let file_path = file.path().to_str().unwrap();
+
+    let accepted = reload_config_from_file(
+        file_path,
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("exact-match mTLS identities remain case-sensitive");
+    assert_eq!(
+        accepted.plugin_configs[0].config["cert_field"],
+        "subject_cn"
+    );
+
+    std::fs::write(file.path(), dns_policy).unwrap();
+    let error = reload_config_from_file(
+        file_path,
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("reload must fail closed before publishing a case-ambiguous DNS index");
+    let message = format!("{error:#}");
+    assert!(message.contains("duplicate consumer credential(s)"));
+    assert_eq!(
+        accepted.plugin_configs[0].config["cert_field"], "subject_cn",
+        "the caller's last accepted snapshot remains usable"
+    );
 }
 
 // ============================================================================
@@ -1525,4 +1711,32 @@ plugin_configs: []
     assert_eq!(config.consumers.len(), 1);
     assert_eq!(config.consumers[0].username, "alice");
     assert_eq!(config.consumers[0].namespace, "prod");
+}
+
+#[test]
+fn test_file_config_rejects_plaintext_basicauth_password() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers:
+  - id: "plaintext-basic"
+    username: "alice"
+    credentials:
+      basicauth:
+        - password: "must-not-enter-runtime-config"
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let error = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file mode must reject plaintext Basic-auth passwords");
+    let message = format!("{error:#}");
+    assert!(message.contains("file-mode Basic-auth credentials"));
+    assert!(!message.contains("must-not-enter-runtime-config"));
 }

@@ -2,9 +2,12 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → `transform_request_body` → `on_final_request_body` →
-//! `backend_admission` → `after_proxy` → `normalize_response_body` →
-//! `on_response_body` → `transform_response_body` → `on_final_response_body` →
+//! `before_proxy` → backend-path policy preview → deferred routing-header hooks →
+//! final backend-path enforcement → remaining deferred `before_proxy` hooks →
+//! `transform_request_body` →
+//! `on_final_request_body` → `backend_admission` → `after_proxy` →
+//! `normalize_response_body` → `on_response_body` →
+//! `transform_response_body` → `on_final_response_body` →
 //! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
@@ -111,15 +114,20 @@ use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, Proxy, ResolvedPortOverride,
-    RetryConfig, Upstream, UpstreamTarget,
+    BackendScheme, BackendTlsConfig, Consumer, DispatchKind, HttpFlavor, Proxy,
+    ResolvedPortOverride, RetryConfig, Upstream, UpstreamTarget,
 };
 use crate::consumer_index::ConsumerIndex;
 use crate::modes::mesh::MeshTrafficDirection;
+use crate::proxy::grpc_proxy::{
+    GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+};
 
 /// Internal provenance marker set after a request-phase plugin has issued an
 /// external operation whose result must not be replayed from an ambiguous
@@ -156,6 +164,19 @@ pub enum ProxyProtocol {
     Tcp,
     /// Raw UDP datagram proxy (includes DTLS termination/origination)
     Udp,
+}
+
+/// Whether a backend-effective path policy hook is validating a provisional
+/// selection or enforcing the final selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendPathPolicyPhase {
+    /// Validate access rules before a deferred routing hook performs external
+    /// work. Stateful policy such as rate limiting must not be charged here.
+    Preview,
+    /// Enforce the settled backend-effective path immediately before the
+    /// remaining deferred hooks, a deferred-hook rejection, or backend
+    /// dispatch. Stateful policy is committed exactly once in this phase.
+    Enforce,
 }
 
 /// All protocol variants, for plugins that support every protocol.
@@ -201,6 +222,226 @@ pub const TCP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp];
 
 /// UDP-only (datagram-level plugins that do not apply to TCP or HTTP).
 pub const UDP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Udp];
+
+/// Apply the pre-filtered initial-response header policy chain in configured
+/// priority order.
+///
+/// The plugin cache builds this list once per proxy/protocol generation. Callers
+/// at protocol-specific client boundaries (notably WebSocket handshakes) can
+/// therefore enforce deterministic response policy without filtering or
+/// allocating on the request path. Ordinary HTTP responses continue to use the
+/// full `after_proxy` lifecycle.
+pub fn apply_initial_response_header_policies(
+    policy_plugins: &[Arc<dyn Plugin>],
+    response_headers: &mut HashMap<String, String>,
+) {
+    for plugin in policy_plugins {
+        plugin.apply_initial_response_header_policy(response_headers);
+    }
+}
+
+/// Ordered outcome of deterministic initial-response policy for a buffered
+/// response whose hook-visible map also contains trailer compatibility fields.
+///
+/// `desired_headers` starts from genuine backend initial HEADERS, while
+/// `observed_headers` starts from the merged header+trailer view passed to
+/// `after_proxy`. After each hook, [`Self::record_after_proxy_plugin`] advances
+/// the desired map: policy plugins apply directly to genuine initial-header
+/// state, while any mutation made by another (including custom) plugin is
+/// copied from the already-ordered real hook result. This preserves priority
+/// overrides and multiple-instance ordering without rerunning hooks or scanning
+/// the plugin chain at the client boundary.
+#[derive(Debug, Clone)]
+pub struct BufferedInitialResponseHeaderPolicyState {
+    header_names: Arc<Vec<String>>,
+    desired_headers: HashMap<String, String>,
+    observed_headers: HashMap<String, String>,
+    /// Application-trailer outcomes immediately before initial-header policy
+    /// first changed each name. A later non-policy hook clears the entry and
+    /// owns both visible copies. Otherwise a final policy set/override restores
+    /// this pre-policy outcome on the trailer channel, while a final policy
+    /// removal suppresses both compatibility-view copies.
+    pre_policy_application_trailers: HashMap<String, Option<String>>,
+}
+
+impl BufferedInitialResponseHeaderPolicyState {
+    /// Build state from cache-prefiltered policy names. Returns `None` when no
+    /// initial-response policy is configured, leaving ordinary buffered paths
+    /// allocation-free.
+    pub fn new(
+        header_names: Arc<Vec<String>>,
+        initial_headers: &HashMap<String, String>,
+        merged_headers: &HashMap<String, String>,
+    ) -> Option<Self> {
+        if header_names.is_empty() {
+            return None;
+        }
+        Some(Self {
+            desired_headers: Self::select_headers(&header_names, initial_headers),
+            observed_headers: Self::select_headers(&header_names, merged_headers),
+            pre_policy_application_trailers: HashMap::new(),
+            header_names,
+        })
+    }
+
+    fn select_headers(
+        header_names: &[String],
+        source: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut selected = HashMap::with_capacity(header_names.len());
+        for name in header_names {
+            if let Some(value) = Self::header_value_ci(source, name) {
+                selected.insert(name.clone(), value.clone());
+            }
+        }
+        selected
+    }
+
+    fn header_value_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
+        headers.get(name).or_else(|| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value)
+        })
+    }
+
+    fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
+        headers.retain(|key, _| !key.eq_ignore_ascii_case(name));
+    }
+
+    /// Select the effective value after one hook and canonicalize every
+    /// case-insensitive spelling to the cache-owned lowercase name. If a later
+    /// plugin inserted a differently-cased duplicate alongside the previously
+    /// observed canonical entry, the changed value is the mutation that wins.
+    fn canonicalize_header_after_mutation(
+        headers: &mut HashMap<String, String>,
+        name: &str,
+        observed: Option<&str>,
+    ) -> Option<String> {
+        let current = headers
+            .get(name)
+            .filter(|value| observed != Some(value.as_str()))
+            .cloned()
+            .or_else(|| {
+                headers
+                    .iter()
+                    .filter(|(key, value)| {
+                        key.as_str() != name
+                            && key.eq_ignore_ascii_case(name)
+                            && observed != Some(value.as_str())
+                    })
+                    .min_by(|(left, _), (right, _)| left.cmp(right))
+                    .map(|(_, value)| value.clone())
+            })
+            .or_else(|| Self::header_value_ci(headers, name).cloned());
+
+        Self::remove_header_ci(headers, name);
+        if let Some(value) = current.as_ref() {
+            headers.insert(name.to_string(), value.clone());
+        }
+        current
+    }
+
+    /// Advance the genuine-initial-header outcome after one real hook has run.
+    /// Values are cloned only when a hook actually changes a policy-owned name.
+    pub fn record_after_proxy_plugin(
+        &mut self,
+        plugin: &dyn Plugin,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if plugin.is_initial_response_header_policy() {
+            plugin.apply_initial_response_header_policy(&mut self.desired_headers);
+            for name in self.header_names.iter() {
+                let previous_value = self.observed_headers.get(name).cloned();
+                let desired_value = self.desired_headers.get(name).cloned();
+                if previous_value != desired_value {
+                    self.pre_policy_application_trailers
+                        .entry(name.clone())
+                        .or_insert(previous_value.clone());
+                    Self::remove_header_ci(response_headers, name);
+                    if let Some(value) = desired_value.as_ref() {
+                        response_headers.insert(name.clone(), value.clone());
+                    }
+                }
+                let current = Self::canonicalize_header_after_mutation(
+                    response_headers,
+                    name,
+                    previous_value.as_deref(),
+                );
+                match current {
+                    Some(value) => {
+                        self.observed_headers.insert(name.clone(), value);
+                    }
+                    None => {
+                        self.observed_headers.remove(name);
+                    }
+                }
+            }
+            return;
+        }
+
+        self.record_later_response_header_mutations(response_headers);
+    }
+
+    /// Advance policy-owned initial-header state after a later response phase
+    /// changes representation metadata. Body transforms run after the ordered
+    /// `after_proxy` chain, so their final edits and removals must remain
+    /// authoritative when the buffered response is split back onto the wire.
+    pub fn record_later_response_header_mutations(
+        &mut self,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        for name in self.header_names.iter() {
+            let observed = self.observed_headers.get(name).cloned();
+            let current = Self::canonicalize_header_after_mutation(
+                response_headers,
+                name,
+                observed.as_deref(),
+            );
+            if observed == current {
+                continue;
+            }
+            match current {
+                Some(value) => {
+                    self.desired_headers.insert(name.clone(), value.clone());
+                    self.observed_headers.insert(name.clone(), value);
+                    self.pre_policy_application_trailers.remove(name);
+                }
+                None => {
+                    self.desired_headers.remove(name);
+                    self.observed_headers.remove(name);
+                    self.pre_policy_application_trailers.remove(name);
+                }
+            }
+        }
+    }
+
+    /// Return the pre-policy application-trailer outcome and whether the final
+    /// policy keeps this name in genuine initial headers. Reconciliation uses
+    /// the presence flag to distinguish a final set/override from a removal;
+    /// `None` leaves the ordinary merged-view outcome authoritative.
+    pub fn application_trailer_initial_response_policy_outcome(
+        &self,
+        name: &str,
+    ) -> Option<(Option<&str>, bool)> {
+        let pre_policy_value = self.pre_policy_application_trailers.get(name)?;
+        Some((
+            pre_policy_value.as_deref(),
+            self.desired_headers.contains_key(name),
+        ))
+    }
+
+    /// Apply the final ordered policy-owned fields to genuine initial HEADERS.
+    pub fn apply_to_initial_headers(&self, response_headers: &mut HashMap<String, String>) {
+        for name in self.header_names.iter() {
+            Self::remove_header_ci(response_headers, name);
+            if let Some(value) = self.desired_headers.get(name) {
+                response_headers.insert(name.clone(), value.clone());
+            }
+        }
+    }
+}
 
 /// How plugin construction or validation failures affect cache publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +652,74 @@ pub struct WsDisconnectContext {
     pub metadata: HashMap<String, String>,
 }
 
+/// One-request/session cache for the authoritative, canonical client IP.
+///
+/// Client-IP resolution is complete before policy hooks run. The first policy
+/// that needs a typed address parses that final string, canonicalizes
+/// IPv4-mapped IPv6, and publishes the result here. Every later plugin instance
+/// performs only the lock-free `OnceLock::get_or_init` fast path. `None` is
+/// cached as well, preserving fail-closed behavior for malformed identities.
+#[derive(Debug, Clone, Default)]
+pub struct CanonicalClientIpCache {
+    value: OnceLock<Option<IpAddr>>,
+}
+
+impl CanonicalClientIpCache {
+    fn get_or_parse(&self, client_ip: &str) -> Option<IpAddr> {
+        *self
+            .value
+            .get_or_init(|| parse_canonical_client_ip(client_ip))
+    }
+
+    /// Whether a policy has already resolved the typed address.
+    ///
+    /// This is exposed for external regression tests that verify multiple
+    /// plugin instances share one parse. Runtime policy should call the context
+    /// accessors instead.
+    #[doc(hidden)]
+    pub fn is_initialized(&self) -> bool {
+        self.value.get().is_some()
+    }
+}
+
+fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
+    parse_client_ip_literal(client_ip).map(|ip| ip.to_canonical())
+}
+
+/// Parse the legacy client/rule literal forms without allocation.
+///
+/// IPv4 accepts the same four decimal-octet grammar used by the original
+/// `ip_restriction` matcher. Brackets and zone identifiers remain IPv6-only;
+/// accepting them on IPv4 would broaden the established policy grammar.
+fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
+    if let Some(ipv4) = parse_ipv4_client_ip_literal(client_ip) {
+        return Some(IpAddr::V4(ipv4));
+    }
+
+    let unbracketed = client_ip
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(client_ip);
+    let without_zone = unbracketed
+        .find('%')
+        .map_or(unbracketed, |index| &unbracketed[..index]);
+    without_zone.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
+}
+
+fn parse_ipv4_client_ip_literal(client_ip: &str) -> Option<Ipv4Addr> {
+    let mut octets = client_ip.split('.');
+    let ipv4 = [
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+    ];
+    if octets.next().is_some() {
+        return None;
+    }
+    Some(Ipv4Addr::from(ipv4))
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -430,8 +739,15 @@ pub struct RequestContext {
     /// resolution. Mesh authz uses this for Istio `source.ip` so forwarded
     /// `remote.ip` cannot masquerade as the direct peer.
     pub direct_client_ip: String,
+    canonical_client_ip: CanonicalClientIpCache,
     pub method: String,
     pub path: String,
+    /// Canonical client-request authority for authentication mechanisms that
+    /// bind signatures to the selected virtual host. Hostnames are
+    /// ASCII-lowercased with a trailing DNS dot removed; an explicit
+    /// non-default port is retained. HTTP frontends populate this after
+    /// Host/`:authority` validation and before authentication.
+    pub request_authority: Option<String>,
     /// Frontend listener port that accepted this HTTP-family request.
     /// HTTP proxy resources do not carry `listen_port`, so mesh authorization
     /// uses this to evaluate Istio `to.ports` matches for HTTP traffic.
@@ -439,6 +755,10 @@ pub struct RequestContext {
     /// SNI hostname from the frontend TLS/QUIC handshake for HTTP-family
     /// requests. Populated only when the downstream client supplied SNI.
     pub frontend_sni_hostname: Option<String>,
+    /// Load-balancer snapshot generation pinned by this request. Backend
+    /// admission uses it to reject a retired service-discovery target view
+    /// after a structural target-set publication.
+    pub lb_generation: u64,
     /// Raw HTTP headers from the request. Stored at init time and consumed by
     /// `materialize_headers()`. Core proxy lookups (IP resolution, host
     /// extraction) read from this directly via `raw_header_get()` to avoid
@@ -476,8 +796,73 @@ pub struct RequestContext {
     /// compiled-in literal — zero allocation on the hot path.
     pub auth_method: Option<&'static str>,
     pub timestamp_received: DateTime<Utc>,
+    /// Whether the request's gRPC deadline state has been initialized from the
+    /// inbound `grpc-timeout` value. Initialization happens once, immediately
+    /// after routing and before any request-plugin or body-buffering await.
+    pub(crate) grpc_deadline_initialized: bool,
+    /// Whether the inbound request supplied a valid positive `grpc-timeout`.
+    /// Keep this source fact separate from the effective budget so an earlier
+    /// default policy cannot satisfy a later `reject_no_deadline` policy.
+    pub(crate) grpc_deadline_had_valid_client_timeout: bool,
+    /// Monotonic receipt instant captured with the request context. Effective
+    /// budgets are added to this exact anchor, independent of wall-clock jumps.
+    pub(crate) grpc_deadline_received_at: tokio::time::Instant,
+    /// Whether the gateway's full ordered deadline-policy preflight completed.
+    /// Direct plugin callers that skip the preflight still apply each instance
+    /// from `before_proxy` for backward-compatible composition.
+    pub(crate) grpc_deadline_preflight_complete: bool,
+    /// Effective receipt-anchored gRPC budget after every `grpc_deadline`
+    /// policy has applied its default/cap decision. Kept separate from the
+    /// relative header forwarded upstream so retries never re-arm the budget.
+    pub(crate) grpc_deadline_budget_ms: Option<u64>,
+    /// Single monotonic absolute deadline shared by request phases, backend
+    /// attempts, retry backoff, and streaming response bodies.
+    pub(crate) grpc_deadline_at: Option<tokio::time::Instant>,
+    /// Once any `grpc_deadline` instance requests gateway-time subtraction,
+    /// every later instance forwards the same remaining budget instead of
+    /// subtracting receipt-to-hook elapsed time again.
+    pub(crate) grpc_deadline_header_is_remaining: bool,
+    /// Whether the gateway selected the canonical client-visible deadline
+    /// response for this request. Keep this typed provenance out of metadata:
+    /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
+    /// unlock the write-biased terminal H3 completion path.
+    gateway_deadline_response_selected: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Per-request ownership state for each live request-deduplication plugin
+    /// instance. Multiple instances may coexist on one proxy; keeping their
+    /// correlation state in a private instance-keyed map prevents one hook
+    /// from consuming another instance's key or local/Redis owner token.
+    pub(crate) request_deduplication_state:
+        HashMap<u64, request_deduplication::RequestDeduplicationRequestState>,
+    /// Aggregate CORS policy state staged across every attached CORS instance
+    /// and consumed by the cache-inserted CORS finalizer. Kept outside public
+    /// metadata so policy details never enter transaction logs.
+    pub(crate) cors_state: cors::CorsRequestState,
+    /// Claim-derived upstream headers committed by the first accepted
+    /// authentication attempt and held until `before_proxy`. Kept out of
+    /// `metadata` so authorization-phase rejection logging can never serialize
+    /// raw claim values.
+    pub(crate) pending_claim_headers: HashMap<String, String>,
+    /// Credential header names precomputed by the plugin cache for safe
+    /// diagnostics and policy calls. Kept outside public metadata so plugin
+    /// configuration details do not enter transaction logs.
+    request_headers_to_redact: Option<Arc<Vec<String>>>,
+    /// Buffered response policy provenance, present only while the ordered
+    /// `after_proxy` chain is processing a merged gRPC header+trailer view.
+    /// Shared through `Arc` so the rare hook-preflight context clone remains
+    /// cheap; the live request uses `Arc::make_mut` after the clone is dropped.
+    buffered_initial_response_header_policy_state:
+        Option<Arc<BufferedInitialResponseHeaderPolicyState>>,
+    /// Client-visible HTTP flavor classified before any plugin hook can mutate
+    /// request headers. Fault rejection shaping consults this fixed value so a
+    /// transformer cannot add or remove native-gRPC semantics mid-pipeline.
+    request_http_flavor: HttpFlavor,
+    /// Whether client-visible rejection responses for this request cross a
+    /// WebSocket handshake boundary. Set once after request-flavor detection so
+    /// the shared reject finalizer can remove transport-owned handshake fields
+    /// after every ordered response hook without reclassifying or allocating.
+    websocket_response_boundary: bool,
     /// Semantic-cache embedding vector staged between `before_proxy` and
     /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
     /// vectors cannot enter transaction logs.
@@ -516,6 +901,27 @@ pub struct RequestContext {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
+    /// Per-`ai_prompt_compressor`-instance source digest, transformed bytes, and
+    /// stats staged by `before_proxy`. Kept out of public metadata so a staged
+    /// prompt copy and prompt-derived digest cannot enter transaction logs.
+    pub(crate) ai_prompt_compressor_staged: HashMap<u64, ai_prompt_compressor::StagedCompression>,
+    /// Incoming request path captured once by the first auto-family compressor
+    /// before backend routing can rewrite `path`. All compressor instances share
+    /// this single bounded snapshot, and public metadata cannot spoof it.
+    pub(crate) ai_prompt_compressor_classification_path: Option<String>,
+    /// Whether the authoritative wire transform has reset provisional
+    /// `before_proxy` compressor counters for this request.
+    pub(crate) ai_prompt_compressor_wire_stats_started: bool,
+    /// Final-hook rejection staged when configured preserve-marker sanitation
+    /// cannot safely produce bounded provider-visible bytes. Kept private so
+    /// request metadata cannot spoof or clear the fail-closed decision.
+    pub(crate) ai_prompt_compressor_marker_reject_status: Option<u16>,
+    /// Encoding selected by the built-in compression plugin for the response it
+    /// will create at the gateway. This is authoritative ownership state for
+    /// distinguishing planned gateway compression from an already-encoded
+    /// origin response; public plugin metadata is not trusted for that security
+    /// decision.
+    gateway_response_compression_algorithm: Option<&'static str>,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -603,11 +1009,21 @@ pub struct RequestContext {
     /// Set by the plugin in `before_proxy`; collected before building
     /// `TransactionSummary` so all logging plugins receive mirror results.
     pub mirror_result_rx: Option<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
+    /// One-shot HMAC work staged before request-body collection and consumed
+    /// at authentication. This is private rather than transaction metadata so
+    /// credential/signature/Consumer secret data cannot be forwarded or
+    /// logged. Its custom `Clone` intentionally clears the staged value.
+    hmac_prebuffer_state: hmac_auth::HmacPrebufferState,
     /// Binary-safe request body bytes, populated when a plugin requires the
     /// body before `before_proxy` (e.g., `request_mirror`). Unlike the
     /// `"request_body"` metadata key (UTF-8 only), this preserves non-UTF-8
     /// payloads such as gRPC protobuf.
     pub request_body_bytes: Option<bytes::Bytes>,
+    /// Precomputed body hashes for integrity-verifying authentication plugins.
+    /// Keeping fixed-size hashes avoids retaining a second full body while the
+    /// sole buffered representation continues to the backend.
+    pub request_body_sha256: Option<[u8; 32]>,
+    pub request_body_sha512: Option<[u8; 64]>,
     /// Shared counter for request body bytes received from the client,
     /// populated by proxy body handlers and read by the summary builders.
     ///
@@ -702,6 +1118,11 @@ pub struct RequestContext {
     /// path; VS-derived proxies never set `strip_listen_path`, so the override
     /// is the literal forwarded path.
     pub route_override_path: Option<String>,
+    /// Backend-effective path that successfully passed the final route policy
+    /// boundary. Not exposed through the public plugin API, so custom plugins
+    /// cannot forge the path consumed by security-sensitive deferred work such
+    /// as request mirroring.
+    authorized_backend_path: Option<String>,
     /// Treat `route_override_path` as an absolute backend path by disabling
     /// `strip_listen_path` on the effective proxy. Used by direct upstream
     /// routers when the override is already the final upstream URL path rather
@@ -768,6 +1189,13 @@ pub struct RequestContext {
     pub mesh_inbound_listener_authz_port: Option<u16>,
 }
 
+/// Return an identity only when it contains a meaningful non-whitespace value.
+/// Security identities are preserved byte-for-byte; this helper rejects blank
+/// principals rather than silently canonicalizing signed claim content.
+pub(crate) fn meaningful_identity(identity: Option<&str>) -> Option<&str> {
+    identity.filter(|identity| !identity.trim().is_empty())
+}
+
 fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
     metadata
         .entry(key.to_string())
@@ -785,10 +1213,13 @@ impl RequestContext {
         Self {
             direct_client_ip: client_ip.clone(),
             client_ip,
+            canonical_client_ip: CanonicalClientIpCache::default(),
             method,
             path,
+            request_authority: None,
             frontend_listen_port: None,
             frontend_sni_hostname: None,
+            lb_generation: 1,
             raw_headers: None,
             headers: HashMap::new(),
             raw_query_string: None,
@@ -800,7 +1231,22 @@ impl RequestContext {
             authenticated_identity_header: None,
             auth_method: None,
             timestamp_received: Utc::now(),
+            grpc_deadline_initialized: false,
+            grpc_deadline_had_valid_client_timeout: false,
+            grpc_deadline_received_at: tokio::time::Instant::now(),
+            grpc_deadline_preflight_complete: false,
+            grpc_deadline_budget_ms: None,
+            grpc_deadline_at: None,
+            grpc_deadline_header_is_remaining: false,
+            gateway_deadline_response_selected: false,
             metadata: HashMap::new(),
+            request_deduplication_state: HashMap::new(),
+            cors_state: cors::CorsRequestState::default(),
+            pending_claim_headers: HashMap::new(),
+            request_headers_to_redact: None,
+            buffered_initial_response_header_policy_state: None,
+            request_http_flavor: HttpFlavor::Plain,
+            websocket_response_boundary: false,
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
@@ -809,6 +1255,11 @@ impl RequestContext {
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_semantic_firewall_request_hashes: HashMap::new(),
             ai_semantic_firewall_response_hashes: HashMap::new(),
+            ai_prompt_compressor_staged: HashMap::new(),
+            ai_prompt_compressor_classification_path: None,
+            ai_prompt_compressor_wire_stats_started: false,
+            ai_prompt_compressor_marker_reject_status: None,
+            gateway_response_compression_algorithm: None,
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -829,7 +1280,10 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
+            hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
+            request_body_sha256: None,
+            request_body_sha512: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
             mesh_route_dispatch_reject_unmatched: false,
@@ -844,6 +1298,7 @@ impl RequestContext {
             route_override_request_transform: None,
             route_override_response_transform: None,
             route_override_path: None,
+            authorized_backend_path: None,
             route_override_path_is_absolute: false,
             route_override_authority: None,
             node_waypoint_pod_uid: None,
@@ -855,6 +1310,50 @@ impl RequestContext {
         }
     }
 
+    /// Return the one absolute gRPC deadline established for this request.
+    /// The instant is monotonic and must be reused rather than reconstructed
+    /// from the relative `grpc-timeout` header on later backend attempts.
+    pub fn grpc_deadline_at(&self) -> Option<tokio::time::Instant> {
+        self.grpc_deadline_at
+    }
+
+    pub(crate) fn mark_gateway_deadline_response_selected(&mut self) {
+        self.gateway_deadline_response_selected = true;
+    }
+
+    pub(crate) fn gateway_deadline_response_selected(&self) -> bool {
+        self.gateway_deadline_response_selected
+    }
+
+    /// Remaining whole-millisecond gRPC budget, rounded up so a positive
+    /// sub-millisecond remainder can never become the invalid wire value `0m`.
+    pub fn grpc_deadline_remaining_ms(&self) -> Option<u64> {
+        let remaining = self
+            .grpc_deadline_at?
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Some(0);
+        }
+        grpc_deadline::duration_millis_ceil_saturating(remaining)
+    }
+
+    pub(crate) fn initialize_grpc_deadline_budget(&mut self, budget_ms: Option<u64>) {
+        if self.grpc_deadline_initialized {
+            return;
+        }
+        self.grpc_deadline_initialized = true;
+        self.grpc_deadline_had_valid_client_timeout = budget_ms.is_some();
+        self.set_grpc_deadline_budget(budget_ms);
+    }
+
+    pub(crate) fn set_grpc_deadline_budget(&mut self, budget_ms: Option<u64>) {
+        self.grpc_deadline_budget_ms = budget_ms;
+        self.grpc_deadline_at = budget_ms.and_then(|budget| {
+            self.grpc_deadline_received_at
+                .checked_add(Duration::from_millis(budget))
+        });
+    }
+
     /// Correlation id for the concrete response-stream inspector chain, when
     /// one attached to this request. Streaming plugins can key bounded shared
     /// state by this id in `response_stream_inspector`, then remove and fold it
@@ -863,19 +1362,89 @@ impl RequestContext {
         self.response_stream_id
     }
 
+    /// Return the authoritative client IP as a canonical typed address.
+    ///
+    /// The value is parsed at most once after trusted-forwarding resolution and
+    /// reused by every policy instance attached to this request.
+    pub fn canonical_client_ip(&self) -> Option<IpAddr> {
+        self.canonical_client_ip.get_or_parse(&self.client_ip)
+    }
+
+    /// Whether [`Self::canonical_client_ip`] has initialized the shared cache.
+    #[doc(hidden)]
+    pub fn canonical_client_ip_is_initialized(&self) -> bool {
+        self.canonical_client_ip.is_initialized()
+    }
+
+    pub(crate) fn mark_gateway_response_compression(&mut self, algorithm: &'static str) {
+        self.gateway_response_compression_algorithm = Some(algorithm);
+    }
+
+    pub(crate) fn gateway_response_compression_algorithm(&self) -> Option<&'static str> {
+        self.gateway_response_compression_algorithm
+    }
+
+    pub(crate) fn bind_authorized_backend_path(&mut self, path: String) {
+        self.authorized_backend_path = Some(path);
+    }
+
+    pub(crate) fn authorized_backend_path(&self) -> Option<&str> {
+        self.authorized_backend_path.as_deref()
+    }
+
+    /// Begin tracking initial-response policy against genuine initial headers
+    /// while hooks operate on a merged buffered gRPC compatibility view.
+    pub(crate) fn begin_buffered_initial_response_header_policy(
+        &mut self,
+        header_names: Arc<Vec<String>>,
+        initial_headers: &HashMap<String, String>,
+        merged_headers: &HashMap<String, String>,
+    ) {
+        self.buffered_initial_response_header_policy_state =
+            BufferedInitialResponseHeaderPolicyState::new(
+                header_names,
+                initial_headers,
+                merged_headers,
+            )
+            .map(Arc::new);
+    }
+
+    pub(crate) fn record_buffered_initial_response_header_plugin(
+        &mut self,
+        plugin: &dyn Plugin,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if let Some(state) = self.buffered_initial_response_header_policy_state.as_mut() {
+            Arc::make_mut(state).record_after_proxy_plugin(plugin, response_headers);
+        }
+    }
+
+    pub(crate) fn take_buffered_initial_response_header_policy(
+        &mut self,
+    ) -> Option<Arc<BufferedInitialResponseHeaderPolicyState>> {
+        self.buffered_initial_response_header_policy_state.take()
+    }
+
     /// Build the lightweight compatibility context used by final request-body
     /// hooks when the active plugin needs request metadata after body
-    /// transforms. Only `metadata` is copied back to the real context by the
-    /// proxy caller, so this deliberately skips raw headers, raw query strings,
-    /// parsed query maps, prebuffered body bytes, and mirror receivers.
-    pub(crate) fn clone_for_final_request_body_hooks(&self) -> Self {
+    /// transforms. The compressor's private staged representation and incoming
+    /// classification path are moved into this context so the authoritative
+    /// wire transform can consume them without recomputing or retaining a
+    /// prompt-sized copy on the real context. Only `metadata` and selected
+    /// policy state are copied back by the proxy caller, so this deliberately
+    /// skips raw headers, raw query strings, parsed query maps, prebuffered body
+    /// bytes, and mirror receivers.
+    pub(crate) fn clone_for_final_request_body_hooks(&mut self) -> Self {
         Self {
             client_ip: self.client_ip.clone(),
             direct_client_ip: self.direct_client_ip.clone(),
+            canonical_client_ip: self.canonical_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
+            request_authority: self.request_authority.clone(),
             frontend_listen_port: self.frontend_listen_port,
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
+            lb_generation: self.lb_generation,
             raw_headers: None,
             headers: self.headers.clone(),
             raw_query_string: None,
@@ -887,6 +1456,14 @@ impl RequestContext {
             authenticated_identity_header: self.authenticated_identity_header.clone(),
             auth_method: self.auth_method,
             timestamp_received: self.timestamp_received,
+            grpc_deadline_initialized: self.grpc_deadline_initialized,
+            grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
+            grpc_deadline_received_at: self.grpc_deadline_received_at,
+            grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
+            grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
+            grpc_deadline_at: self.grpc_deadline_at,
+            grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
+            gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             // Omit `request_body` (the full buffered prompt): no
             // `on_final_request_body` hook reads it from the context — they all
             // take the body as a `&[u8]` parameter — so copying it here would burn
@@ -899,6 +1476,22 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            // Deduplication has no final request-body hook, and the caller only
+            // copies selected hook results back. Keep ownership solely on the
+            // live context instead of cloning request keys and tokens here.
+            request_deduplication_state: HashMap::new(),
+            // Final request-body hooks cannot observe or mutate the real CORS
+            // aggregate. CORS has no body hook, and only metadata is copied
+            // back from this compatibility context.
+            cors_state: cors::CorsRequestState::default(),
+            // Claim-header staging stays on the real request context. Final
+            // body hooks never consume it, and copying raw claim values into a
+            // compatibility clone would extend their lifetime unnecessarily.
+            pending_claim_headers: HashMap::new(),
+            request_headers_to_redact: self.request_headers_to_redact.clone(),
+            buffered_initial_response_header_policy_state: None,
+            request_http_flavor: self.request_http_flavor,
+            websocket_response_boundary: self.websocket_response_boundary,
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
@@ -907,6 +1500,20 @@ impl RequestContext {
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
+            // Transfer rather than clone the potentially body-sized compressor
+            // stage. The final wire hook consumes it from this compatibility
+            // context, while the live context no longer retains a second copy.
+            ai_prompt_compressor_staged: std::mem::take(&mut self.ai_prompt_compressor_staged),
+            ai_prompt_compressor_classification_path: std::mem::take(
+                &mut self.ai_prompt_compressor_classification_path,
+            ),
+            ai_prompt_compressor_wire_stats_started: std::mem::take(
+                &mut self.ai_prompt_compressor_wire_stats_started,
+            ),
+            ai_prompt_compressor_marker_reject_status: std::mem::take(
+                &mut self.ai_prompt_compressor_marker_reject_status,
+            ),
+            gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
@@ -927,7 +1534,10 @@ impl RequestContext {
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
             mirror_result_rx: None,
+            hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
+            request_body_sha256: None,
+            request_body_sha512: None,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
             mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
@@ -942,6 +1552,7 @@ impl RequestContext {
             route_override_request_transform: self.route_override_request_transform.clone(),
             route_override_response_transform: self.route_override_response_transform.clone(),
             route_override_path: self.route_override_path.clone(),
+            authorized_backend_path: self.authorized_backend_path.clone(),
             route_override_path_is_absolute: self.route_override_path_is_absolute,
             route_override_authority: self.route_override_authority.clone(),
             node_waypoint_pod_uid: self.node_waypoint_pod_uid,
@@ -960,6 +1571,39 @@ impl RequestContext {
         self.metadata.retain(|key, _| !key.starts_with("waf."));
         self.waf_owned_metadata.clear();
         self.waf_metadata_initialized = true;
+    }
+
+    pub(crate) fn set_request_headers_to_redact(&mut self, headers: Arc<Vec<String>>) {
+        if !headers.is_empty() {
+            self.request_headers_to_redact = Some(headers);
+        }
+    }
+
+    pub(crate) fn set_websocket_response_boundary(&mut self, enabled: bool) {
+        self.websocket_response_boundary = enabled;
+    }
+
+    pub(crate) fn set_request_http_flavor(&mut self, flavor: HttpFlavor) {
+        self.request_http_flavor = flavor;
+        self.set_websocket_response_boundary(matches!(flavor, HttpFlavor::WebSocket));
+    }
+
+    pub(crate) fn is_native_grpc_request(&self) -> bool {
+        matches!(self.request_http_flavor, HttpFlavor::Grpc)
+    }
+
+    pub(crate) fn has_websocket_response_boundary(&self) -> bool {
+        self.websocket_response_boundary
+    }
+
+    pub(crate) fn request_header_requires_redaction(&self, header_name: &str) -> bool {
+        self.request_headers_to_redact
+            .as_ref()
+            .is_some_and(|headers| {
+                headers
+                    .iter()
+                    .any(|header| header_name.eq_ignore_ascii_case(header))
+            })
     }
 
     pub(crate) fn set_waf_metadata(&mut self, key: &str, value: impl Into<String>) {
@@ -1438,7 +2082,7 @@ impl RequestContext {
         self.identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
-            .or(self.authenticated_identity.as_deref())
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
     }
 
     /// Return the identity value to forward to the backend in
@@ -1459,8 +2103,8 @@ impl RequestContext {
             .identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
-            .or(self.authenticated_identity_header.as_deref())
-            .or(self.authenticated_identity.as_deref())?;
+            .or_else(|| meaningful_identity(self.authenticated_identity_header.as_deref()))
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))?;
         if self.suppresses_backend_consumer_identity_headers() {
             return None;
         }
@@ -1566,6 +2210,73 @@ pub enum PluginResult {
         body: bytes::Bytes,
         headers: HashMap<String, String>,
     },
+}
+
+/// Preserve whether a request plugin produced its result or exhausted the
+/// client RPC deadline so protocol writers can choose terminal write bias.
+pub(crate) enum RequestPluginDeadlineResult {
+    Completed(PluginResult),
+    DeadlineExceeded,
+}
+
+impl RequestPluginDeadlineResult {
+    pub(crate) fn into_plugin_result(self, ctx: &mut RequestContext) -> PluginResult {
+        match self {
+            Self::Completed(result) => result,
+            Self::DeadlineExceeded => {
+                ctx.mark_gateway_deadline_response_selected();
+                grpc_deadline_exceeded_plugin_result()
+            }
+        }
+    }
+}
+
+/// Await one request-phase plugin hook under the RPC's absolute deadline while
+/// preserving typed deadline provenance for protocol-specific finalizers.
+pub(crate) async fn await_request_plugin_deadline_with_provenance<F>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> RequestPluginDeadlineResult
+where
+    F: std::future::Future<Output = PluginResult>,
+{
+    match await_grpc_deadline(deadline, future).await {
+        Ok(result) => RequestPluginDeadlineResult::Completed(result),
+        Err(()) => RequestPluginDeadlineResult::DeadlineExceeded,
+    }
+}
+
+pub(crate) async fn await_grpc_deadline<F, T>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(deadline) = deadline else {
+        return Ok(future.await);
+    };
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| ())
+}
+
+pub(crate) fn grpc_deadline_exceeded_plugin_result() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 200,
+        body: String::new(),
+        headers: HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            (
+                "grpc-status".to_string(),
+                GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER.to_string(),
+            ),
+            (
+                "grpc-message".to_string(),
+                GATEWAY_DEADLINE_EXCEEDED_MESSAGE.to_string(),
+            ),
+        ]),
+    }
 }
 
 /// Action returned by a [`ResponseStreamInspector`]'s per-chunk/end hooks
@@ -1839,16 +2550,35 @@ pub async fn normalize_response_body_for_inspection(
     let content_type = response_headers.get("content-type").cloned();
     let mut normalized = false;
     for plugin in plugins {
-        if let Some(body) = plugin
-            .normalize_response_body_with_context(
+        let deadline = ctx.grpc_deadline_at();
+        let body = match await_grpc_deadline(
+            deadline,
+            plugin.normalize_response_body_with_context(
                 ctx,
                 response_status,
                 response_body,
                 content_type.as_deref(),
                 response_headers,
-            )
-            .await
+            ),
+        )
+        .await
         {
+            Ok(body) => body,
+            Err(()) => {
+                let grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx);
+                crate::proxy::replace_buffered_grpc_response_with_deadline(
+                    ctx,
+                    grpc_web_response_content_type,
+                    response_headers,
+                    response_body,
+                    &[],
+                );
+                normalized = true;
+                break;
+            }
+        };
+        if let Some(body) = body {
             response_headers.insert("content-length".to_string(), body.len().to_string());
             *response_body = body;
             normalized = true;
@@ -2318,6 +3048,10 @@ pub async fn log_with_mirror(
         None
     };
     for plugin in plugins {
+        // Transaction logging is gateway cleanup after the client-visible
+        // outcome is final. A client RPC deadline must bound request handling,
+        // but it must not suppress the audit/transaction record for the
+        // deadline outcome itself.
         plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
@@ -2346,6 +3080,41 @@ pub async fn log_with_mirror(
             plugin
                 .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
                 .await;
+        }
+    });
+}
+
+/// Run terminal transaction logging before a buffered H1/H2 response is handed
+/// to hyper without allowing logging cleanup to extend an active gRPC deadline.
+///
+/// Ordinary requests preserve the historical sequential, awaited logging
+/// contract. Once an absolute RPC deadline is installed, the client-visible
+/// response owns the deadline and logging continues on cloned state under a
+/// finite cleanup bound. This keeps audit delivery best-effort without letting
+/// a blocked sink suppress the terminal response.
+pub async fn log_with_mirror_before_buffered_response(
+    plugins: &[Arc<dyn Plugin>],
+    summary: TransactionSummary,
+    ctx: &RequestContext,
+) {
+    if ctx.grpc_deadline_at().is_none() {
+        log_with_mirror(plugins, &summary, ctx).await;
+        return;
+    }
+
+    let plugins = plugins.to_vec();
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            log_with_mirror(&plugins, &summary, &ctx),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "Detached transaction logging exceeded the post-response cleanup timeout"
+            );
         }
     });
 }
@@ -2382,6 +3151,9 @@ pub struct StreamConnectionContext {
     /// `mesh_authz` to populate Istio's `source.ip` principal (socket peer)
     /// separately from `remote.ip` (forwarded/resolved address).
     pub direct_client_ip: String,
+    /// Shared typed-client-IP cache for stream policy instances.
+    #[doc(hidden)]
+    pub canonical_client_ip: CanonicalClientIpCache,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub listen_port: u16,
@@ -2439,13 +3211,27 @@ pub struct StreamConnectionContext {
 }
 
 impl StreamConnectionContext {
+    /// Return the authoritative stream client IP as a canonical typed address.
+    ///
+    /// The value is parsed at most once per TCP connection or UDP/DTLS session
+    /// and reused by every attached policy instance.
+    pub fn canonical_client_ip(&self) -> Option<IpAddr> {
+        self.canonical_client_ip.get_or_parse(&self.client_ip)
+    }
+
+    /// Whether [`Self::canonical_client_ip`] has initialized the shared cache.
+    #[doc(hidden)]
+    pub fn canonical_client_ip_is_initialized(&self) -> bool {
+        self.canonical_client_ip.is_initialized()
+    }
+
     /// Return the stable authenticated identity for stream policies. A mapped
     /// Consumer username takes precedence over any external authenticated identity.
     pub fn effective_identity(&self) -> Option<&str> {
         self.identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
-            .or(self.authenticated_identity.as_deref())
+            .or_else(|| meaningful_identity(self.authenticated_identity.as_deref()))
     }
 
     /// Insert a metadata value, lazily allocating the map on first write.
@@ -2528,7 +3314,7 @@ pub struct StreamTransactionSummary {
 ///
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
-/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
+/// | Early     | 0–949       | Matched-request tracing and preflight     | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
@@ -2762,9 +3548,41 @@ pub trait Plugin: Send + Sync {
         priority::DEFAULT
     }
 
-    /// Called when a request is first received (before routing).
+    /// Apply a request-receipt gRPC deadline policy synchronously, before any
+    /// plugin or request-body await. Only `grpc_deadline` overrides this hook.
+    /// It must not perform I/O or mutate the forwarded header; `before_proxy`
+    /// emits the relative upstream value from the typed absolute state.
+    fn prepare_grpc_deadline(&self, _ctx: &mut RequestContext) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin participates in the synchronous gRPC
+    /// deadline preflight. The plugin cache uses this to build a dedicated
+    /// phase list so ordinary gRPC requests do not scan the full plugin chain
+    /// before the first asynchronous hook.
+    fn requires_grpc_deadline_preflight(&self) -> bool {
+        false
+    }
+
+    /// Called after routing and per-proxy allowed-method admission succeed.
+    /// Native gRPC requests must also use `POST` before this hook runs.
+    ///
+    /// The hook receives a context whose `matched_proxy` is populated and runs
+    /// over the resolved plugin view for that proxy (applicable global plugins
+    /// plus proxy/proxy-group-scoped plugins). An unmatched route returns 404,
+    /// and a matched route with a disallowed method returns 405, before any
+    /// `on_request_received` hook runs. Consequently neither global nor scoped
+    /// implementations observe those two early terminal paths on H1, H2, or H3.
+    /// Terminal transaction logging is a separate lifecycle concern and must
+    /// not be inferred from whether this ordinary request hook ran.
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Identifies the cache-internal wrapper used to defer a composed CORS
+    /// chain. This prevents incremental cache rebuilds from nesting wrappers.
+    fn is_deferred_cors_wrapper(&self) -> bool {
+        false
     }
 
     /// Authentication phase. Uses ConsumerIndex for O(1) credential lookups.
@@ -2781,6 +3599,13 @@ pub trait Plugin: Send + Sync {
     /// auth plugin before multi-auth can stop at the first success, allowing
     /// later authorization plugins to omit every possible query credential.
     fn mark_query_credentials_for_redaction(&self, _ctx: &mut RequestContext) {}
+
+    /// Request header names whose values contain reusable credentials and must
+    /// be omitted from diagnostics and policy calls. Names are collected once
+    /// when the plugin cache is built, not rediscovered on the request hot path.
+    fn request_headers_to_redact(&self) -> &[String] {
+        &[]
+    }
 
     /// Authorization phase (after authentication).
     async fn authorize(&self, _ctx: &mut RequestContext) -> PluginResult {
@@ -2823,13 +3648,28 @@ pub trait Plugin: Send + Sync {
     ///
     /// This is even narrower than `requires_request_body_before_before_proxy()`:
     /// it forces request body buffering BEFORE the authenticate phase runs, so
-    /// auth plugins can verify body integrity (e.g., HMAC signing string that
-    /// covers a `Digest:` header per RFC 9421 / RFC 3230).
+    /// auth plugins can verify body integrity (e.g., a Ferrum HMAC signing
+    /// string that covers RFC 9530 `Content-Digest` or legacy `Digest`).
     ///
     /// Override this only for auth plugins that perform body integrity checks
     /// at authentication time (e.g., `hmac_auth`).
     fn requires_request_body_before_authenticate(&self) -> bool {
         false
+    }
+
+    /// Return whether this request should be buffered before authentication
+    /// after credential checks that do not require body bytes.
+    ///
+    /// The default preserves the ordinary request-time buffering predicate.
+    /// Body-authentication plugins can override this to reject malformed,
+    /// expired, or unknown credentials without first collecting an attacker-
+    /// controlled request body.
+    fn should_buffer_request_body_before_authenticate(
+        &self,
+        ctx: &RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> bool {
+        self.should_buffer_request_body(ctx)
     }
 
     /// Returns `true` if this plugin needs the raw request body to be available
@@ -2850,6 +3690,12 @@ pub trait Plugin: Send + Sync {
     /// that would otherwise run on every buffered request. Only override
     /// this for plugins that handle non-UTF-8 payloads (e.g., gRPC protobuf).
     fn needs_request_body_bytes(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when the plugin needs SHA-256 and SHA-512 snapshots of
+    /// the body but does not need to retain the body itself.
+    fn needs_request_body_digests(&self) -> bool {
         false
     }
 
@@ -2888,6 +3734,51 @@ pub trait Plugin: Send + Sync {
         &self,
         _ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when `before_proxy` can dispatch external work or
+    /// synthesize a terminal response and therefore must wait until an active
+    /// backend-path policy has authorized the resolved route and target path.
+    ///
+    /// The ordinary plugin pipeline is unchanged when no backend-path plugin
+    /// is active. Opt-in hooks retain their relative order in a deferred pass.
+    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when a deferred `before_proxy` hook can mutate headers
+    /// that normally participate in upstream target selection. The gateway
+    /// runs these hooks in a separate deferred subphase after an access preview
+    /// and pins that previewed target across the external call; the returned
+    /// headers cannot steer this request onto an unpreviewed path.
+    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin must inspect the backend-effective path
+    /// after route overrides and load balancing have selected the first target.
+    ///
+    /// The plugin cache precomputes this opt-in list, so requests without a
+    /// participating plugin do not scan the full chain at this boundary.
+    fn requires_backend_path_resolution(&self) -> bool {
+        false
+    }
+
+    /// Called after the backend-effective path has been assembled from the
+    /// route override, listen-path stripping, proxy/backend path, and selected
+    /// upstream target path, but before any backend is dialed.
+    ///
+    /// When a deferred hook can mutate routing headers, `Preview` runs before
+    /// that hook and `Enforce` runs afterward against the same pinned target.
+    /// Otherwise only `Enforce` runs. Implementations must keep `Preview` free
+    /// of state-consuming effects such as rate-limit charges.
+    async fn on_backend_path_resolved(
+        &self,
+        _ctx: &mut RequestContext,
+        _backend_path: &str,
+        _phase: BackendPathPolicyPhase,
     ) -> PluginResult {
         PluginResult::Continue
     }
@@ -2932,6 +3823,33 @@ pub trait Plugin: Send + Sync {
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin defines deterministic response-header
+    /// policy that must be enforced on protocol-specific initial response
+    /// boundaries as well as the ordinary `after_proxy` path.
+    ///
+    /// The plugin cache uses this marker to pre-filter a priority-ordered list;
+    /// request paths must not rediscover these plugins with name checks or scans.
+    fn is_initial_response_header_policy(&self) -> bool {
+        false
+    }
+
+    /// Apply this plugin's deterministic policy to an initial response header
+    /// map. Called only for plugins that opt in through
+    /// [`Self::is_initial_response_header_policy`]. Implementations must not
+    /// consume request-local state or perform I/O.
+    fn apply_initial_response_header_policy(
+        &self,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
+    }
+
+    /// Canonical field names this initial-response policy may set or remove.
+    /// The plugin cache unions these at reload time so buffered protocol paths
+    /// track only relevant fields and never scan the plugin chain per request.
+    fn initial_response_header_policy_names(&self) -> &[String] {
+        &[]
     }
 
     /// Returns `true` when this plugin may change the response `Content-Type`
@@ -3054,6 +3972,17 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when a successful reject-path response replacement
+    /// should emit a warning.
+    ///
+    /// Fail-closed enforcement plugins should retain the default. A plugin
+    /// performing an expected protocol normalization (for example suppressing
+    /// a `HEAD` response body without changing its representation) may return
+    /// `false`; the replacement is then logged at debug level instead.
+    fn warn_on_rejection_response_replacement(&self) -> bool {
+        true
+    }
+
     /// Returns `true` if this plugin needs the entire response body buffered
     /// in memory before forwarding to the client. When any active plugin
     /// returns `true`, the gateway forces buffered mode for that proxy
@@ -3155,9 +4084,13 @@ pub trait Plugin: Send + Sync {
     /// decision, which is why this is a separate hook.
     ///
     /// The full `response_headers` map (and `response_status`) are also passed so
-    /// a plugin can release a response it will decline to transform once headers
-    /// are known — e.g. `compression` skips `206 Partial Content` / `Content-Range`
-    /// responses, so it must not pin them onto the buffered path either.
+    /// the refinement can account for representation metadata beyond
+    /// `Content-Type`. A plugin can release a response it will decline to
+    /// transform once headers are known — e.g. `compression` skips `206 Partial
+    /// Content` / `Content-Range` responses, so it must not pin them onto the
+    /// buffered path either. Conversely, a buffered final hook that must decode
+    /// or reject a non-identity `Content-Encoding` must keep that representation
+    /// buffered; releasing opaque wire bytes would bypass the final hook.
     ///
     /// Contract: this MUST only narrow `should_buffer_response_body` — it may
     /// return `false` where the unconditional check returned `true`, but never
@@ -3423,6 +4356,18 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Called for transaction logging.
+    ///
+    /// Buffered HTTP-family handlers normally await each plugin's hook
+    /// sequentially before returning the response. When an absolute gRPC
+    /// deadline is active, buffered H1/H2 handlers instead move logging to a
+    /// bounded detached cleanup task so a blocked sink cannot suppress the
+    /// terminal RPC response. Native H3 awaits the hooks after it has
+    /// synchronously driven the response body to completion. Hyper-owned
+    /// streamed H1/H2/gRPC bodies spawn terminal hooks and logging when the body
+    /// completes; spawned work can be lost if no runtime remains during
+    /// shutdown. Plugins should hand slow I/O to a bounded, lifecycle-owned
+    /// worker rather than awaiting it inline or spawning one unbounded task per
+    /// transaction.
     async fn log(&self, _summary: &TransactionSummary) {}
 
     /// Called for transaction logging with a precomputed mesh RED key when
@@ -3692,6 +4637,13 @@ pub trait Plugin: Send + Sync {
     fn active_jwks_uris(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Returns the refresh interval required for each actively referenced
+    /// shared JWKS URI. The plugin cache reconciles duplicate consumers to the
+    /// minimum interval after every full or incremental publication.
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+        Vec::new()
+    }
 }
 
 /// Create a plugin instance from its name and configuration.
@@ -3722,17 +4674,17 @@ pub fn create_plugin_with_http_client(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
-    // Fail CLOSED *before* constructing plugins that dial their OWN resolver —
-    // ldap_auth (ldap3), kafka_logging (librdkafka), ws_logging (tungstenite).
-    // These never go through this `PluginHttpClient` + `DnsCache`, and their
-    // constructors spawn the dial task immediately, so a denied literal endpoint
-    // must be rejected here, not merely warned at config-load. Because the
-    // production `PluginCache` is built with the real-policy client
+    // Fail CLOSED before constructing plugins with literal endpoints. LDAP uses
+    // a dedicated fresh, policy-screened dial resolver; kafka_logging and
+    // ws_logging dial through their own clients. JWKS uses the shared client but
+    // must still reject denied literals at config admission rather than
+    // installing a permanently keyless provider.
+    // The production `PluginCache` is built with the real-policy client
     // (`proxy/mod.rs` → `PluginHttpClient::new` → `with_http_client`), this also
     // makes a database-mode legacy row pointing at e.g. `169.254.169.254` exclude
-    // the plugin instead of letting its background loop reach the metadata service
-    // (warn-only validation can't stop that — there is no runtime egress backstop
-    // for these clients, unlike proxy/Redis dispatch).
+    // the plugin instead of letting its background loop reach the metadata service.
+    // LDAP repeats this screen at every dial; config admission remains useful for
+    // rejecting an invalid literal before the plugin can enter the runtime cache.
     screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
@@ -4070,9 +5022,9 @@ pub fn validate_plugin_config_with_policy(
     // endpoint must be rejected here at config-load.
     screen_redis_endpoint_egress(config, backend_allow_ips)?;
     // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
-    // screened *inside* `create_plugin_with_http_client` above (before the
-    // dial task spawns), so no explicit `screen_direct_client_endpoint_egress`
-    // call is needed here — that path already failed closed on a denial.
+    // screened *inside* `create_plugin_with_http_client` above (before a dial),
+    // so no explicit `screen_direct_client_endpoint_egress` call is needed
+    // here. LDAP additionally repeats the policy check at dial time.
     Ok(())
 }
 
@@ -4114,24 +5066,47 @@ pub(crate) fn screen_redis_endpoint_egress(
     Ok(())
 }
 
-/// Screen the literal-IP endpoints of plugins that dial OUTSIDE the shared
-/// `PluginHttpClient` / `DnsCache`: `ldap_auth` (`ldap_url`, via the `ldap3`
-/// crate) and `kafka_logging` (`broker_list`, via librdkafka). Both perform
-/// their own DNS resolution and connect, so the HTTP-endpoint screen in
-/// [`validate_plugin_config_with_policy`] never sees them — a literal denied
-/// endpoint (`ldap://169.254.169.254:389`, `broker_list=169.254.169.254:9092`)
-/// would otherwise pass file/admin validation and reach the metadata service at
-/// runtime under the default baseline. Reject the literal at config-load.
+/// Screen literal-IP endpoints that require config-admission enforcement.
+/// `jwks_auth` retains the shared client's runtime DNS/IP backstop, and
+/// `ldap_auth` (`ldap_url`) has a dedicated dial-time resolver/backstop.
+/// `kafka_logging` (`broker_list`, via librdkafka) and `ws_logging` dial outside
+/// the shared resolver. A denied literal endpoint must still be rejected at
+/// config-load so file/admin/DB/CP-DP admission is consistent with runtime.
 ///
-/// Hostname endpoints that later rebind to a denied address are an accepted
-/// limitation (the client resolves outside `DnsCache`), mirroring the
-/// `rediss://`-hostname case documented in `redis_rate_limiter`.
+/// LDAP hostnames are freshly resolved and screened immediately before every
+/// connection/reconnection. Other clients outside `DnsCache` retain their
+/// documented hostname limitations; JWKS hostname resolution keeps the shared
+/// client's runtime policy backstop.
 pub(crate) fn screen_direct_client_endpoint_egress(
     name: &str,
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     match name {
+        // JWKS endpoints use the shared client (which keeps a runtime DNS/IP
+        // backstop), but literal denials must fail config admission before a
+        // provider can become permanently keyless and reject all tokens.
+        "jwks_auth" => {
+            if let Some(providers) = config.get("providers").and_then(Value::as_array) {
+                for (provider_idx, provider) in providers.iter().enumerate() {
+                    let Some(provider) = provider.as_object() else {
+                        continue;
+                    };
+                    for field in ["jwks_uri", "discovery_url"] {
+                        if let Some(url) = provider.get(field).and_then(Value::as_str)
+                            && let Ok(parsed) = url::Url::parse(url.trim())
+                            && let Some(host) = parsed.host_str()
+                            && let Some(ip) = crate::config::types::egress_literal_ip(host)
+                            && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+                        {
+                            return Err(format!(
+                                "providers[{provider_idx}].{field} IP {ip} denied by backend egress policy: {reason}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         // ldap_url is a single ldap:// / ldaps:// URL.
         "ldap_auth" => {
             if let Some(url) = config.get("ldap_url").and_then(|v| v.as_str())

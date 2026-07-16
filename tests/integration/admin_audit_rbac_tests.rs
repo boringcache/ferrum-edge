@@ -481,6 +481,171 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
 }
 
 #[tokio::test]
+async fn loki_config_projection_redacts_endpoint_and_all_header_credentials() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let path_secret = "loki-private-path-canary";
+    let query_secret = "loki-query-canary";
+    let auth_secret = "loki-auth-canary";
+    let tenant_secret = "loki-tenant-canary";
+    let arbitrary_header_secret = "loki-arbitrary-header-canary";
+    let endpoint = format!(
+        "https://logs.example.com/{path_secret}/loki/api/v1/push?tenant_key={query_secret}"
+    );
+    let plugin = json!({
+        "id": "loki-redaction-config",
+        "plugin_name": "loki_logging",
+        "scope": "global",
+        "config": {
+            "endpoint_url": endpoint,
+            "authorization_header": format!("Bearer {auth_secret}"),
+            "custom_headers": {
+                "X-Scope-OrgID": tenant_secret,
+                "X-Arbitrary": arbitrary_header_secret
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "Loki plugin create failed: {body:?}");
+    assert_eq!(body["config"]["endpoint_url"], endpoint);
+    assert_eq!(
+        body["config"]["authorization_header"],
+        format!("Bearer {auth_secret}")
+    );
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=loki-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_loki_config_projection_redacted(audit_config);
+
+    for bearer in [&viewer, &operator] {
+        let (status, projected) =
+            get_json(&base, "/plugins/config/loki-redaction-config", bearer).await;
+        assert_eq!(
+            status, 200,
+            "projected Loki config read failed: {projected:?}"
+        );
+        assert_loki_config_projection_redacted(&projected["config"]);
+    }
+
+    let (status, list) = get_json(&base, "/plugins/config", &viewer).await;
+    assert_eq!(status, 200, "viewer Loki config list failed: {list:?}");
+    let listed = list["data"]
+        .as_array()
+        .expect("plugin list data")
+        .iter()
+        .find(|item| item["id"] == "loki-redaction-config")
+        .expect("listed Loki config");
+    assert_loki_config_projection_redacted(&listed["config"]);
+
+    let (status, raw) = get_json(&base, "/plugins/config/loki-redaction-config", &admin).await;
+    assert_eq!(status, 200, "admin Loki config read failed: {raw:?}");
+    assert_eq!(raw["config"]["endpoint_url"], endpoint);
+    assert_eq!(
+        raw["config"]["custom_headers"]["X-Scope-OrgID"],
+        tenant_secret
+    );
+
+    for projection in [audit_config, &listed["config"]] {
+        let serialized = projection.to_string();
+        for secret in [
+            path_secret,
+            query_secret,
+            auth_secret,
+            tenant_secret,
+            arbitrary_header_secret,
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "Loki config projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_loki_config_projection_redacted(config: &Value) {
+    assert_eq!(config["endpoint_url"], "https://logs.example.com/redacted");
+    assert_eq!(config["authorization_header"], "[REDACTED]");
+    assert_eq!(config["custom_headers"]["X-Scope-OrgID"], "[REDACTED]");
+    assert_eq!(config["custom_headers"]["X-Arbitrary"], "[REDACTED]");
+}
+
+#[tokio::test]
+async fn disabled_non_object_loki_configs_are_fully_redacted_across_projections() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    for (shape, raw_config) in [
+        ("scalar", json!("loki-disabled-scalar-secret-canary")),
+        (
+            "array",
+            json!(["loki-disabled-array-secret-canary", {"nested": "credential"}]),
+        ),
+        ("null", Value::Null),
+    ] {
+        let id = format!("loki-disabled-{shape}");
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "loki_logging",
+            "scope": "global",
+            "enabled": false,
+            "config": raw_config
+        });
+
+        let (status, created) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+        assert_eq!(
+            status, 201,
+            "disabled {shape} Loki config create failed: {created:?}"
+        );
+        assert_eq!(created["config"], raw_config);
+
+        let audit_body = wait_for_audit_total(
+            &base,
+            &format!("/audit?resource_type=plugin_config&resource_id={id}"),
+            &admin,
+            1,
+        )
+        .await;
+        let audit_config =
+            &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+        assert_eq!(audit_config, &json!("[REDACTED]"));
+
+        for bearer in [&viewer, &operator] {
+            let (status, projected) =
+                get_json(&base, &format!("/plugins/config/{id}"), bearer).await;
+            assert_eq!(
+                status, 200,
+                "projected disabled {shape} Loki config read failed: {projected:?}"
+            );
+            assert_eq!(projected["config"], "[REDACTED]");
+        }
+
+        let (status, raw) = get_json(&base, &format!("/plugins/config/{id}"), &admin).await;
+        assert_eq!(
+            status, 200,
+            "admin disabled {shape} Loki config read failed: {raw:?}"
+        );
+        assert_eq!(raw["config"], raw_config);
+    }
+}
+
+#[tokio::test]
 async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
@@ -494,6 +659,15 @@ async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
     });
     let (status, body) = post_json(&base, "/consumers", &admin, &consumer).await;
     assert_eq!(status, 201, "consumer create failed: {body:?}");
+    // Audit persistence is asynchronous. Observe the consumer event before
+    // starting another write so the two-connection SQLite pool does not race.
+    wait_for_audit_total(
+        &base,
+        "/audit?resource_type=consumer&resource_id=audit-keyauth-consumer",
+        &admin,
+        1,
+    )
+    .await;
 
     let plaintext_key = "super-secret-keyauth-api-key-do-not-leak";
     let cred = json!([{ "key": plaintext_key }]);
@@ -527,6 +701,121 @@ async fn consumer_keyauth_audit_diff_redacts_plaintext_key() {
         !serialized.contains(plaintext_key),
         "plaintext keyauth key leaked into audit diff: {event:?}"
     );
+}
+
+#[tokio::test]
+async fn basic_credential_mutations_emit_shape_independent_audit_markers() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+
+    let consumer = json!({
+        "id": "audit-basic-consumer",
+        "username": "audit-basic-user",
+        "credentials": {}
+    });
+    let (status, body) = post_json(&base, "/consumers", &admin, &consumer).await;
+    assert_eq!(status, 201, "consumer create failed: {body:?}");
+    // Audit persistence is asynchronous. Observe each event before the next
+    // mutation so the test's two-connection SQLite pool does not race writers.
+    wait_for_audit_total(
+        &base,
+        "/audit?resource_type=consumer&resource_id=audit-basic-consumer",
+        &admin,
+        1,
+    )
+    .await;
+
+    let old_hash = format!("hmac_sha256:{}", "a".repeat(64));
+    let new_hash = format!("hmac_sha256:{}", "b".repeat(64));
+    let client = reqwest::Client::new();
+    let credential_audit_path =
+        "/audit?resource_type=consumer_credentials&resource_id=audit-basic-consumer";
+
+    let response = client
+        .put(format!(
+            "{base}/consumers/audit-basic-consumer/credentials/basicauth"
+        ))
+        .bearer_auth(&admin)
+        .json(&json!([{"password_hash": old_hash.clone()}]))
+        .send()
+        .await
+        .expect("PUT Basic credentials");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status, 200, "PUT Basic credentials failed: {body:?}");
+    assert!(body["credentials"].get("basicauth").is_none());
+    wait_for_audit_total(&base, credential_audit_path, &admin, 1).await;
+
+    let response = client
+        .post(format!(
+            "{base}/consumers/audit-basic-consumer/credentials/basicauth"
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({"password_hash": new_hash.clone()}))
+        .send()
+        .await
+        .expect("POST Basic credential");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status, 200, "POST Basic credential failed: {body:?}");
+    assert!(body["credentials"].get("basicauth").is_none());
+    wait_for_audit_total(&base, credential_audit_path, &admin, 2).await;
+
+    let response = client
+        .delete(format!(
+            "{base}/consumers/audit-basic-consumer/credentials/basicauth/0"
+        ))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .expect("DELETE Basic credential by index");
+    let status = response.status().as_u16();
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status, 200, "DELETE Basic credential failed: {body:?}");
+    assert!(body["credentials"].get("basicauth").is_none());
+    wait_for_audit_total(&base, credential_audit_path, &admin, 3).await;
+
+    let response = client
+        .delete(format!(
+            "{base}/consumers/audit-basic-consumer/credentials/basicauth"
+        ))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .expect("DELETE all Basic credentials");
+    assert_eq!(response.status().as_u16(), 204);
+
+    let audit_body = wait_for_audit_total(&base, credential_audit_path, &admin, 4).await;
+    let items = audit_body["items"].as_array().expect("audit items");
+    let actions: std::collections::HashSet<&str> = items
+        .iter()
+        .filter_map(|event| event["action"].as_str())
+        .collect();
+    assert_eq!(
+        actions,
+        std::collections::HashSet::from([
+            "update_credentials",
+            "append_credential",
+            "delete_credential",
+            "delete_credentials",
+        ])
+    );
+
+    for event in items {
+        assert_eq!(event["diff"]["credential_type"], "basicauth");
+        assert_eq!(event["diff"]["credential_change"], "[REDACTED]");
+        for side in ["before", "after"] {
+            if let Some(marker) = event["diff"][side]["credentials"].get("basicauth") {
+                assert_eq!(marker, "[REDACTED]");
+            }
+        }
+        let serialized = event["diff"].to_string();
+        assert!(!serialized.contains(&old_hash));
+        assert!(!serialized.contains(&new_hash));
+        assert!(!serialized.contains("password_hash"));
+    }
 }
 
 #[tokio::test]
