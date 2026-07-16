@@ -226,9 +226,11 @@ non-identity `Content-Encoding` buffered even when `Content-Type` is missing or
 non-JSON. Its final hook then decodes supported gzip/Brotli within the inspection
 cap and routes empty, malformed, unsupported, or oversized encodings through the
 configured `on_error` policy (fail-closed by default). Partial responses (`206`
-or `Content-Range`) remain on the streaming path when encoded because they are
-not complete encoded representations; unencoded JSON partials remain subject to
-normal inspection. Unencoded unrelated event streams also keep streaming;
+or `Content-Range`) follow the same bounded encoded-body decision as complete
+responses: decodable JSON remains inspectable, while malformed fragments fail
+closed according to the uninspectable-body policy. Unencoded JSON partials also
+remain subject to normal inspection. Unencoded unrelated event streams also
+keep streaming;
 complete origin-encoded event streams stay buffered for bounded decode because
 stream inspectors cannot parse compressed wire bytes. No encoding (or an
 identity-only encoding list) still lets ordinary non-AI text stream, and a

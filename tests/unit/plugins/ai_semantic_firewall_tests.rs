@@ -3722,7 +3722,7 @@ async fn final_response_fails_closed_for_malformed_decoded_json_shape() {
 }
 
 #[tokio::test]
-async fn partial_encoded_responses_skip_buffering_and_response_hooks() {
+async fn partial_encoded_responses_stay_on_bounded_decode_path() {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
@@ -3750,7 +3750,7 @@ async fn partial_encoded_responses_skip_buffering_and_response_hooks() {
         ),
     ] {
         let mut ctx = create_test_context();
-        assert!(!firewall.should_buffer_response_body_for_content_type(
+        assert!(firewall.should_buffer_response_body_for_content_type(
             &ctx,
             Some("text/plain"),
             status,
@@ -3761,17 +3761,62 @@ async fn partial_encoded_responses_skip_buffering_and_response_hooks() {
                 .on_response_body(&mut ctx, status, &headers, gzip_fragment)
                 .await,
         );
-        assert_continue(
+        assert_reject(
             firewall
                 .on_final_response_body(&mut ctx, status, &headers, gzip_fragment)
                 .await,
+            Some(502),
         );
-        assert!(
-            !ctx.metadata
-                .contains_key("ai_semantic_firewall.uninspectable_body")
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.uninspectable_body")
+                .map(String::as_str),
+            Some("encoded_body")
         );
-        assert!(!ctx.metadata.contains_key("ai_semantic_firewall.rule_ids"));
     }
+}
+
+#[tokio::test]
+async fn partial_encoded_json_responses_remain_inspected_when_decodable() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+        ("content-range".to_string(), "bytes 0-1023/1024".to_string()),
+    ]);
+    let body = gzip_bytes(
+        br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
+    );
+    let mut ctx = create_test_context();
+
+    assert!(firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        206,
+        &headers,
+    ));
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 206, &headers, &body)
+            .await,
+    );
+    assert_reject(
+        firewall
+            .on_final_response_body(&mut ctx, 206, &headers, &body)
+            .await,
+        Some(502),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
 }
 
 #[tokio::test]
@@ -3821,7 +3866,7 @@ async fn partial_unencoded_json_responses_remain_inspected() {
 }
 
 #[tokio::test]
-async fn original_range_marker_skips_final_hook_after_content_range_removal() {
+async fn original_range_marker_does_not_release_encoded_response_after_content_range_removal() {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
@@ -3845,22 +3890,24 @@ async fn original_range_marker_skips_final_hook_after_content_range_removal() {
             .await,
     );
     headers.remove("content-range");
-    assert!(!firewall.should_buffer_response_body_for_content_type(
+    assert!(firewall.should_buffer_response_body_for_content_type(
         &ctx,
         Some("text/plain"),
         200,
         &headers,
     ));
-    assert_continue(
+    assert_reject(
         firewall
             .on_final_response_body(&mut ctx, 200, &headers, gzip_fragment)
             .await,
+        Some(502),
     );
-    assert!(
-        !ctx.metadata
-            .contains_key("ai_semantic_firewall.uninspectable_body")
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("encoded_body")
     );
-    assert!(!ctx.metadata.contains_key("ai_semantic_firewall.rule_ids"));
 }
 
 #[tokio::test]
