@@ -69,6 +69,12 @@ pub(crate) struct ApiSpecDeleteSnapshot {
     plugins: Vec<PluginConfig>,
 }
 
+#[derive(Clone, Copy)]
+struct LateDeleteSnapshots<'a> {
+    config: &'a GatewayConfig,
+    api_spec: Option<&'a ApiSpecDeleteSnapshot>,
+}
+
 pub(crate) enum AfterValidateError {
     BadRequest(Vec<String>),
     Conflict(Vec<String>),
@@ -484,8 +490,7 @@ async fn recover_late_resource_write<R: AdminResource>(
     action: LateResourceWrite<'_>,
     written: Option<&R>,
     previous: Option<&R>,
-    previous_snapshot: Option<&GatewayConfig>,
-    previous_api_spec: Option<&ApiSpecDeleteSnapshot>,
+    previous_snapshots: Option<LateDeleteSnapshots<'_>>,
 ) -> Result<bool, anyhow::Error> {
     let recovery_guard = lock_namespace_config_admission(db.clone(), namespace).await?;
     if recovery_guard.immediately_succeeds_generation(lost_generation) {
@@ -505,7 +510,7 @@ async fn recover_late_resource_write<R: AdminResource>(
                         namespace,
                         &current,
                         written,
-                        previous_snapshot,
+                        previous_snapshots.map(|snapshots| snapshots.config),
                     )
                     .await?
                     && !R::db_delete(db.as_ref(), namespace, written.id()).await?
@@ -540,8 +545,8 @@ async fn recover_late_resource_write<R: AdminResource>(
                         db.as_ref(),
                         namespace,
                         previous,
-                        previous_snapshot,
-                        previous_api_spec,
+                        previous_snapshots.map(|snapshots| snapshots.config),
+                        previous_snapshots.and_then(|snapshots| snapshots.api_spec),
                     )
                     .await?;
                 }
@@ -1435,8 +1440,10 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                     LateResourceWrite::Delete { id },
                     None,
                     Some(&existing),
-                    previous_snapshot.as_ref(),
-                    previous_api_spec.as_ref(),
+                    previous_snapshot.as_ref().map(|config| LateDeleteSnapshots {
+                        config,
+                        api_spec: previous_api_spec.as_ref(),
+                    }),
                 )
                 .await
                 {
@@ -4037,7 +4044,6 @@ async fn handle_write<R: AdminResource>(
                             Some(&resource),
                             None,
                             None,
-                            None,
                         )
                         .await
                         {
@@ -4089,7 +4095,6 @@ async fn handle_write<R: AdminResource>(
                         LateResourceWrite::Update { id },
                         Some(&resource),
                         existing.as_ref(),
-                        None,
                         None,
                     )
                     .await
