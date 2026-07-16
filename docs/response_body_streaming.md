@@ -227,10 +227,10 @@ non-JSON. Its final hook then decodes supported gzip/Brotli within the inspectio
 cap and routes empty, malformed, unsupported, or oversized encodings through the
 configured `on_error` policy (fail-closed by default). Partial responses (`206`
 or `Content-Range`) follow the same bounded encoded-body decision as complete
-responses: decodable JSON remains inspectable, while malformed fragments fail
-closed according to the uninspectable-body policy. Unencoded JSON partials also
-remain subject to normal inspection. Unencoded unrelated event streams also
-keep streaming;
+responses: decodable governed content remains inspectable, while malformed
+fragments follow the configured uninspectable-body policy. Unencoded JSON
+partials also remain subject to normal inspection. Unencoded unrelated event
+streams also keep streaming;
 complete origin-encoded event streams stay buffered for bounded decode because
 stream inspectors cannot parse compressed wire bytes. No encoding (or an
 identity-only encoding list) still lets ordinary non-AI text stream, and a
