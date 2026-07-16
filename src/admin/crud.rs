@@ -2751,7 +2751,8 @@ impl AdminResource for PluginConfig {
             if prior_associations.is_empty() {
                 continue;
             }
-            let Some(mut current_proxy) = db.get_proxy_for_write(namespace, &prior_proxy.id).await?
+            let Some(mut current_proxy) =
+                db.get_proxy_for_write(namespace, &prior_proxy.id).await?
             else {
                 continue;
             };
