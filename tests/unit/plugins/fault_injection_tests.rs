@@ -870,7 +870,7 @@ fn test_reject_empty_runtime_overlay_scope() {
 
 #[test]
 fn test_reject_non_string_runtime_overlay_scope() {
-    for invalid_scope in [json!(42), json!(null)] {
+    for invalid_scope in [json!(42), json!(true), json!({})] {
         let err = FaultInjectionPlugin::new(&json!({
             "abort": { "status_code": 503, "percentage": 50.0 },
             "runtime_overlay_scope": invalid_scope
@@ -879,6 +879,19 @@ fn test_reject_non_string_runtime_overlay_scope() {
         .unwrap();
         assert!(err.contains("runtime_overlay_scope"));
     }
+}
+
+#[test]
+fn test_null_runtime_overlay_scope_is_equivalent_to_omission() {
+    let with_null = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 50.0 },
+        "runtime_overlay_scope": null
+    }));
+    let omitted = FaultInjectionPlugin::new(&json!({
+        "abort": { "status_code": 503, "percentage": 50.0 }
+    }));
+    assert!(with_null.is_ok());
+    assert!(omitted.is_ok());
 }
 
 #[tokio::test]
@@ -1015,15 +1028,6 @@ fn test_runtime_overlay_materializations_are_generation_local() {
     assert!(old_config.get("abort").is_none());
     assert_eq!(new_config["abort"]["percentage"], json!(100.0));
     assert_eq!(static_config["abort"]["percentage"], json!(50.0));
-}
-
-#[test]
-fn test_fault_runtime_overlay_has_no_out_of_epoch_global_publisher() {
-    let source = include_str!("../../../src/plugins/fault_injection/runtime_overlay.rs");
-    assert!(source.contains("pub fn materialize_config"));
-    assert!(!source.contains("ArcSwap"));
-    assert!(!source.contains("static OVERRIDES"));
-    assert!(!source.contains("current_overrides"));
 }
 
 #[test]

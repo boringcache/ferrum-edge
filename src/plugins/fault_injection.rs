@@ -35,6 +35,7 @@
 //! At least one of `abort` or `delay` must be present. When both are
 //! configured and both trigger on the same request, the delay executes
 //! first, then the abort fires.
+//! `runtime_overlay_scope` may be omitted or null to disable RTDS scoping.
 //!
 //! ## RTDS overlay
 //!
@@ -200,7 +201,7 @@ impl FaultInjectionPlugin {
                     );
                 }
             }
-            None => {}
+            Some(Value::Null) | None => {}
             Some(_) => {
                 return Err("fault_injection: runtime_overlay_scope must be a string".to_string());
             }

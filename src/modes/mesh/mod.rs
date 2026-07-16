@@ -22558,6 +22558,50 @@ mod tests {
         assert_ne!(disabled.plugin_configs[0].updated_at, generation);
     }
 
+    #[test]
+    fn fault_rtds_numeric_equivalence_preserves_plugin_generation() {
+        use crate::modes::mesh::config::RuntimeValue;
+
+        let generation = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let accepted = GatewayConfig {
+            plugin_configs: vec![crate::config::types::PluginConfig {
+                id: "fault-checkout".to_string(),
+                plugin_name: "fault_injection".to_string(),
+                namespace: "default".to_string(),
+                config: serde_json::json!({
+                    "abort": {"status_code": 503, "percentage": 50},
+                    "runtime_overlay_scope": "checkout"
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: generation,
+                updated_at: generation,
+            }],
+            mesh: Some(Box::new(MeshConfig::default())),
+            ..GatewayConfig::default()
+        };
+        let mut candidate = accepted.clone();
+        materialize_fault_runtime_overlay(
+            &mut candidate,
+            &crate::modes::mesh::config::MeshRuntimeOverlay {
+                fields: HashMap::from([(
+                    "ferrum.fault_injection.checkout.abort_percent".to_string(),
+                    RuntimeValue::Number(50.0),
+                )]),
+            },
+        );
+        reconcile_fault_plugin_generations(&mut candidate, &accepted);
+
+        assert_eq!(candidate.plugin_configs[0].updated_at, generation);
+        assert_eq!(candidate.plugin_configs[0].config, accepted.plugin_configs[0].config);
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert!(delta.modified_plugin_configs.is_empty());
+        assert!(!delta.global_plugin_configs_changed);
+    }
+
     /// Build a minimal mesh-style upstream with one target on `port`, stamped
     /// with `now` as both timestamps (mirrors the materializers).
     fn reconcile_test_upstream(

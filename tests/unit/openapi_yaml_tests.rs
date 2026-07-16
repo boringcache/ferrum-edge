@@ -1529,7 +1529,7 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         );
     }
 
-    for invalid_scope in [json!(""), json!(" \t "), json!(42), json!(null)] {
+    for invalid_scope in [json!(""), json!(" \t "), json!(42), json!(true)] {
         assert_component_validity(
             &spec,
             "FaultInjectionConfig",
@@ -1540,6 +1540,15 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
             false,
         );
     }
+    assert_component_validity(
+        &spec,
+        "FaultInjectionConfig",
+        &json!({
+            "abort": {"status_code": 503, "percentage": 1.0},
+            "runtime_overlay_scope": null
+        }),
+        true,
+    );
     assert_component_validity(
         &spec,
         "FaultInjectionConfig",

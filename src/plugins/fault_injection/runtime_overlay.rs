@@ -163,7 +163,11 @@ pub fn materialize_config(
             continue;
         };
         let next = Value::Number(number);
-        if fault.get("percentage") != Some(&next) {
+        let numerically_unchanged = fault
+            .get("percentage")
+            .and_then(Value::as_f64)
+            .is_some_and(|current| current.total_cmp(&percentage).is_eq());
+        if !numerically_unchanged {
             fault.insert("percentage".to_string(), next);
             changed = true;
         }
@@ -352,6 +356,26 @@ mod tests {
 
         assert_eq!(result, FaultOverlayMaterialization::Changed);
         assert_eq!(config["abort"]["percentage"], serde_json::json!(percentage));
+    }
+
+    #[test]
+    fn integer_static_percentage_equal_to_float_overlay_is_unchanged() {
+        let mut config = serde_json::json!({
+            "abort": {"status_code": 503, "percentage": 50},
+            "runtime_overlay_scope": "checkout"
+        });
+        let original = config.clone();
+        let result = materialize_config(
+            &mut config,
+            &overlay(&[(
+                "ferrum.fault_injection.checkout.abort_percent",
+                RuntimeValue::Number(50.0),
+            )]),
+        );
+
+        assert_eq!(result, FaultOverlayMaterialization::Unchanged);
+        assert_eq!(config, original);
+        assert_eq!(config["abort"]["percentage"], serde_json::json!(50));
     }
 
     #[test]

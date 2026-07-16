@@ -14621,12 +14621,12 @@ components:
               description: Delay probability as a percentage. Positive values below one 64-bit sampler bucket round up to that first bucket.
           required: [duration_ms, percentage]
         runtime_overlay_scope:
-          type: string
+          type: [string, "null"]
           pattern: '\S'
           description: |
             Optional RTDS scope containing at least one non-whitespace
-            character; leading and trailing whitespace is trimmed. The
-            accepted request epoch captures
+            character; null is equivalent to omission, and leading and
+            trailing whitespace is trimmed. The accepted request epoch captures
             `ferrum.fault_injection.<scope>.abort_percent` and `.delay_percent`
             atomically with this plugin config. Missing or malformed keys fall
             back independently to the static percentage.

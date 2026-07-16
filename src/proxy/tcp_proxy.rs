@@ -1928,19 +1928,47 @@ async fn run_tcp_stream_connect_plugins(
 /// validly send their complete request and then half-close while continuing to
 /// wait for the response.
 pub(crate) async fn wait_for_tcp_peer_reset(client_stream: &TcpStream) {
+    let mut retry_backoff = TcpFaultAdmissionRetryBackoff::new();
     loop {
         // Readiness may be spurious, and readiness polling itself may fail.
         // Neither is evidence that the peer disconnected: only a concrete
-        // socket error cancels admission. A short retry interval prevents a
-        // stale readiness bit from spinning while the fault future remains
-        // cancel-safe in the surrounding `select!`.
+        // socket error cancels admission. A bounded increasing retry interval
+        // prevents a persistent HUP/error readiness bit from spinning while
+        // keeping reset cancellation within 50 ms and preserving cancel safety
+        // in the surrounding `select!`.
         let readiness = client_stream.ready(tokio::io::Interest::ERROR).await;
         let socket_error = client_stream.take_error();
         if tcp_fault_admission_should_cancel(&readiness, &socket_error) {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::sleep(retry_backoff.next_delay()).await;
     }
+}
+
+const TCP_FAULT_ADMISSION_RETRY_INITIAL_MS: u64 = 1;
+const TCP_FAULT_ADMISSION_RETRY_MAX_MS: u64 = 50;
+
+struct TcpFaultAdmissionRetryBackoff {
+    next_ms: u64,
+}
+
+impl TcpFaultAdmissionRetryBackoff {
+    fn new() -> Self {
+        Self {
+            next_ms: TCP_FAULT_ADMISSION_RETRY_INITIAL_MS,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = Duration::from_millis(self.next_ms);
+        self.next_ms = (self.next_ms * 2).min(TCP_FAULT_ADMISSION_RETRY_MAX_MS);
+        delay
+    }
+}
+
+pub(crate) fn tcp_fault_admission_retry_delays(polls: usize) -> Vec<Duration> {
+    let mut backoff = TcpFaultAdmissionRetryBackoff::new();
+    (0..polls).map(|_| backoff.next_delay()).collect()
 }
 
 pub(crate) fn tcp_fault_admission_should_cancel(

@@ -1,6 +1,6 @@
 use ferrum_edge::_test_support::{
     StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
-    classify_stream_error, disconnect_cause_for_failure,
+    classify_stream_error, disconnect_cause_for_failure, tcp_fault_admission_retry_delays_for_test,
     tcp_fault_admission_should_cancel_for_test, wait_for_tcp_peer_reset_for_test,
 };
 use ferrum_edge::plugins::{Direction, DisconnectCause};
@@ -33,6 +33,14 @@ fn test_tcp_fault_admission_requires_actual_socket_error() {
             "simulated reset",
         ))),
     ));
+}
+
+#[test]
+fn test_tcp_fault_admission_spurious_readiness_uses_bounded_backoff() {
+    assert_eq!(
+        tcp_fault_admission_retry_delays_for_test(10),
+        [1, 2, 4, 8, 16, 32, 50, 50, 50, 50].map(Duration::from_millis)
+    );
 }
 
 #[tokio::test]

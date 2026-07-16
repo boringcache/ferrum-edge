@@ -933,6 +933,10 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::wait_for_tcp_peer_reset(stream).await;
     }
 
+    pub fn tcp_fault_admission_retry_delays_for_test(polls: usize) -> Vec<Duration> {
+        crate::proxy::tcp_proxy::tcp_fault_admission_retry_delays(polls)
+    }
+
     pub fn tcp_fault_admission_should_cancel_for_test(
         readiness: std::io::Result<tokio::io::Ready>,
         socket_error: std::io::Result<Option<std::io::Error>>,

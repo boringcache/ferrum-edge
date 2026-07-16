@@ -2333,11 +2333,11 @@ When route-sensitive backend-path policy such as `grpc_method_router` is active,
 | `abort.body` | String | `""` | HTTP response body for aborts |
 | `delay.duration_ms` | u64 | required when `delay` is set | Delay before continuing or aborting, 1-60,000 ms |
 | `delay.percentage` | f64 | required when `delay` is set | Delay probability, >0.0 and <=100.0; positive sub-bucket values round up to one 64-bit sampler bucket |
-| `runtime_overlay_scope` | String (optional) | — | RTDS scope with at least one non-whitespace character (outer whitespace is trimmed) for `ferrum.fault_injection.<scope>.{abort,delay}_percent` |
+| `runtime_overlay_scope` | String or null (optional) | — | RTDS scope with at least one non-whitespace character (outer whitespace is trimmed) for `ferrum.fault_injection.<scope>.{abort,delay}_percent`; null is equivalent to omission |
 
 Each plugin instance owns a process-random sampling stream and makes independent delay/abort rolls. Multiple scoped instances therefore all decide in configured priority order: a delaying instance does not suppress a later sibling, while the first abort naturally short-circuits the remaining plugin chain. Route-local VirtualService faults still deduplicate against proxy-scoped faults through a private source marker, so route translation does not accidentally stack the same policy surface. The plugin rejects static no-op configs such as `percentage: 0.0`; omit the plugin or disable it instead.
 
-`abort` and `delay` may be omitted or set to `null` to represent an unused side, but at least one must be an object. RTDS zero materialization treats a null sibling exactly like an omitted sibling, so removing the only configured side disables that plugin instance for the accepted generation.
+`abort` and `delay` may be omitted or set to `null` to represent an unused side, but at least one must be an object. `runtime_overlay_scope: null` is likewise equivalent to omitting the optional scope. RTDS zero materialization treats a null sibling exactly like an omitted sibling, so removing the only configured side disables that plugin instance for the accepted generation.
 
 When `runtime_overlay_scope` is set, a mesh request epoch captures the matching RTDS values atomically with the plugin config. Missing or malformed keys fall back independently to the static percentage. RTDS layers are ordered lexicographically by Runtime resource name, with later names winning; duplicate Runtime names are rejected. A numeric RTDS value may be `0` to temporarily disable one configured fault kind.
 
