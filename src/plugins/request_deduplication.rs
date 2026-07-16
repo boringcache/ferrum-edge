@@ -234,7 +234,7 @@ enum CompletionSkipReason {
 /// The values are hashed identities or opaque owner tokens, but they still do
 /// not belong in public transaction metadata. `RequestContext` holds at most
 /// one entry per deduplication instance attached to the matched proxy.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct RequestDeduplicationRequestState {
     key: String,
     fingerprint: String,
