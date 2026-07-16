@@ -15407,13 +15407,13 @@ async fn handle_proxy_request_inner(
         },
         None => None,
     };
-    ctx.request_host_had_trailing_dot = request_host_had_trailing_dot;
     let request_authority = raw_host.and_then(|authority| {
         normalize_request_authority_for_signing(
             authority,
             Some(if is_tls { "https" } else { "http" }),
         )
     });
+    ctx.request_host_had_trailing_dot = request_host_had_trailing_dot;
     ctx.request_authority = request_authority;
 
     // Classify before routing so route/method rejects can use the client's wire
