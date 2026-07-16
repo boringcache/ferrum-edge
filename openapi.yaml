@@ -6950,6 +6950,7 @@ components:
               plugin_name:
                 const: bot_detection
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/BotDetectionConfig"
@@ -11784,6 +11785,9 @@ components:
         directory permits anonymous reads of group objects, so a service account
         is recommended. TLS connections (`ldaps://`/STARTTLS) honor the gateway
         CRL (`FERRUM_TLS_CRL_FILE_PATH`), rejecting revoked server certificates.
+        Every connection/reconnection performs an uncached A+AAAA lookup, screens
+        the complete candidate set and each imminent dial under the active backend
+        egress policy, and retains the configured hostname for TLS/SNI verification.
         Non-loopback plaintext `ldap://` is rejected unless the development-only
         `allow_plaintext` override is explicitly enabled. Search-then-bind requires
         a canonical identity attribute, rejects ambiguous searches, and exports the
@@ -11845,7 +11849,7 @@ components:
           pattern: "^ldaps?://"
           not:
             pattern: "^ldaps?://[^/?#]*@"
-          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected."
+          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected. Each connection freshly resolves and policy-screens all A/AAAA candidates while retaining this hostname for TLS/SNI verification."
           example: "ldaps://ldap.example.com:636"
         bind_dn_template:
           type: string
@@ -11910,7 +11914,7 @@ components:
           default: 5
           minimum: 1
           maximum: 300
-          description: "Per-connection and per-operation timeout in seconds; also applied as the server-side LDAP search time limit"
+          description: "Per-connection DNS resolution, candidate TCP/TLS establishment, and per-operation timeout in seconds; also applied as the server-side LDAP search time limit"
         request_timeout_seconds:
           type: integer
           format: uint64
@@ -13601,8 +13605,22 @@ components:
 
     BotDetectionConfig:
       type: object
+      additionalProperties: false
+      allOf:
+        - if:
+            required: [blocked_patterns]
+            properties:
+              blocked_patterns:
+                type: array
+                maxItems: 0
+          then:
+            required: [allow_missing_user_agent]
+            properties:
+              allow_missing_user_agent:
+                const: false
       description: >-
         Plugin: bot_detection — case-insensitive User-Agent matching.
+        Configuration must be an object and unknown properties are rejected.
         `blocked_patterns` are substring matches; `allow_list` entries are
         word-boundary matches and are consulted before blocked patterns, so a
         User-Agent that contains a blocked substring can still pass if it also
@@ -13613,12 +13631,15 @@ components:
         (empty `blocked_patterns` while missing User-Agent headers are allowed)
         is rejected; an allow-list alone is not enforcement. The User-Agent is
         client-controlled and spoofable, so this is a coarse filter, not strong
-        bot verification. HTTP-family only.
+        bot verification. Pattern entry whitespace follows Rust `str::trim`
+        Unicode `White_Space` semantics. HTTP-family only.
       properties:
         blocked_patterns:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default:
             - curl
             - wget
@@ -13632,35 +13653,48 @@ components:
             - php/
           description: >-
             User-Agent substrings to reject (case-insensitive). Specifying this
-            field replaces the defaults entirely. Setting it to `[]` is valid
-            only when `allow_missing_user_agent: false` creates a missing-header
-            reject path; an allow-list alone is not enforcement.
+            field with an array replaces the defaults entirely. Entries are
+            trimmed and must contain a non-whitespace character. `null` is the
+            same as omission and installs the documented defaults. Setting the
+            field to `[]` is valid only when `allow_missing_user_agent: false`
+            creates a missing-header reject path; an allow-list alone is not
+            enforcement.
         allow_list:
-          type: array
+          type: [array, "null"]
           items:
             type: string
+            minLength: 1
+            pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
           default: []
           description: >-
             User-Agent tokens that always pass, evaluated before
             `blocked_patterns` (allow wins). Matching is case-insensitive and
             word-boundary anchored, so an entry only matches when it appears as
-            a standalone token in the User-Agent.
+            a standalone token in the User-Agent. Entries are trimmed and must
+            contain a non-whitespace character. `null` is the same as omission
+            and installs an empty allow list.
         allow_missing_user_agent:
-          type: boolean
+          type: [boolean, "null"]
           default: true
           description: >-
             When true (default), requests with no User-Agent header pass — this
             keeps health-check and load-balancer probes working. Set to false
-            to reject them with `custom_response_code`.
+            to reject them with `custom_response_code`. `null` is the same as
+            omission and selects `true`.
         custom_response_code:
-          type: integer
+          type: [integer, "null"]
           format: uint16
-          minimum: 100
+          minimum: 400
           maximum: 599
           default: 403
           description: >-
-            HTTP status code returned for rejected requests. Values outside
-            100–599 (or non-numeric values) are silently coerced to 403.
+            For non-gRPC requests, the final 4xx or 5xx HTTP status returned
+            with the JSON rejection body. Native gRPC requests instead return
+            an empty-body HTTP 200 trailers-only error with this HTTP status
+            mapped to `grpc-status` and `Forbidden` in `grpc-message`. Values
+            outside 400–599, including informational and no-body status codes,
+            and non-integer values are rejected. `null` is the same as omission
+            and selects 403.
 
     RequestTransformerConfig:
       type: object
