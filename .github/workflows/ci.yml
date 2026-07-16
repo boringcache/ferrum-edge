@@ -432,7 +432,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below groups the 59 test files into 5 logical buckets sized roughly by
+    # below groups the 60 test files into 5 logical buckets sized roughly by
     # test count (admin-api ~153, admin-config ~152, mesh-routing ~158,
     # mesh-platform ~60, protocols-data-plane ~150). Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
@@ -477,6 +477,7 @@ jobs:
               integration::log_schema_integration_tests
               integration::log_schema_registry_tests
               integration::deferred_log_tests
+              integration::example_plugin_contract_tests
               integration::api_chargeback_sink_tests
           - shard: mesh-routing
             # End-to-end mesh dispatch + authz + DestinationRule + sidecar
@@ -883,6 +884,7 @@ jobs:
               functional_opa_key_auth_redaction_test
               functional_plugin_extended_test
               functional_plugin_test
+              functional_example_plugin_test
               functional_plugins_network_test
               functional_prometheus_test
               functional_serverless_mirror_test
@@ -1182,282 +1184,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- test_request_deduplication_redis_blocks_concurrent_cross_instance" >> $GITHUB_STEP_SUMMARY
 
-  gateway-api-conformance:
-    name: Gateway API Conformance (CI mirror)
-    needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
-    runs-on: ubuntu-latest
-    # Backstop above the in-script poll bounds (discovery <=30 min +
-    # status <=140 min) so the graceful "Timed out" branch is reachable and
-    # the job is never force-killed at GitHub's 360-min default.
-    timeout-minutes: 180
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - name: Mirror dedicated Gateway API conformance result
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
-          REPOSITORY: ${{ github.repository }}
-          WORKFLOW_FILE: gateway-api-conformance.yml
-          DEDICATED_EVENT: ${{ github.event_name == 'pull_request' && 'pull_request' || 'push' }}
-          # This CI run's own id, used to derive the floor timestamp below so we
-          # only mirror a dedicated run created for the *current* event.
-          CI_RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-
-          {
-            echo "## Gateway API Conformance"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          # A reused head commit (PR close/reopen, or re-running CI without a new
-          # commit) can surface an OLDER gateway-api-conformance.yml run for this
-          # same head_sha that still matches the PR-number filter. Selecting "the
-          # most recent run for this PR" would then `break` on that stale run and
-          # mirror its old conclusion instead of the current attempt's. To make a
-          # reused-SHA stale run unselectable, floor the search by this CI run's
-          # own trigger time: both this CI run and the dedicated conformance run
-          # are launched by the *same* `pull_request` event, so the dedicated run
-          # we want has `created_at` at/after this CI run's `created_at`. A prior
-          # attempt's run for the same SHA was created on an earlier event and is
-          # always strictly older, so the floor drops it.
-          #
-          # `created_at` (event/trigger time) is shared across workflows for one
-          # event, unlike `run_started_at` (runner pickup time, which varies with
-          # queue depth). Subtract a small skew tolerance so a few seconds of
-          # per-workflow registration jitter on the *same* event never excludes
-          # the run we want; this window is far smaller than the minutes-to-hours
-          # gap to any prior attempt for the same SHA.
-          SKEW_TOLERANCE_SECONDS=120
-          ci_created_at=""
-          for _ in $(seq 1 10); do
-            ci_created_at="$(
-              gh api -X GET "/repos/${REPOSITORY}/actions/runs/${CI_RUN_ID}" \
-                --jq '.created_at // empty' 2>/dev/null || true
-            )"
-            if [ -n "$ci_created_at" ]; then
-              break
-            fi
-            sleep 10
-          done
-          if [ -z "$ci_created_at" ]; then
-            echo "Could not resolve this CI run's created_at to floor the conformance run search." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          # GNU date on the ubuntu runner; falls back to BSD date for local use.
-          since="$(date -u -d "${ci_created_at} - ${SKEW_TOLERANCE_SECONDS} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-            || date -u -j -v-"${SKEW_TOLERANCE_SECONDS}"S -f "%Y-%m-%dT%H:%M:%SZ" "${ci_created_at}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-            || echo "${ci_created_at}")"
-          echo "Only mirroring dedicated runs created at/after ${since} (this CI run started ${ci_created_at})." >> "$GITHUB_STEP_SUMMARY"
-
-          # Among dedicated runs for this head_sha that are at/after the floor,
-          # PR events prefer the most recent run whose `.pull_requests[]`
-          # includes THIS PR number; only when none match (cross-fork PR runs
-          # report an empty `.pull_requests`) fall back to the most recent
-          # in-window head_sha run so forked PRs still get a result. Main-push
-          # events have no PR number, so they select the most recent in-window
-          # push run for the exact SHA. The `created_at >= env.SINCE` floor is
-          # applied to both paths so a stale same-SHA run cannot satisfy either.
-          # `gh api --jq` runs gojq, which has no `--arg` flag (that's a flag of
-          # the standalone `jq` binary, not of `gh`). Passing `--arg` makes `gh`
-          # exit non-zero with "unknown flag", and the surrounding
-          # `2>/dev/null || true` would silently swallow it, leaving `run_id`
-          # empty and failing the gate on every PR. Instead, read the values
-          # inside the program via gojq's `env` builtin: `PR_NUMBER` is exported
-          # in the step `env:` block, and `SINCE` is exported here so the jq
-          # program can reference `env.SINCE`.
-          export SINCE="${since}"
-          run_id=""
-          for _ in $(seq 1 60); do
-            if [ "$DEDICATED_EVENT" = "pull_request" ]; then
-              # `env.PR_NUMBER` / `env.SINCE` below read process env from inside
-              # the jq program, so it is intentionally single-quoted.
-              # shellcheck disable=SC2016
-              run_id="$(
-                gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
-                  --jq '
-                    [.workflow_runs[]]
-                    | map(select(.created_at >= env.SINCE))
-                    | sort_by(.created_at) | reverse
-                    | (map(select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber)))) | .[0].id)
-                      // (.[0].id)
-                      // empty
-                  ' 2>/dev/null || true
-              )"
-            else
-              # shellcheck disable=SC2016
-              run_id="$(
-                gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=push&head_sha=${HEAD_SHA}&per_page=10" \
-                  --jq '
-                    [.workflow_runs[]]
-                    | map(select(.created_at >= env.SINCE))
-                    | sort_by(.created_at) | reverse
-                    | .[0].id // empty
-                  ' 2>/dev/null || true
-              )"
-            fi
-            if [ -n "$run_id" ]; then
-              break
-            fi
-            sleep 30
-          done
-
-          if [ -z "$run_id" ]; then
-            echo "Dedicated Gateway API conformance workflow for the current attempt did not start (no run for this head_sha created at/after ${since})." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "Mirroring dedicated workflow run ${run_id}." >> "$GITHUB_STEP_SUMMARY"
-
-          # ~280 polls * 30s ~= 140 min, comfortably under this job's
-          # timeout-minutes cap so the graceful timeout branch is reachable.
-          # The dedicated lab has a 90-min job timeout plus queue time, so a
-          # ~140-min ceiling leaves margin for it to finish and report.
-          for _ in $(seq 1 280); do
-            run_json="$(gh api -X GET "/repos/${REPOSITORY}/actions/runs/${run_id}" 2>/dev/null || true)"
-            if [ -z "$run_json" ]; then
-              sleep 30
-              continue
-            fi
-            status="$(printf '%s' "$run_json" | jq -r '.status' 2>/dev/null || true)"
-            if [ -z "$status" ]; then
-              sleep 30
-              continue
-            fi
-            conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion // ""' 2>/dev/null || true)"
-            if [ "$status" = "completed" ]; then
-              if [ "$conclusion" = "success" ]; then
-                echo "Dedicated Gateway API conformance workflow passed." >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              fi
-              echo "Dedicated Gateway API conformance workflow completed with conclusion: ${conclusion}." >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            fi
-            sleep 30
-          done
-
-          echo "Timed out after ~140 min waiting for dedicated Gateway API conformance workflow." >> "$GITHUB_STEP_SUMMARY"
-          exit 1
-
-  coverage-gate:
-    name: Coverage (CI mirror)
-    needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - name: Mirror dedicated Coverage workflow result
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
-          REPOSITORY: ${{ github.repository }}
-          WORKFLOW_FILE: coverage.yml
-          DEDICATED_EVENT: ${{ github.event_name == 'pull_request' && 'pull_request' || 'push' }}
-          CI_RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-
-          {
-            echo "## Coverage"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          SKEW_TOLERANCE_SECONDS=120
-          ci_created_at=""
-          for _ in $(seq 1 10); do
-            ci_created_at="$(
-              gh api -X GET "/repos/${REPOSITORY}/actions/runs/${CI_RUN_ID}" \
-                --jq '.created_at // empty' 2>/dev/null || true
-            )"
-            if [ -n "$ci_created_at" ]; then
-              break
-            fi
-            sleep 10
-          done
-          if [ -z "$ci_created_at" ]; then
-            echo "Could not resolve this CI run's created_at to floor the coverage run search." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          since="$(date -u -d "${ci_created_at} - ${SKEW_TOLERANCE_SECONDS} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-            || date -u -j -v-"${SKEW_TOLERANCE_SECONDS}"S -f "%Y-%m-%dT%H:%M:%SZ" "${ci_created_at}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-            || echo "${ci_created_at}")"
-          echo "Only mirroring dedicated coverage runs created at/after ${since} (this CI run started ${ci_created_at})." >> "$GITHUB_STEP_SUMMARY"
-
-          export SINCE="${since}"
-          run_id=""
-          for _ in $(seq 1 60); do
-            if [ "$DEDICATED_EVENT" = "pull_request" ]; then
-              # shellcheck disable=SC2016
-              run_id="$(
-                gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
-                  --jq '
-                    [.workflow_runs[]]
-                    | map(select(.created_at >= env.SINCE))
-                    | sort_by(.created_at) | reverse
-                    | (map(select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber)))) | .[0].id)
-                      // (.[0].id)
-                      // empty
-                  ' 2>/dev/null || true
-              )"
-            else
-              # shellcheck disable=SC2016
-              run_id="$(
-                gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=push&head_sha=${HEAD_SHA}&per_page=10" \
-                  --jq '
-                    [.workflow_runs[]]
-                    | map(select(.created_at >= env.SINCE))
-                    | sort_by(.created_at) | reverse
-                    | .[0].id // empty
-                  ' 2>/dev/null || true
-              )"
-            fi
-            if [ -n "$run_id" ]; then
-              break
-            fi
-            sleep 30
-          done
-
-          if [ -z "$run_id" ]; then
-            echo "Dedicated Coverage workflow for the current attempt did not start (no run for this head_sha created at/after ${since})." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "Mirroring dedicated coverage workflow run ${run_id}." >> "$GITHUB_STEP_SUMMARY"
-
-          for _ in $(seq 1 280); do
-            run_json="$(gh api -X GET "/repos/${REPOSITORY}/actions/runs/${run_id}" 2>/dev/null || true)"
-            if [ -z "$run_json" ]; then
-              sleep 30
-              continue
-            fi
-            status="$(printf '%s' "$run_json" | jq -r '.status' 2>/dev/null || true)"
-            if [ -z "$status" ]; then
-              sleep 30
-              continue
-            fi
-            conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion // ""' 2>/dev/null || true)"
-            if [ "$status" = "completed" ]; then
-              if [ "$conclusion" = "success" ]; then
-                echo "Dedicated Coverage workflow passed." >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              fi
-              echo "Dedicated Coverage workflow completed with conclusion: ${conclusion}." >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            fi
-            sleep 30
-          done
-
-          echo "Timed out after ~140 min waiting for dedicated Coverage workflow." >> "$GITHUB_STEP_SUMMARY"
-          exit 1
-
   mesh-multicluster-federation:
     name: Mesh Multicluster Federation
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
@@ -1661,141 +1387,6 @@ jobs:
           echo "## Mesh E2E Sidecar" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Skipped: this PR does not touch mesh sidecar, identity, proxy, JWT plugin, GA-contract, image, proto, docs, config, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
-
-  # Mirrors the dedicated `Mesh E2E Sidecar Live Datapath` workflow's result
-  # into the required aggregate (same pattern as the Gateway API CI mirror
-  # below): the M2 sidecar GA contract is PR-blocking, so a failed live
-  # assertion or a failed live-artifact validation blocks merge. The dedicated
-  # workflow always produces a run for this event — its `changes` job
-  # path-filters internally and the datapath job SKIPS cleanly on unrelated
-  # PRs (run conclusion `success` within ~1 min), so this mirror is cheap
-  # except when the live suite genuinely runs.
-  mesh-e2e-sidecar-live:
-    name: Mesh E2E Sidecar Live (CI mirror)
-    needs: ci-plan
-    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
-    runs-on: ubuntu-latest
-    # Backstop above the in-script poll bound (~120 min) so the graceful
-    # "Timed out" branch is reachable; the dedicated job caps at 90 min plus
-    # queue time.
-    timeout-minutes: 150
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - name: Mirror dedicated mesh e2e sidecar live result
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
-          REPOSITORY: ${{ github.repository }}
-          WORKFLOW_FILE: mesh-e2e-sidecar-live.yml
-          DEDICATED_EVENT: ${{ github.event_name == 'pull_request' && 'pull_request' || 'push' }}
-          CI_RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-
-          {
-            echo "## Mesh E2E Sidecar Live Datapath"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          # Floor the run search by this CI run's own trigger time so a reused
-          # head commit (close/reopen, re-run without a new commit) can never
-          # surface a STALE same-SHA dedicated run — identical reasoning to the
-          # Gateway API mirror above (see its comments for the full rationale).
-          SKEW_TOLERANCE_SECONDS=120
-          ci_created_at=""
-          for _ in $(seq 1 10); do
-            ci_created_at="$(
-              gh api -X GET "/repos/${REPOSITORY}/actions/runs/${CI_RUN_ID}" \
-                --jq '.created_at // empty' 2>/dev/null || true
-            )"
-            if [ -n "$ci_created_at" ]; then
-              break
-            fi
-            sleep 10
-          done
-          if [ -z "$ci_created_at" ]; then
-            echo "Could not resolve this CI run's created_at to floor the live-suite run search." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          since="$(date -u -d "${ci_created_at} - ${SKEW_TOLERANCE_SECONDS} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-            || date -u -j -v-"${SKEW_TOLERANCE_SECONDS}"S -f "%Y-%m-%dT%H:%M:%SZ" "${ci_created_at}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-            || echo "${ci_created_at}")"
-          echo "Only mirroring dedicated runs created at/after ${since} (this CI run started ${ci_created_at})." >> "$GITHUB_STEP_SUMMARY"
-
-          # `env.PR_NUMBER` / `env.SINCE` are read from inside the gojq
-          # program (gh's --jq has no --arg), so the programs are intentionally
-          # single-quoted — same construction as the Gateway API mirror.
-          export SINCE="${since}"
-          run_id=""
-          for _ in $(seq 1 60); do
-            if [ "$DEDICATED_EVENT" = "pull_request" ]; then
-              # shellcheck disable=SC2016
-              run_id="$(
-                gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=pull_request&head_sha=${HEAD_SHA}&per_page=10" \
-                  --jq '
-                    [.workflow_runs[]]
-                    | map(select(.created_at >= env.SINCE))
-                    | sort_by(.created_at) | reverse
-                    | (map(select(any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber)))) | .[0].id)
-                      // (.[0].id)
-                      // empty
-                  ' 2>/dev/null || true
-              )"
-            else
-              # shellcheck disable=SC2016
-              run_id="$(
-                gh api -X GET "/repos/${REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?event=push&head_sha=${HEAD_SHA}&per_page=10" \
-                  --jq '
-                    [.workflow_runs[]]
-                    | map(select(.created_at >= env.SINCE))
-                    | sort_by(.created_at) | reverse
-                    | .[0].id // empty
-                  ' 2>/dev/null || true
-              )"
-            fi
-            if [ -n "$run_id" ]; then
-              break
-            fi
-            sleep 30
-          done
-
-          if [ -z "$run_id" ]; then
-            echo "Dedicated mesh e2e sidecar live workflow for the current attempt did not start (no run for this head_sha created at/after ${since})." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "Mirroring dedicated workflow run ${run_id}." >> "$GITHUB_STEP_SUMMARY"
-
-          # ~240 polls * 30s ~= 120 min: the dedicated datapath job caps at
-          # 90 min, leaving margin for queue time and result propagation.
-          for _ in $(seq 1 240); do
-            run_json="$(gh api -X GET "/repos/${REPOSITORY}/actions/runs/${run_id}" 2>/dev/null || true)"
-            if [ -z "$run_json" ]; then
-              sleep 30
-              continue
-            fi
-            status="$(printf '%s' "$run_json" | jq -r '.status' 2>/dev/null || true)"
-            if [ -z "$status" ]; then
-              sleep 30
-              continue
-            fi
-            conclusion="$(printf '%s' "$run_json" | jq -r '.conclusion // ""' 2>/dev/null || true)"
-            if [ "$status" = "completed" ]; then
-              if [ "$conclusion" = "success" ]; then
-                echo "Dedicated mesh e2e sidecar live workflow passed." >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              fi
-              echo "Dedicated mesh e2e sidecar live workflow completed with conclusion: ${conclusion}." >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            fi
-            sleep 30
-          done
-
-          echo "Timed out after ~120 min waiting for dedicated mesh e2e sidecar live workflow." >> "$GITHUB_STEP_SUMMARY"
-          exit 1
 
   helm-chart:
     name: Helm Chart
@@ -3175,11 +2766,8 @@ jobs:
       - build-functional-tests-archive
       - test-functional
       - plugin-hardening-redis-regression
-      - gateway-api-conformance
-      - coverage-gate
       - mesh-multicluster-federation
       - mesh-e2e-sidecar
-      - mesh-e2e-sidecar-live
       - helm-chart
       - lint
       - detect-ebpf-live-changes
@@ -3256,11 +2844,8 @@ jobs:
           add_row "Functional archive build" "${{ needs.build-functional-tests-archive.result }}"
           add_row "Functional shards" "${{ needs.test-functional.result }}"
           add_row "Plugin hardening Redis regression" "${{ needs.plugin-hardening-redis-regression.result }}"
-          add_row "Gateway API conformance" "${{ needs.gateway-api-conformance.result }}"
-          add_row "Coverage" "${{ needs.coverage-gate.result }}"
           add_row "Mesh multicluster federation" "${{ needs.mesh-multicluster-federation.result }}"
           add_row "Mesh e2e sidecar" "${{ needs.mesh-e2e-sidecar.result }}"
-          add_row "Mesh e2e sidecar live (mirror)" "${{ needs.mesh-e2e-sidecar-live.result }}"
           add_row "Helm chart" "${{ needs.helm-chart.result }}"
           add_row "Lint" "${{ needs.lint.result }}"
           add_row "eBPF/netns live change detector" "${{ needs.detect-ebpf-live-changes.result }}"
@@ -3289,11 +2874,8 @@ jobs:
           require_success "Functional archive build" "${{ needs.build-functional-tests-archive.result }}"
           require_success "Functional shards" "${{ needs.test-functional.result }}"
           require_success "Plugin hardening Redis regression" "${{ needs.plugin-hardening-redis-regression.result }}"
-          require_success "Gateway API conformance" "${{ needs.gateway-api-conformance.result }}"
-          require_success "Coverage" "${{ needs.coverage-gate.result }}"
           require_success "Mesh multicluster federation" "${{ needs.mesh-multicluster-federation.result }}"
           require_success "Mesh e2e sidecar" "${{ needs.mesh-e2e-sidecar.result }}"
-          require_success "Mesh e2e sidecar live (mirror)" "${{ needs.mesh-e2e-sidecar-live.result }}"
           require_success "Helm chart" "${{ needs.helm-chart.result }}"
           require_success "Lint" "${{ needs.lint.result }}"
           require_success "eBPF/netns live change detector" "${{ needs.detect-ebpf-live-changes.result }}"
