@@ -1063,23 +1063,25 @@ impl FunctionDestination {
         // value such as `secret/value` is blocked at `/secret/value`,
         // `/next;leak=secret/value`, and `/next?leak=secret/value`, while
         // `/secret/value-extra` remains distinct.
-        if self.sensitive_query_pairs.iter().any(|(_, value)| {
-            let value = value.trim_matches('/');
-            !value.is_empty() && uri_component_contains_sequence(&candidate_path, value)
-        }) {
+        if self
+            .sensitive_query_scalars()
+            .any(|value| uri_component_contains_sequence(&candidate_path, value))
+        {
             return true;
         }
 
         // Query credentials are unsafe even when copied onto another host,
-        // path, or parameter name. Compare decoded pairs and non-empty values
-        // exactly so reordering, renaming, and ordinary percent-encoding
-        // changes cannot evade the check without introducing substring false
-        // positives.
-        if self.sensitive_query_pairs.iter().any(|sensitive| {
-            candidate_pairs.iter().any(|candidate| {
-                candidate == sensitive
-                    || (!sensitive.1.is_empty() && candidate.1 == sensitive.1)
-            })
+        // path, or parameter name. Compare decoded pairs and protected scalar
+        // components exactly so reordering, renaming, key/value swapping, and
+        // ordinary percent-encoding changes cannot evade the check without
+        // introducing substring false positives.
+        if candidate_pairs.iter().any(|candidate| {
+            self.sensitive_query_pairs
+                .iter()
+                .any(|sensitive| candidate == sensitive)
+                || self.sensitive_query_scalars().any(|component| {
+                    candidate.0 == component || candidate.1 == component
+                })
         }) {
             return true;
         }
@@ -1125,9 +1127,8 @@ impl FunctionDestination {
                     &decoded_fragment.value,
                     path,
                 ))
-                || self.sensitive_query_pairs.iter().any(|(_, value)| {
-                    !value.is_empty()
-                        && uri_component_contains_sequence(&decoded_fragment.value, value)
+                || self.sensitive_query_scalars().any(|value| {
+                    uri_component_contains_sequence(&decoded_fragment.value, value)
                 })
             {
                 return true;
@@ -1141,6 +1142,20 @@ impl FunctionDestination {
         }
 
         false
+    }
+
+    /// Credential-bearing scalar components from the configured query.
+    ///
+    /// Ordinary signed URLs carry the secret in a non-empty value. A key-only
+    /// form such as `?SIGNED_TOKEN` or `?SIGNED_TOKEN=` carries it in the key
+    /// instead; treating an empty value as "nothing sensitive" would let a
+    /// redirect copy that token into another key, value, path, or fragment.
+    fn sensitive_query_scalars(&self) -> impl Iterator<Item = &str> {
+        self.sensitive_query_pairs.iter().filter_map(|(key, value)| {
+            let component = if value.is_empty() { key } else { value };
+            let component = component.trim_matches('/');
+            (!component.is_empty()).then_some(component)
+        })
     }
 
     fn nested_reference_exposes_destination(

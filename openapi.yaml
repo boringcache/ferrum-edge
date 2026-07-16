@@ -15201,10 +15201,12 @@ components:
         when a relative, absolute, encoded, or nested target exposes the
         configured signed function path/query. Complete signed paths match at
         slash-delimited segment boundaries even with added prefix or descendant
-        segments, not inside arbitrary substrings. Non-empty signed query values
-        remain protected if copied under another parameter name or into decoded
-        paths at URI-component boundaries (including path-parameter/query
-        delimiters), and decoded fragments are checked
+        segments, not inside arbitrary substrings. A non-empty query value is
+        the protected credential scalar; for a key-only form such as
+        `?SIGNED_TOKEN=`, the non-empty key is protected instead. That scalar
+        remains protected if copied into either side of another query pair or
+        into decoded paths at URI-component boundaries (including
+        path-parameter/query delimiters), and decoded fragments are checked
         directly at URI-component boundaries even when they are scalar rather
         than URI-shaped. Query comparison
         percent-decodes generic URI components but preserves literal `+` characters

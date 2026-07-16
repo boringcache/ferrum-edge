@@ -1276,6 +1276,10 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "copied-query-path-other-host",
         "copied-query-path-parameter",
         "copied-query-encoded-path-delimiter",
+        "key-only-query-renamed-value",
+        "key-only-query-copied-key",
+        "key-only-query-path",
+        "key-only-query-fragment",
         "literal-plus-encoded-candidate",
         "encoded-plus-literal-candidate",
         "fragment-query-scalar",
@@ -1292,6 +1296,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-query-value-lookalike",
         "benign-query-path-lookalike",
         "benign-query-path-parameter-lookalike",
+        "benign-key-only-query-lookalike",
         "benign-plus-space-distinct",
         "benign-fragment-lookalike",
         "benign-fragment-label",
@@ -1313,6 +1318,13 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-plus-space-distinct" => {
                 format!("{}/signed%2Ftrigger?code=token%20part", server.uri())
+            }
+            "key-only-query-renamed-value"
+            | "key-only-query-copied-key"
+            | "key-only-query-path"
+            | "key-only-query-fragment"
+            | "benign-key-only-query-lookalike" => {
+                format!("{}/signed%2Ftrigger?SIGNED_TOKEN=", server.uri())
             }
             _ => format!(
                 "{}/signed%2Ftrigger?code=secret%2Fvalue",
@@ -1378,6 +1390,18 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "copied-query-encoded-path-delimiter" => {
                 "https://redirect.example/next%3Fleak%3Dsecret/value".to_string()
             }
+            "key-only-query-renamed-value" => {
+                "https://redirect.example/next?leak=SIGNED_TOKEN".to_string()
+            }
+            "key-only-query-copied-key" => {
+                "https://redirect.example/next?SIGNED_TOKEN=other".to_string()
+            }
+            "key-only-query-path" => {
+                "https://redirect.example/next;leak=SIGNED_TOKEN".to_string()
+            }
+            "key-only-query-fragment" => {
+                "https://redirect.example/#leak=SIGNED_TOKEN".to_string()
+            }
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }
@@ -1415,6 +1439,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-query-path-parameter-lookalike" => {
                 "https://redirect.example/next;leak=secret/value-extra".to_string()
+            }
+            "benign-key-only-query-lookalike" => {
+                "https://redirect.example/next?leak=SIGNED_TOKEN_EXTRA".to_string()
             }
             "benign-plus-space-distinct" => {
                 "https://redirect.example/next?leak=token+part".to_string()
