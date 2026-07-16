@@ -270,6 +270,13 @@ impl SinkState {
     }
 
     fn snapshot(&self) -> SinkSnapshot {
+        // Failure counters are the publication barrier for their associated
+        // health and last-failure details. Load them first so a snapshot that
+        // observes a new counter value also observes the diagnostic state the
+        // worker stored before incrementing that counter.
+        let writer_failures_total = self.writer_failures.load(Ordering::Acquire);
+        let flush_failures_total = self.flush_failures.load(Ordering::Acquire);
+        let shutdown_timeouts_total = self.shutdown_timeouts.load(Ordering::Acquire);
         let last_failure = match self.last_failure.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
@@ -288,9 +295,9 @@ impl SinkState {
             saturation_dropped_records_total: self.saturation_dropped.load(Ordering::Relaxed),
             oversized_dropped_records_total: self.oversized_dropped.load(Ordering::Relaxed),
             closed_dropped_records_total: self.closed_dropped.load(Ordering::Relaxed),
-            writer_failures_total: self.writer_failures.load(Ordering::Relaxed),
-            flush_failures_total: self.flush_failures.load(Ordering::Relaxed),
-            shutdown_timeouts_total: self.shutdown_timeouts.load(Ordering::Relaxed),
+            writer_failures_total,
+            flush_failures_total,
+            shutdown_timeouts_total,
             shutdown_incomplete_records_total: self
                 .shutdown_incomplete_records
                 .load(Ordering::Relaxed),
@@ -606,11 +613,13 @@ impl WorkerGuard {
         }
 
         let incomplete = self.state.outstanding_records.load(Ordering::Acquire) as u64;
-        self.state.shutdown_timeouts.fetch_add(1, Ordering::Relaxed);
+        self.state.record_failure("shutdown", "drain_timeout");
         self.state
             .shutdown_incomplete_records
             .fetch_add(incomplete, Ordering::Relaxed);
-        self.state.record_failure("shutdown", "drain_timeout");
+        self.state
+            .shutdown_timeouts
+            .fetch_add(1, Ordering::Release);
         false
     }
 }
@@ -645,8 +654,8 @@ where
     }
 
     if let Err(error) = writer.flush() {
-        state.flush_failures.fetch_add(1, Ordering::Relaxed);
         state.record_failure("flush", io_error_kind(&error));
+        state.flush_failures.fetch_add(1, Ordering::Release);
     }
     state.completion.finish();
 }
@@ -656,8 +665,8 @@ fn write_record<W: Write>(writer: &mut W, bytes: Vec<u8>, state: &SinkState) {
     match writer.write_all(&bytes) {
         Ok(()) => state.healthy.store(true, Ordering::Release),
         Err(error) => {
-            state.writer_failures.fetch_add(1, Ordering::Relaxed);
             state.record_failure("write", io_error_kind(&error));
+            state.writer_failures.fetch_add(1, Ordering::Release);
         }
     }
     state.queued_bytes.fetch_sub(len, Ordering::Release);
