@@ -18,7 +18,7 @@ fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
     let after_selection = &source[selection..];
 
     let cap = after_selection
-        .find("let mut selected_base_proxy =")
+        .find("let selected_base_proxy =")
         .expect("H3 frontend must cap retry policy by selected target");
     let effective = after_selection
         .find("let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(")
