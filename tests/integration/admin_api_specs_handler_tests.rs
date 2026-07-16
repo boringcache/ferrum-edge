@@ -19,7 +19,7 @@ use ferrum_edge::{
     },
     config::{
         db_loader::{DatabaseStore, DbPoolConfig},
-        types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream},
+        types::{Consumer, PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream},
     },
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -1520,6 +1520,67 @@ async fn post_rejects_hmac_request_body_transformer_composition() {
             .to_string()
             .contains("hmac_auth cannot be combined with request-body transformer"),
         "unexpected composition failure: {composition_failure}"
+    );
+}
+
+#[tokio::test]
+async fn post_mtls_dns_policy_conflict_returns_409() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let mut upper = Consumer {
+        id: uid("mtls-upper"),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: uid("mtls-upper-user"),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    upper.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut lower = upper.clone();
+    lower.id = uid("mtls-lower");
+    lower.username = uid("mtls-lower-user");
+    lower.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "api.example.com"}]),
+    );
+    store
+        .create_consumer(&upper)
+        .await
+        .expect("create exact-case upper identity");
+    store
+        .create_consumer(&lower)
+        .await
+        .expect("create exact-case lower identity before DNS policy activation");
+
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+    let proxy_id = uid("mtls-dns-conflict-proxy");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "mTLS DNS conflict", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [{
+            "id": uid("mtls-dns-policy"),
+            "plugin_name": "mtls_auth",
+            "config": {"cert_field": "san_dns"}
+        }]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CONFLICT,
+        "mTLS DNS candidate conflict must use the documented 409 response: {body}"
     );
 }
 

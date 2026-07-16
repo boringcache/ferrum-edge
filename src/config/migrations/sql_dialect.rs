@@ -691,6 +691,10 @@ impl V001SqlBuilder {
     /// policy is effective without leaving a cross-process TOCTOU window when
     /// one is enabled. `restore_owner` is a logical fence that persists across
     /// every transaction in a compensating restore replay.
+    ///
+    /// Build-out policy intentionally keeps this table in the current baseline
+    /// only. It must not be added to `ensure_compatibility_tables` as an
+    /// old-schema upgrade shim.
     fn create_mtls_dns_admission_locks_sql(&self) -> &'static str {
         if self.is_mysql() {
             r#"

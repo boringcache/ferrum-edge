@@ -1742,15 +1742,15 @@ async fn validate_bundle(
         };
         match validation_result {
             Ok(()) => {}
-            Err(
-                crate::admin::crud::AfterValidateError::BadRequest(errors)
-                | crate::admin::crud::AfterValidateError::Conflict(errors),
-            ) => {
+            Err(crate::admin::crud::AfterValidateError::BadRequest(errors)) => {
                 failures.push(ValidationFailure {
                     resource_type: "plugin_composition",
                     id: bundle.proxy.id.clone(),
                     errors,
                 });
+            }
+            Err(crate::admin::crud::AfterValidateError::Conflict(errors)) => {
+                return Err(ApiSpecError::Conflict(errors.join("; ")));
             }
             Err(crate::admin::crud::AfterValidateError::Db(error)) => {
                 return Err(classify_db_error(error));
