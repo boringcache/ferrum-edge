@@ -809,9 +809,8 @@ fn finalize_cors_request(ctx: &mut RequestContext) -> PluginResult {
             && contains_ascii_case(method_union, requested_method)
             && !contains_ascii_case(methods, requested_method)
         {
-            let mut body = String::with_capacity(
-                "CORS method not allowed: ".len() + requested_method.len(),
-            );
+            let mut body =
+                String::with_capacity("CORS method not allowed: ".len() + requested_method.len());
             body.push_str("CORS method not allowed: ");
             body.push_str(requested_method);
             return cors_reject(body);
@@ -828,9 +827,8 @@ fn finalize_cors_request(ctx: &mut RequestContext) -> PluginResult {
                     && contains_ascii_case(header_union, requested)
                     && !contains_ascii_case(headers, requested)
                 {
-                    let mut body = String::with_capacity(
-                        "CORS header not allowed: ".len() + requested.len(),
-                    );
+                    let mut body =
+                        String::with_capacity("CORS header not allowed: ".len() + requested.len());
                     body.push_str("CORS header not allowed: ");
                     body.push_str(requested);
                     return cors_reject(body);

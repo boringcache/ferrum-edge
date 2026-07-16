@@ -509,7 +509,10 @@ async fn mixed_native_and_istio_empty_lists_apply_only_to_preflight() {
             response_headers["access-control-allow-origin"],
             "https://trusted.example"
         );
-        assert_eq!(response_headers["access-control-expose-headers"], "X-Shared");
+        assert_eq!(
+            response_headers["access-control-expose-headers"],
+            "X-Shared"
+        );
         assert!(!response_headers.contains_key("access-control-allow-credentials"));
         assert!(!response_headers.contains_key("access-control-allow-methods"));
         assert!(!response_headers.contains_key("access-control-allow-headers"));
@@ -569,11 +572,7 @@ fn multiple_cors_instances_must_remain_contiguous() {
 #[test]
 fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
     let config = make_config(
-        vec![make_proxy(
-            "p1",
-            "/api",
-            vec!["cors-a", "udp", "cors-b"],
-        )],
+        vec![make_proxy("p1", "/api", vec!["cors-a", "udp", "cors-b"])],
         vec![
             cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
             make_plugin_config_with_priority(
@@ -627,11 +626,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
     );
     let cache = PluginCache::new(&initial).expect("initial cache");
     let stream_interleaved = make_config(
-        vec![make_proxy(
-            "p1",
-            "/api",
-            vec!["cors-a", "udp", "cors-b"],
-        )],
+        vec![make_proxy("p1", "/api", vec!["cors-a", "udp", "cors-b"])],
         vec![
             cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
             make_plugin_config_with_priority(
@@ -665,11 +660,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
     );
 
     let http_interleaved = make_config(
-        vec![make_proxy(
-            "p1",
-            "/api",
-            vec!["cors-a", "ip", "cors-b"],
-        )],
+        vec![make_proxy("p1", "/api", vec!["cors-a", "ip", "cors-b"])],
         vec![
             cors_config("cors-a", &["GET"], &["X-Test"], Some(100)),
             make_plugin_config_with_priority(

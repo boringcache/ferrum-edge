@@ -689,10 +689,7 @@ async fn test_actual_request_does_not_apply_preflight_method_or_header_lists() {
         response_headers["access-control-expose-headers"],
         "X-Response"
     );
-    assert_eq!(
-        response_headers["access-control-allow-credentials"],
-        "true"
-    );
+    assert_eq!(response_headers["access-control-allow-credentials"], "true");
     assert!(!response_headers.contains_key("access-control-allow-methods"));
     assert!(!response_headers.contains_key("access-control-allow-headers"));
 }

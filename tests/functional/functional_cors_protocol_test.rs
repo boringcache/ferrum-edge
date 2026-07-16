@@ -73,8 +73,16 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
             "preflight-only method policy must not reject the actual request: {response:?}"
         );
         assert_eq!(header(&response, "access-control-allow-origin"), ORIGIN);
-        assert!(!response.headers.contains_key("access-control-allow-methods"));
-        assert!(!response.headers.contains_key("access-control-allow-headers"));
+        assert!(
+            !response
+                .headers
+                .contains_key("access-control-allow-methods")
+        );
+        assert!(
+            !response
+                .headers
+                .contains_key("access-control-allow-headers")
+        );
     }
 
     for response in [
@@ -109,39 +117,23 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     }
 
     for response in [
-        send_h1_path(
-            &harness,
-            "/mixed-cors",
-            Method::GET,
-            None,
-            None,
-            ORIGIN,
-        )
-        .await,
-        send_h2_path(
-            &harness,
-            "/mixed-cors",
-            Method::GET,
-            None,
-            None,
-            ORIGIN,
-        )
-        .await,
-        send_h3_path(
-            &harness,
-            "/mixed-cors",
-            Method::GET,
-            None,
-            None,
-            ORIGIN,
-        )
-        .await,
+        send_h1_path(&harness, "/mixed-cors", Method::GET, None, None, ORIGIN).await,
+        send_h2_path(&harness, "/mixed-cors", Method::GET, None, None, ORIGIN).await,
+        send_h3_path(&harness, "/mixed-cors", Method::GET, None, None, ORIGIN).await,
     ] {
         assert_eq!(response.status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&response.body).contains("mixed-cors"));
         assert_eq!(header(&response, "access-control-allow-origin"), ORIGIN);
-        assert!(!response.headers.contains_key("access-control-allow-methods"));
-        assert!(!response.headers.contains_key("access-control-allow-headers"));
+        assert!(
+            !response
+                .headers
+                .contains_key("access-control-allow-methods")
+        );
+        assert!(
+            !response
+                .headers
+                .contains_key("access-control-allow-headers")
+        );
     }
 
     for response in [
