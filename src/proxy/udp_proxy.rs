@@ -74,8 +74,10 @@ struct UdpSession {
     expired: std::sync::atomic::AtomicBool,
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
-    /// Size of the last client→backend datagram for amplification factor checking.
-    /// Updated on each forwarded request; read on each backend→client response.
+    /// Size of the latest accepted client→backend datagram for amplification
+    /// factor checking. Published before the backend send so a loopback reply
+    /// cannot race ahead of the response budget.
+    /// Updated on each policy-accepted request; read on each backend→client response.
     last_request_size: AtomicU64,
     /// Backend target for logging (e.g., "10.0.2.10:5353").
     backend_target: String,
@@ -2066,6 +2068,15 @@ async fn forward_client_datagram_to_backend(
     session: &Arc<UdpSession>,
     data: &[u8],
 ) -> Result<(), anyhow::Error> {
+    // Publish the response budget before the send. In particular, a loopback
+    // backend can receive and answer between the send syscall and this task
+    // being polled again; publishing only after send completion lets that first
+    // response bypass the amplification guard. A failed send still leaves a
+    // conservative budget based on bytes accepted from the client.
+    session
+        .last_request_size
+        .store(data.len() as u64, Ordering::Release);
+
     let send_result = if let Some(ref dtls) = session.dtls_conn {
         dtls.send(data)
             .await
@@ -2085,9 +2096,6 @@ async fn forward_client_datagram_to_backend(
             session
                 .bytes_sent
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
-            session
-                .last_request_size
-                .store(data.len() as u64, Ordering::Relaxed);
             Ok(())
         }
         Err(e) => Err(anyhow::anyhow!("send to backend failed: {}", e)),
@@ -3050,6 +3058,9 @@ async fn handle_dtls_client_inner(
                 }
             }
 
+            // Publish before sending so a fast backend reply cannot observe a
+            // zero or stale amplification budget.
+            last_request_size_fwd.store(len as u64, Ordering::Release);
             let send_ok = if let Some(ref dtls) = backend_dtls_write {
                 dtls.send(&data).await.map_err(|e| e.to_string())
             } else if let Some(ref sock) = backend_udp_write {
@@ -3074,7 +3085,6 @@ async fn handle_dtls_client_inner(
                 .bytes_out
                 .fetch_add(len as u64, Ordering::Relaxed);
             bytes_sent_fwd.fetch_add(len as u64, Ordering::Relaxed);
-            last_request_size_fwd.store(len as u64, Ordering::Relaxed);
             activity_fwd.store(coarse_epoch_millis(), Ordering::Relaxed);
         }
     });
@@ -3114,12 +3124,10 @@ async fn handle_dtls_client_inner(
 
             // Amplification factor check for DTLS path
             if let Some(factor) = amplification_factor_rev {
-                let req_size = last_request_size_rev.load(Ordering::Relaxed);
-                if req_size > 0 {
-                    let max_response = (req_size as f64 * factor as f64) as u64;
-                    if len as u64 > max_response {
-                        continue; // Drop oversized response
-                    }
+                let req_size = last_request_size_rev.load(Ordering::Acquire);
+                let max_response = (req_size as f64 * factor as f64) as u64;
+                if len as u64 > max_response {
+                    continue; // Drop oversized or pre-request response
                 }
             }
 
@@ -3201,7 +3209,7 @@ async fn create_session(
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     crls: &crate::tls::CrlList,
-    _initial_data: &[u8],
+    initial_data: &[u8],
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
     listener_shutdown: &watch::Receiver<bool>,
@@ -3481,7 +3489,9 @@ async fn create_session(
         expired: std::sync::atomic::AtomicBool::new(false),
         bytes_sent: AtomicU64::new(0),
         bytes_received: AtomicU64::new(0),
-        last_request_size: AtomicU64::new(0),
+        // Establish the first response budget before the reply task is spawned.
+        // The caller has already accepted this datagram through policy hooks.
+        last_request_size: AtomicU64::new(initial_data.len() as u64),
         backend_target: format!("{}:{}", backend_host, backend_port),
         backend_resolved_ip: resolved_ip.to_string(),
         sni_hostname: stream_ctx.sni_hostname.clone(),
@@ -3687,20 +3697,18 @@ async fn create_session(
             // Amplification factor check: drop backend responses that exceed
             // the configured ratio relative to the last client request size.
             if let Some(factor) = reply_amplification_factor {
-                let req_size = reply_session.last_request_size.load(Ordering::Relaxed);
-                if req_size > 0 {
-                    let max_response = (req_size as f64 * factor as f64) as u64;
-                    if len as u64 > max_response {
-                        warn!(
-                            proxy_id = %reply_proxy_id,
-                            client = %client_addr,
-                            response_size = len,
-                            request_size = req_size,
-                            factor = factor,
-                            "UDP response dropped: exceeds amplification factor"
-                        );
-                        continue; // Drop this response datagram, continue receiving
-                    }
+                let req_size = reply_session.last_request_size.load(Ordering::Acquire);
+                let max_response = (req_size as f64 * factor as f64) as u64;
+                if len as u64 > max_response {
+                    warn!(
+                        proxy_id = %reply_proxy_id,
+                        client = %client_addr,
+                        response_size = len,
+                        request_size = req_size,
+                        factor = factor,
+                        "UDP response dropped: exceeds amplification factor"
+                    );
+                    continue; // Drop this response datagram, continue receiving
                 }
             }
 
@@ -3806,12 +3814,10 @@ async fn create_session(
                             // Amplification check on batched response datagram
                             if let Some(factor) = reply_amplification_factor {
                                 let req_size =
-                                    reply_session.last_request_size.load(Ordering::Relaxed);
-                                if req_size > 0 {
-                                    let max_response = (req_size as f64 * factor as f64) as u64;
-                                    if len2 as u64 > max_response {
-                                        continue; // Drop oversized response
-                                    }
+                                    reply_session.last_request_size.load(Ordering::Acquire);
+                                let max_response = (req_size as f64 * factor as f64) as u64;
+                                if len2 as u64 > max_response {
+                                    continue; // Drop oversized or pre-request response
                                 }
                             }
                             // Backend→client plugin hooks on batched datagram
@@ -4382,7 +4388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_backend_forward_does_not_refresh_last_activity() {
+    async fn failed_backend_forward_preserves_activity_and_response_budget() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut raw_session = make_udp_session();
         raw_session.backend_socket = Some(socket);
@@ -4412,8 +4418,8 @@ mod tests {
         );
         assert_eq!(
             session.last_request_size.load(Ordering::Relaxed),
-            64,
-            "failed sends must not update last_request_size"
+            b"payload".len() as u64,
+            "accepted client datagrams must establish the amplification budget before send"
         );
     }
 
