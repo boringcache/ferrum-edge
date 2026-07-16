@@ -13594,6 +13594,7 @@ components:
 
     IpRestrictionConfig:
       type: object
+      additionalProperties: false
       anyOf:
         - required: [allow]
           properties:
@@ -13605,17 +13606,28 @@ components:
               minItems: 1
       description: >-
         Plugin: ip_restriction — IP/CIDR allow/deny enforcement. Rules are
-        validated and pre-parsed at config load time; invalid IPv4/IPv6
-        addresses or CIDR prefixes reject plugin creation. Supports IPv4 exact
-        and CIDR (`/0`-`/32`) and IPv6 exact and CIDR (`/0`-`/128`); IPv6 zone
-        identifiers (e.g. `%eth0`) on rules or client IPs are stripped before
-        matching. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
-        At least one of `allow` or `deny` is required.
+        validated and compiled at config load time into sorted, merged numeric
+        intervals; invalid IPv4/IPv6 addresses or CIDR prefixes reject plugin
+        creation. Request lookup is allocation-free, lock-free, and logarithmic
+        in the number of non-overlapping intervals. The authoritative client IP
+        is parsed/canonicalized once per request or stream session and reused by
+        every plugin instance. IPv4 octets must use canonical unsigned decimal
+        notation (for example, `010.1.2.3` and `+10.1.2.3` are rejected).
+        Supports IPv4 exact and CIDR (`/0`-`/32`) and native IPv6 exact and CIDR
+        (`/0`-`/128`). IPv4-mapped IPv6 rules normalize to IPv4, so mapped CIDRs
+        accept only `/96`-`/128` (equivalent to IPv4 `/0`-`/32`); shorter mapped
+        prefixes are rejected as ambiguous. IPv6 zone identifiers (e.g. `%eth0`)
+        on rules or client IPs are stripped before matching. Runs on every
+        protocol — HTTP, gRPC, WebSocket, TCP, UDP, and DTLS. Config must be an
+        object, unknown properties and null values are rejected, and at least
+        one of `allow` or `deny` must be non-empty.
       properties:
         allow:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: '.*\S.*'
           default: []
           description: >-
             Allowed IP addresses or CIDR ranges (IPv4 or IPv6). Empty list
@@ -13624,6 +13636,8 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: '.*\S.*'
           default: []
           description: >-
             Denied IP addresses or CIDR ranges (IPv4 or IPv6). Always takes

@@ -1638,6 +1638,56 @@ fn assert_component_validity(
 }
 
 #[test]
+fn ip_restriction_schema_matches_the_strict_runtime_shape() {
+    use ferrum_edge::plugins::ip_restriction::IpRestriction;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let component = &spec["components"]["schemas"]["IpRestrictionConfig"];
+    assert_eq!(component["additionalProperties"], false);
+    assert_eq!(component["anyOf"][0]["properties"]["allow"]["minItems"], 1);
+    assert_eq!(component["anyOf"][1]["properties"]["deny"]["minItems"], 1);
+    let description = component["description"]
+        .as_str()
+        .expect("IpRestrictionConfig has a description");
+    assert!(description.contains("canonical unsigned decimal"));
+    assert!(description.contains("mapped CIDRs accept only `/96`-`/128`"));
+
+    for config in [
+        json!({"allow": ["10.0.0.0/8"]}),
+        json!({"allow": [], "deny": ["192.0.2.0/24"]}),
+        json!({"allow": ["2001:db8::/32"], "deny": [], "mode": "deny_first"}),
+    ] {
+        assert_component_validity(&spec, "IpRestrictionConfig", &config, true);
+        assert!(
+            IpRestriction::new(&config).is_ok(),
+            "runtime rejected schema-valid strict config: {config}"
+        );
+    }
+
+    for config in [
+        json!(null),
+        json!([]),
+        json!({}),
+        json!({"allow": [], "deny": []}),
+        json!({"allow": null, "deny": ["192.0.2.0/24"]}),
+        json!({"allow": ["10.0.0.0/8"], "deny": null}),
+        json!({"allow": ["10.0.0.0/8"], "mode": null}),
+        json!({"allow": ["10.0.0.0/8"], "mod": "deny_first"}),
+        json!({"alow": ["10.0.0.0/8"], "deny": ["192.0.2.0/24"]}),
+        json!({"allow": "10.0.0.0/8"}),
+        json!({"allow": [""]}),
+        json!({"allow": ["   "]}),
+    ] {
+        assert_component_validity(&spec, "IpRestrictionConfig", &config, false);
+        assert!(
+            IpRestriction::new(&config).is_err(),
+            "runtime accepted schema-invalid strict config: {config}"
+        );
+    }
+}
+
+#[test]
 fn workload_metrics_schema_documents_runtime_tag_limits() {
     use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 
