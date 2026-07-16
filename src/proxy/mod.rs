@@ -3383,7 +3383,13 @@ fn reject_result_to_backend_response(
         headers: reject.headers,
         connection_error: false,
         backend_resolved_ip,
-        error_class: (reject.status_code == 413).then_some(retry::ErrorClass::RequestBodyTooLarge),
+        // Final request-body hooks run before backend dispatch. Keep their
+        // synthetic responses terminal and neutral to backend health.
+        error_class: Some(if reject.status_code == 413 {
+            retry::ErrorClass::RequestBodyTooLarge
+        } else {
+            retry::ErrorClass::DispatchPolicyRejected
+        }),
     }
 }
 
@@ -16979,8 +16985,7 @@ async fn handle_proxy_request_inner(
     // Build the lightweight mutable hook context before `proxy_headers` may
     // borrow `ctx.headers`. The selected dispatch branch takes this one context;
     // early-prepared bodies already ran their transform/final hooks above.
-    let mut deferred_body_hook_ctx = (!request_body_prepared
-        && needs_final_request_body_context)
+    let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
         .then(|| ctx.clone_for_final_request_body_hooks());
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
@@ -17415,10 +17420,17 @@ async fn handle_proxy_request_inner(
                 };
 
             // Store body metadata for plugins that read via ctx.metadata
+            let request_body_size_bytes = grpc_req_body.len().to_string();
             ctx.metadata.insert(
                 "request_body_size_bytes".to_string(),
-                grpc_req_body.len().to_string(),
+                request_body_size_bytes.clone(),
             );
+            if let Some(body_hook_ctx) = deferred_body_hook_ctx.as_mut() {
+                body_hook_ctx.metadata.insert(
+                    "request_body_size_bytes".to_string(),
+                    request_body_size_bytes,
+                );
+            }
 
             // Mirror pre-transform bytes into the shared request-bytes counter
             // so `TransactionSummary.bytes_sent` is populated on the gRPC

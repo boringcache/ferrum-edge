@@ -290,7 +290,7 @@ fn test_terminal_gateway_errors_are_never_retried_by_status_policy() {
     let config = RetryConfig {
         max_retries: 3,
         retry_on_connect_failure: true,
-        retryable_status_codes: vec![413, 499, 502],
+        retryable_status_codes: vec![413, 499, 502, 503],
         retryable_methods: vec!["GET".to_string(), "POST".to_string()],
         ..default_config()
     };
@@ -299,6 +299,7 @@ fn test_terminal_gateway_errors_are_never_retried_by_status_policy() {
         (413, ErrorClass::RequestBodyTooLarge),
         (499, ErrorClass::ClientDisconnect),
         (502, ErrorClass::DispatchPolicyRejected),
+        (503, ErrorClass::DispatchPolicyRejected),
         (502, ErrorClass::ResponseBodyTooLarge),
     ] {
         assert!(

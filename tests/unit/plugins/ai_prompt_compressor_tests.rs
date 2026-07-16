@@ -5,6 +5,7 @@ use ferrum_edge::plugins::{
     ai_prompt_compressor::AiPromptCompressor, compression::CompressionPlugin, priority,
 };
 use serde_json::{Value, json};
+use serial_test::serial;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -239,6 +240,7 @@ fn should_buffer_only_json_post() {
 // ─── Compression behavior ────────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn compresses_long_user_message() {
     let plugin = compressor(5, 0.5);
     let original = long_prompt_text();
@@ -257,6 +259,7 @@ async fn compresses_long_user_message() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn short_message_left_untouched_at_default_floor() {
     // Default min_content_tokens (200) leaves a small prompt alone.
     let plugin = AiPromptCompressor::new(&json!({})).unwrap();
@@ -268,6 +271,7 @@ async fn short_message_left_untouched_at_default_floor() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn system_role_preserved_by_default() {
     let plugin = compressor(5, 0.4);
     let system_text = long_prompt_text();
@@ -300,6 +304,7 @@ async fn system_role_preserved_by_default() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn compress_roles_config_targets_system() {
     let plugin = AiPromptCompressor::new(&json!({
         "compress_roles": ["system"],
@@ -336,6 +341,7 @@ async fn compress_roles_config_targets_system() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn preserves_urls_numbers_and_negations() {
     // Aggressive ratio to prove protected spans survive heavy compression.
     let plugin = compressor(5, 0.3);
@@ -362,6 +368,7 @@ async fn preserves_urls_numbers_and_negations() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn preserves_code_blocks() {
     let plugin = compressor(5, 0.3);
     let content = "Here is a very long explanation about the configuration options that the \
@@ -381,6 +388,7 @@ async fn preserves_code_blocks() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn preserves_matching_backtick_runs_property() {
     let plugin = compressor(5, 0.2);
     for run_length in 1..=6 {
@@ -408,6 +416,7 @@ async fn preserves_matching_backtick_runs_property() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn unmatched_backtick_run_protects_remainder() {
     let plugin = compressor(5, 0.2);
     let protected = "``unclosed retryPolicy(`embedded`) exact tail";
@@ -422,6 +431,7 @@ async fn unmatched_backtick_run_protects_remainder() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn preserve_tag_keeps_span_and_strips_markers() {
     let plugin = AiPromptCompressor::new(&json!({
         "preserve_tag": "keep",
@@ -449,6 +459,7 @@ async fn preserve_tag_keeps_span_and_strips_markers() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn nested_preserve_spans_flatten_without_marker_leaks() {
     let plugin = AiPromptCompressor::new(&json!({
         "preserve_tag": "keep",
@@ -473,6 +484,7 @@ async fn nested_preserve_spans_flatten_without_marker_leaks() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn preserve_marker_cleanup_is_deterministic_property() {
     let plugin = AiPromptCompressor::new(&json!({
         "preserve_tag": "keep",
@@ -497,6 +509,7 @@ async fn preserve_marker_cleanup_is_deterministic_property() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn common_identifiers_and_unicode_numbers_are_verbatim_property() {
     let plugin = compressor(5, 0.1);
     let protected = [
@@ -529,6 +542,7 @@ async fn common_identifiers_and_unicode_numbers_are_verbatim_property() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn frequency_scoring_is_case_insensitive_without_token_copies() {
     let plugin = compressor(1, 0.25);
     let body = chat_body("user", "account Account account extraordinarily");
@@ -541,6 +555,7 @@ async fn frequency_scoring_is_case_insensitive_without_token_copies() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn multimodal_text_parts_compressed() {
     let plugin = compressor(5, 0.4);
     let long = long_prompt_text();
@@ -568,6 +583,7 @@ async fn multimodal_text_parts_compressed() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn chat_multimodal_plain_string_parts_are_rejected_consistently() {
     let plugin = compressor(1, 0.4);
     let body = json!({
@@ -585,6 +601,7 @@ async fn chat_multimodal_plain_string_parts_are_rejected_consistently() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn legacy_prompt_field_compressed_for_user() {
     let plugin = compressor(5, 0.4);
     let original = long_prompt_text();
@@ -596,6 +613,7 @@ async fn legacy_prompt_field_compressed_for_user() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn request_family_gate_rejects_unrelated_and_ambiguous_shapes() {
     let plugin = compressor(5, 0.4);
     let prompt = long_prompt_text();
@@ -636,6 +654,7 @@ async fn request_family_gate_rejects_unrelated_and_ambiguous_shapes() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn fixed_family_explicitly_supports_compatible_custom_paths() {
     let auto = compressor(5, 0.4);
     let body = chat_body("user", &long_prompt_text());
@@ -659,6 +678,7 @@ async fn fixed_family_explicitly_supports_compatible_custom_paths() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn successful_rewrite_reserializes_complete_json_body() {
     let plugin = compressor(5, 0.4);
     let raw = format!(
@@ -684,6 +704,7 @@ async fn successful_rewrite_reserializes_complete_json_body() {
 // ─── Passthrough / safety ────────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn non_json_content_type_passthrough() {
     let plugin = compressor(5, 0.5);
     let bytes = serde_json::to_vec(&chat_body("user", &long_prompt_text())).unwrap();
@@ -698,6 +719,7 @@ async fn non_json_content_type_passthrough() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn content_encoded_body_skipped() {
     let plugin = compressor(5, 0.5);
     let bytes = serde_json::to_vec(&chat_body("user", &long_prompt_text())).unwrap();
@@ -712,6 +734,7 @@ async fn content_encoded_body_skipped() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn invalid_json_passthrough() {
     let plugin = compressor(5, 0.5);
     let headers = json_headers();
@@ -724,6 +747,7 @@ async fn invalid_json_passthrough() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn body_without_messages_passthrough() {
     let plugin = compressor(5, 0.5);
     let body = json!({"model": "gpt-4o", "foo": long_prompt_text()});
@@ -731,6 +755,7 @@ async fn body_without_messages_passthrough() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn oversized_body_skipped() {
     let plugin = AiPromptCompressor::new(&json!({
         "min_content_tokens": 5,
@@ -745,6 +770,7 @@ async fn oversized_body_skipped() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn adversarial_token_and_field_budgets_pass_through() {
     let plugin = compressor(1, 0.5);
 
@@ -791,12 +817,9 @@ async fn adversarial_token_and_field_budgets_pass_through() {
     }))
     .unwrap();
     let too_many_markers = "a</x>".repeat(1_025);
-    let sanitized = transform(
-        &marker_plugin,
-        &chat_body("user", &too_many_markers),
-    )
-    .await
-    .expect("over-budget preserve markers must take the sanitation fallback");
+    let sanitized = transform(&marker_plugin, &chat_body("user", &too_many_markers))
+        .await
+        .expect("over-budget preserve markers must take the sanitation fallback");
     assert_eq!(
         first_message_content(&sanitized),
         "a".repeat(1_025),
@@ -805,6 +828,7 @@ async fn adversarial_token_and_field_budgets_pass_through() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn preserve_markers_are_stripped_above_each_compression_work_budget() {
     let marker_plugin = AiPromptCompressor::new(&json!({
         "preserve_tag": "keep",
@@ -863,6 +887,7 @@ async fn preserve_markers_are_stripped_above_each_compression_work_budget() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn decoded_body_above_hard_marker_bound_fails_closed_in_final_hook() {
     let plugin = AiPromptCompressor::new(&json!({"preserve_tag": "keep"})).unwrap();
     let body = serde_json::to_vec(&chat_body(
@@ -894,6 +919,7 @@ async fn decoded_body_above_hard_marker_bound_fails_closed_in_final_hook() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn preserve_split_backticks_use_the_combined_token_work_bound() {
     let plugin = AiPromptCompressor::new(&json!({
         "preserve_tag": "keep",
@@ -914,6 +940,7 @@ async fn preserve_split_backticks_use_the_combined_token_work_bound() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn escaped_preserve_markers_are_removed_without_json_canonicalization() {
     let plugin = AiPromptCompressor::new(&json!({
         "preserve_tag": "keep",
@@ -933,6 +960,7 @@ async fn escaped_preserve_markers_are_removed_without_json_canonicalization() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn exponent_growth_within_hard_output_cap_keeps_successful_compression() {
     let plugin = compressor(5, 0.5);
     let padding = std::iter::repeat_n("1e8", 10_000)
@@ -955,6 +983,7 @@ async fn exponent_growth_within_hard_output_cap_keeps_successful_compression() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn output_overflow_falls_back_to_representation_preserving_marker_cleanup() {
     let plugin = AiPromptCompressor::new(&json!({
         "preserve_tag": "keep",
@@ -985,6 +1014,7 @@ async fn output_overflow_falls_back_to_representation_preserving_marker_cleanup(
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn concurrent_saturation_never_turns_markers_into_passthrough() {
     const TASKS: usize = 16;
     let plugin = Arc::new(
@@ -1038,6 +1068,7 @@ async fn concurrent_saturation_never_turns_markers_into_passthrough() {
 // ─── before_proxy integration ────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn before_proxy_rewrites_metadata_and_records_stats() {
     let plugin = compressor(5, 0.5);
     let original = long_prompt_text();
@@ -1069,6 +1100,7 @@ async fn before_proxy_rewrites_metadata_and_records_stats() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn auto_family_uses_incoming_path_for_staged_and_recomputed_wire_bodies() {
     let plugin = compressor(5, 0.5);
     let incoming_text = long_prompt_text();
@@ -1117,6 +1149,7 @@ async fn auto_family_uses_incoming_path_for_staged_and_recomputed_wire_bodies() 
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn fixed_family_remains_eligible_across_custom_route_rewrites() {
     let plugin = AiPromptCompressor::new(&json!({
         "request_family": "chat_completions",
@@ -1154,6 +1187,7 @@ async fn fixed_family_remains_eligible_across_custom_route_rewrites() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn auto_family_does_not_gain_eligibility_from_backend_route_rewrite() {
     let plugin = compressor(5, 0.5);
     let body = chat_body("user", &long_prompt_text());
@@ -1179,6 +1213,7 @@ async fn auto_family_does_not_gain_eligibility_from_backend_route_rewrite() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn large_metadata_rewrite_still_produces_wire_body_beyond_stage_cap() {
     let plugin = compressor(1, 0.9);
     let words = (0..10_000)
@@ -1219,6 +1254,7 @@ async fn large_metadata_rewrite_still_produces_wire_body_beyond_stage_cap() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn final_wire_stats_replace_provisional_metadata_stats() {
     let plugin = compressor(5, 0.5);
     let provisional = long_prompt_text();
@@ -1252,6 +1288,7 @@ async fn final_wire_stats_replace_provisional_metadata_stats() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn multiple_instances_keep_distinct_final_wire_stats() {
     let first = compressor(5, 0.8);
     let second = compressor(5, 0.5);
@@ -1335,7 +1372,20 @@ fn marker_sanitation_admission_never_queues_request_bodies() {
     assert!(!admission.contains("acquire_owned().await"));
 }
 
+#[test]
+fn staged_sanitation_digest_uses_the_hard_body_bound() {
+    let source = include_str!("../../../src/plugins/ai_prompt_compressor.rs");
+    let digest = source
+        .split_once("async fn body_digest(")
+        .and_then(|(_, rest)| rest.split_once("/// Shared wire-path compression"))
+        .map(|(body, _)| body)
+        .expect("staged-body digest source region");
+    assert!(digest.contains("if body.len() > HARD_MAX_SCAN_BYTES"));
+    assert!(!digest.contains("self.max_scan_bytes"));
+}
+
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn decompressed_gzip_and_brotli_record_authoritative_wire_stats() {
     for encoding in ["gzip", "br"] {
         let decompressor = CompressionPlugin::new(&json!({"decompress_request": true})).unwrap();
@@ -1396,6 +1446,7 @@ async fn decompressed_gzip_and_brotli_record_authoritative_wire_stats() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn before_proxy_leaves_short_body_unchanged() {
     let plugin = AiPromptCompressor::new(&json!({})).unwrap();
     let body = chat_body("user", "just a short question");
@@ -1413,6 +1464,7 @@ async fn before_proxy_leaves_short_body_unchanged() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn before_proxy_skips_get_requests() {
     let plugin = compressor(5, 0.5);
     let body = chat_body("user", &long_prompt_text());
@@ -1428,6 +1480,7 @@ async fn before_proxy_skips_get_requests() {
 // ─── Codex review regressions ────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn all_verbatim_prompt_does_not_panic() {
     // A long prompt that tokenizes entirely into protected/verbatim tokens has
     // zero scored words; the compressor must not panic on `clamp(1, 0)`.
@@ -1449,6 +1502,7 @@ async fn all_verbatim_prompt_does_not_panic() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn urls_wrapped_in_punctuation_are_preserved() {
     let plugin = compressor(5, 0.3);
     let content = "Please read the cited references very carefully before answering \
@@ -1470,6 +1524,7 @@ async fn urls_wrapped_in_punctuation_are_preserved() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn mixed_case_url_schemes_are_preserved() {
     let plugin = compressor(5, 0.3);
     let content = "Please read the cited references very carefully before answering \
@@ -1492,6 +1547,7 @@ async fn mixed_case_url_schemes_are_preserved() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn non_post_body_skipped_by_context_hook() {
     let plugin = compressor(5, 0.5);
     let bytes = serde_json::to_vec(&chat_body("user", &long_prompt_text())).unwrap();
@@ -1530,6 +1586,7 @@ async fn non_post_body_skipped_by_context_hook() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn non_post_method_pseudo_header_skips_base_hook() {
     let plugin = compressor(5, 0.5);
     let bytes = serde_json::to_vec(&chat_body("user", &long_prompt_text())).unwrap();
@@ -1565,6 +1622,7 @@ fn oversized_content_length_skips_buffering() {
 // ─── Codex review round 3 regressions ────────────────────────────────────────
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn no_context_hook_requires_explicit_method_and_path_markers() {
     // The compatibility hook must not infer method or request family.
     let plugin = compressor(5, 0.5);
@@ -1601,6 +1659,7 @@ async fn no_context_hook_requires_explicit_method_and_path_markers() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn missing_content_type_is_not_compressed() {
     let plugin = compressor(5, 0.5);
     let bytes = serde_json::to_vec(&chat_body("user", &long_prompt_text())).unwrap();
@@ -1616,6 +1675,7 @@ async fn missing_content_type_is_not_compressed() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn preserve_tag_keeps_internal_whitespace_exactly() {
     let plugin = AiPromptCompressor::new(&json!({
         "preserve_tag": "keep",
@@ -1646,6 +1706,7 @@ async fn preserve_tag_keeps_internal_whitespace_exactly() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn curly_apostrophe_negations_preserved() {
     // U+2019 apostrophes are the norm in text pasted from iOS/Word/LLM output;
     // "don\u{2019}t" must be classified as a negation, not a droppable word.
@@ -1667,6 +1728,7 @@ async fn curly_apostrophe_negations_preserved() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn word_following_negation_preserved() {
     // The negated complement must survive with its negation, otherwise a kept
     // "not" re-binds to the following clause and inverts its meaning.
@@ -1688,6 +1750,7 @@ async fn word_following_negation_preserved() {
 }
 
 #[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
 async fn preserve_markers_stripped_when_compression_does_not_apply() {
     // Below the token floor, compression is skipped — but gateway-internal
     // preserve markers must still never leak to the provider.

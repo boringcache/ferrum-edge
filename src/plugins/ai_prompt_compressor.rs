@@ -487,7 +487,9 @@ impl AiPromptCompressor {
     }
 
     async fn body_digest(&self, body: &[u8]) -> Option<[u8; 32]> {
-        if body.len() > self.max_scan_bytes || body.len() > HARD_MAX_SCAN_BYTES {
+        // Staged marker-only sanitation remains reusable above the statistical
+        // scan threshold; only the immutable body ceiling limits digest work.
+        if body.len() > HARD_MAX_SCAN_BYTES {
             return None;
         }
         let permit = Arc::clone(&COMPRESSION_BUDGET).try_acquire_owned().ok()?;
@@ -662,8 +664,8 @@ impl AiPromptCompressor {
                             // Keep this shape validation identical to
                             // `measure_content`: every multimodal part needs a
                             // string type, and text parts need a string payload.
-                            let is_text = obj.get("type").and_then(Value::as_str).ok_or(())?
-                                == "text";
+                            let is_text =
+                                obj.get("type").and_then(Value::as_str).ok_or(())? == "text";
                             if is_text {
                                 let Value::String(text) = obj.get_mut("text").ok_or(())? else {
                                     return Err(());
@@ -1098,9 +1100,16 @@ fn decode_json_string_ascii(body: &[u8], start: usize) -> Option<(Option<u8>, us
         b'u' => {
             let digits = body.get(start + 2..start + 6)?;
             let scalar = digits.iter().try_fold(0u16, |value, byte| {
-                Some(value.checked_mul(16)?.checked_add(hex_digit(*byte)? as u16)?)
+                Some(
+                    value
+                        .checked_mul(16)?
+                        .checked_add(hex_digit(*byte)? as u16)?,
+                )
             })?;
-            return Some(((scalar <= u8::MAX as u16).then_some(scalar as u8), start + 6));
+            return Some((
+                (scalar <= u8::MAX as u16).then_some(scalar as u8),
+                start + 6,
+            ));
         }
         _ => return None,
     };
@@ -1122,7 +1131,10 @@ fn json_string_scalar_end(body: &[u8], start: usize) -> Option<usize> {
     if byte.is_ascii() {
         return Some(start + 1);
     }
-    let character = std::str::from_utf8(body.get(start..)?).ok()?.chars().next()?;
+    let character = std::str::from_utf8(body.get(start..)?)
+        .ok()?
+        .chars()
+        .next()?;
     Some(start + character.len_utf8())
 }
 
@@ -1414,8 +1426,7 @@ impl Plugin for AiPromptCompressor {
         PluginResult::Reject {
             status_code,
             body: if status_code == 413 {
-                r#"{"error":"Request body exceeds AI prompt marker sanitation limit"}"#
-                    .to_string()
+                r#"{"error":"Request body exceeds AI prompt marker sanitation limit"}"#.to_string()
             } else {
                 r#"{"error":"AI prompt marker sanitation unavailable"}"#.to_string()
             },
@@ -1461,11 +1472,8 @@ fn record_stats_metadata(
             .saturating_sub(stats.compressed_tokens),
         stats.fields_compressed,
     ];
-    for ((instance_key, aggregate_key), value) in keys
-        .instance
-        .iter()
-        .zip(AGGREGATE_STAT_KEYS)
-        .zip(values)
+    for ((instance_key, aggregate_key), value) in
+        keys.instance.iter().zip(AGGREGATE_STAT_KEYS).zip(values)
     {
         let previous = metadata_usize(&ctx.metadata, instance_key);
         let aggregate = metadata_usize(&ctx.metadata, aggregate_key)

@@ -98,6 +98,11 @@ HTTP status-code failures are real HTTP responses from the backend (e.g., 502 Ba
 
 By default, `retryable_status_codes` is **empty** — no status-code retries occur unless you explicitly configure them. This means a default retry configuration only retries connection failures.
 
+Gateway-local terminal outcomes are never retried even when their synthetic
+status appears in `retryable_status_codes`. This includes request/response body
+limits, client disconnects, dispatch-policy rejections, and pre-dispatch final
+request-body hook rejections such as marker-sanitation worker exhaustion.
+
 ### Method Filtering
 
 The `retryable_methods` filter applies **only to HTTP status-code retries**, not to connection failure retries:
