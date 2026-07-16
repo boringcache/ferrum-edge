@@ -68,8 +68,7 @@ use tracing::warn;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
     route_local_fault_delay_for_rule, service_entry_port_protocol_is_udp,
-    sidecar_selector_from_istio, translate_k8s_objects_with_filter,
-    workload_selector_from_istio,
+    sidecar_selector_from_istio, translate_k8s_objects_with_filter, workload_selector_from_istio,
 };
 
 /// Field manager used on every `patch_status` call. Kubernetes uses this
@@ -876,17 +875,17 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
 /// VirtualService values that are valid in Istio but exceed a Ferrum runtime
 /// limit and are therefore translated with an operator-visible clamp.
 fn virtual_service_clamped_fields(spec: &Value) -> Vec<&'static str> {
-    let has_clamped_fault_delay = spec
-        .get("http")
-        .and_then(Value::as_array)
-        .is_some_and(|routes| {
-            routes.iter().any(|route| {
-                route
-                    .get("fault")
-                    .and_then(route_local_fault_delay_for_rule)
-                    .is_some_and(|delay| delay.was_clamped())
-            })
-        });
+    let has_clamped_fault_delay =
+        spec.get("http")
+            .and_then(Value::as_array)
+            .is_some_and(|routes| {
+                routes.iter().any(|route| {
+                    route
+                        .get("fault")
+                        .and_then(route_local_fault_delay_for_rule)
+                        .is_some_and(|delay| delay.was_clamped())
+                })
+            });
     if has_clamped_fault_delay {
         vec!["http[].fault.delay.fixedDelay above 60s (clamped to 60s)"]
     } else {

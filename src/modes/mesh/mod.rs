@@ -1468,7 +1468,8 @@ fn materialize_fault_runtime_overlay(
         .iter_mut()
         .filter(|plugin| plugin.enabled && plugin.plugin_name == "fault_injection")
     {
-        if materialize_config(&mut plugin.config, overlay) == FaultOverlayMaterialization::Disabled {
+        if materialize_config(&mut plugin.config, overlay) == FaultOverlayMaterialization::Disabled
+        {
             plugin.enabled = false;
         }
     }
@@ -22590,7 +22591,10 @@ mod tests {
         reconcile_fault_plugin_generations(&mut candidate, &accepted);
 
         assert_eq!(candidate.plugin_configs[0].updated_at, generation);
-        assert_eq!(candidate.plugin_configs[0].config, accepted.plugin_configs[0].config);
+        assert_eq!(
+            candidate.plugin_configs[0].config,
+            accepted.plugin_configs[0].config
+        );
         let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
         assert!(delta.modified_plugin_configs.is_empty());
         assert!(!delta.global_plugin_configs_changed);

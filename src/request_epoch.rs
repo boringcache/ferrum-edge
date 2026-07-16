@@ -61,8 +61,8 @@ mod tests {
         PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget, default_namespace,
     };
     use crate::plugins::{
-        BackendAdmissionContext, BackendAdmissionDecision, PluginHttpClient, ProxyProtocol,
-        PluginResult, RequestContext,
+        BackendAdmissionContext, BackendAdmissionDecision, PluginHttpClient, PluginResult,
+        ProxyProtocol, RequestContext,
     };
     use chrono::Utc;
     use serde_json::{Map, Value, json};
