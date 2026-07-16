@@ -264,8 +264,14 @@ future after a mutation was dispatched has an uncertain write outcome, so
 Ferrum retains both the MongoDB mutex document and the process-local connection
 pin instead of deleting the fence from `Drop`. Verify the durable write outcome,
 stop or restart that admin process, and only then remove the exact
-owner-qualified mutex document. A restore rollback keeps the same pin and owner
-across its compensating clear and every replay batch.
+owner-qualified mutex document. Definitive server rejections (including a
+duplicate-key loser) and definitively aborted transactions explicitly settle
+and release the mutex; they do not create a permanent operator-recovery fence.
+A restore keeps one pin and owner from its pre-clear rollback snapshot through
+the clear, all import batches, and any compensating replay. Credential endpoints
+likewise acquire that owner before reading the Consumer and borrow it for the
+write, so an unrelated credential update cannot resurrect a concurrently
+rotated mTLS identity from a stale full-Consumer snapshot.
 
 Both lock/guard collections hold tiny nonce documents (one per route bucket / referenced upstream) and are created explicitly at migration time because MongoDB < 4.4 cannot implicitly create collections inside transactions.
 

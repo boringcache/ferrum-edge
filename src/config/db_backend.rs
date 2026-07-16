@@ -14,7 +14,8 @@ use std::collections::HashSet;
 pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
     "A proxy with overlapping hosts and listen_path already exists";
 
-/// Whether restore-oriented batches run normal mTLS DNS admission.
+/// Whether a batch owns its namespace admission guard and whether it runs
+/// normal mTLS DNS validation.
 ///
 /// `RestoreRollbackReplay` is intentionally narrow: it may only replay the
 /// exact raw snapshot captured immediately before a destructive restore. That
@@ -23,18 +24,20 @@ pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchConfigWriteMode {
     Admission,
+    GuardedAdmission { guard_owner: String },
     RestoreRollbackReplay { guard_owner: String },
 }
 
 impl BatchConfigWriteMode {
     pub(crate) fn validates_mtls_dns(&self) -> bool {
-        matches!(self, Self::Admission)
+        matches!(self, Self::Admission | Self::GuardedAdmission { .. })
     }
 
     pub(crate) fn guard_owner(&self) -> Option<&str> {
         match self {
             Self::Admission => None,
-            Self::RestoreRollbackReplay { guard_owner } => Some(guard_owner),
+            Self::GuardedAdmission { guard_owner }
+            | Self::RestoreRollbackReplay { guard_owner } => Some(guard_owner),
         }
     }
 }
@@ -577,7 +580,13 @@ pub trait DatabaseBackend: Send + Sync {
     // -----------------------------------------------------------------------
 
     async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error>;
-    async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error>;
+    /// `mode` lets a multi-step credential or restore operation borrow the
+    /// namespace guard it acquired before its authoritative read.
+    async fn update_consumer(
+        &self,
+        consumer: &Consumer,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<bool, anyhow::Error>;
     async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error>;
     async fn get_consumer(
         &self,
@@ -772,17 +781,16 @@ pub trait DatabaseBackend: Send + Sync {
         mode: &BatchConfigWriteMode,
     ) -> Result<DeleteMode, DeleteAllResourcesError>;
 
-    /// Block DNS-sensitive writers across a complete restore rollback replay.
-    /// The returned opaque owner must be supplied through
-    /// [`BatchConfigWriteMode::RestoreRollbackReplay`] until release.
-    async fn acquire_restore_rollback_guard(
+    /// Block DNS-sensitive writers across a multi-step namespace operation.
+    /// The opaque owner must be supplied to guarded writes until release.
+    async fn acquire_mtls_dns_admission_guard(
         &self,
         namespace: &str,
     ) -> Result<String, anyhow::Error>;
 
     /// Release only the guard owned by `guard_owner`. An owner mismatch must
-    /// fail closed rather than unblocking another rollback.
-    async fn release_restore_rollback_guard(
+    /// fail closed rather than unblocking another operation.
+    async fn release_mtls_dns_admission_guard(
         &self,
         namespace: &str,
         guard_owner: &str,

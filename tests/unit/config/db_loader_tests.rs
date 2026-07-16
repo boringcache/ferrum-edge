@@ -766,7 +766,7 @@ async fn independent_sqlite_stores_atomically_serialize_policy_association_and_i
 }
 
 #[tokio::test]
-async fn restore_rollback_guard_blocks_other_sqlite_admin_writers_across_batches() {
+async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_batches() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("mtls_dns_restore_guard.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
@@ -780,7 +780,7 @@ async fn restore_rollback_guard_blocks_other_sqlite_admin_writers_across_batches
             .unwrap();
 
     let guard_owner = store_a
-        .acquire_restore_rollback_guard("ferrum")
+        .acquire_mtls_dns_admission_guard("ferrum")
         .await
         .unwrap();
     let replay_mode = BatchConfigWriteMode::RestoreRollbackReplay {
@@ -796,6 +796,25 @@ async fn restore_rollback_guard_blocks_other_sqlite_admin_writers_across_batches
         .await
         .expect("the guard owner must be able to replay a batch");
 
+    // Credential handlers acquire this same owner before reading the
+    // Consumer, then borrow it for the full update. Pin that reentrant path so
+    // a future refactor cannot move the cross-process lock back after the read.
+    let guarded_mode = BatchConfigWriteMode::GuardedAdmission {
+        guard_owner: guard_owner.clone(),
+    };
+    let mut guarded_consumer = store_a
+        .get_consumer("ferrum", "replayed")
+        .await
+        .unwrap()
+        .unwrap();
+    guarded_consumer.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "guarded-key" }]),
+    );
+    DatabaseBackend::update_consumer(&store_a, &guarded_consumer, &guarded_mode)
+        .await
+        .expect("the pre-read guard owner must be able to persist the credential update");
+
     let wrong_owner_mode = BatchConfigWriteMode::RestoreRollbackReplay {
         guard_owner: "not-the-owner".to_string(),
     };
@@ -807,7 +826,7 @@ async fn restore_rollback_guard_blocks_other_sqlite_admin_writers_across_batches
         .await
         .expect_err("a replay must not borrow another rollback's guard");
     assert!(
-        wrong_owner.to_string().contains("restore rollback replays"),
+        wrong_owner.to_string().contains("guarded operation owns"),
         "unexpected wrong-owner rejection: {wrong_owner:#}"
     );
 
@@ -816,18 +835,18 @@ async fn restore_rollback_guard_blocks_other_sqlite_admin_writers_across_batches
         .await
         .expect_err("another admin process must remain blocked between replay batches");
     assert!(
-        blocked.to_string().contains("restore rollback replays"),
+        blocked.to_string().contains("guarded operation owns"),
         "unexpected rollback-guard rejection: {blocked:#}"
     );
 
     store_a
-        .release_restore_rollback_guard("ferrum", &guard_owner)
+        .release_mtls_dns_admission_guard("ferrum", &guard_owner)
         .await
         .unwrap();
     store_b
         .create_consumer(&make_consumer("after-release", "carol"))
         .await
-        .expect("normal admission must resume after rollback guard release");
+        .expect("normal admission must resume after persistent guard release");
 }
 
 #[tokio::test]

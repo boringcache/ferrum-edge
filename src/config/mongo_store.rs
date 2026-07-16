@@ -55,6 +55,7 @@ mod inner {
     use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
     use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+    use anyhow::Context;
     use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
@@ -68,6 +69,7 @@ mod inner {
     };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
+    use std::future::Future;
     use std::io::Write;
     use std::ops::Deref;
     use std::path::{Path, PathBuf};
@@ -377,6 +379,48 @@ mod inner {
             && state == DurableAdmissionMutationState::InFlightOrUncertain
     }
 
+    /// Whether a returned MongoDB error leaves a dispatched write's durable
+    /// outcome unknowable. Transaction errors labelled transient are
+    /// definitive aborts unless the commit-result label is also present;
+    /// standalone network/write-concern failures remain fail-closed.
+    fn mongo_error_outcome_is_uncertain(error: &mongodb::error::Error) -> bool {
+        if error.contains_label("UnknownTransactionCommitResult") {
+            return true;
+        }
+        if error.contains_label("TransientTransactionError")
+            || error.contains_label("NoWritesPerformed")
+        {
+            return false;
+        }
+        if error.contains_label("RetryableWriteError") {
+            return true;
+        }
+        match error.kind.as_ref() {
+            mongodb::error::ErrorKind::Io(_)
+            | mongodb::error::ErrorKind::ConnectionPoolCleared { .. }
+            | mongodb::error::ErrorKind::InvalidResponse { .. }
+            | mongodb::error::ErrorKind::Shutdown => true,
+            mongodb::error::ErrorKind::Write(
+                mongodb::error::WriteFailure::WriteConcernError(_),
+            ) => true,
+            mongodb::error::ErrorKind::InsertMany(error) => {
+                error.write_concern_error.is_some()
+            }
+            mongodb::error::ErrorKind::BulkWrite(error) => {
+                !error.write_concern_errors.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    fn mongo_mutation_outcome_is_uncertain(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<mongodb::error::Error>()
+                .is_some_and(mongo_error_outcome_is_uncertain)
+        })
+    }
+
     /// A connection bundle paired with the read side of the store's
     /// generation barrier. Keeping this value alive prevents reconnect or
     /// failover from swapping the bundle out from under a protected mutation.
@@ -385,11 +429,12 @@ mod inner {
         _generation_guard: tokio::sync::OwnedRwLockReadGuard<()>,
     }
 
-    /// Store-held pin for one complete restore rollback. Individual replay
-    /// batches borrow the same durable owner and exact connection bundle.
-    struct MongoPersistentRestorePin {
+    /// Store-held pin for one multi-step admission operation. Every guarded
+    /// read and write borrows the same owner and exact connection bundle.
+    struct MongoPersistentAdmissionPin {
         namespace: String,
         pin: MongoAdmissionConnectionPin,
+        uncertain_outcome: Arc<AtomicBool>,
     }
 
     struct MongoLockGuard {
@@ -409,17 +454,21 @@ mod inner {
         valid: Arc<AtomicBool>,
         released: bool,
         mutation_state: DurableAdmissionMutationState,
-        // A replay operation borrows the outer rollback guard and must never
+        // A guarded operation borrows the outer admission guard and must never
         // delete it when the individual batch finishes.
         delete_on_release: bool,
         // Read side of the connection-generation barrier. Ordinary admission
-        // guards own it directly. Whole-rollback guards transfer it into
-        // `MongoStore::persistent_restore_pins` between replay batches.
+        // guards own it directly. Multi-step guards transfer it into
+        // `MongoStore::persistent_admission_pins` between guarded operations.
         connection_generation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
         // If an in-flight mutation future is cancelled or errors, Drop moves
         // the generation pin here instead of releasing it. That keeps this
         // process from reconnecting around the fail-closed datastore fence.
         retained_admission_pins: Arc<DashMap<String, MongoAdmissionConnectionPin>>,
+        // Borrowed guards set this flag if cancellation or an uncertain Mongo
+        // error prevents an explicit outcome settlement. The outer owner then
+        // refuses release and keeps its datastore fence and generation pin.
+        persistent_outcome_uncertain: Option<Arc<AtomicBool>>,
         // Keeps the live connection bundle — and the generated TLS PEM temp
         // files it owns — alive for as long as the reusable lease client may
         // open new sockets, including the best-effort Drop cleanup task.
@@ -428,8 +477,27 @@ mod inner {
 
     impl MongoLockGuard {
         fn mark_mutation_started(&mut self) {
-            if self.mode == MongoLockMode::UntilExplicitRelease && self.delete_on_release {
+            if self.mode == MongoLockMode::UntilExplicitRelease {
                 self.mutation_state = DurableAdmissionMutationState::InFlightOrUncertain;
+            }
+        }
+
+        async fn run_mutation<T, F>(&mut self, mutation: F) -> Result<T, anyhow::Error>
+        where
+            F: Future<Output = Result<T, anyhow::Error>>,
+        {
+            self.mark_mutation_started();
+            match mutation.await {
+                Ok(value) => Ok(value),
+                Err(error) if mongo_mutation_outcome_is_uncertain(&error) => Err(error),
+                Err(error) => {
+                    // A definitive server rejection or transaction abort cannot
+                    // commit later. Settle and release now instead of orphaning
+                    // a non-expiring fence for an operation known not to be in
+                    // flight. Cleanup failure still retains the pin in Drop.
+                    self.release().await?;
+                    Err(error)
+                }
             }
         }
 
@@ -454,15 +522,15 @@ mod inner {
         }
 
         async fn release(&mut self) -> Result<(), anyhow::Error> {
-            if !self.delete_on_release {
-                self.released = true;
-                return Ok(());
-            }
             if self.mode == MongoLockMode::UntilExplicitRelease {
                 // Calling release is the only declaration that the protected
                 // mutation has a settled outcome. A failed cleanup can now be
                 // retried safely without reopening an uncertain-write race.
                 self.mutation_state = DurableAdmissionMutationState::Settled;
+            }
+            if !self.delete_on_release {
+                self.released = true;
+                return Ok(());
             }
             if let Some(stop_tx) = self.stop_tx.take() {
                 let _ = stop_tx.send(true);
@@ -534,7 +602,19 @@ mod inner {
 
     impl Drop for MongoLockGuard {
         fn drop(&mut self) {
-            if self.released || !self.delete_on_release {
+            if self.released {
+                return;
+            }
+            if !self.delete_on_release {
+                if durable_admission_drop_must_retain(self.mode, self.mutation_state)
+                    && let Some(uncertain) = &self.persistent_outcome_uncertain
+                {
+                    uncertain.store(true, Ordering::Release);
+                    error!(
+                        "Retaining outer MongoDB {} guard '{}' because a borrowed mutation outcome is uncertain",
+                        self.label, self.lock_id
+                    );
+                }
                 return;
             }
             if durable_admission_drop_must_retain(self.mode, self.mutation_state) {
@@ -747,10 +827,10 @@ mod inner {
         // reconnect must take the write side before swapping `connection`, so
         // one protected operation can never straddle MongoDB generations.
         connection_generation: Arc<tokio::sync::RwLock<()>>,
-        // Whole-rollback guards outlive an individual trait call. Their owner
+        // Multi-step admission guards outlive an individual trait call. Their owner
         // token indexes the exact connection bundle and generation pin that
         // every clear/replay batch must borrow until explicit release.
-        persistent_restore_pins: Arc<DashMap<String, MongoPersistentRestorePin>>,
+        persistent_admission_pins: Arc<DashMap<String, MongoPersistentAdmissionPin>>,
         // An uncertain mutation deliberately leaks neither availability nor
         // safety silently: retain its connection pin for this process's
         // lifetime, log operator recovery guidance, and leave the durable
@@ -839,7 +919,7 @@ mod inner {
             Ok(Self {
                 connection: Arc::new(ArcSwap::from_pointee(connection)),
                 connection_generation: Arc::new(tokio::sync::RwLock::new(())),
-                persistent_restore_pins: Arc::new(DashMap::new()),
+                persistent_admission_pins: Arc::new(DashMap::new()),
                 retained_admission_pins: Arc::new(DashMap::new()),
                 conn_settings,
                 db_type_str: "mongodb".to_string(),
@@ -1553,6 +1633,24 @@ mod inner {
             }
         }
 
+        async fn run_mtls_dns_mutations<T, F>(
+            leases: &mut Vec<MongoLockGuard>,
+            mutation: F,
+        ) -> Result<T, anyhow::Error>
+        where
+            F: Future<Output = Result<T, anyhow::Error>>,
+        {
+            Self::mark_mtls_dns_mutations_started(leases);
+            match mutation.await {
+                Ok(value) => Ok(value),
+                Err(error) if mongo_mutation_outcome_is_uncertain(&error) => Err(error),
+                Err(error) => {
+                    Self::release_mtls_dns_admission_leases(leases).await?;
+                    Err(error)
+                }
+            }
+        }
+
         async fn validate_mtls_dns_candidate<F>(
             &self,
             namespace: &str,
@@ -1588,21 +1686,26 @@ mod inner {
                 .map(str::to_string)
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             let lock_id = lock_id.to_string();
-            let (connection, connection_generation_guard) = if guard_owner.is_some() {
-                let persistent_pin = self.persistent_restore_pins.get(&owner).ok_or_else(|| {
+            let (connection, connection_generation_guard, persistent_outcome_uncertain) =
+                if guard_owner.is_some() {
+                let persistent_pin = self.persistent_admission_pins.get(&owner).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "MongoDB {label} rollback guard '{lock_id}' is not active in this admin process"
+                        "MongoDB {label} guard '{lock_id}' is not active in this admin process"
                     )
                 })?;
                 if persistent_pin.namespace != lock_id {
                     anyhow::bail!(
-                        "MongoDB {label} rollback guard '{lock_id}' belongs to a different namespace"
+                        "MongoDB {label} guard '{lock_id}' belongs to a different namespace"
                     );
                 }
-                (persistent_pin.pin.connection.clone(), None)
+                (
+                    persistent_pin.pin.connection.clone(),
+                    None,
+                    Some(persistent_pin.uncertain_outcome.clone()),
+                )
             } else {
                 let generation_guard = self.connection_generation.clone().read_owned().await;
-                (self.connection(), Some(generation_guard))
+                (self.connection(), Some(generation_guard), None)
             };
             let collection = connection
                 .lease_client
@@ -1625,7 +1728,7 @@ mod inner {
                     != Some(owner.as_str())
                 {
                     anyhow::bail!(
-                        "MongoDB {label} rollback guard '{lock_id}' is not owned by this replay"
+                        "MongoDB {label} guard '{lock_id}' is not owned by this operation"
                     );
                 }
                 return Ok(MongoLockGuard {
@@ -1642,6 +1745,7 @@ mod inner {
                     delete_on_release: false,
                     connection_generation_guard,
                     retained_admission_pins: self.retained_admission_pins.clone(),
+                    persistent_outcome_uncertain,
                     _connection: connection,
                 });
             }
@@ -1677,6 +1781,7 @@ mod inner {
                             delete_on_release: true,
                             connection_generation_guard,
                             retained_admission_pins: self.retained_admission_pins.clone(),
+                            persistent_outcome_uncertain,
                             _connection: connection,
                         });
                     }
@@ -1890,6 +1995,7 @@ mod inner {
                 delete_on_release: true,
                 connection_generation_guard: None,
                 retained_admission_pins: self.retained_admission_pins.clone(),
+                persistent_outcome_uncertain: None,
                 _connection: connection,
             })
         }
@@ -4308,7 +4414,8 @@ mod inner {
             .await?;
             let doc = proxy_to_doc(proxy)?;
             let guard_params = ProxyWriteGuardParams::from_proxy(proxy);
-            mtls_lease.mark_mutation_started();
+            mtls_lease
+                .run_mutation(async {
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -4350,7 +4457,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("create_proxy transaction failed: {}", e))?;
+                    .map_err(anyhow::Error::new)
+                    .context("create_proxy transaction failed")?;
                 self.compact_config_changes_best_effort(&proxy.namespace)
                     .await;
             } else {
@@ -4439,6 +4547,9 @@ mod inner {
                     return Err(err);
                 }
             }
+            Ok(())
+                })
+                .await?;
             mtls_lease.release().await?;
             self.check_slow_query("create_proxy", start);
             Ok(())
@@ -4469,7 +4580,8 @@ mod inner {
             // the method cannot succeed with an untagged spec-owned proxy.
             let mut doc = proxy_to_doc(proxy)?;
             let guard_params = ProxyWriteGuardParams::from_proxy(proxy);
-            mtls_lease.mark_mutation_started();
+            let matched = mtls_lease
+                .run_mutation(async {
 
             let use_replica_set = self.replica_set_configured.load(Ordering::Acquire);
             if use_replica_set {
@@ -4567,7 +4679,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("update_proxy transaction failed: {}", e))?;
+                    .map_err(anyhow::Error::new)
+                    .context("update_proxy transaction failed")?;
                 if matched {
                     self.compact_config_changes_best_effort(&proxy.namespace)
                         .await;
@@ -4577,8 +4690,6 @@ mod inner {
                         }
                     }
                 }
-                mtls_lease.release().await?;
-                self.check_slow_query("update_proxy", start);
                 return Ok(matched);
             }
 
@@ -4591,8 +4702,6 @@ mod inner {
                 .find_one(doc! { "_id": &proxy.id, "namespace": &proxy.namespace })
                 .await?;
             let Some(previous_doc) = previous_doc else {
-                mtls_lease.release().await?;
-                self.check_slow_query("update_proxy", start);
                 return Ok(false);
             };
             let previous_upstream_id = previous_doc.get_str("upstream_id").ok().map(str::to_string);
@@ -4629,8 +4738,6 @@ mod inner {
                 .await?;
             if replace_result.matched_count == 0 {
                 // Phantom update (concurrent delete): no config-change record.
-                mtls_lease.release().await?;
-                self.check_slow_query("update_proxy", start);
                 return Ok(false);
             }
             // Post-write route reconciliation: unlike two creates, an update
@@ -4705,9 +4812,12 @@ mod inner {
                     .await?;
             }
 
+            Ok(true)
+                })
+                .await?;
             mtls_lease.release().await?;
             self.check_slow_query("update_proxy", start);
-            Ok(true)
+            Ok(matched)
         }
 
         async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
@@ -4720,7 +4830,8 @@ mod inner {
                     .retain(|plugin| plugin.proxy_id.as_deref() != Some(id));
             })
             .await?;
-            mtls_lease.mark_mutation_started();
+            let deleted = mtls_lease
+                .run_mutation(async {
             if self.replica_set_configured.load(Ordering::Acquire) {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -4956,7 +5067,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("delete_proxy transaction failed: {}", e))?;
+                    .map_err(anyhow::Error::new)
+                    .context("delete_proxy transaction failed")?;
                 if deleted {
                     self.compact_config_changes_best_effort(&proxy_namespace_for_changes)
                         .await;
@@ -4971,8 +5083,6 @@ mod inner {
                         }
                     }
                 }
-                mtls_lease.release().await?;
-                self.check_slow_query("delete_proxy", start);
                 return Ok(deleted);
             }
 
@@ -4981,8 +5091,6 @@ mod inner {
                 .find_one(doc! { "_id": id, "namespace": namespace })
                 .await?;
             if proxy_doc_for_changes.is_none() {
-                mtls_lease.release().await?;
-                self.check_slow_query("delete_proxy", start);
                 return Ok(false);
             };
             let proxy_namespace_for_changes = namespace.to_string();
@@ -5024,8 +5132,6 @@ mod inner {
                 .as_ref()
                 .and_then(|doc| doc.get_str("upstream_id").ok().map(str::to_string));
             if proxy_doc.is_none() {
-                mtls_lease.release().await?;
-                self.check_slow_query("delete_proxy", start);
                 return Ok(false);
             }
             let spec_owner: Option<(String, String)> =
@@ -5139,9 +5245,12 @@ mod inner {
                         .await?;
                 }
             }
+            Ok(result.deleted_count > 0)
+                })
+                .await?;
             mtls_lease.release().await?;
             self.check_slow_query("delete_proxy", start);
-            Ok(result.deleted_count > 0)
+            Ok(deleted)
         }
 
         async fn get_proxy(
@@ -5224,7 +5333,8 @@ mod inner {
             .await?;
             let doc = consumer_to_doc(consumer)?;
             let identity_values = consumer_identity_values(consumer);
-            mtls_lease.mark_mutation_started();
+            mtls_lease
+                .run_mutation(async {
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5268,7 +5378,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("create_consumer transaction failed: {}", e))?;
+                    .map_err(anyhow::Error::new)
+                    .context("create_consumer transaction failed")?;
                 self.compact_config_changes_best_effort(&consumer.namespace)
                     .await;
             } else {
@@ -5320,15 +5431,22 @@ mod inner {
                     return Err(err);
                 }
             }
+            Ok(())
+                })
+                .await?;
             mtls_lease.release().await?;
             self.check_slow_query("create_consumer", start);
             Ok(())
         }
 
-        async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error> {
+        async fn update_consumer(
+            &self,
+            consumer: &Consumer,
+            mode: &BatchConfigWriteMode,
+        ) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self
-                .acquire_mtls_dns_admission_lease(&consumer.namespace)
+                .acquire_mtls_dns_admission_lease_for_mode(&consumer.namespace, mode)
                 .await?;
             self.validate_mtls_dns_candidate(&consumer.namespace, |candidate| {
                 if let Some(existing) = candidate
@@ -5343,7 +5461,8 @@ mod inner {
             let doc = consumer_to_doc(consumer)?;
             let new_identity_values = consumer_identity_values(consumer);
             let composite_id = consumer_doc_id(&consumer.namespace, &consumer.id);
-            mtls_lease.mark_mutation_started();
+            let matched = mtls_lease
+                .run_mutation(async {
             let matched = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5421,7 +5540,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("update_consumer transaction failed: {}", e))?;
+                    .map_err(anyhow::Error::new)
+                    .context("update_consumer transaction failed")?;
                 if matched {
                     self.compact_config_changes_best_effort(&consumer.namespace)
                         .await;
@@ -5433,8 +5553,6 @@ mod inner {
                     .find_one(doc! { "_id": &composite_id })
                     .await?;
                 let Some(previous_doc) = previous_doc else {
-                    mtls_lease.release().await?;
-                    self.check_slow_query("update_consumer", start);
                     return Ok(false);
                 };
                 let previous_consumer = doc_to_consumer(previous_doc.clone())?;
@@ -5484,8 +5602,6 @@ mod inner {
                         &added,
                     )
                     .await;
-                    mtls_lease.release().await?;
-                    self.check_slow_query("update_consumer", start);
                     return Ok(false);
                 }
                 if let Err(err) = self
@@ -5522,6 +5638,9 @@ mod inner {
                 .await;
                 true
             };
+            Ok(matched)
+                })
+                .await?;
             mtls_lease.release().await?;
             self.check_slow_query("update_consumer", start);
             Ok(matched)
@@ -5535,7 +5654,8 @@ mod inner {
             })
             .await?;
             let composite_id = consumer_doc_id(namespace, id);
-            mtls_lease.mark_mutation_started();
+            let deleted = mtls_lease
+                .run_mutation(async {
             let deleted = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5574,7 +5694,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("delete_consumer transaction failed: {}", e))?;
+                    .map_err(anyhow::Error::new)
+                    .context("delete_consumer transaction failed")?;
                 if deleted {
                     self.compact_config_changes_best_effort(namespace).await;
                 }
@@ -5606,6 +5727,9 @@ mod inner {
                 }
                 result.deleted_count > 0
             };
+            Ok(deleted)
+                })
+                .await?;
             mtls_lease.release().await?;
             self.check_slow_query("delete_consumer", start);
             Ok(deleted)
@@ -5673,7 +5797,8 @@ mod inner {
             })
             .await?;
             let doc = plugin_config_to_doc(pc)?;
-            mtls_lease.mark_mutation_started();
+            mtls_lease
+                .run_mutation(async {
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5715,9 +5840,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("create_plugin_config transaction failed: {}", e)
-                    })?;
+                    .map_err(anyhow::Error::new)
+                    .context("create_plugin_config transaction failed")?;
                 self.compact_config_changes_best_effort(&pc.namespace).await;
             } else {
                 self.plugin_configs().insert_one(doc).await?;
@@ -5752,6 +5876,9 @@ mod inner {
                     return Err(err);
                 }
             }
+            Ok(())
+                })
+                .await?;
             mtls_lease.release().await?;
             self.check_slow_query("create_plugin_config", start);
             Ok(())
@@ -5798,7 +5925,8 @@ mod inner {
             if let Some(sid) = existing_spec_id {
                 doc.insert("api_spec_id", sid);
             }
-            mtls_lease.mark_mutation_started();
+            let matched = mtls_lease
+                .run_mutation(async {
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -5852,14 +5980,11 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("update_plugin_config transaction failed: {}", e)
-                    })?;
+                    .map_err(anyhow::Error::new)
+                    .context("update_plugin_config transaction failed")?;
                 if matched {
                     self.compact_config_changes_best_effort(&pc.namespace).await;
                 }
-                mtls_lease.release().await?;
-                self.check_slow_query("update_plugin_config", start);
                 return Ok(matched);
             } else {
                 let replace_result = self
@@ -5869,8 +5994,6 @@ mod inner {
                 if replace_result.matched_count == 0 {
                     // Phantom update (concurrent delete): no config-change
                     // record (DB-M4).
-                    mtls_lease.release().await?;
-                    self.check_slow_query("update_plugin_config", start);
                     return Ok(false);
                 }
                 let change_result: Result<(), anyhow::Error> = async {
@@ -5897,9 +6020,12 @@ mod inner {
                     return Err(err);
                 }
             }
+            Ok(true)
+                })
+                .await?;
             mtls_lease.release().await?;
             self.check_slow_query("update_plugin_config", start);
-            Ok(true)
+            Ok(matched)
         }
 
         async fn delete_plugin_config(
@@ -5942,7 +6068,8 @@ mod inner {
                     affected_proxy_ids.push(proxy_id.to_string());
                 }
             }
-            mtls_lease.mark_mutation_started();
+            let deleted = mtls_lease
+                .run_mutation(async {
             let deleted = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -6002,9 +6129,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("delete_plugin_config transaction failed: {}", e)
-                    })?;
+                    .map_err(anyhow::Error::new)
+                    .context("delete_plugin_config transaction failed")?;
                 if deleted {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
@@ -6033,6 +6159,9 @@ mod inner {
                 }
                 result.deleted_count > 0
             };
+            Ok(deleted)
+                })
+                .await?;
             mtls_lease.release().await?;
             self.check_slow_query("delete_plugin_config", start);
             Ok(deleted)
@@ -6849,8 +6978,8 @@ mod inner {
                 }
             }
             let docs: Vec<Document> = proxies.iter().map(proxy_to_doc).collect::<Result<_, _>>()?;
-            Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
-            if self.replica_set_configured() {
+            let count = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+            let count = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
                 let changes: Vec<(String, String)> = proxies
@@ -6881,9 +7010,8 @@ mod inner {
                         })
                     })
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("batch_create_proxies transaction failed: {}", e)
-                    })?;
+                    .map_err(anyhow::Error::new)
+                    .context("batch_create_proxies transaction failed")?;
                 let namespaces: HashSet<String> = proxies
                     .iter()
                     .map(|proxy| proxy.namespace.clone())
@@ -6891,8 +7019,7 @@ mod inner {
                 for namespace in namespaces {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
-                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
-                Ok(count)
+                count
             } else {
                 let ids: Vec<&str> = proxies.iter().map(|proxy| proxy.id.as_str()).collect();
                 let result = match self.proxies().insert_many(docs).ordered(false).await {
@@ -6925,9 +7052,13 @@ mod inner {
                         .await;
                     return Err(err);
                 }
-                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
-                Ok(result.inserted_ids.len())
-            }
+                result.inserted_ids.len()
+            };
+            Ok(count)
+                })
+                .await?;
+            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Ok(count)
         }
 
         async fn batch_create_proxies_without_plugins(
@@ -6999,8 +7130,8 @@ mod inner {
                     )
                 })
                 .collect();
-            Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
-            if self.replica_set_configured() {
+            let count = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+            let count = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
                 let changes: Vec<(String, String)> = consumers
@@ -7042,9 +7173,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("batch_create_consumers transaction failed: {}", e)
-                    })?;
+                    .map_err(anyhow::Error::new)
+                    .context("batch_create_consumers transaction failed")?;
                 let namespaces: HashSet<String> = consumers
                     .iter()
                     .map(|consumer| consumer.namespace.clone())
@@ -7052,8 +7182,7 @@ mod inner {
                 for namespace in namespaces {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
-                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
-                Ok(count)
+                count
             } else {
                 // Standalone RESERVE FIRST: insert identity reservations for
                 // the whole batch (ordered) before any consumer document. On
@@ -7126,9 +7255,13 @@ mod inner {
                     .await;
                     return Err(err);
                 }
-                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
-                Ok(result.inserted_ids.len())
-            }
+                result.inserted_ids.len()
+            };
+            Ok(count)
+                })
+                .await?;
+            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Ok(count)
         }
 
         async fn batch_create_plugin_configs(
@@ -7166,8 +7299,8 @@ mod inner {
                 .iter()
                 .map(plugin_config_to_doc)
                 .collect::<Result<_, _>>()?;
-            Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
-            if self.replica_set_configured() {
+            let count = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+            let count = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
                 let changes: Vec<(String, String)> = configs
@@ -7198,9 +7331,8 @@ mod inner {
                         })
                     })
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("batch_create_plugin_configs transaction failed: {}", e)
-                    })?;
+                    .map_err(anyhow::Error::new)
+                    .context("batch_create_plugin_configs transaction failed")?;
                 let namespaces: HashSet<String> = configs
                     .iter()
                     .map(|config| config.namespace.clone())
@@ -7208,8 +7340,7 @@ mod inner {
                 for namespace in namespaces {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
-                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
-                Ok(count)
+                count
             } else {
                 let ids: Vec<&str> = configs.iter().map(|config| config.id.as_str()).collect();
                 let result = match self.plugin_configs().insert_many(docs).ordered(false).await {
@@ -7247,9 +7378,13 @@ mod inner {
                     .await;
                     return Err(err);
                 }
-                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
-                Ok(result.inserted_ids.len())
-            }
+                result.inserted_ids.len()
+            };
+            Ok(count)
+                })
+                .await?;
+            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Ok(count)
         }
 
         async fn batch_create_upstreams(
@@ -7369,16 +7504,15 @@ mod inner {
             } else {
                 DeleteMode::NonAtomic
             };
-            let delete_error = |source: anyhow::Error| DeleteAllResourcesError::new(mode, source);
             let ns_filter = doc! { "namespace": namespace };
-            mtls_lease.mark_mutation_started();
+            let mutation_result = mtls_lease
+                .run_mutation(async {
             if mode.is_atomic() {
                 let connection = self.connection();
                 let mut session = connection
                     .client
                     .start_session()
-                    .await
-                    .map_err(|error| delete_error(error.into()))?;
+                    .await?;
                 session
                     .start_transaction()
                     .and_run(
@@ -7491,122 +7625,122 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| {
-                        let source =
-                            anyhow::anyhow!("delete_all_resources transaction failed: {}", e);
-                        if e.contains_label("UnknownTransactionCommitResult") {
-                            DeleteAllResourcesError::with_unknown_commit_result(mode, source)
-                        } else {
-                            delete_error(source)
-                        }
-                    })?;
+                    .map_err(anyhow::Error::new)
+                    .context("delete_all_resources transaction failed")?;
                 self.compact_config_changes_best_effort(namespace).await;
             } else {
                 let proxy_ids = self
                     .load_collection_ids_filtered("proxies", ns_filter.clone())
-                    .await
-                    .map_err(&delete_error)?;
+                    .await?;
                 // Plain `id` field — consumer `_id` is the composite
                 // "{namespace}:{id}" and change-log records carry plain ids.
                 let consumer_ids = self
                     .load_consumer_plain_ids_filtered(ns_filter.clone())
-                    .await
-                    .map_err(&delete_error)?;
+                    .await?;
                 let plugin_config_ids = self
                     .load_collection_ids_filtered("plugin_configs", ns_filter.clone())
-                    .await
-                    .map_err(&delete_error)?;
+                    .await?;
                 let upstream_ids = self
                     .load_collection_ids_filtered("upstreams", ns_filter.clone())
-                    .await
-                    .map_err(&delete_error)?;
+                    .await?;
                 self.plugin_configs()
                     .delete_many(ns_filter.clone())
-                    .await
-                    .map_err(|error| delete_error(error.into()))?;
+                    .await?;
                 self.proxies()
                     .delete_many(ns_filter.clone())
-                    .await
-                    .map_err(|error| delete_error(error.into()))?;
+                    .await?;
                 self.consumers()
                     .delete_many(ns_filter.clone())
-                    .await
-                    .map_err(|error| delete_error(error.into()))?;
+                    .await?;
                 // Namespace wipe releases every consumer identity reservation
                 // in the namespace.
                 self.consumer_identity_index()
                     .delete_many(ns_filter.clone())
-                    .await
-                    .map_err(|error| delete_error(error.into()))?;
+                    .await?;
                 self.upstreams()
                     .delete_many(ns_filter.clone())
-                    .await
-                    .map_err(|error| delete_error(error.into()))?;
+                    .await?;
                 // Clear api_specs so restore doesn't leave orphaned spec metadata
                 // pointing to proxies that no longer exist.
                 self.api_specs()
                     .delete_many(ns_filter)
-                    .await
-                    .map_err(|error| delete_error(error.into()))?;
+                    .await?;
                 for id in proxy_ids {
                     self.record_config_change(namespace, "proxy", &id, "delete")
-                        .await
-                        .map_err(&delete_error)?;
+                        .await?;
                 }
                 for id in consumer_ids {
                     self.record_config_change(namespace, "consumer", &id, "delete")
-                        .await
-                        .map_err(&delete_error)?;
+                        .await?;
                 }
                 for id in plugin_config_ids {
                     self.record_config_change(namespace, "plugin_config", &id, "delete")
-                        .await
-                        .map_err(&delete_error)?;
+                        .await?;
                 }
                 for id in upstream_ids {
                     self.record_config_change(namespace, "upstream", &id, "delete")
-                        .await
-                        .map_err(&delete_error)?;
+                        .await?;
                 }
             }
+            Ok(mode)
+                })
+                .await;
+            let mode = match mutation_result {
+                Ok(mode) => mode,
+                Err(source) => {
+                    let error = if mongo_mutation_outcome_is_uncertain(&source) {
+                        DeleteAllResourcesError::with_unknown_commit_result(mode, source)
+                    } else {
+                        DeleteAllResourcesError::new(mode, source)
+                    };
+                    return Err(error);
+                }
+            };
+            let delete_error = |source: anyhow::Error| DeleteAllResourcesError::new(mode, source);
             mtls_lease.release().await.map_err(&delete_error)?;
             info!("All MongoDB resources deleted (namespace='{}')", namespace);
             Ok(mode)
         }
 
-        async fn acquire_restore_rollback_guard(
+        async fn acquire_mtls_dns_admission_guard(
             &self,
             namespace: &str,
         ) -> Result<String, anyhow::Error> {
             let guard = self.acquire_mtls_dns_admission_lease(namespace).await?;
             let (owner, pin) = guard.into_persistent_owner()?;
-            let _ = self.persistent_restore_pins.insert(
+            let _ = self.persistent_admission_pins.insert(
                 owner.clone(),
-                MongoPersistentRestorePin {
+                MongoPersistentAdmissionPin {
                     namespace: namespace.to_string(),
                     pin,
+                    uncertain_outcome: Arc::new(AtomicBool::new(false)),
                 },
             );
             Ok(owner)
         }
 
-        async fn release_restore_rollback_guard(
+        async fn release_mtls_dns_admission_guard(
             &self,
             namespace: &str,
             guard_owner: &str,
         ) -> Result<(), anyhow::Error> {
             let connection = {
                 let persistent_pin = self
-                    .persistent_restore_pins
+                    .persistent_admission_pins
                     .get(guard_owner)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "MongoDB mTLS DNS restore rollback guard is not active in this admin process for namespace '{namespace}'"
+                            "MongoDB mTLS DNS admission guard is not active in this admin process for namespace '{namespace}'"
                         )
                     })?;
                 if persistent_pin.namespace != namespace {
                     anyhow::bail!(
-                        "MongoDB mTLS DNS restore rollback guard belongs to a different namespace than '{namespace}'"
+                        "MongoDB mTLS DNS admission guard belongs to a different namespace than '{namespace}'"
+                    );
+                }
+                if persistent_pin.uncertain_outcome.load(Ordering::Acquire) {
+                    anyhow::bail!(
+                        "MongoDB mTLS DNS admission guard for namespace '{namespace}' retained because a protected mutation outcome is uncertain"
                     );
                 }
                 persistent_pin.pin.connection.clone()
@@ -7617,13 +7751,30 @@ mod inner {
                 .collection::<Document>("mtls_dns_admission_locks")
                 .delete_one(doc! { "_id": namespace, "owner": guard_owner })
                 .write_concern(WriteConcern::majority())
-                .await?;
+                .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    // Every borrowed mutation explicitly settled before this
+                    // cleanup. Preserve its known response and retain the pin
+                    // for an owner-qualified operator cleanup instead of
+                    // reporting a false write failure.
+                    error!(
+                        namespace = %namespace,
+                        error = %error,
+                        "MongoDB mTLS DNS admission guard cleanup failed after a settled operation"
+                    );
+                    return Ok(());
+                }
+            };
             if result.deleted_count != 1 {
-                anyhow::bail!(
-                    "MongoDB mTLS DNS restore rollback guard ownership was lost for namespace '{namespace}'"
+                error!(
+                    namespace = %namespace,
+                    "MongoDB mTLS DNS admission guard cleanup did not match its owner after a settled operation"
                 );
+                return Ok(());
             }
-            let _ = self.persistent_restore_pins.remove(guard_owner);
+            let _ = self.persistent_admission_pins.remove(guard_owner);
             Ok(())
         }
 
@@ -8311,7 +8462,7 @@ mod inner {
                 .await?;
             }
 
-            Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
+            Self::run_mtls_dns_mutations(&mut mtls_leases, async {
             let use_replica_set = self.replica_set_configured();
             let mut orphaned_proxy_group_plugin_deletes = Vec::new();
             if use_replica_set {
@@ -8387,9 +8538,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("submit_api_spec_bundle transaction failed: {}", e)
-                    })?;
+                    .map_err(anyhow::Error::new)
+                    .context("submit_api_spec_bundle transaction failed")?;
             } else {
                 // No replica set: best-effort with compensating rollback on failure.
                 // Track inserted document IDs for cleanup.
@@ -8459,7 +8609,6 @@ mod inner {
                     .await;
                     return Err(e);
                 }
-                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 return Ok(());
             }
 
@@ -8478,6 +8627,9 @@ mod inner {
                 self.compact_config_changes_best_effort(&namespace).await;
             }
 
+            Ok(())
+                })
+                .await?;
             Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
             Ok(())
         }
@@ -8544,13 +8696,16 @@ mod inner {
                     == Some(desired_resource_hash.as_str())
             {
                 // Only update metadata fields on the spec doc.
-                Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
-                self.api_specs()
-                    .replace_one(
-                        doc! { "_id": &spec.id, "namespace": &spec.namespace },
-                        spec_doc_check,
-                    )
-                    .await?;
+                Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+                    self.api_specs()
+                        .replace_one(
+                            doc! { "_id": &spec.id, "namespace": &spec.namespace },
+                            spec_doc_check,
+                        )
+                        .await?;
+                    Ok(())
+                })
+                .await?;
                 Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 return Ok(());
             }
@@ -8692,7 +8847,7 @@ mod inner {
                 .await?;
             }
 
-            Self::mark_mtls_dns_mutations_started(&mut mtls_leases);
+            Self::run_mtls_dns_mutations(&mut mtls_leases, async {
             let use_replica_set = self.replica_set_configured();
             let mut old_plugin_configs_deleted_for_changes = true;
             let mut old_upstreams_deleted_for_changes = true;
@@ -8846,9 +9001,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("replace_api_spec_bundle transaction failed: {}", e)
-                    })?
+                    .map_err(anyhow::Error::new)
+                    .context("replace_api_spec_bundle transaction failed")?
             } else {
                 // No replica set: best-effort delete then re-insert with
                 // compensating rollback on re-insert failure.
@@ -8879,13 +9033,10 @@ mod inner {
                     .delete_one(doc! { "_id": &spec.proxy_id, "namespace": &spec.namespace })
                     .await
                 {
-                    return Err(anyhow::anyhow!(
-                        "replace_api_spec_bundle: failed to delete proxy {} for spec {} before \
-                         dependency cleanup: {}",
-                        spec.proxy_id,
-                        spec.id,
-                        e
-                    ));
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "replace_api_spec_bundle: failed to delete proxy {} for spec {} before dependency cleanup",
+                        spec.proxy_id, spec.id
+                    )));
                 }
 
                 if let Err(e) = self
@@ -8996,7 +9147,6 @@ mod inner {
                 for namespace in namespaces_to_compact {
                     self.compact_config_changes_best_effort(&namespace).await;
                 }
-                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
                 return Ok(());
             }
 
@@ -9037,6 +9187,9 @@ mod inner {
                     .await?;
             }
 
+            Ok(())
+                })
+                .await?;
             Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
             Ok(())
         }
@@ -9399,7 +9552,8 @@ mod inner {
                 )
             };
             let mut orphaned_proxy_group_plugin_deletes = Vec::new();
-            mtls_lease.mark_mutation_started();
+            let deleted = mtls_lease
+                .run_mutation(async {
             if use_replica_set {
                 // With a replica set: use a multi-document transaction so that a
                 // partial failure does not leave orphaned proxy/upstream/plugin rows.
@@ -9557,7 +9711,8 @@ mod inner {
                         },
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("delete_api_spec transaction failed: {}", e))?;
+                    .map_err(anyhow::Error::new)
+                    .context("delete_api_spec transaction failed")?;
                 self.compact_config_changes_best_effort(namespace).await;
                 for (_, plugin_namespace) in &orphaned_proxy_group_plugin_deletes {
                     if plugin_namespace.as_str() != namespace {
@@ -9565,8 +9720,6 @@ mod inner {
                             .await;
                     }
                 }
-                mtls_lease.release().await?;
-                self.check_slow_query("delete_api_spec", start);
                 return Ok(true);
             } else {
                 // No replica set: best-effort deletes.  Log failures as warnings so
@@ -9578,13 +9731,11 @@ mod inner {
                     self.proxies()
                         .delete_one(doc! { "_id": pid, "namespace": namespace })
                         .await
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "delete_api_spec: failed to delete proxy {} for spec {} before \
-                                 dependency cleanup: {}",
-                                pid,
-                                id,
-                                e
+                        .map_err(anyhow::Error::new)
+                        .with_context(|| {
+                            format!(
+                                "delete_api_spec: failed to delete proxy {} for spec {} before dependency cleanup",
+                                pid, id
                             )
                         })?;
                 }
@@ -9666,9 +9817,12 @@ mod inner {
                     .await?;
             }
 
+            Ok(true)
+                })
+                .await?;
             mtls_lease.release().await?;
             self.check_slow_query("delete_api_spec", start);
-            Ok(true)
+            Ok(deleted)
         }
 
         async fn insert_audit_event(
@@ -11163,7 +11317,7 @@ mod inner {
             MongoStore {
                 connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
                 connection_generation: std::sync::Arc::new(tokio::sync::RwLock::new(())),
-                persistent_restore_pins: std::sync::Arc::new(DashMap::new()),
+                persistent_admission_pins: std::sync::Arc::new(DashMap::new()),
                 retained_admission_pins: std::sync::Arc::new(DashMap::new()),
                 conn_settings: settings,
                 db_type_str: "mongodb".to_string(),

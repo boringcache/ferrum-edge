@@ -14,7 +14,8 @@ use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{
-    DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_identity_conflict,
+    BatchConfigWriteMode, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+    is_mtls_dns_identity_conflict,
 };
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
@@ -2692,7 +2693,8 @@ impl AdminResource for Consumer {
     }
 
     async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool> {
-        db.update_consumer(resource).await
+        db.update_consumer(resource, &BatchConfigWriteMode::Admission)
+            .await
     }
 
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {

@@ -912,17 +912,17 @@ impl DatabaseStore {
             (None, None) => {}
             (Some(actual), Some(allowed)) if actual == allowed => {}
             (Some(_), _) => anyhow::bail!(
-                "mTLS DNS admission is blocked while restore rollback replays namespace '{namespace}'"
+                "mTLS DNS admission is blocked while a guarded operation owns namespace '{namespace}'"
             ),
             (None, Some(_)) => anyhow::bail!(
-                "mTLS DNS restore rollback guard ownership was lost for namespace '{namespace}'"
+                "mTLS DNS admission guard ownership was lost for namespace '{namespace}'"
             ),
         }
 
         Ok(())
     }
 
-    async fn acquire_restore_rollback_guard_inner(
+    async fn acquire_mtls_dns_admission_guard_inner(
         &self,
         namespace: &str,
     ) -> Result<String, anyhow::Error> {
@@ -939,13 +939,13 @@ impl DatabaseStore {
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() != 1 {
-            anyhow::bail!("failed to claim mTLS DNS restore rollback guard");
+            anyhow::bail!("failed to claim mTLS DNS admission guard");
         }
         tx.commit().await?;
         Ok(owner)
     }
 
-    async fn release_restore_rollback_guard_inner(
+    async fn release_mtls_dns_admission_guard_inner(
         &self,
         namespace: &str,
         owner: &str,
@@ -963,7 +963,7 @@ impl DatabaseStore {
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() != 1 {
-            anyhow::bail!("mTLS DNS restore rollback guard ownership was lost");
+            anyhow::bail!("mTLS DNS admission guard ownership was lost");
         }
         tx.commit().await?;
         Ok(())
@@ -2861,12 +2861,24 @@ impl DatabaseStore {
     }
 
     pub async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error> {
+        self.update_consumer_for_guard(consumer, None).await
+    }
+
+    async fn update_consumer_for_guard(
+        &self,
+        consumer: &Consumer,
+        guard_owner: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
         let mut tx = self.pool().begin().await?;
-        self.lock_mtls_dns_admission_tx(&mut tx, &consumer.namespace)
-            .await?;
+        self.lock_mtls_dns_admission_for_owner_tx(
+            &mut tx,
+            &consumer.namespace,
+            guard_owner,
+        )
+        .await?;
         // Existence read inside the transaction is the not-found authority —
         // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
         // (sqlx's default) counts *changed* rows, so an update writing
@@ -7769,8 +7781,13 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::create_consumer(self, consumer).await
     }
 
-    async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error> {
-        DatabaseStore::update_consumer(self, consumer).await
+    async fn update_consumer(
+        &self,
+        consumer: &Consumer,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<bool, anyhow::Error> {
+        self.update_consumer_for_guard(consumer, mode.guard_owner())
+            .await
     }
 
     async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
@@ -8018,19 +8035,19 @@ impl DatabaseBackend for DatabaseStore {
             .map_err(|error| crate::config::db_backend::DeleteAllResourcesError::new(mode, error))
     }
 
-    async fn acquire_restore_rollback_guard(
+    async fn acquire_mtls_dns_admission_guard(
         &self,
         namespace: &str,
     ) -> Result<String, anyhow::Error> {
-        self.acquire_restore_rollback_guard_inner(namespace).await
+        self.acquire_mtls_dns_admission_guard_inner(namespace).await
     }
 
-    async fn release_restore_rollback_guard(
+    async fn release_mtls_dns_admission_guard(
         &self,
         namespace: &str,
         guard_owner: &str,
     ) -> Result<(), anyhow::Error> {
-        self.release_restore_rollback_guard_inner(namespace, guard_owner)
+        self.release_mtls_dns_admission_guard_inner(namespace, guard_owner)
             .await
     }
 
