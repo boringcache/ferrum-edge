@@ -399,7 +399,17 @@ async fn compensate_late_api_spec_delete(
     previous_bundle: ExtractedBundle,
     previous_spec: ApiSpec,
     additional_plugins: Vec<crate::config::types::PluginConfig>,
+    state: &AdminState,
 ) -> Result<(), anyhow::Error> {
+    if crate::admin::crud::current_transaction_log_schema_graph_is_valid(
+        db.as_ref(),
+        state,
+        &previous_spec.namespace,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     if db
         .get_api_spec(&previous_spec.namespace, &previous_spec.id)
         .await?
@@ -410,6 +420,28 @@ async fn compensate_late_api_spec_delete(
             .is_some()
     {
         return Ok(());
+    }
+    let mut restored_plugins = previous_bundle.plugins.clone();
+    restored_plugins.extend(additional_plugins.iter().cloned());
+    match crate::admin::crud::validate_transaction_log_schema_candidates(
+        db.as_ref(),
+        state,
+        &previous_spec.namespace,
+        &restored_plugins,
+        None,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(crate::admin::crud::AfterValidateError::BadRequest(errors))
+        | Err(crate::admin::crud::AfterValidateError::Conflict(errors)) => anyhow::bail!(
+            "late API-spec delete compensation could not restore a valid transaction-log schema graph: {}",
+            errors.join("; ")
+        ),
+        Err(crate::admin::crud::AfterValidateError::Db(error)) => return Err(error),
+        Err(crate::admin::crud::AfterValidateError::Response(_)) => anyhow::bail!(
+            "late API-spec delete compensation validation returned an HTTP response"
+        ),
     }
     let additional_plugin_ids = additional_plugins
         .iter()
@@ -3334,6 +3366,7 @@ pub async fn handle_delete_api_spec(
     let settlement_namespace = namespace.to_string();
     let persistence_id = id.to_string();
     let compensation_spec = existing.clone();
+    let settlement_state = state.clone();
     let audit_db = db.clone();
     let audit_enabled = state.admin_audit_enabled;
     let audit_actor = actor.clone();
@@ -3349,8 +3382,9 @@ pub async fn handle_delete_api_spec(
                 previous_bundle,
                 compensation_spec,
                 additional_plugins,
+                &settlement_state,
             ),
-            false,
+            true,
         )
         .await;
         if matches!(&result, Ok(true)) {

@@ -3897,6 +3897,22 @@ async fn restore_snapshot_after_intervening_clear(
         .await
         .map_err(|error| vec![format!("failed to load intervening resources: {error}")])?;
     let (candidate, missing) = intervening_clear_recovery_candidate(snapshot, &current);
+    let mut identity_errors = candidate
+        .validate_mtls_auth_compatibility()
+        .err()
+        .unwrap_or_default();
+    identity_errors.extend(
+        candidate
+            .validate_unique_mtls_credentials()
+            .err()
+            .unwrap_or_default(),
+    );
+    if !identity_errors.is_empty() {
+        return Err(vec![format!(
+            "additive rollback would leave invalid mTLS identities or associations: {}",
+            identity_errors.join("; ")
+        )]);
+    }
     match crud::validate_transaction_log_schema_graph_on_blocking_pool(
         candidate,
         plugin_validation_http_client(state),
