@@ -3652,7 +3652,7 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
         "builtins": {"response_leakage": true}
     });
     let firewall = plugin(&config);
-    let headers = HashMap::from([
+    let base_headers = HashMap::from([
         ("content-type".to_string(), "text/plain".to_string()),
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
@@ -3660,31 +3660,46 @@ async fn final_response_fails_closed_when_mislabeled_decoded_body_exceeds_limit(
     decoded.resize(10 * 1024 * 1024 + 1, b'a');
     decoded.extend_from_slice(br#""}}]}"#);
     let body = gzip_bytes(&decoded);
-    let mut ctx = create_test_context();
+    for (status, headers) in [
+        (200, base_headers.clone()),
+        (
+            206,
+            HashMap::from([
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("content-encoding".to_string(), "gzip".to_string()),
+                (
+                    "content-range".to_string(),
+                    "bytes 0-1023/20971520".to_string(),
+                ),
+            ]),
+        ),
+    ] {
+        let mut ctx = create_test_context();
 
-    assert!(firewall.should_buffer_response_body_for_content_type(
-        &ctx,
-        Some("text/plain"),
-        200,
-        &headers,
-    ));
-    assert_continue(
-        firewall
-            .on_response_body(&mut ctx, 200, &headers, &body)
-            .await,
-    );
-    assert_reject(
-        firewall
-            .on_final_response_body(&mut ctx, 200, &headers, &body)
-            .await,
-        Some(502),
-    );
-    assert_eq!(
-        ctx.metadata
-            .get("ai_semantic_firewall.uninspectable_body")
-            .map(String::as_str),
-        Some("encoded_body")
-    );
+        assert!(firewall.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/plain"),
+            status,
+            &headers,
+        ));
+        assert_continue(
+            firewall
+                .on_response_body(&mut ctx, status, &headers, &body)
+                .await,
+        );
+        assert_reject(
+            firewall
+                .on_final_response_body(&mut ctx, status, &headers, &body)
+                .await,
+            Some(502),
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.uninspectable_body")
+                .map(String::as_str),
+            Some("encoded_body")
+        );
+    }
 }
 
 #[tokio::test]
@@ -3722,7 +3737,7 @@ async fn final_response_fails_closed_for_malformed_decoded_json_shape() {
 }
 
 #[tokio::test]
-async fn partial_encoded_responses_skip_buffering_and_response_hooks() {
+async fn partial_encoded_responses_stay_on_bounded_decode_path() {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
@@ -3750,7 +3765,7 @@ async fn partial_encoded_responses_skip_buffering_and_response_hooks() {
         ),
     ] {
         let mut ctx = create_test_context();
-        assert!(!firewall.should_buffer_response_body_for_content_type(
+        assert!(firewall.should_buffer_response_body_for_content_type(
             &ctx,
             Some("text/plain"),
             status,
@@ -3761,16 +3776,106 @@ async fn partial_encoded_responses_skip_buffering_and_response_hooks() {
                 .on_response_body(&mut ctx, status, &headers, gzip_fragment)
                 .await,
         );
-        assert_continue(
+        assert_reject(
             firewall
                 .on_final_response_body(&mut ctx, status, &headers, gzip_fragment)
                 .await,
+            Some(502),
         );
-        assert!(
-            !ctx.metadata
-                .contains_key("ai_semantic_firewall.uninspectable_body")
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.uninspectable_body")
+                .map(String::as_str),
+            Some("encoded_body")
         );
-        assert!(!ctx.metadata.contains_key("ai_semantic_firewall.rule_ids"));
+    }
+}
+
+#[tokio::test]
+async fn partial_encoded_uninspectable_response_honors_on_error_allow() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "on_error": "allow",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+        ("content-range".to_string(), "bytes 1-98/100".to_string()),
+    ]);
+    let mut ctx = create_test_context();
+
+    assert!(firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        206,
+        &headers,
+    ));
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 206, &headers, b"truncated gzip fragment")
+            .await,
+    );
+    assert_continue(
+        firewall
+            .on_final_response_body(&mut ctx, 206, &headers, b"truncated gzip fragment")
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("encoded_body")
+    );
+}
+
+#[tokio::test]
+async fn partial_encoded_json_responses_remain_inspected_when_decodable() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let plaintext =
+        br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#;
+
+    for (encoding, body) in [
+        ("gzip", gzip_bytes(plaintext)),
+        ("br", brotli_bytes(plaintext)),
+    ] {
+        let headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-encoding".to_string(), encoding.to_string()),
+            ("content-range".to_string(), "bytes 0-1023/1024".to_string()),
+        ]);
+        let mut ctx = create_test_context();
+
+        assert!(firewall.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            206,
+            &headers,
+        ));
+        assert_continue(
+            firewall
+                .on_response_body(&mut ctx, 206, &headers, &body)
+                .await,
+        );
+        assert_reject(
+            firewall
+                .on_final_response_body(&mut ctx, 206, &headers, &body)
+                .await,
+            Some(502),
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.rule_ids")
+                .map(String::as_str),
+            Some("response_leakage")
+        );
     }
 }
 
@@ -3821,7 +3926,7 @@ async fn partial_unencoded_json_responses_remain_inspected() {
 }
 
 #[tokio::test]
-async fn original_range_marker_skips_final_hook_after_content_range_removal() {
+async fn stamped_partial_origin_encoding_survives_live_header_removal() {
     let config = json!({
         "inspect": {"request": false, "response": true},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
@@ -3838,14 +3943,18 @@ async fn original_range_marker_skips_final_hook_after_content_range_removal() {
     let mut ctx = create_test_context();
     ctx.metadata
         .insert("ferrum:range_response".to_string(), "true".to_string());
-
-    assert_continue(
-        firewall
-            .on_response_body(&mut ctx, 200, &headers, gzip_fragment)
-            .await,
+    ctx.metadata.insert(
+        "ferrum:original_response_metadata_stamped".to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata.insert(
+        "ferrum:origin_encoded_response".to_string(),
+        "gzip".to_string(),
     );
     headers.remove("content-range");
-    assert!(!firewall.should_buffer_response_body_for_content_type(
+    headers.remove("content-encoding");
+
+    assert!(firewall.should_buffer_response_body_for_content_type(
         &ctx,
         Some("text/plain"),
         200,
@@ -3853,14 +3962,21 @@ async fn original_range_marker_skips_final_hook_after_content_range_removal() {
     ));
     assert_continue(
         firewall
-            .on_final_response_body(&mut ctx, 200, &headers, gzip_fragment)
+            .on_response_body(&mut ctx, 200, &headers, gzip_fragment)
             .await,
     );
-    assert!(
-        !ctx.metadata
-            .contains_key("ai_semantic_firewall.uninspectable_body")
+    assert_reject(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &headers, gzip_fragment)
+            .await,
+        Some(502),
     );
-    assert!(!ctx.metadata.contains_key("ai_semantic_firewall.rule_ids"));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("encoded_body")
+    );
 }
 
 #[tokio::test]

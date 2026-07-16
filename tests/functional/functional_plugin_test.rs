@@ -1775,8 +1775,8 @@ async fn test_plugin_bot_detection() {
             "proxy_id": "proxy-botdetect",
             "enabled": true,
             "config": {
-                "deny": ["curl", "python-requests", "scrapy"],
-                "mode": "deny"
+                "blocked_patterns": ["FerrumAuditCrawler"],
+                "custom_response_code": 451
             }
         })],
     )
@@ -1797,7 +1797,7 @@ async fn test_plugin_bot_detection() {
         .expect("Request failed");
     assert_eq!(resp.status().as_u16(), 200, "Normal browser UA should pass");
 
-    // Bot user agent should be blocked
+    // Supplying a custom list replaces the built-in defaults.
     let resp = client
         .get(format!("{}/botdetect/test", harness.proxy_base_url))
         .header("User-Agent", "curl/7.68.0")
@@ -1806,21 +1806,31 @@ async fn test_plugin_bot_detection() {
         .expect("Request failed");
     assert_eq!(
         resp.status().as_u16(),
-        403,
-        "Bot UA (curl) should be blocked"
+        200,
+        "Built-in patterns should not mask the custom fixture"
     );
 
-    // Another blocked bot
+    // The configured unique agent receives the configured final JSON rejection.
     let resp = client
         .get(format!("{}/botdetect/test", harness.proxy_base_url))
-        .header("User-Agent", "python-requests/2.28.1")
+        .header("User-Agent", "FerrumAuditCrawler/1.0")
         .send()
         .await
         .expect("Request failed");
     assert_eq!(
         resp.status().as_u16(),
-        403,
-        "Bot UA (python-requests) should be blocked"
+        451,
+        "Configured bot UA should receive the configured final status"
+    );
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        resp.text().await.expect("bot rejection body"),
+        r#"{"error":"Forbidden"}"#
     );
 }
 
