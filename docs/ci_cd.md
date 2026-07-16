@@ -59,11 +59,11 @@ Pull Request
     ├─► CI plan
             ├─► Docs/license/agent-only: lightweight Tests aggregate
             └─► Full CI
-                    ├─► Format
-                    ├─► Unit / inline-lib / integration-shard / functional-shard tests
+                    ├─► Format + integration-shard coverage (in CI plan)
+                    ├─► Unit+inline-lib / integration-shard / functional-shard tests
                     ├─► Lint, dependency audit, vendored regressions
-                    ├─► eBPF/netns live checks when relevant
-                    ├─► In-workflow mesh / Helm / performance gates
+                    ├─► eBPF/netns live checks when planner marks relevant
+                    ├─► Planner-gated mesh / Helm / performance gates
                     └─► Five target release builds
     └─► Dedicated required checks (internally skip unrelated changes)
             ├─► Merge Coverage
@@ -112,12 +112,20 @@ edit cannot classify itself as light; edits to the planner therefore receive
 the full matrix. The required-CI verifier also checks that documentation paths
 used by live-suite filters remain in the planner's full-CI set.
 
-In full mode, the `Tests` aggregate waits for format, test shards, lint,
-dependency audit, vendored patch regressions, in-workflow mesh/Helm gates,
-eBPF/netns gates, performance, and the cross-platform build matrix. In light
-mode it requires the planner to succeed and accepts the planned heavy jobs as
-skipped. Pushes to `main` publish the `latest` prerelease and Docker images only
-after the full aggregate and build matrix pass.
+The same trusted planner emits fail-closed job outputs for Helm, mesh federation,
+the sidecar deployment smoke, eBPF program builds, and eBPF/netns live suites.
+PRs outside those curated path sets skip the downstream job before GitHub
+allocates a runner. Pushes to `main` and manual runs force all of these gates on.
+Rust formatting and the integration-shard coverage contract also run as named
+steps in `CI Plan`, avoiding two additional runner allocations.
+
+In full mode, the `Tests` aggregate waits for the planner/format checks, test
+shards, lint, dependency audit, vendored patch regressions,
+planner-gated mesh/Helm gates, eBPF/netns gates, performance, and the
+cross-platform build matrix. In light mode it requires the planner to succeed
+and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
+`latest` prerelease and Docker images only after the full aggregate and build
+matrix pass.
 
 Branch protection must require four independent PR checks: the unchanged `Tests`
 aggregate from `ci.yml`, plus `Merge Coverage` from `coverage.yml`, `Gateway API
@@ -132,18 +140,21 @@ CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progre
 
 ### Jobs
 
-#### 1. Format Job
+#### 1. CI Plan Static Checks
 
 **Runs**: `ubuntu-latest`
 
-Checks Rust formatting on full-mode pull requests and pushes to `main`:
+Checks Rust formatting and integration-shard declarations on full-mode pull
+requests and pushes to `main`:
 
 ```bash
 cargo fmt --all -- --check
+# Also diffs tests/integration/*.rs against integration::<module> filters in ci.yml.
 ```
 
 **Failures**:
 - Indicate formatting drift
+- Indicate a missing or stale integration shard filter
 - Must be fixed before merging
 
 #### 2. Test Jobs
@@ -155,28 +166,26 @@ pushes to `main`. The commands below are grouped by job, not run as one
 sequential shell script:
 
 ```bash
-# test-unit
-# First runs the four explicit plugin-hardening regressions, then the complete
-# unit suite in the same job so both commands reuse one compiled test binary.
+# test-unit: inline lib first, then the unchanged four-test plugin-hardening
+# exact gate, then the complete external unit suite in the same job.
+cargo test --lib
 cargo test --test unit_tests
 
-# test-lib
-cargo test --lib
-
-# test-integration-{admin-api,admin-config,mesh-routing,mesh-platform,protocols-data-plane}
-cargo nextest run --test integration_tests \
+# test-integration-{admin-platform,mesh-protocols}
+cargo nextest run --archive-file integration-tests-*.tar.zst \
+  --workspace-remap . \
   --no-fail-fast \
   <shard filters>
 
-# test-integration-coverage (sanity check job; needs test-integration)
-# Diffs `ls tests/integration/*.rs` against the union of shard filters and
-# fails the PR if a file is missing from / not declared in any shard.
+# build-test-artifacts (one job/cache for both archives and both binaries)
+cargo build --profile pr-build --bin ferrum-edge
+cargo build --config profile.dev.debug=0 --bin ferrum-cni
+cargo nextest archive --test integration_tests ...
+cargo nextest archive --test functional_tests ...
 
-# build-gateway-binary
-cargo build --bin ferrum-edge
-
-# test-functional-{harness,admin-routing,data-plane,plugins,protocols,resilience}
-cargo nextest run --test functional_tests \
+# test-functional-{application,protocols,data-plane}
+cargo nextest run --archive-file functional-tests-*.tar.zst \
+  --workspace-remap . \
   --run-ignored=all \
   --no-fail-fast \
   -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
@@ -191,9 +200,23 @@ phases.
 **What it tests**:
 - Unit tests in `tests/unit_tests.rs`
 - Inline `#[cfg(test)]` modules in `src/`
-- Integration tests split across five shards (`admin-api`, `admin-config`, `mesh-routing`, `mesh-platform`, `protocols-data-plane`). Each shard runs `cargo nextest run --test integration_tests` with a per-shard list of `integration::<file_module>` positional filters that nextest ORs together. The shard split balances ~583 in-process tests across 57 files roughly by test count (admin-api ~153, admin-config ~152, mesh-routing ~158, mesh-platform ~60 — lower count offset by heavier k8s/telemetry setup per test, protocols-data-plane ~150). Integration tests are in-process (no gateway binary, no Redis/Mongo services); each shard runs on its own `ubuntu-latest` runner with the standard Rust toolchain and a 30-minute cap.
-- `test-integration-coverage` runs after `test-integration` and diffs `ls tests/integration/*.rs` against the union of declared shard filters in `ci.yml`. Adding a new `mod foo_tests` to `tests/integration/mod.rs` without wiring it into a shard fails this guard — silent-skip protection.
-- Functional tests split across six shards (harness, admin-routing, data-plane, plugins, protocols, and resilience). CI builds the gateway binary once in `build-gateway-binary`, uploads it as an artifact, and each functional shard downloads it with `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard runs serialized with `nextest_jobs: 1`, and Redis/MongoDB service containers are attached to every functional shard job for tests that need them.
+- Secret backend tests compile once with Vault/AWS/GCP/Azure enabled and use
+  nextest `--no-fail-fast`; service integration likewise runs Consul and LDAP
+  in one independently reported invocation.
+- Integration tests split across two shards (`admin-platform`,
+  `mesh-protocols`). Each shard runs the prebuilt `integration_tests` nextest
+  archive with a visible list of `integration::<file_module>` positional
+  filters that nextest ORs together. Integration tests are in-process (no
+  gateway binary, no Redis/Mongo services); each shard has a 30-minute cap.
+- The `CI Plan` job diffs `ls tests/integration/*.rs` against the union of
+  declared shard filters in `ci.yml`. Adding a new `mod foo_tests` without
+  wiring it into a shard fails this silent-skip guard.
+- Functional tests split across three shards (`application`, `protocols`,
+  `data-plane`). `build-test-artifacts` compiles the gateway, CNI binary, and
+  both nextest archives in one job/cache; each functional shard downloads the
+  existing OS/architecture-keyed artifacts with
+  `FERRUM_SKIP_GATEWAY_BUILD=1`. The data-plane shard remains serialized with
+  `nextest_jobs: 1` and is the only shard that starts Redis/MongoDB containers.
 
 **Output**:
 - Test pass/fail status
@@ -220,7 +243,13 @@ cargo clippy --all-targets -- -D warnings
 
 **Runs**: `ubuntu-latest`
 
-The job runs on full-mode PRs and pushes to `main`. On PRs, eBPF validation steps only run when files under `ebpf/` changed relative to the PR base; on `main`, they run without the PR path filter. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. If this job is edited, preserve the intent that the shared-types test runs on stable Rust. When no eBPF files changed on a full-mode PR, the job no-ops and reports success.
+The planner schedules this job on PRs only when files under `ebpf/` changed, so
+unrelated PRs consume no runner; pushes to `main` and manual runs force it on.
+The job installs stable and nightly Rust toolchains plus `bpf-linker`, uses
+nightly to build `ferrum-ebpf`, uses stable to run
+`cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs`
+artifact with 14-day retention. If this job is edited, preserve the intent that
+the shared-types test runs on stable Rust.
 
 #### 5. NodeWaypoint eBPF Live Datapath Workflow
 
