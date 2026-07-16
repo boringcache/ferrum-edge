@@ -410,6 +410,23 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
 }
 
 #[test]
+fn h1_h2_request_plugin_awaits_and_body_hook_clones_preserve_deadline_provenance() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+
+    assert!(
+        !proxy.contains("await_request_plugin_deadline("),
+        "proxy request hooks must retain typed timeout provenance until conversion with the live context"
+    );
+    assert!(
+        proxy
+            .matches("body_hook_ctx.gateway_deadline_response_selected()")
+            .count()
+            >= 4,
+        "every final-body compatibility-clone merge must propagate terminal deadline ownership"
+    );
+}
+
+#[test]
 fn buffered_http3_backend_upload_honors_client_grpc_deadline() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
     let http3 = proxy

@@ -3402,7 +3402,16 @@ async fn handle_h3_request(
         &ctx,
         maybe_requires_response_body_buffering,
     );
-    let needs_request_buffering = has_retry || plugin_needs_request_buffering;
+    // A recognized gRPC-Web request can intentionally retain Plain backend
+    // transport when no translator is configured. Once deadline policy has
+    // installed an absolute RPC deadline, buffer that pass-through upload so
+    // cancellation in the plain bridge cannot strand its inlined reqwest body
+    // pump while the bridge emits the terminal gRPC-Web status-4 frame.
+    let deadline_bound_grpc_web_pass_through = grpc_web_response_content_type.is_some()
+        && matches!(backend_http_flavor, HttpFlavor::Plain)
+        && ctx.grpc_deadline_at().is_some();
+    let needs_request_buffering =
+        has_retry || plugin_needs_request_buffering || deadline_bound_grpc_web_pass_through;
     let needs_response_buffering = has_retry || !should_stream_response;
     let forces_reqwest_dispatch = stream_hooks_enabled
         && plugins

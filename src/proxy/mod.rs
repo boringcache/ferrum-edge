@@ -13747,11 +13747,12 @@ async fn apply_synthetic_response_body_hooks(
     let mut response_body_reject = None;
     for plugin in plugins.iter() {
         let deadline = ctx.grpc_deadline_at();
-        let result = crate::plugins::await_request_plugin_deadline(
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
             plugin.on_response_body(ctx, *response_status, response_headers, response_body),
         )
-        .await;
+        .await
+        .into_plugin_result(ctx);
         match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
@@ -13802,11 +13803,12 @@ async fn apply_synthetic_response_body_hooks(
     let mut response_body_reject = None;
     for plugin in plugins.iter() {
         let deadline = ctx.grpc_deadline_at();
-        let result = crate::plugins::await_request_plugin_deadline(
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
             plugin.on_final_response_body(ctx, *response_status, response_headers, response_body),
         )
-        .await;
+        .await
+        .into_plugin_result(ctx);
         match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
@@ -14887,11 +14889,12 @@ async fn run_backend_path_plugins_or_build_reject(
     let phase_start = Instant::now();
     for plugin in backend_path_plugins {
         let deadline = ctx.grpc_deadline_at();
-        match crate::plugins::await_request_plugin_deadline(
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
             plugin.on_backend_path_resolved(ctx, backend_path, phase),
         )
         .await
+        .into_plugin_result(ctx)
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
@@ -15177,11 +15180,12 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
             continue;
         }
         let deadline = ctx.grpc_deadline_at();
-        match crate::plugins::await_request_plugin_deadline(
+        match crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
             plugin.before_proxy(ctx, headers),
         )
         .await
+        .into_plugin_result(ctx)
         {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
@@ -16478,11 +16482,12 @@ async fn handle_proxy_request_inner(
         let phase_start = Instant::now();
         for plugin in plugins.iter() {
             let deadline = ctx.grpc_deadline_at();
-            match crate::plugins::await_request_plugin_deadline(
+            match crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
                 plugin.on_request_received(&mut ctx),
             )
             .await
+            .into_plugin_result(&mut ctx)
             {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
@@ -16820,11 +16825,12 @@ async fn handle_proxy_request_inner(
         let phase_start = Instant::now();
         for plugin in authorize_plugins.iter() {
             let deadline = ctx.grpc_deadline_at();
-            match crate::plugins::await_request_plugin_deadline(
+            match crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
                 plugin.authorize(&mut ctx),
             )
             .await
+            .into_plugin_result(&mut ctx)
             {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
@@ -17721,6 +17727,9 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 if let Some(body_hook_ctx) = body_hook_ctx {
+                    if body_hook_ctx.gateway_deadline_response_selected() {
+                        ctx.mark_gateway_deadline_response_selected();
+                    }
                     let request_body = ctx.metadata.remove("request_body");
                     ctx.metadata = body_hook_ctx.metadata;
                     if let Some(body) = request_body {
@@ -18281,6 +18290,9 @@ async fn handle_proxy_request_inner(
             )
             .await;
             if let Some(body_hook_ctx) = body_hook_ctx {
+                if body_hook_ctx.gateway_deadline_response_selected() {
+                    ctx.mark_gateway_deadline_response_selected();
+                }
                 // `clone_for_final_request_body_hooks` omits `request_body`; carry
                 // the original across the metadata swap (no on_final hook touches
                 // it). Disjoint field assignments avoid a whole-`ctx` borrow.
@@ -19871,7 +19883,7 @@ async fn handle_proxy_request_inner(
                     .await;
                     for plugin in plugins.iter() {
                         let deadline = ctx.grpc_deadline_at();
-                        let result = crate::plugins::await_request_plugin_deadline(
+                        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
                             deadline,
                             plugin.on_response_body(
                                 &mut ctx,
@@ -19880,7 +19892,8 @@ async fn handle_proxy_request_inner(
                                 &response_body,
                             ),
                         )
-                        .await;
+                        .await
+                        .into_plugin_result(&mut ctx);
                         match result {
                             PluginResult::Continue => {}
                             reject @ PluginResult::Reject { .. }
@@ -19965,7 +19978,7 @@ async fn handle_proxy_request_inner(
                     let phase_start = Instant::now();
                     for plugin in plugins.iter() {
                         let deadline = ctx.grpc_deadline_at();
-                        let result = crate::plugins::await_request_plugin_deadline(
+                        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
                             deadline,
                             plugin.on_final_response_body(
                                 &mut ctx,
@@ -19974,7 +19987,8 @@ async fn handle_proxy_request_inner(
                                 &response_body,
                             ),
                         )
-                        .await;
+                        .await
+                        .into_plugin_result(&mut ctx);
                         match result {
                             PluginResult::Continue => {}
                             reject @ PluginResult::Reject { .. }
@@ -20778,6 +20792,9 @@ async fn handle_proxy_request_inner(
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx.take() {
+            if body_hook_ctx.gateway_deadline_response_selected() {
+                ctx.mark_gateway_deadline_response_selected();
+            }
             // `clone_for_final_request_body_hooks` omits `request_body`; carry the
             // original across the metadata swap (no on_final hook touches it).
             // Disjoint field assignments avoid a whole-`ctx` borrow.
@@ -21186,6 +21203,9 @@ async fn handle_proxy_request_inner(
         )
         .await;
         if let Some(body_hook_ctx) = body_hook_ctx {
+            if body_hook_ctx.gateway_deadline_response_selected() {
+                ctx.mark_gateway_deadline_response_selected();
+            }
             // `clone_for_final_request_body_hooks` omits `request_body`; carry the
             // original across the metadata swap (no on_final hook touches it).
             // Disjoint field assignments avoid a whole-`ctx` borrow.
@@ -21559,11 +21579,12 @@ async fn handle_proxy_request_inner(
         let mut response_body_reject = None;
         for plugin in plugins.iter() {
             let deadline = ctx.grpc_deadline_at();
-            let result = crate::plugins::await_request_plugin_deadline(
+            let result = crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
                 plugin.on_response_body(&mut ctx, response_status, &response_headers, data),
             )
-            .await;
+            .await
+            .into_plugin_result(&mut ctx);
             match result {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }
@@ -21625,11 +21646,12 @@ async fn handle_proxy_request_inner(
         let mut response_body_reject = None;
         for plugin in plugins.iter() {
             let deadline = ctx.grpc_deadline_at();
-            let result = crate::plugins::await_request_plugin_deadline(
+            let result = crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
                 plugin.on_final_response_body(&mut ctx, response_status, &response_headers, data),
             )
-            .await;
+            .await
+            .into_plugin_result(&mut ctx);
             match result {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }

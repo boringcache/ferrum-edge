@@ -1330,6 +1330,191 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+fn record_plain_grpc_web_client_deadline(
+    state: &ProxyState,
+    epoch: &RequestEpoch,
+    proxy: &Proxy,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&UpstreamTarget>,
+    current_cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+) {
+    record_backend_outcome(
+        state,
+        proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
+        current_target,
+        current_cb_target_key,
+        StatusCode::OK.as_u16(),
+        false,
+        Some(ErrorClass::ClientDisconnect),
+        cb_is_half_open_probe,
+        false,
+        backend_start.elapsed(),
+    );
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        StatusCode::OK.as_u16(),
+        false,
+        Some(ErrorClass::ClientDisconnect),
+        backend_admission_elapsed,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_plain_grpc_web_client_deadline<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_committed_plugins: &[Arc<dyn Plugin>],
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    backend_start: Instant,
+    bytes_sent: u64,
+    backend_target_url: &str,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    ctx.mark_gateway_deadline_response_selected();
+    let mut outcome = write_final_body_reject(
+        stream,
+        HttpFlavor::Grpc,
+        plugins,
+        ctx,
+        crate::plugins::grpc_deadline_exceeded_plugin_result(),
+        response_committed_plugins,
+        initial_response_header_policy_plugins,
+        RejectWriteAccounting {
+            backend_start,
+            bytes_sent,
+        },
+    )
+    .await?;
+    outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
+    outcome.body_error_class = Some(ErrorClass::ClientDisconnect);
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_plain_grpc_web_client_deadline_without_hooks<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    backend_start: Instant,
+    bytes_sent: u64,
+    backend_target_url: &str,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    ctx.mark_gateway_deadline_response_selected();
+    let deadline = normalized_h3_grpc_deadline();
+    let (_, translated) = normalize_reject_for_client(
+        ctx,
+        deadline.http_status,
+        &deadline.body,
+        &deadline.headers,
+        false,
+    );
+    let Some(translated) = translated else {
+        crate::http3::stream_util::abort_response_stream(stream);
+        crate::http3::stream_util::halt_request_body(stream);
+        return Ok(terminal_deadline_write_aborted_outcome(
+            StatusCode::OK.as_u16(),
+            0,
+            backend_start,
+            bytes_sent,
+            false,
+        ));
+    };
+    let write = write_reject_with_headers(
+        stream,
+        StatusCode::OK,
+        &translated.body,
+        &translated.headers,
+        backend_start,
+        bytes_sent,
+    );
+    let mut outcome = match crate::http3::stream_util::await_terminal_response_write_before_deadline(
+        ctx.grpc_deadline_at(),
+        write,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+            crate::http3::stream_util::abort_response_stream(stream);
+            crate::http3::stream_util::halt_request_body(stream);
+            terminal_deadline_write_aborted_outcome(
+                StatusCode::OK.as_u16(),
+                0,
+                backend_start,
+                bytes_sent,
+                true,
+            )
+        }
+        Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+            crate::http3::stream_util::abort_response_stream(stream);
+            crate::http3::stream_util::halt_request_body(stream);
+            terminal_deadline_write_aborted_outcome(
+                StatusCode::OK.as_u16(),
+                0,
+                backend_start,
+                bytes_sent,
+                false,
+            )
+        }
+    };
+    outcome.backend_target = Some(strip_query_from_backend_url(backend_target_url));
+    outcome.body_error_class = Some(ErrorClass::ClientDisconnect);
+    Ok(outcome)
+}
+
+async fn append_plain_grpc_web_client_deadline<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+) -> (u64, bool)
+where
+    S: SendStream<Bytes>,
+{
+    ctx.mark_gateway_deadline_response_selected();
+    let deadline = normalized_h3_grpc_deadline();
+    let (_, translated) = normalize_reject_for_client(
+        ctx,
+        deadline.http_status,
+        &deadline.body,
+        &deadline.headers,
+        false,
+    );
+    let Some(translated) = translated else {
+        crate::http3::stream_util::abort_response_stream(stream);
+        return (0, false);
+    };
+    let bytes = translated.body.len() as u64;
+    let write = async {
+        if !translated.body.is_empty() {
+            stream.send_data(Bytes::from(translated.body)).await?;
+        }
+        stream.finish().await
+    };
+    match crate::http3::stream_util::await_terminal_response_write_before_deadline(
+        ctx.grpc_deadline_at(),
+        write,
+    )
+    .await
+    {
+        Ok(()) => (bytes, true),
+        Err(_) => {
+            crate::http3::stream_util::abort_response_stream(stream);
+            (0, false)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_plain<S>(
     state: &ProxyState,
     epoch: &RequestEpoch,
@@ -1393,6 +1578,11 @@ where
         HttpFlavor::Grpc
     } else {
         HttpFlavor::Plain
+    };
+    let grpc_web_deadline_at = if matches!(policy_flavor, HttpFlavor::Grpc) {
+        ctx.grpc_deadline_at()
+    } else {
+        None
     };
 
     let req_method = match parse_reqwest_method(method) {
@@ -1535,21 +1725,53 @@ where
                         Err(outcome) => return Ok(outcome),
                     };
 
-                    let send_result = build_plain_request_builder(
-                        &client,
-                        state,
-                        dispatch_proxy,
-                        req_method.clone(),
-                        proxy_headers,
-                        &current_url,
-                        effective_host,
-                        client_ip,
-                        xff_append_ip,
-                        ctx.is_early_data,
+                    let send_result = match crate::plugins::await_grpc_deadline(
+                        grpc_web_deadline_at,
+                        build_plain_request_builder(
+                            &client,
+                            state,
+                            dispatch_proxy,
+                            req_method.clone(),
+                            proxy_headers,
+                            &current_url,
+                            effective_host,
+                            client_ip,
+                            xff_append_ip,
+                            ctx.is_early_data,
+                        )
+                        .body(buffered_body.clone())
+                        .send(),
                     )
-                    .body(buffered_body.clone())
-                    .send()
-                    .await;
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(()) => {
+                            drop(pending_slot);
+                            record_plain_grpc_web_client_deadline(
+                                state,
+                                epoch,
+                                proxy,
+                                upstream_balancer,
+                                current_target.as_deref(),
+                                current_cb_target_key.as_deref(),
+                                cb_retry_probe_slot_available,
+                                backend_start,
+                                &mut backend_admission_permits,
+                                backend_admission_start.elapsed(),
+                            );
+                            return write_plain_grpc_web_client_deadline(
+                                stream,
+                                plugins,
+                                ctx,
+                                response_committed_plugins,
+                                initial_response_header_policy_plugins,
+                                backend_start,
+                                bytes_sent,
+                                &current_url,
+                            )
+                            .await;
+                        }
+                    };
                     drop(pending_slot);
                     match send_result {
                         Ok(response) => {
@@ -1605,7 +1827,25 @@ where
                                     );
                                     cb_retry_probe_slot_available = false;
                                     let delay = crate::retry::retry_delay(retry_config, attempt);
-                                    tokio::time::sleep(delay).await;
+                                    if crate::plugins::await_grpc_deadline(
+                                        grpc_web_deadline_at,
+                                        tokio::time::sleep(delay),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return write_plain_grpc_web_client_deadline(
+                                            stream,
+                                            plugins,
+                                            ctx,
+                                            response_committed_plugins,
+                                            initial_response_header_policy_plugins,
+                                            backend_start,
+                                            bytes_sent,
+                                            &current_url,
+                                        )
+                                        .await;
+                                    }
                                     attempt += 1;
                                     if let CrossProtocolRetryTarget::Selected(
                                         next_target,
@@ -1684,7 +1924,25 @@ where
                                     );
                                     cb_retry_probe_slot_available = false;
                                     let delay = crate::retry::retry_delay(retry_config, attempt);
-                                    tokio::time::sleep(delay).await;
+                                    if crate::plugins::await_grpc_deadline(
+                                        grpc_web_deadline_at,
+                                        tokio::time::sleep(delay),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return write_plain_grpc_web_client_deadline(
+                                            stream,
+                                            plugins,
+                                            ctx,
+                                            response_committed_plugins,
+                                            initial_response_header_policy_plugins,
+                                            backend_start,
+                                            bytes_sent,
+                                            &current_url,
+                                        )
+                                        .await;
+                                    }
                                     attempt += 1;
                                     if let CrossProtocolRetryTarget::Selected(
                                         next_target,
@@ -2367,14 +2625,17 @@ where
 
     if should_buffer_response {
         let mut response_status = status;
-        let mut response_body = match collect_reqwest_response_body_with_limit(
-            response,
-            state.max_response_body_size_bytes,
+        let mut response_body = match crate::plugins::await_grpc_deadline(
+            grpc_web_deadline_at,
+            collect_reqwest_response_body_with_limit(
+                response,
+                state.max_response_body_size_bytes,
+            ),
         )
         .await
         {
-            Ok(body) => body,
-            Err((error_body, error_class)) => {
+            Ok(Ok(body)) => body,
+            Ok(Err((error_body, error_class))) => {
                 record_backend_outcome(
                     state,
                     proxy,
@@ -2412,9 +2673,35 @@ where
                 outcome.error_class = error_class;
                 return Ok(outcome);
             }
+            Err(()) => {
+                record_plain_grpc_web_client_deadline(
+                    state,
+                    epoch,
+                    proxy,
+                    upstream_balancer,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    cb_retry_probe_slot_available,
+                    backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_elapsed,
+                );
+                return write_plain_grpc_web_client_deadline(
+                    stream,
+                    plugins,
+                    ctx,
+                    response_committed_plugins,
+                    initial_response_header_policy_plugins,
+                    backend_start,
+                    bytes_sent,
+                    &current_url,
+                )
+                .await;
+            }
         };
 
-        if !plugins.is_empty() {
+        let plugin_pipeline = async {
+            if !plugins.is_empty() {
             normalize_response_body_for_inspection(
                 plugins,
                 ctx,
@@ -2484,22 +2771,80 @@ where
                 }
             }
 
-            if !response_committed_plugins.is_empty() {
-                crate::proxy::run_deadline_bounded_response_committed_hooks(
-                    response_committed_plugins,
+                if !response_committed_plugins.is_empty() {
+                    crate::proxy::run_deadline_bounded_response_committed_hooks(
+                        response_committed_plugins,
+                        ctx,
+                        &mut response_status,
+                        &mut response_headers,
+                        &mut response_body,
+                        initial_response_header_policy_plugins,
+                    )
+                    .await;
+                }
+            }
+        };
+        if crate::plugins::await_grpc_deadline(grpc_web_deadline_at, plugin_pipeline)
+            .await
+            .is_err()
+        {
+            record_plain_grpc_web_client_deadline(
+                state,
+                epoch,
+                proxy,
+                upstream_balancer,
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
+                cb_retry_probe_slot_available,
+                backend_start,
+                &mut backend_admission_permits,
+                backend_admission_elapsed,
+            );
+            return write_plain_grpc_web_client_deadline(
+                stream,
+                plugins,
+                ctx,
+                response_committed_plugins,
+                initial_response_header_policy_plugins,
+                backend_start,
+                bytes_sent,
+                &current_url,
+            )
+            .await;
+        }
+
+        if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
+            grpc_web_deadline_at,
+            send_response_headers(stream, response_status, &response_headers),
+        )
+        .await
+        {
+            if matches!(
+                error,
+                crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
+            ) {
+                record_plain_grpc_web_client_deadline(
+                    state,
+                    epoch,
+                    proxy,
+                    upstream_balancer,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    cb_retry_probe_slot_available,
+                    backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_elapsed,
+                );
+                return write_plain_grpc_web_client_deadline_without_hooks(
+                    stream,
                     ctx,
-                    &mut response_status,
-                    &mut response_headers,
-                    &mut response_body,
-                    initial_response_header_policy_plugins,
+                    backend_start,
+                    bytes_sent,
+                    &current_url,
                 )
                 .await;
             }
-        }
-
-        if let Err(error) = send_response_headers(stream, response_status, &response_headers).await
-        {
-            debug!("cross-protocol H3 buffered response header write failed: {error}");
+            debug!(?error, "cross-protocol H3 buffered response header write failed");
             record_cross_protocol_header_write_disconnect(
                 state,
                 proxy,
@@ -2524,20 +2869,56 @@ where
             ));
         }
         let bytes_streamed = response_body.len() as u64;
-        let mut body_completed = true;
-        let mut client_disconnected = false;
-        if !response_body.is_empty()
-            && let Err(error) = stream.send_data(Bytes::from(response_body)).await
-        {
-            debug!("cross-protocol H3 buffered body send_data failed: {error}");
-            client_disconnected = true;
-            body_completed = false;
-        }
-        if body_completed && let Err(error) = stream.finish().await {
-            debug!("cross-protocol H3 buffered finish failed: {error}");
-            client_disconnected = true;
-            body_completed = false;
-        }
+        let buffered_write = async {
+            if !response_body.is_empty() {
+                stream.send_data(Bytes::from(response_body)).await?;
+            }
+            stream.finish().await
+        };
+        let (body_completed, client_disconnected) =
+            match crate::http3::stream_util::await_response_write_before_deadline(
+                grpc_web_deadline_at,
+                buffered_write,
+            )
+            .await
+            {
+                Ok(()) => (true, false),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => {
+                    debug!("cross-protocol H3 buffered body write failed: {error}");
+                    (false, true)
+                }
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    record_plain_grpc_web_client_deadline(
+                        state,
+                        epoch,
+                        proxy,
+                        upstream_balancer,
+                        current_target.as_deref(),
+                        current_cb_target_key.as_deref(),
+                        cb_retry_probe_slot_available,
+                        backend_start,
+                        &mut backend_admission_permits,
+                        backend_admission_elapsed,
+                    );
+                    let (deadline_bytes, deadline_written) =
+                        append_plain_grpc_web_client_deadline(stream, ctx).await;
+                    return Ok(CrossProtocolOutcome {
+                        response_status: StatusCode::OK.as_u16(),
+                        response_streamed: false,
+                        bytes_streamed: bytes_streamed.saturating_add(deadline_bytes),
+                        bytes_sent,
+                        backend_target: Some(strip_query_from_backend_url(&current_url)),
+                        backend_resolved_ip: final_backend_resolved_ip.clone(),
+                        body_completed: deadline_written,
+                        client_disconnected: false,
+                        connection_error: false,
+                        error_class: None,
+                        body_error_class: Some(ErrorClass::ClientDisconnect),
+                        backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                        rejection_logged: false,
+                    });
+                }
+            };
 
         record_backend_outcome(
             state,
@@ -2615,8 +2996,38 @@ where
     }
 
     // Send response headers, then stream the body.
-    if let Err(error) = send_response_headers(stream, status, &response_headers).await {
-        debug!("cross-protocol H3 streaming response header write failed: {error}");
+    if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
+        grpc_web_deadline_at,
+        send_response_headers(stream, status, &response_headers),
+    )
+    .await
+    {
+        if matches!(
+            error,
+            crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
+        ) {
+            record_plain_grpc_web_client_deadline(
+                state,
+                epoch,
+                proxy,
+                upstream_balancer,
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
+                cb_retry_probe_slot_available,
+                backend_start,
+                &mut backend_admission_permits,
+                backend_admission_elapsed,
+            );
+            return write_plain_grpc_web_client_deadline_without_hooks(
+                stream,
+                ctx,
+                backend_start,
+                bytes_sent,
+                &current_url,
+            )
+            .await;
+        }
+        debug!(?error, "cross-protocol H3 streaming response header write failed");
         record_cross_protocol_header_write_disconnect(
             state,
             proxy,
@@ -2643,11 +3054,47 @@ where
 
     let coalesce = CoalesceConfig::from_state(state);
     let max_resp_bytes = state.max_response_body_size_bytes;
-    let (bytes_streamed, body_completed, client_disconnected, body_error_class) =
+    let stream_response = async {
         if let Some(inspector) = response_inspector {
             stream_inspected_reqwest_response(stream, response, inspector, max_resp_bytes).await
         } else {
             stream_reqwest_response(stream, response, coalesce, max_resp_bytes).await
+        }
+    };
+    let (bytes_streamed, body_completed, client_disconnected, body_error_class) =
+        match crate::plugins::await_grpc_deadline(grpc_web_deadline_at, stream_response).await {
+            Ok(result) => result,
+            Err(()) => {
+                record_plain_grpc_web_client_deadline(
+                    state,
+                    epoch,
+                    proxy,
+                    upstream_balancer,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    cb_retry_probe_slot_available,
+                    backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_elapsed,
+                );
+                let (deadline_bytes, deadline_written) =
+                    append_plain_grpc_web_client_deadline(stream, ctx).await;
+                return Ok(CrossProtocolOutcome {
+                    response_status: StatusCode::OK.as_u16(),
+                    response_streamed: true,
+                    bytes_streamed: deadline_bytes,
+                    bytes_sent,
+                    backend_target: Some(strip_query_from_backend_url(&current_url)),
+                    backend_resolved_ip: final_backend_resolved_ip.clone(),
+                    body_completed: deadline_written,
+                    client_disconnected: false,
+                    connection_error: false,
+                    error_class: None,
+                    body_error_class: Some(ErrorClass::ClientDisconnect),
+                    backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                    rejection_logged: false,
+                });
+            }
         };
 
     record_backend_outcome(
@@ -8192,5 +8639,34 @@ mod tests {
             !body.contains("if has_retry { None } else { Some(&*ctx) }"),
             "retry-enabled H3 plain dispatch must not suppress content-type refinement"
         );
+    }
+
+    #[test]
+    fn h3_plain_grpc_web_pass_through_uses_the_absolute_rpc_deadline() {
+        let server = include_str!("server.rs");
+        assert!(server.contains("deadline_bound_grpc_web_pass_through"));
+
+        let src = include_str!("cross_protocol.rs");
+        let start = src
+            .find("async fn dispatch_plain<S>")
+            .expect("dispatch_plain not found");
+        let tail = &src[start..];
+        let end = tail
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn dispatch_grpc<S>")
+            .expect("end of dispatch_plain not found");
+        let body = &tail[..end];
+
+        for required in [
+            "let grpc_web_deadline_at",
+            "build_plain_request_builder(",
+            "tokio::time::sleep(delay)",
+            "collect_reqwest_response_body_with_limit(",
+            "stream_response",
+            "await_response_write_before_deadline(",
+            "write_plain_grpc_web_client_deadline(",
+            "append_plain_grpc_web_client_deadline(",
+        ] {
+            assert!(body.contains(required), "missing deadline guard: {required}");
+        }
     }
 }
