@@ -5092,18 +5092,19 @@ impl DatabaseStore {
         if configs.is_empty() {
             return Ok(0);
         }
-        let total = if configs
+        let (graph_configs, unrelated_configs): (Vec<_>, Vec<_>) = configs
             .iter()
-            .any(crate::plugins::transaction_log_schema::is_enabled_config_graph_participant)
-        {
-            self.batch_create_plugin_configs_chunk(configs).await?
-        } else {
-            let mut total = 0usize;
-            for chunk in configs.chunks(Self::BATCH_CHUNK_SIZE) {
-                total += self.batch_create_plugin_configs_chunk(chunk).await?;
-            }
-            total
-        };
+            .cloned()
+            .partition(crate::plugins::transaction_log_schema::is_enabled_config_graph_participant);
+        let mut total = 0usize;
+        if !graph_configs.is_empty() {
+            total += self
+                .batch_create_plugin_configs_chunk(&graph_configs)
+                .await?;
+        }
+        for chunk in unrelated_configs.chunks(Self::BATCH_CHUNK_SIZE) {
+            total += self.batch_create_plugin_configs_chunk(chunk).await?;
+        }
         self.check_slow_query("batch_create_plugin_configs", start);
         Ok(total)
     }

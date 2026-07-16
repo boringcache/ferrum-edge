@@ -2836,9 +2836,10 @@ async fn ensure_hmac_consumer_candidate(
 }
 
 async fn persist_consumer_update(
-    db: &dyn DatabaseBackend,
-    admission_guard: &crud::NamespaceConfigAdmissionGuard,
+    db: Arc<dyn DatabaseBackend>,
+    admission_guard: crud::NamespaceConfigAdmissionGuard,
     mut consumer: Consumer,
+    previous: &Consumer,
     success_status: StatusCode,
 ) -> Response<Full<Bytes>> {
     // Every credential endpoint rewrites the complete Consumer and rebuilds
@@ -2847,25 +2848,50 @@ async fn persist_consumer_update(
     // out-of-band duplicates fail before the datastore uniqueness backstop.
     if !consumer.credential_entries("hmac_auth").is_empty()
         && let Err(response) =
-            ensure_hmac_consumer_candidate(db, &consumer.namespace, &consumer).await
+            ensure_hmac_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
     {
         return *response;
     }
     consumer.updated_at = Utc::now();
+    let namespace = consumer.namespace.clone();
     let update = match admission_guard
         .run_to_completion_while_held(db.update_consumer(&consumer))
         .await
     {
         Ok(crud::NamespaceConfigAdmissionCompletion::Held(update)) => update,
         Ok(crud::NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
-            Ok(_) => {
-                return json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!(
-                        "Config admission was lost after consumer persistence completed; verify the stored consumer before retrying: {error}"
-                    )}),
-                );
+            Ok(true) => {
+                let lost_generation = admission_guard.generation();
+                drop(admission_guard);
+                match crud::recover_late_consumer_update(
+                    db.clone(),
+                    &namespace,
+                    lost_generation,
+                    &consumer,
+                    previous,
+                )
+                .await
+                {
+                    Ok(true) => Ok(true),
+                    Ok(false) => {
+                        return json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({"error": format!(
+                                "Config admission was lost during consumer persistence; the late write was compensated: {error}"
+                            )}),
+                        );
+                    }
+                    Err(recovery_error) => {
+                        return json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({"error": format!(
+                                "Config admission was lost during consumer persistence and recovery failed: {recovery_error}; original error: {error}"
+                            )}),
+                        );
+                    }
+                }
             }
+            Ok(false) => Ok(false),
             Err(persistence_error) => Err(anyhow::anyhow!(
                 "{persistence_error}; namespace config admission was also lost: {error}"
             )),
@@ -3589,9 +3615,10 @@ async fn handle_update_credentials(
         return Ok(*resp);
     }
     let response = persist_consumer_update(
-        db.as_ref(),
-        &_namespace_config_admission_guard,
+        db.clone(),
+        _namespace_config_admission_guard,
         consumer.clone(),
+        &before,
         StatusCode::OK,
     )
     .await;
@@ -3656,9 +3683,10 @@ async fn handle_delete_credentials(
     let before = consumer.clone();
     consumer.credentials.remove(cred_type);
     let response = persist_consumer_update(
-        db.as_ref(),
-        &_namespace_config_admission_guard,
+        db.clone(),
+        _namespace_config_admission_guard,
         consumer.clone(),
+        &before,
         StatusCode::NO_CONTENT,
     )
     .await;
@@ -3783,9 +3811,10 @@ async fn handle_append_credential(
         return Ok(*resp);
     }
     let response = persist_consumer_update(
-        db.as_ref(),
-        &_namespace_config_admission_guard,
+        db.clone(),
+        _namespace_config_admission_guard,
         consumer.clone(),
+        &before,
         StatusCode::OK,
     )
     .await;
@@ -3896,9 +3925,10 @@ async fn handle_delete_credential_by_index(
     }
 
     let response = persist_consumer_update(
-        db.as_ref(),
-        &_namespace_config_admission_guard,
+        db.clone(),
+        _namespace_config_admission_guard,
         consumer.clone(),
+        &before,
         StatusCode::OK,
     )
     .await;

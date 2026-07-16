@@ -53,6 +53,12 @@ pub(crate) enum WriteAction<'a> {
     Update { id: &'a str },
 }
 
+enum LateResourceWrite<'a> {
+    Create,
+    Update { id: &'a str },
+    Delete { id: &'a str },
+}
+
 pub(crate) enum AfterValidateError {
     BadRequest(Vec<String>),
     Db(anyhow::Error),
@@ -393,22 +399,113 @@ pub(crate) async fn lock_namespace_config_admission(
 async fn run_db_write_while_held<T, F>(
     guard: Option<&NamespaceConfigAdmissionGuard>,
     future: F,
-) -> DbResult<T>
+) -> Result<NamespaceConfigAdmissionCompletion<DbResult<T>>, anyhow::Error>
 where
     F: Future<Output = DbResult<T>>,
 {
     match guard {
-        Some(guard) => match guard.run_to_completion_while_held(future).await? {
-            NamespaceConfigAdmissionCompletion::Held(result) => result,
-            NamespaceConfigAdmissionCompletion::Lost { result, error } => match result {
-                Ok(_) => Err(error),
-                Err(persistence_error) => Err(anyhow::anyhow!(
-                    "{persistence_error}; namespace config admission was also lost: {error}"
-                )),
-            },
-        },
-        None => future.await,
+        Some(guard) => guard.run_to_completion_while_held(future).await,
+        None => Ok(NamespaceConfigAdmissionCompletion::Held(future.await)),
     }
+}
+
+/// Reacquire namespace admission after a successful late write. With no
+/// intervening claimant, the original validation remains authoritative. If a
+/// writer did intervene, undo only the still-current late delta; a later
+/// same-resource mutation supersedes the delta and is left intact.
+async fn recover_late_resource_write<R: AdminResource>(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    lost_generation: u64,
+    action: LateResourceWrite<'_>,
+    written: Option<&R>,
+    previous: Option<&R>,
+    previous_snapshot: Option<&GatewayConfig>,
+) -> Result<bool, anyhow::Error> {
+    let recovery_guard = lock_namespace_config_admission(db.clone(), namespace).await?;
+    if recovery_guard.immediately_succeeds_generation(lost_generation) {
+        return Ok(true);
+    }
+
+    let compensation = async {
+        match action {
+            LateResourceWrite::Create => {
+                let written = written.ok_or_else(|| {
+                    anyhow::anyhow!("late create recovery is missing the written resource")
+                })?;
+                if R::db_get_for_write(db.as_ref(), namespace, written.id())
+                    .await?
+                    .is_some_and(|current| current.updated_at() == written.updated_at())
+                    && !R::db_delete(db.as_ref(), namespace, written.id()).await?
+                {
+                    anyhow::bail!("late create compensation found no matching resource");
+                }
+            }
+            LateResourceWrite::Update { id } => {
+                let written = written.ok_or_else(|| {
+                    anyhow::anyhow!("late update recovery is missing the written resource")
+                })?;
+                let previous = previous.ok_or_else(|| {
+                    anyhow::anyhow!("late update recovery is missing the prior resource")
+                })?;
+                if R::db_get_for_write(db.as_ref(), namespace, id)
+                    .await?
+                    .is_some_and(|current| current.updated_at() == written.updated_at())
+                    && !R::db_update(db.as_ref(), previous).await?
+                {
+                    anyhow::bail!("late update compensation found no matching resource");
+                }
+            }
+            LateResourceWrite::Delete { id } => {
+                let previous = previous.ok_or_else(|| {
+                    anyhow::anyhow!("late delete recovery is missing the prior resource")
+                })?;
+                if R::db_get_for_write(db.as_ref(), namespace, id)
+                    .await?
+                    .is_none()
+                {
+                    R::compensate_late_delete(
+                        db.as_ref(),
+                        namespace,
+                        previous,
+                        previous_snapshot,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    };
+    match recovery_guard
+        .run_to_completion_while_held(compensation)
+        .await?
+    {
+        NamespaceConfigAdmissionCompletion::Held(result) => result?,
+        NamespaceConfigAdmissionCompletion::Lost { result, error } => {
+            result?;
+            return Err(error);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) async fn recover_late_consumer_update(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    lost_generation: u64,
+    written: &Consumer,
+    previous: &Consumer,
+) -> Result<bool, anyhow::Error> {
+    recover_late_resource_write(
+        db,
+        namespace,
+        lost_generation,
+        LateResourceWrite::Update { id: &written.id },
+        Some(written),
+        Some(previous),
+        None,
+    )
+    .await
 }
 
 async fn validate_transaction_log_schema_graph_on_blocking_pool(
@@ -901,6 +998,7 @@ pub(crate) trait AdminResource:
     fn set_namespace(&mut self, ns: String);
     fn set_created_at(&mut self, now: DateTime<Utc>);
     fn set_updated_at(&mut self, now: DateTime<Utc>);
+    fn updated_at(&self) -> DateTime<Utc>;
     fn normalize(&mut self);
     fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError>;
     fn cached_items(config: &GatewayConfig) -> &[Self];
@@ -1005,6 +1103,15 @@ pub(crate) trait AdminResource:
     /// phantom success (issue #2122 DB-M4).
     async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool>;
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool>;
+
+    async fn compensate_late_delete(
+        db: &dyn DatabaseBackend,
+        _namespace: &str,
+        previous: &Self,
+        _previous_snapshot: Option<&GatewayConfig>,
+    ) -> DbResult<()> {
+        Self::db_create(db, previous).await
+    }
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
@@ -1192,7 +1299,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
-    let _namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
+    let mut namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
         match lock_namespace_config_admission(db_arc.clone(), namespace).await {
             Ok(guard) => Some(guard),
             Err(error) => return Ok(R::map_precheck_db_error(&error)),
@@ -1210,18 +1317,59 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
         Ok(Some(resource)) => resource,
     };
+    let previous_snapshot = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
+        match db.load_namespace_snapshot(namespace).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => return Ok(R::map_precheck_db_error(&error)),
+        }
+    } else {
+        None
+    };
 
     let validation_ctx = ValidationCtx::from_state(state);
     if let Err(error) = R::before_delete(db, state, namespace, &existing, &validation_ctx).await {
         return Ok(map_after_validate_error::<R>(error));
     }
 
-    match run_db_write_while_held(
-        _namespace_config_admission_guard.as_ref(),
+    let persistence = match run_db_write_while_held(
+        namespace_config_admission_guard.as_ref(),
         R::db_delete(db, namespace, id),
     )
     .await
     {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+            Ok(true) => {
+                let lost_generation = namespace_config_admission_guard
+                    .as_ref()
+                    .map(NamespaceConfigAdmissionGuard::generation)
+                    .unwrap_or_default();
+                drop(namespace_config_admission_guard.take());
+                match recover_late_resource_write(
+                    db_arc.clone(),
+                    namespace,
+                    lost_generation,
+                    LateResourceWrite::Delete { id },
+                    None,
+                    Some(&existing),
+                    previous_snapshot.as_ref(),
+                )
+                .await
+                {
+                    Ok(true) => Ok(true),
+                    Ok(false) => Err(anyhow::anyhow!(
+                        "namespace config admission was lost during delete; the late write was compensated: {error}"
+                    )),
+                    Err(recovery_error) => Err(anyhow::anyhow!(
+                        "namespace config admission was lost during delete and recovery failed: {recovery_error}; original error: {error}"
+                    )),
+                }
+            }
+            other => other,
+        },
+        Err(error) => Err(error),
+    };
+    match persistence {
         Ok(true) => {
             let event = AuditEvent::new(
                 actor,
@@ -2102,6 +2250,10 @@ impl AdminResource for Upstream {
         self.updated_at = now;
     }
 
+    fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
+    }
+
     fn normalize(&mut self) {
         self.api_spec_id = None;
         self.normalize_fields();
@@ -2351,6 +2503,10 @@ impl AdminResource for PluginConfig {
 
     fn set_updated_at(&mut self, now: DateTime<Utc>) {
         self.updated_at = now;
+    }
+
+    fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
     }
 
     fn normalize(&mut self) {
@@ -2695,6 +2851,10 @@ impl AdminResource for Proxy {
         self.updated_at = now;
     }
 
+    fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
+    }
+
     fn normalize(&mut self) {
         self.api_spec_id = None;
         if let Some(methods) = self.allowed_methods.as_mut() {
@@ -2811,6 +2971,57 @@ impl AdminResource for Proxy {
 
     async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
         db.delete_proxy(namespace, id).await
+    }
+
+    async fn compensate_late_delete(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        previous: &Self,
+        previous_snapshot: Option<&GatewayConfig>,
+    ) -> DbResult<()> {
+        let snapshot = previous_snapshot.ok_or_else(|| {
+            anyhow::anyhow!("late proxy delete recovery is missing the namespace snapshot")
+        })?;
+        let associated_ids: HashSet<&str> = previous
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.as_str())
+            .collect();
+        let other_associated_ids: HashSet<&str> = snapshot
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id != previous.id)
+            .flat_map(|proxy| proxy.plugins.iter())
+            .map(|association| association.plugin_config_id.as_str())
+            .collect();
+        let affected_plugins = snapshot
+            .plugin_configs
+            .iter()
+            .filter(|plugin| {
+                plugin.proxy_id.as_deref() == Some(previous.id.as_str())
+                    || (plugin.scope == PluginScope::ProxyGroup
+                        && associated_ids.contains(plugin.id.as_str())
+                        && !other_associated_ids.contains(plugin.id.as_str()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut proxy_without_associations = previous.clone();
+        proxy_without_associations.plugins.clear();
+        db.create_proxy(&proxy_without_associations).await?;
+        for plugin in affected_plugins {
+            if db
+                .get_plugin_config(namespace, &plugin.id)
+                .await?
+                .is_none()
+            {
+                db.create_plugin_config(&plugin).await?;
+            }
+        }
+        if !db.update_proxy(previous).await? {
+            anyhow::bail!("late proxy delete compensation could not restore associations");
+        }
+        Ok(())
     }
 
     async fn check_uniqueness(
@@ -3134,6 +3345,10 @@ impl AdminResource for Consumer {
         self.updated_at = now;
     }
 
+    fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
+    }
+
     fn normalize(&mut self) {
         self.normalize_fields();
     }
@@ -3335,7 +3550,7 @@ async fn handle_write<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
-    let _namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
+    let mut namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
         match lock_namespace_config_admission(db_arc.clone(), namespace).await {
             Ok(guard) => Some(guard),
             Err(error) => return Ok(R::map_precheck_db_error(&error)),
@@ -3377,7 +3592,7 @@ async fn handle_write<R: AdminResource>(
         },
     };
 
-    if let Some(guard) = _namespace_config_admission_guard.as_ref()
+    if let Some(guard) = namespace_config_admission_guard.as_ref()
         && let Err(error) = guard.ensure_held()
     {
         return Ok(R::map_precheck_db_error(&error));
@@ -3474,17 +3689,50 @@ async fn handle_write<R: AdminResource>(
 
     match action {
         WriteAction::Create => {
-            if let Err(error) = run_db_write_while_held(
-                _namespace_config_admission_guard.as_ref(),
+            let persistence = match run_db_write_while_held(
+                namespace_config_admission_guard.as_ref(),
                 R::db_create(db, &resource),
             )
             .await
             {
+                Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+                Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+                    Ok(()) => {
+                        let lost_generation = namespace_config_admission_guard
+                            .as_ref()
+                            .map(NamespaceConfigAdmissionGuard::generation)
+                            .unwrap_or_default();
+                        drop(namespace_config_admission_guard.take());
+                        match recover_late_resource_write(
+                            db_arc.clone(),
+                            namespace,
+                            lost_generation,
+                            LateResourceWrite::Create,
+                            Some(&resource),
+                            None,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err(anyhow::anyhow!(
+                                "namespace config admission was lost during create; the late write was compensated: {error}"
+                            )),
+                            Err(recovery_error) => Err(anyhow::anyhow!(
+                                "namespace config admission was lost during create and recovery failed: {recovery_error}; original error: {error}"
+                            )),
+                        }
+                    }
+                    Err(persistence_error) => Err(persistence_error),
+                },
+                Err(error) => Err(error),
+            };
+            if let Err(error) = persistence {
                 return Ok(R::map_persist_db_error(&error, action));
             }
         }
-        WriteAction::Update { .. } => match run_db_write_while_held(
-            _namespace_config_admission_guard.as_ref(),
+        WriteAction::Update { id } => match run_db_write_while_held(
+            namespace_config_admission_guard.as_ref(),
             R::db_update(db, &resource),
         )
         .await
@@ -3492,13 +3740,55 @@ async fn handle_write<R: AdminResource>(
             // The row vanished between the precheck and the write (concurrent
             // delete). The backend recorded no change — report not-found
             // rather than a phantom success (issue #2122 DB-M4).
-            Ok(false) => {
+            Ok(NamespaceConfigAdmissionCompletion::Held(Ok(false))) => {
                 return Ok(not_found_response::<R>());
             }
-            Ok(true) => {}
-            Err(error) => {
+            Ok(NamespaceConfigAdmissionCompletion::Held(Ok(true))) => {}
+            Ok(NamespaceConfigAdmissionCompletion::Held(Err(error))) | Err(error) => {
                 return Ok(R::map_persist_db_error(&error, action));
             }
+            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error }) => match result {
+                Ok(false) => return Ok(not_found_response::<R>()),
+                Ok(true) => {
+                    let lost_generation = namespace_config_admission_guard
+                        .as_ref()
+                        .map(NamespaceConfigAdmissionGuard::generation)
+                        .unwrap_or_default();
+                    drop(namespace_config_admission_guard.take());
+                    match recover_late_resource_write(
+                        db_arc.clone(),
+                        namespace,
+                        lost_generation,
+                        LateResourceWrite::Update { id },
+                        Some(&resource),
+                        existing.as_ref(),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Ok(R::map_persist_db_error(
+                                &anyhow::anyhow!(
+                                    "namespace config admission was lost during update; the late write was compensated: {error}"
+                                ),
+                                action,
+                            ));
+                        }
+                        Err(recovery_error) => {
+                            return Ok(R::map_persist_db_error(
+                                &anyhow::anyhow!(
+                                    "namespace config admission was lost during update and recovery failed: {recovery_error}; original error: {error}"
+                                ),
+                                action,
+                            ));
+                        }
+                    }
+                }
+                Err(persistence_error) => {
+                    return Ok(R::map_persist_db_error(&persistence_error, action));
+                }
+            },
         },
     }
 

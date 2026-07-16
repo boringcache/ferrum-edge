@@ -14,6 +14,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -28,7 +29,7 @@ use crate::admin::{AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, SortOrder,
 };
-use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
+use crate::config::types::{ApiSpec, PluginAssociation, PluginScope, Upstream};
 use crate::util::body_limit::is_length_limit_error;
 
 // ---------------------------------------------------------------------------
@@ -114,12 +115,16 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
     }
 }
 
-async fn run_api_spec_persistence_while_held<T, F>(
-    guard: &crate::admin::crud::NamespaceConfigAdmissionGuard,
+async fn run_api_spec_persistence_while_held<T, F, C>(
+    db: Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    guard: crate::admin::crud::NamespaceConfigAdmissionGuard,
     future: F,
+    compensation: C,
 ) -> Result<T, ApiSpecError>
 where
     F: Future<Output = Result<T, anyhow::Error>>,
+    C: Future<Output = Result<(), anyhow::Error>>,
 {
     match guard.run_to_completion_while_held(future).await {
         Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(result)) => {
@@ -131,7 +136,53 @@ where
                 "API-spec persistence completed after namespace config admission was lost"
             );
             match result {
-                Ok(_) => Err(ApiSpecError::NoDatabase),
+                Ok(result) => {
+                    let lost_generation = guard.generation();
+                    drop(guard);
+                    let recovery_guard = crate::admin::crud::lock_namespace_config_admission(
+                        db, namespace,
+                    )
+                    .await
+                    .map_err(|recovery_error| {
+                        tracing::error!(
+                            %recovery_error,
+                            "Failed to reacquire API-spec namespace admission after a late write"
+                        );
+                        ApiSpecError::NoDatabase
+                    })?;
+                    if recovery_guard.immediately_succeeds_generation(lost_generation) {
+                        return Ok(result);
+                    }
+                    match recovery_guard
+                        .run_to_completion_while_held(compensation)
+                        .await
+                    {
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Ok(()))) => {}
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
+                            result: Ok(()),
+                            error: recovery_error,
+                        }) => {
+                            tracing::error!(
+                                %recovery_error,
+                                "API-spec late-write compensation lost namespace admission"
+                            );
+                        }
+                        Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(Err(
+                            recovery_error,
+                        )))
+                        | Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
+                            result: Err(recovery_error),
+                            ..
+                        })
+                        | Err(recovery_error) => {
+                            tracing::error!(
+                                %recovery_error,
+                                "API-spec late-write compensation failed"
+                            );
+                        }
+                    }
+                    Err(ApiSpecError::NoDatabase)
+                }
                 Err(error) => Err(classify_db_error(error)),
             }
         }
@@ -143,6 +194,101 @@ where
             Err(ApiSpecError::NoDatabase)
         }
     }
+}
+
+async fn stored_api_spec_bundle_matches(
+    db: &dyn DatabaseBackend,
+    bundle: &ExtractedBundle,
+    spec: &ApiSpec,
+) -> Result<bool, anyhow::Error> {
+    let Some(current_spec) = db.get_api_spec(&spec.namespace, &spec.id).await? else {
+        return Ok(false);
+    };
+    if current_spec.updated_at != spec.updated_at || current_spec.content_hash != spec.content_hash {
+        return Ok(false);
+    }
+    let Some(current_proxy) = db
+        .get_proxy_for_write(&spec.namespace, &bundle.proxy.id)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if current_proxy.updated_at != bundle.proxy.updated_at {
+        return Ok(false);
+    }
+    if let Some(upstream) = bundle.upstream.as_ref() {
+        let Some(current) = db.get_upstream(&spec.namespace, &upstream.id).await? else {
+            return Ok(false);
+        };
+        if current.updated_at != upstream.updated_at {
+            return Ok(false);
+        }
+    }
+    for plugin in &bundle.plugins {
+        let Some(current) = db.get_plugin_config(&spec.namespace, &plugin.id).await? else {
+            return Ok(false);
+        };
+        if current.updated_at != plugin.updated_at {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn compensate_late_api_spec_create(
+    db: Arc<dyn DatabaseBackend>,
+    bundle: ExtractedBundle,
+    spec: ApiSpec,
+) -> Result<(), anyhow::Error> {
+    if stored_api_spec_bundle_matches(db.as_ref(), &bundle, &spec).await? {
+        db.delete_api_spec(&spec.namespace, &spec.id).await?;
+    }
+    Ok(())
+}
+
+async fn compensate_late_api_spec_replace(
+    db: Arc<dyn DatabaseBackend>,
+    written_bundle: ExtractedBundle,
+    written_spec: ApiSpec,
+    previous_bundle: ExtractedBundle,
+    previous_spec: ApiSpec,
+) -> Result<(), anyhow::Error> {
+    if stored_api_spec_bundle_matches(db.as_ref(), &written_bundle, &written_spec).await? {
+        db.replace_api_spec_bundle(&previous_bundle, &previous_spec)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn compensate_late_api_spec_delete(
+    db: Arc<dyn DatabaseBackend>,
+    previous_bundle: ExtractedBundle,
+    previous_spec: ApiSpec,
+    additional_plugins: Vec<crate::config::types::PluginConfig>,
+) -> Result<(), anyhow::Error> {
+    if db
+        .get_api_spec(&previous_spec.namespace, &previous_spec.id)
+        .await?
+        .is_some()
+        || db
+            .get_proxy_for_write(&previous_spec.namespace, &previous_spec.proxy_id)
+            .await?
+            .is_some()
+    {
+        return Ok(());
+    }
+    db.submit_api_spec_bundle(&previous_bundle, &previous_spec)
+        .await?;
+    for plugin in additional_plugins {
+        if db
+            .get_plugin_config(&previous_spec.namespace, &plugin.id)
+            .await?
+            .is_none()
+        {
+            db.create_plugin_config(&plugin).await?;
+        }
+    }
+    Ok(())
 }
 
 fn is_row_missing_error_message(lower: &str) -> bool {
@@ -2460,8 +2606,11 @@ pub async fn handle_post_api_spec(
     };
 
     if let Err(error) = run_api_spec_persistence_while_held(
-        &_namespace_config_admission_guard,
+        db.clone(),
+        namespace,
+        _namespace_config_admission_guard,
         db.submit_api_spec_bundle(&bundle, &spec),
+        compensate_late_api_spec_create(db.clone(), bundle.clone(), spec.clone()),
     )
     .await
     {
@@ -2562,6 +2711,13 @@ pub async fn handle_put_api_spec(
             Ok(upstream) => upstream,
             Err(e) => return Ok(error_response(e)),
         };
+    let existing_spec_plugins = match db
+        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+    {
+        Ok(plugins) => plugins,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
 
     // Assign IDs for PUT: reuse existing stored IDs for empty-id resources so
     // re-submitting the same ID-less spec is idempotent (Fix 1). This must
@@ -2609,6 +2765,19 @@ pub async fn handle_put_api_spec(
         Ok(p) => p,
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
+    let previous_bundle = match existing_proxy_row.as_ref() {
+        Some(proxy) => ExtractedBundle {
+            proxy: proxy.clone(),
+            upstream: existing_spec_upstream.clone(),
+            plugins: existing_spec_plugins,
+        },
+        None => {
+            return Ok(error_response(ApiSpecError::Internal(format!(
+                "API spec '{}' references missing proxy '{}'",
+                existing_spec.id, existing_spec.proxy_id
+            ))));
+        }
+    };
     let existing_upstream_id: Option<&str> = existing_spec_upstream.as_ref().map(|u| u.id.as_str());
 
     let ValidatedBundle { bundle, metadata } = match validate_bundle(
@@ -2647,8 +2816,17 @@ pub async fn handle_put_api_spec(
     spec.created_at = existing_spec.created_at;
 
     if let Err(error) = run_api_spec_persistence_while_held(
-        &_namespace_config_admission_guard,
+        db.clone(),
+        namespace,
+        _namespace_config_admission_guard,
         db.replace_api_spec_bundle(&bundle, &spec),
+        compensate_late_api_spec_replace(
+            db.clone(),
+            bundle.clone(),
+            spec.clone(),
+            previous_bundle,
+            existing_spec.clone(),
+        ),
     )
     .await
     {
@@ -2838,6 +3016,62 @@ pub async fn handle_delete_api_spec(
         Ok(None) => return Ok(error_response(ApiSpecError::NotFound)),
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
+    let existing_proxy = match db
+        .get_proxy_for_write(namespace, &existing.proxy_id)
+        .await
+    {
+        Ok(Some(proxy)) => proxy,
+        Ok(None) => {
+            return Ok(error_response(ApiSpecError::Internal(format!(
+                "API spec '{}' references missing proxy '{}'",
+                existing.id, existing.proxy_id
+            ))));
+        }
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    let existing_upstream = match load_single_spec_owned_upstream(db, namespace, id).await {
+        Ok(upstream) => upstream,
+        Err(error) => return Ok(error_response(error)),
+    };
+    let existing_plugins = match db.list_spec_owned_plugin_configs(namespace, id).await {
+        Ok(plugins) => plugins,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    let deletion_snapshot = match db.load_namespace_snapshot(namespace).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    let owned_plugin_ids: HashSet<&str> =
+        existing_plugins.iter().map(|plugin| plugin.id.as_str()).collect();
+    let proxy_plugin_ids: HashSet<&str> = existing_proxy
+        .plugins
+        .iter()
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    let other_proxy_plugin_ids: HashSet<&str> = deletion_snapshot
+        .proxies
+        .iter()
+        .filter(|proxy| proxy.id != existing.proxy_id)
+        .flat_map(|proxy| proxy.plugins.iter())
+        .map(|association| association.plugin_config_id.as_str())
+        .collect();
+    let additional_plugins = deletion_snapshot
+        .plugin_configs
+        .iter()
+        .filter(|plugin| !owned_plugin_ids.contains(plugin.id.as_str()))
+        .filter(|plugin| {
+            plugin.proxy_id.as_deref() == Some(existing.proxy_id.as_str())
+                || (plugin.scope == PluginScope::ProxyGroup
+                    && proxy_plugin_ids.contains(plugin.id.as_str())
+                    && !other_proxy_plugin_ids.contains(plugin.id.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let previous_bundle = ExtractedBundle {
+        proxy: existing_proxy,
+        upstream: existing_upstream,
+        plugins: existing_plugins,
+    };
 
     match crate::admin::crud::validate_transaction_log_schema_api_spec_deletion_candidate(
         db.as_ref(),
@@ -2867,8 +3101,16 @@ pub async fn handle_delete_api_spec(
     }
 
     let persistence = match run_api_spec_persistence_while_held(
-        &_namespace_config_admission_guard,
+        db.clone(),
+        namespace,
+        _namespace_config_admission_guard,
         db.delete_api_spec(namespace, id),
+        compensate_late_api_spec_delete(
+            db.clone(),
+            previous_bundle,
+            existing.clone(),
+            additional_plugins,
+        ),
     )
     .await
     {

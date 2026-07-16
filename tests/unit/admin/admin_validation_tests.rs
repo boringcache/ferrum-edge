@@ -113,7 +113,9 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(sql_store_source.contains("config_admission_locks"));
     assert!(sql_store_source.contains("config_admission_lease_now_sql"));
     assert!(sql_store_source.contains("SELECT generation FROM config_admission_locks"));
-    assert!(sql_store_source.contains("self.batch_create_plugin_configs_chunk(configs).await?"));
+    assert!(sql_store_source.contains("batch_create_plugin_configs_chunk(&graph_configs)"));
+    assert!(sql_store_source.contains("partition(crate::plugins::transaction_log_schema::"));
+    assert!(sql_store_source.contains("unrelated_configs.chunks(Self::BATCH_CHUNK_SIZE)"));
     let mongo_store_source = include_str!("../../../src/config/mongo_store.rs");
     assert!(mongo_store_source.contains("config_admission_locks"));
     assert!(mongo_store_source.contains("server_time_lease_acquire_pipeline"));
